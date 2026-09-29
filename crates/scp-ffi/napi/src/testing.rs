@@ -456,40 +456,6 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
 // Pseudonym custody test hooks (§9.10.4)
 // ---------------------------------------------------------------------------
 
-/// Test-only: the §9.10.4 routing id the bridge derives for a software-custody
-/// identity whose Ed25519 seed is `seed`, in `context_id`.
-///
-/// Imports `seed` into an in-memory custody as the identity key and runs the
-/// bridge's own pseudonym derivation (`derive_pseudonym_bytes`, the path the
-/// create / join / import flows use), so a TypeScript KAT can compare the
-/// production bridge output against a §25.19 routing id.
-///
-/// # Errors
-///
-/// `SCP-VALID-7005` when `seed` is not 32 bytes; the custody code of a failed
-/// derivation (`SCP-CRYPTO-4006`, `SCP-CRYPTO-4060` or `SCP-IDENT-1055`).
-#[napi(js_name = "testingPseudonymRoutingIdFromSeed")]
-pub async fn testing_pseudonym_routing_id_from_seed(
-    seed: Buffer,
-    context_id: String,
-) -> napi::Result<Buffer> {
-    let seed: zeroize::Zeroizing<[u8; 32]> =
-        zeroize::Zeroizing::new(seed.as_ref().try_into().map_err(|_| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("seed must be 32 bytes, got {}", seed.len()),
-                code: codes::VALID_7005.to_owned(),
-            })
-        })?);
-    let in_memory = scp_platform::testing::InMemoryKeyCustody::new();
-    let identity_key = in_memory.import_ed25519_key(&seed).await;
-    let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(
-        crate::identity::OpaqueInMemoryKeyCustody(in_memory),
-    ));
-    let routing_id =
-        crate::context::derive_pseudonym_bytes(&custody, &identity_key, &context_id).await?;
-    Ok(Buffer::from(routing_id.to_vec()))
-}
-
 /// Test-only handle over one callback custody adapter built from a JS provider.
 ///
 /// TypeScript tests reach the adapter's pseudonym checks through it:

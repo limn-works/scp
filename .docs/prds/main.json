@@ -10802,7 +10802,6 @@
         "bindings/python/scp_sdk/_scp_core.pyi",
         "bindings/python/tests/pseudonym_recipe.py",
         "bindings/python/tests/test_identity_create_with_custody.py",
-        "bindings/python/tests/test_pseudonym_kat.py",
         "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
         "bindings/swift/Tests/SCPTests/Platform/AppleKeyCustodyTests.swift",
         "bindings/typescript/src/index.ts",

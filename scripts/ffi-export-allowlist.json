@@ -620,12 +620,6 @@
       "path": "crates/scp-ffi/src/ucan.rs",
       "kind": "dunder",
       "reason": "Python debug-representation dunder on bridge result types; not a protocol operation."
-    },
-    {
-      "name": "testing_pseudonym_routing_id_from_seed",
-      "path": "crates/scp-ffi/src/testing.rs",
-      "kind": "test-fixture",
-      "reason": "\u00a725.19 / SCP-307 test hook; feature-gated (testing). Derives the \u00a79.10.4 v1 routing id for an identity whose Ed25519 seed is the given 32 bytes (the \u00a79.10.4.A native interim ikm) through the production pseudonym path, so the SDK KAT checks the bridge rather than a fixture. Not a protocol operation."
     }
   ],
   "uniffi": [
@@ -1146,12 +1140,6 @@
       "path": "crates/scp-ffi/napi/src/ucan.rs",
       "kind": "getter",
       "reason": "Getter for a UCAN token id on a result type."
-    },
-    {
-      "name": "testing_pseudonym_routing_id_from_seed",
-      "path": "crates/scp-ffi/napi/src/testing.rs",
-      "kind": "test-fixture",
-      "reason": "\u00a725.19 / SCP-307 test hook; feature-gated (testing). Derives the \u00a79.10.4 v1 routing id for an identity whose Ed25519 seed is the given 32 bytes (the \u00a79.10.4.A native interim ikm) through the production pseudonym path, so the SDK KAT checks the bridge rather than a fixture. Not a protocol operation."
     },
     {
       "name": "new",
