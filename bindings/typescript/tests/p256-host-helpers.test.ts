@@ -132,19 +132,17 @@ describe("P-256 host call wiping (stubbed native function)", () => {
   const seed = new Uint8Array(32).fill(0x11);
   const digest = new Uint8Array(32).fill(0x22);
 
-  test("wipes the argument copies it passed and returns a native Uint8Array uncopied", () => {
+  test("passes number[] copies of the arguments, then wipes them and leaves the caller's seed intact", () => {
     let passed: number[][] = [];
     let valuesAtCall: number[][] = [];
-    const native = new Uint8Array(32).fill(0x33);
-    const out = __p256HostInvokeForTests(
+    __p256HostInvokeForTests(
       (...a) => {
         passed = a;
         valuesAtCall = a.map((r) => r.slice());
-        return native;
+        return new Array<number>(32).fill(0x33);
       },
       [seed, digest],
     );
-    expect(out).toBe(native);
     expect(valuesAtCall).toEqual([Array.from(seed), Array.from(digest)]);
     expect(passed.length).toBe(2);
     for (const r of passed) {

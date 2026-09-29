@@ -270,30 +270,27 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
  * the one `Uint8Array` the host owns.
  *
  * NAPI `Vec<u8>` parameters and returns are `number[]` in JS. The
- * `number[]` copies of the arguments, and a `number[]` result once it is
- * copied into the returned `Uint8Array`, are wiped with `fill(0)`; a
- * `Uint8Array` result is returned as is, uncopied.
+ * `number[]` copies of the arguments, and the `number[]` result once it is
+ * copied into the returned `Uint8Array`, are wiped with `fill(0)`.
  *
  * @internal
  */
 export function __p256HostInvokeForTests(
-  fn: (...a: number[][]) => number[] | Uint8Array,
+  fn: (...a: number[][]) => number[],
   args: readonly Uint8Array[],
 ): Uint8Array {
   const raw = args.map((a) => Array.from(a));
-  let out: number[] | Uint8Array | undefined;
+  let out: number[] | undefined;
   try {
     out = fn(...raw);
-    return out instanceof Uint8Array ? out : Uint8Array.from(out);
+    return Uint8Array.from(out);
   } catch (err) {
     throw mapBridgeError(err);
   } finally {
     for (const r of raw) {
       r.fill(0);
     }
-    if (Array.isArray(out)) {
-      out.fill(0);
-    }
+    out?.fill(0);
   }
 }
 
@@ -656,10 +653,7 @@ function p256HostCall(
   name: "p256PseudonymScalar" | "p256PublicKey" | "p256SignPrehashRfc6979",
   ...args: Uint8Array[]
 ): Uint8Array {
-  return __p256HostInvokeForTests(
-    nativeFreeFn<(...a: number[][]) => number[] | Uint8Array>(name),
-    args,
-  );
+  return __p256HostInvokeForTests(nativeFreeFn<(...a: number[][]) => number[]>(name), args);
 }
 
 /**
