@@ -67,6 +67,14 @@ subscription that a different caller had just opened.
   captures only the newest stop, and an older stop that reached its dispatcher last would
   otherwise release whatever that mount's start opened. For a departure it holds, `unmount`
   returns a `Job` that the next launched stop completes.
+- **Reach one subscription under one key.** The coordinator counts and orders mounts per
+  caller-chosen key only, while `HotStreamFactory` keys a subscription by context handle alone.
+  A mount under `handle` and a mount under `"events" to handle` that both reach one
+  `contextEvents` subscription are two unrelated groups, so the first to leave releases the
+  subscription the other still collects (defect 4). `rememberScpHotStream`'s `key` parameter
+  therefore states that every mount of one subscription passes an equal key, and its samples
+  name a subscription by stream and handle: `"events" to handle` for `contextEvents(handle)` and
+  `"messages" to handle` for `incomingMessages(handle)`.
 - **Change a mount's coordinator only together with its registry.** Two coordinators cannot
   order each other's lambdas. When two coordinators reach one `HotStreamFactory`, the old
   coordinator's stop releases the one subscription that factory keeps under a context handle
@@ -151,3 +159,5 @@ show one context handle during a transition each count only their own mounts.
   proof that nothing is live.
 - Keeping cross-mount coordination state in `remember(key)`. Compose forgets it at exactly one
   moment when two mounts need it.
+- Passing two different keys for one subscription from two screens, such as `handle` in one and
+  `"events" to handle` in another. The coordinator then counts each screen alone.

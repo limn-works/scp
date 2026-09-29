@@ -310,8 +310,17 @@ private fun <R> rememberCollectedState(
  * key leaves. Two mounts that share a key but hold different subscriptions — a `contextEvents`
  * stream and an `incomingMessages` stream keyed by one context handle — each still have their
  * `onStop` run, but the first one's runs only when the second one leaves. A key that names one
- * subscription, such as `"events" to handle`, releases each subscription as soon as its own
- * mounts leave. An `onStop` releases the subscription its mount's `start` returned and nothing
+ * subscription, such as `"events" to handle` for `contextEvents(handle)` and
+ * `"messages" to handle` for `incomingMessages(handle)`, releases each subscription as soon as
+ * its own mounts leave.
+ *
+ * Every mount that reaches one subscription MUST pass one same key. This class counts and
+ * orders mounts per key only, so two keys for one subscription are two unrelated groups: a mount
+ * under `handle` and a mount under `"events" to handle` that both reach one `contextEvents`
+ * subscription never see each other, and the first to leave releases the subscription the other
+ * still collects, which then receives nothing further and reports no error.
+ *
+ * An `onStop` releases the subscription its mount's `start` returned and nothing
  * else, and must be idempotent, because a mount whose `start` returned a different object for
  * one subscription still has its own `onStop` run; `HotStreamFactory`'s stop functions return
  * without effect on a handle they no longer hold.
@@ -591,9 +600,12 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * [onStop] that an earlier mount launched under that same key, and a mount that leaves while
  * another mount under that same key is still composed defers its [onStop] until the last mount
  * under that key leaves, because a registry such as `HotStreamFactory` hands both mounts one
- * subscription. A [key] should name one subscription: two streams under one key each have their
- * [onStop] run, but a stream whose mount leaves first stays open until the other one's mount
- * leaves too. A caller holds that coordinator outside composition, because Compose forgets
+ * subscription. Every mount that reaches one subscription MUST pass one same [key], because
+ * [coordinator] sees only mounts under the key a mount passed: under two keys, the first mount
+ * to leave releases the subscription the other still collects, and that one receives nothing
+ * further and reports no error. A [key] should also name one subscription: two streams under one
+ * key each have their [onStop] run, but a stream whose mount leaves first stays open until the
+ * other one's mount leaves too. A caller holds that coordinator outside composition, because Compose forgets
  * everything this function remembers when a mount ends. [ScpHotStreamCoordinator] states what a
  * per-composition coordinator would break.
  *
@@ -614,7 +626,7 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * @Composable
  * fun EventList(handle: Long, factory: HotStreamFactory, coordinator: ScpHotStreamCoordinator) {
  *     val eventsState = rememberScpHotStream(
- *         key = handle,
+ *         key = "events" to handle,
  *         coordinator = coordinator,
  *         start = { factory.contextEvents(handle) },
  *         onStop = { factory.stopContextEvents(handle) },
@@ -626,7 +638,10 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * }
  * ```
  *
- * @param key Recomposition key. The subscription restarts if this changes.
+ * @param key Recomposition key, compared with `equals`. The subscription restarts if this
+ *   changes. It names the one subscription [start] returns, such as `"events" to handle` for
+ *   `HotStreamFactory.contextEvents(handle)`, and every mount that reaches that subscription
+ *   MUST pass an equal key, because [coordinator] counts and orders mounts per key only.
  * @param coordinator Orders this mount's [start] after any [onStop] an earlier mount launched
  *   under [key]. A caller constructs it outside composition and shares one instance across every
  *   mount that reaches the registry [start] subscribes through, as [ScpHotStreamCoordinator]
