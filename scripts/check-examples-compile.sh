@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Two assertions about example targets:
 #
-#   1. Every example target in the workspace compiles, lint-clean.
+#   1. Every example target in the workspace compiles, lint-clean, and no cfg
+#      predicate other than a platform key removes source from that compile.
 #   2. Every published `examples/*.rs` file IS the source of an example target.
 #
 # Assertion 2 joins on PATH, never on target name. A `[[example]] path = …` key can
@@ -59,16 +60,27 @@
 # list carries `scp-node?/testing`. Measured: the workspace-wide form exits 0 on
 # the `DhtMode::Memory` defect; this loop exits 1.
 #
-# TWO RESIDUAL LIMITS, both structural, neither worth another mechanism:
-#   - A target whose body sits behind `#[cfg(...)]` is counted and compiles to
-#     nothing. `checked` counts targets, not lines, so coverage is an upper bound.
-#   - Beyond the dev-dependency closure stated above (lesson row 4b), every remaining
-#     bypass edits the crate's BUILD CONFIGURATION: its `build.rs`, a manifest key, or
-#     `.cargo/config.toml` rustflags. That is the criterion. It is
-#     not "write access to the crate": every defect this gate catches, including the
-#     `DhtMode::Memory` edit above, is written by someone with that access, so write
-#     access separates nothing. A source edit to an example or to the lib is this
-#     gate's subject and never an exemption. `build.rs` is an instance of the
+# WHY ASSERTION 1 READS CFG PREDICATES. A target whose body sits behind
+# `#[cfg(feature = "testing")] fn main() { ... }`, next to an empty
+# `#[cfg(not(feature = "testing"))] fn main() {}`, compiles to nothing on the feature set
+# the loop builds, and a compile alone counts it as checked. So every `cfg(`, `cfg_attr(`
+# and `cfg!(` predicate in a target's source file, and in every `.rs` file under the
+# package's `examples/`, published or not, may name only a platform key (`unix`,
+# `windows`, `target_*`) under `not`, `any` or `all`, and no empty `any()` or `all()`.
+# Cases `cfgbody`, `cfghelper` and `platformcfg` pin this.
+#
+# TWO RESIDUAL LIMITS:
+#   - Code rustc discards before type-checking by another route: a platform predicate
+#     false on the CI host (`cfg(windows)`, `all(unix, windows)`), a macro that drops its
+#     input tokens, or a `#[path]` module outside `examples/`. Lesson row 9b; no human has
+#     ruled it acceptable.
+#   - Beyond the dev-dependency closure stated above (lesson row 4b) and the discard
+#     routes just named (lesson row 9b), every remaining bypass edits the crate's BUILD
+#     CONFIGURATION: its `build.rs`, a manifest key, or `.cargo/config.toml` rustflags.
+#     That is the criterion. It is not "write access to the crate": every defect
+#     this gate catches, including the `DhtMode::Memory` edit above, is written by
+#     someone with that access, so write access separates nothing. A source edit to an
+#     example or to the lib is this gate's subject and never an exemption. `build.rs` is an instance of the
 #     criterion that needs no manifest key, and one hypothesis stays unmeasured: that a build
 #     script printing `cargo::rustc-cfg=feature="testing"` makes `DhtMode::Memory`
 #     exist for every target of the package. Two attempts to reproduce it made the
@@ -84,6 +96,39 @@ cd "$(dirname "$0")/.."
 
 status=0
 checked=0
+
+# cfg_scan FILE LABEL: fail when FILE holds a cfg predicate naming anything but a
+# platform key. String literals and comments are blanked first, so neither hides one
+# from the scan nor fakes one into it.
+IFS= read -r -d '' CFG_SCAN <<'PL' || true
+local $/; $_ = <STDIN>;
+s{(r(\#*)".*?"\2|b?"(?:[^"\\]|\\.)*"|b?'(?:[^'\\]|\\.)')|//[^\n]*|/\*.*?\*/}{defined $1 ? '""' : ' '}gse;
+my %ok = map { $_ => 1 } qw(not any all unix windows target_os target_family target_arch
+  target_pointer_width target_endian target_env target_vendor);
+while (/\bcfg(_attr)?\s*!?\s*\(/g) {
+  my ($attr, $d, $p, $i) = ($1, 1, '', pos);
+  for (; $i < length && $d; $i++) {
+    my $c = substr($_, $i, 1);
+    $d++ if $c eq '('; $d-- if $c eq ')';
+    last if $attr && $d == 1 && $c eq ',';
+    $p .= $c if $d;
+  }
+  my $bad = grep { !$ok{$_} } $p =~ /\b([A-Za-z_]\w*)\b/g;
+  $bad++ if $p =~ /\b(?:any|all)\s*\(\s*\)/;
+  (my $s = $p) =~ s/\s+/ /g;
+  print "cfg($s)\n" if $bad;
+}
+PL
+cfg_scan() {
+  local hits
+  if ! hits="$(perl -e "$CFG_SCAN" <"$1")"; then
+    echo "FAIL: could not scan $2 for cfg predicates." >&2; status=1; return
+  fi
+  [ -n "$hits" ] || return 0
+  echo "FAIL: $2 gates code on a non-platform cfg predicate, which removes it from this compile:" >&2
+  printf '      %s\n' "$hits" >&2
+  status=1
+}
 
 META="$(cargo metadata --no-deps --format-version 1)"
 
@@ -137,11 +182,20 @@ $(printf '%s\n' "$RAW" | grep -E '^examples/([^/]+\.rs|[^/]+/main\.rs)$' || true
 EOF
   fi
 
+  # Every .rs file on disk under examples/, published or not, helper modules included.
+  if [ -d "$pkgdir/examples" ]; then
+    while IFS= read -r file; do
+      cfg_scan "$file" "$pkg '${file#"$pkgdir"/}'"
+    done < <(find "$pkgdir/examples" -type f -name '*.rs' | sort)
+  fi
+
   [ -n "$TGT_TSV" ] || continue
   while IFS=$'\t' read -r name src; do
     [ -n "$name" ] || continue
     checked=$((checked + 1))
     echo "── $pkg::$name  ($src)"
+    case "$src" in /*) srcfile="$src" ;; *) srcfile="$pkgdir/$src" ;; esac
+    cfg_scan "$srcfile" "$pkg example '$name'"
     if ! cargo clippy -p "$pkg" --example "$name" -- -D warnings </dev/null; then
       echo "FAIL: $pkg example '$name' does not compile." >&2
       status=1

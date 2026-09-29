@@ -2,7 +2,8 @@
 # Cases for scripts/check-examples-compile.sh.
 #
 # THE CRITERION: the gate exits 1 when an example target fails to compile or lint, when a
-# published `examples/*.rs` is no example target's source, when `cargo package --list`
+# cfg predicate other than a platform key sits in an example target's source or in a `.rs`
+# file under `examples/`, when a published `examples/*.rs` is no example target's source, when `cargo package --list`
 # fails, or when it checked no example target; and it exits 0 on a workspace with none of
 # those. Each case builds a workspace in `mktemp -d` (one crate, or two where a case needs a
 # dev-dependency edge between members or a defect in the second package), copies the real
@@ -20,6 +21,10 @@
 # on `excluded`, which expects exit 0. An unquoted `for` loop splits `spaced` at its space and
 # makes the gate exit 1 on `spaced`, which expects exit 0. Ending the package loop after its
 # first package makes the gate exit 0 on `secondbroken` and `secondorphan`, which expect exit 1.
+# Dropping the cfg scan makes the gate exit 0 on `cfgbody` and `cfghelper`, which expect exit
+# 1: `cfgbody` compiles because its feature-gated `main` vanishes. Scanning string literals or
+# comments, or rejecting a platform key, makes the gate exit 1 on `platformcfg`, which
+# expects exit 0.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -141,6 +146,41 @@ ws="$(new_ws secondorphan)"
 add_member "$ws" zeta $'autoexamples = false\n[[example]]\nname = "ex"\npath = "examples/ex.rs"'
 echo 'fn main() {}' > "$ws/zeta/examples/orphan.rs"
 expect "second package publishes an orphan" "$ws" 1 "FAIL: zeta publishes 'examples/orphan.rs'"
+
+# The dodge the cfg scan exists for: the body that names a `testing`-only item compiles only
+# with the feature on, and an empty `main` stands in on default features, so the compile
+# alone exits 0.
+ws="$(new_ws cfgbody $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg(\n    feature = "testing"\n)]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n' > "$ws/demo/examples/good.rs"
+expect "example body behind a feature cfg" "$ws" 1 "FAIL: demo example 'good' gates code on a non-platform cfg predicate"
+
+ws="$(new_ws cfghelper)"
+mkdir -p "$ws/demo/examples/support"
+printf '#[cfg_attr(test, allow(dead_code))]\npub fn h() {}\n' > "$ws/demo/examples/support/mod.rs"
+expect "helper module under examples/ with a cfg_attr predicate" "$ws" 1 "FAIL: demo 'examples/support/mod.rs' gates code on a non-platform cfg predicate"
+
+ws="$(new_ws platformcfg)"
+cat > "$ws/demo/examples/good.rs" <<'RS'
+// #[cfg(feature = "testing")] in a comment is not a predicate.
+/* nor cfg(test) in a block comment */
+fn main() {
+    let s = "#[cfg(feature = \"testing\")]";
+    let c = '"';
+    #[cfg(unix)]
+    {
+        let _ = (s, c);
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = (s, c);
+    }
+    let _ = cfg!(all(target_family = "unix", target_pointer_width = "64"));
+    #[cfg(windows)]
+    let _ = (s, c);
+}
+RS
+expect "platform predicates, and cfg text in strings and comments" "$ws" 0 "OK: 1 example target(s) compile"
 
 echo "$PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ]

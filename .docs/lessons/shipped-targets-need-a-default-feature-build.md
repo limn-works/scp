@@ -11,7 +11,7 @@ A build target that ships to a user MUST be compiled by a job that gates the pul
 request. `cargo package --list -p scp-node` lists `examples/website.rs`, so a broken
 example ships to crates.io.
 
-`scripts/check-examples-compile.sh` carries six mechanisms, and deleting any one
+`scripts/check-examples-compile.sh` carries seven mechanisms, and deleting any one
 of them reopens a bypass this repository has already measured:
 
 1. **Lint one package at a time.** `cargo clippy --workspace --examples` unifies
@@ -38,9 +38,17 @@ of them reopens a bypass this repository has already measured:
    off and exits 0 (row 3); named with `--example NAME`, the same target makes cargo
    fail. Collapsing the loop to one `--examples` call per package keeps mechanisms 1
    to 5 and reopens row 3.
+7. **Reject every cfg predicate but a platform key in example source.** A body under
+   `#[cfg(feature = "testing")] fn main()`, beside an empty
+   `#[cfg(not(feature = "testing"))] fn main() {}`, compiles to nothing on the feature set
+   the lint call builds, and the target still counts as checked (row 9a). The script
+   reads every `cfg(`, `cfg_attr(` and `cfg!(` predicate in each target's source and in
+   every `.rs` file under the package's `examples/`, after blanking string literals and
+   comments, and fails on any name other than `not`, `any`, `all`, `unix`, `windows`
+   and the `target_*` keys, or on an empty `any()` or `all()`.
 
 Row 8 is answered by none of them, and deliberately so. Beyond the dev-dependency closure
-(row 4b), the criterion for what this gate cannot defend against is **an edit to the crate's
+(row 4b) and the discard routes of row 9b, the criterion for what this gate cannot defend against is **an edit to the crate's
 build configuration**: its `build.rs`, a manifest key, or `.cargo/config.toml` rustflags. It
 is not "write access to the crate under test". Every defect the gate catches, the
 `DhtMode::Memory` edit to `examples/website.rs` included, is written by someone with that
@@ -51,19 +59,26 @@ never an exemption. "Edits the manifest" is too narrow in the other direction, b
 contract, which is the failure `.docs/standards/concrete-prose.md`
 §Contracts and indicators names after Caulfield.
 
-## Eight rounds, ten measured bypasses, and which ones the gate closes
+## Nine rounds, eleven measured bypasses, and which ones the gate closes
 
-The table below has thirteen rows. Three are not measured bypasses: row 2 records an
+The table below has fifteen rows. Four are not measured bypasses: row 2 records an
 overclaim, row 4c records a premise this branch measured and found false (the section on
-`required-features` below), and row 8 is a hypothesis two reproduction attempts failed to
-demonstrate. The remaining ten are measured bypasses, found across six of the eight
-rounds — rounds 1, 3, 4, 5, 6, and 7. They do not share one root, and no single change
-closed them.
+`required-features` below), row 8 is a hypothesis two reproduction attempts failed to
+demonstrate, and row 9b names discard routes no round has run. The remaining eleven are
+measured bypasses, found across seven of the nine rounds — rounds 1, 3, 4, 5, 6, 7, and 9.
+They do not share one root, and no single change closed them.
 
-Nine of the ten are closed: rows 1, 3, 4a, 5, 6a, 6b, 7a, and 7b by the six mechanisms
-listed above, and row 6c by reading with `while IFS= read -r` instead of word-splitting.
+Ten of the eleven are closed: rows 1, 3, 4a, 5, 6a, 6b, 7a, 7b, and 9a by the seven
+mechanisms listed above, and row 6c by reading with `while IFS= read -r` instead of
+word-splitting. Row 9a was measured with mechanism 7 removed: the gate compiled the
+feature-gated fixture of case `cfgbody` and exited 0.
 
-Row 4b (any nullifier other than `DhtMode::Memory`) is the one open bypass. No cargo
+Row 9b is open, and no human has ruled it acceptable. Mechanism 7 reads cfg predicates
+only; rustc also discards code before type-checking when a platform predicate is false on
+the CI host (`cfg(windows)`, or `all(unix, windows)`), when a macro drops its input tokens,
+or when a `#[path]` module outside `examples/` carries the gated code. Review covers these.
+
+Row 4b (any nullifier other than `DhtMode::Memory`) is the one open measured bypass. No cargo
 invocation inside the workspace closes it, because cargo gives an example its crate's
 dev-dependencies. A build from outside the workspace does close it: the probe crate
 described below depends on the crate by path, cargo resolves none of a dependency's
@@ -102,6 +117,8 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 7a | `examples/website/main.rs` directory layout | cargo auto-discovers it and publishes it; the enumerating regex matched only the flat form |
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
 | 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
+| 9a | example body under `#[cfg(feature = "testing")] fn main()` beside an empty `#[cfg(not(feature = "testing"))] fn main() {}` | the compile saw only the empty `main` and counted the target as checked |
+| 9b | platform predicate false on the CI host, token-dropping macro, `#[path]` module outside `examples/` | open, unmeasured: rustc discards the code before type-checking, and mechanism 7 reads only cfg predicates in example files |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both
 `examples/NAME.rs` and `examples/NAME/main.rs`; the check's regex encoded only the
