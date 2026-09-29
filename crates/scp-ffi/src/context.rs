@@ -136,13 +136,16 @@ impl PyContextHandle {
     ///
     /// This is a **best-effort, cached** snapshot taken at the last observed
     /// transition — it is intentionally NOT a live supervisor read (that would
-    /// add a mailbox round-trip to every call). Per ADR-049 §10, the next
-    /// per-context operation reads the supervisor and refuses a context whose
-    /// actor the watchdog poisoned or found crashed; polling this getter may
-    /// still report the last-known non-terminal state. Join, leave, send, and
-    /// receive refuse a poisoned context with the operation's own code
-    /// (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`), not
-    /// `SCP-CTX-2134`, and surface a crashed or mid-respawn actor as
+    /// add a mailbox round-trip to every call). Per ADR-049 §10, join, leave,
+    /// send, receive, and every operation the supervisor answers read the
+    /// supervisor and refuse a context whose actor the watchdog poisoned or
+    /// found crashed; polling this getter may still report the last-known
+    /// non-terminal state. An operation the bridge serves from its own state
+    /// (UCAN mint, delegate and validate; outlet and MCP capability checks)
+    /// does not read the supervisor and does not refuse such a context. Join,
+    /// leave, send, and receive refuse a poisoned context with the operation's
+    /// own code (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`,
+    /// `SCP-CTX-2021`), not `SCP-CTX-2134`, and surface a crashed or mid-respawn actor as
     /// `SCP-CTX-2135` `ActorCrashed`. An operation the supervisor answers
     /// without a bridge lifecycle gate returns `SCP-CTX-2134`
     /// `ContextPoisoned`. Operator recovery from a poisoned context is
@@ -2947,8 +2950,8 @@ impl crate::scp::PyScp {
         // The Occupied dedup is keyed on `context_id`,
         // so the "detect a duplicate BEFORE consuming the single-use KeyPackage"
         // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-        // ceiling is re-synced from the joined handle's signed params AFTER a
-        // successful spawn (see `sync_ceiling_from_params` below).
+        // role state, ceiling included, is re-synced from the supervisor AFTER a
+        // successful spawn (see `sync_role_state_from_manager` below).
         //
         // Ordering matters for two reasons:
         //   1. `register_ffi_state` hard-errors on an already-registered context
@@ -3001,30 +3004,30 @@ impl crate::scp::PyScp {
                 }
             };
 
-        // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-        // signed params into both ceiling copies, overwriting the empty ceiling
-        // used for the reversible precheck. The authoritative ceiling lives in the bundle the creator
-        // signed — never in caller input. This runs AFTER the irreversible
-        // commit; the FFI state was just registered (and not removed on this
-        // success path), so the sync targets a live entry.
+        // FLAG-1: replace the bridge role state with the one the supervisor
+        // built from the joined handle's AUTHENTICATED params, and rewrite the
+        // UCAN/outlet ceiling copy from it. The precheck state above was built
+        // from an empty ceiling, so its ceiling, its built-in role definitions
+        // and the creator's admin grant all grant nothing; replacing only the
+        // ceiling would leave every role-derived check (outlet registration,
+        // outlet invocation, MCP) reading those empty roles. The authoritative
+        // ceiling lives in the bundle the creator signed, never in caller
+        // input. This runs AFTER the irreversible commit; the FFI state was
+        // just registered (and not removed on this success path), so the sync
+        // targets a live entry.
         //
         // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails
         // ONLY if a concurrent close/leave removed the just-registered FFI state
-        // in the window since the spawn returned. A close/leave does NOT despawn
-        // the runtime actor, so returning `Err` here without tearing the actor
-        // down would strand a live, orphaned actor for a join that never fully
-        // materialized at the bridge. Compensate with the COMPLETE teardown
-        // (`discard_joined_context`): it removes the actor handle AND destroys
-        // the resident MLS group AND deletes the durable Class-S snapshot the
-        // join persisted — a bare `despawn_actor` would leave the crypto group
-        // and snapshot behind, resurrecting the context on restart and blocking
-        // a fresh re-join. Then purge residual bridge state and surface the
-        // error.
-        if let Err(e) = crate::runtime::sync_ceiling_from_params(
-            bi,
-            &sealed.context_id,
-            &joined.params().ceiling,
-        ) {
+        // or the actor in the window since the spawn returned. Returning `Err`
+        // here without tearing the actor down would strand a live, orphaned
+        // actor for a join that never fully materialized at the bridge.
+        // Compensate with the COMPLETE teardown (`discard_joined_context`): it
+        // removes the actor handle AND destroys the resident MLS group AND
+        // deletes the durable Class-S snapshot the join persisted — a bare
+        // `despawn_actor` would leave the crypto group and snapshot behind,
+        // resurrecting the context on restart and blocking a fresh re-join.
+        // Then purge residual bridge state and surface the error.
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &sealed.context_id) {
             rt.block_on(sup.discard_joined_context(&sealed.context_id));
             crate::runtime::remove_context(bi, &sealed.context_id);
             return Err(PyRuntimeError::new_err(e.to_string()));
@@ -6325,9 +6328,10 @@ mod tests {
     /// `ContextMode` (the same axis `context_join` branches on at the mode
     /// gate). Used by the encrypted-join hard-fail coverage below.
     ///
-    /// It also creates the context in the supervisor, because `context_join`
-    /// gates on the state that context's supervisor actor reports and a handle
-    /// no actor backs never reaches the mode gate.
+    /// It also creates the context in the supervisor with the same parsed
+    /// params, mode included, because `context_join` gates on the state that
+    /// context's supervisor actor reports and a handle no actor backs never
+    /// reaches the mode gate.
     fn active_handle_for_mode(
         bi: &crate::runtime::PyBridgeInstance,
         creator_did: &str,
@@ -6336,15 +6340,21 @@ mod tests {
         let params = Python::with_gil(|py| {
             let dict = PyDict::new(py);
             dict.set_item("mode", mode).unwrap();
+            // A broadcast context supports only the `full` memory scope, so the
+            // supervisor refuses to create one with the `ephemeral` default.
+            if mode == "broadcast" {
+                dict.set_item("memory_scope", "full").unwrap();
+            }
             PyContextParams::from_py_dict(&dict).unwrap()
         });
         let context_id = "0".repeat(64);
         crate::runtime::init_context_manager_for_test(bi);
-        crate::runtime::create_supervisor_context_for_test(
+        let core_params = super::build_core_context_params(&params).unwrap();
+        crate::runtime::create_supervisor_context_with_params_for_test(
             bi,
             &context_id,
             creator_did,
-            &super::default_ceiling_strings(),
+            core_params,
         );
         let handle = PyContextHandle::new(bi, context_id, creator_did.to_owned(), params);
         *handle.state.lock().unwrap() = "active".to_owned();
@@ -6393,10 +6403,12 @@ mod tests {
     /// Drives the REAL `context_join` entry point with the same unregistered
     /// joiner DID as the encrypted test. Broadcast contexts carry no per-member
     /// pseudonym, so the mode gate selects `None` and never calls
-    /// `derive_member_pseudonym`. The join proceeds past the derivation seam and
-    /// fails later for an UNRELATED reason (the standalone handle has no created
-    /// context in the supervisor) — the point is that the failure is NOT the
-    /// `SCP-IDENT-1054` derivation hard-fail.
+    /// `derive_member_pseudonym`. The fixture creates a broadcast context in the
+    /// supervisor, so the join passes the lifecycle gate and reaches the mode
+    /// gate; whatever the join returns after that, it is NOT the
+    /// `SCP-IDENT-1054` derivation hard-fail, and NOT a lifecycle-gate refusal
+    /// (`SCP-CTX-2013` or a missing supervisor context), which would mean the
+    /// mode gate never ran.
     ///
     /// Not false-green: this is the inverse half of the gate pin. If the
     /// production mode gate were inverted (broadcast → derive), this broadcast
@@ -6412,11 +6424,15 @@ mod tests {
         };
         let handle =
             active_handle_for_mode(&bi_arc, "did:dht:z6MkBroadcastJoinCreator", "broadcast");
-        // The join is expected to fail downstream (no created context backs the
-        // standalone handle), but it MUST NOT fail at the derivation seam.
+        // The join MUST get past the lifecycle gate and MUST NOT fail at the
+        // derivation seam.
         let result = scp.context_join(&handle, "did:dht:z6MkNoSuchJoinerIdentity", None);
         if let Err(err) = result {
             let msg = err.to_string();
+            assert!(
+                !msg.contains("SCP-CTX-2013") && !msg.contains("has no live supervisor state"),
+                "broadcast join must pass the lifecycle gate to reach the mode gate: {msg}"
+            );
             assert!(
                 !msg.contains("SCP-IDENT-1054")
                     && !msg.contains("SCP-IDENT-1055")

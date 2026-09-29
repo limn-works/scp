@@ -1566,7 +1566,8 @@ pub fn register_ffi_state(
             // ceiling and the supervisor holds it empty. Substituting the
             // default here would grant eleven capabilities in that context.
             // `context_join_from_welcome` registers `&[]` before the join and
-            // `sync_ceiling_from_params` then writes the authenticated ceiling.
+            // `sync_role_state_from_manager` then writes the authenticated role
+            // state and ceiling.
             //
             // Ceiling-entry grammar enforcement (spec §5.3.1.1) runs on each
             // entry BEFORE it is normalized into the UCAN ceiling string set.
@@ -1861,12 +1862,21 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
     bi.core.remove_economy_state(context_id);
 }
 
-/// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
-/// `ContextManager`.
+/// Re-syncs a context's bridge role state and ceiling copy from the Supervisor.
+///
+/// It replaces `FfiBridgeState.role_state` with the Supervisor's and rewrites
+/// the UCAN/outlet ceiling string set from that role state's ceiling, so the
+/// two copies cannot disagree.
 ///
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
 /// FFI-side copy used by UCAN/outlet capability checks stays current.
+/// `context_join_from_welcome` also calls it after a successful spawn: the
+/// joiner registers its FFI state with an empty, deny-all ceiling as a
+/// reversible precheck, and this replaces the whole role state (ceiling, role
+/// definitions, the creator's admin grant, the joiner's member assignment) with
+/// the one the supervisor built from the ceiling AUTHENTICATED by the joined
+/// MLS group's signed context binding.
 ///
 /// # Errors
 ///
@@ -1882,11 +1892,7 @@ pub fn sync_role_state_from_manager(
     let new_role_state = rt.block_on(sup.get_role_state(context_id)).ok_or_else(|| {
         ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
     })?;
-
-    with_ffi_state(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
+    install_role_state(bi, context_id, new_role_state)
 }
 
 /// Async-native variant of [`sync_role_state_from_manager`].
@@ -1911,44 +1917,21 @@ pub async fn sync_role_state_from_manager_async(
     let new_role_state = sup.get_role_state(context_id).await.ok_or_else(|| {
         ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
     })?;
-
-    with_ffi_state(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
+    install_role_state(bi, context_id, new_role_state)
 }
 
-/// Re-syncs both ceiling copies in a context's `FfiBridgeState` from the
-/// AUTHENTICATED context params carried by a joined
-/// [`ContextHandle`](scp_core::context::ContextHandle).
-///
-/// Peer of [`sync_role_state_from_manager`] (which syncs the whole role state);
-/// this writes the UCAN/outlet capability-check ceiling string set and the role
-/// state's ceiling. Used by `context_join_from_welcome`: the joiner no longer
-/// supplies a ceiling, so the FFI state is registered with an empty, deny-all
-/// ceiling as a reversible precheck, then this overwrites both copies with the
-/// ceiling AUTHENTICATED by the joined MLS group's signed context binding. The
-/// string set holds the entries' enforced UCAN capability-name form
-/// (`{resource}:{action}`), the same set [`register_ffi_state`] builds on the
-/// create path.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the context's FFI state is not
-/// registered (unreachable on the join success path — the state was just
-/// registered and not removed), or if an entry fails the ceiling-entry grammar
-/// (spec §5.3.1.1).
-pub fn sync_ceiling_from_params(
+/// Writes `role_state` and the ceiling string set derived from its ceiling into
+/// the context's `FfiBridgeState`, in the enforced UCAN capability-name form
+/// (`{resource}:{action}`) that [`register_ffi_state`] builds on the create
+/// path.
+fn install_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
-    ceiling: &[scp_core::context::roles::Capability],
+    role_state: ContextRoleState,
 ) -> Result<(), ScpPyError> {
-    let ceiling = CapabilityCeiling::new(ceiling.iter().cloned());
-    let ceiling_strings = ceiling.to_ucan_string_set();
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
     with_ffi_state(bi, context_id, |st| {
-        st.role_state
-            .set_ceiling(ceiling)
-            .map_err(|e| ScpPyError::context(e.to_string()))?;
+        st.role_state = role_state;
         st.ceiling_strings = ceiling_strings;
         Ok(())
     })
@@ -1975,7 +1958,7 @@ pub fn sync_ceiling_from_params(
 /// tokio runtime is unavailable, or when `create_context` rejects the request —
 /// each one is a broken test fixture rather than a condition under test.
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)] // A broken test fixture panics; production paths keep the deny.
+#[allow(clippy::panic)] // A broken test fixture panics; production paths keep the deny.
 pub(crate) fn create_supervisor_context_for_test(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1993,6 +1976,25 @@ pub(crate) fn create_supervisor_context_for_test(
         ceiling: capabilities,
         ..scp_core::context::ContextParams::default()
     };
+    create_supervisor_context_with_params_for_test(bi, context_id, creator_did, params);
+}
+
+/// Test-only: [`create_supervisor_context_for_test`] with the caller's whole
+/// `params`, for a test whose context must carry a mode or other parameter the
+/// default leaves out.
+///
+/// # Panics
+///
+/// Panics when the tokio runtime is unavailable or `create_context` rejects
+/// the request, each a broken test fixture.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) fn create_supervisor_context_with_params_for_test(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    params: scp_core::context::ContextParams,
+) {
     let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
     let rt = super::runtime().expect("tokio runtime must be initialized");
     rt.block_on(sup.create_context(
@@ -3025,40 +3027,101 @@ mod tests {
         remove_context(bi, &ctx_id);
     }
 
-    /// `sync_ceiling_from_params` replaces both ceiling copies a Welcome join
-    /// registered empty, so the UCAN copy and the role state agree on the
-    /// authenticated ceiling.
+    /// `sync_role_state_from_manager` replaces the whole role state a Welcome
+    /// join registered from an empty ceiling: the ceiling, the UCAN ceiling
+    /// copy, the admin role definition and the creator's admin grant all come
+    /// from the supervisor afterwards, so a role-derived check such as outlet
+    /// registration admits the creator.
     #[test]
-    fn sync_ceiling_from_params_writes_both_copies() {
+    fn sync_role_state_from_manager_replaces_roles_built_from_an_empty_ceiling() {
         use scp_core::context::roles::Capability;
+        crate::init_runtime().ok();
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
-        let ctx_id = unique_ctx_id("ceiling-sync");
-        register_context(bi, &ctx_id, "did:dht:z6MkCeilingSync", &[]).unwrap();
-
-        sync_ceiling_from_params(
-            bi,
-            &ctx_id,
-            &[Capability::MessagesRead, Capability::OutletCallAll],
-        )
-        .unwrap();
-
-        let (strings, role_ceiling) = with_ffi_state(bi, &ctx_id, |st| {
-            Ok((st.ceiling_strings.clone(), st.role_state.ceiling().clone()))
+        let ctx_id = format!("51c0{}", "0".repeat(60));
+        let creator = "did:dht:z6MkRoleSync";
+        let ceiling = ["messages:read".to_owned(), "outlet:register".to_owned()];
+        create_supervisor_context_for_test(bi, &ctx_id, creator, &ceiling);
+        register_ffi_state(bi, &ctx_id, creator, &[]).unwrap();
+        let before = with_ffi_state(bi, &ctx_id, |st| {
+            Ok(st
+                .role_state
+                .member_has_capability(creator, &Capability::OutletRegister))
         })
         .unwrap();
-        assert_eq!(
-            strings,
-            ["messages:read", "outlet_call:*"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<HashSet<_>>()
+        assert!(
+            !before,
+            "the empty-ceiling precheck grants the creator nothing"
+        );
+
+        sync_role_state_from_manager(bi, &ctx_id).unwrap();
+
+        let (strings, role_ceiling, admin_caps, creator_caps, can_register) =
+            with_ffi_state(bi, &ctx_id, |st| {
+                Ok((
+                    st.ceiling_strings.clone(),
+                    st.role_state.ceiling().clone(),
+                    st.role_state
+                        .role_definitions
+                        .get("admin")
+                        .map(|r| r.capabilities.clone()),
+                    st.role_state.member_capabilities.get(creator).cloned(),
+                    st.role_state
+                        .member_has_capability(creator, &Capability::OutletRegister),
+                ))
+            })
+            .unwrap();
+        let authenticated =
+            CapabilityCeiling::new([Capability::MessagesRead, Capability::OutletRegister]);
+        assert_eq!(role_ceiling, authenticated);
+        assert_eq!(strings, authenticated.to_ucan_string_set());
+        let admin_caps = admin_caps.expect("the synced state carries the admin role");
+        assert!(
+            admin_caps.contains(&Capability::OutletRegister),
+            "admin: {admin_caps:?}"
         );
         assert_eq!(
-            role_ceiling,
-            CapabilityCeiling::new([Capability::MessagesRead, Capability::OutletCallAll])
+            creator_caps.as_ref(),
+            Some(&admin_caps),
+            "the creator holds the admin grant"
         );
+        assert!(
+            can_register,
+            "the creator's outlet:register grant must survive the sync"
+        );
+
+        remove_context(bi, &ctx_id);
+    }
+
+    /// A context the supervisor does not serve fails the sync and leaves the
+    /// empty, deny-all bridge state as registered.
+    #[test]
+    fn sync_role_state_from_manager_fails_closed_without_a_supervisor_context() {
+        crate::init_runtime().ok();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
+        init_context_manager_for_test(bi);
+        let ctx_id = unique_ctx_id("role-sync-absent");
+        register_context(bi, &ctx_id, "did:dht:z6MkRoleSyncAbsent", &[]).unwrap();
+
+        let err = sync_role_state_from_manager(bi, &ctx_id).unwrap_err();
+        assert!(
+            err.to_string().contains("not found in supervisor"),
+            "got: {err}"
+        );
+        let (strings, role_ceiling_len) = with_ffi_state(bi, &ctx_id, |st| {
+            Ok((
+                st.ceiling_strings.clone(),
+                st.role_state.ceiling().iter().count(),
+            ))
+        })
+        .unwrap();
+        assert!(
+            strings.is_empty(),
+            "the UCAN copy stays empty, got: {strings:?}"
+        );
+        assert_eq!(role_ceiling_len, 0, "the role-state ceiling stays empty");
 
         remove_context(bi, &ctx_id);
     }
