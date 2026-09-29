@@ -5,6 +5,7 @@ package works.limn.scp.android.compose
 
 import android.util.Log
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -17,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
@@ -26,6 +28,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -34,6 +37,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowLog
+import works.limn.scp.stream.EventContextBindings
+import java.lang.reflect.Proxy
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -993,6 +998,113 @@ class ScpHotStreamRemountTest {
         assertEquals(null, checkNotNull(flowState).value)
     }
 
+    /**
+     * A coordinator scope cancelled while a stop's first `onStop` runs under [NonCancellable]
+     * skips nothing when every `onStop` still returns, as `HotStreamFactory`'s stop functions
+     * do. The stop then logs no warning, and the Job that [ScpHotStreamCoordinator.unmount]
+     * returned for each departure completes normally. A stop that judged a skip from its own
+     * Job's completion cause alone would log a leak and fail both Jobs, because cancelling a
+     * running coroutine completes its Job as cancelled even when its body returns.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a scope cancelled while a non-cancellable onStop runs reports every onStop as run`() {
+        ShadowLog.clear()
+        val scope = newCoordinatorScope()
+        val coordinator = ScpHotStreamCoordinator(scope)
+        val stops = AtomicInteger(0)
+        val entered = CountDownLatch(1)
+        val gate = CompletableDeferred<Unit>()
+        val staying = coordinator.startedMount("k")
+        val held =
+            checkNotNull(
+                coordinator.unmount(coordinator.startedMount("k")) {
+                    withContext(NonCancellable) {
+                        entered.countDown()
+                        gate.await()
+                        stops.incrementAndGet()
+                    }
+                },
+            )
+        val stop = checkNotNull(coordinator.unmount(staying) { stops.incrementAndGet() })
+        assertTrue("the held onStop never ran", entered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+
+        scope.cancel()
+        gate.complete(Unit)
+        runBlocking {
+            held.join()
+            stop.join()
+        }
+
+        assertEquals("an onStop was skipped", 2, stops.get())
+        assertEquals("a held departure's Job reported a skipped onStop", false, held.isCancelled)
+        assertEquals("the last departure's Job reported a skipped onStop", false, stop.isCancelled)
+        assertEquals(
+            "a stop that ran every onStop logged a leak",
+            0,
+            ShadowLog.getLogsForTag("ScpHotStreamCoordinator").size,
+        )
+    }
+
+    /**
+     * [rememberContextEvents] and [rememberIncomingMessages] key each stream by its kind and its
+     * context handle. Two mounts of one context's events share one Rust subscription, and the
+     * first to leave releases nothing. That context's message stream is released as soon as its
+     * own mount leaves, while its event stream stays open. A key that named the handle alone
+     * would hold the message stream open, and a key per mount would release the event stream
+     * the other mount still collects.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `ScpHotStreams releases each stream when the last mount of that stream leaves`() {
+        val bindings = CountingEventBindings()
+        val hotStreams = ScpHotStreams(bindings.proxy, newCoordinatorScope())
+        val shown = MutableStateFlow(listOf(StreamMount.EVENTS, StreamMount.EVENTS, StreamMount.MESSAGES))
+        val opened = AtomicInteger(0)
+
+        composeRule.setContent {
+            val mounts by shown.collectAsStateCompat()
+            mounts.forEachIndexed { index, mount ->
+                key(index) {
+                    val state =
+                        when (mount) {
+                            StreamMount.EVENTS -> rememberContextEvents(hotStreams, CONTEXT_HANDLE)
+                            StreamMount.MESSAGES -> rememberIncomingMessages(hotStreams, CONTEXT_HANDLE)
+                        }
+                    if (state.value != null) {
+                        DisposableEffect(Unit) {
+                            opened.incrementAndGet()
+                            onDispose {}
+                        }
+                    }
+                }
+            }
+        }
+
+        awaitCondition("a mount's stream never opened") {
+            composeRule.waitForIdle()
+            opened.get() == 3
+        }
+        assertEquals("two event mounts opened two Rust subscriptions", 1, bindings.eventSubscribes.get())
+        assertEquals(1, bindings.messageSubscribes.get())
+
+        shown.value = listOf(StreamMount.EVENTS, StreamMount.EVENTS)
+        composeRule.waitForIdle()
+        awaitCondition("the message mount's departure released nothing") { bindings.messageUnsubscribes.get() == 1 }
+
+        shown.value = listOf(StreamMount.EVENTS)
+        composeRule.waitForIdle()
+        Thread.sleep(UNORDERED_STOP_GRACE_MS)
+        assertEquals(
+            "an event mount's departure released a stream another mount collects",
+            0,
+            bindings.eventUnsubscribes.get(),
+        )
+
+        shown.value = emptyList()
+        composeRule.waitForIdle()
+        awaitCondition("the last event mount's departure released nothing") { bindings.eventUnsubscribes.get() == 1 }
+        assertEquals(1, bindings.eventSubscribes.get())
+        assertEquals(1, bindings.messageUnsubscribes.get())
+    }
 }
 
 /**
@@ -1033,6 +1145,44 @@ private class FakeSubscriptionRegistry {
     fun unsubscribeIds(): List<Int> = synchronized(lock) { unsubscribed.toList() }
 
     fun liveIds(): List<Int> = synchronized(lock) { listOfNotNull(live) }
+}
+
+/** Which [ScpHotStreams] stream one mount in the stream-keying test shows. */
+private enum class StreamMount {
+    EVENTS,
+    MESSAGES,
+}
+
+/**
+ * Event bindings that count subscribe and unsubscribe calls for each stream kind and reject
+ * every other call, so a [works.limn.scp.stream.HotStreamFactory] built over them reports
+ * which Rust subscriptions it opened and released.
+ */
+private class CountingEventBindings {
+    val eventSubscribes = AtomicInteger(0)
+    val eventUnsubscribes = AtomicInteger(0)
+    val messageSubscribes = AtomicInteger(0)
+    val messageUnsubscribes = AtomicInteger(0)
+
+    val proxy: EventContextBindings =
+        Proxy.newProxyInstance(
+            EventContextBindings::class.java.classLoader,
+            arrayOf(EventContextBindings::class.java),
+        ) { _, method, _ ->
+            when (method.name) {
+                "contextSubscribeEvents" -> eventSubscribes.incrementAndGet().toLong()
+                "contextSubscribe" -> messageSubscribes.incrementAndGet().toLong()
+                "contextUnsubscribeEvents" -> {
+                    eventUnsubscribes.incrementAndGet()
+                    null
+                }
+                "contextUnsubscribe" -> {
+                    messageUnsubscribes.incrementAndGet()
+                    null
+                }
+                else -> throw UnsupportedOperationException(method.name)
+            }
+        } as EventContextBindings
 }
 
 /**
@@ -1138,3 +1288,6 @@ private const val UNORDERED_STOP_GRACE_MS = 300L
 private const val WAIT_TIMEOUT_MS = 5_000L
 
 private const val HOT_FLOW_BUFFER = 16
+
+/** Context handle the stream-keying test mounts its streams under. */
+private const val CONTEXT_HANDLE = 7L

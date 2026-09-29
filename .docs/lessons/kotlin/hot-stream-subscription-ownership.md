@@ -8,10 +8,10 @@ subscription and records its handle in a `ConcurrentHashMap` keyed by context ha
 a caller's only route back to a live subscription: `stopContextEvents`, `stopMessageStream`, and
 `stopAll` read it to decide what to unsubscribe.
 
-`rememberScpHotStream`
+`rememberContextEvents` and `rememberIncomingMessages`
 (`bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/compose/StateHolders.kt`)
-starts one such subscription when a composable enters composition, and stops it when that
-composable leaves.
+start one such subscription when a composable enters composition, and stop it when that
+composable leaves, through the module-internal `rememberScpHotStream`.
 
 Four defects shared one root: no code tied a subscription's lifetime to whichever caller owned
 it, so a subscription could outlive every reference naming it, or a stop could release a
@@ -57,7 +57,8 @@ subscription that a different caller had just opened.
   later subscription carrying one same context handle.
 - **Hold cross-mount ownership state outside composition.** `ScpHotStreamCoordinator` holds a
   live-mount count, one `Mutex`, the `onStop` lambdas of mounts that left early, and one
-  most-recent stop `Job` per key. `rememberScpHotStream` takes a coordinator as a required
+  most-recent stop `Job` per key. `ScpHotStreams` constructs one coordinator together with the
+  `HotStreamFactory` it orders, and `rememberScpHotStream` takes that coordinator as a required
   parameter with no default. `mount` counts a mount when its effect applies and captures the
   pending stop; `unmount` holds a departing mount's `onStop` while another mount under that key
   is live, and when it removes the last live mount it launches one stop that runs every held
@@ -66,26 +67,28 @@ subscription that a different caller had just opened.
   the stop launched before it under that key before it takes that key's mutex, because a mount
   captures only the newest stop, and an older stop that reached its dispatcher last would
   otherwise release whatever that mount's start opened. For a departure it holds, `unmount`
-  returns a `Job` that the next launched stop completes.
-- **Reach one subscription under one key.** The coordinator counts and orders mounts per
-  caller-chosen key only, while `HotStreamFactory` keys a subscription by context handle alone.
-  A mount under `handle` and a mount under `"events" to handle` that both reach one
-  `contextEvents` subscription are two unrelated groups, so the first to leave releases the
-  subscription the other still collects (defect 4). `rememberScpHotStream`'s `key` parameter
-  therefore states that every mount of one subscription passes an equal key, and its samples
-  name a subscription by stream and handle: `"events" to handle` for `contextEvents(handle)` and
-  `"messages" to handle` for `incomingMessages(handle)`.
-- **Change a mount's coordinator only together with its registry.** Two coordinators cannot
-  order each other's lambdas. When two coordinators reach one `HotStreamFactory`, the old
+  returns a `Job` that the next launched stop completes, and the last departure gets that same
+  `Job`.
+- **Derive the key from the stream and the handle.** The coordinator counts and orders mounts
+  per key only, while `HotStreamFactory` keys a subscription by context handle alone. A mount
+  under `handle` and a mount under `"events" to handle` that both reach one `contextEvents`
+  subscription are two unrelated groups, so the first to leave releases the subscription the
+  other still collects (defect 4). A `key` parameter that only documented this rule compiled
+  every mismatched call. `rememberContextEvents` and `rememberIncomingMessages` therefore take a
+  context handle and build the key themselves, one per stream kind and handle, and
+  `rememberScpHotStream`, which accepts any key, is `internal`.
+- **Construct each coordinator with the one registry it orders.** Two coordinators cannot order
+  each other's lambdas. When two coordinators reach one `HotStreamFactory`, the first
   coordinator's stop releases the one subscription that factory keeps under a context handle
-  once the old coordinator's own last mount under that key leaves, and every mount collecting
-  that subscription through the new coordinator loses it (defect 4). An earlier shape made the
+  once that coordinator's own last mount under that key leaves, and every mount collecting that
+  subscription through the second coordinator loses it (defect 4). An earlier shape made a
   moving mount's start wait for the old coordinator's stop. That wait protected the moving mount
-  alone: a third mount already live on the new coordinator still lost its subscription, silently.
-  So `rememberScpHotStream` does no cross-coordinator waiting, and its `coordinator` parameter
-  states that a coordinator changes only together with the registry it orders, such as a new
-  factory with its own new coordinator. Each factory keeps its own Rust subscriptions, so the old
-  coordinator's stop and the new coordinator's start then touch different subscriptions.
+  alone: a third mount already live on the new coordinator still lost its subscription,
+  silently. A public coordinator constructed apart from its factory left that pairing to
+  documentation. `ScpHotStreams` now constructs its own `HotStreamFactory` over the event
+  bindings it receives, together with its own coordinator, and exposes neither, so no second
+  coordinator reaches that factory. A second `ScpHotStreams` opens its own Rust subscriptions,
+  which only its own stops release.
 - **Run one `onStop` per subscription a started mount opened.** `startMounted` and `unmount`
   race to claim a mount with one compare-and-set; when `unmount` wins, that mount's `start`
   never runs and its `onStop` is dropped, because it opened nothing. A held
@@ -104,9 +107,15 @@ subscription that a different caller had just opened.
   `incomingMessages` stream both keyed by one context handle.
 - **Refuse a start and report a skipped stop once the coordinator's scope is cancelled.** A stop
   launched on a cancelled scope never runs its body, so the coordinator logs every stop that
-  cancellation kept from running its `onStop` lambdas, completes a held departure's Job
+  cancellation kept from running its `onStop` lambdas, completes each departure's Job
   exceptionally instead of reporting that its `onStop` ran, and refuses every later `start` with
   `ScpHotStreamCoordinatorClosedException`, because no stop could release what it opened.
+- **Decide a skipped stop from the `onStop` calls that returned, not from the stop's `Job`.**
+  Cancelling a coroutine while its body runs completes its `Job` as cancelled even when the body
+  then returns normally. `HotStreamFactory`'s stop functions run under `NonCancellable`, so a
+  scope cancelled while they run still lets every `onStop` return. The stop sets a flag after its
+  last `onStop` returns, and logs a skip and fails the departures' `Job` only when that flag is
+  unset.
 
 ## Why a coordinator rather than a file-scope registry
 
@@ -114,17 +123,17 @@ subscription that a different caller had just opened.
 and `scripts/check-no-kotlin-mutable-globals.sh` states that this SDK holds no implicit
 per-process mutable state. An `object` singleton in `StateHolders.kt` would carry that state
 across mounts and would also carry it across every unrelated caller in one process, so a caller
-constructs a coordinator, owns its scope, and cancels it only once every mount that passed
-that coordinator has left composition.
+constructs an `ScpHotStreams`, owns its scope, and cancels it only once every mount that passed
+that `ScpHotStreams` has left composition.
 
 A default parameter that built a coordinator per composition would compile, read as convenient,
 and restore defect 3 exactly, because each mount would then coordinate against itself alone.
 
-A coordinator must have the same lifetime and sharing as the registry whose subscriptions it
-orders: one per `HotStreamFactory`, held by an application container, a dependency-graph
-singleton, or a ViewModel that every navigation destination reading that factory shares. A
-ViewModel scoped to one navigation destination restores defect 4, because two destinations that
-show one context handle during a transition each count only their own mounts.
+An application container, a dependency-graph singleton, or a ViewModel that every navigation
+destination shares holds one `ScpHotStreams`, so every screen showing one context's stream
+shares one Rust subscription. An `ScpHotStreams` held by a ViewModel scoped to one navigation
+destination stays correct, because its factory and its coordinator are its own, but it opens a
+second Rust subscription per stream beside any other instance's.
 
 ## How to detect a recurrence
 
@@ -149,7 +158,13 @@ show one context handle during a transition each count only their own mounts.
   hold one onStop per subscription` cancels each departing row's start while it is suspended and
   asserts the same bound, and `a cancelled coordinator scope logs its
   skipped onStop and refuses later starts` asserts the log line, the exceptional Job, and the
-  refused start.
+  refused start. `a scope cancelled while a non-cancellable onStop runs reports every onStop as
+  run` cancels the scope while a held `onStop` suspends under `NonCancellable`, and asserts that
+  both `onStop` calls ran, that neither departure's `Job` is cancelled, and that nothing is
+  logged. `ScpHotStreams releases each stream when the last mount of that stream leaves` mounts
+  two event streams and one message stream of one context over counting bindings, and asserts
+  one Rust subscription per stream, that the message stream is released when its own mount
+  leaves, and that the event stream is released only when its second mount leaves.
 
 ## Anti-patterns
 
@@ -159,5 +174,6 @@ show one context handle during a transition each count only their own mounts.
   proof that nothing is live.
 - Keeping cross-mount coordination state in `remember(key)`. Compose forgets it at exactly one
   moment when two mounts need it.
-- Passing two different keys for one subscription from two screens, such as `handle` in one and
-  `"events" to handle` in another. The coordinator then counts each screen alone.
+- Exposing a caller-chosen key or a coordinator constructed apart from its registry on a public
+  entry point. Two screens that pass `handle` and `"events" to handle` for one subscription,
+  or two coordinators over one factory, then count each screen alone, and both calls compile.
