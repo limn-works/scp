@@ -13,6 +13,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -334,9 +335,11 @@ private fun <R> rememberCollectedState(
  * subscription open, and the [Job] [unmount] returned for each departure that stop covers
  * completes exceptionally instead of reporting that its `onStop` ran. A cancellation that
  * arrives after every `onStop` returned skips nothing, so that stop logs nothing and completes
+ * that [Job] normally. A stop that held no `onStop` skipped none, so it logs nothing and completes
  * that [Job] normally. [startMounted] then refuses every
  * `start` with [ScpHotStreamCoordinatorClosedException], because no stop could release what that
- * `start` opened.
+ * `start` opened. [close] ends this coordinator the same way before [scope] is cancelled, and
+ * returns once every running `start` and every launched stop has finished.
  *
  * @param scope Scope that runs every `onStop` lambda this coordinator launches. The owner of
  *   the [ScpHotStreams] that constructed this coordinator owns that scope, and cancels it only
@@ -345,6 +348,23 @@ private fun <R> rememberCollectedState(
  */
 internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
     private val keyStates = ConcurrentHashMap<Any, KeyState>()
+
+    /** Set by [close]; [startMounted] refuses every `start` once it is set. */
+    private val closed = AtomicBoolean(false)
+
+    /**
+     * Refuse every later `start`, then wait for each `start` running under a key's mutex and
+     * for the last stop launched under each key, which joins every stop launched before it.
+     * A stop whose scope was already cancelled returns from that wait at once.
+     */
+    internal suspend fun close() {
+        closed.set(true)
+        keyStates.values.toList().forEach { state ->
+            // A start that passed the closed check holds this mutex until it returns.
+            state.mutex.withLock {}
+            synchronized(state) { state.lastStop }?.join()
+        }
+    }
 
     /**
      * Run [onStop], logging whatever it throws. A throw that comes from cancelling this
@@ -419,8 +439,9 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
      * instead of keeping one more `onStop` for a subscription it cannot identify. A stop under
      * that key therefore waits for a running `start` to return, whoever cancelled its caller.
      *
-     * @throws ScpHotStreamCoordinatorClosedException when this coordinator's scope is cancelled,
-     *   checked under the mutex, because no stop could release what [start] opened.
+     * @throws ScpHotStreamCoordinatorClosedException when [close] has run or this coordinator's
+     *   scope is cancelled, checked under the mutex, because no stop could release what [start]
+     *   opened.
      * @throws CancellationException when [unmount] has already removed [mount], checked under
      *   the mutex. That mount's own stop may have taken the mutex first and found nothing to
      *   release, and a start run after it would open a subscription that no stop releases.
@@ -433,8 +454,8 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
     ): T {
         mount.pendingStop?.join()
         return mount.state.mutex.withLock {
-            if (!scope.isActive) {
-                throw ScpHotStreamCoordinatorClosedException("the coordinator's scope is cancelled")
+            if (closed.get() || !scope.isActive) {
+                throw ScpHotStreamCoordinatorClosedException("the coordinator is closed or its scope is cancelled")
             }
             if (!mount.phase.compareAndSet(MountPhase.NOT_STARTED, MountPhase.STARTING)) {
                 throw CancellationException("mount left before its start ran")
@@ -505,12 +526,11 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
                         state.lastStop = stop
                         launched = stop
                         stop.invokeOnCompletion { cause ->
-                            if (cause == null || ranEvery.get()) {
+                            // A stop that held no onStop skipped none, so it reports no skip.
+                            if (cause == null || ranEvery.get() || stops.isEmpty()) {
                                 done.complete()
                             } else {
-                                if (stops.isNotEmpty()) {
-                                    Log.w(COORDINATOR_TAG, SCOPE_CANCELLED_BEFORE_STOP, cause)
-                                }
+                                Log.w(COORDINATOR_TAG, SCOPE_CANCELLED_BEFORE_STOP, cause)
                                 done.completeExceptionally(cause)
                             }
                         }
@@ -613,11 +633,10 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  *
  * Usage:
  * ```kotlin
- * // Built once, outside composition. Its owner cancels streamScope only after every
- * // composable that passed hotStreams has left composition; an onStop still pending then is
- * // skipped and logged.
+ * // Built once, outside composition. Once every composable that passed hotStreams has left
+ * // composition, its owner calls hotStreams.close() and then cancels streamScope.
  * val streamScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
- * val hotStreams = ScpHotStreams(bindings, streamScope)
+ * val hotStreams = ScpHotStreams(bindings, streamScope, Dispatchers.IO)
  *
  * @Composable
  * fun EventList(handle: Long, hotStreams: ScpHotStreams) {
@@ -629,16 +648,35 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * ```
  *
  * @param bindings Event bindings the owned [HotStreamFactory] subscribes through.
- * @param scope Scope that runs every `onStop` the owned coordinator launches. Its owner cancels
- *   it only once every mount that passed this instance has left composition; cancelling it
- *   earlier skips each pending stop, logs that skip, and refuses every later start.
+ * @param scope Scope that runs every `onStop` the owned coordinator launches. Its owner calls
+ *   [close] and then cancels it, once every mount that passed this instance has left
+ *   composition; cancelling it without [close] skips each pending stop, logs that skip, and
+ *   refuses every later start.
+ * @param ioDispatcher Dispatcher the owned [HotStreamFactory] subscribes and releases on. A test
+ *   injects a `StandardTestDispatcher` here.
  */
 class ScpHotStreams(
     bindings: EventContextBindings,
     scope: CoroutineScope,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
-    internal val factory = HotStreamFactory(bindings)
+    internal val factory = HotStreamFactory(bindings, ioDispatcher)
     internal val coordinator = ScpHotStreamCoordinator(scope)
+
+    /**
+     * Release every Rust subscription this instance opened. Its owner calls this once every
+     * mount that passed this instance has left composition, and before it cancels `scope`.
+     *
+     * This refuses every later `start` with [ScpHotStreamCoordinatorClosedException], waits for
+     * each running `start` and each stop already launched, and then calls
+     * [HotStreamFactory.stopAll], so a subscription whose stop a cancelled `scope` skipped is
+     * released too. A mount still composed when this runs loses its subscription and receives
+     * nothing further.
+     */
+    suspend fun close() {
+        coordinator.close()
+        factory.stopAll()
+    }
 }
 
 /**
@@ -647,7 +685,7 @@ class ScpHotStreams(
  * when the last mount of that stream leaves composition.
  *
  * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens, and
- *   for good once [hotStreams]'s scope is cancelled.
+ *   for good once [hotStreams] is closed or its scope is cancelled.
  */
 @Composable
 fun rememberContextEvents(
@@ -667,7 +705,7 @@ fun rememberContextEvents(
  * when the last mount of that stream leaves composition.
  *
  * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens, and
- *   for good once [hotStreams]'s scope is cancelled.
+ *   for good once [hotStreams] is closed or its scope is cancelled.
  */
 @Composable
 fun rememberIncomingMessages(
@@ -839,7 +877,8 @@ internal enum class MountPhase {
 }
 
 /**
- * Thrown by [ScpHotStreamCoordinator]'s start path once that coordinator's scope is cancelled:
- * no stop could release a subscription a `start` opened then, so the coordinator runs none.
+ * Thrown by [ScpHotStreamCoordinator]'s start path once that coordinator is closed or its scope
+ * is cancelled: no stop could release a subscription a `start` opened then, so the coordinator
+ * runs none.
  */
 internal class ScpHotStreamCoordinatorClosedException(message: String) : IllegalStateException(message)

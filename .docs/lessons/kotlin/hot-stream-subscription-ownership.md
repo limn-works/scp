@@ -87,7 +87,8 @@ subscription that a different caller had just opened.
   alone: a third mount already live on the new coordinator still lost its subscription,
   silently. A public coordinator constructed apart from its factory left that pairing to
   documentation. `ScpHotStreams` now constructs its own `HotStreamFactory` over the event
-  bindings it receives, together with its own coordinator, and exposes neither, so no second
+  bindings it receives, on the `ioDispatcher` it receives, together with its own coordinator,
+  and exposes neither, so no second
   coordinator reaches that factory. A second `ScpHotStreams` opens its own Rust subscriptions,
   which only its own stops release.
 - **Run one `onStop` per subscription a started mount opened.** `startMounted` and `unmount`
@@ -111,12 +112,19 @@ subscription that a different caller had just opened.
   cancellation kept from running its `onStop` lambdas, completes each departure's Job
   exceptionally instead of reporting that its `onStop` ran, and refuses every later `start` with
   `ScpHotStreamCoordinatorClosedException`, because no stop could release what it opened.
+- **Give the owner a teardown that releases what cancellation would skip.** A stop that the last
+  mount's `onDispose` launched may not have taken its key's mutex when the owner cancels the
+  scope, and nothing outside `ScpHotStreams` could reach its factory's `stopAll`. The owner
+  therefore calls `ScpHotStreams.close()` once every mount has left, and cancels the scope after
+  it returns. `close` refuses every later `start`, waits for each running `start` and each
+  launched stop, and then calls `HotStreamFactory.stopAll`, which also releases a subscription
+  whose stop an earlier cancellation skipped.
 - **Decide a skipped stop from the `onStop` calls that returned, not from the stop's `Job`.**
   Cancelling a coroutine while its body runs completes its `Job` as cancelled even when the body
   then returns normally. `HotStreamFactory`'s stop functions run under `NonCancellable`, so a
   scope cancelled while they run still lets every `onStop` return. The stop sets a flag after its
   last `onStop` returns, and logs a skip and fails the departures' `Job` only when that flag is
-  unset.
+  unset and the stop held at least one `onStop`; a stop that held none skipped none.
 
 ## Why a coordinator rather than a file-scope registry
 
@@ -124,8 +132,8 @@ subscription that a different caller had just opened.
 and `scripts/check-no-kotlin-mutable-globals.sh` states that this SDK holds no implicit
 per-process mutable state. An `object` singleton in `StateHolders.kt` would carry that state
 across mounts and would also carry it across every unrelated caller in one process, so a caller
-constructs an `ScpHotStreams`, owns its scope, and cancels it only once every mount that passed
-that `ScpHotStreams` has left composition.
+constructs an `ScpHotStreams`, owns its scope, and, once every mount that passed that
+`ScpHotStreams` has left composition, calls its `close()` and then cancels that scope.
 
 A default parameter that built a coordinator per composition would compile, read as convenient,
 and restore defect 3 exactly, because each mount would then coordinate against itself alone.
@@ -166,6 +174,13 @@ second Rust subscription per stream beside any other instance's.
   two event streams and one message stream of one context over counting bindings, and asserts
   one Rust subscription per stream, that the message stream is released when its own mount
   leaves, and that the event stream is released only when its second mount leaves.
+  `ScpHotStreams subscribes and releases on its injected dispatcher` asserts that no Rust call
+  runs until an injected `StandardTestDispatcher` runs it, and that each runs on that
+  dispatcher's thread. `closing ScpHotStreams releases a subscription whose stop a cancelled scope
+  skipped` asserts that `close` unsubscribes what a skipped stop left open and refuses a later
+  start, and `closing ScpHotStreams waits for a launched stop` asserts that `close` returns only
+  after a launched `onStop` returns. `a stop that held no onStop reports no skip on a cancelled
+  scope` asserts that such a stop's `Job` completes normally and logs nothing.
 
 ## Anti-patterns
 

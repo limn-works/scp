@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotSame
@@ -1121,6 +1122,115 @@ class ScpHotStreamRemountTest {
         assertEquals(1, bindings.eventSubscribes.get())
         assertEquals(1, bindings.messageUnsubscribes.get())
     }
+
+    /**
+     * [ScpHotStreams] hands the dispatcher it takes to the [works.limn.scp.stream.HotStreamFactory]
+     * it constructs, so the Rust subscribe and unsubscribe calls run only when that dispatcher
+     * runs them, on the thread that advances its scheduler. A factory built on its default
+     * `Dispatchers.IO` would run both calls on an IO worker thread.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `ScpHotStreams subscribes and releases on its injected dispatcher`() {
+        val bindings = CountingEventBindings()
+        val ioDispatcher = StandardTestDispatcher()
+        val hotStreams = ScpHotStreams(bindings.proxy, newCoordinatorScope(), ioDispatcher)
+        val caller = CoroutineScope(Dispatchers.Unconfined)
+
+        val subscribed = caller.launch { hotStreams.factory.contextEvents(CONTEXT_HANDLE) }
+        assertEquals("subscribe ran before the injected dispatcher ran it", 0, bindings.eventSubscribes.get())
+        ioDispatcher.scheduler.advanceUntilIdle()
+        assertTrue("subscribe never finished on the injected dispatcher", subscribed.isCompleted)
+        assertEquals(1, bindings.eventSubscribes.get())
+
+        val released = caller.launch { hotStreams.factory.stopContextEvents(CONTEXT_HANDLE) }
+        assertEquals("unsubscribe ran before the injected dispatcher ran it", 0, bindings.eventUnsubscribes.get())
+        ioDispatcher.scheduler.advanceUntilIdle()
+        assertTrue("unsubscribe never finished on the injected dispatcher", released.isCompleted)
+        assertEquals(1, bindings.eventUnsubscribes.get())
+        assertEquals(
+            "a Rust call ran off the injected dispatcher's thread",
+            listOf(Thread.currentThread(), Thread.currentThread()),
+            bindings.callThreads.toList(),
+        )
+    }
+
+    /**
+     * An owner that cancels its scope before the last stop runs leaves that stop's `onStop`
+     * unrun, so the Rust subscription stays open. [ScpHotStreams.close] releases it through the
+     * factory's `stopAll`, and refuses every later start.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `closing ScpHotStreams releases a subscription whose stop a cancelled scope skipped`() {
+        val bindings = CountingEventBindings()
+        val scope = newCoordinatorScope()
+        val hotStreams = ScpHotStreams(bindings.proxy, scope)
+        val coordinator = hotStreams.coordinator
+        val mount = coordinator.mount("k")
+        runBlocking { coordinator.startMounted(mount) { hotStreams.factory.contextEvents(CONTEXT_HANDLE) } }
+
+        scope.cancel()
+        val stop = checkNotNull(coordinator.unmount(mount) { hotStreams.factory.stopContextEvents(CONTEXT_HANDLE) })
+        runBlocking { stop.join() }
+        assertEquals("a stop ran on a cancelled scope", 0, bindings.eventUnsubscribes.get())
+
+        runBlocking { hotStreams.close() }
+        assertEquals("close left the skipped subscription open", 1, bindings.eventUnsubscribes.get())
+
+        val later = coordinator.mount("k")
+        val outcome = runCatching { runBlocking { coordinator.startMounted(later) { Any() } } }
+        assertTrue(
+            "a start after close was not refused",
+            outcome.exceptionOrNull() is ScpHotStreamCoordinatorClosedException,
+        )
+    }
+
+    /**
+     * [ScpHotStreams.close] returns only after the stop the last departure launched has run its
+     * `onStop`, so an owner that cancels its scope once `close` returns skips no stop.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `closing ScpHotStreams waits for a launched stop`() {
+        val bindings = CountingEventBindings()
+        val hotStreams = ScpHotStreams(bindings.proxy, newCoordinatorScope())
+        val coordinator = hotStreams.coordinator
+        val mount = coordinator.startedMount("k")
+        val entered = CountDownLatch(1)
+        val gate = CompletableDeferred<Unit>()
+        val onStopDone = AtomicBoolean(false)
+        checkNotNull(
+            coordinator.unmount(mount) {
+                entered.countDown()
+                gate.await()
+                onStopDone.set(true)
+            },
+        )
+        assertTrue("the launched stop never ran", entered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+
+        val closed = CoroutineScope(Dispatchers.IO).launch { hotStreams.close() }
+        Thread.sleep(UNORDERED_STOP_GRACE_MS)
+        assertEquals("close returned before the launched stop finished", false, closed.isCompleted)
+
+        gate.complete(Unit)
+        runBlocking { closed.join() }
+        assertTrue("close returned before the onStop returned", onStopDone.get())
+    }
+
+    /**
+     * A stop that holds no `onStop` — its only mount left before its `start` ran — skips
+     * nothing when the coordinator's scope is cancelled, so its departure's Job completes
+     * normally and nothing is logged.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a stop that held no onStop reports no skip on a cancelled scope`() {
+        ShadowLog.clear()
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope().also { it.cancel() })
+
+        val stop = checkNotNull(coordinator.unmount(coordinator.mount("k")) {})
+        runBlocking { stop.join() }
+
+        assertEquals("a stop that held no onStop reported a skip", false, stop.isCancelled)
+        assertEquals(0, ShadowLog.getLogsForTag("ScpHotStreamCoordinator").size)
+    }
 }
 
 /**
@@ -1180,11 +1290,15 @@ private class CountingEventBindings {
     val messageSubscribes = AtomicInteger(0)
     val messageUnsubscribes = AtomicInteger(0)
 
+    /** Thread each subscribe and unsubscribe call ran on, in call order. */
+    val callThreads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
+
     val proxy: EventContextBindings =
         Proxy.newProxyInstance(
             EventContextBindings::class.java.classLoader,
             arrayOf(EventContextBindings::class.java),
         ) { _, method, _ ->
+            callThreads += Thread.currentThread()
             when (method.name) {
                 "contextSubscribeEvents" -> eventSubscribes.incrementAndGet().toLong()
                 "contextSubscribe" -> messageSubscribes.incrementAndGet().toLong()
