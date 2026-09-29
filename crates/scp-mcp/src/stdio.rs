@@ -183,18 +183,24 @@ pub fn read_line_bounded<R: std::io::BufRead>(
 /// server as a member of that group that inherits the stdout pipe. On Unix
 /// (not OpenBSD or Redox, which lack `waitid`) the whole group gets
 /// `SIGKILL`, which closes every holder of that stdout, and the in-flight
-/// [`read_response`] then fails on EOF. The group is signalled only while the
-/// leader is unreaped, because only then can its pid, the group id, name no
-/// other process: a second call (a disconnect, then the client's drop)
-/// signals nothing. Elsewhere only the direct child is killed,
-/// and a process it started keeps the pipe open. A poisoned lock still
-/// yields the child, because a leaked server outlives every caller.
+/// [`read_response`] then fails on EOF. The group is signalled only while a
+/// `waitid` peek finds an unreaped child under the leader's pid. Call it at
+/// most once per `Child`: once a call has reaped the leader, the pid is free,
+/// a later child of this process can take it and lead its own group, and a
+/// second call's peek would find that child and kill its whole group. A
+/// caller that can reach the stop twice (a disconnect, then the transport's
+/// drop) keeps the `Child` in an `Option` slot and takes it out under the
+/// slot's lock, so the second path finds nothing to stop. Elsewhere only the
+/// direct child is killed, and a process it started keeps the pipe open. A
+/// poisoned lock still yields the child, because a leaked server outlives
+/// every caller.
 pub fn stop_server_process(child: &std::sync::Mutex<std::process::Child>) {
     let mut child = child
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A `NOWAIT` peek reports the leader without reaping it, and fails with
-    // `ECHILD` once an earlier call has reaped it.
+    // A `NOWAIT` peek reports the unreaped leader without reaping it. It
+    // cannot tell a reaped leader from a later child reusing its pid, which
+    // is why this function runs at most once per `Child`.
     #[cfg(all(unix, not(any(target_os = "openbsd", target_os = "redox"))))]
     {
         use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
@@ -1065,8 +1071,7 @@ mod tests {
     /// A disconnect kills the server's whole process group, so a process the
     /// server started that inherited its stdout (the real server under a
     /// launcher such as `npx`) no longer holds the pipe open, and a reader
-    /// waiting on that stdout sees EOF. A second call, as the client's drop
-    /// makes after a disconnect, finds the leader reaped and signals nothing.
+    /// waiting on that stdout sees EOF.
     #[cfg(unix)]
     #[test]
     fn stop_server_process_kills_the_group_holding_the_stdout_pipe() {
@@ -1089,7 +1094,6 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("the group kill must close every holder of the stdout pipe")
             .expect("read to EOF");
-        stop_server_process(&child);
     }
 
     /// A line that is not JSON, or an over-long line, fails the call rather

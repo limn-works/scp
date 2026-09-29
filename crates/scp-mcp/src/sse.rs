@@ -2200,6 +2200,36 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    /// A browser's CORS preflight carries no `Authorization` header, so the
+    /// bearer check answers it with 401 and no `Access-Control-Allow-*`
+    /// header, and the browser never sends the request it asked about. The
+    /// module doc and ADR-015 §5 rest their "no browser-hosted client"
+    /// statement on this answer.
+    #[tokio::test]
+    async fn auth_cors_preflight_rejected_without_allow_headers() {
+        use tower::ServiceExt;
+
+        for (path, method) in [("/sse", "GET"), ("/message", "POST")] {
+            let req = Request::builder()
+                .method("OPTIONS")
+                .uri(path)
+                .header("Origin", "https://example.com")
+                .header("Access-Control-Request-Method", method)
+                .header("Access-Control-Request-Headers", "authorization")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = auth_router().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            let allow: Vec<_> = response
+                .headers()
+                .keys()
+                .filter(|name| name.as_str().starts_with("access-control-allow-"))
+                .collect();
+            assert!(allow.is_empty(), "{path} preflight answered with {allow:?}");
+        }
+    }
+
     // -- Synthetic request IDs ------------------------------------------------
 
     /// `message_handler` draws each notification's synthetic request id from
