@@ -27,6 +27,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -183,6 +184,7 @@ class StateHoldersTest {
 
     @Test
     fun `rememberScpHotStream invokes onStop when leaving composition`() {
+        val started = CountDownLatch(1)
         val stopped = CountDownLatch(1)
         val eventFlow = MutableSharedFlow<String>()
         val showComposable = MutableStateFlow(true)
@@ -194,13 +196,19 @@ class StateHoldersTest {
                 rememberScpHotStream(
                     key = "test-key",
                     coordinator = coordinator,
-                    start = { eventFlow },
+                    start = { eventFlow.also { started.countDown() } },
                     onStop = { stopped.countDown() },
                 )
             }
         }
 
         composeRule.waitForIdle()
+        // start runs on Dispatchers.IO, which waitForIdle does not wait for. A mount that leaves
+        // before its start runs opened nothing, so the coordinator drops its onStop.
+        assertTrue(
+            "start did not run within $AWAIT_TIMEOUT_SECONDS seconds of composition",
+            started.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
         assertEquals(1L, stopped.count)
 
         showComposable.value = false
@@ -218,6 +226,7 @@ class StateHoldersTest {
     // rather than reach an assertion.
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `rememberScpHotStream disposal returns while onStop is still suspended`() {
+        val started = CountDownLatch(1)
         val onStopEntered = CountDownLatch(1)
         val releaseOnStop = CountDownLatch(1)
         val onStopReturned = CountDownLatch(1)
@@ -231,7 +240,7 @@ class StateHoldersTest {
                 rememberScpHotStream(
                     key = "blocking-key",
                     coordinator = coordinator,
-                    start = { eventFlow },
+                    start = { eventFlow.also { started.countDown() } },
                     onStop = {
                         onStopEntered.countDown()
                         releaseOnStop.await()
@@ -242,6 +251,11 @@ class StateHoldersTest {
         }
 
         composeRule.waitForIdle()
+        // A mount that leaves before its start runs on Dispatchers.IO has its onStop dropped.
+        assertTrue(
+            "start did not run within $AWAIT_TIMEOUT_SECONDS seconds of composition",
+            started.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
 
         showComposable.value = false
         composeRule.waitForIdle()
@@ -1266,6 +1280,40 @@ class ScpHotStreamRemountTest {
         shown[2].value = false
         composeRule.waitForIdle()
         awaitCondition("the mount moved to the second coordinator never started") { starts[0].get() == 2 }
+    }
+}
+
+/** The list of swapped-out stops that [rememberScpHotStream] carries across coordinator changes. */
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest = Config.NONE, sdk = [33])
+class ScpHotStreamSwappedOutStopTest {
+    @Test
+    fun `a mount leaving one coordinator again while another stays live there adds no second swapped-out stop`() {
+        val first = ScpHotStreamCoordinator(newCoordinatorScope())
+        val second = ScpHotStreamCoordinator(newCoordinatorScope())
+        val flow = hotEventFlow()
+        val stays = first.mount("k")
+        runBlocking { first.startMounted(stays) { flow } }
+
+        val firstVisit = first.mount("k")
+        runBlocking { first.startMounted(firstVisit) { flow } }
+        val firstDeparture = requireNotNull(first.unmount(firstVisit) {}) { "a held departure returned no Job" }
+        val secondVisit = first.mount("k")
+        runBlocking { first.startMounted(secondVisit) { flow } }
+        val secondDeparture = first.unmount(secondVisit) {}
+
+        // Both departures are held for the mount that stays, so each gets back the one Job the
+        // coordinator keeps for the key's next stop.
+        assertSame(firstDeparture, secondDeparture)
+        val other = Job()
+        val afterFirstTrip = withSwappedOutStop(emptyList(), first, firstDeparture)
+        val afterDetour = withSwappedOutStop(afterFirstTrip, second, other)
+        val afterSecondTrip = withSwappedOutStop(afterDetour, first, secondDeparture)
+        assertEquals(listOf(first to firstDeparture, second to other), afterSecondTrip)
+        assertEquals(afterSecondTrip, withSwappedOutStop(afterSecondTrip, second, null))
+
+        first.unmount(stays) {}
+        other.complete()
     }
 }
 

@@ -689,8 +689,8 @@ fun <T> rememberScpHotStream(
     // on `key` alone. Compose runs the old effect's onDispose before the new effect, so the
     // new effect finds that Job here and its start joins it first.
     //
-    // The holder keeps every such Job that has not completed, each paired with the coordinator
-    // that returned it, not just the latest one. A second change before the first swapped-out
+    // The holder keeps every such Job that has not completed, once each, paired with the
+    // coordinator that returned it, not just the latest one. A second change before the first swapped-out
     // stop completes would otherwise drop that stop, and the next start would run before it.
     // A start skips a Job its own coordinator returned: that coordinator already orders it,
     // either through the stop `mount` captures or by holding it until this new mount leaves too,
@@ -739,12 +739,27 @@ fun <T> rememberScpHotStream(
             // Cancelling `scope` afterwards cancels this mount's start only while it waits to
             // run (a start already running finishes), and never that stop.
             val ownStop = slot.close()?.let { coordinator.unmount(it, onStop) }
-            swappedOutStops.set(pendingSwapStops + listOfNotNull(ownStop?.let { coordinator to it }))
+            swappedOutStops.set(withSwappedOutStop(pendingSwapStops, coordinator, ownStop))
             scope.cancel()
         }
     }
     return flowState
 }
+
+/**
+ * [pending] with [stop], when not `null`, paired with the [coordinator] that returned it, keeping
+ * one entry per distinct [Job].
+ *
+ * A held departure gets back the [Job] its coordinator keeps for the key's next stop, the same
+ * one on every departure from that coordinator while another mount stays live there, so a mount
+ * moving back and forth would otherwise add that [Job] once per round trip.
+ */
+internal fun withSwappedOutStop(
+    pending: List<Pair<ScpHotStreamCoordinator, Job>>,
+    coordinator: ScpHotStreamCoordinator,
+    stop: Job?,
+): List<Pair<ScpHotStreamCoordinator, Job>> =
+    (pending + listOfNotNull(stop?.let { coordinator to it })).distinctBy { it.second }
 
 /**
  * One [rememberScpHotStream] effect's count on [coordinator] under [key], taken at most once and

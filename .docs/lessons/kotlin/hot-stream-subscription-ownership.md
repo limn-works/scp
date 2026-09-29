@@ -145,7 +145,9 @@ show one context handle during a transition each count only their own mounts.
   hold one onStop per subscription` cancels each departing row's start while it is suspended and
   asserts the same bound, and `a cancelled coordinator scope logs its
   skipped onStop and refuses later starts` asserts the log line, the exceptional Job, and the
-  refused start.
+  refused start. `ScpHotStreamSwappedOutStopTest` in that same file asserts that two held
+  departures from one coordinator get back one same Job and that the list a composable carries
+  across coordinator changes keeps that Job once.
 
 ## Anti-patterns
 
