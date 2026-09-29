@@ -114,7 +114,30 @@
 #     Case 22 answers `cargo metadata` with an object holding no package list and asserts
 #     that the summary names the feature set the compile step could not read, because a
 #     run that activates a narrower feature set than the merge gate resolves and prints
-#     `compile ok` says nothing about the modules it skipped.
+#     `compile ok` says nothing about the modules it skipped. The same run cannot read
+#     which package has an example target, so case 22 also asserts that the
+#     `scripts/check-examples-compile.sh` assertion 1 line names the changed package and
+#     says the run could not read the targets.
+#
+#     Case 22b changes scp-clock, scp-transport and scp-ffi under a metadata answer in
+#     which only scp-transport owns an example, and scp-transport reaches scp-clock through
+#     a dev-dependency. It asserts that the examples-gate assertion 1 line names scp-clock
+#     and scp-transport and not scp-ffi, which no example compiles; that the line says the
+#     gate lints every workspace library an example compiles; that the assertion 2 line
+#     names all three packages and both example file forms, `examples/NAME.rs` and
+#     `examples/NAME/main.rs`; and that no gate-edit line appears on a branch that left
+#     the gate alone. A run that drops either line, the dependency walk or the
+#     reachability filter reports green over a change the rust-clippy job turns red.
+#
+#     Case 22c changes only `scripts/check-examples-compile.sh` and asserts that the
+#     summary names that gate as unrun over this repository's workspace, and that it prints
+#     neither assertion line, because the run compiled no crate. GATES_NOT_RUN keeps the
+#     run from starting that gate, so without this line an edit to it reads as covered.
+#
+#     Case 22d asserts that every GATES_NOT_RUN path the runner never starts with `bash`
+#     appears in the header's DOES-NOT-RUN list, and that the list names `cargo package
+#     --list`, which the examples gate runs in the rust-clippy job. A NOT CHECKED line the
+#     list has no entry for names a command the header never told the reader about.
 #
 #     Case 23 reads every `scripts/` program a job of `.github/workflows/ci.yml` starts
 #     with `bash`, `python3`, `python3.12`, `python3.12 -m pytest` or a `./` path, on a
