@@ -29,6 +29,8 @@ import works.limn.scp.bridge.MessageCallback
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.logging.Level
+import java.util.logging.Logger
 
 /**
  * Callback interface for real-time context events from the Rust engine.
@@ -380,6 +382,9 @@ class HotStreamFactory(
      * Waits for [eventMutex] under [NonCancellable]: a cancelled caller that found the mutex
      * held would otherwise throw from `withLock` and leave this handle's subscription live.
      *
+     * An unsubscribe call that throws propagates to this caller; the handle's registry entry is
+     * already gone by then, as [removeEventSubscription] states.
+     *
      * @param contextHandle The context to stop receiving events for.
      */
     suspend fun stopContextEvents(contextHandle: Long) {
@@ -390,7 +395,8 @@ class HotStreamFactory(
      * Stop receiving messages for the given context handle.
      *
      * Takes [messageMutex], and waits for it under [NonCancellable], for the reasons
-     * [stopContextEvents] states about [eventMutex].
+     * [stopContextEvents] states about [eventMutex]. An unsubscribe call that throws propagates
+     * to this caller, as [stopContextEvents] states.
      *
      * @param contextHandle The context to stop receiving messages for.
      */
@@ -409,15 +415,50 @@ class HotStreamFactory(
      * releases every handle: each removal's own `withContext` throws on resumption into a
      * cancelled caller, which would otherwise end the loop after its first removal and leave
      * every later Rust subscription live.
+     *
+     * Attempts every release it holds and never throws a release's failure
+     * (`.docs/standards/sdk-common.md` §Cleanup error handling): an unsubscribe call that
+     * throws is logged at warning level, and the loop moves on to the next handle. Every
+     * registry entry is gone when this returns, the failed ones included, because that
+     * section requires local state to be released whatever a remote call reports.
      */
     suspend fun stopAll() {
         withContext(NonCancellable) {
             eventMutex.withLock {
-                activeEventSubscriptions.keys.toList().forEach { removeEventSubscription(it) }
+                activeEventSubscriptions.keys.toList().forEach { handle ->
+                    releaseLogged("context events", handle) { removeEventSubscription(handle) }
+                }
             }
             messageMutex.withLock {
-                activeMessageSubscriptions.keys.toList().forEach { removeMessageSubscription(it) }
+                activeMessageSubscriptions.keys.toList().forEach { handle ->
+                    releaseLogged("incoming messages", handle) { removeMessageSubscription(handle) }
+                }
             }
+        }
+    }
+
+    /**
+     * Run one [stopAll] release and log its failure instead of throwing it.
+     *
+     * Catches [Exception], not [Throwable], so an [Error] such as an out-of-memory condition
+     * still propagates. The caller runs under [NonCancellable], so no cancellation of that
+     * caller reaches this catch.
+     */
+    @Suppress("TooGenericExceptionCaught")
+    private suspend fun releaseLogged(
+        stream: String,
+        contextHandle: Long,
+        release: suspend () -> Unit,
+    ) {
+        try {
+            release()
+        } catch (e: Exception) {
+            logger.log(
+                Level.WARNING,
+                "HotStreamFactory.stopAll: releasing $stream for context handle $contextHandle " +
+                    "failed; its registry entry is removed and the Rust subscription may stay live",
+                e,
+            )
         }
     }
 
@@ -427,7 +468,8 @@ class HotStreamFactory(
      * A caller holds [eventMutex] across this call. [NonCancellable] pairs a registry removal
      * with an unsubscribe call for a reason [contextEvents] states about its own subscribe
      * call: a cancellation landing between those two statements drops a caller's only route to
-     * a live Rust subscription.
+     * a live Rust subscription. The entry is removed before the unsubscribe call, so an
+     * unsubscribe that throws still leaves no local state behind, and its throw propagates.
      */
     private suspend fun removeEventSubscription(contextHandle: Long) {
         withContext(NonCancellable + ioDispatcher) {
@@ -440,13 +482,17 @@ class HotStreamFactory(
      * Remove one message subscription from [activeMessageSubscriptions] and unsubscribe it.
      *
      * A caller holds [messageMutex] across this call, and [NonCancellable] pairs those two
-     * statements for a reason [removeEventSubscription] states.
+     * statements, in that order, for the reasons [removeEventSubscription] states.
      */
     private suspend fun removeMessageSubscription(contextHandle: Long) {
         withContext(NonCancellable + ioDispatcher) {
             val state = activeMessageSubscriptions.remove(contextHandle) ?: return@withContext
             contextBindings.contextUnsubscribe(state.subscriptionHandle)
         }
+    }
+
+    private companion object {
+        val logger: Logger = Logger.getLogger(HotStreamFactory::class.java.name)
     }
 }
 
