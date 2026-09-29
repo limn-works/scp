@@ -11,9 +11,12 @@
 //     SQLCipher under concurrent access
 //   - Zeroing of the passphrase ByteArray in the finally block after database open
 //
-// Only an instrumented test on a real device can run the SQLCipher and Android
-// Keystore path. No instrumented test for AndroidStorage exists, and ADR-027 (the
-// Android platform adapter) names no testing strategy for it.
+// Only an instrumented test can run the SQLCipher and Android Keystore path.
+// ADR-027 (the Android platform adapter) acceptance criterion 13 requires
+// `storage_conformance!()` against AndroidStorage and a SQLCipher test that opens
+// the raw database file and confirms it is unreadable without the
+// Keystore-derived key, on an API 33+ physical device or an API 33 emulator with
+// Play Store. No such test exists.
 //
 // Test strategies:
 //

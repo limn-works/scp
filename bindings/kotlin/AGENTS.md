@@ -34,5 +34,5 @@
 - `net.zetetic:sqlcipher-android` 4.6+ uses package `net.zetetic.database.sqlcipher.*`, loads with `System.loadLibrary("sqlcipher")` (there is no `loadLibs()`), takes the passphrase in the `SQLiteOpenHelper` constructor, and needs `androidx.sqlite:sqlite`.
 - Generate an Android Keystore Ed25519 key with `NamedParameterSpec.ED25519`; `EdDSAParameterSpec` sets prehash mode and context, not the curve.
 - A Keystore AES-GCM key used with a caller-supplied IV needs `.setRandomizedEncryptionRequired(false)`, or `Cipher.init()` throws `InvalidAlgorithmParameterException` on a device while every JVM test passes.
-- Play Integrity calls fail on emulators and on devices without Google Play Services; unit tests cover the deterministic logic only.
+- Play Integrity calls need Google Play services, so they fail on the host JVM, on an emulator image without Play Store, and on a device without Google Play services; ADR-027 acceptance criterion 13 runs hardware tests on an API 33+ device or an API 33 emulator with Play Store. Unit tests cover the deterministic logic only.
 - The Compose compiler is the `kotlin("plugin.compose")` Gradle plugin; the old `org.jetbrains.compose.compiler` artifact is not needed.

@@ -16,15 +16,17 @@ import java.security.MessageDigest
 // Unit tests for AndroidDeviceAttestation
 // ---------------------------------------------------------------------------
 //
-// Play Integrity API calls require a real Android device with Google Play
-// Services. These tests cover the deterministic, locally-testable parts of
-// the attestation flow:
+// Play Integrity API calls need Google Play services, which the host JVM lacks.
+// ADR-027 acceptance criterion 13 runs hardware tests on an API 33+ physical
+// device or on an API 33 emulator with Play Store. These tests cover the
+// deterministic, locally-testable parts of the attestation flow:
 //   - clientDataJSON construction (fixed field order, Base64 encoding)
 //   - Nonce computation (SHA-256 + Base64)
 //
 // No test covers the Play Integrity request, `attest` end to end, or
-// `assertRequest`: each calls the Play Integrity API, which needs a physical
-// device with Google Play services, and the module has no instrumented tests.
+// `assertRequest`: each calls the Play Integrity API, which only an
+// instrumented test on such a device or emulator can reach, and the module has
+// no instrumented tests.
 // Story SCP-111's criterion for end-to-end tests on a physical device is unmet.
 //
 // Uses Robolectric to provide android.util.Base64 on the host JVM.
