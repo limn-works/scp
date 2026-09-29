@@ -151,6 +151,10 @@ jobs:
   #     routines; without NASM openssl-src builds OpenSSL with `no-asm`.
   #   - No --manifest-path arg: bindings/python/pyproject.toml already carries
   #     [tool.maturin] manifest-path.
+  #   - Job rust-build-pyo3-production in ci.yml builds the `scp-ffi` library
+  #     with the same [tool.maturin] features on every PR, on the Linux x86_64
+  #     runner only. The manylinux_2_28 containers, the universal2 build, and
+  #     the Windows NASM build run nowhere but here.
   # ---------------------------------------------------------------------------
   python-wheels:
     name: Python wheel (${{ matrix.target }})

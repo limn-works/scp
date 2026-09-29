@@ -211,12 +211,12 @@ pytest bindings/python/tests/ -v --asyncio-mode=auto
 # Build wheel
 maturin build --release
 
-# Build wheels for all platforms (CI)
-maturin build --release --target x86_64-unknown-linux-gnu
-maturin build --release --target aarch64-unknown-linux-gnu
-maturin build --release --target x86_64-apple-darwin
-maturin build --release --target aarch64-apple-darwin
-maturin build --release --target x86_64-pc-windows-msvc
+# Build wheels for all platforms (CI: the python-wheels job in
+# .github/workflows/build-matrix.yml, one wheel per CPython minor per target)
+maturin build --release --target x86_64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
+maturin build --release --target aarch64-unknown-linux-gnu -i python3.10 python3.11 python3.12 python3.13
+maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13
+maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13
 ```
 
 ## CI Matrix
@@ -228,7 +228,8 @@ maturin build --release --target x86_64-pc-windows-msvc
 | pyi-generated (`.pyi` ↔ PyO3 signature parity) | ubuntu-latest | 3.12 | Every PR |
 | pip-audit | ubuntu-latest | 3.12 | Every PR |
 | test | ubuntu-latest, macos-latest | 3.12, 3.13 | Every PR |
-| build-wheel | ubuntu-latest, macos-latest, windows-latest | 3.12+ | Every PR |
+| rust-build-pyo3-production (`scp-ffi` library with the wheel's `[tool.maturin] features`, vendored OpenSSL) | ubuntu-latest | 3.12 | Every PR that changes Rust or `bindings/python/` |
+| python-wheels (`build-matrix.yml`) | ubuntu-latest (x86_64, aarch64), macos-latest (universal2), windows-latest | 3.10, 3.11, 3.12, 3.13 | Tagged release |
 | conformance | ubuntu-latest | 3.12 | Every PR |
 | publish (PyPI) | ubuntu-latest | 3.12 | Tagged release |
 
