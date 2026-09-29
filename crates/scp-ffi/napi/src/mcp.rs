@@ -240,8 +240,9 @@ impl Drop for McpClientEntry {
 /// nothing. A second stop of the same reaped server would not be safe: the
 /// stop decides whether to signal the group from a `waitid` on the raw pid,
 /// and once the server is reaped that pid can belong to another child of
-/// this process, such as a second stdio server leading its own group. The lock is held until the server is reaped, so a disconnect
-/// returns only after the server is gone even when the transport's drop runs
+/// this process, such as a second stdio server leading its own group. The
+/// lock is held until the server is reaped, so a disconnect returns only
+/// after the server is gone even when the transport's drop runs
 /// concurrently.
 fn stop_stdio_server(slot: &Mutex<Option<std::process::Child>>) {
     let mut slot = slot
@@ -783,17 +784,18 @@ impl ContextProvider for McpNapiBridgeProvider {
 // MCP stdio server loop
 // ---------------------------------------------------------------------------
 
-/// Runs the MCP server over stdio until the shutdown signal fires or stdin
-/// reaches EOF.
+/// Runs the MCP server over stdio until the shutdown signal fires, the bridge
+/// instance is cancelled, or stdin reaches EOF.
 ///
-/// The read loop, the stdout writer, and the resource-subscription event pump
-/// all live in [`scp_mcp::stdio::run_stdio`]; this wrapper only owns the
-/// shutdown arm. Sharing that loop is what keeps JSON-RPC *notification*
-/// parsing correct (messages carrying no `id` never produce a response, and a
+/// `serve` is [`scp_mcp::stdio::run_stdio`] on the server. The read loop, the
+/// stdout writer, and the resource-subscription event pump all live in that
+/// future; this wrapper only owns the stop arms, and dropping `serve` on
+/// either stop signal drops the server and its pump. Sharing that loop is
+/// what keeps JSON-RPC *notification* parsing correct (messages carrying no `id` never produce a response, and a
 /// bare `JsonRpcRequest` decode rejects them) and keeps stdout serialized
 /// between responses and subscription notifications.
 ///
-/// `server` is the [`McpServerForTransport`] bundle: it carries its pump iff it
+/// The server is the [`McpServerForTransport`] bundle: it carries its pump iff it
 /// advertises `resources/subscribe`. The bundle is built by
 /// `McpServer::with_optional_event_source`, so the advertised capability and the
 /// pump that honours it are one value — the loop cannot be handed one without the
@@ -805,7 +807,7 @@ impl ContextProvider for McpNapiBridgeProvider {
 /// server and its pump down, as the SSE path and the `PyO3` and `UniFFI`
 /// bridges do.
 async fn run_mcp_stdio_server(
-    server: McpServerForTransport<McpNapiBridgeProvider>,
+    serve: impl std::future::Future<Output = Result<(), scp_mcp::stdio::StdioError>>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
@@ -814,7 +816,7 @@ async fn run_mcp_stdio_server(
         () = cancel_token.cancelled() => {
             tracing::debug!("MCP stdio server task exiting — bridge instance cancelled");
         }
-        result = scp_mcp::stdio::run_stdio(server) => {
+        result = serve => {
             if let Err(e) = result {
                 tracing::error!("MCP stdio server error: {e}");
             }
@@ -852,7 +854,7 @@ async fn run_mcp_stdio_server(
 fn mcp_server_bundle(
     bi: &NapiBridgeInstance,
     provider: McpNapiBridgeProvider,
-) -> scp_mcp::server::McpServerForTransport<McpNapiBridgeProvider> {
+) -> McpServerForTransport<McpNapiBridgeProvider> {
     let context_events = match crate::runtime::supervisor(bi) {
         Ok(supervisor) => supervisor.subscribe_events(),
         Err(e) => {
@@ -916,7 +918,8 @@ pub(crate) async fn mcp_server_create_on(
     let task_handle = crate::runtime().spawn(async move {
         match transport_mode.as_str() {
             "stdio" => {
-                run_mcp_stdio_server(server, shutdown_rx, cancel_token).await;
+                run_mcp_stdio_server(scp_mcp::stdio::run_stdio(server), shutdown_rx, cancel_token)
+                    .await;
             }
             "sse" => {
                 // `SseConfig::new` draws a fresh bearer token, and the transport rejects
@@ -1408,12 +1411,13 @@ mod tests {
     /// thread and its own clone of the client, not the registry shard, so a
     /// disconnect of the same handle returns at once, and it kills the server
     /// process group, so the in-flight call ends on the closed stdout. The
-    /// stub server writes a notification before its `initialize` response,
-    /// which the client reads past, then waits on a `sleep` child that holds
-    /// the stdout pipe and never answers, as the server an `npx` or `uvx`
-    /// launcher starts does. Killing the shell alone leaves the `sleep`
-    /// holding stdout, so the call ends only when the disconnect kills the
-    /// whole group.
+    /// stub server starts a `sleep` child that holds the stdout pipe, writes a
+    /// notification before its `initialize` response, which the client reads
+    /// past, then waits on the `sleep` and never answers, as the server an
+    /// `npx` or `uvx` launcher starts does. Killing the shell alone leaves the
+    /// `sleep` holding stdout, so the call ends only when the disconnect kills
+    /// the whole group. The `sleep` exists before `initialize` returns, so a
+    /// teardown that starts right after cannot race the shell's fork of it.
     #[test]
     fn mcp_client_disconnect_does_not_wait_on_an_in_flight_call_napi() {
         in_flight_call_ends_on(Teardown::Disconnect);
@@ -1442,10 +1446,11 @@ mod tests {
         allowlist.configure(&["sh"]).expect("allow sh");
         let allowlist = Mutex::new(allowlist);
         let script = "read l; \
+            sleep 600 & \
             echo '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}'; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
-            sleep 600 & wait";
+            wait";
         let transport = StdioMcpTransport::spawn(
             &allowlist,
             &["sh".to_owned(), "-c".to_owned(), script.to_owned()],
@@ -1467,6 +1472,18 @@ mod tests {
             instance_id: bi.instance_id(),
         };
 
+        // Nothing but the call under test locks the client after
+        // `initialize`, so a failed `try_lock` on this clone means the call
+        // has taken the client for its `tools/list`, and the teardown starts
+        // only then. A call that lost the race would fail before `tools/list`
+        // with "not found" or "was disconnected", which the last assertion
+        // rejects.
+        let probe = bi
+            .mcp_client_registry()
+            .get(&handle.handle_id)
+            .map(|entry| Arc::clone(&entry.client))
+            .expect("the client was just registered");
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -1477,7 +1494,10 @@ mod tests {
         let joined = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 tokio::join!(mcp_client_list_tools_on(&bi, &handle), async {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    while probe.try_lock().is_ok() {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    drop(probe);
                     let started = std::time::Instant::now();
                     match teardown {
                         Teardown::Disconnect => mcp_client_disconnect_on(&bi, &handle)
@@ -1508,9 +1528,12 @@ mod tests {
             server.lock().expect("server lock").is_none(),
             "the teardown must stop the stdio server process and empty its slot"
         );
+        let Err(listed) = listed else {
+            panic!("the killed stub server sent no tools/list response");
+        };
         assert!(
-            listed.is_err(),
-            "the killed stub server sent no tools/list response"
+            listed.reason.contains("tools/list failed"),
+            "the call must fail inside tools/list, not before it took the client: {listed}"
         );
     }
 
@@ -2604,6 +2627,92 @@ mod tests {
             ],
             "a missing supervisor must leave resources/list serving the context"
         );
+    }
+
+    /// An SSE server created through `mcp_server_create_on` stops when the
+    /// instance's cancel token fires (`emergency_cancel_tasks`, which the
+    /// instance's `Drop` runs) and `mcp_server_stop` is never called. The test
+    /// holds the entry's shutdown sender, so only the cancel arm can end the
+    /// server task.
+    #[test]
+    fn instance_cancel_stops_an_sse_mcp_server_napi() {
+        let (bi, _fixture_server) = napi_mcp_fixture();
+        let handle = crate::runtime()
+            .block_on(mcp_server_create_on(
+                &bi,
+                NapiMcpServerConfig {
+                    identity_did: AGENT_DID.to_owned(),
+                    context_ids: vec![SUB_CTX.to_owned()],
+                    transport: "sse".to_owned(),
+                },
+            ))
+            .expect("create an SSE MCP server");
+        let Some((_, entry)) = bi.mcp_server_registry().remove(&handle.handle_id) else {
+            panic!("the created server must be registered");
+        };
+        let McpServerEntry {
+            shutdown_tx,
+            _task_handle: task,
+            ..
+        } = entry;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !task.is_finished(),
+            "precondition: the SSE server serves until a stop signal"
+        );
+
+        bi.core.emergency_cancel_tasks();
+        // The timeout is built inside `block_on`, because its timer needs the
+        // runtime's reactor.
+        crate::runtime()
+            .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(5), task).await })
+            .expect("the instance's cancellation must end the SSE server task")
+            .expect("the SSE server task must not panic");
+        drop(shutdown_tx);
+    }
+
+    /// The stdio server loop ends when the instance's cancel token fires and
+    /// the shutdown sender is still alive, and it drops the serve future,
+    /// which owns the server and its event pump. The serve future here never
+    /// finishes on its own, as `run_stdio` on an open stdin does not.
+    #[test]
+    fn instance_cancel_stops_the_stdio_mcp_server_loop_napi() {
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let bi = NapiBridgeInstance::new_napi();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve_dropped = Arc::new(AtomicBool::new(false));
+        let guard = SetOnDrop(Arc::clone(&serve_dropped));
+        let serve = async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), scp_mcp::stdio::StdioError>>().await
+        };
+        let task = crate::runtime().spawn(run_mcp_stdio_server(
+            serve,
+            shutdown_rx,
+            bi.core.cancel_token(),
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !task.is_finished(),
+            "precondition: the stdio loop serves until a stop signal"
+        );
+
+        bi.core.emergency_cancel_tasks();
+        crate::runtime()
+            .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(5), task).await })
+            .expect("the instance's cancellation must end the stdio server loop")
+            .expect("the stdio server loop must not panic");
+        assert!(
+            serve_dropped.load(Ordering::Acquire),
+            "the cancelled loop must drop the server and its pump"
+        );
+        drop(shutdown_tx);
     }
 
     /// A provider whose bridge instance is gone reports its role read as an
