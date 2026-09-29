@@ -23,8 +23,9 @@ import kotlinx.coroutines.sync.withLock
 /**
  * Resource handle for an active SCP context tracked by [ScpViewModel].
  *
- * Encapsulates the opaque context handle returned by [CoroutineBridge.ContextBridge.create]
- * or [CoroutineBridge.ContextBridge.join], the identity handle of the member, and the bridge
+ * Encapsulates the opaque context handle returned by
+ * [works.limn.scp.bridge.ContextBridge.create] or [works.limn.scp.bridge.ContextBridge.join],
+ * the identity handle of the member, and the bridge
  * needed to call [leave] on cleanup.
  *
  * @property handle Opaque context handle from the FFI layer.
@@ -152,8 +153,8 @@ abstract class ScpViewModel : ViewModel() {
      *   lock marks this view model cleared, so every later [trackContext] leaves its context
      *   at once instead of tracking it.
      * - A coroutine is submitted to [cleanupScope]. That coroutine calls
-     *   [CoroutineBridge.ContextBridge.leave] exactly once per snapshotted context, in
-     *   snapshot order.
+     *   [works.limn.scp.bridge.ContextBridge.leave] exactly once per snapshotted context,
+     *   in snapshot order.
      * - A `leave` call that throws, whatever it throws, does not stop remaining `leave`
      *   calls. Its throwable goes to [onCleanupFailure]. That includes a
      *   [CancellationException]: nothing cancels [cleanupScope], so a cancellation that
@@ -183,9 +184,12 @@ abstract class ScpViewModel : ViewModel() {
      * [onCleared] does not cancel [cleanupScope] afterwards. A [SupervisorJob] whose children
      * have all completed holds no thread, no handle, and no memory a cancellation would
      * release, and [Dispatchers.Unconfined] owns no thread, so cancelling that job frees
-     * nothing. Cancelling it would instead make every later [cleanupScope] launch a silent
-     * no-op, which drops the `leave` that [trackContext] launches for a context registered
-     * after [onCleared].
+     * nothing. Cancelling it would instead start every later [cleanupScope] launch already
+     * cancelled. [launchLeave] starts undispatched, so that coroutine still runs, but each
+     * `leave` then throws [CancellationException] from the bridge's `withContext` before its
+     * FFI call, and that exception reaches [onCleanupFailure] when no other cleanup coroutine
+     * holds the failure lock. A context that [trackContext] registers after [onCleared] would
+     * then never be left.
      */
     override fun onCleared() {
         super.onCleared()

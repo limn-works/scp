@@ -248,9 +248,12 @@ class ScpViewModelTest {
         )
     }
 
-    // Guards against reintroducing `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`.
-    // A cancelled cleanup scope drops every later launch without running it, so this
-    // leave would never reach TestNativeBindings.
+    // Guards against ending cleanupScope after onCleared dispatches, whether by
+    // `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }` or by `cleanupJob.complete()`.
+    // Either one starts every later launch already cancelled. The undispatched launch still
+    // runs its loop, but each `leave` throws CancellationException from the bridge's
+    // `withContext` before its FFI call and goes to onCleanupFailure, whose default body logs
+    // a warning, so this leave would never reach TestNativeBindings.
     @Test
     fun `a context tracked after onCleared is left without a second onCleared`() =
         runTest(testDispatcher) {
