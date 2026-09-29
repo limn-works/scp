@@ -14,7 +14,7 @@ use crate::traits::{DeviceAttestation, DeviceAttestationToken};
 /// this adapter.
 const SYNTHETIC_ATTESTATION_PREFIX: &[u8] = b"scp-test-attestation-v1:";
 
-/// In-memory implementation of [`DeviceAttestation`] for testing and development.
+/// In-memory implementation of [`DeviceAttestation`] for testing.
 ///
 /// This adapter satisfies the [`DeviceAttestation`] trait for Phase 1 testing,
 /// where the test host offers no device attestation hardware.
