@@ -401,8 +401,9 @@ home line doesn't have. Honest, not fixable from here.
   named that default `DhtMode::Memory`. ADR-062, capability injection, kept
   `DhtMode::Memory` behind `scp-node`'s `testing` feature, because the in-memory
   client answered resolutions from a process-local map, and added a separate
-  fail-closed variant, `DhtMode::Disabled`, which publishes nothing and answers
-  every resolution `Ok(None)`. `HostSiteConfig::defaults` in
+  fail-closed variant, `DhtMode::Disabled`, which publishes nothing and whose
+  DHT resolution arm answers `Ok(None)`; resolution through the relay layer
+  still runs. `HostSiteConfig::defaults` in
   `crates/scp-node/src/self_host.rs` sets `dht: DhtMode::Disabled`. The example
   command above now builds without `testing` and exits 1 on every run, because
   the example gives `Node::start` an empty storage directory and, on a build

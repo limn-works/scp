@@ -21,7 +21,7 @@
 //! creating one on its `Generate` path. Every run uses a new, empty directory
 //! (below), so every run takes `Generate`. On a build without `testing` that path
 //! returns `NoPreRotationBackend` whatever custody or storage is supplied: it
-//! takes no `PreRotationCustody` input, the backend spec §9.7.4.1 §3 requires,
+//! takes no `PreRotationCustody` input, the backend spec §9.7.4.1 item 3 requires,
 //! so it fails closed here instead of minting a nullifier-backed identity.
 //!
 //! The `PORT` env var overrides the listen port, which defaults to 8080.
