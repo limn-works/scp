@@ -2961,7 +2961,7 @@ impl PerContextState {
     /// Processes an incoming sender-key distribution message, returning the
     /// AUTHENTICATED `(sender_key, epoch)` — verbatim from
     /// [`NodeMlsFactory::process_incoming_sender_key`]. The DHKEM(P-256) wrapping
-    /// secret enters as a parameter (node-resident); this method installs
+    /// secret enters as a parameter (the identity's, spec 09 §9.16.1); this method installs
     /// nothing and reads no crypto state (the caller gates + installs via
     /// [`Self::set_sender_key_unchecked`]).
     ///
@@ -3071,8 +3071,9 @@ impl PerContextState {
     /// Exports the per-context crypto state as an opaque, restore-compatible
     /// byte blob, verbatim from the former provider `export_crypto_state`. The
     /// two floor collections are caller-sourced (authoritative Class-M
-    /// registry); the DHKEM(P-256) wrapping scalar enters as a parameter
-    /// (node-resident; its public point is derived on restore). The send-side sequence counter is read from
+    /// registry). The blob carries no DHKEM(P-256) wrapping key: that key is
+    /// one per identity (spec 09 §9.16.1; spec 10 §10.8.1(4)) and persists on
+    /// its own. The send-side sequence counter is read from
     /// [`PerContextState::send_tracker`] (the actor's home for the provider's
     /// former `send_sequence`).
     ///
@@ -3088,7 +3089,6 @@ impl PerContextState {
         &self,
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
-        wrapping_secret_key: &[u8],
     ) -> Result<Vec<u8>, ContextError> {
         let ContextModeState::Encrypted(crypto) = &self.mode else {
             return Ok(Vec::new());
@@ -3161,7 +3161,6 @@ impl PerContextState {
                 .collect(),
             signer_bytes: std::mem::take(&mut signer_bytes),
             group_id,
-            wrapping_secret_key: wrapping_secret_key.to_vec(),
         };
 
         let result = rmp_serde::to_vec_named(&snapshot)
@@ -4176,6 +4175,7 @@ mod crypto_ops_golden {
     use super::*;
     use crate::crypto::mls::provider::NodeMlsFactory;
     use crate::crypto::mls::two_party_test_support::{TwoPartyPair, stand_up_two_party};
+    use crate::crypto::wrapping::WrappingKeyPair;
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
 
@@ -4187,27 +4187,28 @@ mod crypto_ops_golden {
     /// [`PerContextState`] via the #2148 owned-return constructors + the
     /// production `seed_encrypted_crypto_from_owned` primitive (no provider
     /// `take_crypto_state` round-trip). Returns
-    /// `(alice_provider, alice_state, bob_provider, bob_state, ctx)`: each
-    /// [`PerContextState`] already OWNS its per-context crypto, and each provider
-    /// is retained solely for its node-resident wrapping keypair.
+    /// `(alice_wrapping, alice_state, bob_wrapping, bob_state, ctx)`: each
+    /// [`PerContextState`] already OWNS its per-context crypto, beside each
+    /// party's wrapping keypair.
     fn setup() -> (
-        Arc<NodeMlsFactory>,
+        Arc<WrappingKeyPair>,
         PerContextState,
-        Arc<NodeMlsFactory>,
+        Arc<WrappingKeyPair>,
         PerContextState,
         [u8; 32],
     ) {
         let TwoPartyPair {
-            alice_provider,
+            alice_wrapping,
             alice_state,
-            bob_provider,
+            bob_wrapping,
             bob_state,
             ctx_bytes,
+            ..
         } = stand_up_two_party(CTX_STR, ALICE, BOB);
         (
-            alice_provider,
+            alice_wrapping,
             alice_state,
-            bob_provider,
+            bob_wrapping,
             bob_state,
             ctx_bytes,
         )
@@ -4365,12 +4366,6 @@ mod crypto_ops_golden {
         }
     }
 
-    /// Bob's node-resident P-256 wrapping secret (the HPKE-open key the actor
-    /// receive half takes as a parameter).
-    fn bob_wrapping_secret(bob_p: &NodeMlsFactory) -> [u8; 32] {
-        *bob_p.wrapping_keypair_snapshot().1
-    }
-
     #[test]
     fn golden_seal_open_cross_roundtrip() {
         let (_alice_p, mut alice_a, _bob_p, mut bob_a, ctx) = setup();
@@ -4439,7 +4434,7 @@ mod crypto_ops_golden {
     fn golden_seal_open_after_rotate_nonzero_epoch() {
         let (_alice_p, mut alice_a, bob_p, mut bob_recv_a, ctx) = setup();
         let rid = routing(&ctx);
-        let bob_secret = bob_wrapping_secret(&bob_p);
+        let bob_secret: [u8; 32] = **bob_p.secret();
         let inner = build_inner(ALICE, 0);
 
         // --- Actor path: actor rotate + actor seal + actor open. ---
@@ -4496,7 +4491,7 @@ mod crypto_ops_golden {
         let (_alice_p, mut alice_a, bob_p, mut bob_a, ctx) = setup();
         let rid = routing(&ctx);
         // Bob's node-resident wrapping secret (the actor path's HPKE-open key).
-        let bob_secret = bob_wrapping_secret(&bob_p);
+        let bob_secret: [u8; 32] = **bob_p.secret();
 
         // Rotate ONCE on the actor so Alice holds a single rotated key at a
         // non-zero epoch.
@@ -4648,8 +4643,7 @@ mod crypto_ops_golden {
     fn golden_distribute_and_process_recover_identical_key() {
         let (_alice_p, mut alice_a, bob_p, mut bob_a, ctx) = setup();
         // Bob's wrapping secret (node-resident) — the actor path's HPKE-open key.
-        let (_bob_pub, bob_secret) = bob_p.wrapping_keypair_snapshot();
-        let bob_secret: [u8; 32] = *bob_secret;
+        let bob_secret: [u8; 32] = **bob_p.secret();
 
         // Actor distributes Alice's CURRENT (unrotated) sender key.
         alice_a.distribute_sender_key(ALICE, BOB).unwrap();
@@ -4693,8 +4687,7 @@ mod crypto_ops_golden {
     #[test]
     fn golden_rotate_sender_key_parity() {
         let (_alice_p, mut alice_a, bob_p, bob_a, _ctx) = setup();
-        let (_bob_pub, bob_secret) = bob_p.wrapping_keypair_snapshot();
-        let bob_secret: [u8; 32] = *bob_secret;
+        let bob_secret: [u8; 32] = **bob_p.secret();
 
         let epoch_before = alice_a.local_sender_key_epoch();
         assert_eq!(
@@ -4726,7 +4719,7 @@ mod crypto_ops_golden {
     #[test]
     fn golden_advance_epoch_parity() {
         let (alice_p, mut alice_a, _bob_p, mut bob_from_actor, _ctx) = setup();
-        let (wpub, _wsec) = alice_p.wrapping_keypair_snapshot();
+        let wpub = *alice_p.public();
 
         // `advance_epoch` self-merges the committer's Update+Commit, advancing
         // the local MLS epoch by one.
@@ -4792,19 +4785,14 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_export_restore_equivalent() {
-        let (alice_p, alice_a, _bob_p, _bob_a, ctx) = setup();
-        // Use Alice's provider wrapping keypair so the actor export embeds the
-        // SAME node-resident wrapping material a restore needs.
-        let (_, wsec) = alice_p.wrapping_keypair_snapshot();
+        let (_alice_p, alice_a, _bob_p, _bob_a, ctx) = setup();
 
         // Capture the ORIGINAL group-context extension + local epoch off the live
         // actor (export is non-destructive) as the golden restore target.
         let orig_ext = alice_a.group_context_extension().unwrap();
         let orig_epoch = alice_a.local_sender_key_epoch();
 
-        let blob_a = alice_a
-            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
-            .unwrap();
+        let blob_a = alice_a.export_crypto_state(Vec::new(), Vec::new()).unwrap();
         assert!(!blob_a.is_empty());
 
         // Functional restore equivalence: rebuild the owned material on a fresh
@@ -4812,8 +4800,7 @@ mod crypto_ops_golden {
         // insert-path `restore_crypto_state` twin is gone), reseed an actor, and
         // confirm it agrees with the ORIGINAL on the group-context extension and
         // local sender-key epoch.
-        let reader_provider = NodeMlsFactory::new(ALICE.to_owned(), Arc::new(SystemClock));
-        let (owned, _floors) = reader_provider.build_restored_owned(&ctx, &blob_a).unwrap();
+        let (owned, _floors) = NodeMlsFactory::build_restored_owned(&ctx, &blob_a).unwrap();
         let mut restored =
             PerContextState::new_for_test_encrypted(ctx, 0, DID::from(ALICE.to_owned()));
         restored.seed_encrypted_crypto_from_owned(owned);
@@ -4831,19 +4818,18 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_destroy_mls_group_empties_export() {
-        let (alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
-        let (_, wsec) = alice_p.wrapping_keypair_snapshot();
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
 
         assert!(
             !alice_a
-                .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
+                .export_crypto_state(Vec::new(), Vec::new())
                 .unwrap()
                 .is_empty()
         );
         alice_a.destroy_mls_group().unwrap();
         assert!(
             alice_a
-                .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
+                .export_crypto_state(Vec::new(), Vec::new())
                 .unwrap()
                 .is_empty(),
             "destroy_mls_group makes export return empty (the group map entry is \

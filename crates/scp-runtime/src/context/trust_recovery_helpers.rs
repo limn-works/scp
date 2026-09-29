@@ -234,11 +234,15 @@ pub async fn recovery_advance_epoch(
     //    (SCP-CRYPTOMOVE-001): now driven on the actor `state.mode` via
     //    `commit_class_s_keep` -> `rest_mut` — §9 Class-S, the ratchet is durable
     //    before the Commit is broadcast (this is the highest-stakes safety-gated
-    //    advance; see the broadcast note below). `wrapping_public_key` from the
-    //    retained `deps.crypto.wrapping_keypair()`. If this fails (or its
+    //    advance; see the broadcast note below). The Update keeps publishing
+    //    the identity's wrapping key (spec 09 §9.16.1); with none loaded it
+    //    fails closed before anything ratchets. If this fails (or its
     //    fail-closed persist fails) the error `?`-propagates and the bookkeeping
     //    counter is NOT incremented — disposition preserved.
-    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    let wrapping_public_key = *deps
+        .supervisor
+        .my_wrapping_keypair(&deps.owned_identity)?
+        .public();
     let epoch_commit_bytes = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             v.rest_mut()
@@ -541,14 +545,12 @@ fn persist_state_best_effort<'d, 'c>(
     // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
     // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
     // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
-    // on the actor's `state` (was the provider); the P-256 wrapping keypair enters
-    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
-    // sequence is read from `state.send_tracker` inside the twin.
-    let (_, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    // on the actor's `state` (was the provider), and the send sequence is read
+    // from `state.send_tracker` inside the twin. The blob carries no wrapping
+    // key: the identity's pair persists on its own (spec 09 §9.16.1).
     match state.export_crypto_state(
         deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
         deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
-        &*wrapping_secret_key,
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {

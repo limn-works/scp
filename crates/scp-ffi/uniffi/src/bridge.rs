@@ -89,18 +89,21 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 /// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
 /// used to accept `None`, but real MLS rejects it.
 ///
-/// Uses `None` for the wrapping key so the leaf **declares the `0xFF02`
-/// (`scp_context_params`) capability** — mandatory to be added to an encrypted
-/// context group (`valn0502`, §5.13.3) — without attaching a wrapping-key leaf
-/// extension (this single-process membership path retains no joiner private
-/// state). The base `generate_key_package` declares no SCP capabilities and
-/// real MLS rejects it from a context group.
+/// The leaf **declares the `0xFF02` (`scp_context_params`) capability** —
+/// mandatory to be added to an encrypted context group (`valn0502`, §5.13.3) —
+/// and carries `wrapping_public` as its `0xFF01` extension: the identity's
+/// wrapping public key, whose secret the supervisor holds (spec 09 §9.16.1).
+/// The base `generate_key_package` declares no SCP capabilities and real MLS
+/// rejects it from a context group.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Crypto` if the DID format is invalid (must be
 /// `did:dht:z…`), key package generation fails, or TLS serialization fails.
-fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
+fn generate_mls_key_package_bytes(
+    did: &str,
+    wrapping_public: &[u8; 65],
+) -> Result<Vec<u8>, ScpError> {
     use scp_core::crypto::mls::credential::ScpCredential;
     use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -113,13 +116,15 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
             }
         })?;
 
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| ScpError::Crypto {
-                msg: format!("MLS key package generation failed: {e}"),
-                code: codes::CRYPTO_4011.to_owned(),
-            },
-        )?;
+    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(
+        &cred,
+        Some(wrapping_public),
+        &scp_clock::SystemClock,
+    )
+    .map_err(|e| ScpError::Crypto {
+        msg: format!("MLS key package generation failed: {e}"),
+        code: codes::CRYPTO_4011.to_owned(),
+    })?;
 
     kp_bundle
         .key_package()
@@ -11167,7 +11172,11 @@ impl Scp {
                 // `NodeMlsFactory` requires `Some(bytes)` — the old DID-less
                 // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
                 // it with real MLS crypto across every bridge entry point.
-                let kp_bytes = generate_mls_key_package_bytes(&identity.did)?;
+                let wrapping_public = sup
+                    .wrapping_public_key(&identity.did.clone().into())
+                    .await
+                    .map_err(ScpError::from)?;
+                let kp_bytes = generate_mls_key_package_bytes(&identity.did, &wrapping_public)?;
                 let key_package = KeyPackage {
                     owner_did: identity.did.clone().into(),
                     mls_key_package_bytes: Some(kp_bytes),

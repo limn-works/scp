@@ -7,9 +7,10 @@
 //! #2148 (ADR-049 birth-into-actor) — provider per-context-state DISSOLUTION.
 //! The provider holds NO per-context state: the `contexts` / `broadcast_keys`
 //! `DashMap`s and the `taken_context_ids` `DashSet` are DELETED. The provider is
-//! now a node-level MLS-birth / HPKE helper — local DID, injected clock,
-//! MLS/HPKE backends, and the node-resident DHKEM(P-256) wrapping keypair
-//! (`ArcSwap<...>` for atomic rotation; §9.16.1). The birth constructors
+//! now a node-level MLS-birth / HPKE helper — local DID, injected clock, and
+//! MLS/HPKE backends. The DHKEM(P-256) wrapping keypair is per identity (spec 09
+//! §9.16.1) and owned by the supervisor; the methods that use it take it as a
+//! parameter. The birth constructors
 //! ([`NodeMlsFactory::create_mls_group_with_context`],
 //! [`NodeMlsFactory::install_joined_group`]) and the restore seam
 //! ([`NodeMlsFactory::build_restored_owned`]) return
@@ -33,20 +34,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use scp_clock::Clock;
 use scp_did::SigningKeyId;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use super::backend::MlsBackend;
 use super::production_backend::ProductionMlsBackend;
 use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
-use crate::crypto::wrapping::WrappingKeyPair;
 use scp_mls::credential::ScpCredential;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use scp_mls::validate_key_package_lifetime;
@@ -80,7 +78,6 @@ use scp_protocol::crypto::sender_keys::{
 ///
 /// - `signer_bytes` — P-256 private signing scalar (MLS credential signer, cs2)
 /// - `local_sender_key` — AES-256 sender key (per-context message encryption)
-/// - `wrapping_secret_key` — P-256 scalar (HPKE-sealed sender key decryption)
 /// - `mls_storage_entries` — `OpenMLS` `MemoryStorage` dump, which includes MLS
 ///   epoch secrets, HPKE private keys, and the key schedule
 ///
@@ -168,12 +165,6 @@ pub(crate) struct MlsCryptoSnapshot {
     /// defense-in-depth at the sender-key layer.
     #[serde(default)]
     pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
-    /// The provider-level DHKEM(P-256) wrapping secret scalar (§9.16.1), the
-    /// only persisted half: restore derives the public point from it, so a
-    /// restored provider keeps publishing the key its remote members sealed
-    /// sender keys to. Wrapped in a `Vec<u8>` for serde compatibility; restore
-    /// requires a 32-byte scalar in `[1, n − 1]`, re-wrapped in [`Zeroizing`].
-    pub(crate) wrapping_secret_key: Vec<u8>,
 }
 
 // SECURITY: Manual Debug impl redacts all sensitive key material.
@@ -209,7 +200,6 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
             )
             .field("signer_bytes", &"[REDACTED]")
             .field("group_id", &format_args!("[{} bytes]", self.group_id.len()))
-            .field("wrapping_secret_key", &"[REDACTED]")
             .finish()
     }
 }
@@ -235,7 +225,6 @@ impl MlsCryptoSnapshot {
     pub(crate) fn zeroize_secrets(&mut self) {
         self.signer_bytes.zeroize();
         self.local_sender_key.zeroize();
-        self.wrapping_secret_key.zeroize();
         for (_, value) in &mut self.mls_storage_entries {
             value.zeroize();
         }
@@ -430,20 +419,16 @@ pub struct RestoredFloors {
 /// the per-context actor's single-threaded command loop (ADR-049), so
 /// contention on these mutexes is minimal.
 ///
-/// # Wrapping-keypair atomicity (ADR-049 PR-7 hardening H3)
+/// # Wrapping keypair
 ///
-/// The node-resident DHKEM(P-256) wrapping keypair is stored as a SINGLE
-/// [`WrappingKeyPair`] behind ONE [`ArcSwap`], so the public and secret halves
-/// rotate and are read as one unit. A prior design held the two halves in two
-/// separate `ArcSwap` slots; a reader that loaded the public half and then the
-/// secret half across two `.load()` calls could observe a torn pair (public of
-/// generation N with secret of N+1) if a rotation interleaved. That is closed by
-/// construction here: every read goes through a single `.load()` of the combined
-/// slot (see [`NodeMlsFactory::wrapping_keypair`]).
+/// The factory holds no DHKEM(P-256) wrapping keypair. That keypair is one per
+/// identity (spec 09 §9.16.1; spec 10 §10.8.1(4)) and its only owner is the
+/// supervisor's per-identity map; every method here that publishes or opens
+/// with it takes it as a parameter.
 ///
 /// Renamed from `MlsCryptoProvider` in #2185: after #2148 (birth-into-actor)
 /// this type holds NO per-context state - it is a node-level MLS-birth + HPKE
-/// helper (node DID, injected clock, MLS/HPKE backends, node wrapping keypair);
+/// helper (node DID, injected clock, MLS/HPKE backends);
 /// per-context crypto lives on the actor's `PerContextState` by move.
 pub struct NodeMlsFactory {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
@@ -475,20 +460,7 @@ pub struct NodeMlsFactory {
     // cross-map TOCTOU by construction: there is no check-then-insert to race;
     // the supervisor registry's atomic first-writer-wins insert is the sole
     // double-birth guard. The provider is now a node-level MLS-birth / HPKE
-    // helper (local DID, clock, MLS/HPKE backends, node wrapping keypair).
-    /// Node-resident DHKEM(P-256) wrapping keypair for sender key HPKE (§9.16.1) —
-    /// public half published in the MLS `LeafNode` `scp_wrapping_key` extension,
-    /// secret half used to open HPKE-sealed sender key responses.
-    ///
-    /// Held as a SINGLE [`WrappingKeyPair`] behind ONE [`ArcSwap`] (ADR-049 PR-7
-    /// hardening H3) so the pair rotates and is read atomically — the
-    /// snapshot-restore path (which takes `&self`) replaces both halves in one
-    /// `.store()`, and every reader loads both halves from one `.load()`,
-    /// closing the two-slot torn-read window. Rotation is atomic and the prior
-    /// key material is zeroized when the last `Arc` to the pair drops. Reader
-    /// discipline (load → use → drop within the same poll) is enforced at every
-    /// callsite — no callsite stores the loaded `Arc` in a struct field.
-    wrapping_keypair: ArcSwap<WrappingKeyPair>,
+    // helper (local DID, clock, MLS/HPKE backends).
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -546,7 +518,6 @@ impl NodeMlsFactory {
             clock,
             mls_backend,
             hpke_backend,
-            wrapping_keypair: ArcSwap::from_pointee(WrappingKeyPair::generate()),
         }
     }
 
@@ -663,14 +634,12 @@ impl NodeMlsFactory {
     pub fn create_mls_group_with_context(
         &self,
         context_extension: &scp_protocol::context::ScpContextExtension,
+        wrapping_public_key: &[u8; 65],
     ) -> Result<OwnedMlsCryptoState, ContextCreationError> {
         let credential = self.make_credential()?;
-        // Load through ArcSwap; the guard is dropped as the public point is
-        // copied into the stack array (load → copy → drop within the poll).
-        let wrapping_pk = *self.wrapping_keypair.load().public();
         let mls_group = group::create_group_with_context(
             &credential,
-            &wrapping_pk,
+            wrapping_public_key,
             context_extension,
             self.clock.as_ref(),
         )
@@ -737,12 +706,14 @@ impl NodeMlsFactory {
     /// Returns [`ContextCreationError::CryptoFailed`] if credential creation or
     /// MLS group creation fails.
     #[cfg(any(test, feature = "testing"))]
-    pub fn create_bare_group_owned(&self) -> Result<OwnedMlsCryptoState, ContextCreationError> {
+    pub fn create_bare_group_owned(
+        &self,
+        wrapping_public_key: &[u8; 65],
+    ) -> Result<OwnedMlsCryptoState, ContextCreationError> {
         let credential = self.make_credential()?;
-        let wrapping_pk = *self.wrapping_keypair.load().public();
         let mls_group = group::create_group_with_wrapping_key(
             &credential,
-            Some(&wrapping_pk),
+            Some(wrapping_public_key),
             self.clock.as_ref(),
         )
         .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
@@ -874,6 +845,7 @@ impl NodeMlsFactory {
         context_id: &[u8; 32],
         sender_did: &str,
         message_bytes: &[u8],
+        wrapping_secret_key: &[u8; 32],
     ) -> Result<(SenderKey, u64), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
 
@@ -883,21 +855,15 @@ impl NodeMlsFactory {
 
         match msg {
             SenderKeyDistributionMessage::KeyResponse(response) => {
-                // ADR-049 §15: load wrapping secret through
-                // `ArcSwap`. The returned `Arc` is held only for the
-                // duration of the HPKE-open call (no `.await` between
-                // load and drop).
-                let wrapping_keypair_guard = self.wrapping_keypair.load();
                 let sender_key = crate::crypto::sender_keys::key_protocol::hpke_open_sender_key(
                     &response.hpke_sealed_key,
                     &response.ephemeral_pubkey,
-                    wrapping_keypair_guard.secret(),
+                    wrapping_secret_key,
                     &ctx_id_hex,
                     &response.sender_did,
                     response.epoch,
                 )
                 .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
-                drop(wrapping_keypair_guard);
 
                 // Verify the sender DID matches the claimed sender. This is
                 // AUTHENTICATION (the HPKE tag + DID binding), NOT floor gating,
@@ -932,41 +898,6 @@ impl NodeMlsFactory {
     // seams live on the actor-owned `ContextCryptoState` (`context/actor/state.rs`);
     // tests drive them there.
 
-    /// Test-only snapshot of the provider's identity-level DHKEM(P-256) wrapping
-    /// keypair (§9.16.1): `(public, secret)`. Lets the full-stack harness
-    /// publish the provider's OWN self-consistent keypair into the joiner's
-    /// `Supervisor::set_wrapping_keys` slot so the pooled `KeyPackage`'s `0xFF01`
-    /// wrapping-leaf pubkey and the secret this provider opens sender keys with
-    /// stay the SAME keypair across the reserve → `spawn_actor_from_welcome` join
-    /// migration. The wrapping SECRET never leaves the provider in a prod build.
-    #[cfg(any(test, feature = "testing"))]
-    #[must_use]
-    pub fn wrapping_keypair_snapshot(&self) -> ([u8; 65], zeroize::Zeroizing<[u8; 32]>) {
-        self.wrapping_keypair()
-    }
-
-    /// Returns a copy of this provider's node-resident DHKEM(P-256) wrapping keypair
-    /// `(public, secret)` from a SINGLE atomic `ArcSwap` load (ADR-049 PR-7
-    /// hardening H3). The public half is the HPKE recipient key advertised in
-    /// the `0xFF01` wrapping leaf; the secret half opens sender keys sealed to
-    /// this member and is returned in [`zeroize::Zeroizing`] so it zeroes on
-    /// drop (no bare `[u8; 32]` secret escapes the provider).
-    ///
-    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / hardening H3: the Prep A
-    /// per-context crypto methods on `PerContextState` take the node-resident
-    /// wrapping keypair as a METHOD PARAMETER (never stored on
-    /// `ContextCryptoState`). The atomic core actor-seeding path
-    /// (SCP-CRYPTOMOVE-001) reads the keypair off the provider to hand it in.
-    /// This SINGLE combined accessor supersedes the earlier two separate
-    /// `wrapping_public_key()` / `wrapping_secret()` accessors: reading both
-    /// halves through one `.load()` makes the pair atomic by construction, so a
-    /// rotation can never pair a public of generation N with a secret of N+1.
-    #[must_use]
-    pub(crate) fn wrapping_keypair(&self) -> ([u8; 65], zeroize::Zeroizing<[u8; 32]>) {
-        let guard = self.wrapping_keypair.load();
-        (*guard.public(), guard.secret().clone())
-    }
-
     /// Reconstructs the per-context MLS crypto MATERIAL from a persisted
     /// snapshot and RETURNS it as an owned [`OwnedMlsCryptoState`] plus the
     /// Class-M [`RestoredFloors`].
@@ -975,20 +906,10 @@ impl NodeMlsFactory {
     /// The restore / respawn / cold-restart / import caller
     /// (`lifecycle_helpers`) seeds the per-context actor directly from the
     /// returned material — the provider holds no per-context state to install
-    /// into. This method restores the node-level DHKEM(P-256) wrapping keypair as a
-    /// `&self` side effect but touches no per-context map (there is none) and
-    /// imports nothing from `context::actor` (the owned payload is the boundary
-    /// shape between the provider and the actor).
-    ///
-    /// # Side effect — node-level wrapping keypair
-    ///
-    /// The DHKEM(P-256) wrapping keypair (§9.16.1) is node-level, NOT per-context and
-    /// NOT part of [`OwnedMlsCryptoState`]; the atomic-core actor reads it via
-    /// the Prep B `pub(crate)` accessors
-    /// ([`wrapping_keypair`](Self::wrapping_keypair)). This method restores it into
-    /// the provider's `ArcSwap` slots here, in the same order the legacy insert
-    /// path did (before the caller installs the per-context material), so both
-    /// restore paths keep byte-parity.
+    /// into. It has no side effect: a snapshot carries no wrapping keypair
+    /// (that keypair is one per identity, spec 09 §9.16.1, owned by the
+    /// supervisor), so restoring one context never changes the key every other
+    /// context of the identity publishes.
     ///
     /// # Errors
     ///
@@ -997,7 +918,6 @@ impl NodeMlsFactory {
     /// `restore_crypto_state`), if deserialization
     /// fails, or if the data is corrupt.
     pub(crate) fn build_restored_owned(
-        &self,
         context_id: &[u8; 32],
         data: &[u8],
     ) -> Result<(OwnedMlsCryptoState, RestoredFloors), ContextError> {
@@ -1150,51 +1070,6 @@ impl NodeMlsFactory {
             member_wrapping_keys,
         };
 
-        // Restore the provider-level (node-level) DHKEM(P-256) wrapping keypair
-        // before returning the owned material to the caller (the legacy
-        // `restore_crypto_state` path installs that material into the contexts
-        // map immediately after; the atomic core seeds the actor from it). This
-        // preserves the original ordering — the keypair rotates before any
-        // per-context entry becomes observable — so a reader never sees a
-        // partial pairing of new wrapping key with stale context state.
-        //
-        // ADR-049 PR-7 hardening H3: the wrapping keypair is a SINGLE
-        // `ArcSwap<WrappingKeypair>` slot, so the public and secret halves
-        // rotate in ONE atomic `.store()` — an in-flight reader always sees a
-        // consistent pair (either old/old or new/new). This closes the
-        // prior two-store window where one slot could be observed rotated
-        // while the other lagged.
-        //
-        // Only the scalar is persisted; the public point is derived from it,
-        // so a restored pair cannot disagree with itself. A secret that is not
-        // a 32-byte scalar in `[1, n − 1]` fails the restore closed before the
-        // slot changes.
-        //
-        // SECURITY: the intermediate secret is `Zeroizing` from the copy on, so
-        // it is zeroed on drop even on the `?` returns below.
-        let secret: Zeroizing<[u8; 32]> = Zeroizing::new(
-            snapshot
-                .wrapping_secret_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    ContextError::CryptoFailed(format!(
-                        "restored wrapping secret key must be 32 bytes, got {}",
-                        snapshot.wrapping_secret_key.len()
-                    ))
-                })?,
-        );
-        let pair = WrappingKeyPair::from_secret(secret).map_err(|e| {
-            ContextError::CryptoFailed(format!("restored wrapping secret key: {e}"))
-        })?;
-        self.wrapping_keypair.store(Arc::new(pair));
-
-        // SECURITY: Zeroize the wrapping secret key bytes remaining in the
-        // snapshot. The key has been copied into the Zeroizing<[u8; 32]> guard
-        // above, so this intermediate Vec should not retain raw P-256 secret
-        // key material.
-        snapshot.wrapping_secret_key.zeroize();
-
         // #2148 (ADR-049 birth-into-actor): this method hands the per-context
         // crypto material OUT to seed an actor's `PerContextState` (welcome /
         // restore / respawn / cold-restart) and touches no provider map (there
@@ -1251,6 +1126,7 @@ impl NodeMlsFactory {
 )]
 mod tests {
     use super::*;
+    use crate::crypto::wrapping::WrappingKeyPair;
     use scp_clock::SystemClock;
     use scp_mls::group::generate_key_package;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -1277,7 +1153,7 @@ mod tests {
     // were RELOCATED onto the actor's `PerContextState`. The provider retains
     // only the birth/restore machinery (`create_mls_group[_with_context]`,
     // `add_member`, `take_crypto_state`, `build_restored_owned`, `with_context`,
-    // `wrapping_keypair`, `destroy_*`, `validate_key_package`) plus the
+    // `destroy_*`, `validate_key_package`) plus the
     // receive-side primitives (`distribute_sender_key`,
     // `process_incoming_sender_key`, `set_sender_key_unchecked`,
     // `store_member_sender_key`). The helpers below drive the relocated actor
@@ -1302,8 +1178,18 @@ mod tests {
     /// binds its OWN `ctx_str` in the AEAD AAD, independent of the group's
     /// committed extension, so a bare group exercises those seams identically.
     fn take_into_actor(provider: &NodeMlsFactory, ctx: &[u8; 32]) -> PerContextState {
+        take_into_actor_with(provider, ctx, WrappingKeyPair::generate().public())
+    }
+
+    /// [`take_into_actor`] with the wrapping public key the own leaf publishes
+    /// in `0xFF01`.
+    fn take_into_actor_with(
+        provider: &NodeMlsFactory,
+        ctx: &[u8; 32],
+        wrapping_public_key: &[u8; 65],
+    ) -> PerContextState {
         let owned = provider
-            .create_bare_group_owned()
+            .create_bare_group_owned(wrapping_public_key)
             .expect("birth owned crypto material");
         let mut state =
             PerContextState::new_for_test_encrypted(*ctx, 0, DID::from(provider.local_did.clone()));
@@ -1313,18 +1199,15 @@ mod tests {
 
     /// Birth a fresh owned context on `provider`, seed it onto a throwaway actor
     /// state, and export the crypto through the actor
-    /// [`PerContextState::export_crypto_state`] seam — sourcing the node-resident
-    /// wrapping keypair (public + secret) from the provider exactly as the
-    /// production actor-export caller does.
+    /// [`PerContextState::export_crypto_state`] seam.
     fn actor_export(
         provider: &NodeMlsFactory,
         ctx: &[u8; 32],
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
     ) -> Result<Vec<u8>, ContextError> {
-        let (_, wsec) = provider.wrapping_keypair();
         let state = take_into_actor(provider, ctx);
-        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, &*wsec)
+        state.export_crypto_state(sender_key_epochs, recv_sequence_floors)
     }
 
     /// #2148 (ADR-049 birth-into-actor): birth an owned context onto a throwaway
@@ -1340,11 +1223,10 @@ mod tests {
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
         mutate: impl FnOnce(&mut crate::context::actor::ContextCryptoState),
     ) -> Vec<u8> {
-        let (_, wsec) = provider.wrapping_keypair();
         let mut state = take_into_actor(provider, ctx);
         mutate(actor_crypto_mut(&mut state));
         state
-            .export_crypto_state(sender_key_epochs, recv_sequence_floors, &*wsec)
+            .export_crypto_state(sender_key_epochs, recv_sequence_floors)
             .expect("export seeded actor crypto")
     }
 
@@ -1372,47 +1254,6 @@ mod tests {
                 panic!("expected encrypted mode")
             }
         }
-    }
-
-    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / hardening H3: the single
-    /// `pub(crate)` `wrapping_keypair()` accessor that the atomic core
-    /// actor-seeding path (SCP-CRYPTOMOVE-001) reads must return a
-    /// self-consistent `(public, secret)` pair from ONE atomic `ArcSwap` load,
-    /// stable across repeated calls, and must observe the SAME node-resident
-    /// keypair as the test-gated
-    /// [`NodeMlsFactory::wrapping_keypair_snapshot`] ground truth. Also pins
-    /// the contract that the secret half returns `Zeroizing` (no bare
-    /// `[u8; 32]` secret escapes the provider) via a load-bearing type witness.
-    #[test]
-    fn wrapping_keypair_single_load_matches_snapshot_and_secret_is_zeroizing() {
-        let provider = make_provider();
-
-        // Ground truth: the identity-level wrapping keypair as the test-gated
-        // snapshot reports it (which now delegates to `wrapping_keypair`).
-        let (snap_pub, snap_sec) = provider.wrapping_keypair_snapshot();
-
-        // The single combined accessor returns the SAME pair, and is stable
-        // across repeated calls (no torn read between the two halves).
-        let (pub1, sec1) = provider.wrapping_keypair();
-        let (pub2, sec2) = provider.wrapping_keypair();
-        assert_eq!(pub1, pub2, "wrapping_keypair() public half must be stable");
-        assert_eq!(
-            *sec1, *sec2,
-            "wrapping_keypair() secret half must be stable"
-        );
-        assert_eq!(
-            pub1, snap_pub,
-            "wrapping_keypair() public must match the snapshot"
-        );
-        assert_eq!(
-            *sec1, *snap_sec,
-            "wrapping_keypair() secret must match the snapshot"
-        );
-
-        // Type witness: the secret half is `Zeroizing<[u8; 32]>`, not a bare
-        // secret. This binding is load-bearing — it fails to compile if the
-        // signature ever regresses to a plain `[u8; 32]`.
-        let _sec_witness: zeroize::Zeroizing<[u8; 32]> = sec1;
     }
 
     /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): a normal sender-key rotation on the
@@ -1630,9 +1471,9 @@ mod tests {
 
         // Epoch advance moved onto `PerContextState::advance_epoch`, which sources
         // the node-resident wrapping public key as a parameter.
-        let (wpub, _wsec) = provider.wrapping_keypair();
+        let wrapping = WrappingKeyPair::generate();
         let mut actor = take_into_actor(&provider, &ctx_id);
-        let output = actor.advance_epoch(wpub);
+        let output = actor.advance_epoch(*wrapping.public());
         assert!(output.is_ok(), "advance_epoch failed: {output:?}");
         let output = output.unwrap();
         assert!(
@@ -1708,7 +1549,8 @@ mod tests {
         // node-resident wrapping public key in its own leaf node.
         let provider = make_provider();
         let ctx_id = make_context_id();
-        let actor = take_into_actor(&provider, &ctx_id);
+        let wrapping = WrappingKeyPair::generate();
+        let actor = take_into_actor_with(&provider, &ctx_id, wrapping.public());
 
         let group = actor_crypto(&actor)
             .mls_group
@@ -1717,8 +1559,8 @@ mod tests {
         let extracted = scp_mls::wrapping_extension::extract_own_wrapping_key(group).unwrap();
         assert_eq!(
             extracted,
-            Some(*provider.wrapping_keypair.load().public()),
-            "own leaf node must contain provider's wrapping public key"
+            Some(*wrapping.public()),
+            "own leaf node must contain the wrapping public key it was born with"
         );
     }
 
@@ -1758,7 +1600,8 @@ mod tests {
         let ctx_id = make_context_id();
 
         let ctx_hex = hex::encode(ctx_id);
-        let bob_wrapping_pk = *bob_provider.wrapping_keypair.load().public();
+        let bob_wrapping = WrappingKeyPair::generate();
+        let bob_wrapping_pk = *bob_wrapping.public();
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
@@ -1780,8 +1623,12 @@ mod tests {
         let msg = SenderKeyDistributionMessage::KeyResponse(response);
         let serialized = msg.to_bytes().unwrap();
 
-        let result =
-            bob_provider.process_incoming_sender_key(&ctx_id, "did:dht:z6MkCharlie", &serialized);
+        let result = bob_provider.process_incoming_sender_key(
+            &ctx_id,
+            "did:dht:z6MkCharlie",
+            &serialized,
+            bob_wrapping.secret(),
+        );
         assert!(
             result.is_err(),
             "should reject when sender_did doesn't match transport sender"
@@ -1801,10 +1648,7 @@ mod tests {
         let unknown_ctx = [0xFFu8; 32];
         let state =
             PerContextState::new_for_test_encrypted(unknown_ctx, 0, DID::from(TEST_DID.to_owned()));
-        let (_, wsec) = make_provider().wrapping_keypair();
-        let exported = state
-            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
-            .unwrap();
+        let exported = state.export_crypto_state(Vec::new(), Vec::new()).unwrap();
         assert!(
             exported.is_empty(),
             "should return empty Vec for a context with no MLS group"
@@ -1859,10 +1703,7 @@ mod tests {
         };
 
         // Export crypto state through the actor seam.
-        let (_, wsec) = provider.wrapping_keypair();
-        let exported = actor
-            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
-            .unwrap();
+        let exported = actor.export_crypto_state(Vec::new(), Vec::new()).unwrap();
         assert!(!exported.is_empty(), "exported state should be non-empty");
 
         // Rebuild the owned material on a fresh provider via the RETAINED restore
@@ -1872,8 +1713,7 @@ mod tests {
         // round-trip across the restored group is pinned by
         // `context::actor::state`'s `golden_seal_open_cross_roundtrip` (which
         // seals from a restored, seeded actor state).
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (owned, _floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+        let (owned, _floors) = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
 
         // Verify sender key state is restored (on the owned material).
         {
@@ -1994,7 +1834,6 @@ mod tests {
 
         // Export with BOTH floor axes populated: per-sender epoch (bob, 5) and
         // intra-epoch recv floor ReceiveFloor { epoch: 5, sequence: 3 }.
-        let (_, wsec) = provider.wrapping_keypair();
         let exported = actor
             .export_crypto_state(
                 vec![(bob.to_owned(), 5)],
@@ -2005,14 +1844,12 @@ mod tests {
                         sequence: 3,
                     },
                 )],
-                &*wsec,
             )
             .unwrap();
         assert!(!exported.is_empty());
 
         // Fresh provider: build the owned material (no insert, no take).
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (owned, floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+        let (owned, floors) = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
 
         // (a) Owned 8 fields match the snapshot. mls_group functional-equiv is
         // the group-id parity + a readable epoch.
@@ -2094,10 +1931,8 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider_b = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (_owned_b, floors_b) = provider_b
-            .build_restored_owned(&ctx_id, &legacy_bytes)
-            .unwrap();
+        let (_owned_b, floors_b) =
+            NodeMlsFactory::build_restored_owned(&ctx_id, &legacy_bytes).unwrap();
 
         // The owned path seeds bob's legacy floor from the global counter (7).
         assert!(
@@ -2116,10 +1951,8 @@ mod tests {
     /// `Ok(default)` — see `restore_crypto_state_noop_on_empty_data`).
     #[test]
     fn build_restored_owned_rejects_empty_snapshot() {
-        let provider = make_provider();
         let ctx_id = make_context_id();
-        let err = provider
-            .build_restored_owned(&ctx_id, &[])
+        let err = NodeMlsFactory::build_restored_owned(&ctx_id, &[])
             .expect_err("empty snapshot must be rejected on the owned path");
         assert!(
             matches!(err, ContextError::CryptoFailed(_)),
@@ -2237,8 +2070,7 @@ mod tests {
 
         // Restart: fresh provider, rebuild the owned material via the retained
         // restore reader. The floor comes back in RestoredFloors.
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+        let (owned, restored) = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
         assert!(
             restored
                 .sender_epochs
@@ -2280,8 +2112,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+        let (owned, restored) = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
 
         // The removed-member floor survives in RestoredFloors …
         assert!(
@@ -2335,9 +2166,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (owned, restored) = provider2
-            .build_restored_owned(&ctx_id, &legacy_bytes)
+        let (owned, restored) = NodeMlsFactory::build_restored_owned(&ctx_id, &legacy_bytes)
             .expect("legacy snapshot (empty epoch map) must restore cleanly");
 
         // The legacy snapshot had no per-sender epoch map, so restore seeds every
@@ -2400,9 +2229,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (_owned, restored) = provider2
-            .build_restored_owned(&ctx_id, &legacy_bytes)
+        let (_owned, restored) = NodeMlsFactory::build_restored_owned(&ctx_id, &legacy_bytes)
             .expect("legacy restore must succeed");
 
         // OBSERVED BEHAVIOR (ADR-049 PR-6): the peer's restored floor in
@@ -2449,10 +2276,8 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (owned, restored) = provider2
-            .build_restored_owned(&ctx_id, &legacy_bytes)
-            .unwrap();
+        let (owned, restored) =
+            NodeMlsFactory::build_restored_owned(&ctx_id, &legacy_bytes).unwrap();
 
         // ADR-049 PR-6: the legacy seed (max(global, 1)) is returned in
         // RestoredFloors, clamped to at least 1 when the global counter is 0.
@@ -2476,11 +2301,10 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        let (_, wsec) = provider.wrapping_keypair();
         let mut actor = take_into_actor(&provider, &ctx_id);
         assert!(
             !actor
-                .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
+                .export_crypto_state(Vec::new(), Vec::new())
                 .unwrap()
                 .is_empty(),
             "live group must export non-empty state"
@@ -2489,9 +2313,7 @@ mod tests {
         actor.destroy_mls_group().unwrap();
 
         // After destroy, export should return empty (no MLS group).
-        let exported = actor
-            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
-            .unwrap();
+        let exported = actor.export_crypto_state(Vec::new(), Vec::new()).unwrap();
         assert!(
             exported.is_empty(),
             "destroyed group should export empty state"
@@ -2500,12 +2322,11 @@ mod tests {
 
     #[test]
     fn restore_rejects_corrupt_data() {
-        let provider = make_provider();
         let ctx_id = make_context_id();
 
         // The relocated restore reader is `build_restored_owned`; corrupt bytes
         // must fail to deserialize.
-        let result = provider.build_restored_owned(&ctx_id, b"not valid msgpack");
+        let result = NodeMlsFactory::build_restored_owned(&ctx_id, b"not valid msgpack");
         assert!(result.is_err(), "corrupt data should fail");
     }
 
@@ -2520,9 +2341,8 @@ mod tests {
         // must also yield working material (owned-return path, no insert to
         // clobber). Seed an actor from the second result and confirm it is a
         // coherent live encrypted state.
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (_owned1, _f1) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
-        let (owned2, _f2) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+        let (_owned1, _f1) = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
+        let (owned2, _f2) = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
 
         let mut actor =
             PerContextState::new_for_test_encrypted(ctx_id, 0, DID::from(TEST_DID.to_owned()));
@@ -2544,13 +2364,9 @@ mod tests {
             .expect("group present")
             .epoch()
             .unwrap();
-        let (_, wsec) = provider.wrapping_keypair();
-        let exported = actor
-            .export_crypto_state(Vec::new(), Vec::new(), &*wsec)
-            .unwrap();
+        let exported = actor.export_crypto_state(Vec::new(), Vec::new()).unwrap();
 
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let (owned, _floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+        let (owned, _floors) = NodeMlsFactory::build_restored_owned(&ctx_id, &exported).unwrap();
 
         // Verify epoch is preserved on the restored owned material.
         let epoch_after = owned.mls_group.epoch().unwrap();
@@ -2561,57 +2377,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_wrapping_key_persisted_across_restart() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-
-        // Capture the original wrapping keypair.
-        let original_public = *provider.wrapping_keypair.load().public();
-        let original_secret: [u8; 32] = **provider.wrapping_keypair.load().secret();
-
-        // Sanity: the keypair should not be all zeros.
-        assert_ne!(
-            original_public, [0u8; 65],
-            "wrapping public key must not be zero"
-        );
-        assert_ne!(
-            original_secret, [0u8; 32],
-            "wrapping secret key must not be zero"
-        );
-
-        // Export the crypto state through the relocated actor seam.
-        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
-        assert!(!exported.is_empty());
-
-        // Create a fresh provider (simulates restart — gets a NEW random keypair).
-        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let fresh_public = *provider2.wrapping_keypair.load().public();
-        assert_ne!(
-            fresh_public, original_public,
-            "fresh provider should have a DIFFERENT wrapping public key"
-        );
-
-        // Rebuild the owned material on the fresh provider. `build_restored_owned`
-        // restores the node-resident wrapping keypair into the provider's
-        // ArcSwap slots as a documented side effect (ADR-049 PR-7 OBS-2), which
-        // is exactly the persistence property this test pins.
-        let _ = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
-
-        // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
-        let restored_public = *provider2.wrapping_keypair.load().public();
-        let restored_secret: [u8; 32] = **provider2.wrapping_keypair.load().secret();
-
-        assert_eq!(
-            restored_public, original_public,
-            "wrapping public key must be restored from snapshot, not freshly generated"
-        );
-        assert_eq!(
-            restored_secret, original_secret,
-            "wrapping secret key must be restored from snapshot, not freshly generated"
-        );
-    }
-
     /// Exports a real cs2 snapshot for `ctx_id` and decodes it, so a test can
     /// tamper one field and re-encode it.
     fn exported_snapshot(provider: &NodeMlsFactory, ctx_id: &[u8; 32]) -> MlsCryptoSnapshot {
@@ -2619,76 +2384,14 @@ mod tests {
         rmp_serde::from_slice(&exported).unwrap()
     }
 
-    /// Restores `snapshot` on a fresh provider and returns the error text,
-    /// asserting that the fresh provider's wrapping keypair did not change
-    /// (a refused restore leaves the node-resident slot untouched).
+    /// Restores `snapshot` on a fresh provider and returns the error text.
     fn restore_error(snapshot: &MlsCryptoSnapshot) -> String {
         let bytes = rmp_serde::to_vec_named(snapshot).unwrap();
-        let fresh = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let before = *fresh.wrapping_keypair.load().public();
-        let err = match fresh.build_restored_owned(&make_context_id(), &bytes) {
+        match NodeMlsFactory::build_restored_owned(&make_context_id(), &bytes) {
             Err(ContextError::CryptoFailed(m)) => m,
             Err(other) => panic!("expected CryptoFailed, got {other:?}"),
             Ok(_) => panic!("tampered snapshot must not restore"),
-        };
-        assert_eq!(
-            *fresh.wrapping_keypair.load().public(),
-            before,
-            "a refused restore must not replace the wrapping keypair"
-        );
-        err
-    }
-
-    /// A persisted wrapping scalar outside `[1, n − 1]` (zero, or the group
-    /// order `n`) fails the restore closed instead of deriving a point.
-    #[test]
-    fn build_restored_owned_rejects_out_of_range_wrapping_secret() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        let n = hex::decode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
-            .unwrap();
-        for (case, secret) in [("zero", vec![0u8; 32]), ("n", n)] {
-            let mut snapshot = exported_snapshot(&provider, &ctx_id);
-            snapshot.wrapping_secret_key = secret;
-            let err = restore_error(&snapshot);
-            assert!(
-                err.contains("restored wrapping secret key"),
-                "{case}: {err}"
-            );
         }
-    }
-
-    /// Restore derives the published wrapping point from the persisted scalar:
-    /// a snapshot carrying scalar `1` restores a provider whose public key is
-    /// the P-256 base point `G`.
-    #[test]
-    fn build_restored_owned_derives_the_wrapping_point_from_the_scalar() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        let mut snapshot = exported_snapshot(&provider, &ctx_id);
-        let mut one = vec![0u8; 32];
-        one[31] = 1;
-        snapshot.wrapping_secret_key = one;
-        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
-        let fresh = make_provider();
-        let _restored = fresh.build_restored_owned(&ctx_id, &bytes).unwrap();
-        assert_eq!(
-            hex::encode(fresh.wrapping_keypair.load().public()),
-            "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296\
-             4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
-        );
-    }
-
-    /// A persisted wrapping secret that is not 32 bytes fails the
-    /// restore closed rather than keeping a freshly generated pair.
-    #[test]
-    fn build_restored_owned_rejects_wrong_length_wrapping_secret() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        let mut snapshot = exported_snapshot(&provider, &ctx_id);
-        snapshot.wrapping_secret_key = vec![1u8; 31];
-        let err = restore_error(&snapshot);
-        assert!(err.contains("must be 32 bytes, got 31"), "{err}");
     }
 
     /// T7: a snapshot whose P-256 signer carries a public key that is not
@@ -3257,7 +2960,7 @@ mod tests {
         let ctx_ext = provider_context_extension("ctx:provider-write");
 
         let owned = provider
-            .create_mls_group_with_context(&ctx_ext)
+            .create_mls_group_with_context(&ctx_ext, WrappingKeyPair::generate().public())
             .expect("birth owned context group");
 
         let read_back = owned

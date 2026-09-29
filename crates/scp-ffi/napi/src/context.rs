@@ -40,19 +40,22 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// and TLS-serializes it to bytes suitable for
 /// `ContextCryptoProvider::validate_key_package` and `add_member`.
 ///
-/// Uses `generate_key_package_with_context_params` with `None` so the leaf
-/// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
+/// Uses `generate_key_package_with_context_params` so the leaf **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
 /// be added to an encrypted context group (`valn0502`, §5.13.3). The base
 /// `generate_key_package` declares no SCP capabilities and real MLS rejects it
-/// from a context group. No wrapping-key leaf extension is attached (this
-/// single-process membership path retains no joiner private state).
+/// from a context group. The leaf carries `wrapping_public` as its `0xFF01`
+/// extension: the identity's wrapping public key, whose secret the supervisor
+/// holds (spec 09 §9.16.1).
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Crypto` if the DID format is invalid (must be
 /// `did:dht:z...`), key package generation fails, or TLS serialization
 /// fails.
-fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
+fn generate_mls_key_package_bytes(
+    did: &str,
+    wrapping_public: &[u8; 65],
+) -> Result<Vec<u8>, ScpNapiError> {
     use scp_core::crypto::mls::credential::ScpCredential;
     use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -65,13 +68,15 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
             }
         })?;
 
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| ScpNapiError::Crypto {
-                message: format!("MLS key package generation failed: {e}"),
-                code: codes::CRYPTO_4011.to_owned(),
-            },
-        )?;
+    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(
+        &cred,
+        Some(wrapping_public),
+        &scp_clock::SystemClock,
+    )
+    .map_err(|e| ScpNapiError::Crypto {
+        message: format!("MLS key package generation failed: {e}"),
+        code: codes::CRYPTO_4011.to_owned(),
+    })?;
 
     kp_bundle
         .key_package()
@@ -945,7 +950,11 @@ pub(crate) async fn context_join_on(
     // The key package contains the joiner's SCP credential (DID) and is
     // validated by NodeMlsFactory::validate_key_package before MLS
     // group addition.
-    let kp_bytes = generate_mls_key_package_bytes(&identity_did)?;
+    let wrapping_public = crate::runtime::supervisor(bi)?
+        .wrapping_public_key(&DID(identity_did.clone()))
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let kp_bytes = generate_mls_key_package_bytes(&identity_did, &wrapping_public)?;
 
     let key_package = scp_core::context::membership::KeyPackage {
         owner_did: DID(identity_did.clone()),

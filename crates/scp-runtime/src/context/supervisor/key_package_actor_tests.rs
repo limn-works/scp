@@ -94,7 +94,9 @@ fn deps_with(
         mls_storage: storage,
         transport,
         clock: Arc::new(SystemClock) as Arc<dyn Clock>,
-        wrapping_pubkey: None,
+        wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::crypto::wrapping::WrappingKeyPair::generate(),
+        )),
     }
 }
 
@@ -2596,7 +2598,9 @@ async fn expired_reservation_is_swept_and_kp_burned() {
             mls_storage: Arc::clone(&storage),
             transport: no_transport(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
-            wrapping_pubkey: None,
+            wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::crypto::wrapping::WrappingKeyPair::generate(),
+            )),
         };
         KeyPackageStoreActor::spawn(alice(), deps)
     };

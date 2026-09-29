@@ -42,9 +42,9 @@ use scp_did::SigningKeyId;
 /// suspected compromise.
 ///
 /// Returns `(public_key, secret_key)`: the 65-byte uncompressed P-256 point
-/// and the 32-byte big-endian scalar, wiped on drop. The secret key should be
-/// persisted via `ProtocolRepository::store_wrapping_key` and the public
-/// key included in the `LeafNode` extension via `make_wrapping_key_extension`.
+/// and the 32-byte big-endian scalar, wiped on drop. The runtime persists the
+/// scalar alone, one keypair per identity, and publishes the public key in the
+/// `LeafNode` extension via `make_wrapping_key_extension`.
 ///
 /// See spec §9.16.1.
 #[must_use]

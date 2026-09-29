@@ -531,14 +531,12 @@ fn handle_flush_snapshot_actor<'d>(
     // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
     // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
     // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
-    // on the actor's `state` (was the provider); the P-256 wrapping keypair enters
-    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
-    // sequence is read from `state.send_tracker` inside the twin.
-    let (_, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    // on the actor's `state` (was the provider), and the send sequence is read
+    // from `state.send_tracker` inside the twin. The blob carries no wrapping
+    // key: the identity's pair persists on its own (spec 09 §9.16.1).
     match state.export_crypto_state(
         deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
         deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
-        &*wrapping_secret_key,
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
@@ -739,9 +737,16 @@ async fn handle_issue_mls_update_actor(
     // provider-authoritative arch, where the provider ratcheted and the actor only
     // shadowed) is subsumed here: the actor `advance_epoch` ratchets the group but
     // does not itself bump the `mls_epoch` scalar, so the single authoritative bump
-    // now lives in the Class-S closure. `wrapping_public_key` comes from the
-    // retained `deps.crypto.wrapping_keypair()`.
-    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    // now lives in the Class-S closure. The Update keeps publishing the
+    // identity's wrapping key (spec 09 §9.16.1); with none loaded it fails
+    // closed before anything ratchets.
+    let wrapping_public_key = match deps.supervisor.my_wrapping_keypair(&deps.owned_identity) {
+        Ok(pair) => *pair.public(),
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return Outcome::ok(());
+        }
+    };
     let result = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();

@@ -1161,11 +1161,13 @@ fn resolve_future(
 /// be added to an encrypted context group (`valn0502`, §5.13.3). The base
 /// `generate_key_package` (which declares no SCP capabilities) produces a KP
 /// that real MLS rejects from a context group ("the capabilities of the add
-/// proposal are insufficient for this group"). No wrapping-key leaf extension
-/// is attached: this single-process membership path retains no joiner private
-/// state, so a wrapping key here would advertise a key whose secret is
-/// discarded; sender-key distribution to such a member is correctly skipped.
-fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::ScpPyError> {
+/// proposal are insufficient for this group"). The leaf carries `wrapping_public`
+/// as its `0xFF01` extension: the identity's wrapping public key, whose secret
+/// the supervisor holds (spec 09 §9.16.1).
+fn generate_mls_key_package_bytes(
+    did: &str,
+    wrapping_public: &[u8; 65],
+) -> Result<Vec<u8>, crate::error::ScpPyError> {
     use scp_core::crypto::mls::credential::ScpCredential;
     use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -1177,10 +1179,14 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
             ))
         })?;
 
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}")),
-        )?;
+    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(
+        &cred,
+        Some(wrapping_public),
+        &scp_clock::SystemClock,
+    )
+    .map_err(|e| {
+        crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
+    })?;
 
     kp_bundle
         .key_package()
@@ -2547,7 +2553,10 @@ impl crate::scp::PyScp {
             // The key package contains the joiner's SCP credential (DID) and is
             // validated by NodeMlsFactory::validate_key_package before MLS
             // group addition.
-            let kp_bytes = generate_mls_key_package_bytes(identity_did)
+            let wrapping_public = rt
+                .block_on(sup.wrapping_public_key(&scp_did::DID(member_did.clone())))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             let key_package = scp_core::context::membership::KeyPackage {

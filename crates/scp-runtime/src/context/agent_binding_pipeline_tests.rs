@@ -441,7 +441,6 @@ mod live_supervisor_send {
     use scp_protocol::context::params::{ContextMode, ContextParams};
     use scp_protocol::context::roles::Capability;
     use scp_protocol::context::{ContextError, context_id_bytes};
-    use zeroize::Zeroizing;
 
     use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver};
     use crate::context::ContextHandle;
@@ -615,18 +614,9 @@ mod live_supervisor_send {
         let (bob_sup, bob) =
             crate::crypto::mls::two_party_test_support::bob_supervisor(BOB_DID, resolver);
 
-        // Publish Bob's OWN provider wrapping keypair BEFORE reserving so the
-        // pooled KP's `0xFF01` leaf and the secret Bob opens sender keys with stay
-        // the same keypair; then reserve his real KeyPackage from his own store.
-        let (bob_wrap_public, bob_wrap_secret) = bob.wrapping_keypair_snapshot();
-        bob_sup
-            .set_wrapping_keys(
-                DID::from(BOB_DID),
-                bob_wrap_public.to_vec(),
-                Zeroizing::new(bob_wrap_secret.to_vec()),
-            )
-            .await
-            .expect("publish bob's wrapping key");
+        // Reserve Bob's real KeyPackage from his own store. The store loads
+        // Bob's identity wrapping keypair first, and the KP publishes its public
+        // key in `0xFF01`; Bob opens sender keys with the same pair.
         let (reservation_id, bob_kp_bytes) = bob_sup
             .reserve_key_package(DID::from(BOB_DID))
             .await
@@ -685,13 +675,16 @@ mod live_supervisor_send {
             .await
             .expect("bob confirms the join and receives the joined MLS group");
         let bob_owned = bob.install_joined_group(joined_group);
+        // Bob's identity wrapping secret (the actor HPKE-open key), for opening
+        // Alice's sender-key distributions; then seed his owned actor state
+        // directly from the join constructor.
+        let bob_wsec: [u8; 32] = **bob_sup
+            .ensure_wrapping_key(&DID::from(BOB_DID))
+            .await
+            .expect("bob's wrapping keypair is loaded")
+            .load()
+            .secret();
         drop(bob_sup);
-
-        // Bob's node-resident wrapping secret (the actor HPKE-open key), captured
-        // for opening Alice's sender-key distributions, then seed his owned actor
-        // state directly from the join constructor.
-        let (_bob_wpub, bob_wsec) = bob.wrapping_keypair_snapshot();
-        let bob_wsec: [u8; 32] = *bob_wsec;
         let mut bob_actor =
             PerContextState::new_for_test_encrypted(ctx_bytes, 0, DID::from(BOB_DID));
         bob_actor.seed_encrypted_crypto_from_owned(bob_owned);

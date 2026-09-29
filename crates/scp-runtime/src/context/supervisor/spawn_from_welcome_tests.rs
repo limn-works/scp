@@ -59,6 +59,7 @@ use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::state::context_id_to_bytes;
 use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+use crate::crypto::wrapping::WrappingKeyPair;
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
 const BOB_DID: &str = "did:dht:z6MkBobSpawnFromWelcomeJoiner";
@@ -278,20 +279,6 @@ fn joiner_params() -> ContextParams {
     }
 }
 
-/// Bob's DHKEM(P-256) wrapping keypair (§9.16.1, §9.5): the 65-byte
-/// uncompressed point and its 32-byte scalar. A joiner's KeyPackage must
-/// declare the `scp_context_params` (`0xFF02`) capability to be added to an SCP
-/// context group (OpenMLS `valn0502`); the production `generate_key_package`
-/// path declares `0xFF02` UNCONDITIONALLY (its capability is decoupled from any
-/// wrapping key). Publishing a wrapping key here exercises the
-/// wrapping-key-PRESENT leaf path (the `0xFF01` wrapping-key leaf extension) —
-/// NOT because `0xFF02` requires it. `set_wrapping_keys` validates the point
-/// and checks the scalar derives it, so the pair is a real one.
-fn bob_wrap() -> (Vec<u8>, Zeroizing<Vec<u8>>) {
-    let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
-    (public.to_vec(), Zeroizing::new(secret.to_vec()))
-}
-
 /// Builds the creator-committed `scp_context_params` (`0xFF02`) extension for a
 /// ROOT context from `params`, byte-for-byte the way the creator write path
 /// (`builder::create_context` → `create_mls_group_with_context`) does — so a
@@ -331,18 +318,6 @@ fn alice_welcome_for_bob(
     alice_state
         .add_member(BOB_DID, Some(kp_bytes), &scp_clock::SystemClock)
         .expect("alice adds bob's reserved key package on her owned group")
-}
-
-/// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages carry the
-/// `0xFF01` wrapping-key leaf extension, exercising the wrapping-key-PRESENT path
-/// (see [`bob_wrap`]); the `0xFF02` context-params capability is declared
-/// unconditionally regardless. Idempotent; must run BEFORE the KeyPackage store
-/// is first spawned (i.e. before [`reserve_bob_kp`]).
-async fn set_bob_wrapping(sup: &Arc<Supervisor>, bob: &DID) {
-    let (public, secret) = bob_wrap();
-    sup.set_wrapping_keys(bob.clone(), public, secret)
-        .await
-        .expect("set bob's wrapping key");
 }
 
 /// Resolves `ALICE_DID` / `BOB_DID` / `MALLORY_DID` to their fixed #active
@@ -451,11 +426,6 @@ async fn reserve_bob_kp(
     sup: &Arc<Supervisor>,
     bob: &DID,
 ) -> (super::key_package_actor::ReservationId, Vec<u8>) {
-    // Publish Bob's wrapping key BEFORE the store spawns so every pooled KP
-    // declares `0xFF02` and satisfies `valn0502` when added to an SCP context
-    // group (§5.13.3). Harmless for the wrapping-only (non-SCP) group fixtures —
-    // a group with no `0xFF02` requirement accepts a `0xFF02`-declaring KP.
-    set_bob_wrapping(sup, bob).await;
     let store = sup
         .key_package_store_for(bob)
         .await
@@ -570,12 +540,15 @@ async fn run_join_with_active_key(
     let alice_owned = committed.as_ref().map_or_else(
         || {
             alice_crypto
-                .create_bare_group_owned()
+                .create_bare_group_owned(WrappingKeyPair::generate().public())
                 .expect("alice creates a wrapping-only group (no 0xFF02)")
         },
         |committed_params| {
             alice_crypto
-                .create_mls_group_with_context(&honest_ext(&group_ctx_id, committed_params))
+                .create_mls_group_with_context(
+                    &honest_ext(&group_ctx_id, committed_params),
+                    WrappingKeyPair::generate().public(),
+                )
                 .expect("alice creates the SCP context group (0xFF02)")
         },
     );
@@ -1159,7 +1132,10 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let alice_owned = alice_crypto
-        .create_mls_group_with_context(&honest_ext(&ctx_id, &joiner_params()))
+        .create_mls_group_with_context(
+            &honest_ext(&ctx_id, &joiner_params()),
+            WrappingKeyPair::generate().public(),
+        )
         .unwrap();
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
     let welcome = add_output.welcome_bytes;
@@ -1243,7 +1219,10 @@ fn alice_welcome_for(context_id: &str, kp_public_bytes: &[u8]) -> (Arc<NodeMlsFa
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let alice_owned = alice_crypto
-        .create_mls_group_with_context(&honest_ext(context_id, &joiner_params()))
+        .create_mls_group_with_context(
+            &honest_ext(context_id, &joiner_params()),
+            WrappingKeyPair::generate().public(),
+        )
         .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, kp_public_bytes);
     (alice_crypto, add_output.welcome_bytes)
@@ -1346,12 +1325,6 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
     let _collide_bytes = context_id_to_bytes(&collide_id);
 
     let (sup, _bob_crypto) = bob_supervisor(None);
-
-    // Publish bob's wrapping key BEFORE `create_context` — which get-or-spawns
-    // bob's KeyPackage store via `build_actor_deps` and freezes its
-    // wrapping-pubkey deps at spawn time. Without this, the pooled KPs would be
-    // wrapping-only (no `0xFF02`) and could not join Alice's SCP context group.
-    set_bob_wrapping(&sup, &bob).await;
 
     // Bob pre-creates a BROADCAST context under `collide_id`: this registers an
     // actor (so `lookup` is `Some`) while the encrypted `contexts` crypto slot
@@ -1936,9 +1909,6 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
     // unused here — the payload round-trip that drove it relocated to fullstack.
     let (sup, _bob_crypto) = bob_supervisor(None);
 
-    // Publish bob's wrapping key so his pooled KP declares `0xFF02` (valn0502).
-    set_bob_wrapping(&sup, &bob).await;
-
     // Reserve via the PUBLIC `Supervisor` entrypoint (get-or-spawn bob's store,
     // replenish barrier, list, reserve) — bare DID; in production the FFI bridge
     // enforces that the DID is locally custodied.
@@ -2010,9 +1980,6 @@ async fn spawn_under_a_different_did_is_rejected() {
     let ctx_id = ctx_hex(0xb2);
 
     let (sup, _bob_crypto) = bob_supervisor(None);
-
-    // Publish bob's wrapping key so his pooled KP declares `0xFF02` (valn0502).
-    set_bob_wrapping(&sup, &bob).await;
 
     // Bob reserves under HIS OWN DID; Alice builds the Welcome for that KP.
     let (reservation_id, kp_public_bytes) = sup
@@ -3084,7 +3051,10 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let alice_owned = alice_crypto
-        .create_mls_group_with_context(&honest_ext(&ctx_id, &params))
+        .create_mls_group_with_context(
+            &honest_ext(&ctx_id, &params),
+            WrappingKeyPair::generate().public(),
+        )
         .expect("alice creates the honest SCP context group committing creator=Alice");
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
 
@@ -3373,7 +3343,10 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let alice_owned = alice_crypto
-        .create_mls_group_with_context(&honest_ext(&group_ctx_id, &joiner_params()))
+        .create_mls_group_with_context(
+            &honest_ext(&group_ctx_id, &joiner_params()),
+            WrappingKeyPair::generate().public(),
+        )
         .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
 
