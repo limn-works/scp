@@ -1871,15 +1871,20 @@ pub async fn sync_role_state_from_manager(
     })
 }
 
-/// Re-syncs a joined context's UCAN ceiling and role-state ceiling from its
+/// Re-syncs a joined context's UCAN ceiling and role state from its
 /// authenticated params.
 ///
 /// Both come from the AUTHENTICATED context params carried by a joined
-/// [`ContextHandle`](scp_core::context::ContextHandle), and both are set to
-/// the same ceiling.
+/// [`ContextHandle`](scp_core::context::ContextHandle). The role state is
+/// rebuilt from that ceiling, not only pointed at it: `ContextRoleState::new`
+/// derives the built-in role definitions and the creator's admin capabilities
+/// from the ceiling, so a bare `set_ceiling` would keep every default
+/// capability in `member_capabilities`, and this bridge's role checks (outlet
+/// registration, the admin-gated outlet paths) would admit what the actor's
+/// ceiling denies. The members the precheck inserted are carried over.
 ///
-/// Peer of [`sync_role_state_from_manager`] (which syncs the whole role state);
-/// this syncs only the two ceilings. Used by
+/// Peer of [`sync_role_state_from_manager`] (which syncs the whole role state
+/// from the actor); this syncs from the authenticated params. Used by
 /// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
 /// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
 /// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
@@ -1893,24 +1898,41 @@ pub async fn sync_role_state_from_manager(
 ///
 /// Returns `ScpNapiError::Context` if the context's FFI state is not registered
 /// (unreachable on the join success path — the state was just registered and not
-/// removed), and `ScpNapiError::Validation` if an authenticated ceiling entry
-/// fails the §5.3.1.1 grammar; the state is left unchanged on either error.
+/// removed) or the role state cannot be rebuilt, and `ScpNapiError::Validation`
+/// if an authenticated ceiling entry fails the §5.3.1.1 grammar; the state is
+/// left unchanged on every error.
 pub fn sync_ceiling_from_params(
     bi: &NapiBridgeInstance,
     context_id: &str,
     ceiling: &[scp_core::context::roles::Capability],
 ) -> Result<(), ScpNapiError> {
     let ceiling = scp_core::context::roles::CapabilityCeiling::new(ceiling.iter().cloned());
+    ceiling
+        .validate_entries()
+        .map_err(|e| ScpNapiError::Validation {
+            message: e.to_string(),
+            code: codes::VALID_7000.to_owned(),
+        })?;
     let ceiling_strings = ceiling.to_ucan_string_set();
     with_context(bi, context_id, |st| {
-        // The role state's ceiling follows the same authenticated ceiling, so
-        // it never keeps the default the precheck registered.
-        st.role_state
-            .set_ceiling(ceiling)
-            .map_err(|e| ScpNapiError::Validation {
-                message: e.to_string(),
-                code: codes::VALID_7000.to_owned(),
-            })?;
+        // Rebuild from the authenticated ceiling so the role definitions and
+        // the creator's admin grants carry nothing the default precheck
+        // ceiling added; keep the members the precheck inserted.
+        let mut role_state = ContextRoleState::new(
+            context_id,
+            st.core.creator_did.clone(),
+            ceiling,
+            Vec::new(),
+            &SystemClock,
+        )
+        .map_err(|e| ScpNapiError::Context {
+            message: format!("failed to rebuild role state: {e}"),
+            code: codes::CTX_2023.to_owned(),
+        })?;
+        role_state
+            .members
+            .extend(st.role_state.members.iter().cloned());
+        st.role_state = role_state;
         st.core.ceiling_strings = ceiling_strings;
         Ok(())
     })
@@ -2573,4 +2595,63 @@ mod tests {
     // legacy default bridge no longer exists. Each caller owns its own
     // `NapiBridgeInstance` and `Scp::new()` verifies uniqueness via
     // `test_napi_bridge_instance_unique_ids` above.
+
+    /// The Welcome-join sync rebuilds the role state from the authenticated
+    /// ceiling: after a precheck registered the default ceiling, a context
+    /// whose authenticated ceiling lacks `outlet:register` grants its creator
+    /// no `OutletRegister` at the bridge, and one whose ceiling names it
+    /// does. The member the precheck inserted survives the rebuild.
+    #[test]
+    fn welcome_sync_rebuilds_role_grants_from_the_authenticated_ceiling() {
+        use scp_core::context::roles::Capability;
+
+        const CREATOR: &str = "did:test:welcome-sync-creator";
+        const JOINER: &str = "did:test:welcome-sync-joiner";
+        let default_strings: Vec<String> = scp_core::context::roles::default_ceiling()
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect();
+
+        for (ceiling, admits) in [
+            (Vec::new(), false),
+            (vec![Capability::MessagesWrite], false),
+            (vec![Capability::OutletRegister], true),
+        ] {
+            let bi = NapiBridgeInstance::new_napi();
+            register_ffi_state(&bi, "ctx-welcome-sync", CREATOR, &default_strings)
+                .expect("precheck registration should succeed");
+            with_context(&bi, "ctx-welcome-sync", |st| {
+                assert!(
+                    st.role_state
+                        .member_has_capability(CREATOR, &Capability::OutletRegister),
+                    "the default precheck grants the creator OutletRegister"
+                );
+                st.role_state.members.insert(JOINER.to_owned());
+                Ok(())
+            })
+            .expect("the precheck state must be registered");
+
+            sync_ceiling_from_params(&bi, "ctx-welcome-sync", &ceiling)
+                .expect("sync should accept a well-formed authenticated ceiling");
+
+            let (granted, has_joiner, ucan_register) =
+                with_context(&bi, "ctx-welcome-sync", |st| {
+                    Ok((
+                        st.role_state
+                            .member_has_capability(CREATOR, &Capability::OutletRegister),
+                        st.role_state.members.contains(JOINER),
+                        st.core.ceiling_strings.contains("outlet:register"),
+                    ))
+                })
+                .expect("the synced state must stay registered");
+            assert_eq!(
+                granted,
+                admits,
+                "ceiling {ceiling:?} must {} the creator OutletRegister",
+                if admits { "grant" } else { "deny" }
+            );
+            assert_eq!(ucan_register, admits, "ceiling {ceiling:?} UCAN set");
+            assert!(has_joiner, "the precheck's joiner must survive the rebuild");
+        }
+    }
 }
