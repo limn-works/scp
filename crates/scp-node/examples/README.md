@@ -40,10 +40,12 @@ identity it finds in its default directory without checking how it was created
 
 ### What this example does
 
-It hosts the small site under [`website-site/`](./website-site/) (an
-`index.html` + `style.css`). The page is published as encrypted broadcast
-content and served back through the node's projection handler — there is no
-traditional web server and no DNS.
+No run does anything below today: every run exits 1 at identity creation,
+before any deploy or serve step, for the reason stated at the top of this
+file. The example's code asks `host_site` to host the small site under
+[`website-site/`](./website-site/) (an `index.html` + `style.css`): publish
+the page as encrypted broadcast content and serve it back through the node's
+projection handler, with no traditional web server and no DNS.
 
 ### Local demo vs public hosting
 
