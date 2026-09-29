@@ -54,9 +54,10 @@ struct McpIntegration {
         //   )
         //   _ = try await scp.mcpServerCreate(config: serverConfig)
         //
-        //   // Connect as an MCP client to a remote server via SSE. The remote
-        //   // server runs no bearer check; an SCP SSE server needs its token
-        //   // here instead of nil.
+        //   // Connect as an MCP client to an MCP server on this machine via
+        //   // SSE. This server runs no bearer check; an SCP SSE server needs
+        //   // its token here instead of nil. The transport has no TLS, so a
+        //   // token is sent only to a loopback host.
         //   let client = try await McpClient.connect(
         //       scp: scp,
         //       config: .sse(url: "http://localhost:8080/mcp", authToken: nil)
