@@ -8,11 +8,11 @@
 # Prerequisites (install manually first):
 #   - Homebrew: https://brew.sh
 #   - mise 2026.9.15 or newer: https://mise.jdx.dev (brew install mise). `.mise.toml`
-#     sets `min_version = "2026.9.15"`, and this script exits before its first mise call
-#     when `mise --version` reports an older release. mise 2026.2.22 resolved the
-#     `npm:@napi-rs/cli = "latest"` entry by running `npm view`, and `npm` is a mise shim,
-#     so each call started mise again until about 10,000 processes filled the process
-#     table.
+#     sets `min_version = "2026.9.15"`, and this script's first mise call loads that file,
+#     so an older mise exits with its own error and this script stops there. mise
+#     2026.2.22 resolved the `npm:@napi-rs/cli = "latest"` entry by running `npm view`, and
+#     `npm` is a mise shim, so each call started mise again until about 10,000 processes
+#     filled the process table.
 #   - rustup: https://rustup.rs
 #   - Xcode Command Line Tools: xcode-select --install
 #
@@ -82,52 +82,17 @@ require_cmd brew || true
 require_cmd mise || true
 require_cmd rustup || true
 
-# True when dot-separated integer version $1 is at least $2.
-version_at_least() {
-  local -a have floor
-  IFS=. read -ra have <<< "$1"
-  IFS=. read -ra floor <<< "$2"
-  local i count=${#floor[@]}
-  (( ${#have[@]} > count )) && count=${#have[@]}
-  for (( i = 0; i < count; i++ )); do
-    (( 10#${have[i]:-0} > 10#${floor[i]:-0} )) && return 0
-    (( 10#${have[i]:-0} < 10#${floor[i]:-0} )) && return 1
-  done
-  return 0
-}
-
-# The floor comes from `.mise.toml`, so this script and mise read one value. No TOML
-# parser exists before mise installs Python, so the sed takes the line of exactly
-# `min_version = "..."` above the first line starting with `[`, and check 5 of
-# `scripts/check-toolchain-wiring.sh` fails on any `.mise.toml` whose floor this sed does
-# not read. The script exits instead of counting a failure, because every step below runs
-# mise, and a mise below the floor is the release that re-enters itself through its `npm`
-# shim. Each command substitution below sits in an `if` condition, so a failing sed or
-# `mise --version` reaches its message instead of ending the script through `set -e`.
+# The first mise call loads `.mise.toml`, whose string `min_version` is a hard floor: on
+# `mise config ls`, which lists configuration files and installs nothing, a mise older
+# than the floor prints "mise version <floor> is required" and exits non-zero. mise's
+# stderr stays on the terminal, and the script exits on that failure in both modes,
+# because every step below runs mise.
 if command -v mise &>/dev/null; then
-  if [[ ! -f "$REPO_ROOT/.mise.toml" ]]; then
-    red "  ✗ $REPO_ROOT/.mise.toml does not exist, so this script cannot read the mise version floor"
+  if ! mise --cd "$REPO_ROOT" config ls >/dev/null; then
+    red "  ✗ mise refused to load $REPO_ROOT/.mise.toml; its error above names the cause. When that is the min_version floor, upgrade mise (brew upgrade mise) and run this script again."
     exit 1
   fi
-  if ! MISE_FLOOR="$(sed -n '/^\[/q; s/^min_version = "\([0-9.]*\)"$/\1/p' "$REPO_ROOT/.mise.toml")" \
-    || [[ -z "$MISE_FLOOR" ]]; then
-    red "  ✗ .mise.toml has no line of exactly 'min_version = \"<version>\"' above its first table header, so this script cannot read the mise version floor"
-    exit 1
-  fi
-  # mise's own stderr stays on the terminal, so a mise that refuses `--version` shows why.
-  if ! MISE_VERSION_OUTPUT="$(mise --version)"; then
-    red "  ✗ 'mise --version' exited with an error, so this script cannot compare the mise version against $MISE_FLOOR"
-    exit 1
-  fi
-  MISE_HAVE="$(awk '{print $1; exit}' <<< "$MISE_VERSION_OUTPUT")"
-  if [[ ! "$MISE_HAVE" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
-    red "  ✗ 'mise --version' printed '$MISE_HAVE', which is not a version this script can compare against $MISE_FLOOR"
-    exit 1
-  elif ! version_at_least "$MISE_HAVE" "$MISE_FLOOR"; then
-    red "  ✗ mise $MISE_HAVE is older than $MISE_FLOOR, the floor .mise.toml sets. Upgrade it (brew upgrade mise) and run this script again."
-    exit 1
-  fi
-  ok "mise $MISE_HAVE is at least $MISE_FLOOR"
+  ok "mise loads .mise.toml, so it meets the min_version floor"
 fi
 
 # Xcode CLT

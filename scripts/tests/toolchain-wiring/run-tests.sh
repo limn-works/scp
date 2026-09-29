@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-tests.sh — exercise all five checks in `scripts/check-toolchain-wiring.sh` against
-# canned repositories, and the mise version check in `scripts/setup-toolchain.sh`.
+# canned repositories, and the mise floor refusal in `scripts/setup-toolchain.sh`.
 #
 # WHAT THIS TESTS.
 #   * Check 1 fails when a file Docker builds from a `rust` base image does not carry the
@@ -66,28 +66,24 @@
 #     when the pin is absent, when the pin names no channel, and when
 #     `scripts/check-resolved-rustc.sh` is absent. Every other case in this file runs with a
 #     compiler that agrees with the pin, and each of those that expects exit 0 proves check
-#     4 stays silent then, because `run_case` fails it on any FAIL line.
+#     4 stays silent then, because `run_case` fails any case whose gate exit differs from
+#     the one it expects.
 #     One state has no case: `rustc` absent from PATH, which a canned repository cannot
 #     produce without also taking `bash`, `sed`, and `grep` off PATH.
 #   * Check 5 fails when `.mise.toml` lets a mise older than 2026.9.15 run, which it does
 #     when `min_version` is absent, a soft floor only, lower than 2026.9.15, or not
 #     dot-separated integers, and fails when `settings.npm.package_manager` is absent or
-#     names a manager other than bun. It also fails on three spellings mise accepts but
-#     `scripts/setup-toolchain.sh` cannot read: a `{ hard = ... }` table, a trailing
-#     comment, and no spaces around `=`. It passes a floor above 2026.9.15 whose month has
-#     two digits, which a string comparison would order below 2026.9.15. It fails closed,
-#     with its own message, on an absent `.mise.toml` and on one tomllib rejects. Every case
-#     except the "policy-*" ones, the absent `.mise.toml`, and the malformed one writes both
-#     settings, and `run_case` fails any of those whose output carries a check 5 finding,
-#     so each one proves check 5 stays silent then, whatever else the case expects.
-#   * `scripts/setup-toolchain.sh` reads the floor check 5 requires: it rejects a mise
-#     below the plain-string floor, compares a two-digit month as an integer, rejects the
-#     table spelling and a `min_version` inside a table, and reports an absent
-#     `.mise.toml`, a failing `mise --version`, and an unreadable version, each with its
-#     own message instead of dying silently under `set -e`. Each of those cases stops before
-#     the script's first mise call past `mise --version`. Two cases accept a mise at exactly
-#     the floor and one whose two-digit month orders it above the floor, and prove the
-#     script prints no rejection and runs past the check.
+#     names a manager other than bun. It passes a `{ hard = ... }` table, which mise
+#     enforces like a string, and a floor above 2026.9.15 whose month has two digits, which
+#     a string comparison would order below 2026.9.15. It fails closed, with its own
+#     message, on an absent `.mise.toml`, on one tomllib rejects, and when no interpreter on
+#     PATH imports tomllib. Every case except the "policy-*" ones, the absent `.mise.toml`,
+#     the malformed one, and the one without a parser writes both settings, and `run_case`
+#     fails any of those whose output carries a check 5 finding, so each one proves check 5
+#     stays silent then, whatever else the case expects.
+#   * `scripts/setup-toolchain.sh` exits 1 with its own message when mise refuses to load
+#     `.mise.toml`, before any further mise call, and runs on to its next mise call when
+#     mise loads the file.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate and
 # `scripts/check-resolved-rustc.sh` into `scripts/`, runs `git init` so the gate's
@@ -192,6 +188,9 @@ failed=0
 #                     the same way it reads an unset variable, so no case has to unset it.
 #   COPY_RESOLVED_RUSTC — "no" leaves `scripts/check-resolved-rustc.sh` out of the canned
 #                     repository, which is the one defect no file's contents can express.
+#   STUB_NO_TOML_PARSER — "yes" writes `python3.12`, `python3`, and `python` into
+#                     `stub-bin/`, each exiting 1, so no interpreter on the gate's PATH
+#                     imports tomllib. "no" writes none.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
 EXTRA_FILTER_ENTRY=""
@@ -208,6 +207,7 @@ STUB_RUSTC_INSTALLER="rustup"
 STUB_OVERRIDE="none"
 CASE_RUSTUP_TOOLCHAIN=""
 COPY_RESOLVED_RUSTC="yes"
+STUB_NO_TOML_PARSER="no"
 
 RESOLVED_RUSTC_CHECK="$REPO_ROOT/scripts/check-resolved-rustc.sh"
 if [[ ! -f "$RESOLVED_RUSTC_CHECK" ]]; then
@@ -405,14 +405,6 @@ emit_mise_body() {
             printf 'min_version = { hard = "2026.9.15", soft = "2026.9.20" }\n\n[tools]\nbun = "1.3.9"\n'
             printf '%b' "$MISE_POLICY_TAIL"
             ;;
-        policy-min-version-trailing-comment)
-            printf 'min_version = "2026.9.15" # floor\n\n[tools]\nbun = "1.3.9"\n'
-            printf '%b' "$MISE_POLICY_TAIL"
-            ;;
-        policy-min-version-no-spaces)
-            printf 'min_version="2026.9.15"\n\n[tools]\nbun = "1.3.9"\n'
-            printf '%b' "$MISE_POLICY_TAIL"
-            ;;
         policy-min-version-two-digit-month)
             printf 'min_version = "2026.10.1"\n\n[tools]\nbun = "1.3.9"\n'
             printf '%b' "$MISE_POLICY_TAIL"
@@ -553,6 +545,13 @@ run_case() {
         emit_stub_rustc > "$root/stub-bin/rustc"
         chmod +x "$root/stub-bin/rustc"
     fi
+    if [[ $STUB_NO_TOML_PARSER == "yes" ]]; then
+        local interpreter
+        for interpreter in python3.12 python3 python; do
+            printf '#!/usr/bin/env bash\nexit 1\n' > "$root/stub-bin/$interpreter"
+            chmod +x "$root/stub-bin/$interpreter"
+        done
+    fi
     git -C "$root" init -q
     "$ci_producer" > "$root/.github/workflows/ci.yml"
     "$mise_producer" > "$root/.mise.toml"
@@ -585,10 +584,11 @@ run_case() {
         ok=0
     fi
     # Every mise producer sets MISE_SOURCE, and every source outside these three writes
-    # both settings check 5 requires, so check 5 must stay silent however the case fails.
+    # both settings check 5 requires, so check 5 must stay silent however the case fails,
+    # unless the case takes the TOML parser away.
     local check5_phrase
-    case $MISE_SOURCE in
-        absent | malformed | policy-*) ;;
+    case $STUB_NO_TOML_PARSER:$MISE_SOURCE in
+        yes:* | no:absent | no:malformed | no:policy-*) ;;
         *)
             for check5_phrase in "${CHECK5_PHRASES[@]}"; do
                 if grep -Fq -- "$check5_phrase" <<< "$output"; then
@@ -973,18 +973,24 @@ mise_source_case policy-min-version-lower "mise-min-version-below-the-floor" 1 \
     "which is lower than 2026.9.15"
 mise_source_case policy-min-version-not-numeric "mise-min-version-not-dot-separated-integers" 1 \
     "which is not dot-separated integers"
-setup_cannot_read="but scripts/setup-toolchain.sh reads the floor only from a line of exactly"
-mise_source_case policy-min-version-hard-table "mise-min-version-as-a-hard-table" 1 \
-    "$setup_cannot_read"
-mise_source_case policy-min-version-trailing-comment "mise-min-version-with-a-trailing-comment" 1 \
-    "$setup_cannot_read"
-mise_source_case policy-min-version-no-spaces "mise-min-version-without-spaces" 1 \
-    "$setup_cannot_read"
+mise_source_case policy-min-version-hard-table "mise-min-version-as-a-hard-table" 0 ""
 mise_source_case policy-min-version-two-digit-month "mise-min-version-above-the-floor-with-a-two-digit-month" 0 ""
 mise_source_case policy-npm-manager-absent "mise-sets-no-npm-package-manager" 1 \
     "sets settings.npm.package_manager to None, not 'bun'"
 mise_source_case policy-npm-manager-npm "mise-sets-npm-as-the-npm-package-manager" 1 \
     "sets settings.npm.package_manager to 'npm', not 'bun'"
+
+# No interpreter on PATH imports tomllib. Checks 3 and 5 each report the missing parser,
+# so one case requires each message: either goes red if its check skips `.mise.toml`
+# instead of reporting that it cannot read it.
+STUB_NO_TOML_PARSER="yes"
+run_case "no-toml-parser-for-check-3" 1 \
+    "so the gate cannot parse .mise.toml to check that mise names no Rust version source" \
+    routing_ok mise_ok
+run_case "no-toml-parser-for-check-5" 1 \
+    "so the gate cannot parse .mise.toml to check its mise version floor and npm package manager" \
+    routing_ok mise_ok
+STUB_NO_TOML_PARSER="no"
 
 # ── Check 1: every container build asserts the compiler it resolved ──────────────────
 #
@@ -1477,38 +1483,54 @@ COPY_RESOLVED_RUSTC="yes"
 
 SETUP="$REPO_ROOT/scripts/setup-toolchain.sh"
 
-# setup_case <name> <.mise.toml text|""> <body of the canned mise> <required substring>
-#            [forbidden substring]
+# setup_case <name> <canned mise answer to `config ls`: "refuse" or "load"> <required substring>
 #
-# Every case expects exit 1 and runs `--check`, which installs nothing. A rejecting state
-# stops the script before its first mise call past `mise --version`. An accepted mise runs
-# on, and the canned `mise`, `brew`, `rustc`, and `cargo` answer every later call with an
-# error, so the script counts its missing tools and exits 1 without reading this machine's
-# toolchain. An empty `.mise.toml` text writes no file.
+# Each case runs `--check`, which installs nothing, with a canned `mise` that appends its
+# arguments to `mise-calls` and answers every call but `config ls` with exit 97, and a
+# canned `brew`, `rustc`, and `cargo` that exit 97, so the script reads none of this
+# machine's toolchain. A refusing mise prints the error a mise below `min_version` prints.
+# The script exits 1 in both cases: on the refusal, or on the tools the canned mise reports
+# missing. A refusal case also fails unless `config ls` was the only mise call; a loading
+# case fails unless the script made a mise call after it.
 setup_case() {
-    local name=$1 mise_toml=$2 mise_body=$3 want_msg=$4 forbid_msg=${5:-}
-    local root output actual_exit ok=1 stub
+    local name=$1 answer=$2 want_msg=$3
+    local root output actual_exit ok=1 stub calls
     root="$TMP_PARENT/setup-$name"
     mkdir -p "$root/scripts" "$root/stub-bin"
     cp "$SETUP" "$root/scripts/"
-    [[ -n $mise_toml ]] && printf '%b' "$mise_toml" > "$root/.mise.toml"
-    printf '#!/usr/bin/env bash\n%s\n' "$mise_body" > "$root/stub-bin/mise"
+    printf 'min_version = "2026.9.15"\n' > "$root/.mise.toml"
+    {
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$root/mise-calls"
+        printf 'if [[ " $* " == *" config ls "* ]]; then\n'
+        if [[ $answer == "refuse" ]]; then
+            printf '  echo "mise ERROR mise version 2026.9.15 is required, but you are using 2026.2.22" >&2\n  exit 1\n'
+        else
+            printf '  exit 0\n'
+        fi
+        printf 'fi\nexit 97\n'
+    } > "$root/stub-bin/mise"
     for stub in brew rustc cargo; do
         printf '#!/usr/bin/env bash\nexit 97\n' > "$root/stub-bin/$stub"
     done
     chmod +x "$root/stub-bin/"*
     output=$(PATH="$root/stub-bin:$PATH" bash "$root/scripts/setup-toolchain.sh" --check 2>&1)
     actual_exit=$?
+    calls=0
+    [[ -f $root/mise-calls ]] && calls=$(( $(wc -l < "$root/mise-calls") ))
     if ! grep -Fq -- "$want_msg" <<< "$output"; then
         echo "FAIL [setup-$name]: output missing required substring: $want_msg" >&2
         ok=0
     fi
-    if [[ -n $forbid_msg ]] && grep -Fq -- "$forbid_msg" <<< "$output"; then
-        echo "FAIL [setup-$name]: output contains forbidden substring: $forbid_msg" >&2
-        ok=0
-    fi
     if [[ $actual_exit -ne 1 ]]; then
         echo "FAIL [setup-$name]: setup-toolchain.sh exited $actual_exit, expected 1" >&2
+        ok=0
+    fi
+    if [[ $(head -n 1 "$root/mise-calls" 2>/dev/null) != *"config ls"* ]]; then
+        echo "FAIL [setup-$name]: the first mise call is not 'config ls'" >&2
+        ok=0
+    fi
+    if [[ $answer == "refuse" && $calls -ne 1 ]] || [[ $answer == "load" && $calls -lt 2 ]]; then
+        echo "FAIL [setup-$name]: the canned mise answered $calls calls" >&2
         ok=0
     fi
     if [[ $ok -eq 1 ]]; then
@@ -1522,39 +1544,10 @@ setup_case() {
     fi
 }
 
-setup_policy="${MISE_POLICY_HEAD}[tools]\nbun = \"1.3.9\"\n${MISE_POLICY_TAIL}"
-setup_no_floor="has no line of exactly 'min_version = \"<version>\"' above its first table header"
-
-setup_case "rejects-a-mise-below-the-floor" "$setup_policy" 'echo "2026.2.22 macos-arm64"' \
-    "mise 2026.2.22 is older than 2026.9.15"
-setup_case "compares-a-two-digit-month-as-an-integer" \
-    'min_version = "2026.10.1"\n\n[tools]\nbun = "1.3.9"\n' 'echo "2026.9.15 macos-arm64"' \
-    "mise 2026.9.15 is older than 2026.10.1"
-setup_case "rejects-a-hard-table" \
-    'min_version = { hard = "2026.9.15" }\n\n[tools]\nbun = "1.3.9"\n' 'echo "2026.9.15 macos-arm64"' \
-    "$setup_no_floor"
-setup_case "ignores-a-min-version-inside-a-table" \
-    '[tools]\nmin_version = "2026.9.15"\n' 'echo "2026.9.15 macos-arm64"' \
-    "$setup_no_floor"
-setup_case "reports-an-absent-mise-config" "" 'echo "2026.9.15 macos-arm64"' \
-    ".mise.toml does not exist, so this script cannot read the mise version floor"
-setup_case "reports-a-failing-mise-version" "$setup_policy" 'exit 3' \
-    "'mise --version' exited with an error"
-setup_case "reports-an-unreadable-mise-version" "$setup_policy" 'echo "garbage"' \
-    "'mise --version' printed 'garbage'"
-
-# A mise at or above the floor passes the check, and the script runs on to its next mise
-# call, which the canned mise fails. A comparator that rejected every version would print
-# the rejection and exit before "java not installed via mise".
-setup_case "accepts-a-mise-at-the-floor" "$setup_policy" \
-    '[[ ${1:-} == --version ]] && echo "2026.9.15 macos-arm64" && exit 0; exit 97' \
-    "mise 2026.9.15 is at least 2026.9.15" "is older than"
-setup_case "accepts-a-mise-whose-two-digit-month-is-above-the-floor" "$setup_policy" \
-    '[[ ${1:-} == --version ]] && echo "2026.10.1 macos-arm64" && exit 0; exit 97' \
-    "mise 2026.10.1 is at least 2026.9.15" "is older than"
-setup_case "runs-past-the-floor-check-after-accepting" "$setup_policy" \
-    '[[ ${1:-} == --version ]] && echo "2026.9.15 macos-arm64" && exit 0; exit 97' \
-    "java not installed via mise" "is older than"
+setup_case "stops-when-mise-refuses-the-floor" refuse \
+    "mise version 2026.9.15 is required, but you are using 2026.2.22"
+setup_case "runs-on-when-mise-loads-the-config" load \
+    "java not installed via mise"
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"

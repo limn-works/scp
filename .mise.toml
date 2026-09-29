@@ -41,9 +41,10 @@
 # such call started mise again, which started `npm view` again, until about 10,000
 # processes filled a developer's process table. mise 2026.9.15 answers
 # `mise ls-remote npm:@napi-rs/cli` without starting `npm view`. A string value is a hard
-# floor: mise exits with an error instead of warning. `scripts/setup-toolchain.sh` checks
-# the same floor, and `scripts/check-toolchain-wiring.sh` fails when this key or the
-# `[settings.npm]` table below is removed or lowered.
+# floor: mise exits with an error instead of warning, so `scripts/setup-toolchain.sh`,
+# whose first mise call loads this file, stops on an older mise.
+# `scripts/check-toolchain-wiring.sh` fails when this key or the `[settings.npm]` table
+# below is removed or lowered.
 min_version = "2026.9.15"
 
 [tools]
