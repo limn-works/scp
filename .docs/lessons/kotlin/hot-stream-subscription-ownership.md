@@ -62,7 +62,8 @@ subscription that a different caller had just opened.
   parameter with no default. `mount` counts a mount when its effect applies and captures the
   pending stop; `unmount` holds a departing mount's `onStop` while another mount under that key
   is live, and when it removes the last live mount it launches one stop that runs every held
-  `onStop` and its own, and records that stop's `Job` before `onDispose` returns;
+  `onStop` and its own, except each whose mount's start returned the object an earlier one's
+  start returned, and records that stop's `Job` before `onDispose` returns;
   `startMounted` joins the captured stop before it runs a `start` lambda. Each launched stop joins
   the stop launched before it under that key before it takes that key's mutex, because a mount
   captures only the newest stop, and an older stop that reached its dispatcher last would

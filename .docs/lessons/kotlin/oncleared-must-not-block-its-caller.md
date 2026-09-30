@@ -30,9 +30,14 @@ in `TIMED_WAITING (parking)` at `BlockingCoroutine.joinBlocking`, called from
 
 The dispatcher the `runBlocking` call names does not change the outcome. `runBlocking(Dispatchers.IO)`
 parks the *calling* thread and runs the block on an IO thread, and that block still suspends on the
-test scheduler, which still needs the parked thread. `withTimeoutOrNull` does not rescue it either:
-the timeout runs on the test scheduler's virtual clock, which only advances when the parked thread
-advances it. Every variant that blocks the caller keeps the deadlock.
+test scheduler, which still needs the parked thread. `withTimeoutOrNull` does not rescue it either.
+Inside `runBlocking(cleanupScope.coroutineContext)`, whose dispatcher was `Dispatchers.IO`, the
+timeout takes its clock from `Dispatchers.IO`, which does not implement `Delay`, so it falls back to
+the default wall-clock executor, and the timeout fires. Firing only cancels the pending
+`withContext(ioDispatcher)` coroutine. That coroutine completes its cancellation only when its
+queued task runs on the `StandardTestDispatcher`, `withTimeoutOrNull` returns only after it
+completes, and only the parked thread can run that task. Every variant that blocks the caller keeps
+the deadlock.
 
 ## The rule
 
@@ -114,8 +119,10 @@ cancels races cancellation against `onStop`, and `onStop` may never run. A secon
 both — disposal hands `onStop` to its coordinator and returns after cancelling its subscription
 scope. When the departing mount is the last live mount under its key, the coordinator launches a stop
 that runs `onStop` on a scope disposal never cancels; while another mount under that key stays live,
-the coordinator holds `onStop` for the stop the last mount's departure launches; and when the
-departing mount's start never ran, the coordinator drops `onStop`, which then never runs. `rememberScpContext`'s KDoc example teaches callers
+the coordinator holds `onStop` for the stop the last mount's departure launches. The coordinator
+drops `onStop`, which then never runs, in two cases: the departing mount's start never ran, or its
+start returned the object (compared by identity) that an earlier departing mount's start under that
+key returned, in which case the coordinator holds or runs that earlier mount's `onStop` in its place. `rememberScpContext`'s KDoc example teaches callers
 that same shape, because that example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
 disposal callback.
 

@@ -167,7 +167,7 @@ interface Context {
 UniFFI generates:
 - `scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt` — JNA bindings to the Rust shared library, in package `uniffi.scp`
 - Kotlin classes wrapping each interface
-- Kotlin enums for error types
+- An exception class hierarchy for each error type, such as `uniffi.scp.ScpException` and its subclasses (for example `ScpException.Transport`)
 
 ### Async bridging
 
@@ -298,7 +298,7 @@ data class ToolDefinition(
 
 ## Exception Hierarchy
 
-Superseded. `scp-kt` defines none of the classes below, so this sketch binds no code. `SCP` operations throw the UniFFI-generated `uniffi.scp.ScpException` subclasses (for example `ScpException.Transport`, which the `SCP.suspendInstance` KDoc names), `CoroutineBridge` throws `BridgeException` (`bridge/CoroutineBridge.kt`) when an FFI call fails, and `ColdMessageFlow` closes with one on a buffer overflow; `BridgeException` carries a structured `code` such as `"SCP-CTX-2001"`. The one hand-written `ScpException` is `scp-kt-android`'s, in `platform/Types.kt`.
+Superseded. `scp-kt` defines none of the classes below, so this sketch binds no code. `SCP` operations throw the UniFFI-generated `uniffi.scp.ScpException` subclasses (for example `ScpException.Transport`, which the `SCP.suspendInstance` KDoc names), `CoroutineBridge`'s FFI wrappers (`ffiCall`, `ffiCallSuspend`, `ffiCallWithCancellation`) catch and convert nothing, so an FFI call that fails reaches the caller as the exception the binding threw. `BridgeException` (`bridge/CoroutineBridge.kt`) carries a structured `code` such as `"SCP-CTX-2001"`, and the SDK raises it itself: `CoroutineBridge` throws it for a missing identity handle (`"SCP-IDENT-1060"`) and for a field missing from a result's JSON, `Types.kt` throws it for a denied capability and for an input that fails validation, `Server.kt` throws it for a handle JSON missing a field, and `ContextBridge.subscribe` and `ColdMessageFlow` close with one on a buffer overflow (`"SCP-CTX-2001"`) and on an `onError` callback, which supplies the code. The one hand-written `ScpException` is `scp-kt-android`'s, in `platform/Types.kt`.
 
 ```kotlin
 open class ScpException(

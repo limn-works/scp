@@ -283,9 +283,11 @@ private fun <R> rememberCollectedState(
  * stayed composed, one [Job] naming the most recent stop it launched, and one [Job] that the
  * next stop it launches completes. [mount] counts a mount and captures the most recent stop.
  * [unmount] holds a departing mount's `onStop` while another mount under that key stays
- * composed, and when it removes the last live mount it launches one stop that runs every
- * `onStop` it held for that key and then the departing mount's own. So a mount that leaves while
- * another mount under that key stays composed stops nothing yet.
+ * composed, and when it removes the last live mount it launches one stop that runs the `onStop`
+ * lambdas it held for that key and then the departing mount's own, skipping each one whose
+ * mount's `start` returned an object an earlier one's `start` returned, as the next paragraph
+ * states. So a mount that leaves while another mount under that key stays composed stops
+ * nothing yet.
  *
  * Only a mount whose `start` ran has its `onStop` run: a mount that leaves before its `start`
  * takes the key's mutex opened nothing, and its `start` never runs afterwards. Two mounts whose
@@ -756,6 +758,9 @@ internal enum class HotStreamKind {
  * [start] and [onStop] across mounts: a [start] for one key waits for an [onStop] that an
  * earlier mount launched under that key, and a mount that leaves while another mount under
  * that key is still composed defers its [onStop] until the last mount under that key leaves.
+ * [coordinator] drops this mount's [onStop] when this mount's [start] never ran, or when its
+ * [start] returned the instance an earlier departing mount's [start] under [key] returned; it
+ * then runs that earlier mount's [onStop] in its place.
  *
  * @param key Recomposition key, compared with `equals`. The subscription restarts if it
  *   changes. It names the one subscription [start] returns, because [coordinator] counts and
@@ -831,7 +836,9 @@ internal fun <T> rememberScpHotStream(
             // unmount launches a stop only when this was the last live mount under this key
             // (holding onStop for that stop otherwise), and records that stop's Job before it
             // returns, so a start that a later mount begins under this same key joins that job
-            // instead of racing it. It drops onStop when this mount's start never ran there.
+            // instead of racing it. It drops onStop when this mount's start never ran there,
+            // and when this mount's start returned the object an earlier departing mount's
+            // start under this key returned, whose onStop it holds or runs in its place.
             // Cancelling `scope` afterwards cancels this mount's start only while it waits to
             // run (a start already running finishes), and never that stop.
             coordinator.unmount(mount, onStop)
