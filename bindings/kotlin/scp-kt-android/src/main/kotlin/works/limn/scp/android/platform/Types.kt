@@ -148,8 +148,10 @@ enum class DestructionMethod {
  * SCP-specific exception with structured error codes.
  *
  * Error codes follow the pattern `SCP-{DOMAIN}-{NUMBER}`:
- * - `SCP-CRYPTO-4001`: Key not found by any method other than [KeyCustodyProvider.dhAgree]
- *   (a software or Keystore lookup, any key type, X25519 included)
+ * - `SCP-CRYPTO-4001`: Key not found (a software or Keystore lookup, any key type, X25519
+ *   included), with two exceptions: [KeyCustodyProvider.dhAgree] throws `SCP-CRYPTO-4002` for a
+ *   missing key, and [KeyCustodyProvider.exportSigningKeyBytes] throws `SCP-CRYPTO-4005` for a
+ *   Keystore handle ([CustodyType.HARDWARE]) whether or not its key exists
  * - `SCP-CRYPTO-4002`: [KeyCustodyProvider.dhAgree] found no software key under the handle: a
  *   destroyed or unknown handle, or a Keystore Ed25519 handle
  * - `SCP-CRYPTO-4003`: Wrong key type for operation, or a [KeyCustodyProvider.dhAgree] peer
@@ -269,7 +271,11 @@ interface PushProvider {
      *
      * @param payload The push notification data payload as a key-value map.
      * @return [WakeSignal] indicating the action the caller should take.
-     * @throws ScpException if the payload is invalid.
+     * @throws ScpException with code `SCP-TRANS-5001` if the payload has no `scp` field.
+     * @throws ScpException with code `SCP-TRANS-5002` if the `scp` field is not `"1"`.
+     *   [AndroidPushProvider] checks no other property of the payload: it returns
+     *   [WakeSignal.PULL] for a payload that carries other fields beside `"scp": "1"`. §10.7
+     *   opacity is the sender's obligation (§10.7.1 step 5).
      */
     fun handleNotification(payload: Map<String, String>): WakeSignal
 }
@@ -327,7 +333,11 @@ interface PushProvider {
  * - [destroyKey]: the same `KeyStore.getInstance` and `KeyStore.load` exceptions, and
  *   `KeyStoreException` from `containsAlias` and `deleteEntry`.
  *
- * [dhAgree] and [exportSigningKeyBytes] do not reach Keystore.
+ * [dhAgree] and [exportSigningKeyBytes] do not reach Keystore. [dhAgree] still lets one
+ * non-[ScpException] escape, and remote input causes it: [dhAgree] passes a 32-byte peer key to
+ * Bouncy Castle with no point-order check, so a low-order peer key, such as 32 zero bytes, makes
+ * Bouncy Castle throw `IllegalStateException` ("X25519 agreement failed") because the shared
+ * secret is all zero.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -371,12 +381,15 @@ interface KeyCustodyProvider {
     /**
      * Destroy key material associated with a handle.
      *
-     * After this call, operations with the same handle in the same process throw [ScpException]
-     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, or
-     * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
-     * length before any key lookup; and [exportSigningKeyBytes] on a Keystore handle
-     * ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
+     * After this call, operations with the same handle on the same [AndroidKeyCustody] instance
+     * throw [ScpException] with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws
+     * `SCP-CRYPTO-4002`, or `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it
+     * checks the peer key's length before any key lookup; and [exportSigningKeyBytes] on a
+     * Keystore handle ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
      * [KeyHandle.custodyType] before any key lookup.
+     * Each [AndroidKeyCustody] instance holds its own map of software keys and restores every
+     * persisted software Ed25519 seed into it when constructed, so another instance in the same
+     * process that already holds a software key keeps signing with it after this call.
      * [AndroidKeyCustody] removes the persisted seed of a software Ed25519 key that
      * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
      * can restore the key when this process dies before the removal reaches disk (see
@@ -405,8 +418,11 @@ interface KeyCustodyProvider {
      *   software key sits under [keyHandle]: a destroyed or unknown handle, or a Keystore
      *   Ed25519 handle.
      * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
-     *   checked before any key lookup, or
-     *   [keyHandle] names a software Ed25519 key.
+     *   checked before any key lookup, or [keyHandle] names a software Ed25519 key.
+     * @throws IllegalStateException from Bouncy Castle ("X25519 agreement failed") if
+     *   [peerPublic] is 32 bytes long but a low-order point, such as 32 zero bytes, which makes
+     *   the shared secret all zero. No point order is checked, so a `catch (e: ScpException)`
+     *   does not catch it.
      */
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
 

@@ -1,7 +1,9 @@
 //! Android platform adapter modules for SCP.
 //!
-//! This module declares the four Android platform adapter modules. The
-//! adapters themselves are Kotlin classes in `bindings/kotlin/scp-kt-android/`.
+//! This module declares four modules, one per Android adapter capability; each
+//! only re-exports the platform trait for its capability from
+//! [`crate::traits`]. The adapters themselves are Kotlin classes in
+//! `bindings/kotlin/scp-kt-android/`.
 //! ADR-021 (the `UniFFI` bridge) and ADR-027 (the Android platform adapter)
 //! require each Kotlin class to implement the `UniFFI` callback interface for
 //! its capability and to be injected into the Rust engine. No shipped class
@@ -59,6 +61,9 @@
 //!
 //! # Adapter Modules
 //!
+//! Each bullet names the module that re-exports a capability's trait and
+//! describes the Kotlin adapter class for that capability.
+//!
 //! - [`key_custody`] — Android Keystore key management (Keystore-held Ed25519
 //!   on API 33+, reported as hardware custody without a `KeyInfo.securityLevel`
 //!   check, Bouncy Castle software fallback on API 26-32, today; ADR-027
@@ -66,8 +71,10 @@
 //! - [`device_attestation`] — Play Integrity device attestation (a Classic
 //!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
 //! - [`push_provider`] — Firebase Cloud Messaging; checks only the `scp` wake
-//!   field of a data-only payload and does not enforce the opaque payload
-//!   §10.7 of the infrastructure spec defines.
+//!   field of a data-only payload and returns the same wake signal whatever
+//!   other fields it carries; §10.7 opacity is the sender's obligation
+//!   (§10.7.1 step 5 of the infrastructure spec), and no code in this
+//!   repository sends a push.
 //! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte passphrase is
 //!   derived from a Keystore-held AES-256 key; `SQLCipher` derives the database
 //!   key from that passphrase.
@@ -79,16 +86,20 @@
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 
-/// Android Keystore key custody adapter.
+/// Re-exports the key custody trait and its types; the Kotlin
+/// `AndroidKeyCustody` class is the Android Keystore adapter.
 pub mod key_custody;
 
-/// Play Integrity device attestation adapter.
+/// Re-exports the device attestation trait and its token type; the Kotlin
+/// `AndroidDeviceAttestation` class is the Play Integrity adapter.
 pub mod device_attestation;
 
-/// Firebase Cloud Messaging push provider adapter.
+/// Re-exports the push trait and its types; the Kotlin `AndroidPushProvider`
+/// class is the Firebase Cloud Messaging adapter.
 pub mod push_provider;
 
-/// SQLCipher encrypted storage adapter.
+/// Re-exports the storage trait; the Kotlin `AndroidStorage` class is the
+/// `SQLCipher` encrypted storage adapter.
 pub mod storage;
 
 pub use device_attestation::{DeviceAttestation, DeviceAttestationToken};
