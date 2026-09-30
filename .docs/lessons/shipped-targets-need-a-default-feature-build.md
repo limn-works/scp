@@ -57,7 +57,7 @@ of them reopens a bypass this repository has already measured:
    type-checked, and the attribute also works path-qualified and renamed through `use`, so
    the rule matches the name rather than the attribute form. It fails on a block comment or string literal it cannot close.
 
-Row 8 is answered by none of them, and deliberately so. Three kinds of bypass are known to
+Row 8 is answered by none of them. Three kinds of bypass are known to
 remain: the dev-dependency closure (row 4b), code outside `examples/` that an example calls
 or expands (row 9c), and **an edit to the crate's build configuration**: its `build.rs`, a
 manifest key, or `.cargo/config.toml` rustflags. The list is what reviewers have found, not a
@@ -70,6 +70,9 @@ exemption. "Edits the manifest" is too narrow in the other direction, because
 `build.rs` needs no manifest key; an earlier draft wrote that narrower indicator as the
 contract, which is the failure `.docs/standards/concrete-prose.md`
 §Contracts and indicators names after Caulfield.
+Review covers build-configuration edits, and no human has ruled this third residual
+acceptable; the plan of record's entry for this pull request records it as open, beside
+rows 4b and 9c.
 
 ## Nine rounds, eleven measured bypasses, and which ones the gate closes
 
@@ -283,8 +286,10 @@ that an earlier run had persisted, so it took the branch that loads an identity 
 never reached the branch that creates one. Pointing `XDG_DATA_HOME` at an empty
 directory and running the example again reproduced the reviewer's report exactly:
 the program exited 1 and printed `NodeBuild("identity error: no production
-pre-rotation custody backend available; ...")`. The example's own doc comment in
-`crates/scp-node/examples/website.rs` quotes the start of the message.
+pre-rotation custody backend available; ...")`, the output from before `NodeBuild`
+carried a typed `NodeError`. The example's own doc comment in
+`crates/scp-node/examples/website.rs` quotes the error as the example prints it today,
+`NodeBuild(Identity(NoPreRotationBackend))`.
 
 So point every state directory the program reads at an empty one before you measure
 behavior that a populated directory changes.

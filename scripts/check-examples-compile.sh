@@ -112,7 +112,8 @@
 #     unmeasured: that a build script printing `cargo::rustc-cfg=feature="testing"` makes
 #     `DhtMode::Memory` exist for every target of the package. Two attempts to reproduce
 #     it made the gate exit 1 instead, because the injected cfg desynchronized the lib
-#     from its dependency features. Review covers build-configuration edits.
+#     from its dependency features. Review covers build-configuration edits. No human
+#     has ruled this acceptable.
 # No hook guards this script. AGENTS.md lists it among the enforcement files a human must
 # approve weakening, and review enforces that rule.
 #

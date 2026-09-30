@@ -64,14 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Services: {}", document.service.len());
     println!();
 
-    // 5. Publish to the DHT.
+    // 5. Publish to the in-memory DHT, a map inside this process that no peer reads.
     did_dht.publish(&identity, &document).await?;
-    println!("Published to DHT successfully.");
+    println!("Published to the in-memory DHT (this process only; no peer sees it).");
 
     // 6. Resolve it back.
     let resolved = did_dht.resolve(&identity.did).await?;
     assert_eq!(resolved.id, document.id);
-    println!("Resolved from DHT — document matches.");
+    println!("Resolved from the in-memory DHT — document matches.");
 
     Ok(())
 }
