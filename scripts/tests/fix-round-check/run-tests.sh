@@ -1287,6 +1287,7 @@ scan_rule_phrase() {
             echo 'on a block comment or string literal the scan cannot close' ;;
         *'include!'* | *'macro_rules!'* | *'stringify!'*) echo 'on any include, macro_rules or stringify word' ;;
         *'U+200E or U+200F'*) echo 'on a U+200E or U+200F mark outside a literal or comment' ;;
+        *'shebang line'*) echo 'on a first line that starts with #!, after an optional byte-order mark, unless [ follows the #! after spaces, tabs and line breaks alone' ;;
         *'#[path]'*) echo 'any #[path] or #[r#path] attribute, whatever each holds' ;;
         *'(cfg_\w+)'*) echo 'on any identifier outside a comment or string literal that starts with cfg_ (cfg_attr and cfg_select! included)' ;;
         *'test-attribute name'*) echo 'on the identifier test, bench or test_case wherever it stands' ;;
@@ -1341,19 +1342,20 @@ else
     grep -qF "and $plat_count platform keys" "$REPO_ROOT/scripts/fix-round-check.sh" \
         || scan_rules_missing+="[header item 8: and $plat_count platform keys] "
 fi
-if [[ $gate_rule_count -ge 10 && -z $scan_rules_missing ]]; then
+if [[ $gate_rule_count -ge 11 && -z $scan_rules_missing ]]; then
     report "case 22b states every source rule the examples gate applies" 0 ""
 else
     report "case 22b states every source rule the examples gate applies" 1 "the gate has $gate_rule_count scan rules; the source-scan line lacks $scan_rules_missing: ${SCAN_LINE:-<absent>}"
 fi
 # The map must reject a rule it does not know. Two retired wordings must fail the phrase
 # check: the one that named cfg_attr alone and left out test, bench and test_case, and the
-# one written before the gate rejected stringify, #[r#path], U+200E and U+200F.
+# one written before the gate rejected stringify, #[r#path], U+200E, U+200F and a shebang line.
 earlier_wording='on any include or macro_rules word, and any #[path] attribute, whatever each holds'
 retired='on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds; and on a block comment or string literal the scan cannot close'
 if [[ -z $(scan_rule_phrase 'print "cfg_select!\n" if /\bcfg_select\b/;') \
     && $earlier_wording != *"$(scan_rule_phrase 'print "stringify!\n" if /\bstringify\b/;')"* \
     && $earlier_wording != *"$(scan_rule_phrase 'print "U+200E or U+200F outside a literal or comment\n"')"* \
+    && $earlier_wording != *"$(scan_rule_phrase 'print "shebang line\n"')"* \
     && $retired != *"$(scan_rule_phrase 'print "test-attribute name $1\n"')"* \
     && $retired != *"$(scan_rule_phrase 'print "$1\n" while /\b(cfg_\w+)/g;')"* ]]; then
     report "case 22b rejects an unmapped gate rule and the retired rule wording" 0 ""
