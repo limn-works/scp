@@ -18,7 +18,7 @@
 //!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
 //!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP). A shipped build
 //!    starts only from a storage directory that already holds an identity;
-//!    given any other directory it logs `self-host mode failed` with
+//!    given a directory that holds none it logs `self-host mode failed` with
 //!    `no production pre-rotation custody backend available`
 //!    (`IdentityError::NoPreRotationBackend`) and exits 1.
 //!
