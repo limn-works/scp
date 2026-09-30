@@ -1938,7 +1938,8 @@ pub fn sync_ceiling_from_params(
 ///
 /// - `SCP-CTX-2000` when this instance holds no supervisor;
 /// - `SCP-CTX-2130` when an actor serves `context_id` but the mailbox send
-///   failed or timed out, or the actor did not answer the state read in time;
+///   failed or timed out, or the actor dropped its reply to the state read or
+///   missed the reply timeout;
 /// - `SCP-CTX-2135` when no actor is registered for `context_id` because the
 ///   crash watchdog despawned it and has not finished the respawn, because an
 ///   operator's `clear_poison` cleared its poison flag and has not yet

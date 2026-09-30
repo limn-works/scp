@@ -535,58 +535,25 @@ pub const CTX_2095: &str = "SCP-CTX-2095";
 ///
 /// Maps from `ContextError::NotPseudonymousContext`.
 pub const CTX_2096: &str = "SCP-CTX-2096";
-/// Actor busy: an actor or a reservation the call needed gave no answer, and
-/// a fresh call may succeed (ADR-049 §10).
+/// Actor busy (ADR-049 §10).
 ///
-/// The producers are:
-/// - a per-context actor whose mailbox send failed or timed out (a saturated
-///   mailbox, or a closed one whose task terminated before the crash watchdog
-///   despawned it), that dropped the reply channel, or whose reply missed the
-///   reply timeout;
-/// - the per-identity key-package actor on the same four faults, reached by a
-///   key-package reservation such as a Welcome join's;
-/// - `start_saga`, when the saga's participant context set overlaps an
-///   in-flight saga;
-/// - the checked role read, when an actor registers while it classifies a
-///   miss.
-///
-/// A retry after a per-context actor fault or a checked role read reads the
-/// context's current state, which can be an answer, `CTX_2135` while a
-/// respawn of a terminated actor runs or after a failed respawn, or `CTX_2134`
-/// once the watchdog poisons the context. A retry after the key-package actor
-/// or `start_saga` reaches that producer again and reads no context
-/// lifecycle state. `CTX_2135` is retryable only while a respawn runs, and
-/// `CTX_2134` is not retryable until an operator clears the poison or the
-/// process restarts.
-///
-/// Maps from `ContextError::ActorBusy` in each bridge's error translator. A
-/// bridge call site that reports every failure under one fixed code reports
-/// that code instead, and one that formats the error into a message with no
-/// code reports no code; the same holds for `CTX_2134` and `CTX_2135`.
+/// Maps from `ContextError::ActorBusy` in each bridge's error translator; that
+/// variant's doc states its producers and retry behaviour.
 pub const CTX_2130: &str = "SCP-CTX-2130";
 /// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
 ///
 /// No longer respawned; the context is dormant until an operator clears the
 /// poison (triggering a fresh respawn) or the process restarts.
 ///
-/// Maps from `ContextError::ContextPoisoned` in each bridge's error translator.
-/// A bridge call site that reports every failure under one fixed code reports
-/// that code instead, and one that formats the error into a message with no
-/// code reports no code.
+/// Maps from `ContextError::ContextPoisoned`.
 pub const CTX_2134: &str = "SCP-CTX-2134";
-/// Context actor crashed and has not been respawned (ADR-049 §10).
+/// Context actor crashed and could not be respawned (ADR-049 §10).
 ///
-/// Covers two states. While the watchdog's respawn runs, the context is
-/// mid-respawn and a retry can succeed once the respawn finishes. After a
-/// failed respawn below the budget (typically a lost or corrupt persisted
-/// snapshot), nothing retries the respawn, so the code persists until
-/// operator recovery or a restart. Distinct from `CTX_2134`: the crash budget
-/// was not necessarily exhausted.
+/// Typically a lost or corrupt persisted snapshot. Distinct from `CTX_2134`:
+/// the crash budget was not necessarily exhausted; the respawn itself was
+/// impossible.
 ///
-/// Maps from `ContextError::ActorCrashed` in each bridge's error translator.
-/// A bridge call site that reports every failure under one fixed code reports
-/// that code instead, and one that formats the error into a message with no
-/// code reports no code.
+/// Maps from `ContextError::ActorCrashed`.
 pub const CTX_2135: &str = "SCP-CTX-2135";
 /// Key package single-use replay rejected by the crypto-layer consumed-init-key
 /// backstop (ADR-049 §9 two-anchor single-use model).

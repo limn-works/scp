@@ -1381,14 +1381,8 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
-            // ADR-049 §10: an actor or a reservation the call needed gave
-            // no answer. The producers are a per-context actor (failed or
-            // timed-out mailbox send, dropped reply channel, reply timeout),
-            // the per-identity key-package actor on the same faults, a saga
-            // whose context set overlaps an in-flight saga, and a checked role
-            // read racing an actor registration; `CTX_2130`'s doc lists them.
-            // Dedicated SCP-CTX-2130 instead of CTX_2001 so a caller retries
-            // with a fresh call rather than treat it as permanent.
+            // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
+            // `ContextError::ActorBusy` doc states producers and retry behaviour.
             CE::ActorBusy(_) => Self::Context {
                 msg: format!("{e}"),
                 code: codes::CTX_2130.to_owned(),
@@ -23474,7 +23468,7 @@ mod tests {
     }
 
     /// ADR-049 §10: `ContextError::ActorBusy` must surface the dedicated
-    /// retryable SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001, as the
+    /// SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001, as the
     /// NAPI and `PyO3` translators do. The code reaches Swift and Kotlin only
     /// where the failing operation routes its error through this translator.
     #[test]

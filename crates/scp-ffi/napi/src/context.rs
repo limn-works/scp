@@ -5560,11 +5560,11 @@ fn parse_template_id_napi(
 }
 
 /// Maps a failed supervisor call that otherwise reports every failure under
-/// one fixed `code` to the bridge error, keeping `ActorBusy` retryable.
+/// one fixed `code` to the bridge error, keeping `ActorBusy` apart.
 ///
-/// `ActorBusy` keeps its retryable `SCP-CTX-2130` code (ADR-049 §10): an
-/// actor the call needed, such as the joiner's key-package actor, gave no
-/// answer, and a fresh call can succeed. Every other failure reports `code`.
+/// `ActorBusy` reports `SCP-CTX-2130` (ADR-049 §10), whose producers and retry
+/// behaviour the `ContextError::ActorBusy` doc states. Every other failure
+/// reports `code`.
 /// The Welcome join, the key-package reservation and the invite map their
 /// errors through it.
 fn busy_or(op: &str, code: &str, e: &scp_core::context::ContextError) -> ScpNapiError {
@@ -6822,10 +6822,10 @@ mod tests {
     }
 
     /// A Welcome join, a key-package reservation or an invite that meets a
-    /// busy actor keeps the retryable `SCP-CTX-2130` code, and any other
-    /// failure reads the operation's own code.
+    /// busy actor reports `SCP-CTX-2130`, and any other failure reads the
+    /// operation's own code.
     #[test]
-    fn busy_or_keeps_actor_busy_retryable() {
+    fn busy_or_keeps_actor_busy_code() {
         use scp_core::context::ContextError;
         let code_of = |e: crate::error::ScpNapiError| match e {
             crate::error::ScpNapiError::Context { code, .. } => code,

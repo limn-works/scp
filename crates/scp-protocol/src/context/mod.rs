@@ -545,22 +545,31 @@ pub enum ContextError {
         attempts: u32,
     },
 
-    /// An actor or a reservation the call needed gave no answer, and a fresh
-    /// call may succeed (ADR-049 §10).
+    /// An actor or a reservation the call needed gave no answer (ADR-049 §10).
     ///
-    /// Producers: a per-context actor whose mailbox send failed or exceeded
-    /// `SEND_TIMEOUT` (a backed-up mailbox, or a closed one whose actor task
-    /// has terminated), that dropped the reply channel, or whose reply missed
-    /// `REPLY_TIMEOUT`; the per-identity key-package actor on the same
-    /// faults; `start_saga`, when the saga's participant context set overlaps
-    /// an in-flight saga; and the checked role read, when an actor registers
-    /// while it classifies a miss. A retry after a per-context actor fault or
-    /// a checked role read reads the context's current state and can meet a
-    /// respawning, failed-respawn, or poisoned context rather than a live
-    /// actor; a retry after the key-package actor or `start_saga` reads no
-    /// context lifecycle state. Distinct from
-    /// [`Self::RateLimited`], which rejects pre-mailbox on capability
-    /// grounds.
+    /// Producers, and what each means for a retry:
+    /// - A per-context actor's mailbox send failed (a closed mailbox whose
+    ///   actor task has terminated) or exceeded `SEND_TIMEOUT` (a backed-up
+    ///   mailbox), or the per-identity key-package actor's send failed or
+    ///   exceeded `KP_SEND_TIMEOUT`. The actor never received the command, so
+    ///   a fresh call cannot apply it twice.
+    /// - A per-context actor dropped the reply channel or its reply missed
+    ///   `REPLY_TIMEOUT`, or the key-package actor did the same or missed
+    ///   `KP_REPLY_TIMEOUT`. The actor had already received the command and
+    ///   may have run it, so a retry can apply a non-idempotent operation (a
+    ///   send, a governance action, a key-package reservation) twice. Read
+    ///   the context's state before retrying one.
+    /// - `start_saga`, when the saga's participant context set overlaps an
+    ///   in-flight saga, and the checked role read, when an actor registers
+    ///   while it classifies a miss. Neither reaches an actor with the
+    ///   command, so a fresh call cannot apply it twice.
+    ///
+    /// A retry after a per-context actor fault or a checked role read reads
+    /// the context's current state and can meet a respawning, failed-respawn,
+    /// or poisoned context rather than a live actor; a retry after the
+    /// key-package actor or `start_saga` reads no context lifecycle state.
+    /// Distinct from [`Self::RateLimited`], which rejects pre-mailbox on
+    /// capability grounds.
     ///
     /// Mapped to canonical code `SCP-CTX-2130` through the bridge error
     /// translators.
