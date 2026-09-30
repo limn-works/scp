@@ -127,9 +127,9 @@
 #     names all three packages and both example file forms, `examples/NAME.rs` and
 #     `examples/NAME/main.rs`; that the assertion 1 source-scan line names scp-ffi, whose
 #     `examples/` holds a helper and no target, and scp-transport and not scp-clock, and
-#     states every source rule the gate applies, as the gate's own `print` lines give
-#     them; and that no gate-edit line appears on a
-#     branch that left the gate alone. A run that drops any of the three lines, the
+#     that it and header item 8 name `scripts/check-examples-compile.sh` as the one
+#     statement of the scan's rules instead of restating them; and that no gate-edit line
+#     appears on a branch that left the gate alone. A run that drops any of the three lines, the
 #     dependency walk or the reachability filter reports green over a change the
 #     rust-clippy job turns red.
 #
@@ -1275,243 +1275,23 @@ if [[ $SCAN_LINE == *'source scan over scp-ffi, scp-transport:'* ]]; then
 else
     report "case 22b names the source scan over each package with an example target or examples/" 1 "the source-scan line reads: ${SCAN_LINE:-<absent>}"
 fi
-# The line must state every rule the gate applies. The rules come from the gate itself:
-# each `print` line in check-examples-compile.sh's scan names one rejection, and
-# scan_rule_phrase maps it to the phrase the line must carry. A scan rule the map does not
-# know maps to nothing, so a rule added to the gate turns this case red until the line and
-# the map state it. A line that admits windows or any target_ key, or that leaves out a
-# word rejection, tells a fix agent that code the gate rejects will pass.
-scan_rule_phrase() {
-    case $1 in
-        *'unbalanced block comment'* | *'unbalanced string literal'*)
-            echo 'on a block comment or string literal the scan cannot close' ;;
-        *'include!'* | *'macro_rules!'* | *'stringify!'*) echo 'on any include, macro_rules or stringify word' ;;
-        *'U+200E or U+200F'*) echo 'on a U+200E or U+200F mark outside a literal or comment' ;;
-        *'shebang line'*) echo 'on a first line that starts with #!, after an optional byte-order mark, unless [ follows the #! after spaces, tabs and line breaks alone' ;;
-        *'#[path]'*) echo 'any #[path] or #[r#path] attribute, whatever each holds' ;;
-        *'(cfg_\w+)'*) echo 'on any identifier outside a comment or string literal that starts with cfg_ (cfg_attr and cfg_select! included)' ;;
-        *'test-attribute name'*) echo 'on the identifier test, bench or test_case wherever it stands' ;;
-        *'cfg($s)'*) echo 'fails on a cfg( or cfg!( predicate that names anything but not, any, all and ' ;;
-        *) echo '' ;;
-    esac
-}
-# Header item 8 of fix-round-check.sh states the same rules in its own words, so
-# header_rule_phrase maps each gate rule to the phrase item 8 must carry, and
-# header_rules_missing prints each phrase an item-8 text lacks. The cfg rule's phrase
-# carries the count of the gate's %plat list, passed as the second argument.
-header_rule_phrase() {
-    case $1 in
-        *'unbalanced block comment'* | *'unbalanced string literal'*)
-            echo 'on a block comment or string literal it cannot close' ;;
-        *'include!'* | *'macro_rules!'* | *'stringify!'*) echo 'on any `include`, `macro_rules` or `stringify` word' ;;
-        *'U+200E or U+200F'*) echo 'on a U+200E or U+200F mark outside a literal or comment' ;;
-        *'shebang line'*) echo 'on a first line that rustc strips as a shebang (`#!`, after an optional byte-order mark, not followed by `[` after spaces, tabs and line breaks alone)' ;;
-        *'#[path]'*) echo 'on any `#[path]` or `#[r#path]` attribute' ;;
-        *'(cfg_\w+)'*) echo 'on any identifier that starts with `cfg_`' ;;
-        *'test-attribute name'*) echo 'on the identifiers `test`, `bench` and `test_case` wherever they stand' ;;
-        *'cfg($s)'*) echo "predicate naming anything but \`not\`, \`any\`, \`all\` and $2 platform keys" ;;
-        *) echo '' ;;
-    esac
-}
-header_rules_missing() {
-    local text=$1 count=$2 rule want out=""
-    while IFS= read -r rule; do
-        want=$(header_rule_phrase "$rule" "$count")
-        if [[ -z $want ]]; then
-            out+="[an item-8 phrase for the gate rule: $rule] "
-        elif [[ $text != *"$want"* ]]; then
-            out+="[header item 8: $want] "
-        fi
-    done < <(grep -E '^[[:space:]]*print "' "$REPO_ROOT/scripts/check-examples-compile.sh")
-    for want in 'on a platform predicate false on the Linux runner' \
-        'including a package with no example target'; do
-        [[ $text == *"$want"* ]] || out+="[header item 8: $want] "
-    done
-    printf '%s' "$out"
-}
-# Every other cfg rejection comes out of the gate's `ev` predicate evaluator through the
-# one `print "cfg($s)` line, so the print map above cannot tell those rules apart. Each
-# `return undef` line in `ev` is one rejection; ev_rule_phrase maps it to the phrase the
-# source-scan line (first argument `scan`) or header item 8 (`header`) must carry, `-` for
-# the line that only passes a nested rejection up. A `return undef` line the map does not
-# know maps to nothing, so a rule added to `ev` turns this case red until both texts and
-# the map state it.
-ev_rule_phrase() {
-    local scan header
-    case $2 in
-        *'ev($t); return undef unless defined $x'*) echo -; return 0 ;;
-        *'$k =~ /^[A-Za-z_]/'* | *"shift(@\$t) eq ')'"*)
-            scan='on a predicate the scan cannot parse, such as cfg() or any(unix windows)'
-            header='on a predicate it cannot parse' ;;
-        *'(?:not|any|all)'* | *'$plat{$k}'*)
-            scan='fails on a cfg( or cfg!( predicate that names anything but not, any, all and '
-            header='predicate naming anything but `not`, `any`, `all` and' ;;
-        *"\$k eq 'not' ? @v != 1 : !@v"*)
-            scan='on an empty any() or all(), and on a not() that holds other than one predicate'
-            header='on an empty `any()` or `all()`, on a `not()` that holds other than one predicate' ;;
-        *'$s =~ /^"(\d+)"$/ && $str[$1] !~ /\\/'*)
-            scan='on a platform value that is not a string literal, as in target_os = linux, or that holds a backslash'
-            header='on a platform value that is not a string literal or that holds a backslash' ;;
-        *) return 0 ;;
-    esac
-    [[ $1 == scan ]] && echo "$scan" || echo "$header"
-}
-# ev_rules_missing KIND TEXT GATE prints each phrase TEXT lacks for a `return undef` line of
-# GATE's `ev` sub, and a note when GATE's `ev` holds fewer than the seven such lines the
-# gate has, so a gate whose `ev` the case cannot find fails instead of passing.
-ev_rules_missing() {
-    local line want n=0 out=""
-    while IFS= read -r line; do
-        n=$((n + 1))
-        want=$(ev_rule_phrase "$1" "$line")
-        if [[ -z $want ]]; then
-            out+="[a phrase for the ev rule: $line] "
-        elif [[ $want != - && $2 != *"$want"* ]]; then
-            out+="[$1: $want] "
-        fi
-    done < <(awk '/^sub ev \{/ { on = 1 } on && /return undef/ { print } on && /^\}/ { on = 0 }' "$3")
-    [[ $n -ge 7 ]] || out+="[the seven return undef lines of the gate's ev sub; found $n] "
-    printf '%s' "$out"
+# The source-scan line and header item 8 do not restate the scan's rules: each names
+# scripts/check-examples-compile.sh as the one statement of them, so a rule the gate
+# gains or drops leaves both texts true. scan_points_to_gate passes a text that carries
+# that pointer and fails one that drops it.
+scan_points_to_gate() {
+    [[ $1 == *'scripts/check-examples-compile.sh'*' is the one statement of the rules that scan applies'* ]]
 }
 # Item 8's text, comment markers stripped and its lines joined with single spaces.
 HEADER8=$(awk '/^#   8\./ { on = 1 } /^# USAGE/ { on = 0 } on' "$REPO_ROOT/scripts/fix-round-check.sh" \
     | sed -E 's/^#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')
-scan_rules_missing=""
-gate_rule_count=0
-while IFS= read -r rule; do
-    gate_rule_count=$((gate_rule_count + 1))
-    want=$(scan_rule_phrase "$rule")
-    if [[ -z $want ]]; then
-        scan_rules_missing+="[a phrase for the gate rule: $rule] "
-    elif [[ $SCAN_LINE != *"$want"* ]]; then
-        scan_rules_missing+="[$want] "
-    fi
-done < <(grep -E '^[[:space:]]*print "' "$REPO_ROOT/scripts/check-examples-compile.sh")
-for want in 'false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows)' \
-    'in every workspace package whether or not it has an example target'; do
-    [[ $SCAN_LINE == *"$want"* ]] || scan_rules_missing+="[$want] "
-done
-# The cfg rule admits the keys in the gate's %plat list and no others, so the line must
-# name exactly that list and its count, read from the gate; each key its "so KEY and KEY
-# fail;" clause names must be missing from that list; and header item 8 must give the same
-# count and every rule. plat_keys_list prints a gate file's %plat keys, or nothing when the
-# file holds no %plat list; plat_keys_phrase prints the phrase that list requires.
-plat_keys_list() {
-    perl -0ne 'print join(" ", split(" ", $1)) if /%plat\s*=\s*map\s*\{[^}]*\}\s*qw\(([^)]*)\)/' "$1"
-}
-plat_keys_phrase() {
-    local keys n words
-    keys=$(plat_keys_list "$1")
-    [[ -n $keys ]] || return 0
-    read -r -a keys <<<"$keys"
-    n=${#keys[@]}
-    words=(zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty)
-    local count=$n
-    [[ $n -le 20 ]] && count=${words[$n]}
-    if [[ $n -eq 1 ]]; then
-        echo "the $count platform key ${keys[0]},"
-    else
-        local head
-        head=$(printf '%s, ' "${keys[@]:0:n-1}")
-        echo "the $count platform keys ${head%, } and ${keys[n-1]},"
-    fi
-}
-# plat_fail_bad prints each key a line's "so KEY and KEY fail;" clause names that the
-# gate file's %plat list admits, or a note when the line has no such clause.
-plat_fail_bad() {
-    local plat clause k out=""
-    plat=" $(plat_keys_list "$2") "
-    clause=$(perl -ne 'print "$1 $2" if /\bso ([a-z_]+) and ([a-z_]+) fail;/' <<<"$1")
-    [[ -n $clause ]] || { printf '%s' "[a 'so KEY and KEY fail;' clause] "; return 0; }
-    for k in $clause; do
-        [[ $plat == *" $k "* ]] && out+="[$k, which the gate's %plat list admits, named as failing] "
-    done
-    printf '%s' "$out"
-}
-plat_want=$(plat_keys_phrase "$REPO_ROOT/scripts/check-examples-compile.sh")
-if [[ -z $plat_want ]]; then
-    scan_rules_missing+="[the gate's %plat key list, which the case could not read] "
+if scan_points_to_gate "$SCAN_LINE" && scan_points_to_gate "$HEADER8" \
+    && ! scan_points_to_gate "${SCAN_LINE/is the one statement/is one statement}" \
+    && ! scan_points_to_gate "${HEADER8/is the one statement/is one statement}" \
+    && ! scan_points_to_gate "${SCAN_LINE//scripts\/check-examples-compile.sh/the gate}"; then
+    report "case 22b points the source-scan line and header item 8 to the examples gate for its rules" 0 ""
 else
-    [[ $SCAN_LINE == *"$plat_want"* ]] || scan_rules_missing+="[$plat_want] "
-    scan_rules_missing+=$(plat_fail_bad "$SCAN_LINE" "$REPO_ROOT/scripts/check-examples-compile.sh")
-    plat_count=${plat_want#the }
-    plat_count=${plat_count%% *}
-    scan_rules_missing+=$(header_rules_missing "$HEADER8" "$plat_count")
-fi
-scan_rules_missing+=$(ev_rules_missing scan "$SCAN_LINE" "$REPO_ROOT/scripts/check-examples-compile.sh")
-scan_rules_missing+=$(ev_rules_missing header "$HEADER8" "$REPO_ROOT/scripts/check-examples-compile.sh")
-if [[ $gate_rule_count -ge 11 && -z $scan_rules_missing ]]; then
-    report "case 22b states every source rule the examples gate applies" 0 ""
-else
-    report "case 22b states every source rule the examples gate applies" 1 "the gate has $gate_rule_count scan rules; the source-scan line lacks $scan_rules_missing: ${SCAN_LINE:-<absent>}"
-fi
-# The map must reject a rule it does not know. Two retired wordings must fail the phrase
-# check: the one that named cfg_attr alone and left out test, bench and test_case, and the
-# one written before the gate rejected stringify, #[r#path], U+200E, U+200F and a shebang line.
-earlier_wording='on any include or macro_rules word, and any #[path] attribute, whatever each holds'
-retired='on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds; and on a block comment or string literal the scan cannot close'
-if [[ -z $(scan_rule_phrase 'print "cfg_select!\n" if /\bcfg_select\b/;') \
-    && $earlier_wording != *"$(scan_rule_phrase 'print "stringify!\n" if /\bstringify\b/;')"* \
-    && $earlier_wording != *"$(scan_rule_phrase 'print "U+200E or U+200F outside a literal or comment\n"')"* \
-    && $earlier_wording != *"$(scan_rule_phrase 'print "shebang line\n"')"* \
-    && $retired != *"$(scan_rule_phrase 'print "test-attribute name $1\n"')"* \
-    && $retired != *"$(scan_rule_phrase 'print "$1\n" while /\b(cfg_\w+)/g;')"* ]]; then
-    report "case 22b rejects an unmapped gate rule and the retired rule wording" 0 ""
-else
-    report "case 22b rejects an unmapped gate rule and the retired rule wording" 1 "scan_rule_phrase accepted an unknown rule, or the retired wording carries a required phrase"
-fi
-# The key-list check must go red when the gate's %plat list gains or loses a key, and
-# when the gate holds no list at all. Each mutation edits a copy of the gate.
-plat_gate=$(mktemp "${TMPDIR:-/tmp}/plat-gate.XXXXXX")
-plat_bad=""
-perl -pe 's/qw\(unix /qw(unix target_has_atomic /' "$REPO_ROOT/scripts/check-examples-compile.sh" >"$plat_gate"
-m=$(plat_keys_phrase "$plat_gate")
-[[ -n $m && $SCAN_LINE != *"$m"* && $m == *'the ten platform keys'* ]] || plat_bad+="[an added key left the phrase in the line: $m] "
-[[ $(plat_fail_bad "$SCAN_LINE" "$plat_gate") == *'target_has_atomic, which the gate'* ]] \
-    || plat_bad+="[a key added to %plat and still named as failing passed] "
-[[ -n $(header_rules_missing "$HEADER8" ten) ]] || plat_bad+="[header item 8 passed with the wrong key count] "
-perl -pe 's/ target_vendor\)/)/' "$REPO_ROOT/scripts/check-examples-compile.sh" >"$plat_gate"
-m=$(plat_keys_phrase "$plat_gate")
-[[ -n $m && $SCAN_LINE != *"$m"* && $m == *'the eight platform keys'* ]] || plat_bad+="[a removed key left the phrase in the line: $m] "
-perl -pe 's/%plat\b/%other/' "$REPO_ROOT/scripts/check-examples-compile.sh" >"$plat_gate"
-[[ -z $(plat_keys_phrase "$plat_gate") ]] || plat_bad+="[a gate without %plat still gave a phrase] "
-[[ -z $(plat_fail_bad "$SCAN_LINE" "$REPO_ROOT/scripts/check-examples-compile.sh") ]] \
-    || plat_bad+="[the line's fail clause names a key the gate admits] "
-[[ -n $(plat_fail_bad "${SCAN_LINE/ fail;/ pass;}" "$REPO_ROOT/scripts/check-examples-compile.sh") ]] \
-    || plat_bad+="[a line without the fail clause passed] "
-[[ -n $(header_rules_missing "${HEADER8/\`stringify\`/\`concat\`}" nine) ]] \
-    || plat_bad+="[header item 8 without stringify passed] "
-[[ -n $(header_rules_missing "${HEADER8/as a shebang/as a comment}" nine) ]] \
-    || plat_bad+="[header item 8 without the shebang rule passed] "
-[[ -z $(header_rules_missing "$HEADER8" nine) ]] || plat_bad+="[the head's header item 8 failed] "
-# The ev map must pass the head's texts, reject a text that drops an ev rule, and reject a
-# gate whose ev gains a rejection the map does not know or whose ev it cannot find.
-GATE=$REPO_ROOT/scripts/check-examples-compile.sh
-[[ -z $(ev_rules_missing scan "$SCAN_LINE" "$GATE") && -z $(ev_rules_missing header "$HEADER8" "$GATE") ]] \
-    || plat_bad+="[the head's texts failed the ev rules] "
-[[ -n $(ev_rules_missing scan "${SCAN_LINE/, or that holds a backslash/}" "$GATE") ]] \
-    || plat_bad+="[a source-scan line without the backslash rule passed] "
-[[ -n $(ev_rules_missing header "${HEADER8/or that holds a backslash/}" "$GATE") ]] \
-    || plat_bad+="[header item 8 without the backslash rule passed] "
-[[ -n $(ev_rules_missing scan "${SCAN_LINE/and on a not() that holds/and on a not() with}" "$GATE") ]] \
-    || plat_bad+="[a source-scan line without the not() arity rule passed] "
-perl -pe "s/^(\s*return undef unless \\\$plat\{\\\$k\};)/\$1\n  return undef if \\\$k eq 'target_env';/" "$GATE" >"$plat_gate"
-[[ $(ev_rules_missing scan "$SCAN_LINE" "$plat_gate") == *"[a phrase for the ev rule:"*"target_env"* ]] \
-    || plat_bad+="[a gate whose ev gained an unmapped rejection passed] "
-perl -pe 's/^sub ev \{/sub evaluate {/' "$GATE" >"$plat_gate"
-[[ -n $(ev_rules_missing scan "$SCAN_LINE" "$plat_gate") ]] || plat_bad+="[a gate with no ev sub passed] "
-rm -f "$plat_gate"
-if [[ -z $plat_bad ]]; then
-    report "case 22b rejects a line or header item 8 that differs from the gate's rules and key list" 0 ""
-else
-    report "case 22b rejects a line or header item 8 that differs from the gate's rules and key list" 1 "$plat_bad"
-fi
-# The retired wording admitted any target_ key and a cfg_attr whose predicate names a
-# platform key; neither the scan line nor the assertion 1 line may carry it.
-if grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt" | grep -qF 'or a target_ key such as target_os'; then
-    report "case 22b carries no stale cfg rule" 1 "$(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
-else
-    report "case 22b carries no stale cfg rule" 0 ""
+    report "case 22b points the source-scan line and header item 8 to the examples gate for its rules" 1 "the source-scan line reads: ${SCAN_LINE:-<absent>}; header item 8 reads: ${HEADER8:-<absent>}"
 fi
 if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over this repository' "$HARNESS22B/out.txt"; then
     report "case 22b names no unrun gate edit on a branch that left the gate alone" 1 "$(grep -F 'check-examples-compile.sh over this repository' "$HARNESS22B/out.txt")"
