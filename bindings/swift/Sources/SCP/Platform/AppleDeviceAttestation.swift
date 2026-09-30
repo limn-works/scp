@@ -132,10 +132,11 @@
     /// `AppleDeviceAttestation` is `final` and conforms to `Sendable`. Its
     /// `UserDefaults` reads and writes are protected by `NSLock`.
     /// `callSerializer`, an actor, runs the App Attest calls of every `attest`
-    /// and `assertRequest`, key generation included, one call at a time in
-    /// arrival order. Each call therefore reads the stored key ID after every
-    /// preceding call finished writing it, and concurrent `attest` calls on a
-    /// device with no stored key generate one key. `attest` and
+    /// and `assertRequest`, key generation included, one call at a time, in
+    /// the order the serializer accepts them. Each call therefore reads the
+    /// stored key ID after every preceding call finished writing it, and
+    /// concurrent `attest` calls on a device with no stored key generate one
+    /// key. `attest` and
     /// `assertRequest` check `isSupported` and the 32-byte length before they
     /// queue a call, so a call either check rejects waits for no other call.
     /// `attestKey` and `generateAssertion` bridge to structured concurrency
@@ -535,7 +536,15 @@
     // App Attest call serialization
     // ---------------------------------------------------------------------------
 
-    /// Runs App Attest calls one at a time, in arrival order.
+    /// Runs App Attest calls one at a time, in the order it accepts them.
+    ///
+    /// The serializer accepts a call when the actor runs that caller's
+    /// `run(_:)` job. Swift's default actor executor does not promise to run
+    /// jobs in the order callers made them: it may run a later,
+    /// higher-priority caller's job before an earlier, lower-priority one. So
+    /// the order App Attest sees is the acceptance order, not the order in
+    /// which callers called `attest` or `assertRequest`. Mutual exclusion and
+    /// the one-key guarantee do not depend on that order.
     ///
     /// **Why serialization, rather than a lock around the key-ID read:**
     /// `generateKey` answers through a completion handler, so a lock cannot be

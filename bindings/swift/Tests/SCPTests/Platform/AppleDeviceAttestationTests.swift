@@ -757,9 +757,9 @@
     }
 
     /// Cases that pin `AppleDeviceAttestation`'s call serializer: App Attest
-    /// sees one outstanding call at a time, in arrival order, across every
-    /// adapter over one `UserDefaults` object, and the `isSupported` and
-    /// 32-byte checks run before a call is queued.
+    /// sees one outstanding call at a time, in the order the serializer
+    /// accepts them, across every adapter over one `UserDefaults` object, and
+    /// the `isSupported` and 32-byte checks run before a call is queued.
     struct AppAttestCallOrderingTests {
         @Test("App Attest sees one outstanding call at a time")
         func appAttestCallsNeverOverlap() async {
