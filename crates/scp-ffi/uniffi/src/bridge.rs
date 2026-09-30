@@ -23213,9 +23213,29 @@ mod tests {
         );
         scp.shutdown(1_000).await.expect("shut the instance down");
 
-        let result = scp
-            .mcp_client_connect_stdio(vec!["sh".to_owned(), "-c".to_owned(), script])
-            .await;
+        // Bounded: the stub keeps stdout open until `sleep 600` ends, so a
+        // connect that stops finishing the handshake would hang this test ten
+        // minutes; it fails here in 10 s instead. The handshake runs on a
+        // blocking thread the runtime waits for when the test's runtime drops,
+        // so a timeout first kills the stub and its `sleep`, which ends the
+        // thread's read of stdout.
+        let Ok(result) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            scp.mcp_client_connect_stdio(vec!["sh".to_owned(), "-c".to_owned(), script]),
+        )
+        .await
+        else {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                let _ = std::process::Command::new("pkill")
+                    .args(["-KILL", "-P", pid.trim()])
+                    .status();
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", pid.trim()])
+                    .status();
+            }
+            let _ = std::fs::remove_file(&pid_file);
+            panic!("the connect must end within 10 s");
+        };
         let pid = std::fs::read_to_string(&pid_file).expect("the stub server wrote its pid");
         let _ = std::fs::remove_file(&pid_file);
 
