@@ -121,8 +121,10 @@ scope. When the departing mount is the last live mount under its key, the coordi
 that runs `onStop` on a scope disposal never cancels; while another mount under that key stays live,
 the coordinator holds `onStop` for the stop the last mount's departure launches. The coordinator
 drops `onStop`, which then never runs, in two cases: the departing mount's start never ran, or its
-start returned the object (compared by identity) that an earlier departing mount's start under that
-key returned, in which case the coordinator holds or runs that earlier mount's `onStop` in its place. `rememberScpContext`'s KDoc example teaches callers
+start returned the object (compared by identity) that the start of another departed mount, whose
+`onStop` the coordinator still holds under that key, returned, in which case the coordinator runs that
+held `onStop` in its place. A stop clears the held list, so an `onStop` an earlier stop already ran is
+not compared, and a later mount whose start returns that object keeps its own `onStop`. `rememberScpContext`'s KDoc example teaches callers
 that same shape, because that example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
 disposal callback.
 

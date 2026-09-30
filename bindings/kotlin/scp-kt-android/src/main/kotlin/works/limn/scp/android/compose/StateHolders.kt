@@ -285,23 +285,32 @@ private fun <R> rememberCollectedState(
  * [unmount] holds a departing mount's `onStop` while another mount under that key stays
  * composed, and when it removes the last live mount it launches one stop that runs the `onStop`
  * lambdas it held for that key and then the departing mount's own, skipping each one whose
- * mount's `start` returned an object an earlier one's `start` returned, as the next paragraph
- * states. So a mount that leaves while another mount under that key stays composed stops
+ * mount's `start` returned an object that an earlier one in that same list's `start` returned,
+ * as the next paragraph states. So a mount that leaves while another mount under that key stays composed stops
  * nothing yet.
  *
  * Only a mount whose `start` ran has its `onStop` run: a mount that leaves before its `start`
- * takes the key's mutex opened nothing, and its `start` never runs afterwards. Two mounts whose
- * `start` returned one same object (compared by identity) hold one subscription, so this class
- * keeps and runs one `onStop` for that object; a registry such as `HotStreamFactory` returns one
- * [SharedFlow] instance for every caller of one subscription. A `start` that began runs to
- * completion even when its mount leaves meanwhile, so what it returned is compared too. A mount
- * whose `start` threw keeps its own `onStop`, because that `start` may have opened a
- * subscription it did not return. The `onStop` lambdas held for a key therefore number at most
- * the distinct objects its mounts' `start` returned, plus one for the `start` running under the
- * key's mutex, plus one for each departed mount whose `start` threw. While another mount under
- * the key stays composed, a departing mount whose `start` returned an object already held adds
- * nothing, and each departing mount whose `start` threw adds one, so the held list grows
- * linearly with those departures until the last mount leaves.
+ * takes the key's mutex opened nothing, and its `start` never runs afterwards. Two departed
+ * mounts whose `start` returned one same object (compared by identity) and whose `onStop` lambdas
+ * this class holds together under one key hold one subscription, so it keeps and runs one
+ * `onStop` for that object; a registry such as `HotStreamFactory` returns one [SharedFlow]
+ * instance for every caller of one subscription. The comparison reaches only the `onStop`
+ * lambdas held since the key's last stop launched: a stop clears the held list, so a later mount
+ * whose `start` returns an object an earlier stop already released keeps its own `onStop`, and
+ * that `onStop` runs. A `start` that began runs to completion even when its mount leaves
+ * meanwhile, so what it returned is compared too. A mount whose `start` threw keeps its own
+ * `onStop`, because that `start` may have opened a subscription it did not return.
+ *
+ * [unmount] compacts the held list only when a mount departs, and keeps each entry whose
+ * `start` is still running at that moment. The `onStop` lambdas held for a key therefore number
+ * at most the distinct objects its mounts' `start` returned, plus one for each departed mount
+ * whose `start` threw, plus one for each whose `start` was still running when a departure last
+ * compacted the list; the next departure or the key's stop drops such an entry when its `start`
+ * returned an object already held. While another mount under the key stays composed, a departing
+ * mount whose `start` has returned an object already held adds nothing, a departing mount whose
+ * `start` is still running adds one until the next compaction, and each departing mount whose
+ * `start` threw adds one, so the held list grows linearly with the departures whose `start`
+ * threw until the last mount leaves.
  *
  * Each stop joins the stop launched before it under that key before it takes
  * that key's mutex, and [startMounted] joins the stop its mount captured before it runs a
@@ -330,8 +339,9 @@ private fun <R> rememberCollectedState(
  * one subscription still has its own `onStop` run; `HotStreamFactory`'s stop functions return
  * without effect on a handle they no longer hold.
  *
- * An `onStop` that throws is logged at warning level and goes no further, as
- * `.docs/standards/sdk-common.md` §Cleanup error handling requires of a cleanup error. Letting
+ * An `onStop` that throws anything other than a [CancellationException] raised by cancelling
+ * [scope] is logged at warning level and goes no further, and the stop runs its next `onStop`,
+ * as `.docs/standards/sdk-common.md` §Cleanup error handling requires of a cleanup error. Letting
  * it escape would reach the thread's uncaught-exception handler, which on Android kills the
  * process after the screen that mounted the stream is gone, and on a [scope] without a
  * [SupervisorJob] would also cancel that scope, so every later `onStop` would never run.
@@ -373,12 +383,15 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
     }
 
     /**
-     * Run [onStop], logging whatever it throws. A throw that comes from cancelling this
-     * coordinator's own [scope] still propagates, because [ensureActive] rethrows it.
+     * Run [onStop], logging whatever it throws, so the next held `onStop` still runs. A
+     * [CancellationException] thrown while this coordinator's own [scope] is cancelled
+     * propagates, because [ensureActive] rethrows it, and the stop runs no further `onStop`.
+     * Any other throw is logged even when [scope] was cancelled meanwhile, and the next
+     * `onStop` then runs under that cancellation.
      */
     private suspend fun runStop(onStop: suspend () -> Unit) {
         runCatching { onStop() }.onFailure { failure ->
-            currentCoroutineContext().ensureActive()
+            if (failure is CancellationException) currentCoroutineContext().ensureActive()
             Log.w(COORDINATOR_TAG, "onStop threw while releasing a hot stream", failure)
         }
     }
@@ -478,9 +491,10 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
      * its [Job] before returning, so a [mount] that begins afterwards captures it.
      *
      * [onStop] is kept only when [mount]'s `start` ran or is running, and the stop runs it only
-     * when no `onStop` it runs earlier came from a mount whose `start` returned that same object.
-     * A held departure whose `start` returned an object an earlier held departure's `start`
-     * returned adds nothing to the held list.
+     * when no `onStop` that same stop runs earlier came from a mount whose `start` returned that
+     * same object. A departure beside a live mount whose `start` has returned an object that a
+     * `start` of a held departure returned adds nothing to the held list; one whose `start` is
+     * still running stays held until the next departure or the stop compares it.
      *
      * @return A [Job] that the stop covering [onStop] completes once it has run every `onStop`
      *   it holds. Every departure that stop covers gets this one [Job], whether that stop
@@ -759,8 +773,10 @@ internal enum class HotStreamKind {
  * earlier mount launched under that key, and a mount that leaves while another mount under
  * that key is still composed defers its [onStop] until the last mount under that key leaves.
  * [coordinator] drops this mount's [onStop] when this mount's [start] never ran, or when its
- * [start] returned the instance an earlier departing mount's [start] under [key] returned; it
- * then runs that earlier mount's [onStop] in its place.
+ * [start] returned the instance that the [start] of another departed mount, whose [onStop]
+ * [coordinator] still holds under [key], returned; it then runs that held [onStop] in its
+ * place. A mount whose [onStop] already ran in an earlier stop is not compared, so a later
+ * mount whose [start] returns that same instance keeps its own [onStop], which runs.
  *
  * @param key Recomposition key, compared with `equals`. The subscription restarts if it
  *   changes. It names the one subscription [start] returns, because [coordinator] counts and
@@ -771,7 +787,7 @@ internal enum class HotStreamKind {
  * @param start Suspend lambda that opens the [SharedFlow]. Once it begins, disposal does not
  *   cancel it: it runs to completion, so [coordinator] learns what it returned. It returns one
  *   same [SharedFlow] instance to every mount of one subscription, as `HotStreamFactory` does,
- *   because [coordinator] runs one [onStop] per instance it saw.
+ *   because one stop of [coordinator] runs one [onStop] per instance among those it holds.
  * @param onStop Suspend lambda that releases the subscription [start] returned, and nothing
  *   else. [coordinator] runs it on its own scope once the last live mount under [key] leaves,
  *   and skips it when this mount left before its [start] ran or when an [onStop] it runs first
@@ -837,8 +853,10 @@ internal fun <T> rememberScpHotStream(
             // (holding onStop for that stop otherwise), and records that stop's Job before it
             // returns, so a start that a later mount begins under this same key joins that job
             // instead of racing it. It drops onStop when this mount's start never ran there,
-            // and when this mount's start returned the object an earlier departing mount's
-            // start under this key returned, whose onStop it holds or runs in its place.
+            // and when this mount's start returned the object that the start of another
+            // departed mount, whose onStop it still holds under this key, returned; it runs that
+            // held onStop in its place. An onStop that an earlier stop already ran is not
+            // compared, so this onStop then stays held and runs.
             // Cancelling `scope` afterwards cancels this mount's start only while it waits to
             // run (a start already running finishes), and never that stop.
             coordinator.unmount(mount, onStop)

@@ -1518,6 +1518,62 @@ private fun hotEventFlow() =
 
 private const val SETTLE_DELAY_MS = 100L
 
+/**
+ * Coordinator stops whose scope is cancelled while they run, kept apart from
+ * [ScpHotStreamRemountTest] so that neither class exceeds detekt's class-size limit.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest = Config.NONE, sdk = [33])
+class ScpHotStreamCancelledStopTest {
+    /**
+     * An `onStop` that throws a non-cancellation exception after the coordinator's scope was
+     * cancelled is still logged with its own cause, and the stop still runs the next `onStop`.
+     * Every `onStop` then ran, so the stop logs no leak and every departure's Job completes
+     * normally. A stop that let the scope's cancellation replace that exception would drop it,
+     * skip the last `onStop`, log a leak, and fail every departure's Job.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a throwing onStop on a cancelled scope is logged and the next onStop still runs`() {
+        ShadowLog.clear()
+        val scope = newCoordinatorScope()
+        val coordinator = ScpHotStreamCoordinator(scope)
+        val stops = AtomicInteger(0)
+        val entered = CountDownLatch(1)
+        val gate = CompletableDeferred<Unit>()
+        val failure = IllegalStateException("engine already dropped the context")
+        val staying = coordinator.startedMount("k")
+        val first =
+            checkNotNull(
+                coordinator.unmount(coordinator.startedMount("k")) {
+                    withContext(NonCancellable) {
+                        entered.countDown()
+                        gate.await()
+                        stops.incrementAndGet()
+                    }
+                },
+            )
+        val throwing = checkNotNull(coordinator.unmount(coordinator.startedMount("k")) { throw failure })
+        val stop = checkNotNull(coordinator.unmount(staying) { stops.incrementAndGet() })
+        assertTrue("the first held onStop never ran", entered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+
+        scope.cancel()
+        gate.complete(Unit)
+        runBlocking {
+            first.join()
+            throwing.join()
+            stop.join()
+        }
+
+        assertEquals("an onStop after the throwing one was skipped", 2, stops.get())
+        assertEquals("a held departure's Job reported a skipped onStop", false, first.isCancelled)
+        assertEquals("the throwing departure's Job reported a skipped onStop", false, throwing.isCancelled)
+        assertEquals("the last departure's Job reported a skipped onStop", false, stop.isCancelled)
+        val warning = ShadowLog.getLogsForTag("ScpHotStreamCoordinator").single()
+        assertEquals(Log.WARN, warning.type)
+        assertSame("the onStop's own failure was not the logged cause", failure, warning.throwable)
+    }
+}
+
 /** Upper bound on how long a test waits for a latch that another thread opens. */
 private const val AWAIT_TIMEOUT_SECONDS = 10L
 

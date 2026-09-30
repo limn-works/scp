@@ -95,17 +95,22 @@ subscription that a different caller had just opened.
 - **Run one `onStop` per subscription a started mount opened.** `startMounted` and `unmount`
   race to claim a mount with one compare-and-set; when `unmount` wins, that mount's `start`
   never runs and its `onStop` is dropped, because it opened nothing. A held
-  departure whose `start` returned the same object as an earlier held one's (compared by
+  departure whose `start` has returned the same object as a held one's (compared by
   identity; `HotStreamFactory` hands every caller of one subscription one `SharedFlow`) adds
   nothing to the held list, so list rows whose start returned an existing subscription can
-  scroll past a long-lived mount without growing that list. A `start` that
+  scroll past a long-lived mount without growing that list. The comparison reaches only the
+  `onStop` lambdas held since the key's last stop: a stop clears the held list, so a later mount
+  whose start returns an object an earlier stop already released keeps its own `onStop`. A `start` that
   began runs to completion under `NonCancellable` even when its mount leaves meanwhile: a start
   that disposal cancelled returned nothing to compare, so each row that left while its start
   waited on `HotStreamFactory`'s mutex kept one more `onStop` for good. A mount whose `start`
-  threw keeps its `onStop`, because that start may have opened what it did not return. The held
-  list for a key therefore holds one entry per distinct subscription, one for the start running
-  under the key's mutex, and one for each departed mount whose start threw: while a long-lived
-  mount stays composed, it grows by one with every row whose start threw and then left, such as
+  threw keeps its `onStop`, because that start may have opened what it did not return. The
+  coordinator compacts the held list only when a mount departs, and keeps an entry whose start
+  is still running then. The held list for a key therefore holds at most one entry per distinct
+  subscription, plus one for each departed mount whose start threw, plus one for each departed
+  mount whose start was still running when a departure last compacted the list, which the next
+  departure or the key's stop drops when that start returned an object already held. While a
+  long-lived mount stays composed, it grows by one with every row whose start threw and then left, such as
   a row over a dropped context whose subscribe keeps throwing. `rememberScpHotStream` logs that throw and leaves the mount's State null: its launch
   scope has no exception handler, so a throw escaping it reaches the thread's uncaught-exception
   handler, which on Android kills the process before the held `onStop` can run. Discarding an early

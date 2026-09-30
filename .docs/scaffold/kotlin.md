@@ -126,47 +126,13 @@ bindings/kotlin/
 
 ## UniFFI Bridge
 
-UniFFI generates Kotlin bindings from a single UDL (Universal Definition Language) file shared with Swift.
+UniFFI generates the Kotlin bindings from the metadata that proc-macro exports (`#[uniffi::export]`, `#[derive(uniffi::Object)]`, `#[derive(uniffi::Record)]`, `#[derive(uniffi::Error)]`, `#[uniffi::export(callback_interface)]`) embed in the compiled `scp-ffi-uniffi` library. Those exports live in `bridge.rs`, `lib.rs`, `outlet_stream.rs`, `scp.rs`, and `server.rs` under `crates/scp-ffi/uniffi/src/`. `scripts/generate-uniffi-kotlin.sh` builds that library and runs `uniffi-bindgen generate --library <library> --language kotlin`, and the Gradle task `generateUniffiBindings` runs that script.
 
-### UDL definition
-
-Located at `crates/scp-ffi/uniffi/src/scp.udl`:
-
-```
-namespace scp {
-  [Throws=ScpError]
-  Identity identity_create(IdentityConfig config);
-
-  [Throws=ScpError]
-  Identity identity_load(bytes identifier);
-
-  [Throws=ScpError]
-  ResolutionOutcome identity_resolve(bytes identifier);
-};
-
-interface Identity {
-  bytes identifier();
-  CustodyType custody_type();
-
-  [Throws=ScpError]
-  Identity rotate_key();
-};
-
-interface Context {
-  string context_id();
-  string state();
-
-  [Throws=ScpError]
-  void send(bytes payload);
-
-  [Throws=ScpError]
-  ToolResult invoke_tool(string tool_id, string input_json);
-};
-```
+`crates/scp-ffi/uniffi/src/scp.udl` holds only the empty `namespace scp {};` that `uniffi::include_scaffolding!("scp")` in `lib.rs` requires, and declares no type or function. An operation reaches Kotlin when a proc-macro export declares it in Rust; an edit to the UDL adds nothing to the bindings.
 
 UniFFI generates:
 - `scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt` — JNA bindings to the Rust shared library, in package `uniffi.scp`
-- Kotlin classes wrapping each interface
+- A Kotlin class for each exported object, such as `Scp`, `Identity`, `ContextHandle`, `RelayHandle`, and `NodeHandle`
 - An exception class hierarchy for each error type, such as `uniffi.scp.ScpException` and its subclasses (for example `ScpException.Transport`)
 
 ### Async bridging
