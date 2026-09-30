@@ -787,14 +787,9 @@ impl ScpClient {
         //
         // The authenticated source is each member's signed
         // `scp_wrapping_key` leaf extension in the (now Welcome-embedded) ratchet
-        // tree. openmls 0.9.0 exposes every remote leaf, but reading a member's
-        // wrapping key from the tree waits on an attestation-verified binding of
-        // identifier to leaf: a leaf's credential identifier is self-asserted, so
-        // the tree alone cannot say which leaves an identifier's holder controls.
-        // ADR-057's T4 residual (3), the self-certifying directory, assigns that
-        // binding to the leaf-signing / custody slice (§23.13, Event Verification
-        // During Reconciliation) — the same residual T3/T4 name for the
-        // convergent timestamp. Triggers 1 (adder→joiner) and 3
+        // tree, but [`scp_mls::extract_member_wrapping_key`] returns only the
+        // local member's key; its rustdoc says why.
+        // Triggers 1 (adder→joiner) and 3
         // (bystander→joiner) do NOT share this gap: they read the wrapping key from
         // a validated KeyPackage / Add proposal.
         for (member_did, member_wrapping_key) in wrapping_keys {

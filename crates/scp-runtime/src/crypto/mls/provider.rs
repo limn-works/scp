@@ -735,12 +735,8 @@ impl NodeMlsFactory {
     /// initial shape a fresh join produces. `member_wrapping_keys` STAYS empty
     /// for a joiner: it caches other members' STABLE wrapping keys, used ONLY by
     /// the proactive/offline PUSH path and populated on the incumbent/adder side.
-    /// openmls 0.9.0 exposes every remote leaf, but reading a member's signed
-    /// `scp_wrapping_key` leaf extension from the tree waits on an
-    /// attestation-verified binding of identifier to leaf, because a leaf's
-    /// credential identifier is self-asserted; that binding is the leaf-signing /
-    /// custody slice's work (ADR-057's T4 residual (3), the self-certifying
-    /// directory; §23.13, Event Verification During Reconciliation). A joiner
+    /// [`scp_mls::extract_member_wrapping_key`] returns only the local member's
+    /// key; its rustdoc says why. A joiner
     /// does not need the cache — it reaches every incumbent through the pull protocol and
     /// answers incumbents' pulls via the ephemeral key in their requests.
     pub fn install_joined_group(&self, group: ScpMlsGroup) -> OwnedMlsCryptoState {
