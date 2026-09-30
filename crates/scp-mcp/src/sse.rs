@@ -101,11 +101,15 @@ const DEFAULT_RETRY_MS: u64 = 3000;
 /// and with it the session guard, as soon as the stream ends. The permit is
 /// released only after `SessionGuard`'s spawned task takes `state.server` and
 /// runs `reset_session`, so the old session holds the slot past this bound in
-/// two cases. First, its connection's socket buffers are full, because hyper
+/// three cases. First, its connection's socket buffers are full, because hyper
 /// polls the body only while it can buffer output. Second, any request holds
 /// `state.server`, which `message_handler` does for the whole of
 /// `handle_request`, including a `tools/call` that waits on its outlet for
-/// up to the outlet's timeout.
+/// up to the outlet's timeout. Third, the event pump holds `state.server`
+/// while it computes and broadcasts one event's notifications or a lagged
+/// resync, and computing them runs the provider's re-authorization calls
+/// (`active_context_ids`, `validate_resource_access`), which on the `UniFFI`
+/// bridge are `block_in_place` actor round-trips.
 const EVICTION_WAIT: Duration = Duration::from_secs(5);
 
 /// Configuration for the SSE transport server.

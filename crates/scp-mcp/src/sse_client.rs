@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::client::McpTransport;
-use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId};
 use crate::stdio::read_line_bounded;
 
 /// The error of a call on a transport whose stream has closed.
@@ -431,8 +431,9 @@ impl McpTransport for SseClientTransport {
     /// # Errors
     ///
     /// Returns an error when the stream has closed, before any POST, when the
-    /// POST fails, when a read fails or times out, and when the stream closes
-    /// during the wait. A closed stream stays closed: the server has ended
+    /// POST fails, when a read fails or times out, when the stream closes
+    /// during the wait, on a `data:` line that is not JSON, and on a `data:`
+    /// line carrying this request's `id` that is not a valid response. A closed stream stays closed: the server has ended
     /// the session, and the caller connects a new transport. Returns
     /// [`SSE_CLOSED`] when an [`SseCloser`] closed the transport before or
     /// during the call.
@@ -474,20 +475,32 @@ impl McpTransport for SseClientTransport {
             let trimmed = line.trim();
             if trimmed.starts_with("data:") {
                 let data = trimmed.strip_prefix("data:").unwrap_or("").trim();
+                // Every `data:` line after the `endpoint` event carries one
+                // JSON-RPC message, so a line that is not JSON fails the call,
+                // as it does on the stdio transport.
+                let value = serde_json::from_str::<serde_json::Value>(data)
+                    .map_err(|e| format!("failed to parse response JSON: {e}"))?;
                 // A notification has no id, and a server-initiated request
                 // carries a method; `JsonRpcResponse` would accept the
                 // request's shape, so skip it before deserializing.
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                let Some(line_id) = value.get("id") else {
                     continue;
                 };
-                if value.get("id").is_none() || value.get("method").is_some() {
+                if value.get("method").is_some() {
                     continue;
                 }
-                if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(value)
-                    && response.id == request.id
+                if serde_json::from_value::<RequestId>(line_id.clone())
+                    .ok()
+                    .as_ref()
+                    != Some(&request.id)
                 {
-                    return Ok(response);
+                    continue;
                 }
+                // The server answers each id once, so a malformed answer
+                // under this call's id fails the call; skipping it would
+                // wait for a response that never comes.
+                return serde_json::from_value(value)
+                    .map_err(|e| format!("failed to parse response JSON: {e}"));
             }
         }
     }
@@ -882,6 +895,73 @@ mod tests {
         assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
         assert!(response.error.is_none());
         drop(server.join().expect("server thread"));
+    }
+
+    /// Runs one call whose response stream carries `events`, then an
+    /// answer the call must never reach, and returns the call's result. The
+    /// server keeps the stream open, so a call that skipped every event would
+    /// return the trailing valid response instead of failing.
+    fn call_against(events: &'static str, id: i64) -> Result<JsonRpcResponse, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (_, mut sse) = accept_sse(&listener);
+            let (mut conn, _) = listener.accept().expect("accept request POST");
+            read_request(&conn);
+            sse.write_all(events.as_bytes()).expect("write events");
+            sse.write_all(
+                format!(
+                    "event: message\r\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"late\":true}}}}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("write trailing response");
+            conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .expect("answer request POST");
+            sse
+        });
+        let transport =
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect");
+        let result = transport.send_request(&request(id));
+        drop(server.join().expect("server thread"));
+        result
+    }
+
+    /// A malformed answer under the call's own id fails the call, as it does
+    /// on the stdio transport: the server answers each id once, so skipping
+    /// it would wait for a response that never comes. A malformed message
+    /// under another id is not this call's, and the call reads past it.
+    #[test]
+    fn sse_client_fails_a_call_on_a_malformed_answer_under_its_own_id() {
+        for (events, what) in [
+            (
+                "event: message\r\ndata: {\"id\":7,\"result\":{}}\r\n\r\n",
+                "no jsonrpc field",
+            ),
+            (
+                "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"error\":\"boom\"}\r\n\r\n",
+                "a malformed error object",
+            ),
+            (
+                "event: message\r\ndata: not json\r\n\r\n",
+                "a data line that is not JSON",
+            ),
+        ] {
+            let err = call_against(events, 7).expect_err(what);
+            assert!(
+                err.contains("failed to parse response JSON"),
+                "{what}: {err}"
+            );
+        }
+
+        let response = call_against(
+            "event: message\r\ndata: {\"id\":8,\"result\":{}}\r\n\r\n",
+            7,
+        )
+        .expect("a malformed message under another id is not this call's answer");
+        assert_eq!(response.id, crate::protocol::RequestId::Number(7));
+        assert_eq!(response.result, Some(serde_json::json!({"late": true})));
     }
 
     /// Once a call sees the stream close, the server has ended the session:
