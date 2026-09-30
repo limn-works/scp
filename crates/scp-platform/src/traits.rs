@@ -229,12 +229,12 @@ impl PseudonymKeypair {
                 public_key.len()
             ))
         })?;
-        P256PublicKey::from_sec1(&compressed).map_err(|e| {
+        let point = P256PublicKey::from_sec1(&compressed).map_err(|e| {
             PlatformError::CustodyError(format!("invalid pseudonym public key: {e}"))
         })?;
         Ok(Self {
             public_key: PublicKey::new(compressed.to_vec()),
-            routing_id: scp_crypto::pseudonym::pseudonym_routing_id(&compressed),
+            routing_id: scp_crypto::pseudonym::pseudonym_routing_id(&point),
             key_handle,
         })
     }
@@ -1075,7 +1075,7 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
     all(feature = "sqlite", feature = "software_platform")
 ))]
 pub(crate) fn sign_pseudonym_digest(
-    key: &scp_crypto::p256::P256SigningKey,
+    key: &scp_crypto::p256::P256SecretKey,
     data: &[u8],
 ) -> Result<Signature, PlatformError> {
     let digest: &[u8; 32] = data.try_into().map_err(|_| {

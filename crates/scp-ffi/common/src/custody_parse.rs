@@ -645,9 +645,11 @@ mod tests {
         0x25, 0x51,
     ];
 
-    fn signing_key() -> scp_crypto::p256::P256SigningKey {
-        scp_crypto::p256::P256SigningKey::from_seed(b"SCP-FFI-COMMON-TEST", &[9u8; 32])
-            .expect("seed maps to a scalar")
+    fn signing_key() -> scp_crypto::p256::P256SecretKey {
+        scp_crypto::p256::P256SecretKey::from_seed(
+            scp_crypto::p256::SeedLabel::TestVectorKey,
+            &[9u8; 32],
+        )
     }
 
     /// `n - s` for a big-endian 32-byte `s < n`.

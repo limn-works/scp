@@ -249,12 +249,12 @@ impl ScpMlsGroup {
     /// is this per-context MLS signing keypair. So — per the Alec 2026-07-16
     /// ruling (ADR-057 planning-session-10, Option A) — the browser derives its
     /// pseudonym over the MLS key via the single shared
-    /// [`scp_crypto::pseudonym::derive_pseudonym_keypair`] recipe. This is
+    /// [`scp_crypto::pseudonym::derive_pseudonym`] recipe. This is
     /// **MLS-keyed, not identity-keyed**: it does NOT byte-match a native member's
     /// identity-keyed pseudonym for the same human. That is acceptable under the
     /// device-local-pseudonym model (each member announces its own address; peers
     /// record it) and is a documented, human-ruled deviation from §9.10.4.A,
-    /// pending the #1980 key-to-WebCrypto move that unifies the key boundary.
+    /// pending the key-to-WebCrypto move that unifies the key boundary.
     ///
     /// The private seed NEVER leaves this method: it is extracted, fed to the
     /// derivation as the 32-byte ikm, and dropped (zeroized) here. Only the
@@ -262,9 +262,9 @@ impl ScpMlsGroup {
     ///
     /// `context_id` is the raw context-id bytes. This derives the **v1 (static)**
     /// pseudonym — the only form the transport slice wires today; v2 epoch-scoped
-    /// (rotatable) derivation (§9.10.4.1) is not yet driven, so the epoch is fixed
-    /// to `None` internally (see the body note) rather than exposed as an
-    /// always-`None` parameter.
+    /// (rotatable) derivation (§9.10.4.1) is not yet driven, so the version is
+    /// fixed to [`PseudonymVersion::Static`](scp_crypto::pseudonym::PseudonymVersion::Static)
+    /// internally rather than exposed as an always-static parameter.
     ///
     /// # Errors
     ///
@@ -279,15 +279,14 @@ impl ScpMlsGroup {
         // ikm; when the ciphersuite moves to P-256 the ikm becomes the MLS
         // P-256 scalar, with the same recipe.
         let ikm = extract_ed25519_seed(signer)?;
-        // v1 (static) derivation. The epoch is fixed to `None` internally rather
-        // than exposed as an always-`None` parameter — v2 epoch-scoped (rotatable)
-        // pseudonyms (§9.10.4.1) are not yet driven by the transport slice, and the
-        // shared recipe gains the epoch when rotation is wired.
-        let pseudonym = scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, None)
-            .map_err(|e| MlsError::PseudonymDerivationFailed(e.to_string()))?;
-        Ok(scp_crypto::pseudonym::pseudonym_routing_id(
-            &pseudonym.public_key().to_compressed(),
-        ))
+        // v1 (static) derivation: v2 epoch-scoped (rotatable) pseudonyms
+        // (§9.10.4.1) are not yet driven by the transport slice.
+        let pseudonym = scp_crypto::pseudonym::derive_pseudonym(
+            &ikm,
+            context_id,
+            scp_crypto::pseudonym::PseudonymVersion::Static,
+        );
+        Ok(scp_crypto::pseudonym::pseudonym_routing_id(&pseudonym))
     }
 
     /// Reconstructs an `ScpMlsGroup` from its constituent parts.
@@ -1369,14 +1368,11 @@ mod tests {
         let signer = group.signer_key_pair().unwrap();
         // SCP MLS signer is Ed25519 → a 32-byte seed.
         let seed: [u8; 32] = signer.private().try_into().unwrap();
-        let point = scp_crypto::pseudonym::derive_pseudonym_keypair(
-            &zeroize::Zeroizing::new(seed),
+        let point = scp_crypto::pseudonym::derive_pseudonym(
+            &seed,
             context_id,
-            None,
-        )
-        .unwrap()
-        .public_key()
-        .to_compressed();
+            scp_crypto::pseudonym::PseudonymVersion::Static,
+        );
         let expected = scp_crypto::pseudonym::pseudonym_routing_id(&point);
 
         assert_eq!(
@@ -1384,7 +1380,7 @@ mod tests {
             "derive_pseudonym must recover the exact MLS private seed and derive the same pseudonym"
         );
         // (v2 epoch-scoped derivation is not exposed by `derive_pseudonym` yet — the
-        // epoch is fixed to `None` internally; the v1-vs-v2 domain separation is
+        // version is fixed to `Static` internally; the v1-vs-v2 domain separation is
         // covered by `scp_crypto::pseudonym`'s own KAT.)
     }
 

@@ -7641,10 +7641,12 @@ mod tests {
             .await
             .expect("derivation succeeds");
 
-        let point = scp_crypto::pseudonym::derive_pseudonym_keypair(&seed, b"ctx-napi-kat", None)
-            .expect("recipe")
-            .public_key()
-            .to_compressed();
+        let point = scp_crypto::pseudonym::derive_pseudonym(
+            &seed,
+            b"ctx-napi-kat",
+            scp_crypto::pseudonym::PseudonymVersion::Static,
+        )
+        .to_compressed();
         let mut hasher = Sha256::new();
         hasher.update(b"scp-pseudonym-routing-v1:");
         hasher.update(point);

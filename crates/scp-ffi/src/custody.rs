@@ -939,10 +939,7 @@ class FakeCustody:
 
     /// The compressed pseudonym point the fake returns for a context seed.
     pub fn fake_pseudonym_point(context_seed: &[u8; 32]) -> [u8; 33] {
-        scp_crypto::p256::P256SigningKey::from_seed(b"SCP-PSEUDONYM-P256-V1", context_seed)
-            .expect("seed_to_scalar is total")
-            .public_key()
-            .to_compressed()
+        scp_crypto::pseudonym::pseudonym_from_context_seed(context_seed).to_compressed()
     }
 }
 
@@ -1006,7 +1003,9 @@ mod tests {
         assert_eq!(pseudo.public_key().as_bytes(), &expected);
         assert_eq!(
             pseudo.routing_id(),
-            &scp_crypto::pseudonym::pseudonym_routing_id(&expected)
+            &scp_crypto::pseudonym::pseudonym_routing_id(
+                &scp_crypto::p256::P256PublicKey::from_sec1(&expected).expect("valid point")
+            )
         );
         assert_ne!(pseudo.key_handle(), &handle, "a fresh pseudonym key id");
 

@@ -97,16 +97,34 @@ pub enum P256Error {
     /// `s = 0`, probability about 2^-256).
     #[error("P-256 signing failed")]
     SigningFailed,
-    /// The FIPS 186-5 A.2.1 seed-to-scalar step failed. Unreachable for a
-    /// 32-byte seed; kept as a typed error rather than a panic.
-    #[error("P-256 seed-to-scalar derivation failed")]
-    ScalarDerivationFailed,
+}
+
+/// The HKDF-Expand `info` label of a [`seed_to_scalar`] derivation. Each label
+/// is a separate domain, so the same seed yields unrelated scalars under two
+/// labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeedLabel {
+    /// `"SCP-PSEUDONYM-P256-V1"`: the per-context pseudonym scalar (§9.10.4).
+    Pseudonym,
+    /// `"SCP-TEST-VECTOR-KEY-V1"`: the §25.2 reference key material.
+    TestVectorKey,
+}
+
+impl SeedLabel {
+    /// The label's bytes, as §9.10.4 and §25.2 print them.
+    #[must_use]
+    pub const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Pseudonym => b"SCP-PSEUDONYM-P256-V1",
+            Self::TestVectorKey => b"SCP-TEST-VECTOR-KEY-V1",
+        }
+    }
 }
 
 /// A validated P-256 public key: on the curve and not the point at infinity.
 ///
 /// The only constructors are [`P256PublicKey::from_sec1`] and
-/// [`P256SigningKey::public_key`], so holding one proves §9.5 point validation
+/// [`P256SecretKey::public_key`], so holding one proves §9.5 point validation
 /// has run.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct P256PublicKey(PublicKey);
@@ -179,17 +197,17 @@ impl P256PublicKey {
 ///
 /// The inner scalar is zeroized on drop by `p256`. `Debug` never prints it.
 #[derive(Clone)]
-pub struct P256SigningKey(SigningKey);
+pub struct P256SecretKey(SigningKey);
 
-impl core::fmt::Debug for P256SigningKey {
+impl core::fmt::Debug for P256SecretKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("P256SigningKey")
+        f.debug_struct("P256SecretKey")
             .field("public_key", &self.public_key())
             .finish_non_exhaustive()
     }
 }
 
-impl P256SigningKey {
+impl P256SecretKey {
     /// Builds a key from a 32-byte big-endian scalar.
     ///
     /// # Errors
@@ -208,12 +226,9 @@ impl P256SigningKey {
     }
 
     /// Derives a key from a 32-byte seed by [`seed_to_scalar`] under `label`.
-    ///
-    /// # Errors
-    ///
-    /// [`P256Error::ScalarDerivationFailed`], unreachable for a 32-byte seed.
-    pub fn from_seed(label: &[u8], seed: &[u8; 32]) -> Result<Self, P256Error> {
-        seed_to_scalar(label, seed).map(Self::from_nonzero_scalar)
+    #[must_use]
+    pub fn from_seed(label: SeedLabel, seed: &[u8; 32]) -> Self {
+        Self::from_nonzero_scalar(seed_to_scalar(label, seed))
     }
 
     /// The public key `d·G`.
@@ -244,14 +259,9 @@ impl P256SigningKey {
 /// The 48-byte input carries 128 bits more than `n`, so the bias from uniform
 /// is below 2^-128. There is no reject-and-retry and no direct reduction of the
 /// 32-byte seed, both of which §9.10.4 forbids.
-///
-/// # Errors
-///
-/// [`P256Error::ScalarDerivationFailed`]. The expansion length is fixed at
-/// compile time and the result lies in `[1, n − 1]` by construction, so this
-/// is unreachable; it stays a typed error rather than a panic.
-pub fn seed_to_scalar(label: &[u8], seed: &[u8; 32]) -> Result<NonZeroScalar, P256Error> {
-    let okm = crate::kdf::hkdf_expand::<48>(seed, label);
+#[must_use]
+pub fn seed_to_scalar(label: SeedLabel, seed: &[u8; 32]) -> NonZeroScalar {
+    let okm = crate::kdf::hkdf_expand::<48>(seed, label.as_bytes());
 
     let mut wide = U384::from_be_slice(okm.as_ref());
     let mut reduced = wide.rem(&N_MINUS_ONE);
@@ -263,7 +273,12 @@ pub fn seed_to_scalar(label: &[u8], seed: &[u8; 32]) -> Result<NonZeroScalar, P2
     narrow.zeroize();
     let scalar = Option::<NonZeroScalar>::from(NonZeroScalar::from_uint(d));
     d.zeroize();
-    scalar.ok_or(P256Error::ScalarDerivationFailed)
+    // `d = (x mod (n − 1)) + 1` lies in `[1, n − 1]` for every `x`, so
+    // `from_uint` accepts it for every seed.
+    let Some(scalar) = scalar else {
+        unreachable!("(x mod (n - 1)) + 1 is always in [1, n - 1]")
+    };
+    scalar
 }
 
 /// Signs a 32-byte digest with RFC 6979 deterministic nonces (`h1 = digest`,
@@ -273,7 +288,7 @@ pub fn seed_to_scalar(label: &[u8], seed: &[u8; 32]) -> Result<NonZeroScalar, P2
 ///
 /// [`P256Error::SigningFailed`] if the nonce yields `r = 0` or `s = 0`.
 pub fn sign_prehash_rfc6979(
-    key: &P256SigningKey,
+    key: &P256SecretKey,
     digest: &[u8; 32],
 ) -> Result<[u8; SIGNATURE_LEN], P256Error> {
     let signature: Signature = key
@@ -307,9 +322,11 @@ pub fn verify_prehash_strict(
 
 /// Verifies a raw signature that may carry a high `s`.
 ///
-/// Only for the §9.5 carve-out: MLS-layer signatures and JOSE ES256 signatures
-/// on a UCAN an outside party issued. Every signature built under §9.5.1 goes
-/// through [`verify_prehash_strict`] instead.
+/// Only for the §9.5 carve-out on JOSE ES256 signatures an outside party
+/// issued (RFC 7518 imposes no low-`s` rule), reached through
+/// [`jose::es256_verify_lenient`]. MLS-layer signatures are verified inside
+/// openmls, not here. Every signature built under §9.5.1 goes through
+/// [`verify_prehash_strict`] instead.
 ///
 /// # Errors
 ///
@@ -387,7 +404,7 @@ pub fn der_to_raw(der: &[u8]) -> Result<[u8; SIGNATURE_LEN], P256Error> {
 /// `peer` has already passed §9.5 point validation by construction, which is
 /// what closes the invalid-curve attack §9.5 names.
 #[must_use]
-pub fn ecdh_p256(key: &P256SigningKey, peer: &P256PublicKey) -> Zeroizing<[u8; 32]> {
+pub fn ecdh_p256(key: &P256SecretKey, peer: &P256PublicKey) -> Zeroizing<[u8; 32]> {
     let shared = ::p256::ecdh::diffie_hellman(key.0.as_nonzero_scalar(), peer.0.as_affine());
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(shared.raw_secret_bytes());
@@ -404,7 +421,7 @@ pub mod jose {
     use sha2::{Digest, Sha256};
 
     use super::{
-        P256Error, P256PublicKey, P256SigningKey, SIGNATURE_LEN, sign_prehash_rfc6979,
+        P256Error, P256PublicKey, P256SecretKey, SIGNATURE_LEN, sign_prehash_rfc6979,
         verify_prehash_lenient, verify_prehash_strict,
     };
 
@@ -421,7 +438,7 @@ pub mod jose {
     ///
     /// [`P256Error::SigningFailed`], as for [`sign_prehash_rfc6979`].
     pub fn es256_sign(
-        key: &P256SigningKey,
+        key: &P256SecretKey,
         signing_input: &[u8],
     ) -> Result<[u8; SIGNATURE_LEN], P256Error> {
         sign_prehash_rfc6979(key, &Sha256::digest(signing_input).into())
@@ -565,7 +582,7 @@ mod tests {
         let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*digest));
         let r = <Scalar as Reduce<U256>>::reduce_bytes(&AffinePoint::GENERATOR.x());
         let d = (s - z) * Option::<Scalar>::from(r.invert()).unwrap();
-        let key = P256SigningKey::from_scalar_bytes(&d.to_repr().into()).unwrap();
+        let key = P256SecretKey::from_scalar_bytes(&d.to_repr().into()).unwrap();
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&r.to_repr());
         sig[32..].copy_from_slice(&s_bytes);
@@ -605,7 +622,7 @@ mod tests {
         let x: [u8; 32] = h("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
         let ux = "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6";
         let uy = "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299";
-        let key = P256SigningKey::from_scalar_bytes(&x).unwrap();
+        let key = P256SecretKey::from_scalar_bytes(&x).unwrap();
         let pk = key.public_key();
         assert_eq!(hex::encode(pk.to_uncompressed()), format!("04{ux}{uy}"));
 
@@ -658,7 +675,6 @@ mod tests {
     /// `"SCP-TEST-VECTOR-KEY-V1"`, then compressed and uncompressed points.
     #[test]
     fn spec_25_2_fixture_keys() {
-        let label = b"SCP-TEST-VECTOR-KEY-V1";
         for (seed, scalar, compressed, uncompressed) in [
             (
                 "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
@@ -682,7 +698,7 @@ mod tests {
                  700192d543b6d5d6b3d7990f4463d2f0692bcb7bdbaf3b1ee8f4465dd888323df0",
             ),
         ] {
-            let key = P256SigningKey::from_seed(label, &h(seed)).unwrap();
+            let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &h(seed));
             assert_eq!(
                 hex::encode(*key.to_scalar_bytes()),
                 scalar,
@@ -791,11 +807,10 @@ mod tests {
     #[test]
     fn spec_25_26_vectors_41_42_signatures() {
         let v = spec_25_26();
-        let key = P256SigningKey::from_seed(
-            b"SCP-TEST-VECTOR-KEY-V1",
+        let key = P256SecretKey::from_seed(
+            SeedLabel::TestVectorKey,
             &h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"),
-        )
-        .unwrap();
+        );
         let public_key = key.public_key();
 
         let signature_41 = sign_prehash_rfc6979(&key, &v.digest_41).unwrap();
@@ -847,7 +862,7 @@ mod tests {
             Err(P256Error::PointNotOnCurve)
         );
         // Flip one bit of a valid y.
-        let key = P256SigningKey::from_seed(b"t", &[7u8; 32]).unwrap();
+        let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[7u8; 32]);
         let mut bad = key.public_key().to_uncompressed();
         bad[64] ^= 1;
         assert_eq!(
@@ -863,22 +878,22 @@ mod tests {
     #[test]
     fn scalar_bounds_are_enforced() {
         assert_eq!(
-            P256SigningKey::from_scalar_bytes(&[0u8; 32]).unwrap_err(),
+            P256SecretKey::from_scalar_bytes(&[0u8; 32]).unwrap_err(),
             P256Error::InvalidScalar
         );
         assert_eq!(
-            P256SigningKey::from_scalar_bytes(&h(N_HEX)).unwrap_err(),
+            P256SecretKey::from_scalar_bytes(&h(N_HEX)).unwrap_err(),
             P256Error::InvalidScalar
         );
         assert_eq!(
-            P256SigningKey::from_scalar_bytes(&[0xff; 32]).unwrap_err(),
+            P256SecretKey::from_scalar_bytes(&[0xff; 32]).unwrap_err(),
             P256Error::InvalidScalar
         );
     }
 
     #[test]
     fn strict_verify_rejects_malformed_signatures() {
-        let key = P256SigningKey::from_seed(b"t", &[9u8; 32]).unwrap();
+        let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[9u8; 32]);
         let pk = key.public_key();
         let digest = [0x42u8; 32];
         let sig = sign_prehash_rfc6979(&key, &digest).unwrap();
@@ -921,44 +936,216 @@ mod tests {
     }
 
     #[test]
-    fn der_to_raw_round_trip_and_rejections() {
+    fn der_to_raw_round_trip() {
         // r = 1, s = 0x80 (needs a sign-padding zero).
         let der = [0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x80];
         let raw = der_to_raw(&der).unwrap();
         assert_eq!(raw[31], 1);
         assert_eq!(raw[63], 0x80);
         assert!(raw[..31].iter().all(|b| *b == 0));
+        assert!(raw[32..63].iter().all(|b| *b == 0));
+    }
 
-        let reject = |bytes: &[u8]| assert!(der_to_raw(bytes).is_err(), "{bytes:02x?}");
-        reject(&[]);
-        reject(&[0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]); // SET, not SEQUENCE
-        reject(&[0x30, 0x81, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]); // long form
-        reject(&[0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]); // length overrun
-        reject(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00]); // trailing byte
-        reject(&[0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01]); // non-minimal
-        reject(&[0x30, 0x06, 0x02, 0x01, 0x81, 0x02, 0x01, 0x01]); // negative
-        reject(&[0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01]); // r = 0
-        reject(&[0x30, 0x05, 0x02, 0x00, 0x02, 0x01, 0x01]); // empty INTEGER
+    fn assert_der_rejected(der: &[u8], expected: P256Error) {
+        assert_eq!(der_to_raw(der), Err(expected), "{der:02x?}");
     }
 
     #[test]
-    fn ecdh_is_symmetric() {
-        let a = P256SigningKey::from_seed(b"t", &[1u8; 32]).unwrap();
-        let b = P256SigningKey::from_seed(b"t", &[2u8; 32]).unwrap();
-        assert_eq!(
-            *ecdh_p256(&a, &b.public_key()),
-            *ecdh_p256(&b, &a.public_key())
+    fn der_rejects_truncated_sequence_header() {
+        assert_der_rejected(
+            &[0x30],
+            P256Error::MalformedDer("truncated SEQUENCE header"),
         );
     }
 
     #[test]
+    fn der_rejects_set_tag() {
+        assert_der_rejected(
+            &[0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("expected SEQUENCE tag"),
+        );
+    }
+
+    #[test]
+    fn der_rejects_sequence_length_mismatch() {
+        assert_der_rejected(
+            &[0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("SEQUENCE length does not match the input"),
+        );
+    }
+
+    /// The SEQUENCE length covers the whole input, and a byte follows the
+    /// second INTEGER inside it.
+    #[test]
+    fn der_rejects_trailing_byte_inside_sequence() {
+        assert_der_rejected(
+            &[0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00],
+            P256Error::MalformedDer("trailing bytes inside SEQUENCE"),
+        );
+    }
+
+    #[test]
+    fn der_rejects_truncated_integer_header() {
+        assert_der_rejected(
+            &[0x30, 0x04, 0x02, 0x01, 0x01, 0x02],
+            P256Error::MalformedDer("truncated INTEGER header"),
+        );
+    }
+
+    #[test]
+    fn der_rejects_wrong_integer_tag() {
+        assert_der_rejected(
+            &[0x30, 0x06, 0x04, 0x01, 0x01, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("expected INTEGER tag"),
+        );
+    }
+
+    #[test]
+    fn der_rejects_empty_integer() {
+        assert_der_rejected(
+            &[0x30, 0x05, 0x02, 0x00, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("empty INTEGER"),
+        );
+    }
+
+    #[test]
+    fn der_rejects_truncated_integer() {
+        assert_der_rejected(
+            &[0x30, 0x04, 0x02, 0x05, 0x01, 0x01],
+            P256Error::MalformedDer("truncated INTEGER"),
+        );
+    }
+
+    #[test]
+    fn der_rejects_negative_integer() {
+        assert_der_rejected(
+            &[0x30, 0x06, 0x02, 0x01, 0x81, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("negative INTEGER"),
+        );
+    }
+
+    #[test]
+    fn der_rejects_non_minimal_integer() {
+        assert_der_rejected(
+            &[0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("non-minimal INTEGER encoding"),
+        );
+    }
+
+    /// A 33-byte INTEGER whose first byte is not a sign-padding zero carries
+    /// 33 bytes of magnitude.
+    #[test]
+    fn der_rejects_integer_wider_than_32_bytes() {
+        let mut der = vec![0x30, 0x26, 0x02, 0x21];
+        der.extend_from_slice(&[0x01; 33]);
+        der.extend_from_slice(&[0x02, 0x01, 0x01]);
+        assert_der_rejected(&der, P256Error::MalformedDer("INTEGER wider than 32 bytes"));
+    }
+
+    #[test]
+    fn der_rejects_zero_r() {
+        assert_der_rejected(
+            &[0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01],
+            P256Error::SignatureScalarOutOfRange,
+        );
+    }
+
+    /// `Debug` on a private key prints the public key and never the scalar
+    /// (§9.5 secret handling).
+    #[test]
+    fn secret_key_debug_hides_the_scalar() {
+        let key = P256SecretKey::from_seed(
+            SeedLabel::TestVectorKey,
+            &h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"),
+        );
+        let printed = format!("{key:?}");
+        assert!(
+            !printed.contains("6f0712104c3f61ba04526a822836d3f4a13be12e09a8c3c7586b2da0c795998b")
+        );
+        assert!(
+            printed.contains("033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027")
+        );
+    }
+
+    /// RFC 7515 Appendix A.3: the JWS ES256 example. Its `s` begins `0xc5`,
+    /// above `n/2`, so the strict verifier returns `HighS` and the lenient
+    /// verifier accepts it (§9.5 carve-out for outside ES256 tokens).
+    #[test]
+    fn rfc7515_a3_es256_high_s_is_lenient_only() {
+        let signing_input = b"eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+        let pk = P256PublicKey::from_sec1(&h::<65>(
+            "047fcdce2770f6c45d4183cbee6fdb4b7b580733357be9ef13bacf6e3c7bd15445\
+             c7f144cd1bbd9b7e872cdfedb9eeb9f4b3695d6ea90b24ad8a4623288588e5ad",
+        ))
+        .unwrap();
+        let sig: [u8; 64] = h(
+            "0ed1215379636c483c2f7f155807d402a3b228033af97c7e17819ac3169ea665\
+             c50a07d38c3c70e5d8f12daf084a5480a66590c5f293509a8f3f7f8a83a354d5",
+        );
+        assert_eq!(
+            jose::es256_verify_strict(&pk, signing_input, &sig),
+            Err(P256Error::HighS)
+        );
+        assert_eq!(jose::es256_verify_lenient(&pk, signing_input, &sig), Ok(()));
+        let low = normalize_low_s(&sig).unwrap();
+        assert_eq!(jose::es256_verify_strict(&pk, signing_input, &low), Ok(()));
+    }
+
+    /// `p` is the field prime. `02‖p` and `03‖p` carry an `x` outside the
+    /// field; `02‖(p + 1)` likewise. None may decode (§9.5 point validation).
+    #[test]
+    fn from_sec1_rejects_x_at_or_above_field_prime() {
+        const P_HEX: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
+        const P_PLUS_ONE_HEX: &str =
+            "ffffffff00000001000000000000000000000001000000000000000000000000";
+        for encoded in [
+            format!("02{P_HEX}"),
+            format!("03{P_HEX}"),
+            format!("02{P_PLUS_ONE_HEX}"),
+        ] {
+            assert_eq!(
+                P256PublicKey::from_sec1(&h::<33>(&encoded)),
+                Err(P256Error::PointNotOnCurve),
+                "{encoded}"
+            );
+        }
+    }
+
+    /// A valid leading byte at a length that byte does not allow is a length
+    /// error for lengths other than 33 and 65, and a prefix error at the other
+    /// of the two.
+    #[test]
+    fn from_sec1_rejects_valid_prefix_at_wrong_length() {
+        for (prefix, len) in [
+            (0x02u8, 32usize),
+            (0x03, 34),
+            (0x02, 65),
+            (0x04, 33),
+            (0x04, 64),
+            (0x04, 66),
+        ] {
+            let mut encoded = vec![0x11u8; len];
+            encoded[0] = prefix;
+            let expected = if len == 33 || len == 65 {
+                P256Error::InvalidPointPrefix { len, prefix }
+            } else {
+                P256Error::InvalidPointLength(len)
+            };
+            assert_eq!(
+                P256PublicKey::from_sec1(&encoded),
+                Err(expected),
+                "{prefix:#04x} at {len}"
+            );
+        }
+    }
+
+    #[test]
     fn jose_es256_round_trip() {
-        let key = P256SigningKey::from_seed(b"t", &[3u8; 32]).unwrap();
+        let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[3u8; 32]);
         let input = b"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ4In0";
         let sig = jose::es256_sign(&key, input).unwrap();
         jose::es256_verify_strict(&key.public_key(), input, &sig).unwrap();
         jose::es256_verify_lenient(&key.public_key(), input, &sig).unwrap();
-        assert_eq!(jose::ES256_ALG, "ES256");
         assert_eq!(
             jose::es256_verify_strict(&key.public_key(), b"other", &sig),
             Err(P256Error::VerificationFailed)
@@ -970,7 +1157,7 @@ mod tests {
         /// strictly.
         #[test]
         fn every_signature_is_low_s(seed in any::<[u8; 32]>(), digest in any::<[u8; 32]>()) {
-            let key = P256SigningKey::from_seed(b"prop", &seed).unwrap();
+            let key = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &seed);
             let sig = sign_prehash_rfc6979(&key, &digest).unwrap();
             // Equal-length big-endian byte strings compare as integers.
             let half_n: [u8; 32] = h("7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8");

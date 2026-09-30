@@ -540,8 +540,7 @@ impl FileKeyCustody {
         // seed, never the public key. Until S12 the identity key is
         // Ed25519, so its 32-byte seed is the ikm.
         let ikm = Zeroizing::new(signing_key.to_bytes());
-        let pseudonym_key = derive_pseudonym_keypair(&ikm, context_id, epoch)
-            .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+        let pseudonym_key = derive_pseudonym_keypair(&ikm, context_id, epoch);
 
         let mut pseudonyms = self.pseudonym_keys.lock().await;
         if let Some((existing, public_key)) = pseudonyms.existing(key_id, context_id, epoch) {

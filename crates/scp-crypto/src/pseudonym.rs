@@ -1,5 +1,5 @@
-//! Shared pseudonym secret derivation and per-context P-256 keypair derivation
-//! (§9.10.4, §9.10.4.A, §9.10.4.1).
+//! Shared pseudonym secret derivation and per-context P-256 pseudonym
+//! derivation (§9.10.4, §9.10.4.A, §9.10.4.1).
 //!
 //! This is the single wasm-safe source of the software-custody pseudonym
 //! derivation. Every native `KeyCustody` backend in `scp-platform` and the
@@ -11,9 +11,12 @@
 //! context_seed     = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")              // v1
 //!                  = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "scp-pseudonym-v2") // v2
 //! d                = seed_to_scalar("SCP-PSEUDONYM-P256-V1", context_seed)   // FIPS 186-5 A.2.1
-//! context_pseudonym    = compressed(d·G)                                     // 33 bytes
+//! context_pseudonym    = compressed(d·G)                                     // 33 bytes; d is discarded
 //! pseudonym_routing_id = SHA-256("scp-pseudonym-routing-v1:" || context_pseudonym)
 //! ```
+//!
+//! A pseudonym has no private key (§9.10.4): no protocol message is signed
+//! under one, so every function here returns the point and wipes `d`.
 //!
 //! `ikm` is the 32-byte identity private key material. The spec's target is the
 //! P-256 private scalar; until the identity key moves to P-256 (S12), native
@@ -30,7 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::kdf::{hkdf_expand, hkdf_extract, hmac_sha256};
 
-use crate::p256::{COMPRESSED_POINT_LEN, P256Error, P256SigningKey};
+use crate::p256::{P256PublicKey, P256SecretKey, SeedLabel};
 
 /// Salt for HKDF-SHA-256 pseudonym secret derivation (§9.10.4.A).
 const PSEUDONYM_SECRET_SALT: &[u8] = b"scp-pseudonym-secret-v1";
@@ -41,67 +44,99 @@ const PSEUDONYM_V1_DOMAIN: &[u8] = b"scp-pseudonym";
 /// Domain separator for v2 (rotatable) pseudonym derivation (§9.10.4.1).
 const PSEUDONYM_V2_DOMAIN: &[u8] = b"scp-pseudonym-v2";
 
-/// HKDF-Expand label of the seed-to-scalar step (§9.10.4).
-pub const PSEUDONYM_SCALAR_LABEL: &[u8] = b"SCP-PSEUDONYM-P256-V1";
-
 /// Prefix of the pseudonym routing-id hash (§9.10.4, registered in §9.18.2).
-pub const PSEUDONYM_ROUTING_PREFIX: &[u8] = b"scp-pseudonym-routing-v1:";
+const PSEUDONYM_ROUTING_PREFIX: &[u8] = b"scp-pseudonym-routing-v1:";
+
+/// Which pseudonym derivation to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PseudonymVersion {
+    /// v1, the static pseudonym (§9.10.4).
+    Static,
+    /// v2, the rotatable pseudonym of rotation epoch `epoch` (§9.10.4.1).
+    Rotatable {
+        /// The pseudonym rotation epoch, distinct from MLS epochs.
+        epoch: u64,
+    },
+}
 
 /// Derives the `pseudonym_secret` from 32 bytes of private key material via
 /// HKDF-SHA-256 (§9.10.4.A). The PRK and the output block wipe on drop.
 #[must_use]
-pub fn derive_pseudonym_secret(ikm: &Zeroizing<[u8; 32]>) -> Zeroizing<[u8; 32]> {
-    let prk = hkdf_extract(PSEUDONYM_SECRET_SALT, ikm.as_ref());
+pub fn derive_pseudonym_secret(ikm: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let prk = hkdf_extract(PSEUDONYM_SECRET_SALT, ikm);
     hkdf_expand::<32>(&prk, b"")
 }
 
 /// Computes the per-context `context_seed` (§9.10.4 v1, §9.10.4.1 v2).
 fn context_seed(
-    pseudonym_secret: &Zeroizing<[u8; 32]>,
+    pseudonym_secret: &[u8; 32],
+    context_id: &[u8],
+    version: PseudonymVersion,
+) -> Zeroizing<[u8; 32]> {
+    match version {
+        PseudonymVersion::Static => {
+            hmac_sha256(pseudonym_secret, &[context_id, PSEUDONYM_V1_DOMAIN])
+        }
+        PseudonymVersion::Rotatable { epoch } => hmac_sha256(
+            pseudonym_secret,
+            &[context_id, &epoch.to_be_bytes(), PSEUDONYM_V2_DOMAIN],
+        ),
+    }
+}
+
+/// Turns a 32-byte `context_seed` into the pseudonym point: the §9.10.4
+/// seed-to-scalar step, then `d·G`. `d` wipes on drop.
+///
+/// This is the step a custody whose `pseudonym_secret` stays inside a keystore
+/// runs on the seed the keystore computed (§9.10.4.A).
+#[must_use]
+pub fn pseudonym_from_context_seed(context_seed: &[u8; 32]) -> P256PublicKey {
+    P256SecretKey::from_seed(SeedLabel::Pseudonym, context_seed).public_key()
+}
+
+/// Derives the per-context pseudonym point from identity private key material
+/// (`ikm`) for the static (v1) or rotatable (v2) `version` (§9.10.4,
+/// §9.10.4.1). Every intermediate secret wipes on drop.
+#[must_use]
+pub fn derive_pseudonym(
+    ikm: &[u8; 32],
+    context_id: &[u8],
+    version: PseudonymVersion,
+) -> P256PublicKey {
+    let secret = derive_pseudonym_secret(ikm);
+    pseudonym_from_context_seed(&context_seed(&secret, context_id, version))
+}
+
+/// Derives the per-context P-256 pseudonym key, private scalar included, for
+/// `epoch = None` (v1, static) or `Some(e)` (v2, rotatable).
+///
+/// A pseudonym signs nothing (§9.10.4); this remains only for the custody
+/// backends that still store a pseudonym key. Everything else calls
+/// [`derive_pseudonym`].
+#[must_use]
+pub fn derive_pseudonym_keypair(
+    ikm: &[u8; 32],
     context_id: &[u8],
     epoch: Option<u64>,
-) -> Zeroizing<[u8; 32]> {
-    epoch.map_or_else(
-        || {
-            hmac_sha256(
-                pseudonym_secret.as_ref(),
-                &[context_id, PSEUDONYM_V1_DOMAIN],
-            )
-        },
-        |e| {
-            hmac_sha256(
-                pseudonym_secret.as_ref(),
-                &[context_id, &e.to_be_bytes(), PSEUDONYM_V2_DOMAIN],
-            )
-        },
+) -> P256SecretKey {
+    let version = epoch.map_or(PseudonymVersion::Static, |epoch| {
+        PseudonymVersion::Rotatable { epoch }
+    });
+    let secret = derive_pseudonym_secret(ikm);
+    P256SecretKey::from_seed(
+        SeedLabel::Pseudonym,
+        &context_seed(&secret, context_id, version),
     )
 }
 
-/// Derives the per-context P-256 pseudonym key from identity private key
-/// material (`ikm`), for `epoch = None` (v1, static) or `Some(e)` (v2,
-/// rotatable).
-///
-/// # Errors
-///
-/// [`P256Error::ScalarDerivationFailed`], unreachable for a 32-byte seed; it
-/// is propagated rather than papered over.
-pub fn derive_pseudonym_keypair(
-    ikm: &Zeroizing<[u8; 32]>,
-    context_id: &[u8],
-    epoch: Option<u64>,
-) -> Result<P256SigningKey, P256Error> {
-    let secret = derive_pseudonym_secret(ikm);
-    let seed = context_seed(&secret, context_id, epoch);
-    P256SigningKey::from_seed(PSEUDONYM_SCALAR_LABEL, &seed)
-}
-
 /// The 32-byte routing id every routing field carries for a pseudonym
-/// (§9.10.4): `SHA-256("scp-pseudonym-routing-v1:" || context_pseudonym)`.
+/// (§9.10.4): `SHA-256("scp-pseudonym-routing-v1:" || context_pseudonym)`,
+/// over the 33-byte compressed point.
 #[must_use]
-pub fn pseudonym_routing_id(context_pseudonym: &[u8; COMPRESSED_POINT_LEN]) -> [u8; 32] {
+pub fn pseudonym_routing_id(context_pseudonym: &P256PublicKey) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PSEUDONYM_ROUTING_PREFIX);
-    hasher.update(context_pseudonym);
+    hasher.update(context_pseudonym.to_compressed());
     hasher.finalize().into()
 }
 
@@ -171,51 +206,50 @@ mod tests {
         ];
         let ctx = b"context-alpha";
         for v in vectors {
-            let identity =
-                P256SigningKey::from_seed(b"SCP-TEST-VECTOR-KEY-V1", &h(v.seed)).unwrap();
+            let identity = P256SecretKey::from_seed(SeedLabel::TestVectorKey, &h(v.seed));
             let ikm = identity.to_scalar_bytes();
             assert_eq!(hex::encode(*ikm), v.scalar, "identity scalar");
 
             let secret = derive_pseudonym_secret(&ikm);
             assert_eq!(hex::encode(*secret), v.secret, "pseudonym_secret");
 
-            assert_eq!(hex::encode(*context_seed(&secret, ctx, None)), v.seed_v1);
-            assert_eq!(hex::encode(*context_seed(&secret, ctx, Some(1))), v.seed_v2);
+            let v1 = PseudonymVersion::Static;
+            let v2 = PseudonymVersion::Rotatable { epoch: 1 };
+            let seed_v1 = context_seed(&secret, ctx, v1);
+            let seed_v2 = context_seed(&secret, ctx, v2);
+            assert_eq!(hex::encode(*seed_v1), v.seed_v1);
+            assert_eq!(hex::encode(*seed_v2), v.seed_v2);
+            assert_eq!(
+                hex::encode(pseudonym_from_context_seed(&seed_v1).to_compressed()),
+                v.pub_v1
+            );
 
-            let k1 = derive_pseudonym_keypair(&ikm, ctx, None).unwrap();
-            let p1 = k1.public_key().to_compressed();
-            assert_eq!(hex::encode(p1), v.pub_v1);
+            let p1 = derive_pseudonym(&ikm, ctx, v1);
+            assert_eq!(hex::encode(p1.to_compressed()), v.pub_v1);
             assert_eq!(hex::encode(pseudonym_routing_id(&p1)), v.rid_v1);
-            let k2 = derive_pseudonym_keypair(&ikm, ctx, Some(1)).unwrap();
-            let p2 = k2.public_key().to_compressed();
-            assert_eq!(hex::encode(p2), v.pub_v2);
+            let p2 = derive_pseudonym(&ikm, ctx, v2);
+            assert_eq!(hex::encode(p2.to_compressed()), v.pub_v2);
             assert_eq!(hex::encode(pseudonym_routing_id(&p2)), v.rid_v2);
         }
     }
 
     #[test]
-    fn routing_id_is_prefixed_sha256_of_point() {
-        let point: [u8; 33] =
-            h("0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72");
-        let mut pre = PSEUDONYM_ROUTING_PREFIX.to_vec();
-        pre.extend_from_slice(&point);
-        let expected: [u8; 32] = Sha256::digest(&pre).into();
-        assert_eq!(pseudonym_routing_id(&point), expected);
-        assert_eq!(PSEUDONYM_ROUTING_PREFIX, b"scp-pseudonym-routing-v1:");
-    }
-
-    #[test]
     fn distinct_contexts_and_epochs() {
-        let ikm = Zeroizing::new([0x07u8; 32]);
-        let pk = |c: &[u8], e| {
-            derive_pseudonym_keypair(&ikm, c, e)
-                .unwrap()
-                .public_key()
-                .to_compressed()
-        };
-        assert_eq!(pk(b"ctx", None), pk(b"ctx", None));
-        assert_ne!(pk(b"ctx-1", None), pk(b"ctx-2", None));
-        assert_ne!(pk(b"ctx-1", Some(1)), pk(b"ctx-1", Some(2)));
-        assert_ne!(pk(b"ctx-1", None), pk(b"ctx-1", Some(0)));
+        let ikm = [0x07u8; 32];
+        let pk = |c: &[u8], version| derive_pseudonym(&ikm, c, version).to_compressed();
+        let rotatable = |epoch| PseudonymVersion::Rotatable { epoch };
+        assert_eq!(
+            pk(b"ctx", PseudonymVersion::Static),
+            pk(b"ctx", PseudonymVersion::Static)
+        );
+        assert_ne!(
+            pk(b"ctx-1", PseudonymVersion::Static),
+            pk(b"ctx-2", PseudonymVersion::Static)
+        );
+        assert_ne!(pk(b"ctx-1", rotatable(1)), pk(b"ctx-1", rotatable(2)));
+        assert_ne!(
+            pk(b"ctx-1", PseudonymVersion::Static),
+            pk(b"ctx-1", rotatable(0))
+        );
     }
 }

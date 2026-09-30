@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use scp_crypto::p256::P256SigningKey;
+use scp_crypto::p256::P256SecretKey;
 
 /// A pseudonym's slot: the identity handle, the context id, and the epoch
 /// (`None` for the v1 static pseudonym).
@@ -23,13 +23,13 @@ type Slot = (u64, Vec<u8>, Option<u64>);
 /// frees an unwiped copy of a scalar.
 #[derive(Default)]
 pub struct PseudonymKeys {
-    keys: HashMap<u64, Box<P256SigningKey>>,
+    keys: HashMap<u64, Box<P256SecretKey>>,
     slots: HashMap<Slot, u64>,
 }
 
 impl PseudonymKeys {
     /// The key behind pseudonym handle `handle`.
-    pub fn get(&self, handle: u64) -> Option<&P256SigningKey> {
+    pub fn get(&self, handle: u64) -> Option<&P256SecretKey> {
         self.keys.get(&handle).map(|key| &**key)
     }
 
@@ -54,7 +54,7 @@ impl PseudonymKeys {
         context_id: &[u8],
         epoch: Option<u64>,
         handle: u64,
-        key: Box<P256SigningKey>,
+        key: Box<P256SecretKey>,
     ) {
         self.keys.insert(handle, key);
         self.slots

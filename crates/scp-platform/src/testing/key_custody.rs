@@ -194,8 +194,7 @@ impl InMemoryKeyCustody {
         // seed, never the public key. Until S12 the identity key is
         // Ed25519, so its 32-byte seed is the ikm.
         let ikm = Zeroizing::new(signing_key.to_bytes());
-        let pseudonym_key = derive_pseudonym_keypair(&ikm, context_id, epoch)
-            .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+        let pseudonym_key = derive_pseudonym_keypair(&ikm, context_id, epoch);
         let public_key = pseudonym_key.public_key().to_compressed();
 
         let handle = self.next_handle();
@@ -541,8 +540,7 @@ mod tests {
 
     use super::*;
     use hmac::{Hmac, Mac};
-    use scp_crypto::p256::P256SigningKey;
-    use scp_crypto::pseudonym::{PSEUDONYM_SCALAR_LABEL, derive_pseudonym_secret};
+    use scp_crypto::pseudonym::{derive_pseudonym_secret, pseudonym_from_context_seed};
     use sha2::Sha256;
 
     #[tokio::test]
@@ -818,10 +816,9 @@ mod tests {
             pk_bytes
         );
         let pk = P256PublicKey::from_sec1(pk_bytes).unwrap();
-        let point: [u8; 33] = pk_bytes.try_into().unwrap();
         assert_eq!(
             pseudonym.routing_id(),
-            &scp_crypto::pseudonym::pseudonym_routing_id(&point)
+            &scp_crypto::pseudonym::pseudonym_routing_id(&pk)
         );
 
         // It signs a 32-byte digest, low-s, verifiable under §9.5.1.
@@ -968,10 +965,7 @@ mod tests {
         mac.update(b"scp-pseudonym-v2");
         let expected_seed: [u8; 32] = mac.finalize().into_bytes().into();
 
-        let expected_pubkey = P256SigningKey::from_seed(PSEUDONYM_SCALAR_LABEL, &expected_seed)
-            .unwrap()
-            .public_key()
-            .to_compressed();
+        let expected_pubkey = pseudonym_from_context_seed(&expected_seed).to_compressed();
 
         let custody = InMemoryKeyCustody::new();
         let handle = custody.import_ed25519_key(&seed_bytes).await;
@@ -1045,10 +1039,7 @@ mod tests {
         // expected_seed is HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym"),
         // so the expected public key is the P-256 key from that seed by the
         // FIPS 186-5 A.2.1 step under "SCP-PSEUDONYM-P256-V1" (§9.10.4).
-        let expected_pubkey = P256SigningKey::from_seed(PSEUDONYM_SCALAR_LABEL, &expected_seed)
-            .unwrap()
-            .public_key()
-            .to_compressed();
+        let expected_pubkey = pseudonym_from_context_seed(&expected_seed).to_compressed();
         assert_eq!(
             pseudo1.public_key().as_bytes(),
             expected_pubkey.as_slice(),

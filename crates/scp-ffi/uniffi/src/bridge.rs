@@ -24325,7 +24325,7 @@ mod tests {
     struct ProdLikeCustody {
         keys: Arc<std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>>>,
         pseudonyms:
-            std::sync::Mutex<std::collections::HashMap<String, scp_crypto::p256::P256SigningKey>>,
+            std::sync::Mutex<std::collections::HashMap<String, scp_crypto::p256::P256SecretKey>>,
         next: std::sync::atomic::AtomicU64,
         fault: PseudonymFault,
         /// Called with the key id at the start of `destroy_key`, before the
@@ -24418,7 +24418,7 @@ mod tests {
                 })
         }
 
-        fn pseudonym_for(&self, key_id: &str) -> Option<scp_crypto::p256::P256SigningKey> {
+        fn pseudonym_for(&self, key_id: &str) -> Option<scp_crypto::p256::P256SecretKey> {
             self.pseudonyms
                 .lock()
                 .expect("pseudonym mutex")
@@ -24441,8 +24441,7 @@ mod tests {
             }
             let ikm = zeroize::Zeroizing::new(sk.to_bytes());
             let pseudonym =
-                scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
-                    .expect("seed_to_scalar is total");
+                scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch);
             let public_key = pseudonym.public_key().to_compressed().to_vec();
             let id = if self.fault == PseudonymFault::FixedId {
                 "777".to_owned()
@@ -24466,10 +24465,10 @@ mod tests {
     #[cfg(feature = "testing")]
     fn recipe_routing_id(seed: [u8; 32], context_id: &[u8], epoch: Option<u64>) -> [u8; 32] {
         let ikm = zeroize::Zeroizing::new(seed);
-        let point = scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
-            .expect("seed_to_scalar is total")
-            .public_key()
-            .to_compressed();
+        let version = epoch.map_or(scp_crypto::pseudonym::PseudonymVersion::Static, |epoch| {
+            scp_crypto::pseudonym::PseudonymVersion::Rotatable { epoch }
+        });
+        let point = scp_crypto::pseudonym::derive_pseudonym(&ikm, context_id, version);
         scp_crypto::pseudonym::pseudonym_routing_id(&point)
     }
 

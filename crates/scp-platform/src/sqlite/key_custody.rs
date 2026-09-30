@@ -267,8 +267,7 @@ impl SqliteKeyCustody {
         // Ed25519, so its 32-byte seed is the ikm.
         let ikm = Zeroizing::new(signing_key.to_bytes());
         let pseudonym_key =
-            scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch)
-                .map_err(|e| PlatformError::CustodyError(format!("pseudonym derivation: {e}")))?;
+            scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch);
         let public_key = pseudonym_key.public_key().to_compressed();
 
         let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -649,14 +648,15 @@ mod tests {
                     .await
                     .unwrap(),
             };
-            let expected = scp_crypto::pseudonym::derive_pseudonym_keypair(&seed, b"ctx", epoch)
-                .unwrap()
-                .public_key()
-                .to_compressed();
+            let version = epoch.map_or(scp_crypto::pseudonym::PseudonymVersion::Static, |epoch| {
+                scp_crypto::pseudonym::PseudonymVersion::Rotatable { epoch }
+            });
+            let point = scp_crypto::pseudonym::derive_pseudonym(&seed, b"ctx", version);
+            let expected = point.to_compressed();
             assert_eq!(pseudo.public_key().as_bytes(), expected.as_slice());
             assert_eq!(
                 pseudo.routing_id(),
-                &scp_crypto::pseudonym::pseudonym_routing_id(&expected)
+                &scp_crypto::pseudonym::pseudonym_routing_id(&point)
             );
 
             let digest = [0x77u8; 32];

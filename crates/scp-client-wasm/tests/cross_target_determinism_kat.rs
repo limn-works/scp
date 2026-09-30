@@ -565,7 +565,7 @@ fn relay_wire_encoding_is_target_deterministic() {
 
 /// Golden §9.10.4 pseudonym public key: §25.19 Vector 30's v1 pseudonym (the
 /// 33-byte compressed P-256 point), copied from `.docs/specs/25-test-vectors.md`.
-/// It is the output of the SHARED `scp_crypto::pseudonym::derive_pseudonym_keypair`
+/// It is the output of the SHARED `scp_crypto::pseudonym::derive_pseudonym`
 /// recipe that `ScpMlsGroup::derive_pseudonym` feeds the wasm-held MLS key into;
 /// pinning it here guards that the derivation is byte-identical native vs wasm32
 /// (an HKDF/HMAC/P-256 width or ordering divergence would move it).
@@ -593,16 +593,15 @@ fn assert_transport_wire_and_pseudonym_golden_vectors() {
     // (1) Pseudonym derivation over the shared recipe (fixed seed).
     // §25.19 Vector 30: identity seed 0x01 x 32 → identity P-256 scalar (the
     // ikm) under the §25.2 label → v1 pseudonym in "context-alpha".
-    let identity =
-        scp_crypto::p256::P256SigningKey::from_seed(b"SCP-TEST-VECTOR-KEY-V1", &[0x01u8; 32])
-            .unwrap_or_else(|e| panic!("seed_to_scalar: {e}"));
-    let derived = scp_crypto::pseudonym::derive_pseudonym_keypair(
+    let identity = scp_crypto::p256::P256SecretKey::from_seed(
+        scp_crypto::p256::SeedLabel::TestVectorKey,
+        &[0x01u8; 32],
+    );
+    let derived = scp_crypto::pseudonym::derive_pseudonym(
         &identity.to_scalar_bytes(),
         b"context-alpha",
-        None,
+        scp_crypto::pseudonym::PseudonymVersion::Static,
     )
-    .unwrap_or_else(|e| panic!("derive_pseudonym_keypair: {e}"))
-    .public_key()
     .to_compressed();
     assert_eq!(
         to_hex(&derived),

@@ -19,13 +19,12 @@
 //! wrappers over these functions, so the three bridges share one argument
 //! order, one set of checks and one pair of error codes:
 //! `SCP-VALID-7005` for an input of the wrong length and `SCP-CRYPTO-4001`
-//! for a scalar out of range or a failed reduction or signature.
+//! for a scalar out of range or a failed signature.
 //!
 //! Every scalar copy made here is wiped on drop (`Zeroizing`); the caller
 //! wipes the buffers it owns.
 
-use scp_crypto::p256::{P256SigningKey, seed_to_scalar, sign_prehash_rfc6979};
-use scp_crypto::pseudonym::PSEUDONYM_SCALAR_LABEL;
+use scp_crypto::p256::{P256SecretKey, SeedLabel, seed_to_scalar, sign_prehash_rfc6979};
 use zeroize::Zeroizing;
 
 use crate::error_codes as codes;
@@ -36,8 +35,8 @@ use crate::error_codes as codes;
 pub enum P256HostError {
     /// An input had the wrong length (`SCP-VALID-7005`).
     Validation(String),
-    /// A scalar was zero or not below `n`, or the reduction or signature
-    /// failed (`SCP-CRYPTO-4001`).
+    /// A scalar was zero or not below `n`, or the signature failed
+    /// (`SCP-CRYPTO-4001`).
     Crypto(String),
 }
 
@@ -75,9 +74,9 @@ fn exact_32(what: &str, bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, P256HostErr
     Ok(Zeroizing::new(array))
 }
 
-fn signing_key(scalar: &[u8]) -> Result<P256SigningKey, P256HostError> {
+fn signing_key(scalar: &[u8]) -> Result<P256SecretKey, P256HostError> {
     let scalar = exact_32("P-256 scalar", scalar)?;
-    P256SigningKey::from_scalar_bytes(&scalar)
+    P256SecretKey::from_scalar_bytes(&scalar)
         .map_err(|e| P256HostError::Crypto(format!("invalid P-256 scalar: {e}")))
 }
 
@@ -86,20 +85,17 @@ fn signing_key(scalar: &[u8]) -> Result<P256SigningKey, P256HostError> {
 ///
 /// FIPS 186-5 A.2.1, §9.10.4:
 /// `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`.
-/// The label is fixed here ([`PSEUDONYM_SCALAR_LABEL`]), so a host cannot
+/// The label is fixed here ([`SeedLabel::Pseudonym`]), so a host cannot
 /// derive a pseudonym under a mistyped one. Returns the 32-byte big-endian
 /// scalar.
 ///
 /// # Errors
 ///
-/// [`P256HostError::Validation`] when `context_seed` is not 32 bytes;
-/// [`P256HostError::Crypto`] if the reduction fails (unreachable for a
-/// 32-byte seed).
+/// [`P256HostError::Validation`] when `context_seed` is not 32 bytes.
 pub fn p256_pseudonym_scalar(context_seed: &[u8]) -> Result<Zeroizing<[u8; 32]>, P256HostError> {
     let seed = exact_32("context_seed", context_seed)?;
-    let scalar = seed_to_scalar(PSEUDONYM_SCALAR_LABEL, &seed)
-        .map_err(|e| P256HostError::Crypto(format!("seed_to_scalar failed: {e}")))?;
-    Ok(P256SigningKey::from_nonzero_scalar(scalar).to_scalar_bytes())
+    let scalar = seed_to_scalar(SeedLabel::Pseudonym, &seed);
+    Ok(P256SecretKey::from_nonzero_scalar(scalar).to_scalar_bytes())
 }
 
 /// The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.

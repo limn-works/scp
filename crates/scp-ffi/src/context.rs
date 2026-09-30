@@ -6327,7 +6327,9 @@ mod tests {
         );
         assert_eq!(
             routing_id,
-            scp_crypto::pseudonym::pseudonym_routing_id(&point)
+            scp_crypto::pseudonym::pseudonym_routing_id(
+                &scp_crypto::p256::P256PublicKey::from_sec1(&point).expect("valid point")
+            )
         );
     }
 
