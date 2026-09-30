@@ -1170,7 +1170,9 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 ///
 /// The Android adapter throws it when a Play Integrity token request fails,
 /// and the Apple adapter throws it when Apple's App Attest service answers
-/// with an error that no narrower `SCP-ATTEST-` code names.
+/// with an error that no narrower `SCP-ATTEST-` code names, or when the
+/// caller's task is cancelled while its App Attest call is queued or waiting
+/// for Apple's answer.
 pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
 
 /// Attestation signature verification requires raw JSON, which is absent.
@@ -1233,9 +1235,12 @@ pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
 pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 /// Apple App Attest did not answer one serialized call within 25 seconds.
 ///
-/// ADR-025 acceptance criterion 3 bounds each App Attest call the Apple
-/// adapter's call serializer runs at 25 seconds, below the runtime's
-/// 30-second actor `HANDLER_TIMEOUT`. When the bound expires, the waiting
+/// ADR-025 acceptance criterion 3 bounds each call the Apple adapter's call
+/// serializer runs, the whole of one `attest` or one `assert_request`, at 25
+/// seconds from the call's start, below the runtime's 30-second actor
+/// `HANDLER_TIMEOUT`. Time the call spends queued behind earlier calls counts
+/// against no bound, so a queued caller's whole wait can pass 30 seconds.
+/// When the bound expires, the waiting
 /// `attest` or `assert_request` throws this code, the serializer starts the
 /// next queued call, and an answer Apple gives later is discarded: it stores
 /// no key ID and reaches no caller. `SCP-ATTEST-9025` names a completion

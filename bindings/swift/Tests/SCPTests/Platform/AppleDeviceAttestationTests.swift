@@ -31,17 +31,18 @@
 //    `attest` then generates no key. ADR-025 acceptance criterion 3 has the
 //    Rust core pass the binding digest `D` and the assertion digest `A` of
 //    §9.3.1 of the security model spec as those two inputs.
-// 5. App Attest sees one outstanding call at a time: a call queued behind an
-//    outstanding call reaches Apple only after that call answers, concurrent
-//    `attest` calls on a device with no stored key generate one key, and
-//    every adapter over one `UserDefaults` object shares one lock and one
-//    call serializer. A call that the `isSupported` check or the 32-byte
+// 5. While every call ends with Apple's answer, App Attest sees one
+//    outstanding call at a time: a call queued behind a running call reaches
+//    Apple only after that call ends, concurrent `attest` calls on a device
+//    with no stored key generate one key, and every adapter over one
+//    `UserDefaults` object shares one lock and one call serializer. A call that the `isSupported` check or the 32-byte
 //    check rejects returns while another call holds the serializer, so it
 //    never waits in the queue. A call Apple does not answer within the
 //    adapter's time limit throws `SCP-ATTEST-9027` and the next queued call
-//    runs; Apple's later answer stores no key ID and reaches no caller. A
-//    caller cancelled while queued never reaches Apple, and one cancelled
-//    while Apple holds its call frees the queue. `AppAttestCallOrderingTests`
+//    runs while Apple may still hold the abandoned call; Apple's later
+//    answer stores no key ID and reaches no caller. A caller cancelled while
+//    queued never reaches Apple, and one cancelled while Apple holds its
+//    call frees the queue. `AppAttestCallOrderingTests`
 //    pins each case, with a time limit of a fraction of a second in place of
 //    the adapter's 25 seconds.
 //
@@ -613,6 +614,27 @@
         return await adapter.waitingAppAttestCallCount() == count
     }
 
+    /// Return `task`'s value, or a "hung" marker when it has none after ten
+    /// seconds. The bound makes a case whose caller never returns fail on its
+    /// `#expect` instead of hanging the suite. Neither racer is a child task,
+    /// so a hung `task` does not keep this function waiting.
+    private func valueWithin(_ task: Task<String, Never>) async -> String {
+        let (results, sink) = AsyncStream.makeStream(of: String.self)
+        Task { sink.yield(await task.value) }
+        let timer = Task {
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            sink.yield("hung: no result within 10 seconds")
+        }
+        var first = "no result"
+        for await result in results {
+            first = result
+            break
+        }
+        sink.finish()
+        timer.cancel()
+        return first
+    }
+
     // MARK: - Fail-closed tests
 
     struct AppleDeviceAttestationFailClosedTests {
@@ -846,12 +868,14 @@
         }
     }
 
-    /// Cases that pin `AppleDeviceAttestation`'s call serializer: App Attest
-    /// sees one outstanding call at a time, in the order the serializer
-    /// accepts them, across every adapter over one `UserDefaults` object, and
-    /// the `isSupported` and 32-byte checks run before a call is queued.
+    /// Cases that pin `AppleDeviceAttestation`'s call serializer: while every
+    /// call ends with Apple's answer, App Attest sees one outstanding call at
+    /// a time, in the order the serializer accepts them, across every adapter
+    /// over one `UserDefaults` object; the `isSupported` and 32-byte checks
+    /// run before a call is queued; and a timed-out or cancelled call frees
+    /// the serializer while Apple may still hold it.
     struct AppAttestCallOrderingTests {
-        @Test("App Attest sees one outstanding call at a time")
+        @Test("App Attest sees one outstanding call at a time while Apple answers every call")
         func appAttestCallsNeverOverlap() async {
             // `peakConcurrency` counts calls this double had outstanding at
             // once. Six callers starting together drive it above one for an
@@ -908,7 +932,7 @@
             #expect(Set(arrivals.dropFirst()) == Set(callerArrivals))
         }
 
-        @Test("a call queued behind an outstanding call reaches Apple only after that call answers, even with an error")
+        @Test("a call queued behind a running call reaches Apple only after Apple answers that call, even with an error")
         func queuedCallWaitsForOutstandingCall() async {
             let service = RecordingAppAttestService(
                 holdsFirstAssertion: true,
@@ -934,8 +958,8 @@
             #expect(!secondReachedApple, "a queued assertRequest reached Apple while an earlier call was outstanding")
 
             service.releaseHeldAssertion()
-            #expect(await first.value == "SCP-ATTEST-9001")
-            #expect(await second.value == "SCP-ATTEST-9001")
+            #expect(await valueWithin(first) == "SCP-ATTEST-9001")
+            #expect(await valueWithin(second) == "SCP-ATTEST-9001")
             #expect(service.assertions.map(\.clientDataHash) == [requestHash, secondHash])
         }
 
@@ -993,7 +1017,7 @@
 
             #expect(service.isHoldingAssertion, "a rejected call waited for the held assertion")
             service.releaseHeldAssertion()
-            #expect(await held.value == "returned bytes")
+            #expect(await valueWithin(held) == "returned bytes")
             #expect(service.generatedKeyCount == 0)
             #expect(service.attestations.isEmpty)
             #expect(service.assertions.count == 1)
@@ -1050,7 +1074,10 @@
             let service = RecordingAppAttestService(holdsFirstAssertion: true)
             let defaults = InMemoryUserDefaults()
             defaults.set(RecordingAppAttestService.generatedKeyId(1), forKey: keyIdDefaultsKey)
-            let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .milliseconds(300))
+            // One second gives the second caller time to join the queue before
+            // the first call's limit expires, so the case exercises the
+            // hand-off from a timed-out call to a queued one.
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .seconds(1))
             let secondHash = Data(repeating: 0xCD, count: 32)
 
             let first = Task { await code(of: { () async throws(ScpError) -> Data in
@@ -1060,9 +1087,14 @@
             let second = Task { await code(of: { () async throws(ScpError) -> Data in
                 try await adapter.assertRequest(requestHash: secondHash)
             }) }
+            // The queue holds a caller only while another call runs, so a
+            // count of one here proves the second call queued behind the
+            // first before the first timed out.
+            #expect(await waitForWaitingCalls(1, in: adapter), "the second assertRequest never joined the queue")
+            #expect(service.assertions.count == 1, "the queued assertRequest reached Apple before the first call ended")
 
-            #expect(await first.value == "SCP-ATTEST-9027")
-            #expect(await second.value == "returned bytes")
+            #expect(await valueWithin(first) == "SCP-ATTEST-9027")
+            #expect(await valueWithin(second) == "returned bytes")
             #expect(service.isHoldingAssertion, "the queued call waited for Apple to answer the timed-out call")
             #expect(service.assertions.map(\.clientDataHash) == [requestHash, secondHash])
 
@@ -1121,12 +1153,12 @@
             #expect(await waitForWaitingCalls(1, in: adapter), "the second assertRequest never joined the queue")
 
             queued.cancel()
-            #expect(await queued.value == "SCP-ATTEST-9001")
+            #expect(await valueWithin(queued) == "SCP-ATTEST-9001")
             #expect(await adapter.waitingAppAttestCallCount() == 0)
             #expect(service.isHoldingAssertion, "the cancelled caller waited for the held assertion")
 
             service.releaseHeldAssertion()
-            #expect(await held.value == "returned bytes")
+            #expect(await valueWithin(held) == "returned bytes")
             #expect(service.assertions.map(\.clientDataHash) == [requestHash])
         }
 
@@ -1148,8 +1180,8 @@
             #expect(await waitForWaitingCalls(1, in: adapter), "the second assertRequest never joined the queue")
 
             first.cancel()
-            #expect(await first.value == "SCP-ATTEST-9001")
-            #expect(await second.value == "returned bytes")
+            #expect(await valueWithin(first) == "SCP-ATTEST-9001")
+            #expect(await valueWithin(second) == "returned bytes")
             #expect(service.isHoldingAssertion, "the second call waited for Apple to answer the cancelled call")
             #expect(service.assertions.map(\.clientDataHash) == [requestHash, secondHash])
 

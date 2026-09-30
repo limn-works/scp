@@ -18,8 +18,9 @@
         /// The platform App Attest service returned an error other than
         /// `DCError.featureUnsupported`, or the caller's task was cancelled
         /// while its App Attest call waited in the queue or for Apple's
-        /// answer. The adapter maps that Swift `CancellationError` to this
-        /// case, as it maps every error that is not an `AttestationError`.
+        /// answer. For a cancellation the adapter throws no Swift
+        /// `CancellationError`: it returns this case, with a message that
+        /// begins `CancellationError:`.
         case serviceError(String)
         /// App Attest is unsupported: `DCAppAttestService` reports
         /// `isSupported == false`, or an App Attest call answers with
@@ -144,24 +145,31 @@
     /// `callSerializer`, an actor, runs the App Attest calls of every `attest`
     /// and `assertRequest`, key generation included, one call at a time, in
     /// the order the serializer accepts them. Each call therefore reads the
-    /// stored key ID after every preceding call ended, and concurrent
-    /// `attest` calls on a device with no stored key generate one key.
+    /// stored key ID after every preceding call ended. When every preceding
+    /// call ended with Apple's answer, concurrent `attest` calls on a device
+    /// with no stored key generate one key.
     /// `attest` and `assertRequest` check `isSupported` and the 32-byte
     /// length before they queue a call, so a call either check rejects waits
     /// for no other call.
     ///
-    /// One serialized call ends at the first of three events: Apple answers
-    /// it, `appAttestCallTimeLimit` (25 seconds) passes, or the caller's task
-    /// is cancelled. On the time limit the caller gets `SCP-ATTEST-9027`; on
-    /// cancellation it gets `SCP-ATTEST-9001`, the case every error that is
-    /// not an `AttestationError` maps to. Either way the serializer runs the
+    /// One serialized call is the whole of one `attest` (`generateKey`, when
+    /// no key ID is stored, then `attestKey`) or one `assertRequest`
+    /// (`generateAssertion`). It ends at the first of three events: Apple's
+    /// answers end it (an error from any of its App Attest methods, or the
+    /// answer to its last one), `appAttestCallTimeLimit` (25
+    /// seconds from the call's start) passes, or the caller's task is
+    /// cancelled. On the time limit the caller gets `SCP-ATTEST-9027`; on
+    /// cancellation it gets `SCP-ATTEST-9001`, through
+    /// `AttestationError.serviceError`. Either way the serializer runs the
     /// next queued call, and a completion handler Apple runs after the call
     /// ended stores no key ID, starts no further App Attest call, and reaches
     /// no caller. A caller cancelled while queued leaves the queue and never
     /// reaches Apple. After a timeout or a cancellation, Apple can still be
-    /// working on the abandoned call while the next call runs, and a
-    /// `generateKey` that ended that way leaves a key no stored ID names, so
-    /// the next `attest` generates another.
+    /// working on the abandoned call while the next call runs, so App Attest
+    /// can then hold two outstanding calls, and a `generateKey` that ended
+    /// that way leaves a key no stored ID names, so the next `attest`
+    /// generates another. The time limit starts when a call starts: time a
+    /// caller spends queued counts against no limit.
     ///
     /// The lock and the serializer belong to the `UserDefaults` object that
     /// holds the key ID, not to one instance: `AppAttestKeyStateGuard`
@@ -188,7 +196,8 @@
 
         /// Runs one App Attest call at a time, so each call reads the stored
         /// key ID after every preceding call ended, and concurrent `attest`
-        /// calls generate one key.
+        /// calls generate one key while every preceding call ended with
+        /// Apple's answer.
         private let callSerializer: AppAttestCallSerializer
 
         /// How long one serialized App Attest call may run before its caller
@@ -197,9 +206,12 @@
 
         /// The time limit on one serialized App Attest call: 25 seconds,
         /// below the 30-second `HANDLER_TIMEOUT` a runtime actor handler
-        /// waits, so a Rust caller receives `SCP-ATTEST-9027` rather than
-        /// its own timeout (ADR-025 acceptance criterion 3, the call-ordering
-        /// item).
+        /// waits (ADR-025 acceptance criterion 3, the call-ordering item).
+        /// The limit starts when the call starts, not when its caller
+        /// queues. A caller whose call starts at once therefore gets
+        /// `SCP-ATTEST-9027` within 25 seconds; a caller queued behind
+        /// another call first waits for that call to end, up to 25 seconds
+        /// per call ahead of it, so its whole wait can pass 30 seconds.
         static let appAttestCallTimeLimit: Duration = .seconds(25)
 
         /// The value of `DCAppAttestService.isSupported`, and nothing more.
@@ -369,7 +381,8 @@
             // The two checks above run before the call is queued, so a call
             // they reject waits for no other call. The key ID is read inside
             // the serialized call, so it follows every preceding call's write,
-            // and concurrent first calls generate one key.
+            // and concurrent first calls generate one key while every
+            // preceding call ended with Apple's answer.
             let outcome = await callSerializer.run(timeLimit: callTimeLimit) { [self] call in
                 if let keyId = loadKeyId() {
                     requestAttestation(keyId: keyId, challenge: challenge, call: call)
@@ -551,8 +564,9 @@
     /// promise to run jobs in the order callers made them: it may run a
     /// later, higher-priority caller's job before an earlier, lower-priority
     /// one. So the order App Attest sees is the acceptance order, not the
-    /// order in which callers called `attest` or `assertRequest`. Mutual
-    /// exclusion and the one-key guarantee do not depend on that order.
+    /// order in which callers called `attest` or `assertRequest`. Neither the
+    /// serializer's mutual exclusion nor the one-key guarantee, which holds
+    /// while every call ends with Apple's answer, depends on that order.
     ///
     /// **Why serialization, rather than a lock around the key-ID read:**
     /// `generateKey` answers through a completion handler, so a lock cannot be
@@ -569,7 +583,8 @@
     /// `AppAttestCall` discards whatever Apple answers after that. A caller
     /// cancelled while queued leaves the queue without reaching Apple. Time
     /// spent queued counts against no limit: each call ahead of a caller runs
-    /// for at most `timeLimit`.
+    /// for at most `timeLimit`, so a caller behind `n` calls waits up to
+    /// `n + 1` times `timeLimit` in all.
     private actor AppAttestCallSerializer {
         /// Whether a call holds the serializer.
         private var running = false
@@ -664,10 +679,10 @@
         private var waiter: CheckedContinuation<Result<Data, AttestationError>, Never>?
         private var timer: Task<Void, Never>?
 
-        /// What a caller cancelled while queued or running receives. The
-        /// adapter maps the Swift `CancellationError` to
-        /// `AttestationError.serviceError`, as it maps every error that is not
-        /// an `AttestationError`.
+        /// What a caller cancelled while queued or running receives:
+        /// `AttestationError.serviceError`, whose message begins
+        /// `CancellationError:`. No Swift `CancellationError` is thrown; the
+        /// serializer returns this outcome in its place.
         static let cancelledOutcome: Result<Data, AttestationError> = .failure(.serviceError(
             "CancellationError: the caller's task was cancelled before App Attest answered; "
                 + "the adapter discards any later answer"
