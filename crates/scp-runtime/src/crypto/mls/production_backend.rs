@@ -314,8 +314,9 @@ fn signer_and_provider_from_wrapper(
         }
     }
 
-    // The signer is not written into the provider's storage: Welcome processing
-    // and every later group operation take it as an argument.
+    // The signer is not written into the provider's storage: every openmls
+    // operation that signs takes it as an argument, and openmls never reads a
+    // stored `SignatureKeyPair` back.
     Ok((signer, provider))
 }
 

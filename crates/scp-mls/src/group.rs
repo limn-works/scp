@@ -938,8 +938,9 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // Eagerly drop cryptographic state. `Option::take` moves the value out,
     // leaving `None`, and the taken value is dropped at the end of the
     // statement. This releases:
-    //   - MlsGroup: tree secrets, epoch key schedules, ratchet state (freed, not
-    //     overwritten: openmls 0.9.0's in-memory `Secret` type has no zeroize)
+    //   - MlsGroup: tree secrets, epoch key schedules, ratchet state, zeroized on
+    //     drop: openmls 0.9.0's `Secret`, `AeadKey`, and `HpkePrivateKey` hold a
+    //     `tls_codec::SecretVLBytes`
     //   - SignatureKeyPair: Ed25519 private key, zeroized on drop by `SecretVLBytes`
     drop(group.group.take());
     drop(group.signer.take());
