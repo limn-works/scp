@@ -115,6 +115,15 @@ pub enum MlsStorageBridgeError {
     /// occurs when `StorageProvider` methods are called outside a tokio context.
     #[error("no tokio runtime available: {0}")]
     NoRuntime(String),
+
+    /// A caller asked the bridge to store an MLS signer.
+    ///
+    /// The signer's private key never enters provider storage: snapshots
+    /// persist that storage and restores re-inject it, and every openmls
+    /// operation SCP calls takes the signer as an argument (security model
+    /// spec §9.15). The bridge writes nothing and returns this error.
+    #[error("the MLS signer must not be stored in provider storage")]
+    SignerStorageForbidden,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,18 +510,22 @@ impl<S: Storage> StorageProvider<CURRENT_VERSION> for MlsStorageBridge<S> {
 
     // --- writers for crypto objects ---
 
+    /// Refuses to store the signer: writes nothing and returns
+    /// [`MlsStorageBridgeError::SignerStorageForbidden`] (security model spec
+    /// §9.15). The refusal covers this bridge only, and only tests build a
+    /// provider over it. Every live provider (this crate's `new_provider`,
+    /// `scp-client`, and the wasm32 client) is an `InMemoryMlsProvider` over
+    /// openmls's `MemoryStorage`, which accepts the signer, so on those paths the
+    /// clippy `disallowed-methods` ban on this method is the only guard.
     fn write_signature_key_pair<
         SignaturePublicKey: traits::SignaturePublicKey<CURRENT_VERSION>,
         SignatureKeyPair: traits::SignatureKeyPair<CURRENT_VERSION>,
     >(
         &self,
-        public_key: &SignaturePublicKey,
-        signature_key_pair: &SignatureKeyPair,
+        _public_key: &SignaturePublicKey,
+        _signature_key_pair: &SignatureKeyPair,
     ) -> Result<(), Self::Error> {
-        let pk_bytes = Self::serialize_key(public_key)?;
-        let key = self.build_key(SIGNATURE_KEY_PAIR_LABEL, &pk_bytes);
-        let val_bytes = Self::serialize_value(signature_key_pair)?;
-        self.sync_store(&key, &val_bytes)
+        Err(MlsStorageBridgeError::SignerStorageForbidden)
     }
 
     fn write_encryption_key_pair<
@@ -1083,6 +1096,55 @@ mod tests {
     /// is not available on the type.
     fn to_json_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
         serde_json::to_vec(value).unwrap()
+    }
+
+    /// Storing the signer through the bridge is refused with a typed error and
+    /// leaves no signer entry in the store, whichever entry point a caller uses.
+    ///
+    /// Each `expect` is also the control for one `disallowed-methods` entry in
+    /// this crate's `clippy.toml`: it is unfulfilled, and the CI clippy run
+    /// (`-D warnings`) fails, when that entry stops disallowing the call
+    /// (security model spec §9.15).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signer_write_is_refused_and_stores_nothing() {
+        type Bridge = MlsStorageBridge<scp_platform::in_memory::InMemoryStorage>;
+        let bridge = MlsStorageBridge::new(test_store(), "ctx-no-signer".to_owned()).unwrap();
+        let signer = openmls_basic_credential::SignatureKeyPair::new(
+            scp_mls::group::SCP_CIPHERSUITE.signature_algorithm(),
+        )
+        .unwrap();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "asserts the bridge refuses the signer write the lint bans"
+        )]
+        let direct = openmls_traits::storage::StorageProvider::write_signature_key_pair(
+            &bridge,
+            &signer.id(),
+            &signer,
+        );
+        assert!(matches!(
+            direct,
+            Err(MlsStorageBridgeError::SignerStorageForbidden)
+        ));
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "asserts the bridge refuses the signer write the lint bans"
+        )]
+        let via_store = signer.store(&bridge);
+        assert!(matches!(
+            via_store,
+            Err(MlsStorageBridgeError::SignerStorageForbidden)
+        ));
+
+        let pk_bytes = Bridge::serialize_key(&signer.id()).unwrap();
+        let key = bridge.build_key(SIGNATURE_KEY_PAIR_LABEL, &pk_bytes);
+        assert!(bridge.sync_retrieve(&key).unwrap().is_none());
+        let read: Option<openmls_basic_credential::SignatureKeyPair> =
+            openmls_traits::storage::StorageProvider::signature_key_pair(&bridge, &signer.id())
+                .unwrap();
+        assert!(read.is_none());
     }
 
     // -- AC4: group state store/load roundtrip --

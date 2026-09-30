@@ -1779,9 +1779,62 @@ mod tests {
             "generate_key_package must not copy the signer into provider storage"
         );
 
+        // join_group: the joiner's provider after processing the Welcome.
+        let mut alice = create_group(&cred, &SystemClock).unwrap();
+        let bob_cred = test_credential("bob");
+        let (bob_kp, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice,
+            bob_kp.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
+        let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
+        assert!(
+            !stores_signature_key_pair(bob.provider()),
+            "join_group must not copy the signer into provider storage"
+        );
+
+        // deserialize_state: the provider a restored snapshot is rebuilt into.
+        let restored = ScpMlsGroup::deserialize_state(&bob.serialize_state().unwrap()).unwrap();
+        assert!(
+            !restored
+                .provider()
+                .storage()
+                .values
+                .read()
+                .unwrap()
+                .is_empty(),
+            "the restored provider holds the group's secrets, so the scan sees real entries"
+        );
+        assert!(
+            !stores_signature_key_pair(restored.provider()),
+            "deserialize_state must not copy the signer into provider storage"
+        );
+
         // Control: the detector does see a stored signer.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the detector: stores the signer on purpose"
+        )]
         signer.store(provider.storage()).unwrap();
         assert!(stores_signature_key_pair(&provider));
+
+        // Control for the trait-method entry: a direct `StorageProvider` call,
+        // which bypasses `SignatureKeyPair::store`, is disallowed too.
+        let direct = InMemoryMlsProvider::default();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint: stores the signer through the trait on purpose"
+        )]
+        openmls_traits::storage::StorageProvider::write_signature_key_pair(
+            direct.storage(),
+            &signer.id(),
+            &signer,
+        )
+        .unwrap();
+        assert!(stores_signature_key_pair(&direct));
     }
 
     #[test]
