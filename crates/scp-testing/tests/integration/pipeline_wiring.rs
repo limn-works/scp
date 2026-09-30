@@ -323,6 +323,19 @@ fn extract_fn_body(source: &str, fn_name: &str) -> Option<String> {
 /// is consumed by a dedicated `skip_*` helper that emits the right number of
 /// spaces (preserving length/order) and returns the index just past the span.
 fn clean_and_extract_braced(s: &str) -> Option<String> {
+    clean_code(s, true)
+}
+
+/// Returns `s` with every comment, string and char literal blanked as
+/// [`clean_and_extract_braced`] blanks them, over the whole of `s`.
+fn strip_non_code(s: &str) -> String {
+    clean_code(s, false).unwrap_or_default()
+}
+
+/// The lexer behind [`clean_and_extract_braced`] (`balanced_body`: stop at the
+/// `}` that balances the leading `{`, or return `None` when none does) and
+/// [`strip_non_code`] (scan all of `s`).
+fn clean_code(s: &str, balanced_body: bool) -> Option<String> {
     let chars: Vec<char> = s.chars().collect();
     let mut cleaned = String::with_capacity(chars.len());
     let mut depth = 0u32;
@@ -376,16 +389,17 @@ fn clean_and_extract_braced(s: &str) -> Option<String> {
         if ch == '{' {
             depth += 1;
         } else if ch == '}' {
-            depth -= 1;
+            depth = depth.saturating_sub(1);
         }
         cleaned.push(ch);
-        if ch == '}' && depth == 0 {
+        if balanced_body && ch == '}' && depth == 0 {
             return Some(cleaned);
         }
         i += 1;
     }
 
-    None // Unbalanced braces
+    // A body scan whose braces never balance yields no body.
+    (!balanced_body).then_some(cleaned)
 }
 
 /// Consume a `//` line comment starting at `start` (`chars[start] == '/'`,
@@ -3011,7 +3025,8 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
         ),
     ] {
         // Search the PRODUCTION code only: everything before the trailing
-        // `#[cfg(test)]\nmod tests { ... }`, with comment lines removed. Each
+        // `#[cfg(test)]\nmod tests { ... }`, with comments and string
+        // contents blanked (see `production_code`). Each
         // bridge's unit tests and its comments name the same symbols, so a bare
         // `contains` over the file stayed green after the real call was deleted.
         let code = production_code(src);
@@ -3066,12 +3081,13 @@ fn serves_the_supervisor_event_source(
     const ARM: &str = "{ Ok(supervisor) => supervisor.subscribe_events(),";
     // The arms allowed after `ARM`, each closing the `match` and ending the
     // statement: with no Supervisor there is no receiver, so the arm's value is
-    // `None` (after, at most, the bridges' shared warning). Any other value is a
-    // receiver no Supervisor feeds, which would advertise
-    // `resources.subscribe: true` over a pump that never fires.
+    // `None` (after, at most, the bridges' shared warning, whose message
+    // `production_code` blanks). Any other value is a receiver no Supervisor
+    // feeds, which would advertise `resources.subscribe: true` over a pump
+    // that never fires.
     const ERR_ARMS: [&str; 2] = [
         "Err(_) => None, };",
-        "Err(e) => { tracing::warn!(\"MCP server: no supervisor event source ({e})\"); None } };",
+        "Err(e) => { tracing::warn!(\" \"); None } };",
     ];
     let bind = format!("let context_events = match {supervisor_of_bi} ");
     let bundle_wired = fn_body(code, "mcp_server_bundle").is_some_and(|body| {
@@ -3181,7 +3197,7 @@ const WIRED_BUNDLE: &str = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpSer
 fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     let wired = WIRED_BUNDLE;
     // The wired bundle carries a comment line naming `context_events`, which
-    // counts as a third mention when comment lines are searched.
+    // counts as a third mention when comments are searched.
     assert!(serves_the_supervisor_event_source(
         &production_code(wired),
         "serve",
@@ -3730,7 +3746,7 @@ fn mcp_resource_gate_rejects_a_read_not_from_the_bridge_instance() {
 #[test]
 fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     // The comment holds the exact call the search looks for, so only the
-    // removal of comment lines keeps it from satisfying the search.
+    // blanking of comments keeps it from satisfying the search.
     let doc_only = "/// rt.role_state.member_has_capability(agent_did, &Capability::MessagesRead)\n\
                     fn check() -> bool { rt.role_state.members.contains(agent) }\n";
     assert!(checks_messages_read(doc_only));
@@ -3815,17 +3831,7 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     ));
     // The predicate's `messages:read` arm is replaced by a membership check,
     // or the two arms swap their requirements.
-    let predicate = "pub fn check_access(self, role_state: &ContextRoleState) -> bool {\n    \
-                     match self {\n        \
-                     Self::Events | Self::Members => \
-                     role_state.member_has_capability(agent, &Capability::MessagesRead),\n        \
-                     Self::Tools => role_state.members.contains(agent),\n    }\n}\n\
-                     const fn display_name(self) {}\n";
-    let arm_checks_messages_read = |src: &str| {
-        fn_body(&production_code(src), "check_access")
-            .and_then(events_and_members_arm)
-            .is_some_and(checks_messages_read)
-    };
+    let predicate = CHECK_ACCESS_PREDICATE;
     assert!(arm_checks_messages_read(predicate));
     let membership_only = predicate.replace(
         "member_has_capability(agent, &Capability::MessagesRead)",
@@ -3844,12 +3850,168 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     assert!(!arm_checks_messages_read(&swapped));
 }
 
-/// Returns the text of the first `fn {name}(` in `code` (from
-/// [`production_code`]), from that signature up to the next ` fn `.
+/// A `check_access` whose events/members arm checks `messages:read`, as the
+/// predicate gate accepts it.
+const CHECK_ACCESS_PREDICATE: &str = "pub fn check_access(self, role_state: &ContextRoleState) \
+                  -> bool {\n    match self {\n        Self::Events | Self::Members => \
+                  role_state.member_has_capability(agent, &Capability::MessagesRead),\n        \
+                  Self::Tools => role_state.members.contains(agent),\n    }\n}\n\
+                  const fn display_name(self) {}\n";
+
+/// The predicate gate that [`mcp_resource_access_is_answered_from_real_role_state`]
+/// runs on `scp-mcp`'s server, applied to `src`.
+fn arm_checks_messages_read(src: &str) -> bool {
+    fn_body(&production_code(src), "check_access")
+        .and_then(events_and_members_arm)
+        .is_some_and(checks_messages_read)
+}
+
+/// The predicate gate must go red when the events/members arm checks
+/// membership only and keeps the `messages:read` call in a trailing comment,
+/// a block comment, or a string literal on the arm's line.
+#[test]
+fn mcp_predicate_gate_ignores_trailing_comments_and_strings() {
+    let predicate = CHECK_ACCESS_PREDICATE;
+    assert!(arm_checks_messages_read(predicate));
+    for hidden in [
+        "members.contains(agent), // member_has_capability(agent, &Capability::MessagesRead)",
+        "members.contains(agent) /* member_has_capability(agent, &Capability::MessagesRead) */,",
+        "members.contains(agent) || \"member_has_capability(agent, &Capability::MessagesRead)\" \
+         .is_empty(),",
+    ] {
+        let regression = predicate.replace(
+            "member_has_capability(agent, &Capability::MessagesRead),",
+            hidden,
+        );
+        assert_ne!(regression, predicate);
+        assert!(!arm_checks_messages_read(&regression), "{regression}");
+    }
+}
+
+/// Every MCP gate reads [`production_code`], which blanks comments and string
+/// contents, and [`fn_body`], which ends a function at its closing `}` and
+/// refuses a name defined twice. Each case below keeps a pinned statement only
+/// in a trailing comment, a block comment or a string literal on a code line,
+/// or adds a second function of the pinned name, and must go red; each
+/// unaltered fixture must stay green.
+#[test]
+fn mcp_gates_ignore_trailing_comments_strings_and_second_definitions() {
+    // Event-source gate: the serve path's provider and bundle call.
+    let serves = |src: &str| {
+        serves_the_supervisor_event_source(
+            &production_code(src),
+            "serve",
+            SUPERVISOR_OF_BI,
+            WIRED_SERVE_PATH,
+        )
+    };
+    assert!(serves(WIRED_BUNDLE));
+    for (pin, hidden) in [
+        (
+            "bi: Arc::downgrade(bi),",
+            "bi: Arc::downgrade(&other), // bi: Arc::downgrade(bi),",
+        ),
+        (
+            "bi: Arc::downgrade(bi),",
+            "bi: Arc::downgrade(&other), /* bi: Arc::downgrade(bi), */",
+        ),
+        (
+            "let server = mcp_server_bundle(bi, provider);",
+            "let server = serve_detached(provider); // let server = mcp_server_bundle(bi, provider);",
+        ),
+    ] {
+        let regression = WIRED_BUNDLE.replace(pin, hidden);
+        assert_ne!(regression, WIRED_BUNDLE);
+        assert!(!serves(&regression), "{regression}");
+    }
+
+    // Split gate: the role-state `match` itself, and a statement before it.
+    let splits = |src: &str| splits_absent_context_from_failed_read(&production_code(src));
+    assert!(splits(SPLIT_GATE));
+    for (pin, hidden) in [
+        (
+            "match held_role_state(bi, context_id) {",
+            "match cached_role_state(bi, context_id) { // match held_role_state(bi, context_id) {",
+        ),
+        (
+            "use scp_mcp::server::AccessRefusal;\n",
+            "use scp_mcp::server::AccessRefusal;\n    \
+             if bi.core.try_supervisor().is_none() { return Ok(ContextRoleState::default()); }\n",
+        ),
+        (
+            "use scp_mcp::server::AccessRefusal;\n",
+            "use scp_mcp::server::AccessRefusal;\n    let bi = &other_instance;\n",
+        ),
+    ] {
+        let regression = SPLIT_GATE.replace(pin, hidden);
+        assert_ne!(regression, SPLIT_GATE);
+        assert!(!splits(&regression), "{regression}");
+    }
+    // A second `gate_role_state` that callers can reach in place of the split one.
+    let second = format!(
+        "{SPLIT_GATE}fn gate_role_state(bi: &Bi, context_id: &str) -> R {{ \
+         Ok(ContextRoleState::default()) }}\n"
+    );
+    assert!(!splits(&second));
+
+    // Source gate: the supervisor call, and the read `gate_role_state` matches on.
+    let reads = |src: &str| reads_role_state_from_its_own_source(&production_code(src));
+    assert!(reads(HELD_READ));
+    for (pin, hidden) in [
+        (
+            "block_on(async move { supervisor.get_role_state_checked(&id).await })",
+            "block_on(async move { cached(&id).await }) \
+             // async move { supervisor.get_role_state_checked(&id).await",
+        ),
+        (
+            "block_on(async move { supervisor.get_role_state_checked(&id).await })",
+            "block_on(cached(&id, \"async move { supervisor.get_role_state_checked(&id).await\"))",
+        ),
+        (
+            "match held_role_state(bi, context_id) {",
+            "match cached_role_state(bi, context_id) { // match held_role_state(bi, context_id) {",
+        ),
+    ] {
+        let regression = HELD_READ.replace(pin, hidden);
+        assert_ne!(regression, HELD_READ);
+        assert!(!reads(&regression), "{regression}");
+    }
+}
+
+/// Returns the text of the function `fn {name}(` in `code` (from
+/// [`production_code`]), from that signature to the `}` that closes its body.
+///
+/// Returns `None` when `code` holds no such function, or more than one, since
+/// a gate could then read one function while callers reach another; and when
+/// a `;` precedes the body's `{`, since that signature has no body. Braces are
+/// counted over `code` as [`production_code`] leaves it, with comments and
+/// literals blanked, so a `{` in one of them cannot move the end.
 fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
-    let start = code.find(&format!("fn {name}("))?;
+    let signature = format!("fn {name}(");
+    let mut starts = code.match_indices(&signature).map(|(at, _)| at);
+    let start = starts.next()?;
+    if starts.next().is_some() {
+        return None;
+    }
     let rest = &code[start..];
-    Some(rest[3..].find(" fn ").map_or(rest, |end| &rest[..end + 3]))
+    let open = rest.find('{')?;
+    if rest[..open].contains(';') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (at, ch) in rest[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..=open + at]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether the production `validate_resource_access` in `code` reads the
@@ -3911,17 +4073,28 @@ fn answers_resource_access_from_live_role_state(code: &str) -> bool {
 /// `Err(e)` arm, the match's `}` and the function's `}`. So no guarded arm can
 /// sit between the `Denied` arm and the `Err(e)` arm and turn some failed
 /// reads into a stand-in role state.
+///
+/// The match must also be the function's first statement after
+/// `use scp_mcp::server::AccessRefusal;`: the text before it is the signature,
+/// its `{` (the only `{` there) and that `use`. So no earlier statement can
+/// return a stand-in role state or rebind `bi` or `context_id`.
 fn splits_absent_context_from_failed_read(code: &str) -> bool {
+    const PRELUDE: &str = "{ use scp_mcp::server::AccessRefusal;";
     const HELD_THEN_ABSENT: &str =
         " Ok(Some(role_state)) => Ok(role_state), Ok(None) => Err(AccessRefusal::Denied(";
     const FAILED: &str = ", Err(e) => Err(AccessRefusal::Unreadable(e)), } }";
     fn_body(code, "gate_role_state").is_some_and(|body| {
         ROLE_STATE_READS.iter().any(|(read, _)| {
             body.find(read).is_some_and(|at| {
-                body[at + read.len()..]
-                    .strip_prefix(HELD_THEN_ABSENT)
-                    .and_then(after_open_parens::<2>)
-                    .is_some_and(|rest| rest.trim_end() == FAILED)
+                let first_statement = body[..at]
+                    .trim_end()
+                    .strip_suffix(PRELUDE)
+                    .is_some_and(|signature| !signature.contains('{'));
+                first_statement
+                    && body[at + read.len()..]
+                        .strip_prefix(HELD_THEN_ABSENT)
+                        .and_then(after_open_parens::<2>)
+                        .is_some_and(|rest| rest.trim_end() == FAILED)
             })
         })
     })
@@ -4180,18 +4353,17 @@ fn mcp_capability_stub_gate_rejects_a_grant() {
 
 /// Returns the production code of a Rust source file as one whitespace-collapsed
 /// line: everything before the trailing `#[cfg(test)] mod tests { ... }`, with
-/// every line that is only a comment (`//`, `///`, `//!`) removed.
+/// every comment (a whole-line or trailing `//` comment, a `/* */` block) and
+/// the contents of every string and char literal blanked by
+/// [`strip_non_code`], the lexer [`extract_fn_body`] uses. A string literal
+/// keeps its quotes, so `"text"` reads as `" "`.
 ///
-/// A gate reading this cannot be satisfied by a bridge's own unit tests or by a
-/// comment-only line that names the symbol. Text on a code line still counts,
-/// including a trailing `//` comment, a `/* */` block and a string literal, so
-/// the gates that read it claim no more than that. Collapsing whitespace lets
-/// one pattern match a call rustfmt wraps across lines.
+/// A gate reading this cannot be satisfied by a bridge's own unit tests, by a
+/// comment, or by a string literal that names the symbol. Collapsing
+/// whitespace lets one pattern match a call rustfmt wraps across lines.
 fn production_code(src: &str) -> String {
-    production_source(src)
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .flat_map(str::split_whitespace)
+    strip_non_code(production_source(src))
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -4270,7 +4442,7 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
     // not a string, so no `resource:{kind}` capability name can be synthesized
     // from it; this test carries no source-text check for that spelling.
     //
-    // Search PRODUCTION code with comment-only lines removed, as the
+    // Search PRODUCTION code with comments and string contents blanked, as the
     // event-source gate above does: each bridge's test module and doc comments
     // name the same symbols, so a whole-file `contains` stayed green after the
     // real call was deleted.
