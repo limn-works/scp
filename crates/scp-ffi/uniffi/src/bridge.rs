@@ -16706,11 +16706,11 @@ impl Scp {
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function `mcp_server_create`.
+    /// Starts an MCP server over this instance's contexts on the `stdio` or
+    /// `sse` transport.
     ///
-    /// Routes through `&*self.inner`. The MCP server registry is
-    /// module-level (not per-instance) so the returned opaque handle
-    /// string is globally unique; this method preserves that behaviour.
+    /// Registers the server in this instance's MCP server registry under a
+    /// random opaque handle; only this instance's `mcp_server_stop` finds it.
     ///
     /// A server created while the instance has no supervisor or is
     /// suspended serves no resource subscriptions for its whole life: it
@@ -16838,10 +16838,10 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `mcp_server_stop`.
+    /// Stops the MCP server registered under `handle`.
     ///
-    /// Routes through the module-level MCP server registry (the registry
-    /// is not per-instance; the opaque handle string is globally unique).
+    /// Looks the handle up in this instance's MCP server registry; a handle
+    /// another instance returned is not found.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_server_stop(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
@@ -16868,9 +16868,11 @@ impl Scp {
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+    /// Starts `command` as an MCP server subprocess and connects to it over
+    /// stdio.
     ///
-    /// Routes through the module-level MCP client registry.
+    /// Registers the client in this instance's MCP client registry; the
+    /// returned handle works only on this instance.
     pub async fn mcp_client_connect_stdio(&self, command: Vec<String>) -> Result<String, ScpError> {
         if command.is_empty() {
             return Err(ScpError::Validation {
@@ -16906,9 +16908,10 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+    /// Connects to the MCP SSE server at `url`.
     ///
-    /// Routes through the module-level MCP client registry. `auth_token` is
+    /// Registers the client in this instance's MCP client registry; the
+    /// returned handle works only on this instance. `auth_token` is
     /// sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
     /// or `None` for a server that runs no bearer check; an SCP SSE server
     /// always runs one (ADR-015). The transport has no TLS, so a token is
@@ -16946,9 +16949,10 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
+    /// Disconnects the MCP client registered under `handle`.
     ///
-    /// Routes through the module-level MCP client registry. Dropping the
+    /// Removes the entry from this instance's MCP client registry; a handle
+    /// another instance returned is not found. Dropping the
     /// entry closes the client's transport, even while a call on the handle
     /// is in flight. A stdio client's server process group, which holds the
     /// processes the server started, is dead when this returns, and the
@@ -16974,9 +16978,10 @@ impl Scp {
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function `mcp_client_list_tools`.
+    /// Lists the tools the MCP server behind `handle` exposes.
     ///
-    /// Routes through the module-level MCP client registry.
+    /// Looks the handle up in this instance's MCP client registry; a handle
+    /// another instance returned is not found.
     pub async fn mcp_client_list_tools(
         &self,
         handle: String,
@@ -17004,9 +17009,10 @@ impl Scp {
             .collect())
     }
 
-    /// Per-instance equivalent of the free-function `mcp_client_invoke`.
+    /// Invokes a tool on the MCP server behind `handle`.
     ///
-    /// Routes through the module-level MCP client registry.
+    /// Looks the handle up in this instance's MCP client registry; a handle
+    /// another instance returned is not found.
     pub async fn mcp_client_invoke(
         &self,
         handle: String,
