@@ -4086,12 +4086,11 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     ///
-    /// A stdio client's server process group is killed before this returns,
-    /// and a call in flight on the handle then fails. A disconnect does not
-    /// end a call in flight on an SSE client: that call waits until the
-    /// server answers its POST or closes the connection. A call still waiting
-    /// behind an in-flight call on the handle fails once it reaches the
-    /// client, on either transport, and sends no request.
+    /// A stdio client's server process group is killed, or an SSE client's
+    /// sockets are shut down, before this returns, and a call in flight on
+    /// the handle then fails. A call still waiting behind an in-flight call
+    /// on the handle fails once it reaches the client, on either transport,
+    /// and sends no request.
     #[napi(js_name = "mcpClientDisconnect")]
     pub async fn mcp_client_disconnect(&self, handle: &NapiMcpClientHandle) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);

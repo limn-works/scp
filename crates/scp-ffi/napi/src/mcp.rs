@@ -2,7 +2,9 @@
 //!
 //! Exposes MCP server and client operations to Node.js/Bun:
 //!
-//! - `mcp_server_create` — Start an MCP server exposing SCP context outlets.
+//! - `mcp_server_create` — Start an MCP server over stdio or SSE. It lists no
+//!   tools and refuses every `tools/call`, because outlet invocation is not
+//!   wired to this bridge (SCP-048).
 //! - `mcp_server_stop` — Stop a running MCP server.
 //! - `mcp_client_connect_stdio` — Connect to an external MCP server via stdio.
 //! - `mcp_client_connect_sse` — Connect to an external MCP server via SSE.
@@ -142,31 +144,36 @@ pub(crate) struct McpClientEntry {
     /// blocking thread, and a silent server holds at most one blocking thread
     /// per handle.
     pub(crate) client: Arc<tokio::sync::Mutex<McpClient<McpClientTransportWrapper>>>,
-    /// A stdio client's server process, which the entry's `Drop` stops
-    /// through [`stop_stdio_server`], so every path that drops the entry (a
+    /// What the entry's `Drop` ends, so every path that drops the entry (a
     /// disconnect, the registry clear at instance shutdown, the instance's
-    /// drop) stops the server: an in-flight call's clone of `client` would
-    /// otherwise keep the process alive, and a blocking thread parked on its
-    /// stdout, for as long as the server stays silent. `None` for an SSE client: its POST read
-    /// has no timeout, and a disconnect has no handle that ends it, so a call
-    /// in flight against a silent SSE server holds its blocking thread until
-    /// the server answers or closes the connection.
-    pub(crate) stdio_server: Option<Arc<Mutex<Option<std::process::Child>>>>,
+    /// drop) ends the transport even while a call on the handle is in
+    /// flight: that call's clone of `client` would otherwise keep the
+    /// transport open, and a blocking thread parked on it, for as long as
+    /// the server stays silent.
+    pub(crate) stop: McpClientStop,
     /// Set by the entry's `Drop`. A call reads it after it takes the client's
-    /// lock, so a call queued behind an in-flight one fails once the handle
-    /// is disconnected instead of sending a request over a transport the
-    /// disconnect left open (an SSE client's connection outlives the entry).
+    /// lock, so a call queued behind an in-flight one fails as disconnected,
+    /// under its own code, and sends no request.
     closed: Arc<AtomicBool>,
 }
 
+/// How a disconnect ends a client's transport.
+pub(crate) enum McpClientStop {
+    /// A stdio client's server process, stopped through
+    /// [`stop_stdio_server`]; a call in flight then fails on the closed
+    /// stdout.
+    StdioServer(Arc<Mutex<Option<std::process::Child>>>),
+    /// An SSE client's closer, which shuts down the `GET` stream's socket and
+    /// the socket of every POST a call waits on; a call in flight then fails
+    /// at once, and the transport sends nothing more.
+    Sse(scp_mcp::sse_client::SseCloser),
+}
+
 impl McpClientEntry {
-    fn new(
-        client: McpClient<McpClientTransportWrapper>,
-        stdio_server: Option<Arc<Mutex<Option<std::process::Child>>>>,
-    ) -> Self {
+    fn new(client: McpClient<McpClientTransportWrapper>, stop: McpClientStop) -> Self {
         Self {
             client: Arc::new(tokio::sync::Mutex::new(client)),
-            stdio_server,
+            stop,
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -223,11 +230,12 @@ impl Drop for McpClientEntry {
     fn drop(&mut self) {
         // A call queued on the handle's lock fails once it gets the lock.
         self.closed.store(true, Ordering::Release);
-        // A stdio server, and every process in its process group, is dead
-        // once the entry drops, even while a call on the handle is in flight;
-        // that call then fails on the closed stdout.
-        if let Some(server) = &self.stdio_server {
-            stop_stdio_server(server);
+        // The transport is ended once the entry drops, even while a call on
+        // the handle is in flight: a stdio server and every process in its
+        // process group are dead, and an SSE client's sockets are shut down.
+        match &self.stop {
+            McpClientStop::StdioServer(server) => stop_stdio_server(server),
+            McpClientStop::Sse(closer) => closer.close(),
         }
     }
 }
@@ -399,7 +407,7 @@ impl StdioMcpTransport {
         })
     }
 
-    /// The server process, for [`McpClientEntry::stdio_server`].
+    /// The server process, for [`McpClientStop::StdioServer`].
     fn server_process(&self) -> Arc<Mutex<Option<std::process::Child>>> {
         Arc::clone(&self.child)
     }
@@ -1071,7 +1079,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
         bi,
         bi.mcp_client_registry(),
         mcp_handle_id("mcp-client"),
-        McpClientEntry::new(client, Some(server)),
+        McpClientEntry::new(client, McpClientStop::StdioServer(server)),
     )?;
     crate::increment_handle_count();
 
@@ -1091,7 +1099,7 @@ pub(crate) async fn mcp_client_connect_sse_on(
     // over-long URL is a validation error on every binding.
     scp_ffi_common::validate::validate_relay_url(&url)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let client = run_mcp_client_io(codes::TRANS_5018, move || {
+    let (client, closer) = run_mcp_client_io(codes::TRANS_5018, move || {
         let transport =
             scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref()).map_err(
                 |e| ScpNapiError::Transport {
@@ -1099,12 +1107,13 @@ pub(crate) async fn mcp_client_connect_sse_on(
                     code: codes::TRANS_5018.to_owned(),
                 },
             )?;
+        let closer = transport.closer();
         let mut client = McpClient::new(McpClientTransportWrapper::Sse(transport));
         client.initialize().map_err(|e| ScpNapiError::Transport {
             message: format!("MCP initialize handshake failed: {e}"),
             code: codes::TRANS_5018.to_owned(),
         })?;
-        Ok(client)
+        Ok((client, closer))
     })
     .await?;
 
@@ -1112,7 +1121,7 @@ pub(crate) async fn mcp_client_connect_sse_on(
         bi,
         bi.mcp_client_registry(),
         mcp_handle_id("mcp-client"),
-        McpClientEntry::new(client, None),
+        McpClientEntry::new(client, McpClientStop::Sse(closer)),
     )?;
     crate::increment_handle_count();
 
@@ -1136,9 +1145,10 @@ pub(crate) async fn mcp_client_disconnect_on(
         }
         .into());
     };
-    // Dropping the entry kills a stdio server and its process group before
-    // this returns, even while a call on the handle is in flight, and makes
-    // every call still queued on the handle's lock fail without sending.
+    // Dropping the entry kills a stdio server and its process group, or shuts
+    // down an SSE client's sockets, before this returns, even while a call on
+    // the handle is in flight, and makes every call still queued on the
+    // handle's lock fail without sending.
     drop(entry);
     Ok(())
 }
@@ -1150,7 +1160,7 @@ pub(crate) async fn mcp_client_list_tools_on(
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
     crate::napi_check_handle!(&bi.core, handle);
     let client_guard = LiveMcpClient::checkout(bi, &handle.handle_id, codes::TRANS_5020)?
-        .lock(&handle.handle_id, codes::TRANS_5020)
+        .lock(&handle.handle_id, codes::TRANS_5021)
         .await?;
     let outlets = run_mcp_client_io(codes::TRANS_5022, move || {
         client_guard
@@ -1189,7 +1199,7 @@ pub(crate) async fn mcp_client_invoke_on(
             message: format!("invalid input JSON: {e}"),
             code: codes::VALID_7021.to_owned(),
         })?;
-    let client_guard = client.lock(&handle.handle_id, codes::TRANS_5023).await?;
+    let client_guard = client.lock(&handle.handle_id, codes::TRANS_5024).await?;
     let result = run_mcp_client_io(codes::TRANS_5025, move || {
         client_guard
             .invoke(&outlet_name, input, &context_id, &invoker_did)
@@ -1362,28 +1372,20 @@ mod tests {
     /// holds the connection silent until the timer branch has run, then
     /// closes it, so the connect fails after the header has gone out. On this
     /// single-threaded runtime a connect that blocked the worker would hold
-    /// the timer branch for the listener's five-second hold.
+    /// the timer branch for the listener's five-second hold. A connect that
+    /// fails before it opens a connection fails the test within five seconds
+    /// rather than leaving the listener parked in `accept`.
     #[test]
     fn mcp_client_connect_sse_sends_the_bearer_token_napi() {
-        use std::io::BufRead;
         let bi = NapiBridgeInstance::new_napi();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
-            let (conn, _) = listener.accept().expect("accept GET");
-            let mut reader = std::io::BufReader::new(conn);
-            let mut head = String::new();
-            loop {
-                let mut line = String::new();
-                let n = reader.read_line(&mut line).expect("read head");
-                if n == 0 || line == "\r\n" {
-                    break;
-                }
-                head.push_str(&line);
-            }
+            let conn = accept_within(&listener)?;
+            let head = read_http_request(&conn);
             let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
-            head
+            Some(head)
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1405,7 +1407,12 @@ mod tests {
                 }
             )
         });
-        let head = server.join().expect("server thread");
+        let Some(head) = server.join().expect("server thread") else {
+            panic!(
+                "the connect never opened a connection: {:?}",
+                result.as_ref().err().map(|e| &e.reason)
+            );
+        };
         assert!(
             head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
             "the GET must carry the token, got: {head}"
@@ -1581,7 +1588,7 @@ mod tests {
         let handle_id = mcp_handle_id("mcp-client");
         bi.mcp_client_registry().insert(
             handle_id.clone(),
-            McpClientEntry::new(client, Some(Arc::clone(&server))),
+            McpClientEntry::new(client, McpClientStop::StdioServer(Arc::clone(&server))),
         );
         crate::increment_handle_count();
         let handle = NapiMcpClientHandle {
@@ -1683,7 +1690,7 @@ mod tests {
         let handle_id = mcp_handle_id("mcp-client");
         bi.mcp_client_registry().insert(
             handle_id.clone(),
-            McpClientEntry::new(client, Some(Arc::clone(&server))),
+            McpClientEntry::new(client, McpClientStop::StdioServer(Arc::clone(&server))),
         );
         crate::increment_handle_count();
         let handle = NapiMcpClientHandle {
@@ -1747,11 +1754,11 @@ mod tests {
     }
 
     /// A call queued behind an in-flight one sends nothing once the handle is
-    /// disconnected, though the transport is still open. The entry carries no
-    /// server process, as an SSE client's does not, so the disconnect leaves
-    /// the stub server answering: the in-flight `tools/list` gets its answer,
-    /// and the stub would answer the queued one too had the queued call sent
-    /// it.
+    /// disconnected, though the transport is still open, and fails under the
+    /// "was disconnected" code of its operation, not the "not found" code.
+    /// The entry's stop slot is empty, so the disconnect leaves the stub
+    /// server answering: the in-flight `tools/list` gets its answer, and the
+    /// stub would answer a queued call too had that call sent its request.
     #[test]
     fn a_call_queued_at_disconnect_sends_no_request_napi() {
         let bi = NapiBridgeInstance::new_napi();
@@ -1764,7 +1771,9 @@ mod tests {
             read l; read l; sleep 1; \
             echo '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}'; \
             read l; \
-            echo '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[]}}'; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}'; \
+            read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"tools\":[]}}'; \
             sleep 30 & wait";
         let transport = StdioMcpTransport::spawn(
             &allowlist,
@@ -1775,8 +1784,13 @@ mod tests {
         let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
         client.initialize().expect("initialize the stub server");
         let handle_id = mcp_handle_id("mcp-client");
-        bi.mcp_client_registry()
-            .insert(handle_id.clone(), McpClientEntry::new(client, None));
+        bi.mcp_client_registry().insert(
+            handle_id.clone(),
+            McpClientEntry::new(
+                client,
+                McpClientStop::StdioServer(Arc::new(Mutex::new(None))),
+            ),
+        );
         crate::increment_handle_count();
         let handle = NapiMcpClientHandle {
             handle_id,
@@ -1798,6 +1812,18 @@ mod tests {
                         mcp_client_list_tools_on(&bi, &handle).await
                     },
                     async {
+                        tokio::time::sleep(short).await;
+                        mcp_client_invoke_on(
+                            &bi,
+                            &handle,
+                            "echo".to_owned(),
+                            "{}".to_owned(),
+                            "ctx-1".to_owned(),
+                            "invoker-1".to_owned(),
+                        )
+                        .await
+                    },
+                    async {
                         tokio::time::sleep(short * 2).await;
                         mcp_client_disconnect_on(&bi, &handle)
                             .await
@@ -1811,21 +1837,188 @@ mod tests {
         if joined.is_err() {
             runtime.shutdown_background();
         }
-        let (first, second, ()) = joined.expect("both calls must end");
+        let (first, queued_list, queued_invoke, ()) = joined.expect("every call must end");
         if let Err(e) = &first {
             panic!(
                 "the in-flight call must get the open transport's answer: {}",
                 e.reason
             );
         }
-        let Err(err) = second else {
-            panic!("the queued call sent tools/list after the disconnect");
+        let Err(list_err) = queued_list else {
+            panic!("the queued tools/list was sent after the disconnect");
+        };
+        let Err(invoke_err) = queued_invoke else {
+            panic!("the queued tools/call was sent after the disconnect");
+        };
+        for (err, code) in [
+            (&list_err, codes::TRANS_5021),
+            (&invoke_err, codes::TRANS_5024),
+        ] {
+            assert!(
+                err.reason.contains("was disconnected") && err.reason.contains(code),
+                "a queued call must fail as disconnected under {code}, got: {}",
+                err.reason
+            );
+        }
+    }
+
+    /// A disconnect ends an SSE call in flight against a server that
+    /// accepted its POST and never answers, and the handle then fails as
+    /// not found. The client is connected through `mcp_client_connect_sse_on`,
+    /// so the test fails unless the connect hands the transport's closer to
+    /// the entry. The fake server holds every connection open until the test
+    /// ends, so only the disconnect can end the call.
+    #[test]
+    fn a_disconnect_ends_an_sse_call_in_flight_napi() {
+        use std::io::Write;
+        let bi = NapiBridgeInstance::new_napi();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut sse = accept_within(&listener)?;
+            read_http_request(&sse);
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                  event: endpoint\r\ndata: /message?sessionId=s1\r\n\r\n",
+            )
+            .ok()?;
+            let mut init = accept_within(&listener)?;
+            read_http_request(&init);
+            init.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .ok()?;
+            sse.write_all(
+                b"event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\
+                  {\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\
+                  \"serverInfo\":{\"name\":\"stub\"}}}\r\n\r\n",
+            )
+            .ok()?;
+            let mut initialized = accept_within(&listener)?;
+            read_http_request(&initialized);
+            initialized
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .ok()?;
+            let silent = accept_within(&listener)?;
+            read_http_request(&silent);
+            let _ = accepted_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            Some((sse, silent))
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let connected = runtime.block_on(mcp_client_connect_sse_on(
+            &bi,
+            format!("http://127.0.0.1:{port}/sse"),
+            None,
+        ));
+        let handle = match connected {
+            Ok(handle) => handle,
+            Err(e) => {
+                drop(release_tx);
+                panic!("connect to the fake SSE server: {}", e.reason);
+            }
+        };
+        let joined = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(mcp_client_list_tools_on(&bi, &handle), async {
+                    let accepted = tokio::task::spawn_blocking(move || {
+                        accepted_rx.recv_timeout(std::time::Duration::from_secs(5))
+                    })
+                    .await
+                    .expect("wait task");
+                    let disconnected_at = std::time::Instant::now();
+                    mcp_client_disconnect_on(&bi, &handle)
+                        .await
+                        .expect("disconnect a known handle");
+                    (accepted, disconnected_at)
+                })
+            })
+            .await
+        });
+        let ended_at = std::time::Instant::now();
+        drop(release_tx);
+        let Ok((call, (accepted, disconnected_at))) = joined else {
+            runtime.shutdown_background();
+            panic!("the disconnect must end the SSE call in flight");
+        };
+        accepted.expect("the tools/list POST must reach the server");
+        let Err(err) = call else {
+            panic!("the silent server sent no tools/list response");
         };
         assert!(
-            err.reason.contains("was disconnected"),
-            "the queued call must fail as disconnected, got: {}",
+            err.reason.contains(codes::TRANS_5022),
+            "the call in flight must fail on its transport, got: {}",
             err.reason
         );
+        assert!(
+            ended_at.duration_since(disconnected_at) < std::time::Duration::from_secs(2),
+            "the disconnect must end the call at once"
+        );
+        let Err(after) = runtime.block_on(mcp_client_list_tools_on(&bi, &handle)) else {
+            panic!("a disconnected handle must refuse a call");
+        };
+        assert!(
+            after.reason.contains(codes::TRANS_5020),
+            "got: {}",
+            after.reason
+        );
+        assert!(
+            server.join().expect("server thread").is_some(),
+            "the fake server saw every request"
+        );
+    }
+
+    /// Accepts one connection on `listener`, or `None` once five seconds pass
+    /// with none, so a test whose client never connects fails on its own
+    /// assertion instead of hanging in `accept`.
+    fn accept_within(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    conn.set_nonblocking(false).expect("blocking stream");
+                    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .expect("read timeout");
+                    return Some(conn);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Reads one HTTP request's head and body, returning the head.
+    fn read_http_request(stream: &std::net::TcpStream) -> String {
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(stream);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).unwrap_or(0);
+            if n == 0 || line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+        let length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .map_or(0, |v| v.trim().parse::<usize>().unwrap_or(0));
+        let mut body = vec![0_u8; length];
+        let _ = reader.read_exact(&mut body);
+        head
     }
 
     /// `stop_stdio_server` reaps the server and empties its slot, so the
