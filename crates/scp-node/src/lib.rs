@@ -4068,8 +4068,9 @@ mod tests {
     /// Builds a domain-mode `NodeConfig` for `test.example.com` with a
     /// succeeding self-signed TLS provider and a fresh generated identity.
     /// The config opts into `DhtMode::Production` (M2 accepts `Disabled` for
-    /// every `Reach`, `Reach::Domain` included); the in-memory `TestDidDht`
-    /// publishes nothing offline.
+    /// every `Reach`, `Reach::Domain` included), so `Node::start` publishes the
+    /// identity document to the in-memory `TestDidDht`, which receives it in
+    /// process and never reaches live Mainline.
     fn domain_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
