@@ -164,7 +164,7 @@ impl<S: Storage> ProtocolRepository<S> {
         key_data: &[u8],
     ) -> Result<(), StoreError> {
         let key = active_signing_key_key(did)?;
-        self.store_value_zeroize(&key, &key_data.to_vec()).await
+        self.store_value_zeroize(&key, key_data).await
     }
 
     /// Loads the active signing key handle for an identity.
@@ -195,7 +195,7 @@ impl<S: Storage> ProtocolRepository<S> {
         state: &[u8],
     ) -> Result<(), StoreError> {
         let key = identity_private_state_key(did, seq)?;
-        self.store_value_zeroize(&key, &state.to_vec()).await
+        self.store_value_zeroize(&key, state).await
     }
 
     /// Loads identity private state at a given sequence number.

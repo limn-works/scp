@@ -54,7 +54,7 @@ rmp-serde = { workspace = true }
 # (keypackage_attestation.rs). Workspace-pinned 0.10, wasm32-safe (the same dep
 # scp-protocol uses on the wasm path).
 sha2 = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

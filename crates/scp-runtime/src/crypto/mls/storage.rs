@@ -57,6 +57,7 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider, traits};
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use scp_platform::traits::Storage;
 
@@ -180,8 +181,34 @@ impl<S: Storage> MlsStorageBridge<S> {
     }
 
     /// Serializes an `OpenMLS` entity value to `MessagePack` bytes for storage.
-    fn serialize_value<V: Serialize>(value: &V) -> Result<Vec<u8>, MlsStorageBridgeError> {
-        rmp_serde::to_vec(value).map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))
+    ///
+    /// Entity values include HPKE private keys and epoch secrets, so the
+    /// encoding lands in one exactly-sized buffer that is wiped
+    /// on drop; `rmp_serde::to_vec_named` would free the unwiped buffers it outgrows
+    /// (security model spec §9.15 step 2). The bytes equal
+    /// `rmp_serde::to_vec_named`'s.
+    fn serialize_value<V: Serialize + ?Sized>(
+        value: &V,
+    ) -> Result<Zeroizing<Vec<u8>>, MlsStorageBridgeError> {
+        scp_mls::secret_msgpack::encode_named(value)
+            .map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))
+    }
+
+    /// Reads the `MessagePack` list of serialized entity values stored under
+    /// `key`, or an empty list when none is stored.
+    fn retrieve_list(&self, key: &str) -> Result<Vec<Vec<u8>>, MlsStorageBridgeError> {
+        let Some(bytes) = self.sync_retrieve(key)? else {
+            return Ok(Vec::new());
+        };
+        rmp_serde::from_slice(&bytes)
+            .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))
+    }
+
+    /// Stores a list of serialized entity values under `key` from the one
+    /// buffer [`Self::serialize_value`] fills.
+    fn store_list(&self, key: &str, list: &[Vec<u8>]) -> Result<(), MlsStorageBridgeError> {
+        let list_bytes = Self::serialize_value(list)?;
+        self.sync_store(key, &list_bytes)
     }
 
     /// Deserializes an `OpenMLS` entity value from stored `MessagePack` bytes.
@@ -276,18 +303,13 @@ impl<S: Storage> MlsStorageBridge<S> {
     ) -> Result<(), MlsStorageBridgeError> {
         let gid_bytes = Self::serialize_key(group_id)?;
         let key = self.build_key(label, &gid_bytes);
-        let val_bytes = Self::serialize_value(value)?;
+        let mut val_bytes = Self::serialize_value(value)?;
 
-        let mut list: Vec<Vec<u8>> = match self.sync_retrieve(&key)? {
-            Some(bytes) => rmp_serde::from_slice(&bytes)
-                .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))?,
-            None => Vec::new(),
-        };
-        list.push(val_bytes);
-
-        let list_bytes = rmp_serde::to_vec(&list)
-            .map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))?;
-        self.sync_store(&key, &list_bytes)
+        let mut list = self.retrieve_list(&key)?;
+        // Lists carry only public values (`LeafNode`, `ProposalRef`), so these
+        // bytes may leave the wiping buffer.
+        list.push(std::mem::take(&mut *val_bytes));
+        self.store_list(&key, &list)
     }
 
     /// Reads a `MessagePack`-encoded list stored under a single key.
@@ -298,17 +320,10 @@ impl<S: Storage> MlsStorageBridge<S> {
     ) -> Result<Vec<V>, MlsStorageBridgeError> {
         let gid_bytes = Self::serialize_key(group_id)?;
         let key = self.build_key(label, &gid_bytes);
-        match self.sync_retrieve(&key)? {
-            Some(bytes) => {
-                let items: Vec<Vec<u8>> = rmp_serde::from_slice(&bytes)
-                    .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))?;
-                items
-                    .iter()
-                    .map(|item_bytes| Self::deserialize_value(item_bytes))
-                    .collect()
-            }
-            None => Ok(Vec::new()),
-        }
+        self.retrieve_list(&key)?
+            .iter()
+            .map(|item_bytes| Self::deserialize_value(item_bytes))
+            .collect()
     }
 
     /// Removes a specific value from a `MessagePack`-encoded list stored under a single key.
@@ -322,19 +337,11 @@ impl<S: Storage> MlsStorageBridge<S> {
         let key = self.build_key(label, &gid_bytes);
         let val_bytes = Self::serialize_value(value)?;
 
-        let mut list: Vec<Vec<u8>> = match self.sync_retrieve(&key)? {
-            Some(bytes) => rmp_serde::from_slice(&bytes)
-                .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))?,
-            None => Vec::new(),
-        };
-
-        if let Some(pos) = list.iter().position(|stored| stored == &val_bytes) {
+        let mut list = self.retrieve_list(&key)?;
+        if let Some(pos) = list.iter().position(|stored| *stored == *val_bytes) {
             list.remove(pos);
         }
-
-        let list_bytes = rmp_serde::to_vec(&list)
-            .map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))?;
-        self.sync_store(&key, &list_bytes)
+        self.store_list(&key, &list)
     }
 }
 
@@ -1397,6 +1404,117 @@ mod tests {
             to_json_bytes(&loaded.unwrap()),
             to_json_bytes(&MlsGroupState::Operational)
         );
+    }
+
+    /// Creates a one-member group over `provider`, which writes every entity
+    /// openmls stores for a new group through the bridge.
+    fn create_group(
+        provider: &ScpMlsProvider<scp_platform::in_memory::InMemoryStorage>,
+    ) -> (
+        openmls::group::MlsGroup,
+        openmls_basic_credential::SignatureKeyPair,
+    ) {
+        use openmls::prelude::{BasicCredential, CredentialWithKey, MlsGroupCreateConfig};
+        let signer = openmls_basic_credential::SignatureKeyPair::new(
+            scp_mls::group::SCP_CIPHERSUITE.signature_algorithm(),
+        )
+        .unwrap();
+        let credential_with_key = CredentialWithKey {
+            credential: BasicCredential::new(b"alice".to_vec()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(scp_mls::group::SCP_CIPHERSUITE)
+            .build();
+        let group =
+            openmls::group::MlsGroup::new(provider, &signer, &config, credential_with_key).unwrap();
+        (group, signer)
+    }
+
+    /// The named fields of openmls's crate-private `EncryptionKeyPair`, the
+    /// HPKE key pair it stores per leaf encryption key.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct KeyPairFields {
+        public_key: serde_json::Value,
+        private_key: serde_json::Value,
+    }
+
+    impl openmls_traits::storage::traits::HpkeKeyPair<{ openmls_traits::storage::CURRENT_VERSION }>
+        for KeyPairFields
+    {
+    }
+    impl openmls_traits::storage::Entity<{ openmls_traits::storage::CURRENT_VERSION }>
+        for KeyPairFields
+    {
+    }
+
+    /// A group that commits a self-update over the bridge loads from the same
+    /// store through a fresh provider at the next epoch, and the new epoch's
+    /// HPKE key pair for the member's leaf reads back through that provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_loads_through_a_fresh_provider_after_a_commit() {
+        let store = test_store();
+        let provider = ScpMlsProvider::new(Arc::clone(&store), "ctx-group-rt".to_owned()).unwrap();
+        let (mut group, signer) = create_group(&provider);
+        let epoch = group.epoch().as_u64();
+        group
+            .self_update(
+                &provider,
+                &signer,
+                openmls::prelude::LeafNodeParameters::default(),
+            )
+            .unwrap();
+        group.merge_pending_commit(&provider).unwrap();
+        let group_id = group.group_id().clone();
+        drop(group);
+
+        let fresh = ScpMlsProvider::new(store, "ctx-group-rt".to_owned()).unwrap();
+        let loaded = openmls::group::MlsGroup::load(fresh.storage(), &group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.epoch().as_u64(), epoch + 1);
+        // After the merge openmls holds the leaf's new HPKE key pair in the
+        // epoch key pairs, not under its encryption key.
+        let epoch_pairs: Vec<KeyPairFields> = StorageProvider::encryption_epoch_key_pairs(
+            fresh.storage(),
+            &group_id,
+            &loaded.epoch(),
+            loaded.own_leaf_index().u32(),
+        )
+        .unwrap();
+        assert_eq!(epoch_pairs.len(), 1);
+        assert_eq!(
+            epoch_pairs[0].public_key,
+            serde_json::to_value(loaded.own_leaf().unwrap().encryption_key()).unwrap()
+        );
+        assert!(!epoch_pairs[0].private_key.is_null());
+    }
+
+    /// The bridge reads an entity stored in `rmp_serde`'s positional layout,
+    /// as main's bridge wrote it, as well as the named layout it now writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn positional_entity_reads_back_through_the_bridge() {
+        type Bridge = MlsStorageBridge<scp_platform::in_memory::InMemoryStorage>;
+        let provider = ScpMlsProvider::new(test_store(), "ctx-positional".to_owned()).unwrap();
+        let (group, _signer) = create_group(&provider);
+        let bridge = provider.mls_storage();
+        let named: openmls::group::MlsGroupJoinConfig =
+            StorageProvider::mls_group_join_config(bridge, group.group_id())
+                .unwrap()
+                .unwrap();
+        let positional = rmp_serde::to_vec(&named).unwrap();
+        assert_ne!(positional, *Bridge::serialize_value(&named).unwrap());
+
+        let key = bridge.build_key(
+            JOIN_CONFIG_LABEL,
+            &Bridge::serialize_key(group.group_id()).unwrap(),
+        );
+        bridge.sync_store(&key, &positional).unwrap();
+        let read: openmls::group::MlsGroupJoinConfig =
+            StorageProvider::mls_group_join_config(bridge, group.group_id())
+                .unwrap()
+                .unwrap();
+        assert_eq!(to_json_bytes(&read), to_json_bytes(&named));
     }
 
     // -- Legacy in-memory provider backward compatibility --

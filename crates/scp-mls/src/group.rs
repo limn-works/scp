@@ -60,10 +60,12 @@ pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 /// (A dedicated `scp-mls` unit test cross-checks this against the `test-utils`
 /// `private()` accessor, so a future upstream serde-shape change fails loudly.)
 ///
-/// The intermediate serialized bytes and the extracted seed `Vec` are zeroized;
-/// the returned seed rides home in [`Zeroizing`](zeroize::Zeroizing). Fails
-/// closed if the seed is not exactly 32 bytes, so a non-Ed25519 or malformed
-/// signer can never be silently truncated into a derivation.
+/// The signer is serialized by [`crate::secret_msgpack::encode_named`] into one
+/// buffer sized to the encoding, so no reallocation frees a partial copy; that buffer and
+/// the extracted seed `Vec` are zeroized, and the returned seed rides home in
+/// [`Zeroizing`](zeroize::Zeroizing). Fails closed if the seed is not exactly
+/// 32 bytes, so a non-Ed25519 or malformed signer can never be silently
+/// truncated into a derivation.
 fn extract_ed25519_seed(
     signer: &SignatureKeyPair,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>, MlsError> {
@@ -95,10 +97,10 @@ fn extract_ed25519_seed(
         )));
     }
 
-    let mut serialized = rmp_serde::to_vec_named(signer)
+    let serialized = crate::secret_msgpack::encode_named(signer)
         .map_err(|e| MlsError::PseudonymDerivationFailed(format!("serializing MLS signer: {e}")))?;
     let extract: Result<Ed25519SeedExtract, _> = rmp_serde::from_slice(&serialized);
-    serialized.zeroize();
+    drop(serialized);
     let mut extract = extract.map_err(|e| {
         MlsError::PseudonymDerivationFailed(format!("recovering MLS signer private seed: {e}"))
     })?;

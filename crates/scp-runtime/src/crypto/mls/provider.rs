@@ -42,7 +42,7 @@ use scp_clock::Clock;
 use scp_did::SigningKeyId;
 use serde::{Deserialize, Serialize};
 use tls_codec::Deserialize as TlsDeserializeTrait;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::backend::MlsBackend;
 use super::production_backend::ProductionMlsBackend;
@@ -98,10 +98,13 @@ use scp_protocol::crypto::sender_keys::{
 /// satisfy this. In-memory storage used in tests is acceptable because no
 /// persistence occurs.
 ///
-/// **Defense in depth:** `export_crypto_state` and `restore_crypto_state`
-/// zeroize the intermediate `MlsCryptoSnapshot` struct after
-/// serialization/extraction to minimize the window where private keys
-/// exist as a structured, easily-extractable object in memory.
+/// **Defense in depth:** every field that holds private key material has a
+/// type that wipes on drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so
+/// the intermediate `MlsCryptoSnapshot` wipes those fields when it drops on an
+/// export or restore path, early returns included. Buffers that serde
+/// allocates and frees while decoding the blob are not wiped. `Zeroizing`'s
+/// serde impls delegate to the inner value, so the encoding is that of the
+/// plain fields.
 // ADR-049 PR-7 (crypto-state move, prep A): visibility elevated from private to
 // `pub(crate)` (fields included) so the additive
 // [`crate::context::actor::PerContextState::export_crypto_state`] inherent method
@@ -115,11 +118,13 @@ use scp_protocol::crypto::sender_keys::{
 pub(crate) struct MlsCryptoSnapshot {
     /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
     /// Each pair is `(key_bytes, value_bytes)`.
-    pub(crate) mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) mls_storage_entries: scp_mls::snapshot::ProviderStorageEntries,
     /// The local member's AES-256 sender key (32 bytes).
     pub(crate) local_sender_key: SenderKey,
-    /// All sender keys for this context: `(sender_did, key)` pairs.
-    pub(crate) sender_key_entries: Vec<(String, SenderKey)>,
+    /// All sender keys for this context: `(sender_did, key)` pairs. The
+    /// `Zeroizing` vector wipes its whole buffer on drop, including the slots
+    /// restore drains keys out of.
+    pub(crate) sender_key_entries: Zeroizing<Vec<(String, SenderKey)>>,
     /// Per-sender epoch high-water marks for this context:
     /// `(sender_did, epoch)` pairs.
     ///
@@ -157,7 +162,7 @@ pub(crate) struct MlsCryptoSnapshot {
     /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
     /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
     /// feature, so we serialize it separately and store the blob here.
-    pub(crate) signer_bytes: Vec<u8>,
+    pub(crate) signer_bytes: Zeroizing<Vec<u8>>,
     /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
     pub(crate) group_id: Vec<u8>,
     /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
@@ -175,11 +180,25 @@ pub(crate) struct MlsCryptoSnapshot {
     #[serde(default)]
     pub(crate) wrapping_public_key: [u8; 32],
     /// The provider-level X25519 wrapping secret key (§9.16.1).
-    /// Wrapped in a `Vec<u8>` for serde compatibility; the 32-byte key
-    /// is re-wrapped in [`Zeroizing`] on restore.
+    /// A byte vector for serde compatibility; the 32-byte key is re-wrapped
+    /// in a `Zeroizing<[u8; 32]>` on restore.
     #[serde(default)]
-    pub(crate) wrapping_secret_key: Vec<u8>,
+    pub(crate) wrapping_secret_key: Zeroizing<Vec<u8>>,
 }
+
+impl Drop for MlsCryptoSnapshot {
+    fn drop(&mut self) {
+        // Exists only as a move guard: `local_sender_key` is inline, so restore must
+        // `mem::replace` it, which zeroes its slot, and a partial move out is a
+        // compile error (E0509). Every field wipes itself through its type.
+    }
+}
+
+#[expect(drop_bounds, reason = "asserts the E0509 move guard")]
+const _: fn() = || {
+    const fn guard<T: Drop>() {}
+    guard::<MlsCryptoSnapshot>();
+};
 
 // SECURITY: Manual Debug impl redacts all sensitive key material.
 // Clone is intentionally NOT derived — snapshots contain raw private keys
@@ -217,48 +236,6 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
             .field("wrapping_public_key", &"[REDACTED]")
             .field("wrapping_secret_key", &"[REDACTED]")
             .finish()
-    }
-}
-
-impl MlsCryptoSnapshot {
-    /// Zeroizes every field that holds private key material.
-    ///
-    /// [`export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state) calls this once at its
-    /// end (belt-and-suspenders) after serializing the snapshot.
-    /// [`build_restored_owned`](crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned) does NOT call it:
-    /// restore consumes each secret field incrementally as it moves the material
-    /// into the live crypto state (`drain`/`mem::replace`/per-field `zeroize` at
-    /// the point of use), so there is no single end-of-function sweep to make. On
-    /// both paths the [`Drop`] impl below is the backstop that also fires on an
-    /// early `?` return, so raw signer / sender-key / wrapping-secret / MLS-secret
-    /// bytes never linger un-zeroized in freed memory on ANY path (matches the
-    /// parity guarantee the `scp-mls` and `scp-client` snapshots make via their
-    /// own `Drop`s).
-    ///
-    /// ADR-049 PR-7 (prep A): `pub(crate)` so the additive
-    /// [`crate::context::actor::PerContextState::export_crypto_state`] verbatim
-    /// move can perform the identical end-of-function secret sweep.
-    pub(crate) fn zeroize_secrets(&mut self) {
-        self.signer_bytes.zeroize();
-        self.local_sender_key.zeroize();
-        self.wrapping_secret_key.zeroize();
-        for (_, value) in &mut self.mls_storage_entries {
-            value.zeroize();
-        }
-        for (_, key) in &mut self.sender_key_entries {
-            key.zeroize();
-        }
-    }
-}
-
-// SECURITY: zeroize key material on every drop path — including an early `?`
-// return between deserialization and the explicit trailing `zeroize` calls — so
-// private material never lingers in freed memory. No field is ever moved out of a
-// `MlsCryptoSnapshot` (the export/restore paths drain/replace/borrow in place), so
-// this `Drop` does not conflict with a partial move.
-impl Drop for MlsCryptoSnapshot {
-    fn drop(&mut self) {
-        self.zeroize_secrets();
     }
 }
 
@@ -1045,20 +1022,17 @@ impl NodeMlsFactory {
                     ContextError::CryptoFailed(format!("storage lock poisoned: {e}"))
                 })?;
             // Drain entries so the snapshot no longer holds MLS storage data
-            // (which contains epoch secrets and HPKE private keys).
+            // (which contains epoch secrets and HPKE private keys); the
+            // drained `Zeroizing` vector wipes its buffer when it drops.
             for (k, v) in snapshot.mls_storage_entries.drain(..) {
                 values.insert(k, v);
             }
         }
 
-        // Deserialize the signer from the snapshot's raw bytes.
+        // Deserialize the signer from the snapshot's raw bytes, which their
+        // `Zeroizing` type wipes when the snapshot drops.
         let signer: SignatureKeyPair = rmp_serde::from_slice(&snapshot.signer_bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("signer deserialization: {e}")))?;
-
-        // SECURITY: Zeroize the raw signer bytes now that they've been
-        // deserialized — the Ed25519 private key should not linger in this
-        // intermediate buffer.
-        snapshot.signer_bytes.zeroize();
 
         // Reconstruct the MLS group from persisted storage via MlsGroup::load.
         let group_id = GroupId::from_slice(&snapshot.group_id);
@@ -1146,7 +1120,8 @@ impl NodeMlsFactory {
 
         // Take the local_sender_key and leave a zeroed placeholder. SenderKey
         // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot
-        // drops, and the original is moved into crypto_state.
+        // drops, and the original is moved into crypto_state. Stack copies the
+        // move makes are not wiped.
         let local_sender_key = std::mem::replace(
             &mut snapshot.local_sender_key,
             SenderKey::from_bytes([0u8; 32]),
@@ -1201,12 +1176,6 @@ impl NodeMlsFactory {
                 secret: Zeroizing::new(*secret),
             }));
         }
-
-        // SECURITY: Zeroize the wrapping secret key bytes remaining in the
-        // snapshot. The key has been copied into the Zeroizing<[u8; 32]> guard
-        // above (or skipped for legacy snapshots), so this intermediate Vec
-        // should not retain raw X25519 secret key material.
-        snapshot.wrapping_secret_key.zeroize();
 
         // #2148 (ADR-049 birth-into-actor): this method hands the per-context
         // crypto material OUT to seed an actor's `PerContextState` (welcome /
@@ -1334,7 +1303,7 @@ mod tests {
         ctx: &[u8; 32],
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
-    ) -> Result<Vec<u8>, ContextError> {
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ContextError> {
         let (wpub, wsec) = provider.wrapping_keypair();
         let state = take_into_actor(provider, ctx);
         state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
@@ -1352,7 +1321,7 @@ mod tests {
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
         mutate: impl FnOnce(&mut crate::context::actor::ContextCryptoState),
-    ) -> Vec<u8> {
+    ) -> zeroize::Zeroizing<Vec<u8>> {
         let (wpub, wsec) = provider.wrapping_keypair();
         let mut state = take_into_actor(provider, ctx);
         mutate(actor_crypto_mut(&mut state));

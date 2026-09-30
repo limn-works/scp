@@ -97,7 +97,7 @@ struct FuzzState {
     /// Serialized pristine generation-0 state of Bob's group. Restored into a
     /// FRESH receiver before every decrypt call (openmls advances the receive
     /// ratchet before content-AEAD and does not roll back — see module docs).
-    receiver_snapshot: Vec<u8>,
+    receiver_snapshot: zeroize::Zeroizing<Vec<u8>>,
     /// A genuinely valid application ciphertext from Alice, decryptable by a fresh
     /// gen-0 receiver (the base for the guaranteed-tamper Path-2 mutation).
     valid_ciphertext: Vec<u8>,

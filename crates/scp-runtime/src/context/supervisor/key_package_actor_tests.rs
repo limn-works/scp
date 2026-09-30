@@ -2365,11 +2365,10 @@ async fn reserved_kp_with_lost_index_entry_restored_as_reserved_on_respawn() {
     let public_bytes = {
         let key = format!("scp-kp/{}/{kp_ref}", alice().0);
         let record = storage.retrieve(&key).await.unwrap().unwrap();
-        // The restored reserved KP record still holds the public bytes; clone
-        // them by reference (`PersistedKeyPackage` has a zeroizing `Drop`, so its
-        // fields cannot be moved out by value).
-        let parsed = rmp_serde::from_slice::<super::PersistedKeyPackage>(&record).unwrap();
-        parsed.public_bytes.clone()
+        // The restored reserved KP record still holds the public bytes.
+        rmp_serde::from_slice::<super::PersistedKeyPackage>(&record)
+            .unwrap()
+            .public_bytes
     };
     let welcome = real_welcome_for(&mls2, &public_bytes).await;
     handle2
@@ -3700,5 +3699,28 @@ async fn send_reply_await_is_bounded_when_actor_never_replies() {
         elapsed >= KP_REPLY_TIMEOUT,
         "reply-await must span the full KP_REPLY_TIMEOUT budget before failing \
          closed (elapsed {elapsed:?} < {KP_REPLY_TIMEOUT:?})"
+    );
+}
+
+/// A KeyPackage record's `Zeroizing` signer-state encodes as the plain
+/// `Vec<u8>` field it replaced, so stored records still decode.
+#[test]
+fn kp_record_encodes_like_plain_fields() {
+    #[derive(serde::Serialize)]
+    struct Plain {
+        public_bytes: Vec<u8>,
+        signer_state: Vec<u8>,
+    }
+    let record = super::PersistedKeyPackage {
+        public_bytes: vec![0x11; 200],
+        signer_state: zeroize::Zeroizing::new(vec![0x5A; 300]),
+    };
+    let plain = Plain {
+        public_bytes: vec![0x11; 200],
+        signer_state: vec![0x5A; 300],
+    };
+    assert_eq!(
+        *scp_mls::secret_msgpack::encode_named(&record).unwrap(),
+        rmp_serde::to_vec_named(&plain).unwrap()
     );
 }
