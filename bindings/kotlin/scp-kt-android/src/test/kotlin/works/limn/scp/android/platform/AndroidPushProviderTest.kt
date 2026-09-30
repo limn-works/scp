@@ -2,9 +2,14 @@
  * Unit tests for [AndroidPushProvider].
  *
  * Tests cover the [AndroidPushProvider.handleNotification] logic — payload
- * validation, wake signal generation, and error code correctness. The
- * [AndroidPushProvider.register] method requires a live Firebase instance,
- * and the module has no instrumented tests, so no test covers it.
+ * validation, wake signal generation, and error code correctness. No test
+ * covers [AndroidPushProvider.register]: the method calls
+ * `FirebaseMessaging.getInstance()` itself, and the class takes no
+ * `FirebaseMessaging` to inject. ADR-027 criterion 13 requires FCM tests on
+ * Firebase Test Lab or against a mock `FirebaseMessaging` injected through
+ * dependency injection, and the module has neither. Story SCP-112 stays in
+ * progress while its criteria "FCM token registration and refresh handled"
+ * and "Integration tests verify push delivery flow" are unmet.
  *
  * See ADR-027 (Android Platform Adapter) and §10.7 (push payload opacity).
  */
@@ -164,7 +169,7 @@ class AndroidPushProviderTest {
     }
 
     // -----------------------------------------------------------------------
-    // Payload with extra fields — the current accept path
+    // Payload with extra fields — the accept path §16.12.5 permits
     // -----------------------------------------------------------------------
 
     @Test
@@ -175,7 +180,7 @@ class AndroidPushProviderTest {
         // (the relay sends exactly { "scp": 1 }), and FCM has carried every
         // field before the handler sees it. §16.12.5 push_conformance lets an
         // adapter accept such a payload with a byte-identical WakeSignal or
-        // reject it. This test pins the current accept path.
+        // reject it. This test pins the accept path this adapter takes.
         val payload = mapOf("scp" to "1", "extra" to "ignored")
         val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)

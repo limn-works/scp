@@ -26,7 +26,9 @@
  * Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send exactly
  * `{ "scp": 1 }`. FCM has already carried every field of a payload before
  * [handleNotification] sees it, so no check in this class can keep a field from FCM. No
- * code in this repository sends a push, so no code meets the sender obligation.
+ * code in this repository sends a push, so no code meets the sender obligation. SCP-112's
+ * criterion "FCM payload format is opaque" is unmet because no sender exists; rejecting
+ * extra fields in [handleNotification] would not meet it.
  *
  * ## Token Registration Lifecycle
  *

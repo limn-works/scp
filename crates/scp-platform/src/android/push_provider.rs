@@ -26,7 +26,9 @@
 //! Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send
 //! exactly `{ "scp": 1 }`. FCM has carried every field of a payload before
 //! the Kotlin adapter sees it, so no receive-side check can keep a field from
-//! FCM, and no code in this repository sends a push.
+//! FCM, and no code in this repository sends a push. SCP-112's criterion "FCM
+//! payload format is opaque" is unmet because no sender exists; rejecting
+//! extra fields on receipt would not meet it.
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 
