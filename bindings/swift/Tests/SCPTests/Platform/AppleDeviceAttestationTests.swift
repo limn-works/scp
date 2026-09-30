@@ -42,9 +42,11 @@
 //    runs while Apple may still hold the abandoned call; Apple's later
 //    answer stores no key ID and reaches no caller. A caller cancelled while
 //    queued never reaches Apple, and one cancelled while Apple holds its
-//    call frees the queue. `AppAttestCallOrderingTests`
-//    pins each case, with a time limit of a fraction of a second in place of
-//    the adapter's 25 seconds.
+//    call frees the queue. `AppAttestCallOrderingTests` pins each case: the
+//    time-out case injects a limit of one second and the late-answer case
+//    one of 300 milliseconds in place of the adapter's 25 seconds, the
+//    cancellation cases keep the 25-second default and cancel well before it
+//    expires, and one case asserts the default is 25 seconds.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and the
 // UniFFI `DeviceAttestationProvider` callback interface in
@@ -1067,6 +1069,26 @@
                 )
                 #expect(defaults.string(forKey: keyIdDefaultsKey) == CountingAppAttestService.keyId)
             }
+        }
+
+        @Test("the production time limit on one App Attest call is 25 seconds, and an injected limit replaces it")
+        func productionCallTimeLimitIsTwentyFiveSeconds() {
+            // Alec's ruling of 2026-09-29 sets the bound at 25 seconds, below
+            // the runtime's 30-second actor HANDLER_TIMEOUT. Any other value
+            // turns this case red.
+            #expect(AppleDeviceAttestation.appAttestCallTimeLimit == .seconds(25))
+            #expect(AppleDeviceAttestation().callTimeLimit == .seconds(25))
+            let service = RecordingAppAttestService()
+            #expect(AppleDeviceAttestation(service: service, defaults: InMemoryUserDefaults()).callTimeLimit == .seconds(25))
+            // An injected limit is the one the adapter holds, so the cases
+            // below that inject a shorter limit run under it.
+            let injected = AppleDeviceAttestation(
+                service: service,
+                defaults: InMemoryUserDefaults(),
+                callTimeLimit: .milliseconds(300)
+            )
+            #expect(injected.callTimeLimit == .milliseconds(300))
+            #expect(injected.callTimeLimit != AppleDeviceAttestation.appAttestCallTimeLimit)
         }
 
         @Test("a call Apple does not answer within the time limit throws SCP-ATTEST-9027, and the next queued call runs")

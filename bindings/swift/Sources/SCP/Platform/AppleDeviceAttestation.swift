@@ -2,6 +2,7 @@
 
     import DeviceCheck
     import Foundation
+    import os
 
     // DeviceAttestationProvider protocol is now defined by UniFFI in ScpBindings.swift.
     // The UniFFI-generated protocol has the same method signatures:
@@ -201,8 +202,9 @@
         private let callSerializer: AppAttestCallSerializer
 
         /// How long one serialized App Attest call may run before its caller
-        /// gets `SCP-ATTEST-9027`.
-        private let callTimeLimit: Duration
+        /// gets `SCP-ATTEST-9027`. Internal, not private, so a test can pin
+        /// the value each initializer installs.
+        let callTimeLimit: Duration
 
         /// The time limit on one serialized App Attest call: 25 seconds,
         /// below the 30-second `HANDLER_TIMEOUT` a runtime actor handler
@@ -669,15 +671,20 @@
     /// to end the call; the first one ends it and resumes its caller, and each
     /// later one does nothing. A completion handler therefore stores a key ID
     /// only through `whileOpen(_:)`, which stores nothing once the call ended.
-    private final class AppAttestCall: @unchecked Sendable {
-        // `@unchecked Sendable`: every mutable property below is read and
-        // written only while `lock` is held.
-        private let lock = NSLock()
-        private var ended = false
-        /// The outcome of a call that ended before `run` installed `waiter`.
-        private var endedEarly: Result<Data, AttestationError>?
-        private var waiter: CheckedContinuation<Result<Data, AttestationError>, Never>?
-        private var timer: Task<Void, Never>?
+    private final class AppAttestCall: Sendable {
+        /// The call's mutable state. `OSAllocatedUnfairLock` guards it, so
+        /// the class conforms to `Sendable` with the compiler checking every
+        /// access.
+        private struct State: Sendable {
+            var ended = false
+            /// The outcome of a call that ended before `run` installed
+            /// `waiter`.
+            var endedEarly: Result<Data, AttestationError>?
+            var waiter: CheckedContinuation<Result<Data, AttestationError>, Never>?
+            var timer: Task<Void, Never>?
+        }
+
+        private let state = OSAllocatedUnfairLock(initialState: State())
 
         /// What a caller cancelled while queued or running receives:
         /// `AttestationError.serviceError`, whose message begins
@@ -696,13 +703,13 @@
         ) async -> Result<Data, AttestationError> {
             await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
-                    let starts: Bool = lock.withLock {
-                        if let endedEarly {
+                    let starts: Bool = state.withLock { state in
+                        if let endedEarly = state.endedEarly {
                             continuation.resume(returning: endedEarly)
                             return false
                         }
-                        waiter = continuation
-                        timer = Task { [self] in
+                        state.waiter = continuation
+                        state.timer = Task { [self] in
                             do {
                                 try await Task.sleep(for: timeLimit)
                             } catch {
@@ -728,17 +735,17 @@
         /// already ended.
         func end(with outcome: Result<Data, AttestationError>) {
             let (waiter, timer): (CheckedContinuation<Result<Data, AttestationError>, Never>?, Task<Void, Never>?) =
-                lock.withLock {
-                    guard !ended else {
+                state.withLock { state in
+                    guard !state.ended else {
                         return (nil, nil)
                     }
-                    ended = true
-                    let taken = (self.waiter, self.timer)
-                    if self.waiter == nil {
-                        endedEarly = outcome
+                    state.ended = true
+                    let taken = (state.waiter, state.timer)
+                    if state.waiter == nil {
+                        state.endedEarly = outcome
                     }
-                    self.waiter = nil
-                    self.timer = nil
+                    state.waiter = nil
+                    state.timer = nil
                     return taken
                 }
             timer?.cancel()
@@ -747,9 +754,9 @@
 
         /// Run `effect` while holding the call open, and report whether the
         /// call was still open. Once the call ended, `effect` does not run.
-        func whileOpen(_ effect: () -> Void) -> Bool {
-            lock.withLock {
-                guard !ended else {
+        func whileOpen(_ effect: @Sendable () -> Void) -> Bool {
+            state.withLock { state in
+                guard !state.ended else {
                     return false
                 }
                 effect()
