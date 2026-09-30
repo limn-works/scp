@@ -21,7 +21,7 @@
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
-use scp_platform::Push;
+use scp_platform::{Push, WakeSignal};
 
 /// The wake payloads the platform artifacts name. Each adapter accepts the one
 /// its platform uses and may reject the others:
@@ -45,11 +45,13 @@ pub const METADATA_PAYLOADS: [&[u8]; 2] = [
     b"new-message-ctx-123",
 ];
 
-/// Asserts that `push` returns one fixed, non-empty wake signal: it accepts at
-/// least one of [`PERMITTED_PAYLOADS`], and every payload it accepts among
-/// [`PERMITTED_PAYLOADS`], each of them with three trailing spaces, and
-/// [`METADATA_PAYLOADS`] yields a signal byte-identical to the signal for the
-/// first permitted payload it accepts.
+/// Asserts that `push` returns one fixed, non-empty wake signal.
+///
+/// `push` must accept at least one of [`PERMITTED_PAYLOADS`]. The signal for
+/// the first permitted payload it accepts is the fixed signal, and every
+/// payload it accepts among [`PERMITTED_PAYLOADS`], each of them with three
+/// trailing spaces, and [`METADATA_PAYLOADS`] must yield a signal
+/// byte-identical to it.
 ///
 /// # Panics
 ///
@@ -59,29 +61,36 @@ pub async fn check_fixed_wake_signal<P: Push>(push: &P) {
     let mut fixed = None;
     for payload in PERMITTED_PAYLOADS {
         if let Ok(signal) = push.handle_notification(payload).await {
-            fixed = Some(signal);
-            break;
+            record_signal(&mut fixed, signal);
         }
     }
-    let Some(fixed) = fixed else {
-        panic!("handle_notification rejected every permitted payload");
-    };
     assert!(
-        !fixed.payload.is_empty(),
-        "wake signal payload should not be empty"
+        fixed.is_some(),
+        "handle_notification rejected every permitted payload"
     );
     let padded = PERMITTED_PAYLOADS.map(|p| [p, b"   ".as_slice()].concat());
-    let others = PERMITTED_PAYLOADS
-        .into_iter()
-        .chain(padded.iter().map(Vec::as_slice))
-        .chain(METADATA_PAYLOADS);
+    let others = padded.iter().map(Vec::as_slice).chain(METADATA_PAYLOADS);
     for payload in others {
         if let Ok(signal) = push.handle_notification(payload).await {
-            assert_eq!(
-                signal, fixed,
-                "wake signal varies with the notification payload"
-            );
+            record_signal(&mut fixed, signal);
         }
+    }
+}
+
+/// Stores `signal` as the fixed signal when none is held yet, asserting that
+/// it is non-empty; otherwise asserts that `signal` equals the held one.
+fn record_signal(fixed: &mut Option<WakeSignal>, signal: WakeSignal) {
+    if let Some(held) = fixed {
+        assert_eq!(
+            signal, *held,
+            "wake signal varies with the notification payload"
+        );
+    } else {
+        assert!(
+            !signal.payload.is_empty(),
+            "wake signal payload should not be empty"
+        );
+        *fixed = Some(signal);
     }
 }
 
@@ -142,9 +151,9 @@ macro_rules! push_conformance {
 mod tests {
     use std::future::Future;
 
+    use scp_platform::PushToken;
     use scp_platform::error::PlatformError;
     use scp_platform::in_memory::InMemoryPush;
-    use scp_platform::{PushToken, WakeSignal};
 
     use super::*;
 
