@@ -1171,7 +1171,11 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------
 
-/// Device attestation provider call failed (Play Integrity API error).
+/// Device attestation provider call failed.
+///
+/// The Android adapter throws it when a Play Integrity token request fails,
+/// and the Apple adapter throws it when Apple's App Attest service answers
+/// with an error that no narrower `SCP-ATTEST-` code names.
 pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
 
 /// Attestation signature verification requires raw JSON, which is absent.
@@ -1203,6 +1207,35 @@ pub const ATTEST_9017: &str = "SCP-ATTEST-9017";
 
 /// Cryptographic-class verification method not verifiable via browser fetch.
 pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
+
+// Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
+// from its UniFFI `DeviceAttestationProvider` callback methods
+// (`AttestationError.scpError`). Each of these four codes belongs to one of
+// the five `AttestationError` cases; the fifth case, `serviceError`, reuses
+// `ATTEST_9001`.
+
+/// Apple App Attest is unsupported on this device.
+///
+/// `DCAppAttestService.isSupported` is `false`, or an App Attest call answered
+/// with `DCError.featureUnsupported`.
+pub const ATTEST_9019: &str = "SCP-ATTEST-9019";
+/// No App Attest key ID is stored, so no assertion is possible.
+pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
+/// The App Attest adapter reached a state no caller input produces.
+///
+/// Apple's service answered a completion handler with neither a value nor an
+/// error.
+pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
+/// The attestation challenge or the assertion request hash is not 32 bytes.
+///
+/// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding
+/// digest `D` of `09-security-model.md` §9.3.1 as `challenge` and the 32-byte
+/// assertion digest `A` as `request_hash`, and the Apple adapter hands each to
+/// App Attest as `clientDataHash` unchanged. On a device that supports App
+/// Attest, the Apple adapter throws this code for either input when it is not
+/// 32 bytes, before it generates a key or calls App Attest; on a device that
+/// does not, it throws `SCP-ATTEST-9019` first.
+pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)

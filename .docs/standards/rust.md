@@ -94,7 +94,7 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
 | `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
-| `python` | `python-test` runs `maturin develop --release` |
+| `python` | `python-test` runs `maturin develop --release`, and `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
 | `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
 | `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
