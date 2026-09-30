@@ -152,7 +152,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 p256 = { version = "0.13", features = ["ecdsa"] }
-hpke-rs = "0.6"
+hpke-rs = "0.7"
 sha2 = "0.10"
 hkdf = "0.12"
 aes-gcm = "0.10"
@@ -180,7 +180,7 @@ redb = "2"
 | `rmp-serde` | latest | scp-core, scp-transport | MessagePack binary serialization (envelopes, relay protocol, ProtocolRepository §17.5) |
 | `rusqlite` | latest, `bundled-sqlcipher` feature | scp-platform, scp-transport | SQLite storage: `SqliteStorage` (§17.6), `SqliteBlobStore` (§17.7). Bundled SQLCipher for encryption at rest. |
 | `redb` | latest stable (v3+ on-disk format) | scp-transport | `RedbBlobStore` (§17.7) — pure Rust B-tree DB for medium relay deployments |
-| `hpke-rs` | 0.6.x | scp-core | HPKE under DHKEM(P-256, HKDF-SHA256) (ADR-063) |
+| `hpke-rs` | 0.7.x | scp-core | HPKE under DHKEM(P-256, HKDF-SHA256) (ADR-063) |
 | `thiserror` | 2.x | all crates | Error type derivation |
 | `futures` | 0.3.x | scp-transport | Stream combinators |
 | `tracing` | 0.1.x | all crates | Structured logging |
