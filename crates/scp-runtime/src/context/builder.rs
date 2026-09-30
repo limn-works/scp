@@ -704,7 +704,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 // it back to the caller, which seeds the spawning actor directly. There is no
 // provider-side crypto to roll back. On a post-birth creation failure the owned
 // material is disposed on the rollback branch (`OwnedMlsCryptoState::dispose_secrets`,
-// F6) — a bare drop FREES the group's in-memory OpenMLS storage and zeroizes
+// F6) — a bare drop zeroizes the group's in-memory OpenMLS storage values and
 // the Ed25519 signer (OpenMLS `SignatureKeyPair` holds its private key in
 // `SecretVLBytes`). `destroy_group` releases the same material; on this rollback
 // branch the owner drops immediately after, so the explicit dispose is

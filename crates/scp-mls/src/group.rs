@@ -1854,7 +1854,7 @@ mod tests {
     fn add_member_rejects_over_long_lifetime_that_openmls_would_accept() {
         use crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
         // Build a legitimately-signed KeyPackage whose Lifetime is temporally
-        // valid (not_before < now < not_after) but whose total range exceeds the
+        // valid (not_before <= now < not_after) but whose total range exceeds the
         // RFC 9420 maximum. openmls's own `validate` would accept it (it never
         // calls `has_acceptable_range`); our add_member rejects it on range.
         let real_now = SystemClock.now_secs();

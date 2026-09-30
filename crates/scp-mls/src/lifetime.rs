@@ -55,10 +55,13 @@
 //! make an honest `KeyPackage` or commit fail, but cannot get a forged
 //! `Lifetime` accepted. On the Welcome path openmls's tree-leaf check is
 //! switched off and SCP's check is the only one, so there openmls's clock is
-//! never read for a `Lifetime`. The paths:
+//! never read for a `Lifetime`. The residual closes when openmls lets the
+//! caller supply the clock that `KeyPackageIn::validate` and
+//! `process_message` read. The paths:
 //!
 //! - `KeyPackageIn::validate`: [`crate::group::add_member`],
-//!   [`crate::group::key_package_in_did`], and the runtime backend's
+//!   [`crate::group::key_package_in_did`],
+//!   [`crate::group::key_package_in_wrapping_key`], and the runtime backend's
 //!   `validate_key_package` in `scp-runtime` (`crypto/mls/production_backend.rs`
 //!   and `crypto/mls/provider.rs`).
 //! - `process_message`: the staged-commit Add proposals in

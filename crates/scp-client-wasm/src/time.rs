@@ -61,7 +61,8 @@
 //!   honest `KeyPackage` or commit fail, but cannot get a forged `Lifetime`
 //!   accepted. Page same-origin integrity (CSP/SRI/COOP/COEP) stays
 //!   load-bearing only against that denial of service, not for `Lifetime`
-//!   acceptance.
+//!   acceptance. The residual closes when openmls lets the caller supply the
+//!   clock that `KeyPackageIn::validate` and `process_message` read.
 
 use scp_clock::Clock;
 
