@@ -916,7 +916,7 @@ Independent implementations SHOULD run the generator, compare its output against
 
 ## 25.19 Per-Context Pseudonym Derivation Vectors (§9.10.4, §9.10.4.A, §9.10.4.1)
 
-These vectors pin the **software-custody** per-context pseudonym keypair derivation. Software custody is cross-platform deterministic: every SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact public-key bytes below for the same identity seed, `context_id`, and epoch. Under the §9.10.4.A native interim, native software custody reproduces them when the 32-byte `identity_scalar` below is held as the identity's Ed25519 seed; the Rust, Swift and Kotlin KATs install it that way in the custody under test, and the TypeScript and Python KATs pass it to the bridge's `testing` hook, which runs the production derivation and returns the v1 routing id. **Hardware custody** (Secure Enclave, Android Keystore TEE, HSM) is device-local by design — the `pseudonym_secret` is a device-local secret generated inside the hardware boundary, so hardware pseudonyms are NOT expected to match these values and are NOT cross-device deterministic (§9.10.4.A).
+These vectors pin the **software-custody** per-context pseudonym derivation. Software custody is cross-platform deterministic: every SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact public-key bytes below for the same identity seed, `context_id`, and epoch. Under the §9.10.4.A native interim, native software custody reproduces them when the 32-byte `identity_scalar` below is held as the identity's Ed25519 seed; the Rust, Swift and Kotlin KATs install it that way in the custody under test. The TypeScript and Python KATs pass it to the software-host export `p256_software_pseudonym_point`, which runs the production derivation and returns the point. Each bridge's Rust tests assert the v1 routing id that its callback adapter computes from the Vector 30 point. **Hardware custody** (Secure Enclave, Android Keystore TEE, HSM) is device-local by design — the `pseudonym_secret` is a device-local secret generated inside the hardware boundary, so hardware pseudonyms are NOT expected to match these values and are NOT cross-device deterministic (§9.10.4.A).
 
 Derivation recipe (all implementations agree):
 
@@ -940,7 +940,7 @@ context_seed_v2 = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "sc
 # seed-to-scalar (FIPS 186-5 A.2.1, extra random bits — §9.10.4):
 scalar_input = HKDF-Expand-SHA256(context_seed, "SCP-PSEUDONYM-P256-V1", 48)
 d            = (int(scalar_input) mod (n - 1)) + 1
-pseudonym_public_key = P256_keypair_from_scalar(d).public_key   (33-byte compressed)
+pseudonym_public_key = d·G   (33-byte compressed; d is discarded)
 
 # routing id (every routing field carries this, never the point):
 pseudonym_routing_id = SHA-256("scp-pseudonym-routing-v1:" || pseudonym_public_key)
@@ -1016,7 +1016,7 @@ Expected v2 pseudonym_routing_id (epoch = 1):
   0x3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27
 ```
 
-`spec_25_19_vectors_30_31` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert every value above, routing ids included, on native and on `wasm32`. `scripts/gen-test-vectors-p256.py` emits them.
+`spec_25_19_vectors_30_31` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert every value above, routing ids included, on native and on `wasm32`. `scripts/gen-test-vectors-p256.py` emits them. `test_software_pseudonym_point_reproduces_spec_25_19` in `bindings/python/tests/test_p256_host_helpers.py` and the matching test in `bindings/typescript/tests/p256-host-helpers.test.ts` assert the four points through the bridge exports. `callback_pseudonym_routing_id_is_spec_25_19_vector_30` in each bridge's custody adapter asserts the Vector 30 v1 routing id.
 
 ### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
 

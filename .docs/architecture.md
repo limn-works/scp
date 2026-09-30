@@ -281,7 +281,7 @@ scp/
 │   │
 │   ├── scp-clock/             # Clock port — wasm-safe capability leaf (Clock, SystemClock, TestClock)
 │   │
-│   ├── scp-crypto/            # P-256 signature verification — wasm-safe capability leaf
+│   ├── scp-crypto/            # P-256 primitives, ScpSigner, HKDF, pseudonym derivation, JOSE ES256 — wasm-safe capability leaf
 │   │
 │   ├── scp-did/               # Identity data model — wasm-safe (identifier, SigningKeyId, key state, attestation)
 │   │   ├── document.rs        # Retired document types; the key state replaces them
@@ -667,17 +667,19 @@ This section documents the layered dependency graph, every replaceable subsystem
 
 #### 2.5.1 Layered Dependency Graph
 
-Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `p256` directly), so there are no intra-layer edges among them. Violations are compile errors (separate crates) or PR review failures (internal modules).
+Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `p256` directly), so there are no intra-layer edges among them. `scp-platform` is the one Layer 0 crate that is not a leaf: it depends on `scp-crypto`, because the `Pseudonym` type its `KeyCustody` trait returns validates its P-256 point and computes its routing id there, and that edge is Layer 0's only intra-layer edge. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
 Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
-           │  scp-crypto             P-256 signature verification. Wasm-safe leaf.
+           │  scp-crypto             P-256 primitives (verify, sign, ECDH, SEC1 encoding),
+           │                          the ScpSigner trait, HKDF, pseudonym derivation and
+           │                          routing id, JOSE ES256, and CustodyFailure. Wasm-safe leaf.
            │  scp-did                Identity data model (identifier, SigningKeyId, key state,
            │                          attestation). Wasm-safe leaf; deps =
            │                          the `p256` crate directly (no SCP deps).
            │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
-           │                          DeviceAttestation, Push).
-           │                          Zero SCP dependencies — leaf crates.
+           │                          DeviceAttestation, Push). Depends on scp-crypto only;
+           │                          the other Layer 0 crates have no SCP dependencies.
            │
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
            │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
