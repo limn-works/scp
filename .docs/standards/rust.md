@@ -94,7 +94,7 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
 | `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
-| `python` | `python-test` runs `maturin develop --release` |
+| `python` | `python-test` runs `maturin develop --release`, and `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
 | `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
 | `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
@@ -426,6 +426,72 @@ cargo deny check
 cargo doc --workspace --no-deps --document-private-items \
   --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
 ```
+
+## Clearing a Security Advisory
+
+When a RUSTSEC advisory names a workspace dependency, bump the dependency. Add a
+`deny.toml` ignore entry only when no released version clears the advisory, or when a
+dependency this workspace does not control blocks the upgrade. State that blocking
+upgrade in the entry's comment, and delete the entry in the same change that takes the
+fix — an ignore entry for a patched advisory is a false record.
+
+**Choosing the version.** Take the newest release whose dependency floors this workspace
+already satisfies. Reject a newer release that raises a floor on a native-code dependency
+to supply a capability the workspace does not use, because recompiling a vendored C
+library across every cross-compiled target adds build risk and no security. The case that
+produced this rule: rustls-webpki 0.103.14 raised its `aws-lc-rs` floor from 1.14 to 1.18
+to expose ML-DSA. At the time the workspace compiled `aws-lc-sys`, so taking it would have
+moved `aws-lc-sys` 0.39.0 to 0.44.0 and its vendored AWS-LC 1.71.0 to 5.5.0 across CI's
+cross-compiled targets, for an algorithm this workspace never asserts, while 0.103.13
+cleared the same three advisories and moved nothing. The workspace has since dropped
+`aws-lc-sys` altogether and resolves a later rustls-webpki, so the example is history; the
+rule still applies to the next native-code floor.
+Establish that by evidence: `diff` the candidate's `Cargo.toml` against the current one,
+and read the upstream release notes for every version in between.
+
+**Applying the bump.** Use `cargo update -p <crate> --precise <version>`. A bare
+`cargo update -p <crate>` re-resolves unrelated edges, so read the whole `Cargo.lock` diff
+and revert every change the advisory did not require, except a move off a yanked version,
+which `cargo update -p <crate>@<new> --precise <old>` reports as `was yanked`; name each
+kept change in the pull request. spin 0.9.9 is the case: 0.9.8 is yanked, and 0.9.9 fixes
+unsoundness in three `Once` into-inner methods. When `--precise` fails with a
+version conflict, read whether the conflicting requirement is `locked to` a version: a
+lockfile pin is not a blocker, so unlock that crate first with
+`cargo update -p <crate>@<locked version>` and retry. aws-sdk-s3 1.144.0 is the first
+release that requires the patched `lru ^0.18.2`, which clears RUSTSEC-2026-0253.
+1.119.0 requires `lru ^0.12.2`, which also falls under RUSTSEC-2026-0002 (patched at
+0.16.3); 1.120.0 through 1.143.0 require `lru ^0.16.3`, which clears RUSTSEC-2026-0002
+but not RUSTSEC-2026-0253. `--precise`
+refused 1.144.0 only because `Cargo.lock` held `sha2 0.11.0-rc.5`, which mainline's
+`ed25519-dalek 3.0.0-pre.6` accepts at 0.11.0 too.
+Prove the result resolves with `cargo metadata --locked --all-features`.
+
+**Verifying.** Run the cargo-deny version CI runs, not whatever `cargo install` left on
+the machine. `EmbarkStudios/cargo-deny-action@v2` is a floating major tag, not a pin:
+upstream moves it to each new release, so look up in the action's repository which
+cargo-deny release the tag points at on the day you run. CI's verdict is the one that gates the merge,
+so a local run only predicts CI when the binary matches. `.mise.toml` declares
+`"cargo:cargo-deny" = "latest"`, which pins nothing and drifts, so check the installed
+version rather than assuming the toolchain manifest supplied the one CI runs. Two
+diagnostics decide the outcome and both are version-sensitive: an `error` fails the run,
+and an `advisory-not-detected` warning marks an ignore entry as unnecessary. Do not delete
+an entry on an `advisory-not-detected` from a binary whose version differs from CI's. Count every copy of the crate in
+`Cargo.lock` and in `fuzz/Cargo.lock` before calling an advisory cleared: a bump that adds
+a patched version on top of unpatched duplicates leaves the unpatched ones compiling into
+the shipped artifact. `fuzz/` is a standalone crate whose own lockfile resolves the
+workspace crates through path dependencies, and no CI job runs `cargo deny` against it, so
+repeat every lock-only fix there with `cd fuzz && cargo update -p <crate> --precise <version>`.
+cargo-deny reports a vulnerability advisory against every affected copy, but its
+`[advisories] unsound` key decides which copies an `unsound` informational advisory
+reaches. Its default, `"workspace"`, reports only a crate a workspace member names
+directly: cargo-deny reported the `lru` advisory RUSTSEC-2026-0253 against `lru 0.16.3`
+alone while `lru 0.12.5` also compiled in, and raising the direct dependency to 0.18.2
+turned the check green with both affected copies still in the build. `deny.toml`
+therefore sets `unsound = "all"`, which reports every copy in the graph. Never lower
+that key. Clear a transitive copy by bumping the crate that pins it; an `ignore` entry
+for it follows the rule at the head of this section, and its comment names the pinning
+crate, shows that no release of it takes the patched version, and says why the
+advisory's trigger cannot occur.
 
 ## CI Matrix
 

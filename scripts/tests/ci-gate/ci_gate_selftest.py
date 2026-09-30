@@ -570,6 +570,18 @@ RUST_ONLY_RUNS = {
     "typescript-wasm-check": False,
 }
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
+PYTHON_ONLY = DOCS_ONLY | {"python": "true"}
+PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+    (
+        "bridge-parity",
+        "bridge-parity-kotlin",
+        "bridge-parity-swift",
+        "python-lint",
+        "python-test",
+        "rust-build-pyo3-production",
+    ),
+    True,
+)
 
 SCENARIOS = {
     "rust-only, pull_request": Scenario(
@@ -595,6 +607,12 @@ SCENARIOS = {
         filters=RUST_ONLY,
         event="merge_group",
         runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
+    ),
+    "python-only, pull_request": Scenario(
+        name="python-only, pull_request",
+        filters=PYTHON_ONLY,
+        event="pull_request",
+        runs=PYTHON_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
     ),
 }
 
@@ -3423,6 +3441,28 @@ def main() -> int:
         code, out = run_aggregate(needs, rust_pr.event)
         check(
             f"{job_id} skipped on a Rust-only change -> exit 1 naming it",
+            code == 1 and job_id in out,
+            out,
+        )
+
+    python_pr = SCENARIOS["python-only, pull_request"]
+
+    print("python-fanout — a change under bindings/python/ runs the wheel-features build")
+    # rust-build-pyo3-production builds scp-ffi with bindings/python/pyproject.toml's
+    # [tool.maturin] features, so an edit to that file alone must run it.
+    # SCENARIOS says it runs on a python-only change, so reporting it `skipped`
+    # must reach an aggregate as one named failure. Dropping
+    # `|| needs.changes.outputs.python == 'true'` from that job's `if:` makes an
+    # aggregate accept that skip, which drops this assertion's exit code to 0.
+    needs = build_needs(jobs, python_pr)
+    code, out = run_aggregate(needs, python_pr.event)
+    check("python-only change, every selected job passed -> exit 0", code == 0, out)
+    for job_id in ("rust-build-pyo3-production", "python-test"):
+        needs = build_needs(jobs, python_pr)
+        needs[job_id]["result"] = "skipped"
+        code, out = run_aggregate(needs, python_pr.event)
+        check(
+            f"{job_id} skipped on a python-only change -> exit 1 naming it",
             code == 1 and job_id in out,
             out,
         )

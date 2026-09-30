@@ -176,9 +176,9 @@ async fn build_self_host_node() -> BuiltNode {
     let blob_storage_handle = blob_storage.clone();
 
     // `Node::start` requires `S: EncryptedStorage`, satisfied by `SqliteStorage`.
-    // `NatTraversal` (no_domain) is a publishing reach → `DhtMode::Production`
-    // (M2; advisory in P1). The `FixedTierNatStrategy` is supplied via
-    // `NatSlot::Custom`.
+    // `NatTraversal` (no_domain) is a publishing reach: `DhtMode::Production`
+    // makes the start publish and fail if that publish fails. The
+    // `FixedTierNatStrategy` is supplied via `NatSlot::Custom`.
     let node = Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
         dht: DhtMode::Production,
@@ -1065,7 +1065,8 @@ async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode
 
     // The production `--self-host` identity wiring: `IdentitySource::Persisted`
     // load-or-creates from the root storage so the DID is stable across
-    // restarts. `NatTraversal` (publishing) → `DhtMode::Production` (M2).
+    // restarts. The node opts into `DhtMode::Production` (M2 accepts
+    // `Disabled` for every `Reach`, `NatTraversal` included).
     Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
         dht: DhtMode::Production,
@@ -1243,10 +1244,10 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
     let http_port = 28444u16;
 
     // `Reach::Local` skips the NAT probe (the flat-config equivalent of
-    // `no_domain().skip_nat_probe()`). Local is non-publishing → `DhtMode::Memory`
-    // (the default). The `PanicOnProbeNatStrategy` is still supplied via
-    // `NatSlot::Custom`: a clean build proves `Local` short-circuited the probe
-    // before `select_tier` was ever called.
+    // `no_domain().skip_nat_probe()`). Local is non-publishing → `DhtMode::Disabled`,
+    // the value `NodeConfig::defaults` sets. The `PanicOnProbeNatStrategy` is still
+    // supplied via `NatSlot::Custom`: a clean build proves `Local` short-circuited
+    // the probe before `select_tier` was ever called.
     let node = Node::start(NodeConfig {
         nat: NatSlot::Custom(Arc::new(PanicOnProbeNatStrategy)),
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),

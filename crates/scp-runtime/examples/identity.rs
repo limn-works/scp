@@ -4,8 +4,20 @@
 //! inspecting the resulting DID document, and publishing it
 //! to the (in-memory) DHT.
 //!
-//! Usage:
-//!   `cargo run -p scp-runtime --example identity`
+//! Usage, from a checkout of the repository:
+//!   `cargo run -p scp-runtime --features testing --example identity`
+//!
+//! This example names three test-harness types: `InMemoryDhtClient`,
+//! `InMemoryKeyCustody`, and `InMemoryPreRotationCustody`. `scp-dht` compiles
+//! the first only under `scp-dht/testing`, and `scp-platform` compiles the other
+//! two only under `scp-platform/testing`. `scp-runtime/testing` activates both
+//! of those features, and `scp-dht` and `scp-platform` are normal dependencies
+//! that survive publication, so a consumer of the published crate compiles this
+//! file under `--features testing` (ADR-062, capability injection,
+//! §Decision 1). Every one of those types stays out of a shipped artifact,
+//! because no shipped artifact enables `scp-runtime/testing`, which
+//! `scripts/check-shipped-feature-graph.sh`, the shipped-feature-graph
+//! prove-absence gate, asserts on every run.
 
 use std::sync::Arc;
 
@@ -52,14 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Services: {}", document.service.len());
     println!();
 
-    // 5. Publish to the DHT.
+    // 5. Publish to the in-memory DHT, a map inside this process that no peer reads.
     did_dht.publish(&identity, &document).await?;
-    println!("Published to DHT successfully.");
+    println!("Published to the in-memory DHT (this process only; no peer sees it).");
 
     // 6. Resolve it back.
     let resolved = did_dht.resolve(&identity.did).await?;
     assert_eq!(resolved.id, document.id);
-    println!("Resolved from DHT — document matches.");
+    println!("Resolved from the in-memory DHT — document matches.");
 
     Ok(())
 }

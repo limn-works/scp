@@ -237,6 +237,10 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              # The rust-clippy job runs scripts/check-examples-compile.sh and
+              # its cases, so a change to either must trigger the job that runs it.
+              - 'scripts/check-examples-compile.sh'
+              - 'scripts/tests/examples-compile/**'
               # The `docker-image` job builds from these two and is guarded by this
               # filter, so a change to either has to reach it.
               - 'Dockerfile'
@@ -377,14 +381,28 @@ jobs:
           save-if: false
       - name: scp-node self-host create paths fail closed
         # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
-        # its filter selects no test. Both tests this lane names carry
-        # `#[cfg(not(feature = "testing"))]`, so a dependency edge that turned
-        # `testing` on for scp-node would delete them and leave this lane green
-        # over zero assertions. Measured on this tree: `cargo test -p scp-node
-        # --lib no_such_name` exits 0, while `cargo nextest run
-        # --no-tests=fail -p scp-node --lib -E 'test(no_such_name)'` exits 4.
+        # its filter selects no test. Every test this filter selects (each
+        # `pre_rotation_severance` test in crates/scp-node/src/lib.rs and
+        # src/self_host.rs) carries `#[cfg(not(feature = "testing"))]`, so a
+        # dependency edge that turned `testing` on for scp-node would delete
+        # them and leave this lane green over zero assertions. Measured on this
+        # tree: `cargo test -p scp-node --lib no_such_name` exits 0, while
+        # `cargo nextest run --no-tests=fail -p scp-node --lib -E
+        # 'test(no_such_name)'` exits 4.
         # This lane now reports such a loss instead of hiding it.
         run: cargo nextest run --no-tests=fail -p scp-node --lib -E 'test(pre_rotation_severance)'
+      - name: scp-node shipped binary refuses --ephemeral before --health
+        # The test spawns the shipped `scp-node` binary and asserts that `main`
+        # calls `unavailable_mode` before the `--health` probe. It carries
+        # `#[cfg(not(feature = "testing"))]`, and every other lane builds
+        # scp-node with `testing` (the workspace nextest unifies it through
+        # scp-ffi-common's `scp-node?/testing`), so every other lane compiles it
+        # out. `-p scp-node` without `--features` builds it without `testing`,
+        # as the step above relies on. This is its own step, not a second
+        # filter on the step above, because `--no-tests=fail` fails only when an
+        # invocation selects zero tests overall: kept apart, either test
+        # disappearing turns its own step red.
+        run: cargo nextest run --no-tests=fail -p scp-node --test run_mode_selection -E 'test(shipped_build_refuses_ephemeral_before_the_health_probe)'
       - name: scp-identity create paths fail closed
         # Three manifests turn `scp-identity/testing` on, each in its own
         # `[dev-dependencies]`: crates/scp-testing/Cargo.toml,
@@ -1018,6 +1036,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # scripts/check-examples-compile.sh parses cargo metadata with jq, which
+      # the runner image ships. This step fails the job by name if an image drops it.
+      - name: Require jq
+        run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-compile.sh needs it"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1062,6 +1084,11 @@ jobs:
           cargo clippy -p scp-node --features quic,http3,udp,testing --all-targets -- -D warnings
           cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
           cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
+          # Asserts two things: every example target compiles and its example
+          # source holds no construct the script's source scan rejects, and every
+          # published examples/*.rs is some target's source. The script header
+          # states what the check cannot prove; do not restate it here.
+          bash scripts/check-examples-compile.sh
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
           # --workspace sweep above leaves off. The first command lints the
@@ -1076,6 +1103,10 @@ jobs:
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+      # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
+      # workspaces, each carrying a defect the gate must reject or a layout it must accept.
+      - name: Run examples-compile cases
+        run: bash scripts/tests/examples-compile/run-tests.sh
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven
@@ -1440,12 +1471,23 @@ jobs:
             -E 'test(ffi_dht_client_is_pkarr_only_in_shipped_build) + test(disabled_node_resolution_returns_ok_none_for_unknown_did)'
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
-  # features (`server` on) but WITHOUT `testing`. This is the
-  # config `build-matrix.yml` only exercises at release/tag time, so a PR could
-  # re-gate a production identity/SCPID/custody op behind the test-only
-  # `testing` feature — making it vanish from the production lib —
-  # and the regression would go unnoticed until release. This is the per-PR guard
-  # against that over-gating regression class.
+  # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the
+  # PyPI wheel only at release/tag time, so a PR could re-gate a production
+  # identity/SCPID/custody op behind the test-only `testing` feature — making it
+  # vanish from the production lib — and the regression would go unnoticed until
+  # release. This is the per-PR guard against that over-gating regression class.
+  #
+  # The wheel adds the features `[tool.maturin] features` in
+  # `bindings/python/pyproject.toml` names (`extension-module`,
+  # `vendored-openssl`), and `vendored-openssl` compiles OpenSSL from source
+  # through openssl-src for a Linux or Windows target and activates nothing for an
+  # Apple target, whose SQLCipher keeps CommonCrypto when an Apple host builds it.
+  # A third step checks that split with `cargo tree` for each wheel target, and a
+  # fourth builds the library with exactly that list, read from the file, so a PR
+  # that breaks the OpenSSL or SQLCipher source build fails here instead of in the
+  # release run. The build covers the Linux x86_64 host only; the manylinux_2_28
+  # container, the universal2 macOS build, and the Windows NASM build still run
+  # only in `build-matrix.yml`.
   #
   # This job carried a "build-only" note claiming a pyo3 test suite assumes
   # in-memory custody and does not compile in prod config. Measured on this tree,
@@ -1455,7 +1497,9 @@ jobs:
   # crates/scp-ffi/src/scp.rs:536.
   rust-build-pyo3-production:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # `python` too: the `python` filter covers `bindings/python/pyproject.toml`,
+    # whose `[tool.maturin] features` list the wheel step below builds.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     name: Rust / build + fail-closed test (pyo3 production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1511,6 +1555,44 @@ jobs:
           # than 0 if a feature flip selects zero tests.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
             -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed)'
+      - name: Check the PyPI wheel's features vendor OpenSSL on non-Apple targets only
+        run: |
+          # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that
+          # `vendored-openssl` sets for non-Apple targets only, because
+          # libsqlite3-sys 0.30.1 checks `bundled-sqlcipher-vendored-openssl` before
+          # the Apple branch that selects CommonCrypto. For each wheel target this
+          # resolves the wheel's feature list, requires the vendored feature on the
+          # Linux and Windows targets, and on the Apple targets requires
+          # `bundled-sqlcipher` (proof that the tree rendered) without the vendored one.
+          FEATURES="$(python3 -c 'import tomllib; print(",".join(tomllib.load(open("bindings/python/pyproject.toml", "rb"))["tool"]["maturin"]["features"]))')"
+          VENDORED='libsqlite3-sys feature "bundled-sqlcipher-vendored-openssl"'
+          BUNDLED='libsqlite3-sys feature "bundled-sqlcipher"'
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-darwin x86_64-apple-darwin; do
+            TREE="$(cargo tree -p scp-ffi --features "${FEATURES}" -e features --target "${target}" -i libsqlite3-sys)"
+            case "${target}" in
+              *-apple-darwin)
+                grep -qF "${BUNDLED}" <<<"${TREE}" || { echo "${target}: no SQLCipher in the resolved tree"; exit 1; }
+                if grep -qF "${VENDORED}" <<<"${TREE}"; then echo "${target}: the wheel vendors OpenSSL and drops CommonCrypto"; exit 1; fi ;;
+              *)
+                grep -qF "${VENDORED}" <<<"${TREE}" || { echo "${target}: the wheel does not vendor OpenSSL"; exit 1; } ;;
+            esac
+            echo "${target}: OK"
+          done
+      - name: Build pyo3 bridge with the PyPI wheel's features (vendored OpenSSL)
+        run: |
+          # The feature list comes from the file maturin reads, so this step builds
+          # what the wheel builds and follows any later edit to that list. `--lib`
+          # because `extension-module` leaves libpython unlinked, which a shared
+          # library tolerates and a test or bin target does not. A failing python3
+          # stops the step before cargo runs (assigned before use, shellcheck SC2155).
+          FEATURES="$(python3 -c 'import tomllib; print(",".join(tomllib.load(open("bindings/python/pyproject.toml", "rb"))["tool"]["maturin"]["features"]))')"
+          # Without `vendored-openssl` this step compiles no OpenSSL and proves
+          # nothing this step exists for, so it fails instead of passing quietly.
+          case ",${FEATURES}," in
+            *,vendored-openssl,*) ;;
+            *) echo "bindings/python/pyproject.toml [tool.maturin] features lacks vendored-openssl: ${FEATURES}"; exit 1 ;;
+          esac
+          cargo build -p scp-ffi --lib --features "${FEATURES}"
 
   # Builds the uniffi bridge (`scp-ffi-uniffi`) in its PRODUCTION configuration:
   # default features (`server` on) but WITHOUT `testing`. Same

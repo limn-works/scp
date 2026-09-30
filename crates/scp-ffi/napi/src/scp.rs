@@ -733,7 +733,7 @@ impl Scp {
             // FAIL CLOSED on a shipped (no-`testing`) build (ADR-062 §Decision
             // 6, IDENT_1059). This callback-custody path funnels through the
             // same mandatory pre-rotation commitment as every other create path
-            // (spec §9.7.4.1 §3); the only `PreRotationCustody` backend is the
+            // (spec §9.7.4.1 item 5(a)); the only `PreRotationCustody` backend is the
             // severed in-memory nullifier, so production returns a typed error
             // rather than minting it. Mirrors the `PyO3` reference bridge.
             #[cfg(not(feature = "testing"))]
