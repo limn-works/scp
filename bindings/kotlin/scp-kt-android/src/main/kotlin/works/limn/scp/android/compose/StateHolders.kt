@@ -55,9 +55,11 @@ import java.util.concurrent.atomic.AtomicReference
  * @property scope Coroutine scope that lives as long as the holder.
  *   Cancelled on disposal, which ends every [rememberScpStateIn]
  *   collection bound to this holder.
- * @property onDispose Cleanup callback invoked when the Composable
- *   leaves composition. Receives both the context handle and identity handle.
- *   Typically calls leave/close on the context.
+ * @property onDispose Cleanup callback that [dispose] invokes, after it cancels [scope], when
+ *   the Composable leaves composition. Receives both the context handle and identity handle.
+ *   It runs on a composition thread, which on Android is a main thread, so it MUST NOT block:
+ *   it launches `leave` (or, for an admin, `close`) on a scope that outlives disposal and
+ *   returns, as [rememberScpContext]'s `onDispose` parameter states.
  */
 class ScpContextHolder(
     val contextHandle: Long,

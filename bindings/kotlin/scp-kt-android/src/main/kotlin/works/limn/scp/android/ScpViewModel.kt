@@ -39,11 +39,16 @@ data class TrackedContext(
 )
 
 /**
- * Base [ViewModel] that manages SCP resource lifecycle.
+ * Base [ViewModel] that leaves every tracked SCP context when the ViewModel is cleared.
  *
- * Extend this class in your app's ViewModels to get automatic cleanup of SCP connections,
- * streams, and subscriptions when the ViewModel is cleared (i.e., when the associated
- * Activity or Fragment is destroyed and not recreating due to configuration change).
+ * Extend this class in your app's ViewModels so that clearing the ViewModel (when the
+ * associated Activity or Fragment is destroyed and not recreated for a configuration change)
+ * leaves every context tracked through [trackContext]: [onCleared] launches
+ * [works.limn.scp.bridge.ContextBridge.leave] for each one, passes each `leave` failure to
+ * [onCleanupFailure], and returns without waiting on a `leave` that suspends into its bridge's
+ * dispatcher. It closes no connection and releases no stream or subscription. An app that holds
+ * an `SCP` instance or an `ScpHotStreams` tears it down itself, with `SCP.shutdown` or
+ * `ScpHotStreams.close()`, from a coroutine the app owns.
  *
  * Per ADR-028, the recommended pattern is:
  * 1. Create [CoroutineBridge] and context handles in the ViewModel

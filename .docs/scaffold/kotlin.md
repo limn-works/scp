@@ -113,7 +113,6 @@ bindings/kotlin/
         Types.kt
     src/test/kotlin/works/limn/scp/android/
       ContextLifecycleTest.kt
-      DispatcherInjectionScanTest.kt
       ScpViewModelCleanupLoggingTest.kt
       ScpViewModelTest.kt
       compose/StateHoldersTest.kt
@@ -172,7 +171,7 @@ UniFFI generates:
 
 ### Async bridging
 
-UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`, and this SDK does not depend on that plugin until the plugin stabilizes. `CoroutineBridge`, `ServerBridge`, and the stream factories in `stream/Streams.kt` run each blocking FFI call they dispatch and each subscription release on an injected `ioDispatcher`, which defaults to `Dispatchers.IO`, so a test can inject a `StandardTestDispatcher`. The `SCP` class's `shutdown`, `suspendInstance`, and `resume` take a `CoroutineBridge` and dispatch on its `ioDispatcher`. The class's other methods forward to UniFFI and dispatch nothing: a synchronous forwarder runs on its caller's thread, so the caller picks the dispatcher (ADR-028, the Kotlin SDK, Dispatcher strategy). `DispatcherInjectionScanTest` in `scp-kt-android` reads both modules' main sources, apart from the generated UniFFI bindings under `internal/uniffi`. It fails on a `withContext` call whose context names `Dispatchers.IO`, and on an import, an alias, or a `val`, `var`, or `fun` that reaches `Dispatchers.IO` under another name; a parameter default of `Dispatchers.IO` passes. It allows one dispatch in `platform/AndroidDeviceAttestation.kt`, the Play Integrity token request, and one in `platform/AndroidPushProvider.kt`, the Firebase token request, because neither calls the SCP FFI, and it allows each only with the exact block the test records (ADR-028 acceptance criterion 6). The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
+UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`, and this SDK does not depend on that plugin until the plugin stabilizes. `CoroutineBridge`, `ServerBridge`, and the stream factories in `stream/Streams.kt` run each blocking FFI call they dispatch and each subscription release on an injected `ioDispatcher`, which defaults to `Dispatchers.IO`, so a test can inject a `StandardTestDispatcher`. The `SCP` class's `shutdown`, `suspendInstance`, and `resume` take a `CoroutineBridge` and dispatch on its `ioDispatcher`. ADR-028's Dispatcher strategy states the rule that every FFI call runs on an IO dispatcher, and ADR-028 acceptance criterion 6 names the one test that checks the injected dispatcher, for `ScpHotStreams`. The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
 
 ```kotlin
 class Context internal constructor(
@@ -355,7 +354,7 @@ class Identity private constructor(
 
 ## Resource Management
 
-A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, so it could reach the engine only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
+A type with a teardown function of its own that reaches the Rust engine exposes that function as one `suspend` function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` that reaches the engine could keep that promise only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. A lifecycle callback that cannot suspend, `ScpViewModel.onCleared()` or the `onDispose` callback a composable passes to `rememberScpContext`, promises no finished teardown, so it launches the `suspend` teardown on a scope that outlives it and returns. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
 
 `SCP.shutdown(bridge, timeout)` and `InvocationHandle.cancel()` are the Kotlin teardowns that reach the Rust engine today; `cancel()` suspends on the UniFFI-generated async `Scp.outletStreamCancel`. `Relay` and `Node` follow the same rule, but no production class implements the `ServerBindings` interface they call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`), so their `shutdown()` reaches only the test source set's `StubServerBindings`. `ScpHotStreams.close()` (`scp-kt-android`) follows it too, and no production class implements the `EventContextBindings` interface it releases through, so it reaches only test stubs.
 
@@ -384,9 +383,9 @@ class SCP internal constructor(
 // Run it under NonCancellable: a finally block usually runs because the coroutine was
 // cancelled, and in a cancelled coroutine the bridge's withContext(ioDispatcher) throws
 // CancellationException before the FFI call starts, so a bare shutdown() tears nothing down.
-// SCP.withStorage blocks its calling thread, and SCP dispatches none of its forwarders, so the
-// caller picks the dispatcher (ADR-028, Dispatcher strategy). This sample takes an injected
-// ioDispatcher so that a test can substitute a StandardTestDispatcher.
+// SCP.withStorage blocks its calling thread on JNA, so this sample runs it on an injected
+// ioDispatcher (ADR-028, Dispatcher strategy), which a test can replace with a
+// StandardTestDispatcher.
 val scp = withContext(ioDispatcher) { SCP.withStorage(config) }
 try {
     scp.contextCreate(identity, params)
