@@ -111,9 +111,12 @@ composition thread on Android is a main thread, where blocking risks an ANR rega
 
 That comment also named a real constraint: launching `onStop` on whichever scope disposal then
 cancels races cancellation against `onStop`, and `onStop` may never run. A second scope settles
-both — disposal hands `onStop` to its coordinator, which runs it on a scope disposal never
-cancels, then disposal cancels its subscription scope and returns. `rememberScpContext`'s KDoc example teaches callers that same shape, because that
-example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
+both — disposal hands `onStop` to its coordinator and returns after cancelling its subscription
+scope. When the departing mount is the last live mount under its key, the coordinator launches a stop
+that runs `onStop` on a scope disposal never cancels; while another mount under that key stays live,
+the coordinator holds `onStop` for the stop the last mount's departure launches; and when the
+departing mount's start never ran, the coordinator drops `onStop`, which then never runs. `rememberScpContext`'s KDoc example teaches callers
+that same shape, because that example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
 disposal callback.
 
 ## No exception for `AutoCloseable`

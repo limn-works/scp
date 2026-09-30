@@ -208,7 +208,7 @@ class Context internal constructor(
                 subscription = handle.subscribe { envelope ->
                     val result = trySend(envelope.toMessage())
                     if (result.isFailure && !result.isClosed) {
-                        close(ContextException("Message buffer overflow", "SCP-CTX-2001"))
+                        close(BridgeException("Message buffer overflow", "SCP-CTX-2001"))
                     }
                 }
             }
@@ -273,6 +273,8 @@ detekt {
 
 ## Data Classes
 
+Superseded. `scp-kt` ships no `Message` or `ToolDefinition` class, so this sketch binds no code: a message flow such as `ColdMessageFlow` (`stream/Streams.kt`) emits each message as a JSON string, outlet declarations use `OutletDefinition` in `Types.kt`, and the other data types come from the UniFFI-generated `uniffi.scp` package or the hand-written data classes beside each bridge.
+
 ```kotlin
 data class Message(
     val senderIdentifier: ByteArray,
@@ -295,6 +297,8 @@ data class ToolDefinition(
 ```
 
 ## Exception Hierarchy
+
+Superseded. `scp-kt` defines none of the classes below, so this sketch binds no code. `SCP` operations throw the UniFFI-generated `uniffi.scp.ScpException` subclasses (for example `ScpException.Transport`, which the `SCP.suspendInstance` KDoc names), `CoroutineBridge` throws `BridgeException` (`bridge/CoroutineBridge.kt`) when an FFI call fails, and `ColdMessageFlow` closes with one on a buffer overflow; `BridgeException` carries a structured `code` such as `"SCP-CTX-2001"`. The one hand-written `ScpException` is `scp-kt-android`'s, in `platform/Types.kt`.
 
 ```kotlin
 open class ScpException(
@@ -356,7 +360,7 @@ class Identity private constructor(
 
 A type with a teardown function of its own that reaches the Rust engine exposes that function as one `suspend` function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` that reaches the engine could keep that promise only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. A lifecycle callback that cannot suspend, `ScpViewModel.onCleared()` or the `onDispose` callback a composable passes to `rememberScpContext`, promises no finished teardown, so it launches the `suspend` teardown on a scope that outlives it and returns. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
 
-`SCP.shutdown(bridge, timeout)` and `InvocationHandle.cancel()` are the Kotlin teardowns that reach the Rust engine today; `cancel()` suspends on the UniFFI-generated async `Scp.outletStreamCancel`. `Relay` and `Node` follow the same rule, but no production class implements the `ServerBindings` interface they call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`), so their `shutdown()` reaches only the test source set's `StubServerBindings`. `ScpHotStreams.close()` (`scp-kt-android`) follows it too, and no production class implements the `EventContextBindings` interface it releases through, so it reaches only test stubs.
+`SCP.shutdown(bridge, timeout)` and `InvocationHandle.cancel()` are the teardowns of a type's own resources that reach the Rust engine today, and this rule covers only those; `SCP.contextClose(handle, identity)` also reaches the engine, through the UniFFI-generated `contextClose`, but it closes a context handle, not the `SCP` instance, so this rule does not govern it; `cancel()` suspends on the UniFFI-generated async `Scp.outletStreamCancel`. `Relay` and `Node` follow the same rule, but no production class implements the `ServerBindings` interface they call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`), so their `shutdown()` reaches only the test source set's `StubServerBindings`. `ScpHotStreams.close()` (`scp-kt-android`) follows it too, and no production class implements the `EventContextBindings` interface it releases through, so it reaches only test stubs.
 
 ```kotlin
 class SCP internal constructor(
