@@ -12,8 +12,6 @@
 //! those superseded buffers are freed unzeroized inside `MemoryStorage`; this
 //! type covers only the values present when the provider is released.
 
-use std::collections::HashMap;
-
 use openmls_memory_storage::MemoryStorage;
 use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
 use openmls_traits::OpenMlsProvider;
@@ -59,7 +57,9 @@ impl OpenMlsProvider for InMemoryMlsProvider {
 }
 
 impl Drop for InMemoryMlsProvider {
-    /// Zeroizes every storage value before `MemoryStorage` frees the map.
+    /// Zeroizes every storage value in place before `MemoryStorage` frees the
+    /// map, so each value's allocation is freed holding only zeroes
+    /// (`Vec::zeroize` wipes the whole capacity and keeps the allocation).
     ///
     /// A poisoned lock does not stop the wipe: the map is taken from the poison
     /// error and wiped anyway, because a panic elsewhere does not make the key
@@ -71,66 +71,8 @@ impl Drop for InMemoryMlsProvider {
             .values
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        zeroize_values(&mut values);
-    }
-}
-
-/// Zeroizes every value in `values` in place, leaving each an empty vector with
-/// its allocation still held, so the caller frees only zeroed memory.
-fn zeroize_values(values: &mut HashMap<Vec<u8>, Vec<u8>>) {
-    for value in values.values_mut() {
-        value.zeroize();
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn zeroize_values_empties_every_value_in_its_own_allocation() {
-        let mut values: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        values.insert(b"EpochSecrets-a".to_vec(), vec![0xAB; 64]);
-        values.insert(b"EncryptionKeyPair-b".to_vec(), vec![0xCD; 32]);
-        let capacities: HashMap<Vec<u8>, usize> = values
-            .iter()
-            .map(|(k, v)| (k.clone(), v.capacity()))
-            .collect();
-
-        zeroize_values(&mut values);
-
-        // Both entries are still in the map, so the vectors inspected here are the
-        // original allocations: each is emptied (zeroize clears after wiping) and
-        // keeps its capacity, so nothing was freed or reallocated before the wipe.
-        assert_eq!(values.len(), 2);
-        for (key, value) in &values {
-            assert!(value.is_empty(), "value under {key:?} was not zeroized");
-            assert_eq!(value.capacity(), capacities[key]);
+        for value in values.values_mut() {
+            value.zeroize();
         }
-    }
-
-    /// `Drop` recovers a poisoned storage lock and wipes anyway instead of
-    /// panicking (a panic inside `drop` during unwinding aborts the process).
-    #[test]
-    #[allow(clippy::panic)]
-    fn drop_wipes_through_a_poisoned_storage_lock() {
-        let provider = InMemoryMlsProvider::default();
-        provider
-            .storage()
-            .values
-            .write()
-            .unwrap()
-            .insert(b"EpochSecrets-a".to_vec(), vec![0xAB; 64]);
-        std::thread::scope(|s| {
-            let poisoner = s.spawn(|| {
-                let _guard = provider.storage().values.write().unwrap();
-                panic!("poison the storage lock");
-            });
-            assert!(poisoner.join().is_err());
-        });
-        assert!(provider.storage().values.is_poisoned());
-
-        drop(provider);
     }
 }

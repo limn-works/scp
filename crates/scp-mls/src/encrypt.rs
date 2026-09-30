@@ -46,9 +46,22 @@ use crate::wrapping_extension::extract_wrapping_key;
 /// cannot crash a native client process. On wasm32 (`panic=abort`) the guard
 /// catches nothing; the typed error return is the guarantee there.
 ///
-/// After a successful `process_message`, [`reject_own_echo`] turns a
-/// self-authored echo into [`MlsError::CannotDecryptOwnMessage`] before any
-/// caller reads the sender or the content.
+/// After a successful `process_message`, a frame this member authored that the
+/// untrusted relay echoed back returns [`MlsError::CannotDecryptOwnMessage`]
+/// before any caller reads the sender or the content (ADR-057). The relay
+/// delivers a PUBLISH to every subscriber of a routing id, the publisher
+/// included, so every member receives the echo of its own
+/// `PseudonymAnnouncement` on the shared `context_routing_id`. openmls 0.9.0
+/// returns `Ok` for that echo, with content
+/// `ProcessedMessageContent::OwnPrivateMessage`, an undecrypted body, and an
+/// unverified signature; the typed error lets the receive loop drop it benignly
+/// instead of reading an unauthenticated sender or AAD.
+/// `ProcessedMessageContent::OwnPendingCommit` gets the same error, but a
+/// `PrivateMessage` never reaches it: openmls 0.9.0's `from_inbound_ciphertext`
+/// (`framing/validation.rs`) returns `OwnPrivateMessage` for every
+/// `PrivateMessage` whose sender is the local member, before decryption, so a
+/// member's own Commit sent as a `PrivateMessage` also arrives as
+/// `OwnPrivateMessage`.
 fn process_inbound(
     g: &mut MlsGroup,
     provider: &crate::InMemoryMlsProvider,
@@ -65,32 +78,11 @@ fn process_inbound(
             ));
         }
     };
-    reject_own_echo(&processed)?;
-    Ok(processed)
-}
-
-/// Returns [`MlsError::CannotDecryptOwnMessage`] when `processed` is a frame
-/// this member authored that the untrusted relay echoed back (ADR-057).
-///
-/// The relay delivers a PUBLISH to every subscriber of a routing id, the
-/// publisher included, so every member receives the echo of its own
-/// `PseudonymAnnouncement` on the shared `context_routing_id`. openmls 0.9.0
-/// returns `Ok` for that echo, with content
-/// `ProcessedMessageContent::OwnPrivateMessage`, an undecrypted body, and an
-/// unverified signature; the typed error lets the receive loop drop it benignly
-/// instead of reading an unauthenticated sender or AAD.
-/// `ProcessedMessageContent::OwnPendingCommit` gets the same error, but a
-/// `PrivateMessage` never reaches it: openmls 0.9.0's `from_inbound_ciphertext`
-/// (`framing/validation.rs`) returns `OwnPrivateMessage` for every
-/// `PrivateMessage` whose sender is the local member, before decryption, so a
-/// member's own Commit sent as a `PrivateMessage` also arrives as
-/// `OwnPrivateMessage`.
-fn reject_own_echo(processed: &ProcessedMessage) -> Result<(), MlsError> {
     match processed.content() {
         ProcessedMessageContent::OwnPrivateMessage | ProcessedMessageContent::OwnPendingCommit => {
             Err(MlsError::CannotDecryptOwnMessage)
         }
-        _ => Ok(()),
+        _ => Ok(processed),
     }
 }
 
