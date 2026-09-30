@@ -40,7 +40,8 @@ env:
 
 jobs:
   # ── The nightly every job below compiles on ────────────────────────────────
-  # `fuzz/rust-toolchain.toml` names it and records why it carries no date. This job reads the channel out of that file and no other step in this
+  # `fuzz/rust-toolchain.toml` names it and records why it is a dated nightly. This job
+  # reads the channel out of that file and no other step in this
   # workflow repeats it, so the file and the workflow cannot disagree.
   #
   # Every job reaches the value through `dtolnay/rust-toolchain@master` plus a
@@ -51,7 +52,7 @@ jobs:
   # but no dated-nightly branch, so the `@nightly-<date>` ref these jobs used before
   # never resolved and every scheduled run failed at setup.
   toolchain:
-    name: Fuzz / read the fuzz nightly channel
+    name: Fuzz / read the pinned nightly
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -157,8 +158,8 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # `fuzz/rust-toolchain.toml` names this channel and records why it carries
-      # no date.
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.toolchain.outputs.channel }}
@@ -275,8 +276,8 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # `fuzz/rust-toolchain.toml` names this channel and records why it carries
-      # no date.
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.toolchain.outputs.channel }}
@@ -393,8 +394,8 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # `fuzz/rust-toolchain.toml` names this channel and records why it carries
-      # no date.
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.toolchain.outputs.channel }}

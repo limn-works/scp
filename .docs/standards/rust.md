@@ -290,8 +290,9 @@ proptest! {
 
 SCP uses cargo-fuzz (libFuzzer) for parser safety and security invariant testing at trust
 boundaries. The fuzz crate lives at `fuzz/` (repo root) — a **standalone crate, not a
-workspace member**. Every `cargo fuzz` command runs from inside `fuzz/`, on the channel that
-`fuzz/rust-toolchain.toml` names:
+workspace member**. Every `cargo fuzz` command runs from inside `fuzz/`, on the dated nightly
+that `fuzz/rust-toolchain.toml` pins, because some nightlies reject openmls 0.9.0's prelude
+glob re-export (E0365):
 
 ```sh
 cd fuzz && cargo fuzz list          # list all 27 targets

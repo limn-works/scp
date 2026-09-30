@@ -2345,8 +2345,8 @@ jobs:
       # This step names no channel. rustup applies the toolchain file of the directory a
       # command runs in, so running `cargo check` from `fuzz/` resolves
       # `fuzz/rust-toolchain.toml` and installs the nightly it names — the same
-      # invocation `fuzz/README.md` documents. That file records why the channel
-      # carries no date.
+      # invocation `fuzz/README.md` documents. That file records why the channel is a
+      # dated nightly.
       - name: Check fuzz crate compiles
         working-directory: fuzz
         run: cargo check

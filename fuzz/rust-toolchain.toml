@@ -5,17 +5,20 @@
 # WHO READS IT.
 #   - `.github/workflows/fuzz.yml` reads the channel below in its `toolchain` job and
 #     passes that output to every other job; `.github/workflows/ci.yml` reads it in a step
-#     of its fuzz-build job. Neither workflow repeats the channel.
+#     of its fuzz-build job. Neither workflow repeats the date.
 #   - `cargo` and `rustup` read it for a command run inside `fuzz/`.
 #   - `build.rs` beside it reads the channel below and fails this crate's build when the
 #     compiler cargo resolved is not a nightly, naming `RUSTUP_TOOLCHAIN` as the thing that
 #     overrides this file when it is set.
 #
-# THE CHANNEL is the undated `nightly`. openmls 0.9.0's prelude still glob-re-exports its
-# `pub(crate) use signature::*`, as 0.8.1's did, but current nightlies accept that
-# re-export again (checked on nightly-2026-08-14 and nightly-2026-09-28), so no date needs
-# pinning. rustup resolves `nightly` to the newest nightly installed locally, and CI
-# installs the current one.
+# THE CHANNEL is a dated nightly, so a local run and CI compile on the same compiler; an
+# undated `nightly` resolves to whatever each machine installed last. The date is
+# 2026-09-28 (rustc 1.101.0-nightly d080e7dff 2026-09-27), the nightly on which
+# `cd fuzz && cargo check` was last run and passed. openmls 0.9.0's prelude still
+# glob-re-exports its `pub(crate) use signature::*`, as 0.8.1's did. Some nightlies after
+# 2026-05-03 rejected that re-export (E0365); this one accepts it again, and a later
+# nightly that tightens E0365 again would break this build. Move the date only to a
+# nightly on which `cd fuzz && cargo check` passes.
 #
 # A command run from the repository root resolves the STABLE pin instead, because rustup
 # applies the toolchain file of the directory the command runs in, and cargo-fuzz refuses
@@ -33,5 +36,5 @@
 # the channel below in one job and passes it on the command line, where an explicit
 # `+toolchain` sets `RUSTUP_TOOLCHAIN` for the command and everything it spawns.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-09-28"
 components = ["rust-analyzer"]
