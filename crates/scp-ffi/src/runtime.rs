@@ -1470,12 +1470,10 @@ pub struct FfiBridgeState {
     /// Also maintained by `ContextManager` for lifecycle operations.
     /// This copy is used by UCAN validation (`ucan.rs`) and outlet capability
     /// checking (`outlets.rs`, `mcp.rs`) which access state via `with_ffi_state`.
-    /// `register_ffi_state` builds it from the caller's declared ceiling, the
-    /// one the supervisor enforces (a Welcome join registers an empty ceiling
-    /// first), and `install_role_state` replaces it, and `ceiling_strings`
-    /// with it, from the supervisor's role state. While `role_state_fenced` is
-    /// set the two differ on purpose: this copy is deny-all and the
-    /// supervisor's is not.
+    /// `register_ffi_state` builds it from the caller's declared ceiling (a
+    /// Welcome join registers an empty ceiling first). A governance action
+    /// (through `sync_role_state_from_manager`) and a committed Welcome join
+    /// replace it with the supervisor's role state.
     pub role_state: ContextRoleState,
     /// UCAN revocation list for this context.
     pub revocation_list: RevocationList,
@@ -1484,12 +1482,6 @@ pub struct FfiBridgeState {
     /// Capability ceiling as a set of `{resource}:{action}` strings for
     /// UCAN validation (ADR-016 step 8).
     pub ceiling_strings: HashSet<String>,
-    /// `true` while [`fence_role_state_deny_all`] holds `role_state` and
-    /// `ceiling_strings` at deny-all because a re-read of the supervisor's role
-    /// state failed. [`install_role_state`] clears it, and
-    /// [`resync_fenced_role_state`], which the join, leave, send and receive
-    /// lifecycle gates run, re-reads the supervisor while it is set.
-    pub role_state_fenced: bool,
     /// The DID of the context creator.
     pub creator_did: String,
     /// Registered outlet handlers keyed by outlet ID.
@@ -1575,9 +1567,9 @@ pub fn register_ffi_state(
             // reaches here, so an empty slice is a caller-declared deny-all
             // ceiling and the supervisor holds it empty. Substituting the
             // default here would grant eleven capabilities in that context.
-            // `context_join_from_welcome` registers `&[]` before the join and
-            // `install_role_state` then writes the authenticated role state
-            // and ceiling.
+            // `context_join_from_welcome` registers `&[]` before the join, then
+            // writes the authenticated ceiling (`sync_ceiling_from_params`)
+            // and the supervisor's role state.
             //
             // Ceiling-entry grammar enforcement (spec §5.3.1.1) runs on each
             // entry BEFORE it is normalized into the UCAN ceiling string set.
@@ -1625,7 +1617,6 @@ pub fn register_ffi_state(
                 revocation_list,
                 nonce_tracker,
                 ceiling_strings,
-                role_state_fenced: false,
                 creator_did: creator_did.to_owned(),
                 outlet_handlers: HashMap::new(),
                 message_tx: None,
@@ -1873,17 +1864,14 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
     bi.core.remove_economy_state(context_id);
 }
 
-/// Re-syncs a context's bridge role state and ceiling copy from the Supervisor.
+/// Re-syncs the `FfiBridgeState.role_state` for a context from the
+/// Supervisor.
 ///
-/// It replaces `FfiBridgeState.role_state` with the Supervisor's and rewrites
-/// the UCAN/outlet ceiling string set from that role state's ceiling, so the
-/// two copies cannot disagree.
-///
-/// A failed re-read leaves both bridge copies as they were. A caller that
-/// re-syncs after the supervisor may have narrowed a ceiling, a role or the
-/// member set (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`)
-/// runs [`sync_role_state_or_fence_async`] instead, which fences both copies
-/// deny-all when the re-read fails.
+/// Must be called after any governance action that modifies role state
+/// (`ChangeRole`, `AddMember`, `RemoveMember`, etc.) so that the FFI-side
+/// copy used by outlet and MCP capability checks stays current. It does not
+/// touch `ceiling_strings`, and a failed re-read leaves the older role state
+/// in place.
 ///
 /// The read is `Supervisor::get_role_state_checked`, so a busy or timed-out
 /// actor, a crashed or mid-respawn context and a poisoned context each fail
@@ -1906,9 +1894,9 @@ pub fn sync_role_state_from_manager(
 
 /// Async-native variant of [`sync_role_state_from_manager`].
 ///
-/// Callers that are already executing inside `runtime().block_on(...)` MUST
-/// use this, or [`sync_role_state_or_fence_async`] that wraps it, instead of
-/// the sync wrapper: the sync wrapper
+/// Callers that are already executing inside `runtime().block_on(...)` (e.g.
+/// the governance propose, approve, reject, withdraw and execute flows in
+/// `context.rs`) MUST use this instead of the sync wrapper: the sync wrapper
 /// performs its own `block_on`, and a nested `block_on` on the multi-threaded
 /// runtime panics with "Cannot start a runtime from within a runtime". This
 /// helper awaits the supervisor role-state query directly so it composes
@@ -1930,136 +1918,44 @@ pub async fn sync_role_state_from_manager_async(
         .ok_or_else(|| {
             ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
         })?;
-    install_role_state(bi, context_id, new_role_state)
+    with_ffi_state(bi, context_id, |st| {
+        st.role_state = new_role_state;
+        Ok(())
+    })
 }
 
-/// Writes `role_state` and the ceiling string set derived from its ceiling into
-/// the context's `FfiBridgeState`, in the enforced UCAN capability-name form
-/// (`{resource}:{action}`) that [`register_ffi_state`] builds on the create
-/// path, and clears the fence flag [`fence_role_state_deny_all`] sets.
+/// Re-syncs the `FfiBridgeState.ceiling_strings` for a context from the
+/// AUTHENTICATED context params carried by a joined
+/// [`ContextHandle`](scp_core::context::ContextHandle).
 ///
-/// `context_join_from_welcome` calls it directly with the role state the
-/// supervisor built from the ceiling AUTHENTICATED by the joined MLS group's
-/// signed context binding, replacing the whole precheck role state (ceiling,
-/// role definitions, the creator's admin grant, the joiner's member
-/// assignment) it registered with an empty, deny-all ceiling.
+/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
+/// the UCAN/outlet capability-check ceiling string set. Used by
+/// `context_join_from_welcome`: the joiner no longer supplies a ceiling, so the
+/// FFI state is registered with an empty, deny-all ceiling as a reversible
+/// precheck, then this overwrites it with the ceiling AUTHENTICATED by the
+/// joined MLS group's signed context binding. The ceiling entries are
+/// normalized to their enforced UCAN capability-name form
+/// (`{resource}:{action}`), matching the set [`register_ffi_state`] builds on
+/// the create path.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` when the FFI state registry holds no
-/// entry for `context_id`.
-pub(crate) fn install_role_state(
+/// Returns `ScpPyError::ContextError` if the context's FFI state is not
+/// registered (unreachable on the join success path — the state was just
+/// registered and not removed).
+pub fn sync_ceiling_from_params(
     bi: &PyBridgeInstance,
     context_id: &str,
-    role_state: ContextRoleState,
+    ceiling: &[scp_core::context::roles::Capability],
 ) -> Result<(), ScpPyError> {
-    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+    let ceiling_strings: HashSet<String> = ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::ucan_capability_name)
+        .collect();
     with_ffi_state(bi, context_id, |st| {
-        st.role_state = role_state;
         st.ceiling_strings = ceiling_strings;
-        st.role_state_fenced = false;
         Ok(())
     })
-}
-
-/// Replaces the context's bridge role state and UCAN ceiling copy with a pair
-/// built from an empty ceiling, keeping the member set, so every UCAN, outlet
-/// and MCP check the bridge serves from its own state refuses.
-///
-/// A caller runs it when the supervisor may have narrowed the ceiling but the
-/// re-sync read failed: keeping the older, broader copy would admit a
-/// capability the supervisor's ceiling no longer holds. It sets
-/// `role_state_fenced`, so the next join, leave, send or receive lifecycle gate
-/// that finds the context active re-reads the supervisor's role state through
-/// [`resync_fenced_role_state`]; any other successful
-/// [`sync_role_state_from_manager`] restores it too.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` when the FFI state registry holds no
-/// entry for `context_id` or the empty-ceiling role state cannot be built.
-pub(crate) fn fence_role_state_deny_all(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpPyError> {
-    with_ffi_state(bi, context_id, |st| {
-        let mut role_state = ContextRoleState::new(
-            context_id,
-            &st.creator_did,
-            CapabilityCeiling::new(Vec::new()),
-            vec![],
-            &SystemClock,
-        )
-        .map_err(|e| ScpPyError::context(format!("failed to create role state: {e}")))?;
-        role_state.members = std::mem::take(&mut st.role_state.members);
-        st.role_state = role_state;
-        st.ceiling_strings.clear();
-        st.role_state_fenced = true;
-        Ok(())
-    })
-}
-
-/// Re-reads the supervisor's role state into the bridge, and fences both
-/// bridge copies deny-all through [`fence_role_state_deny_all`] when that
-/// re-read fails.
-///
-/// Every caller that re-syncs after the supervisor may have narrowed a
-/// ceiling, a role or the member set (the governance propose, approve, reject,
-/// withdraw and execute flows and `apply_pending_ceiling_modification`) runs
-/// this, so a failed re-read never leaves an older, broader copy granting a
-/// capability the supervisor removed.
-///
-/// # Errors
-///
-/// Returns the re-read's error once the fence is in place, or the fence's
-/// error when the FFI state registry holds no entry for `context_id`.
-pub async fn sync_role_state_or_fence_async(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpPyError> {
-    match sync_role_state_from_manager_async(bi, context_id).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            fence_role_state_deny_all(bi, context_id)?;
-            Err(e)
-        }
-    }
-}
-
-/// Re-reads the supervisor's role state into a bridge copy that
-/// [`fence_role_state_deny_all`] left deny-all, and does nothing for a copy
-/// that is not fenced or a context this bridge holds no FFI state for.
-///
-/// The join, leave, send and receive lifecycle gates in `context.rs` run it
-/// once the supervisor reports the context active, so a fence a failed
-/// re-read left, including the one a committed Welcome join keeps when the
-/// supervisor did not answer its role-state read, lifts on the member's next
-/// lifecycle-gated operation.
-///
-/// # Errors
-///
-/// Returns `ScpPyError` when the supervisor is unavailable, the
-/// sync-to-async bridge fails, the supervisor could not answer the read or
-/// serves no context for `context_id`. The copy then stays fenced.
-pub(crate) fn resync_fenced_role_state(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpPyError> {
-    let fenced = ffi_state_registry(bi)
-        .get(context_id)
-        .is_some_and(|st| st.role_state_fenced);
-    if !fenced {
-        return Ok(());
-    }
-    let sup = Arc::clone(supervisor(bi)?);
-    let ctx = context_id.to_owned();
-    let role_state =
-        block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })?
-            .map_err(ScpPyError::from)?
-            .ok_or_else(|| {
-                ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-            })?;
-    install_role_state(bi, context_id, role_state)
 }
 
 /// Test-only: spawns the per-context supervisor actor whose lifecycle state
@@ -3153,10 +3049,10 @@ mod tests {
     }
 
     /// `sync_role_state_from_manager` replaces the whole role state a Welcome
-    /// join registered from an empty ceiling: the ceiling, the UCAN ceiling
-    /// copy, the admin role definition and the creator's admin grant all come
-    /// from the supervisor afterwards, so a role-derived check such as outlet
-    /// registration admits the creator.
+    /// join registered from an empty ceiling: the ceiling, the admin role
+    /// definition and the creator's admin grant all come from the supervisor
+    /// afterwards, so a role-derived check such as outlet registration admits
+    /// the creator.
     #[test]
     fn sync_role_state_from_manager_replaces_roles_built_from_an_empty_ceiling() {
         use scp_core::context::roles::Capability;
@@ -3182,10 +3078,9 @@ mod tests {
 
         sync_role_state_from_manager(bi, &ctx_id).unwrap();
 
-        let (strings, role_ceiling, admin_caps, creator_caps, can_register) =
+        let (role_ceiling, admin_caps, creator_caps, can_register) =
             with_ffi_state(bi, &ctx_id, |st| {
                 Ok((
-                    st.ceiling_strings.clone(),
                     st.role_state.ceiling().clone(),
                     st.role_state
                         .role_definitions
@@ -3200,7 +3095,6 @@ mod tests {
         let authenticated =
             CapabilityCeiling::new([Capability::MessagesRead, Capability::OutletRegister]);
         assert_eq!(role_ceiling, authenticated);
-        assert_eq!(strings, authenticated.to_ucan_string_set());
         let admin_caps = admin_caps.expect("the synced state carries the admin role");
         assert!(
             admin_caps.contains(&Capability::OutletRegister),
@@ -3249,63 +3143,6 @@ mod tests {
         assert_eq!(role_ceiling_len, 0, "the role-state ceiling stays empty");
 
         remove_context(bi, &ctx_id);
-    }
-
-    /// The governance flows' async re-sync narrows a stale UCAN/outlet ceiling
-    /// copy to the supervisor's ceiling, a `[]` deny-all ceiling included.
-    ///
-    /// Each bridge copy starts as the default ceiling, the state a bridge holds
-    /// after `apply_pending_ceiling_modification` narrowed the supervisor's
-    /// ceiling and before the bridge re-synced. The precondition assertion is
-    /// the case that must differ; after the sync the two copies must agree.
-    #[test]
-    fn sync_role_state_from_manager_async_narrows_a_stale_ceiling_copy() {
-        crate::init_runtime().ok();
-        let default_strings: Vec<String> = scp_core::context::roles::default_ceiling()
-            .iter()
-            .map(|cap| cap.name().into_owned())
-            .collect();
-        for (prefix, supervisor_ceiling) in [
-            ("51c1", vec!["messages:read".to_owned()]),
-            ("51c2", Vec::new()),
-        ] {
-            let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
-            let bi = &*bi_arc;
-            init_context_manager_for_test(bi);
-            let ctx_id = format!("{prefix}{}", "0".repeat(60));
-            let creator = "did:dht:z6MkCeilingResync";
-            create_supervisor_context_for_test(bi, &ctx_id, creator, &supervisor_ceiling);
-            register_ffi_state(bi, &ctx_id, creator, &default_strings).unwrap();
-            let before = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
-            assert!(
-                before.contains("messages:write"),
-                "{prefix}: the stale copy must grant messages:write, got: {before:?}"
-            );
-
-            crate::runtime()
-                .unwrap()
-                .block_on(sync_role_state_from_manager_async(bi, &ctx_id))
-                .unwrap();
-
-            let (strings, expected) = with_ffi_state(bi, &ctx_id, |st| {
-                Ok((
-                    st.ceiling_strings.clone(),
-                    st.role_state.ceiling().to_ucan_string_set(),
-                ))
-            })
-            .unwrap();
-            assert_eq!(strings, expected, "{prefix}: the two copies must agree");
-            assert!(
-                !strings.contains("messages:write"),
-                "{prefix}: the narrowed copy must not grant messages:write, got: {strings:?}"
-            );
-            assert_eq!(
-                strings.is_empty(),
-                supervisor_ceiling.is_empty(),
-                "{prefix}: a `[]` supervisor ceiling leaves the copy deny-all, got: {strings:?}"
-            );
-            remove_context(bi, &ctx_id);
-        }
     }
 
     /// A poisoned context fails the sync with `SCP-CTX-2134`, not with the
