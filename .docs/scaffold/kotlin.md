@@ -106,29 +106,6 @@ class Context internal constructor(private val handle: ContextHandle) {
             val result = handle.invokeTool(toolId, json)
             Json.decodeFromString(result)
         }
-
-    // Release the subscription by suspending in a finally, off the collector's thread:
-    // awaitClose's lambda runs on the collector's thread, an Android main thread under
-    // collectAsState. Log a release that throws instead of rethrowing it (sdk-common.md
-    // §Cleanup error handling): rethrown from the finally, it would replace the collector's
-    // cancellation as the failure.
-    fun receiveFlow(): Flow<Message> = callbackFlow {
-        handle.subscribe { envelope ->
-            trySend(envelope.toMessage())
-        }
-        try {
-            awaitClose()
-        } finally {
-            withContext(NonCancellable + Dispatchers.IO) {
-                try {
-                    handle.unsubscribe()
-                } catch (e: Exception) {
-                    java.util.logging.Logger.getLogger("works.limn.scp.Context")
-                        .log(java.util.logging.Level.WARNING, "unsubscribe failed when receiveFlow() closed", e)
-                }
-            }
-        }
-    }
 }
 ```
 

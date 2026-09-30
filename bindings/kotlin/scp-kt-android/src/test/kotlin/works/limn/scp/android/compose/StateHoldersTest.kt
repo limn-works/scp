@@ -321,12 +321,42 @@ class StateHoldersTest {
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `rememberScpHotStream logs a throwing start, keeps State null, and still runs onStop`() {
+        assertThrowingStartLogged(IllegalStateException("engine already dropped the context")) { logged ->
+            // Coroutine stack-trace recovery may rethrow a copy of the failure, so compare its
+            // type and message rather than its identity.
+            assertTrue(logged is IllegalStateException)
+            assertEquals("engine already dropped the context", logged.message)
+        }
+    }
+
+    /**
+     * `start` runs under NonCancellable, so a CancellationException it throws while its mount is
+     * still composed was raised by the start itself, not by a cancelled mount. It is logged like
+     * any other throw; rethrown, it would complete the launch cancelled with nothing logged and
+     * the State null, which fails this test's wait for the warning.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `rememberScpHotStream logs a start that throws CancellationException while mounted`() {
+        assertThrowingStartLogged(CancellationException("executor rejected the subscribe")) { logged ->
+            val causes = generateSequence(logged) { it.cause }.toList()
+            assertTrue(
+                "the logged throwable does not carry the start's CancellationException: $causes",
+                causes.any { it is CancellationException && it.message == "executor rejected the subscribe" },
+            )
+        }
+    }
+
+    /**
+     * Mount a [rememberScpHotStream] whose `start` throws [failure], and assert the throw is
+     * logged once at warning level (checked by [checkLogged]), never reaches the
+     * uncaught-exception handler, leaves the State null, and still has onStop run on disposal.
+     */
+    private fun assertThrowingStartLogged(failure: Throwable, checkLogged: (Throwable) -> Unit) {
         ShadowLog.clear()
         val escaped = AtomicReference<Throwable?>(null)
         val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { _, thrown -> escaped.set(thrown) }
         try {
-            val failure = IllegalStateException("engine already dropped the context")
             val startThrew = CountDownLatch(1)
             val stopped = CountDownLatch(1)
             val showComposable = MutableStateFlow(true)
@@ -359,10 +389,7 @@ class StateHoldersTest {
             assertEquals("a throwing start escaped to the uncaught-exception handler", null, escaped.get())
             val warning = ShadowLog.getLogsForTag("ScpHotStreamCoordinator").single()
             assertEquals(Log.WARN, warning.type)
-            // Coroutine stack-trace recovery may rethrow a copy of `failure`, so compare its
-            // type and message rather than its identity.
-            assertTrue(warning.throwable is IllegalStateException)
-            assertEquals(failure.message, warning.throwable.message)
+            checkLogged(warning.throwable)
             assertEquals(null, flowState?.value)
 
             showComposable.value = false

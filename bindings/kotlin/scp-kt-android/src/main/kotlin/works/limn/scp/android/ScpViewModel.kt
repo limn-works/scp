@@ -46,9 +46,8 @@ data class TrackedContext(
  * leaves every context tracked through [trackContext]: [onCleared] launches
  * [works.limn.scp.bridge.ContextBridge.leave] for each one, passes each `leave` failure to
  * [onCleanupFailure], and returns without waiting on a `leave` that suspends into its bridge's
- * dispatcher. It closes no connection and releases no stream or subscription. An app that holds
- * an `SCP` instance or an `ScpHotStreams` tears it down itself, with `SCP.shutdown` or
- * `ScpHotStreams.close()`, from a coroutine the app owns.
+ * dispatcher. It closes no connection and releases no stream or subscription; an app that holds
+ * an `ScpHotStreams` calls `ScpHotStreams.close()` itself, from a coroutine the app owns.
  *
  * Per ADR-028, the recommended pattern is:
  * 1. Create [CoroutineBridge] and context handles in the ViewModel

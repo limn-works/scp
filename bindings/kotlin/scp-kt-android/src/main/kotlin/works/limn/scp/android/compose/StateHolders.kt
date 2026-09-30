@@ -836,8 +836,19 @@ internal fun <T> rememberScpHotStream(
             // process. A throwing `start` (an FFI subscribe on a context the engine dropped)
             // is logged here instead and leaves `flowState` null; the coordinator keeps this
             // mount's onStop, because that `start` may have opened a subscription it did not
-            // return. Cancellation and an Error (a JVM fault) still propagate.
-            runCatching { coordinator.startMounted(mount, start) }
+            // return. `start` runs under NonCancellable, so a CancellationException it throws
+            // (a dispatcher that rejected its task, say) does not mean this mount was
+            // cancelled; it is wrapped so it is logged like any other throw. A
+            // CancellationException from startMounted itself (this mount left before its start
+            // ran) and an Error (a JVM fault) still propagate.
+            val loggedStart: suspend () -> SharedFlow<T> = {
+                try {
+                    start()
+                } catch (e: CancellationException) {
+                    throw IllegalStateException("hot stream start threw CancellationException", e)
+                }
+            }
+            runCatching { coordinator.startMounted(mount, loggedStart) }
                 .onSuccess { flowState.value = it }
                 .onFailure { failure ->
                     if (failure is CancellationException || failure is Error) throw failure
