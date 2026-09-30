@@ -27,7 +27,10 @@ const SSE_CLOSED: &str = "SSE connection is closed; connect a new transport";
 /// the call. A request returns the first JSON-RPC response on the stream whose
 /// `id` is the request's, and skips every other response, every notification,
 /// and every server-initiated request (a line carrying `method`), whatever its
-/// `id`.
+/// `id`. Calls on one transport run one at a time: a request holds the stream
+/// from before its POST until its response arrives, and a concurrent call
+/// waits for it, so every response a call skips answers an earlier call that
+/// already failed.
 pub struct SseClientTransport {
     /// The SSE endpoint URL (e.g., `http://localhost:3000/sse`).
     _url: String,
@@ -441,22 +444,27 @@ impl McpTransport for SseClientTransport {
     fn send_request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         let body = serde_json::to_string(request)
             .map_err(|e| format!("failed to serialize request: {e}"))?;
-        self.ensure_open()?;
-        self.post(&body)?;
-
-        // The server accepted the POST; the JSON-RPC response comes on the
-        // SSE stream.
+        // The call holds the stream from before its POST until its response
+        // arrives, so calls on one transport run one at a time: a second
+        // call's POST goes out only after the first call returned, and no
+        // call can read and skip the response of a call still waiting.
+        // `ensure_open` takes this lock, so its checks are repeated here.
         let mut sse_reader = self
             .sse_reader
             .lock()
             .map_err(|e| format!("SSE reader lock poisoned: {e}"))?;
-
+        if self.close.closed.load(Ordering::SeqCst) {
+            return Err(SSE_CLOSED.to_owned());
+        }
         let reader = sse_reader.as_mut().ok_or(SSE_CLOSED)?;
+        self.post(&body)?;
 
-        // Read SSE events until the response to this request arrives. A
-        // response under another id answers an earlier request whose call
-        // already failed (a read timeout, say); handing it to this call would
-        // shift every later reply by one.
+        // The server accepted the POST; the JSON-RPC response comes on the
+        // SSE stream. Read SSE events until the response to this request
+        // arrives. Calls run one at a time, so a response under another id
+        // answers an earlier request whose call already failed (a read
+        // timeout, say); handing it to this call would shift every later
+        // reply by one.
         loop {
             let mut line = String::new();
             let read = read_line_bounded(reader, &mut line);
@@ -740,6 +748,124 @@ mod tests {
                 head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
                 "every request must carry the token, got: {head}"
             );
+        }
+    }
+
+    /// Accepts one POST on a nonblocking `listener` within `wait`, answers it
+    /// 202, and returns its JSON-RPC id; `None` when no POST arrived.
+    fn accept_post_within(
+        listener: &std::net::TcpListener,
+        wait: std::time::Duration,
+    ) -> Option<i64> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    conn.set_nonblocking(false).expect("blocking POST");
+                    let mut reader = BufReader::new(&conn);
+                    let mut head = String::new();
+                    loop {
+                        let mut line = String::new();
+                        let n = std::io::BufRead::read_line(&mut reader, &mut line).expect("head");
+                        if n == 0 || line == "\r\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                    }
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .map_or(0, |v| v.trim().parse::<usize>().expect("length"));
+                    let mut body = vec![0_u8; length];
+                    std::io::Read::read_exact(&mut reader, &mut body).expect("body");
+                    conn.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                        .expect("answer POST");
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&body).expect("JSON body");
+                    return Some(value["id"].as_i64().expect("numeric id"));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept POST: {e}"),
+            }
+        }
+    }
+
+    /// Writes the response to request `id` on the SSE stream.
+    fn write_response(sse: &mut std::net::TcpStream, id: i64) {
+        sse.write_all(
+            format!(
+                "event: message\r\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"id\":{id}}}}}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write response");
+    }
+
+    /// Two calls on one shared transport run one at a time: the second
+    /// call's POST goes out only after the first call has its response, so
+    /// neither call reads and skips the other's response, and each returns
+    /// its own. The server holds the first call's response back for 500 ms
+    /// and records whether a second POST arrived in that window; when one
+    /// does, it answers both and closes the stream, so a call that lost its
+    /// response fails instead of hanging the test.
+    #[test]
+    fn sse_client_runs_concurrent_calls_on_one_transport_one_at_a_time() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (_, mut sse) = accept_sse(&listener);
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let long = std::time::Duration::from_secs(20);
+            let first = accept_post_within(&listener, long).expect("first POST");
+            let overlap = accept_post_within(&listener, std::time::Duration::from_millis(500));
+            write_response(&mut sse, first);
+            if let Some(second) = overlap {
+                write_response(&mut sse, second);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = sse.shutdown(Shutdown::Both);
+                return true;
+            }
+            let second = accept_post_within(&listener, long).expect("second POST");
+            write_response(&mut sse, second);
+            false
+        });
+
+        let transport = Arc::new(
+            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
+                .expect("connect"),
+        );
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let calls: Vec<_> = [5, 6]
+            .into_iter()
+            .map(|id| {
+                let transport = Arc::clone(&transport);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    (id, transport.send_request(&request(id)))
+                })
+            })
+            .collect();
+        let results: Vec<_> = calls
+            .into_iter()
+            .map(|call| call.join().expect("call thread"))
+            .collect();
+        let overlapped = server.join().expect("server thread");
+        assert!(
+            !overlapped,
+            "a second POST went out while the first call waited for its response"
+        );
+        for (id, result) in results {
+            let response = result.unwrap_or_else(|e| panic!("call {id} failed: {e}"));
+            assert_eq!(response.id, crate::protocol::RequestId::Number(id));
+            assert_eq!(response.result, Some(serde_json::json!({"id": id})));
         }
     }
 
