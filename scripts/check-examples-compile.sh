@@ -95,6 +95,12 @@
 #     then `#[t]`), so the rule matches the name, not the attribute form; a function or
 #     variable named `test` fails too. No example in the workspace uses a construct that
 #     this item or the one before it names.
+#   - A U+200E (LEFT-TO-RIGHT MARK) or U+200F (RIGHT-TO-LEFT MARK) outside a string
+#     literal, char literal or comment. rustc lexes both as whitespace, and Perl's `\s`
+#     matches neither, so `#[cfg<U+200E>(feature = "testing")]` and
+#     `#[<U+200F>path = "x"]` would slip past the `cfg(` and `#[path]` matchers. Outside a
+#     literal or comment rustc accepts either character only as whitespace, so the rule
+#     rejects every such use and every `\s` in the scan stays sound.
 #   - A block comment or string literal the scan cannot close. Block comments nest, as
 #     rustc reads them, and an unclosed one fails the scan instead of desynchronizing it.
 # String literals, char literals and comments are blanked first, so neither hides a
@@ -158,6 +164,7 @@ print "unbalanced string literal\n" if s/"\d+"//gr =~ /"/;
 print "include!\n" if /\binclude\b/;
 print "macro_rules!\n" if /\bmacro_rules\b/;
 print "stringify!\n" if /\bstringify\b/;
+print "U+200E or U+200F outside a literal or comment\n" if /[\x{200E}\x{200F}]/;
 print "#[path]\n" if /#\s*!?\s*\[\s*(?:r#)?path\b/;
 print "$1\n" while /\b(cfg_\w+)/g;
 print "test-attribute name $1\n" while /\b(test|bench|test_case)\b/g;

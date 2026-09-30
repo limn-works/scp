@@ -28,6 +28,7 @@
 # empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
 # the same on `nestedcomment`, dropping the `include`, `#[path]`, `macro_rules` or
 # `stringify` rule does the same on `include`, `pathmod`, `macrorules` or `stringify`,
+dropping the U+200E and U+200F rule does the same on `lrmcfg`, `lrmcfgmacro` and `rlmpath`,
 # matching `path` only directly after `[` does the same on `rawpath`, and listing `examples/` without
 # following symbolic links does the same on `symlinkmod` and `symlinkdir`, matching only
 # `cfg_attr` in place of every `cfg_` name does the same on `cfgselect`, dropping the
@@ -42,7 +43,7 @@
 # so on `charhex` and `charunicode`; and refusing a raw string whose prefix follows a `#`
 # token does so on `hashraw`.
 # Scanning string literals or comments, rejecting a platform predicate true on the host,
-# rejecting `include_str!`, rejecting an identifier that merely starts with `test`,
+# rejecting `include_str!`, rejecting a U+200E or U+200F inside a literal or comment, rejecting an identifier that merely starts with `test`,
 # `bench` or `stringify`, rejecting an identifier `path` or `r#path` outside an attribute,
 # refusing a raw string whose prefix follows `(` or a space, or
 # matching a char literal byte by byte in place of decoding the source as UTF-8 makes the
@@ -252,6 +253,24 @@ printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo
 printf 'const _: &str = stringify! { fn body() { demo::t(); } };\nfn main() {}\n' > "$ws/demo/examples/good.rs"
 expect "example body inside stringify!" "$ws" 1 "      stringify!"
 
+# rustc lexes U+200E and U+200F as whitespace, and Perl's `\s` matches neither, so each
+# fixture below holds a live `cfg(`, `cfg!(` or `#[path]` attribute that a scan joining the
+# attribute's tokens with `\s` never reports. Each compiles on default features.
+ws="$(new_ws lrmcfg $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg\xe2\x80\x8e(feature = "testing")]\nfn main() { demo::t(); }\n#[cfg\xe2\x80\x8e(not(feature = "testing"))]\nfn main() {}\n' > "$ws/demo/examples/good.rs"
+expect "feature cfg joined by a U+200E" "$ws" 1 "      U+200E or U+200F outside a literal or comment"
+
+ws="$(new_ws lrmcfgmacro $'[features]\ntesting = []')"
+printf 'fn main() { let _ = cfg!\xe2\x80\x8e(feature = "testing"); }\n' > "$ws/demo/examples/good.rs"
+expect "cfg! macro joined by a U+200E" "$ws" 1 "      U+200E or U+200F outside a literal or comment"
+
+ws="$(new_ws rlmpath $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf '#[cfg(feature = "testing")]\npub fn run() { demo::t(); }\n#[cfg(not(feature = "testing"))]\npub fn run() {}\n' > "$ws/demo/examples/body.inc"
+printf '#[\xe2\x80\x8fpath = "body.inc"]\nmod body;\nfn main() { body::run(); }\n' > "$ws/demo/examples/good.rs"
+expect "example module read through #[path] joined by a U+200F" "$ws" 1 "      U+200E or U+200F outside a literal or comment"
+
 # std's stable `cfg_select!` keeps only the arm whose predicate holds, and its predicates
 # are not `cfg(` calls, so a scan that matched only `cfg(` would pass this file.
 ws="$(new_ws cfgselect $'[features]\ntesting = []')"
@@ -325,7 +344,9 @@ fn main() {
     let r#path = stringify_all();
     let _ = (path, "stringify!(x) #[path = \"x\"]");
     let _ = ('\x41','"', '\u{41}','"', b'\x7f','"', 'é','"', "cfg(windows)");
+    let _ = ("cfg‎(windows) #[‏path]", '‎', r"‏");
 }
+// cfg‎(windows) and #[‏path] in a comment are not attributes.
 // cfg_if! and #[bench] in a comment are not constructs either.
 #[inline]
 fn tested() -> u8 { 0 }

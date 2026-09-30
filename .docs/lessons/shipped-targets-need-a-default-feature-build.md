@@ -61,7 +61,10 @@ of them reopens a bypass this repository has already measured:
    stands: the lint call is not a `--test` build, so rustc deletes a `#[test]` item before
    name resolution and a body in `#[test] fn body()` beside an empty `fn main()` is never
    type-checked, and the attribute also works path-qualified and renamed through `use`, so
-   the rule matches the name rather than the attribute form. It fails on a block comment or string literal it cannot close.
+   the rule matches the name rather than the attribute form. It fails on a U+200E or U+200F
+   outside a literal or comment: rustc lexes both as whitespace and Perl's `\s` matches
+   neither, so `#[cfg<U+200E>(feature = "testing")]` is a live attribute the `cfg(` matcher
+   would miss. It fails on a block comment or string literal it cannot close.
 
 Row 8 is answered by none of them. Three kinds of bypass are known to
 remain: the dev-dependency closure (row 4b), code outside `examples/` that an example calls
@@ -96,8 +99,9 @@ word-splitting. Row 9a was measured with mechanism 7 removed: the gate compiled 
 feature-gated fixture of case `cfgbody` and exited 0.
 
 Row 9b is closed by mechanism 7 for every route in its row, and the case suite's
-`falsecfg`, `emptyany`, `nestedcomment`, `include`, `pathmod`, `macrorules`, `cfgselect`,
-`testattr`, `testpath` and `testalias` cases each fail on one of those routes. The row lists the routes
+`falsecfg`, `emptyany`, `nestedcomment`, `include`, `pathmod`, `rawpath`, `macrorules`,
+`stringify`, `lrmcfg`, `lrmcfgmacro`, `rlmpath`, `cfgselect`, `testattr`, `testpath` and
+`testalias` cases each fail on one of those routes. The row lists the routes
 reviewers have found, not a proof that no other exists.
 Row 9c is open, and no human has ruled it acceptable. Mechanism 7 reads example sources
 only, so a lib item compiled only under a feature key beside an empty default twin, or a lib
@@ -144,7 +148,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
 | 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
 | 9a | example body under `#[cfg(feature = "testing")] fn main()` beside an empty `#[cfg(not(feature = "testing"))] fn main() {}` | the compile saw only the empty `main` and counted the target as checked |
-| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
+| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, a U+200E or U+200F that rustc lexes as whitespace inside a `cfg(`, `cfg!(` or `#[path]` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
 | 9c | a lib item under a feature key beside an empty default twin, a lib or dependency macro that drops or feature-gates its input | open, unmeasured: the code sits outside `examples/`, which is all mechanism 7 reads |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both
