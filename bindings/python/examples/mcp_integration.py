@@ -36,15 +36,25 @@ async def main() -> None:
         server = await scp.mcp_serve(identity.did, [ctx.context_id], "stdio")
         print("MCP server running")
 
-        # Or connect as an MCP client to an SCP SSE server on this machine that
-        # exposes this context. An SCP SSE server always runs a bearer check
-        # (ADR-015), so pass the token that server's operator gives you; this
-        # example reads it from SCP_MCP_SSE_TOKEN. The transport has no TLS, so
-        # a token is sent only to a loopback host.
+        # Or connect as an MCP client to an SCP SSE server started separately on
+        # this machine at 127.0.0.1:8080. The server streams events at ``/sse``
+        # and takes requests at the ``/message`` path it names in its first
+        # event, so the client dials ``/sse``. The context created above lives
+        # only in this process's in-memory store, so that server cannot expose
+        # it: the example invokes a context the server exposes, read from
+        # SCP_MCP_SSE_CONTEXT_ID, and that context must offer an outlet named
+        # ``summarize``. An SCP SSE server always runs a bearer check (ADR-015),
+        # so pass the token that server's operator gives you, read here from
+        # SCP_MCP_SSE_TOKEN. The transport has no TLS, so a token is sent only
+        # to a loopback host.
         sse_token = os.environ.get("SCP_MCP_SSE_TOKEN")
-        if not sse_token:
-            raise RuntimeError("set SCP_MCP_SSE_TOKEN to the bearer token of the SCP SSE server")
-        client = await scp.mcp_client_connect_sse("http://localhost:8080/mcp", sse_token)
+        sse_context_id = os.environ.get("SCP_MCP_SSE_CONTEXT_ID")
+        if not sse_token or not sse_context_id:
+            raise RuntimeError(
+                "set SCP_MCP_SSE_TOKEN to the bearer token of the SCP SSE server on "
+                "127.0.0.1:8080 and SCP_MCP_SSE_CONTEXT_ID to a context it exposes"
+            )
+        client = await scp.mcp_client_connect_sse("http://127.0.0.1:8080/sse", sse_token)
         outlets = await scp.mcp_client_list_tools(client)
         print(f"The SSE server offers {len(outlets)} outlet(s)")
 
@@ -52,7 +62,7 @@ async def main() -> None:
             client,
             "summarize",
             {"text": "SCP is a protocol for..."},
-            ctx.context_id,
+            sse_context_id,
             identity.did,
         )
         print(f"Result: {result}")

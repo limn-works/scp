@@ -11,6 +11,8 @@ Covers:
 - Per-instance allowlist API on :class:`SCP`:
   ``mcp_configure_stdio_allowlist``, ``mcp_disable_stdio_allowlist``,
   ``mcp_reset_stdio_allowlist``, ``mcp_get_stdio_allowlist``
+- ``examples/mcp_integration.py`` dials the ``GET`` route the SCP SSE server's
+  router in ``crates/scp-mcp/src/sse.rs`` declares
 
 Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`McpServer` and
 :class:`McpClient` into pure handle wrappers. :func:`serve_mcp` /
@@ -583,3 +585,54 @@ class TestStdioAllowlistInstanceIsolation:
 
         b_state = b.mcp_get_stdio_allowlist()
         assert "custom-a" not in b_state["allowed"]
+
+
+# ---------------------------------------------------------------------------
+# The MCP example dials the path an SCP SSE server serves
+# ---------------------------------------------------------------------------
+
+
+def _sse_get_routes() -> set[str]:
+    """Return the GET routes the SCP SSE server's router declares."""
+    import re
+    from pathlib import Path
+
+    sse_rs = Path(__file__).resolve().parents[3] / "crates" / "scp-mcp" / "src" / "sse.rs"
+    return set(re.findall(r'\.route\("([^"]+)",\s*get\(', sse_rs.read_text()))
+
+
+def _connect_sse_url_paths(source: str) -> list[str]:
+    """Return the URL path of every string-literal ``mcp_client_connect_sse`` URL."""
+    import ast
+    from urllib.parse import urlsplit
+
+    paths = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "mcp_client_connect_sse"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            paths.append(urlsplit(node.args[0].value).path)
+    return paths
+
+
+class TestMcpExampleSsePath:
+    def test_example_dials_a_get_route_the_sse_server_serves(self) -> None:
+        from pathlib import Path
+
+        routes = _sse_get_routes()
+        assert routes == {"/sse"}
+        example = Path(__file__).resolve().parents[1] / "examples" / "mcp_integration.py"
+        paths = _connect_sse_url_paths(example.read_text())
+        assert paths, "the example makes no mcp_client_connect_sse call with a literal URL"
+        assert all(path in routes for path in paths), paths
+
+    def test_a_path_the_sse_server_does_not_serve_is_detected(self) -> None:
+        source = 'client = await scp.mcp_client_connect_sse("http://localhost:8080/mcp", t)'
+        paths = _connect_sse_url_paths(source)
+        assert paths == ["/mcp"]
+        assert not all(path in _sse_get_routes() for path in paths)
