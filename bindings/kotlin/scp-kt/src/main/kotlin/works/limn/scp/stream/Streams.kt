@@ -210,9 +210,12 @@ internal fun buildPaginatedFilter(
  *
  * ## Cleanup
  *
- * Call [stopContextEvents] or [stopMessageStream] to unsubscribe from the
- * Rust engine and release resources. Cleanup also occurs if the factory
- * is garbage collected, but explicit cleanup is strongly preferred.
+ * Call [stopAll] in teardown, or [stopContextEvents] or [stopMessageStream] for
+ * one handle, to unsubscribe from the Rust engine and remove the registry
+ * entry. Nothing else releases a subscription: cancelling a collector's scope
+ * does not, and the factory has no finalizer or cleaner, so dropping it
+ * without a stop leaves every Rust subscription it opened live, still
+ * emitting into its [SharedFlow].
  */
 class HotStreamFactory(
     private val contextBindings: EventContextBindings,
@@ -370,9 +373,11 @@ class HotStreamFactory(
     /**
      * Stop receiving context events for the given context handle.
      *
-     * Unsubscribes from the Rust engine and removes the internal state.
-     * After this call, the [SharedFlow] returned by [contextEvents] will
-     * no longer receive new events.
+     * Removes the handle's registry entry and unsubscribes from the Rust engine.
+     * When the unsubscribe call succeeds, the [SharedFlow] returned by
+     * [contextEvents] receives no new events after this call. When it throws,
+     * the Rust subscription may stay live and keep emitting into that
+     * [SharedFlow], although no registry entry names it any more.
      *
      * Takes [eventMutex], so a stop that races an in-flight [contextEvents] call for one same
      * handle waits for that call to record its subscription and then releases it. Without that
@@ -401,9 +406,12 @@ class HotStreamFactory(
     /**
      * Stop receiving messages for the given context handle.
      *
-     * Takes [messageMutex], and waits for it under [NonCancellable], for the reasons
-     * [stopContextEvents] states about [eventMutex]. An unsubscribe call that throws is logged,
-     * never thrown, as [stopContextEvents] states.
+     * Removes the handle's registry entry and unsubscribes from the Rust engine, and after an
+     * unsubscribe call that throws the [SharedFlow] returned by [incomingMessages] may keep
+     * receiving messages, as [stopContextEvents] states for events. Takes [messageMutex], and
+     * waits for it under [NonCancellable], for the reasons [stopContextEvents] states about
+     * [eventMutex]. An unsubscribe call that throws is logged, never thrown, as
+     * [stopContextEvents] states.
      *
      * @param contextHandle The context to stop receiving messages for.
      */
@@ -516,8 +524,8 @@ class HotStreamFactory(
  * Internal state for an active hot stream subscription.
  *
  * Pairs a read-only [SharedFlow] that a caller collects with a Rust subscription handle, so that
- * [HotStreamFactory.stopContextEvents] and [HotStreamFactory.stopMessageStream] can unsubscribe
- * from a Rust engine.
+ * [HotStreamFactory.stopContextEvents], [HotStreamFactory.stopMessageStream], and
+ * [HotStreamFactory.stopAll] can unsubscribe from a Rust engine.
  *
  * Carries no `equals` override, so two instances compare by identity. [SubscriptionSlot] relies
  * on that: it removes a registry entry only when that entry is its own instance.
