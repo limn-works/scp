@@ -6,9 +6,14 @@
 //! docs list where the two differ. ADR-021 and ADR-027 require the class to
 //! implement the `UniFFI` `KeyCustodyProvider` callback interface and to be injected
 //! into the Rust engine. The class does neither, and no code injects it into
-//! the Rust engine. Story SCP-110 stays in progress while the class fails its
-//! trait criterion. This module documents the Rust-side contract and
-//! re-exports the trait types for Android builds.
+//! the Rust engine. Story SCP-110 stays in progress while any acceptance
+//! criterion its description in `.docs/prds/main.json` records as unmet
+//! stands: the trait criterion, the criterion that the adapter reports
+//! [`CustodyType::Hardware`] only for a key held in the TEE, the attested
+//! key-destruction criterion, and the P-256 criteria that the shipped Ed25519
+//! and X25519 keys and the signature-derived pseudonym secret fail. This
+//! module documents the Rust-side contract and re-exports the trait types for
+//! Android builds.
 //!
 //! # Key Storage Strategy
 //!
