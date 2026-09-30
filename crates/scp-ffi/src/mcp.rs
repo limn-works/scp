@@ -1910,8 +1910,12 @@ impl crate::scp::PyScp {
 ///
 /// Raises `TransportError` if the token is malformed, or if the connection
 /// or MCP handshake fails, including when the server refuses the token, or
-/// if the instance shuts down before the connect returns; a shutdown during
-/// the handshake closes the connection and ends it.
+/// if the instance shuts down before the connect returns. A shutdown during
+/// the `initialize` handshake closes the connection and ends it. The HTTP
+/// `GET` and the wait for the server's `endpoint` event run before the client
+/// is registered, so a shutdown does not end them: each read there waits up
+/// to 30 seconds, and a server that sends a byte within every 30 seconds
+/// holds the connect without limit.
 #[pymethods]
 impl crate::scp::PyScp {
     #[pyo3(name = "py_mcp_client_connect_sse", signature = (url, auth_token))]
@@ -1924,8 +1928,10 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         validate::validate_relay_url(url)?;
 
-        // Connect to the SSE endpoint and perform the initialize handshake
-        // with the GIL released, so a silent server stalls only this thread.
+        // Open the SSE stream and wait for the server's `endpoint` event with
+        // the GIL released, so a silent server stalls only this thread. The
+        // client is not registered yet, so a shutdown does not end this wait;
+        // `initialize_registered` then registers it and runs `initialize`.
         let transport = py
             .allow_threads(|| SseClientTransport::connect(url, auth_token))
             .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
