@@ -2,12 +2,11 @@
  * Shared wasm-pack build configuration for `@limn-works/scp-ts-wasm`.
  *
  * The build profile is a single invariant (ADR-057 Prerequisite 4): the shipped
- * wasm MUST be a `--release` build. That is the configuration the
- * `fuzz_mls_decrypt` target fuzzes with `-O` (debug-assertions off), so it is
- * the configuration whose decrypt path is shown to return a typed
- * `[SCP-CRYPTO-4041]` `DecryptionFailed` on tampered ciphertext rather than
- * panic. A `--dev` build turns on every `debug_assert!` in SCP and its
- * dependencies, a panic surface the shipped path is never fuzzed against.
+ * wasm MUST be a `--release` build. A `--dev` build turns on every
+ * `debug_assert!` and overflow check in SCP and its dependencies, each a panic
+ * site the release build does not carry, and in the browser a panic aborts the
+ * tab. The decrypt path returns a typed `[SCP-CRYPTO-4041]` `DecryptionFailed`
+ * on tampered ciphertext in either build.
  *
  * The profile flag is a constant here so the `check-release-only` guard asserts
  * against the SAME argv the build actually runs — a positive, bounded invariant
@@ -40,8 +39,7 @@ export const FORBIDDEN_PROFILE_FLAGS: readonly string[] = ["--dev", "--debug", "
  * spawns wasm-pack) and the standalone `check-release-only` guard, so the two can
  * never drift. Together with the root `[profile.release] debug-assertions = false`
  * line in `Cargo.toml`, `--release` guarantees the shipped wasm has
- * debug-assertions off, the configuration `fuzz_mls_decrypt -O` exercises
- * (ADR-057 Prereq-4).
+ * debug-assertions off (ADR-057 Prereq-4).
  */
 export function assertReleaseOnly(args: readonly string[]): void {
   if (!args.includes(WASM_PACK_PROFILE_FLAG)) {

@@ -29,10 +29,12 @@
 //! # Build profiles
 //!
 //! The shipped browser wasm is a `--release` build with debug-assertions off.
-//! `cd fuzz && cargo fuzz run fuzz_mls_decrypt -O …` matches it; without `-O`,
-//! cargo-fuzz injects `-Cdebug-assertions`, which also exercises openmls's and
-//! SCP's debug-only checks. CI runs the `-O` build. See
-//! `.github/workflows/fuzz.yml` (`fuzz-mls-decrypt` job).
+//! CI runs this target like every other, without `-O`, so cargo-fuzz injects
+//! `-Cdebug-assertions` and `-Coverflow-checks` and the fuzzed build also
+//! exercises openmls's and SCP's debug-only checks, a superset of the panic
+//! sites the shipped build carries. openmls 0.9.0 returns a typed error for a
+//! tampered ciphertext in both configurations. See the `fuzz_mls_decrypt` leg of
+//! `fuzz-nightly` in `.github/workflows/fuzz.yml`.
 //!
 //! # Strategy — a FRESH generation-0 receiver per decrypt call
 //!
