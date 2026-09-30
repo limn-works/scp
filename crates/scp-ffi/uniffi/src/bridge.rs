@@ -4620,33 +4620,50 @@ pub(crate) struct McpClientEntry {
     /// parked thread.
     pub(crate) client:
         Arc<tokio::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>>,
-    /// A stdio client's server process, which the entry's `Drop` stops
-    /// through [`stop_stdio_server`], so every path that drops the entry (a
-    /// disconnect, the registry clear at instance shutdown, the instance's
-    /// drop) kills the server: an in-flight call's clone of `client` would
-    /// otherwise keep the process alive, and a blocking thread parked on its
-    /// stdout, for as long as the server stays silent. `None` for an SSE
-    /// client: its POST read has no timeout, and a disconnect has no handle
-    /// that ends it, so the one call in flight against a silent SSE server
-    /// holds its blocking thread until the server answers or closes the
-    /// connection.
-    pub(crate) stdio_server: Option<Arc<std::sync::Mutex<Option<std::process::Child>>>>,
+    /// What the entry's `Drop` uses to end the client's transport, so every
+    /// path that drops the entry (a disconnect, the registry clear at
+    /// instance shutdown, the instance's drop) ends a call in flight on the
+    /// handle: that call's clone of `client` would otherwise keep the
+    /// transport open, and a blocking thread parked on it, for as long as the
+    /// server stays silent.
+    closer: McpClientCloser,
     /// Set by the entry's `Drop`. A call reads it after it takes the client's
     /// lock, so a call queued behind an in-flight one fails once the handle
-    /// is disconnected instead of sending a request over a transport the
-    /// disconnect left open (an SSE client's connection outlives the entry).
+    /// is disconnected instead of sending a request.
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl McpClientEntry {
     fn new(
         client: scp_mcp::client::McpClient<McpUniFFITransportWrapper>,
-        stdio_server: Option<Arc<std::sync::Mutex<Option<std::process::Child>>>>,
+        closer: McpClientCloser,
     ) -> Self {
         Self {
             client: Arc::new(tokio::sync::Mutex::new(client)),
-            stdio_server,
+            closer,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Ends an MCP client's transport from outside the call that uses it.
+pub(crate) enum McpClientCloser {
+    /// A stdio client's server process. [`stop_stdio_server`] kills its
+    /// process group, so a call parked on the server's stdout fails on the
+    /// closed pipe.
+    Stdio(Arc<std::sync::Mutex<Option<std::process::Child>>>),
+    /// An SSE client's closer. A POST read has no timeout, so a call parked
+    /// on a silent server ends only when
+    /// [`scp_mcp::sse_client::SseCloser::close`] shuts down its socket and
+    /// the `GET` stream's.
+    Sse(scp_mcp::sse_client::SseCloser),
+}
+
+impl McpClientCloser {
+    fn close(&self) {
+        match self {
+            Self::Stdio(server) => stop_stdio_server(server),
+            Self::Sse(closer) => closer.close(),
         }
     }
 }
@@ -4705,12 +4722,11 @@ impl Drop for McpClientEntry {
         // A call queued on the handle's lock fails once it gets the lock.
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
-        // A stdio server, and every process in its process group, is dead
-        // once the entry drops, even while a call on the handle is in flight;
-        // that call then fails on the closed stdout.
-        if let Some(server) = &self.stdio_server {
-            stop_stdio_server(server);
-        }
+        // The transport is closed once the entry drops, even while a call on
+        // the handle is in flight: a stdio server's process group is dead
+        // and the call fails on the closed stdout, or an SSE client's sockets
+        // are shut down and the call fails as closed.
+        self.closer.close();
     }
 }
 
@@ -16788,7 +16804,7 @@ impl Scp {
             &self.inner,
             mcp_client_registry(&self.inner),
             mcp_handle_id("mcp-client"),
-            McpClientEntry::new(client, Some(server)),
+            McpClientEntry::new(client, McpClientCloser::Stdio(server)),
         )
     }
 
@@ -16806,20 +16822,21 @@ impl Scp {
     ) -> Result<String, ScpError> {
         validate_relay_url(&url)?;
 
-        let client = run_mcp_client_io(codes::TRANS_5018, move || {
+        let (client, closer) = run_mcp_client_io(codes::TRANS_5018, move || {
             let transport =
                 scp_mcp::sse_client::SseClientTransport::connect(&url, auth_token.as_deref())
                     .map_err(|e| ScpError::Transport {
                         msg: format!("failed to connect SSE client: {e}"),
                         code: codes::TRANS_5018.to_owned(),
                     })?;
+            let closer = transport.closer();
             let mut client =
                 scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Sse(transport));
             client.initialize().map_err(|e| ScpError::Transport {
                 msg: format!("MCP initialize handshake failed: {e}"),
                 code: codes::TRANS_5018.to_owned(),
             })?;
-            Ok(client)
+            Ok((client, closer))
         })
         .await?;
 
@@ -16827,21 +16844,20 @@ impl Scp {
             &self.inner,
             mcp_client_registry(&self.inner),
             mcp_handle_id("mcp-client"),
-            McpClientEntry::new(client, None),
+            McpClientEntry::new(client, McpClientCloser::Sse(closer)),
         )
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     ///
     /// Routes through the module-level MCP client registry. Dropping the
-    /// entry stops a stdio client's server, so its process group, which holds
-    /// the processes the server started, is dead when this returns, even
-    /// while a call on the handle is in flight; that call then fails on the
-    /// closed stdout. A call queued behind the in-flight one, on a stdio or
-    /// an SSE client, fails as disconnected once it takes the client's lock
-    /// and sends nothing. A disconnect does not end a call in flight on an
-    /// SSE client: that call waits until the server answers its POST or
-    /// closes the connection.
+    /// entry closes the client's transport, even while a call on the handle
+    /// is in flight. A stdio client's server process group, which holds the
+    /// processes the server started, is dead when this returns, and the
+    /// call fails on the closed stdout. An SSE client's POST and `GET`
+    /// sockets are shut down, and the call fails as closed. A call queued
+    /// behind the in-flight one, on a stdio or an SSE client, fails as
+    /// disconnected once it takes the client's lock and sends nothing.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
@@ -23405,7 +23421,7 @@ mod tests {
         let handle = mcp_handle_id("mcp-client");
         mcp_client_registry(&scp.inner).insert(
             handle.clone(),
-            McpClientEntry::new(client, Some(Arc::clone(&server))),
+            McpClientEntry::new(client, McpClientCloser::Stdio(Arc::clone(&server))),
         );
 
         let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -23458,6 +23474,127 @@ mod tests {
         );
     }
 
+    /// The SSE twin of `mcp_client_disconnect_does_not_wait_on_an_in_flight_call`:
+    /// a disconnect ends a `tools/list` whose POST a silent SSE server
+    /// accepted and never answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_client_disconnect_ends_an_in_flight_sse_call() {
+        in_flight_sse_call_ends_on(Teardown::Disconnect).await;
+    }
+
+    /// The SSE twin of
+    /// `mcp_client_registry_clear_on_shutdown_kills_an_in_flight_server`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_client_registry_clear_on_shutdown_ends_an_in_flight_sse_call() {
+        in_flight_sse_call_ends_on(Teardown::Shutdown).await;
+    }
+
+    /// Reads one HTTP request from `conn` and returns its body.
+    fn read_http_body(conn: &std::net::TcpStream) -> Vec<u8> {
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(conn);
+        let mut length = 0_usize;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read head");
+            if n == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.strip_prefix("Content-Length: ") {
+                length = v.trim().parse().expect("content length");
+            }
+        }
+        let mut body = vec![0_u8; length];
+        reader.read_exact(&mut body).expect("read body");
+        body
+    }
+
+    /// Connects through `mcp_client_connect_sse` to a stub SSE server that
+    /// completes the `initialize` handshake, then accepts the `tools/list`
+    /// POST and never writes its status line, and removes the client entry
+    /// mid-call through `teardown`. The POST's connection has no read
+    /// timeout and the stub holds it open for thirty seconds, so the call
+    /// ends inside the ten-second bound only if the entry's drop closes the
+    /// transport the connect registered.
+    async fn in_flight_sse_call_ends_on(teardown: Teardown) {
+        use std::io::Write;
+        const ACCEPTED: &[u8] = b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (posted_tx, posted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept GET");
+            read_http_body(&sse);
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                  event: endpoint\r\ndata: /message?sessionId=s1\r\n\r\n",
+            )
+            .expect("write endpoint event");
+            let (mut init, _) = listener.accept().expect("accept initialize POST");
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_http_body(&init)).expect("initialize body");
+            init.write_all(ACCEPTED).expect("answer initialize POST");
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "stub"},
+                },
+            });
+            sse.write_all(format!("event: message\r\ndata: {response}\r\n\r\n").as_bytes())
+                .expect("write initialize response");
+            let (mut notified, _) = listener.accept().expect("accept notification POST");
+            read_http_body(&notified);
+            notified
+                .write_all(ACCEPTED)
+                .expect("answer notification POST");
+            let (list, _) = listener.accept().expect("accept tools/list POST");
+            read_http_body(&list);
+            let _ = posted_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+            drop((sse, list));
+        });
+        let scp = scp_test();
+        let handle = scp
+            .mcp_client_connect_sse(format!("http://127.0.0.1:{port}/sse"), None)
+            .await
+            .expect("connect to the stub SSE server");
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(scp.mcp_client_list_tools(handle.clone()), async {
+                posted_rx
+                    .await
+                    .expect("the stub accepted the tools/list POST");
+                match teardown {
+                    Teardown::Disconnect => scp
+                        .mcp_client_disconnect(handle.clone())
+                        .await
+                        .expect("disconnect a known handle"),
+                    Teardown::Shutdown => scp.shutdown(1_000).await.expect("shut down"),
+                }
+            })
+        })
+        .await;
+        let _ = release_tx.send(());
+        server.join().expect("server thread");
+        let (listed, ()) =
+            joined.expect("the in-flight call must end once the teardown closes the transport");
+        assert!(
+            mcp_client_registry(&scp.inner).get(&handle).is_none(),
+            "the teardown must remove the client entry"
+        );
+        let Err(err) = listed else {
+            panic!("the silent stub server sent no tools/list response");
+        };
+        assert!(
+            err.to_string().contains("SSE connection is closed"),
+            "the call must fail on the closed transport, got: {err}"
+        );
+    }
+
     /// A stop takes the server out of its slot, so a second stop (the
     /// transport's drop after the entry's) finds nothing to signal and never
     /// peeks a pid the kernel may have handed to another child.
@@ -23478,9 +23615,10 @@ mod tests {
     }
 
     /// A call queued behind an in-flight one sends nothing once the handle is
-    /// disconnected, though the transport is still open. The entry carries no
-    /// server process, as an SSE client's does not, so the disconnect leaves
-    /// the stub server answering: the in-flight `tools/list` gets its answer,
+    /// disconnected, though the transport is still open. The entry's closer
+    /// holds an empty server slot, so the disconnect leaves the stub server
+    /// answering and the test isolates the closed flag from the transport's
+    /// close: the in-flight `tools/list` gets its answer,
     /// and the stub would answer the queued one too had the queued call sent
     /// it. The refusal carries the queued operation's disconnected code,
     /// not the code for an unknown handle.
@@ -23526,7 +23664,13 @@ mod tests {
             scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
         client.initialize().expect("initialize the stub server");
         let handle = mcp_handle_id("mcp-client");
-        mcp_client_registry(&scp.inner).insert(handle.clone(), McpClientEntry::new(client, None));
+        mcp_client_registry(&scp.inner).insert(
+            handle.clone(),
+            McpClientEntry::new(
+                client,
+                McpClientCloser::Stdio(Arc::new(std::sync::Mutex::new(None))),
+            ),
+        );
 
         let short = std::time::Duration::from_millis(300);
         let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -23620,7 +23764,7 @@ mod tests {
             let handle = mcp_handle_id("mcp-client");
             mcp_client_registry(&scp.inner).insert(
                 handle.clone(),
-                McpClientEntry::new(client, Some(Arc::clone(&server))),
+                McpClientEntry::new(client, McpClientCloser::Stdio(Arc::clone(&server))),
             );
 
             let short = std::time::Duration::from_millis(300);
