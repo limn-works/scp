@@ -16,8 +16,8 @@
  * repository sends an FCM message. When one arrives, FCM starts the app if it is not
  * running (Android delivers nothing to an app the user force-stopped) and delivers the
  * message to `FirebaseMessagingService.onMessageReceived`, where the caller passes its
- * data to [handleNotification]. No SDK code connects to a relay or pulls envelopes: the
- * caller does both when [handleNotification] returns [WakeSignal.PULL].
+ * data to [handleNotification]. No SDK code connects to a relay or pulls envelopes on a
+ * push: the caller does both when [handleNotification] returns [WakeSignal.PULL].
  *
  * [handleNotification] checks only the `scp` field. It rejects a payload that lacks the
  * field with [ScpException] code `SCP-TRANS-5001`, and a payload whose field is not

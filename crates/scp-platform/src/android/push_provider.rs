@@ -23,8 +23,8 @@
 //! is not running (Android delivers nothing to an app the user force-stopped)
 //! and delivers the message to `FirebaseMessagingService.onMessageReceived`,
 //! where the caller passes its data to the Kotlin adapter. No SDK code
-//! connects to a relay or pulls envelopes: the caller does both when the
-//! Kotlin adapter returns `WakeSignal.PULL`.
+//! connects to a relay or pulls envelopes on a push: the caller does both
+//! when the Kotlin adapter returns `WakeSignal.PULL`.
 //!
 //! Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send
 //! exactly `{ "scp": 1 }`. FCM has carried every field of a payload before
