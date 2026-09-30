@@ -585,10 +585,11 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
    - Errors are returned as JSON-RPC error responses with descriptive messages.
 
 3. **MCP server — resource listing (context events):**
-   - `resources/list` returns SCP context event streams as MCP resources.
-   - Resources: `scp://context_a/events`, `scp://context_a/members`, `scp://context_a/tools`.
-   - `resources/read` returns the current state of a resource (e.g., member list, recent events).
-   - Resource subscriptions (`resources/subscribe`) map to SCP context event streams.
+   - `resources/list` returns, for each context the server serves, the resources of that context the agent may read, out of `scp://{context}/events`, `scp://{context}/members` and `scp://{context}/tools`. The list leaves out a resource the agent may not read instead of reporting an error for it.
+   - One access rule decides which resources the agent may read (`ResourceKind::check_access` in `scp-mcp`). Reading `events` or `members` requires `messages:read`, because the role table of the contexts spec (§5.5.1, Default Role Set) lets an `observer`, whose only capability is `messages:read`, see all content and membership. Reading `tools` requires membership only, because its contents are the capability-filtered tool list, so a member with no tool capabilities reads `[]`.
+   - `resources/read` returns the current state of a resource (e.g., member list, recent events). The server answers a read by an agent that does not take part in the context with RESOURCE_NOT_FOUND (-32002), a read the access rule refuses with CAPABILITY_DENIED (-32005), and a read this server cannot perform, whatever capability the agent holds, with CAPABILITY_UNSUPPORTED (-32007). `resources/subscribe` answers with the same three errors.
+   - `resources/subscribe` and `resources/unsubscribe` map to SCP context event streams. When a context event changes a subscribed resource that the agent may still read, the server sends `notifications/resources/updated` for that resource. When a membership, capability or lifecycle event changes this agent's tool list or readable resources, or removes the context from the served set, the server sends `notifications/tools/list_changed` and `notifications/resources/list_changed`. `resources/unsubscribe` succeeds for a URI that is not subscribed.
+   - A server serves subscriptions only when a context event source is wired to it. A server with no event source, which the bridges create while the instance is suspended or has no supervisor, advertises `resources.subscribe`, `resources.listChanged` and `tools.listChanged` as false at `initialize`, and answers `resources/subscribe` and `resources/unsubscribe` with METHOD_NOT_FOUND (-32601). The server stays without an event source for its whole life, so the host creates the server again once the instance has a supervisor and is not suspended.
 
 4. **MCP server — stdio transport:**
    - Reads JSON-RPC requests from stdin (line-delimited JSON).
