@@ -114,8 +114,10 @@ data class PseudonymKeyHandle(
  *   the field says no more than that [KeyCustodyProvider.destroyKey] returned. For a Keystore
  *   key, the check asks Keystore whether it still holds the alias. For a software key, the check
  *   reads the in-memory map right after removing the id from it, so it fails only when another
- *   call inserts the same id between the removal and the check, and [AndroidKeyCustody] inserts
- *   only fresh random UUIDs. It does not read the EncryptedSharedPreferences entry that holds
+ *   call inserts the same id between the removal and the check. Apart from its constructor,
+ *   which restores the ids of persisted software Ed25519 seeds before any
+ *   [KeyCustodyProvider.destroyKey] call can run, [AndroidKeyCustody] inserts only fresh random
+ *   UUIDs. It does not read the EncryptedSharedPreferences entry that holds
  *   the seed of a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates
  *   (API 26-32). [AndroidKeyCustody] removes that entry with
  *   `apply()`, which returns before the removal reaches disk, so `confirmed` is `true` while the
@@ -223,9 +225,7 @@ interface DeviceAttestationProvider {
      *   this parameter; [AndroidDeviceAttestation] reads it into the `clientDataJSON` nonce
      *   today (see its KDoc).
      * @return Platform-specific attestation token bytes.
-     * @throws ScpException if attestation fails. ADR-027 acceptance criterion 7 requires the
-     *   Android adapter to throw [ScpException] with code `SCP-ATTEST-9001` for every failure;
-     *   [AndroidDeviceAttestation] converts only some exception types (see its KDoc).
+     * @throws ScpException if attestation fails.
      */
     suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray
 
@@ -237,10 +237,7 @@ interface DeviceAttestationProvider {
      *   ADR-027 require the caller to pass `A`, never the request bytes or
      *   their plain SHA-256. No Rust code calls this method yet.
      * @return Platform-specific assertion token bytes.
-     * @throws ScpException if assertion fails. ADR-027's Implementation paragraph on
-     *   `AndroidDeviceAttestation.kt` requires every failure to leave the Android adapter as
-     *   [ScpException]; acceptance criterion 8, which covers this method, names no error rule;
-     *   [AndroidDeviceAttestation] converts only some exception types (see its KDoc).
+     * @throws ScpException if assertion fails.
      */
     suspend fun assertRequest(requestHash: ByteArray): ByteArray
 }
