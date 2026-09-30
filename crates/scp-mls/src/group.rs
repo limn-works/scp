@@ -945,10 +945,11 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     drop(group.signer.take());
 
     // The provider's storage holds HPKE key pairs, epoch and message secrets,
-    // and key packages. Zeroize every value, then replace the provider with a
-    // fresh empty one (the old provider's own `Drop` wipes again, finding
-    // nothing left).
-    crate::provider::wipe_memory_storage(group.provider.storage());
+    // and key packages. Replacing the provider with a fresh empty one drops the
+    // old one, and `InMemoryMlsProvider`'s `Drop` zeroizes every value present
+    // then and empties the map, once. This does not reach values openmls already
+    // replaced or deleted during the group's life: `MemoryStorage` freed those
+    // unzeroized.
     group.provider = InMemoryMlsProvider::default();
 
     // Mark the group as destroyed so all future operations are rejected.
@@ -1569,9 +1570,19 @@ mod tests {
         assert!(group.group.is_some());
         assert!(group.signer.is_some());
 
+        assert!(
+            !group.provider().storage().values.read().unwrap().is_empty(),
+            "a live group's provider holds its epoch and HPKE secrets"
+        );
+
         destroy_group(&mut group).unwrap();
 
-        // After destroy: group and signer are None, provider is fresh.
+        // After destroy: group and signer are None, provider is fresh and empty
+        // (the old provider's `Drop` zeroized and cleared its storage).
+        assert!(
+            group.provider().storage().values.read().unwrap().is_empty(),
+            "no storage entry survives destroy_group"
+        );
         assert!(
             group.group.is_none(),
             "MLS group must be dropped on destroy"
