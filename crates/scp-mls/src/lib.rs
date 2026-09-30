@@ -45,6 +45,10 @@
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.
 
+// The crate holds the MLS signer, `destroy_group`, and the zeroizing provider;
+// no unsafe code may enter it.
+#![forbid(unsafe_code)]
+
 pub mod context_extension;
 pub mod convergent_timestamp;
 pub mod credential;
