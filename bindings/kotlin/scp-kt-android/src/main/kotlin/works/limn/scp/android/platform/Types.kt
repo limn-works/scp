@@ -494,13 +494,19 @@ interface KeyCustodyProvider {
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for a key handle.
      *
-     * Required for governance vote signing, which needs the raw signing key
-     * bytes. Software-backed keys can export their private material.
+     * Governance vote signing takes raw signing key bytes, and this method is where a caller
+     * gets them. Software-backed keys can export their private material.
      * Keystore keys ([CustodyType.HARDWARE]) are non-extractable, so the method MUST throw
      * for one, with a clear message indicating that governance signing is not supported
-     * on Keystore keys. ADR-063's curve slice requires governance signing to take a
-     * signer instead of raw-key export; until that slice lands, this method exports the
-     * seed of a software key.
+     * on Keystore keys.
+     *
+     * ADR-063's curve slice requires every core function that takes a raw signing key to
+     * take a signer instead, and every key-export accessor, this method included, to leave
+     * the custody adapters and all three bridges. That slice has not landed, so this method
+     * still exports the seed of a software key. ADR-027 acceptance criterion 14 (private key
+     * isolation) says the Rust engine receives only signatures and public keys, never private
+     * key material, and the UniFFI `KeyCustodyProvider` callback's `export_signing_key_bytes`
+     * would carry this seed to Rust, so this method's design diverges from criterion 14.
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
