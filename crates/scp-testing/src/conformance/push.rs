@@ -174,7 +174,8 @@ mod tests {
 
     /// An adapter that derives its signal from the payload with its function.
     /// It leaks the derived bytes to get the `&'static` slice `WakeSignal`
-    /// holds, the one way an adapter can put payload bytes in a signal.
+    /// holds, one of the ways an adapter can make its signal vary with the
+    /// payload.
     struct DerivingPush(fn(&[u8]) -> Vec<u8>);
 
     impl Push for DerivingPush {
@@ -257,6 +258,30 @@ mod tests {
                 .map_or_else(|| b"wake".to_vec(), |i| p[i..].to_vec())
         }))
         .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "wake signal varies with the notification payload")]
+    async fn rejects_constant_chosen_by_payload_content() {
+        // Two `'static` constants and no leak: the type accepts this adapter,
+        // and only the conformance check rejects it.
+        struct SelectingPush;
+        impl Push for SelectingPush {
+            async fn register(&self) -> Result<PushToken, PlatformError> {
+                Ok(PushToken::new(b"token".to_vec()))
+            }
+            async fn handle_notification(
+                &self,
+                payload: &[u8],
+            ) -> Result<WakeSignal, PlatformError> {
+                if payload.windows(4).any(|w| w == b"ctx-") {
+                    Ok(WakeSignal::new(b"wake-ctx"))
+                } else {
+                    Ok(WakeSignal::new(b"wake"))
+                }
+            }
+        }
+        check_fixed_wake_signal(&SelectingPush).await;
     }
 
     #[tokio::test]

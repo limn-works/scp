@@ -866,7 +866,7 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (`InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3; the `Push` trait's `handle_notification` returns one fixed wake signal, which `WakeSignal`'s `&'static` bytes enforce against the borrowed payload; `push_conformance!()` requires a fixed wake signal of every adapter, in the testing harness paragraph).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (`InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3; the `Push` trait's `handle_notification` returns one fixed wake signal; `WakeSignal`'s `&'static` bytes rule out returning the borrowed payload or a temporary copy of it, and `check_fixed_wake_signal` checks that the signal does not vary across the payloads it sends; `push_conformance!()` requires a fixed wake signal of every adapter, in the testing harness paragraph).
 
 **Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `KeyType` enum this ADR defines named one variant per curve and now names both by purpose: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
@@ -997,7 +997,10 @@ pub trait Push: Send + Sync {
     /// Amended 2026-09-29: returns one fixed WakeSignal for every payload it accepts, and
     /// may reject a payload instead. §10.7 of 10-infrastructure-and-self-hosting.md forbids
     /// metadata in a push payload, so the signal must not vary with the payload. WakeSignal
-    /// holds &'static bytes, so an implementation cannot return the borrowed payload.
+    /// holds &'static bytes, so an implementation cannot return the borrowed payload or a
+    /// temporary copy of it; the type does not stop a signal chosen by payload content, and
+    /// the conformance check check_fixed_wake_signal rejects a signal that varies across the
+    /// payloads it sends.
     async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError>;
 }
 

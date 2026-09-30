@@ -291,10 +291,12 @@ impl PushToken {
 /// §10.7 of the infrastructure spec forbids a context ID, a sender identifier,
 /// and any other metadata in a push payload, so a wake signal must not vary
 /// with the payload it was produced from. `WakeSignal` holds `&'static` bytes,
-/// so a [`Push`] implementation builds it from a constant: the borrowed
-/// payload and a temporary copy of it do not compile (the two examples below),
-/// and only a deliberate leak such as `Vec::leak` gets payload bytes in. The
-/// conformance check `scp_testing::conformance::push::check_fixed_wake_signal`
+/// so returning the borrowed payload or a temporary copy of it does not
+/// compile (the two examples below). The type does not stop a signal that
+/// varies with the payload: an implementation can leak payload bytes with
+/// `Vec::leak`, pick one of several `'static` constants by payload content, or
+/// slice a `static` table at an index read from the payload. The conformance
+/// check `scp_testing::conformance::push::check_fixed_wake_signal` is what
 /// rejects an adapter whose signal differs across the payloads it sends,
 /// however the signal was built. `InMemoryPush`, the durability-only adapter behind the
 /// `in-memory-push` feature (ADR-062 §0), returns the fixed bytes
