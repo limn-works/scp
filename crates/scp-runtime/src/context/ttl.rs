@@ -539,7 +539,7 @@ pub async fn finalize_close(
     // Validate state transition BEFORE any key destruction (which the caller,
     // `ttl_close_helpers::finalize_close`, performs on the ACTOR-owned crypto
     // AFTER this returns Ok). Key destruction is irreversible — once destroyed
-    // (sender keys zeroized, MLS group + signer freed), encrypted content becomes
+    // (sender keys, MLS signer, and MLS provider storage zeroized), encrypted content becomes
     // permanently unreadable. If the transition fails
     // (e.g. context is not in Closing state), no keys must be destroyed.
     handle.transition_to(&ContextState::Closed)?;
@@ -749,8 +749,8 @@ pub(crate) fn apply_ttl_terminal_transition(
     //    Ephemeral/Summary close, so the secrets must be released explicitly.
     //    `dispose_secrets` runs OpenMLS `destroy_group` (eagerly dropping the
     //    Ed25519 signer, whose private key zeroizes on drop because
-    //    `SignatureKeyPair` holds it in `SecretVLBytes`, and freeing the group's
-    //    in-memory storage) and zeroizes the sender key material. SYNC (no `.await`), so
+    //    `SignatureKeyPair` holds it in `SecretVLBytes`, and zeroizing the group's
+    //    in-memory provider storage) and zeroizes the sender key material. SYNC (no `.await`), so
     //    this whole phase runs outside any timeout.
     //
     //    #2199 / F-BH — COMPLETION vs PROVENANCE are SEPARATED here. The STEP

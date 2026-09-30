@@ -314,12 +314,8 @@ fn signer_and_provider_from_wrapper(
         }
     }
 
-    // Re-store the signer in the provider's key store so OpenMLS can resolve
-    // it during Welcome processing.
-    signer
-        .store(provider.storage())
-        .map_err(|e| MlsError::StorageError(format!("signer store failed: {e}")))?;
-
+    // The signer is not written into the provider's storage: Welcome processing
+    // and every later group operation take it as an argument.
     Ok((signer, provider))
 }
 

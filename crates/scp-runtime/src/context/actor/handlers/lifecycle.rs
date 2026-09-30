@@ -580,8 +580,8 @@ fn handle_flush_snapshot_actor<'d>(
 ///
 /// Per-actor body of the relocated sweep. Destroys this actor's
 /// per-context sender keys + MLS group + event log (in that order so
-/// secrets are released before structure tears down; the `SenderKey`s
-/// and the MLS Ed25519 signer zeroize on drop, the MLS group storage is freed).
+/// secrets are released before structure tears down; the `SenderKey`s,
+/// the MLS Ed25519 signer, and the MLS provider-storage values zeroize on drop).
 /// Mirrors the
 /// per-context body of `shutdown_all_contexts_legacy`.
 ///

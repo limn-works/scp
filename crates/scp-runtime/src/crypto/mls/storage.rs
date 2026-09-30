@@ -1029,8 +1029,9 @@ impl<S: Storage> OpenMlsProvider for ScpMlsProvider<S> {
 ///
 /// Each provider instance has independent storage. This is retained for
 /// backward compatibility with existing tests and Phase 1 code. The
-/// `InMemoryMlsProvider` type alias itself now lives in the `scp-mls` crate
-/// (ADR-057); it is re-exported from `crate::crypto::mls`.
+/// `InMemoryMlsProvider` type itself lives in the `scp-mls` crate (ADR-057),
+/// which zeroizes its storage when the provider drops; it is re-exported from
+/// `crate::crypto::mls`.
 ///
 /// # Example
 ///
@@ -1039,7 +1040,7 @@ impl<S: Storage> OpenMlsProvider for ScpMlsProvider<S> {
 /// ```
 #[must_use]
 pub(crate) fn new_provider() -> scp_mls::InMemoryMlsProvider {
-    openmls_rust_crypto::OpenMlsRustCrypto::default()
+    scp_mls::InMemoryMlsProvider::default()
 }
 
 // ---------------------------------------------------------------------------

@@ -383,9 +383,9 @@ impl OwnedMlsCryptoState {
     }
 
     /// Best-effort teardown of a born-but-never-seeded payload's secrets on a
-    /// creation-rollback path (#2148 F6). A bare drop FREES the group's
-    /// in-memory `OpenMLS` storage but does NOT zeroize its epoch-secret bytes;
-    /// the Ed25519 signer zeroizes on drop (`OpenMLS` `SignatureKeyPair` holds its
+    /// creation-rollback path (#2148 F6). A bare drop zeroizes every value in
+    /// the group's in-memory `OpenMLS` provider storage (`scp_mls::InMemoryMlsProvider`
+    /// wipes on drop); the Ed25519 signer zeroizes on drop (`OpenMLS` `SignatureKeyPair` holds its
     /// private key in `SecretVLBytes`), and [`scp_mls::group::destroy_group`]
     /// drops it eagerly. The
     /// [`SenderKey`] zeroizes on its own `ZeroizeOnDrop` when the payload drops.
@@ -1055,11 +1055,6 @@ impl NodeMlsFactory {
         // deserialized — the Ed25519 private key should not linger in this
         // intermediate buffer.
         snapshot.signer_bytes.zeroize();
-
-        // Re-store the signer in the provider's key store so OpenMLS can find it.
-        signer
-            .store(provider.storage())
-            .map_err(|e| ContextError::CryptoFailed(format!("signer store failed: {e}")))?;
 
         // Reconstruct the MLS group from persisted storage via MlsGroup::load.
         let group_id = GroupId::from_slice(&snapshot.group_id);

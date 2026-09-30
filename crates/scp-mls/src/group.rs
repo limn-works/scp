@@ -133,13 +133,15 @@ pub struct ScpMlsGroup {
     /// The underlying `OpenMLS` group. `None` after [`destroy_group`]
     /// drops the MLS state (tree secrets, epoch keys, etc.).
     pub(crate) group: Option<MlsGroup>,
-    /// The MLS provider (crypto + storage) for this group.
+    /// The MLS provider (crypto + storage) for this group. Its storage values
+    /// are zeroized by [`destroy_group`] and whenever the provider drops.
     pub(crate) provider: InMemoryMlsProvider,
-    /// The local member's Ed25519 signing key pair. `None` after
-    /// [`destroy_group`] drops it. The private key is a
-    /// `tls_codec::SecretVLBytes`, which zeroizes on drop, so taking the signer
-    /// out wipes the key material at destruction rather than when the wrapper
-    /// is dropped.
+    /// The local member's Ed25519 signing key pair: the only copy of the private
+    /// key in this group, because SCP never writes the signer into the
+    /// provider's storage. `None` after [`destroy_group`] drops it. The private
+    /// key is a `tls_codec::SecretVLBytes`, which zeroizes on drop, so taking the
+    /// signer out wipes the key material at destruction rather than when the
+    /// wrapper is dropped.
     pub(crate) signer: Option<SignatureKeyPair>,
     /// Whether the group has been destroyed.
     pub(crate) destroyed: bool,
@@ -487,11 +489,10 @@ fn create_group_inner(
     let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
         .map_err(|e| MlsError::GroupCreationFailed(format!("signature key generation: {e}")))?;
 
-    // Store the signer's keys in the provider's key store so OpenMLS can
-    // look them up during group operations.
-    signer
-        .store(provider.storage())
-        .map_err(|e| MlsError::StorageError(format!("storing signature key: {e}")))?;
+    // The signer is NOT written into the provider's storage. Every openmls
+    // operation SCP calls takes the signer as an argument, and nothing reads a
+    // stored `SignatureKeyPair` back, so a stored copy would only be a second
+    // copy of the private key.
 
     // Serialize the SCP credential into the MLS BasicCredential identity field.
     let credential_bytes = credential.to_bytes()?;
@@ -937,14 +938,17 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // Eagerly drop cryptographic state. `Option::take` moves the value out,
     // leaving `None`, and the taken value is dropped at the end of the
     // statement. This releases:
-    //   - MlsGroup: tree secrets, epoch key schedules, ratchet state
+    //   - MlsGroup: tree secrets, epoch key schedules, ratchet state (freed, not
+    //     overwritten: openmls 0.9.0's in-memory `Secret` type has no zeroize)
     //   - SignatureKeyPair: Ed25519 private key, zeroized on drop by `SecretVLBytes`
     drop(group.group.take());
     drop(group.signer.take());
 
-    // Replace the provider with a fresh empty instance. The old provider's
-    // MemoryStorage contains encryption key pairs, key packages, and other
-    // MLS artifacts — dropping it releases all of that key material.
+    // The provider's storage holds HPKE key pairs, epoch and message secrets,
+    // and key packages. Zeroize every value, then replace the provider with a
+    // fresh empty one (the old provider's own `Drop` wipes again, finding
+    // nothing left).
+    crate::provider::wipe_memory_storage(group.provider.storage());
     group.provider = InMemoryMlsProvider::default();
 
     // Mark the group as destroyed so all future operations are rejected.
@@ -1120,10 +1124,6 @@ fn generate_key_package_inner(
 
     let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
         .map_err(|e| MlsError::KeyPackageGenerationFailed(format!("signer generation: {e}")))?;
-
-    signer
-        .store(provider.storage())
-        .map_err(|e| MlsError::StorageError(format!("storing signature key: {e}")))?;
 
     let credential_bytes = credential.to_bytes()?;
     let basic_credential = BasicCredential::new(credential_bytes);
@@ -1582,6 +1582,43 @@ mod tests {
         );
     }
 
+    /// True when any storage key carries `openmls_memory_storage`'s
+    /// signature-key-pair label (keys are `label ++ key ++ version`).
+    fn stores_signature_key_pair(provider: &InMemoryMlsProvider) -> bool {
+        provider
+            .storage()
+            .values
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .any(|k| k.starts_with(b"SignatureKeyPair"))
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn no_provider_stores_the_signer() {
+        let cred = test_credential("alice");
+        let group = create_group(&cred, &SystemClock).unwrap();
+        assert!(
+            !stores_signature_key_pair(group.provider()),
+            "create_group must not copy the signer into provider storage"
+        );
+
+        let (_bundle, signer, provider) = generate_key_package(&cred, &SystemClock).unwrap();
+        assert!(
+            !provider.storage().values.read().unwrap().is_empty(),
+            "the key package's HPKE private keys are stored, so the scan sees real entries"
+        );
+        assert!(
+            !stores_signature_key_pair(&provider),
+            "generate_key_package must not copy the signer into provider storage"
+        );
+
+        // Control: the detector does see a stored signer.
+        signer.store(provider.storage()).unwrap();
+        assert!(stores_signature_key_pair(&provider));
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn destroy_group_then_add_member_fails() {
@@ -1777,7 +1814,6 @@ mod tests {
         let cred = test_credential("dave");
         let provider = InMemoryMlsProvider::default();
         let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
-        signer.store(provider.storage()).unwrap();
         let cwk = CredentialWithKey {
             credential: BasicCredential::new(cred.to_bytes().unwrap()).into(),
             signature_key: signer.to_public_vec().into(),
@@ -1898,7 +1934,6 @@ mod tests {
         // directly, as a non-SCP member of the group could.
         let carol_provider = InMemoryMlsProvider::default();
         let carol_signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
-        carol_signer.store(carol_provider.storage()).unwrap();
         let cwk = CredentialWithKey {
             credential: BasicCredential::new(test_credential("carol").to_bytes().unwrap()).into(),
             signature_key: carol_signer.to_public_vec().into(),

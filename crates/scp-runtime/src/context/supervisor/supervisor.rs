@@ -5463,8 +5463,8 @@ impl Supervisor {
     /// [`Self::spawn_actor_from_welcome`] materialized after the irreversible
     /// KeyPackage consume: it drops the actor handle (whose owned
     /// `PerContextState` holds the MLS crypto — #2148 birth-into-actor — so the
-    /// sender key and the group's signer ZEROIZE on drop and the group storage
-    /// is FREED when the actor task ends) AND deletes the persisted Class-S snapshot
+    /// sender key, the group's signer, and the group's provider-storage values
+    /// ZEROIZE on drop when the actor task ends) AND deletes the persisted Class-S snapshot
     /// (`delete_context`).
     ///
     /// The FFI bridges call this as the compensating teardown when a
@@ -5497,7 +5497,7 @@ impl Supervisor {
         //    (born owned at the WELCOME seam, never provider-resident), so
         //    dropping the actor handle closes its mailbox — the actor task ends
         //    and its state drops: the sender key ZEROIZES (`ZeroizeOnDrop`), the
-        //    group's signer zeroizes on drop, and the group storage is FREED. There is no
+        //    group's signer and its provider-storage values zeroize on drop. There is no
         //    provider map to also destroy (the deleted `destroy_mls_group` arm).
         let removed = self.actors.remove(context_id).is_some();
         let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
@@ -5511,8 +5511,8 @@ impl Supervisor {
         }
         // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
         //    discarded welcome-join is permanently gone (its actor-owned crypto
-        //    freed on the handle drop above — `SenderKey`s and the MLS group's
-        //    signer zeroize on drop; its durable snapshot
+        //    freed on the handle drop above — `SenderKey`s, the MLS group's
+        //    signer, and its provider-storage values zeroize on drop; its durable snapshot
         //    deleted), so
         //    the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
@@ -10778,8 +10778,8 @@ impl Supervisor {
     ///
     /// Destroys per-context sender keys + MLS groups + event logs in
     /// that order (release secrets before tearing down structure;
-    /// `SenderKey`s and the MLS group's signer zeroize on drop, the group
-    /// storage is freed),
+    /// `SenderKey`s, the MLS group's signer, and its provider-storage values
+    /// zeroize on drop),
     /// removes the contexts from the supervisor's registry, clears the
     /// standing-context tracking + local-DID registry + per-identity
     /// wrapping keys, and aborts background tasks (TTL timers,
@@ -14345,8 +14345,8 @@ impl Supervisor {
                     // 3. Build the Welcome-derived PerContextState (EMPTY encrypted mode).
                     //    On failure, dispose `owned` FIRST (#2148 F6) — it is the live
                     //    owner of the born crypto here (not yet seeded onto `state`). A
-                    //    bare drop already frees the joined group's in-memory storage and
-                    //    zeroizes the Ed25519 signer; `dispose_secrets` (`destroy_group`)
+                    //    bare drop already zeroizes the joined group's provider-storage
+                    //    values and the Ed25519 signer; `dispose_secrets` (`destroy_group`)
                     //    releases the same material eagerly (the `SenderKey` zeroizes on
                     //    its own drop).
                     //    On this branch `owned` drops immediately after, so the dispose is
@@ -14550,7 +14550,8 @@ impl Supervisor {
                     // reach into the cancelled future to `dispose_secrets`, so the born
                     // crypto is bare-dropped here: the `SenderKey` and the OpenMLS Ed25519
                     // signer zeroize on drop (`SignatureKeyPair` holds its private key in
-                    // `SecretVLBytes`), and the group storage is freed. There
+                    // `SecretVLBytes`), and the group's provider-storage values zeroize
+                    // on drop. There
                     // is no provider-resident crypto to tear down (#2148 birth-into-actor).
                     // Delete any persisted snapshot: an idempotent `let _ =` no-op when the
                     // elapse landed before step 4 ran, so it is safe regardless of how far

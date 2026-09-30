@@ -2187,14 +2187,14 @@ impl ContextCryptoState {
     /// expiry) the context's crypto must be released while the `PerContextState`
     /// stays alive (the actor is NOT dropped), so nothing would otherwise free
     /// the material. Each [`ScpMlsGroup`] owns its OWN in-memory OpenMLS provider
-    /// (`InMemoryMlsProvider`), so a bare drop DOES free that storage, and the
+    /// (`InMemoryMlsProvider`), so a bare drop zeroizes that storage's values, and the
     /// Ed25519 signer zeroizes on drop (OpenMLS `SignatureKeyPair` holds its
     /// private key in `SecretVLBytes`). [`scp_mls::group::destroy_group`] drops
     /// the signer eagerly, so it is zeroized NOW rather than when the state
     /// drops. This is NOT a shared persistent store. This method:
     ///
     /// - runs `destroy_group` on the MLS group (eagerly drops the signer, which
-    ///   zeroizes its private key, and drops the in-memory OpenMLS state), then nulls
+    ///   zeroizes its private key, and zeroizes the provider storage), then nulls
     ///   the handle;
     /// - drops the local `sender_key` and the whole `sender_key_store`, whose
     ///   `SenderKey`s zeroize on drop (`ZeroizeOnDrop`);
