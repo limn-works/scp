@@ -158,8 +158,9 @@
     /// (`generateAssertion`). It ends at the first of four events: an
     /// `assertRequest` that reads no stored key ID ends its call at that
     /// read with `SCP-ATTEST-9020` and calls no App Attest method; Apple's
-    /// answers end it (an error from any of its App Attest methods, or the
-    /// answer to its last one); `appAttestCallTimeLimit` (25 seconds from
+    /// answers end it (every answer from its App Attest methods except a
+    /// `generateKey` answer that carries a key ID and no error, which leads
+    /// to `attestKey`); `appAttestCallTimeLimit` (25 seconds from
     /// the call's start) passes; or the caller's task is cancelled. On the
     /// time limit the caller gets `SCP-ATTEST-9027`; on
     /// cancellation it gets `SCP-ATTEST-9001`, through
