@@ -1241,7 +1241,7 @@ macro_rules! push_conformance {
             }
 
             #[tokio::test]
-            async fn handle_notification_produces_event() {
+            async fn handle_notification_returns_fixed_wake() {
                 // Calls check_fixed_wake_signal, a public function of
                 // this module, which asserts the contract below.
                 // The adapter accepts at least one permitted wake payload:
@@ -1251,8 +1251,8 @@ macro_rules! push_conformance {
                 // { "scp": 1 } (§10.7.1 step 5). It returns a non-empty
                 // WakeSignal for it. Every other payload the adapter
                 // accepts (another permitted payload, a permitted payload
-                // with trailing whitespace, or a payload carrying metadata
-                // §10.7 forbids) yields a byte-identical WakeSignal; the
+                // with trailing whitespace, or a payload carrying a context
+                // ID or sender) yields a byte-identical WakeSignal; the
                 // adapter may reject any of them instead. A signal that
                 // varied with the payload would hand the caller whatever
                 // a relay put in it, which §10.7 forbids.

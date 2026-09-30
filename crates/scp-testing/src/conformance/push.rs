@@ -5,7 +5,7 @@
 //! specification (ADR-006):
 //!
 //! 1. `register_returns_token` — `register()` returns a non-empty push token
-//! 2. `handle_notification_produces_event` — [`check_fixed_wake_signal`]:
+//! 2. `handle_notification_returns_fixed_wake` — [`check_fixed_wake_signal`]:
 //!    `handle_notification` accepts at least one of [`PERMITTED_PAYLOADS`], the
 //!    wake payloads the platform artifacts name, and returns a non-empty wake
 //!    signal for it. Every other payload the adapter accepts, whether another
@@ -14,11 +14,11 @@
 //!    to that first one; the adapter may reject any of them instead. Spec
 //!    §16.12.5 (`.docs/specs/16-test-infrastructure.md`) and ADR-006's testing
 //!    harness paragraph, both amended 2026-09-29, state this contract for
-//!    every adapter. It follows §10.7's opacity rule
-//!    (`.docs/specs/10-infrastructure-and-self-hosting.md`: a push payload
-//!    carries "no context ID, no sender identifier, no message preview, no
-//!    metadata of any kind"): a signal that varied with the payload would hand
-//!    the caller whatever a relay put in it.
+//!    every adapter. It follows §10.7
+//!    (`.docs/specs/10-infrastructure-and-self-hosting.md`): "Push payloads
+//!    MUST contain a wake signal and nothing else. No context ID, no sender
+//!    identifier, no message preview, no metadata of any kind." A signal that
+//!    varied with the payload would hand the caller whatever a relay put in it.
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
@@ -139,7 +139,7 @@ macro_rules! push_conformance {
             }
 
             #[tokio::test]
-            async fn handle_notification_produces_event() {
+            async fn handle_notification_returns_fixed_wake() {
                 let push = $factory;
                 $crate::conformance::push::check_fixed_wake_signal(&push).await;
             }

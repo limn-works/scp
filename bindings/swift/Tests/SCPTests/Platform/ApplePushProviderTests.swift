@@ -9,8 +9,9 @@
 // than the integer 1, for bytes that are not a JSON object", and for bytes that
 // differ from the permitted payload by more than JSON whitespace. §10.7,
 // notifications and push, of `.docs/specs/10-infrastructure-and-self-hosting.md`
-// is where the opacity requirement comes from: a push payload carries no
-// context ID, no sender identifier, and no metadata of any kind.
+// is where the opacity requirement comes from: "Push payloads MUST contain a
+// wake signal and nothing else. No context ID, no sender identifier, no message
+// preview, no metadata of any kind."
 //
 // The adapter runs three rules: a 4 KB size cap, a JSON-object parse, and a
 // byte comparison with the permitted payload after whitespace outside string
@@ -18,10 +19,11 @@
 // most 4096 bytes is accepted, so each rejection case below that builds a JSON
 // object of at most 4096 bytes turns green only while that comparison runs. The
 // size cap also rejects a JSON object the comparison accepts, the permitted
-// payload padded past 4096 bytes with whitespace, so the oversized case turns
-// green only while the size cap runs. The parse only picks the error case: each
-// case requires the `PushError` case `handleNotification(payload:)` throws,
-// `invalidPayload` for bytes that are not a JSON object and
+// payload padded past 4096 bytes with whitespace, so the two oversized cases
+// turn green only while the size cap runs, and the case at exactly 4096 bytes
+// turns red if the cap rejects a payload of the APNs maximum. The parse only
+// picks the error case: each case requires the `PushError` case
+// `handleNotification(payload:)` throws, `invalidPayload` for bytes that are not a JSON object and
 // `opaquePayloadViolation` for every other rejection, so deleting the parse
 // turns the two `invalidPayload` cases red.
 //
@@ -269,6 +271,36 @@
             #expect(bytes.count > 4096)
             let parsed = try JSONSerialization.jsonObject(with: bytes) as? [String: [String: Int]]
             #expect(parsed == ["aps": ["content-available": 1]])
+
+            await expectRejection(provider, bytes, .opaquePayloadViolation)
+        }
+
+        /// The permitted payload padded with trailing whitespace to `count` bytes.
+        private func paddedOpaquePayload(count: Int) throws -> Data {
+            let bytes = try opaquePayload()
+            return bytes + Data(String(repeating: " ", count: count - bytes.count).utf8)
+        }
+
+        @Test("handleNotification accepts a payload of exactly 4096 bytes, the APNs maximum")
+        func handleNotificationAcceptsPayloadAtSizeCap() async throws {
+            // ADR-025 criterion 4 rejects a payload "larger than 4096 bytes", so
+            // 4096 bytes is legal; a cap written as `<` in place of `<=` turns
+            // this case red.
+            let provider = ApplePushProvider()
+            let bytes = try paddedOpaquePayload(count: 4096)
+            #expect(bytes.count == 4096)
+
+            let signal = try await provider.handleNotification(payload: bytes)
+            #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))
+        }
+
+        @Test("handleNotification rejects a payload of 4097 bytes, one above the APNs maximum")
+        func handleNotificationRejectsPayloadOneAboveSizeCap() async throws {
+            // These bytes break no rule but the size rule, so a cap above 4096
+            // bytes turns this case red.
+            let provider = ApplePushProvider()
+            let bytes = try paddedOpaquePayload(count: 4097)
+            #expect(bytes.count == 4097)
 
             await expectRejection(provider, bytes, .opaquePayloadViolation)
         }

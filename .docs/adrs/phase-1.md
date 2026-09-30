@@ -914,7 +914,7 @@ None. This is foundational. The traits it implements are defined in `scp-platfor
 
 3. **`InMemoryPush`**
    - `register() -> PushToken`: Returns a synthetic push token (UUID).
-   - `handle_notification(payload) -> WakeSignal`: Returns the fixed wake signal `{"aps":{"content-available":1}}` (UTF-8 bytes) for every payload and copies no byte of the payload into it. `10-infrastructure-and-self-hosting.md` §10.7 forbids a context ID, a sender identifier, and any other metadata in a push payload, so a wake signal built from the received bytes would hand the caller whatever metadata a relay put there. The bytes are the APNs payload ADR-025 criterion 4 (`.docs/adrs/phase-5.md`) names. (Amended 2026-09-29; this bullet previously read "`handle_notification(payload) -> WakeSignal`: Passes through the payload as a wake signal.")
+   - `handle_notification(payload) -> WakeSignal`: Returns the fixed wake signal `{"aps":{"content-available":1}}` (UTF-8 bytes) for every payload and copies no byte of the payload into it. `10-infrastructure-and-self-hosting.md` §10.7 states: "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender identifier, no message preview, no metadata of any kind." A wake signal built from the received bytes would hand the caller whatever metadata a relay put there. The bytes are the APNs payload ADR-025 criterion 4 (`.docs/adrs/phase-5.md`) names. (Amended 2026-09-29; this bullet previously read "`handle_notification(payload) -> WakeSignal`: Passes through the payload as a wake signal.")
    - For Phase 1 testing, push is not exercised (two processes use direct relay subscriptions). This adapter exists to satisfy the trait requirements.
 
 4. **`InMemoryStorage`**
@@ -995,8 +995,10 @@ pub trait DeviceAttestation: Send + Sync {
 pub trait Push: Send + Sync {
     async fn register(&self) -> Result<PushToken, PlatformError>;
     /// Amended 2026-09-29: returns one fixed WakeSignal for every payload it accepts, and
-    /// may reject a payload instead. §10.7 of 10-infrastructure-and-self-hosting.md forbids
-    /// metadata in a push payload, so the signal must not vary with the payload. WakeSignal
+    /// may reject a payload instead. §10.7 of 10-infrastructure-and-self-hosting.md states:
+    /// "Push payloads MUST contain a wake signal and nothing else. No context ID, no sender
+    /// identifier, no message preview, no metadata of any kind." The signal must therefore
+    /// not vary with the payload. WakeSignal
     /// holds &'static bytes, so an implementation cannot return the borrowed payload or a
     /// temporary copy of it; the type does not stop a signal chosen by payload content, and
     /// the conformance check check_fixed_wake_signal rejects a signal that varies across the

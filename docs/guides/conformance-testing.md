@@ -304,7 +304,7 @@ mod tests {
 | # | Test | Contract verified |
 |---|------|-------------------|
 | 1 | `register_returns_token` | `register()` returns a non-empty `PushToken` |
-| 2 | `handle_notification_produces_event` | `handle_notification(payload)` returns a non-empty `WakeSignal` |
+| 2 | `handle_notification_returns_fixed_wake` | `handle_notification(payload)` returns one fixed, non-empty `WakeSignal` for every payload it accepts |
 
 ---
 

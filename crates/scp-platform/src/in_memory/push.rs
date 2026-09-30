@@ -12,19 +12,19 @@ use crate::traits::{Push, PushToken, WakeSignal};
 ///
 /// Produces synthetic push tokens using UUID v4. `handle_notification`
 /// returns `WAKE_SIGNAL` for every payload and never the received bytes.
-/// §10.7 of the infrastructure spec forbids a context ID, a sender identifier,
-/// and any other metadata in a push payload, and a wake signal built from the
-/// received bytes would hand whatever metadata a relay put there to the
-/// caller.
+/// §10.7 of the infrastructure spec states: "Push payloads MUST contain a wake
+/// signal and nothing else. No context ID, no sender identifier, no message
+/// preview, no metadata of any kind." A wake signal built from the received
+/// bytes would hand the caller whatever a relay put there.
 ///
 /// See ADR-006 in `.docs/adrs/phase-1.md`.
 pub struct InMemoryPush;
 
 /// The wake signal [`InMemoryPush`] returns for every notification: the UTF-8
 /// bytes of `{"aps":{"content-available":1}}`, the APNs payload ADR-025
-/// criterion 4 names. The signal is fixed because §10.7's opacity rule allows
-/// a push payload no content, context, sender, or metadata, so no byte of the
-/// received payload may reach the caller.
+/// criterion 4 names. The signal is fixed so that no byte of the received
+/// payload reaches the caller; the [`InMemoryPush`] doc quotes the §10.7 rule
+/// this follows.
 const WAKE_SIGNAL: &[u8] = br#"{"aps":{"content-available":1}}"#;
 
 impl InMemoryPush {

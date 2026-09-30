@@ -16,9 +16,10 @@
 // ## APNs Payload Opacity (§10.7)
 //
 // The relay sends **only** `{"aps": {"content-available": 1}}` — a silent push.
-// No context ID, sender DID, message preview, or any other metadata may appear
-// in the payload. Silent push wakes the app in the background. §10.7 then has the
-// device connect to its relays and pull pending encrypted envelopes; no Rust code
+// §10.7: "Push payloads MUST contain a wake signal and nothing else. No context
+// ID, no sender identifier, no message preview, no metadata of any kind."
+// Silent push wakes the app in the background. §10.7 then has the device
+// connect to its relays and pull pending encrypted envelopes; no Rust code
 // calls `handleNotification(payload:)` yet, so nothing performs that pull today.
 // Apple learns only that the device received a notification at a specific time.
 //
@@ -239,17 +240,16 @@
         /// Handle an incoming APNs silent push notification.
         ///
         /// Validates that `payload` is the opaque `{"aps": {"content-available": 1}}` payload
-        /// ADR-025 criterion 4 names for APNs, which meets the §10.7 rule that a push
-        /// payload carries no context ID, sender identifier, or other metadata. Any
+        /// ADR-025 criterion 4 names for APNs, which meets §10.7: "Push payloads MUST
+        /// contain a wake signal and nothing else. No context ID, no sender identifier,
+        /// no message preview, no metadata of any kind." Any
         /// additional field in the payload — at the top level or nested inside `aps`,
         /// including one carried by a repeated key — is rejected with
         /// ``PushError/opaquePayloadViolation``.
         ///
         /// When the payload is valid, the method returns ``wakeSignal``, a fixed byte
         /// string, and never the received bytes, so a caller receives no byte the relay
-        /// chose. The permitted payload carries no context ID, sender identifier, or
-        /// message count, so the wake signal carries none. No Rust code calls this
-        /// method yet.
+        /// chose. No Rust code calls this method yet.
         ///
         /// - Parameter payload: The raw JSON bytes delivered by APNs.
         /// - Returns: ``wakeSignal``, the UTF-8 bytes of `{"aps":{"content-available":1}}`.

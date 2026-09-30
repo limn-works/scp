@@ -288,8 +288,9 @@ impl PushToken {
 /// A wake signal produced by [`Push::handle_notification`].
 ///
 /// Indicates that the application should wake up and process pending messages.
-/// §10.7 of the infrastructure spec forbids a context ID, a sender identifier,
-/// and any other metadata in a push payload, so a wake signal must not vary
+/// §10.7 of the infrastructure spec states: "Push payloads MUST contain a wake
+/// signal and nothing else. No context ID, no sender identifier, no message
+/// preview, no metadata of any kind." A wake signal must therefore not vary
 /// with the payload it was produced from. `WakeSignal` holds `&'static` bytes,
 /// so returning the borrowed payload or a temporary copy of it does not
 /// compile (the two examples below). The type does not stop a signal that
@@ -916,8 +917,9 @@ pub trait Push: Send + Sync {
     ///
     /// Returns one fixed [`WakeSignal`] for every payload the implementation
     /// accepts, and may reject a payload instead. §10.7 of the infrastructure
-    /// spec forbids a context ID, a sender identifier, and any other metadata
-    /// in a push payload, so the signal must not vary with `payload`: a signal
+    /// spec states: "Push payloads MUST contain a wake signal and nothing else.
+    /// No context ID, no sender identifier, no message preview, no metadata of
+    /// any kind." The signal must therefore not vary with `payload`: a signal
     /// that did would hand the caller whatever a relay put there. Spec
     /// §16.12.5 and ADR-006 state this contract for every implementation.
     ///

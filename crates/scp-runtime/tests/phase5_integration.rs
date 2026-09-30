@@ -676,8 +676,9 @@ async fn platform_push_notifications() {
     assert!(!token.as_bytes().is_empty());
 
     // -- Handle notification --
-    // §10.7 forbids a context ID in a push payload, so the wake signal must
-    // not carry the one this payload holds.
+    // §10.7: "Push payloads MUST contain a wake signal and nothing else. No
+    // context ID, no sender identifier, no message preview, no metadata of any
+    // kind." The wake signal must not carry the context ID this payload holds.
     let payload = b"new-message-ctx-123";
     let wake = push
         .handle_notification(payload)
