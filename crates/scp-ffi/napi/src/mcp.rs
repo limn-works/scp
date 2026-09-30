@@ -1867,9 +1867,22 @@ mod tests {
     /// not found. The client is connected through `mcp_client_connect_sse_on`,
     /// so the test fails unless the connect hands the transport's closer to
     /// the entry. The fake server holds every connection open until the test
-    /// ends, so only the disconnect can end the call.
+    /// ends, so only the teardown can end the call.
     #[test]
     fn a_disconnect_ends_an_sse_call_in_flight_napi() {
+        sse_call_in_flight_ends_on(Teardown::Disconnect);
+    }
+
+    /// The instance-shutdown twin of
+    /// `a_disconnect_ends_an_sse_call_in_flight_napi`: the shutdown hook
+    /// clears the client registry while the SSE `tools/list` is in flight,
+    /// and the cleared entry's drop shuts the transport's sockets.
+    #[test]
+    fn a_registry_clear_on_shutdown_ends_an_sse_call_in_flight_napi() {
+        sse_call_in_flight_ends_on(Teardown::Shutdown);
+    }
+
+    fn sse_call_in_flight_ends_on(teardown: Teardown) {
         use std::io::Write;
         let bi = NapiBridgeInstance::new_napi();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1931,9 +1944,14 @@ mod tests {
                     .await
                     .expect("wait task");
                     let disconnected_at = std::time::Instant::now();
-                    mcp_client_disconnect_on(&bi, &handle)
-                        .await
-                        .expect("disconnect a known handle");
+                    match teardown {
+                        Teardown::Disconnect => mcp_client_disconnect_on(&bi, &handle)
+                            .await
+                            .expect("disconnect a known handle"),
+                        Teardown::Shutdown => {
+                            scp_ffi_common::bridge_instance::BridgeInstanceCore::bridge_specific_shutdown(&bi);
+                        }
+                    }
                     (accepted, disconnected_at)
                 })
             })
@@ -1943,23 +1961,24 @@ mod tests {
         drop(release_tx);
         let Ok((call, (accepted, disconnected_at))) = joined else {
             runtime.shutdown_background();
-            panic!("the disconnect must end the SSE call in flight");
+            panic!("the teardown must end the SSE call in flight");
         };
         accepted.expect("the tools/list POST must reach the server");
         let Err(err) = call else {
             panic!("the silent server sent no tools/list response");
         };
         assert!(
-            err.reason.contains(codes::TRANS_5022),
-            "the call in flight must fail on its transport, got: {}",
+            err.reason.contains(codes::TRANS_5022)
+                && err.reason.contains("SSE connection is closed"),
+            "the call in flight must fail on its closed transport, got: {}",
             err.reason
         );
         assert!(
             ended_at.duration_since(disconnected_at) < std::time::Duration::from_secs(2),
-            "the disconnect must end the call at once"
+            "the teardown must end the call at once"
         );
         let Err(after) = runtime.block_on(mcp_client_list_tools_on(&bi, &handle)) else {
-            panic!("a disconnected handle must refuse a call");
+            panic!("a torn-down handle must refuse a call");
         };
         assert!(
             after.reason.contains(codes::TRANS_5020),
