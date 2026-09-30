@@ -1914,9 +1914,11 @@ pub fn sync_ceiling_from_params(
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
 ///
-/// An absent actor reads as `None` instead of as an error. An absent actor the
-/// crash watchdog poisoned reads as `Some(Poisoned)`, because the supervisor
-/// keeps that flag outside the actor (ADR-049 §10).
+/// A context the supervisor holds no actor, no poison flag, and no
+/// crash-window record for reads as `None` instead of as an error. An absent
+/// actor the crash watchdog poisoned reads as `Some(Poisoned)`, because the
+/// supervisor keeps that flag outside the actor (ADR-049 §10). An absent actor
+/// the supervisor is still recovering reads as an error (see `# Errors`).
 ///
 /// [`require_active_context`] is the gate form: it turns `None` into an error so
 /// a gate never admits an operation on an absent answer.
@@ -1932,13 +1934,23 @@ pub fn sync_ceiling_from_params(
 ///
 /// # Errors
 ///
-/// Returns [`ScpNapiError::Context`] when this instance holds no supervisor,
-/// when an actor serves `context_id` but did not answer the state read, and
-/// when the crash watchdog despawned `context_id`'s actor for a respawn it has
-/// not finished or its last respawn failed (ADR-049 §10). The state read
-/// reports an actor the supervisor never held as `Ok(None)`, so a caller
-/// distinguishes "no actor serves this context" from "this bridge could not
-/// get an answer".
+/// Returns [`ScpNapiError::Context`] with:
+///
+/// - `SCP-CTX-2000` when this instance holds no supervisor;
+/// - `SCP-CTX-2130` when an actor serves `context_id` but the mailbox send
+///   failed or timed out, or the actor did not answer the state read in time;
+/// - `SCP-CTX-2135` when no actor is registered for `context_id` because the
+///   crash watchdog despawned it and has not finished the respawn, because an
+///   operator's `clear_poison` cleared its poison flag and has not yet
+///   respawned it, because an import despawned it and has not yet registered
+///   the imported actor, or because its last respawn failed and the context is
+///   not yet poisoned (ADR-049 §10).
+///
+/// It also returns whatever error the actor's `ReadContextState` handler
+/// returned, translated by `From<ContextError>`. The state read reports a
+/// context the supervisor neither serves nor is recovering as `Ok(None)`, so
+/// a caller distinguishes "no actor serves this context" from "this bridge
+/// could not get an answer".
 pub async fn read_live_context_state(
     bi: &NapiBridgeInstance,
     context_id: &str,

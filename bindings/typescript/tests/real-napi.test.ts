@@ -697,13 +697,41 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanValidate(ctx, token.encoded, fullUri as string, member.did);
     });
 
-    test("an omitted ceiling mints a capability the default ceiling carries", async () => {
+    // The handle's `ceiling` getter renders the ceiling `parse_context_params`
+    // produced, the same value the bridge hands the supervisor. It is the
+    // TypeScript-visible surface that tells "absent means default_ceiling()"
+    // from "absent means []": a mint cannot, because `ucanMint` widens an
+    // empty handle ceiling to the default. The Rust test
+    // `the_supervisor_enforces_an_empty_ceiling_as_deny_all` covers the
+    // actor's enforcement of each reading.
+    test("an omitted or null ceiling resolves to the default ceiling; [] stays empty", async () => {
       const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
-      const ctx = await napi.contextCreate(admin, JSON.stringify({ memoryScope: "ephemeral" }));
+      // default_ceiling() in UCAN `{resource}:{action}` form.
+      const defaultCeiling = [
+        "context:close",
+        "governance:propose",
+        "governance:vote",
+        "member:invite",
+        "member:remove",
+        "messages:read",
+        "messages:write",
+        "outlet:register",
+        "outlet_call:*",
+        "outlet_query:*",
+        "role:assign",
+      ];
+      // `BridgeContextHandle` does not declare the addon handle's `ceiling`
+      // getter, so the test reads it through a narrowed view.
+      const ceilingOf = (handle: unknown): string[] => (handle as { ceiling: string[] }).ceiling;
 
-      const token = await napi.ucanMint(ctx, member.did, ["messages:write"]);
-      expect(token.capabilities.some((c: string) => c.endsWith("/messages:write"))).toBe(true);
+      const omitted = await napi.contextCreate(admin, JSON.stringify({ memoryScope: "ephemeral" }));
+      expect([...ceilingOf(omitted)].sort()).toEqual(defaultCeiling);
+
+      const nulled = await napi.contextCreate(admin, JSON.stringify({ ceiling: null }));
+      expect([...ceilingOf(nulled)].sort()).toEqual(defaultCeiling);
+
+      const empty = await napi.contextCreate(admin, JSON.stringify({ ceiling: [] }));
+      expect(ceilingOf(empty)).toEqual([]);
     });
 
     test("rejects validation for an ungranted capability", async () => {

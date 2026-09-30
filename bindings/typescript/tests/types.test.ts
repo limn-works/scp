@@ -63,8 +63,9 @@ describe("type definitions", () => {
   });
 
   it("ContextParams may omit the ceiling", () => {
-    // Type-level only: the bridge's reading of an absent ceiling is tested
-    // against the real addon in real-napi.test.ts.
+    // Type-level only. The real-addon test in real-napi.test.ts checks that an
+    // omitted ceiling reaches the handle as default_ceiling(); the Rust tests
+    // in crates/scp-ffi/napi/src/context.rs check the supervisor's reading.
     const params: ContextParams = { mode: "Encrypted" };
     expect(params.ceiling).toBeUndefined();
   });
