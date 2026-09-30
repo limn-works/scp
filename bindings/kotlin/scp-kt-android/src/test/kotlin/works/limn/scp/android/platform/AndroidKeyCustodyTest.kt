@@ -648,8 +648,9 @@ class AndroidKeyCustodyTest {
             assertEquals("SCP-CRYPTO-4005", exception.code)
             val message = exception.message.orEmpty()
             assertTrue(message.contains("ADR-063's curve slice"), message)
-            // ADR-063 requires every key-export accessor to leave the adapters, not only for
-            // governance signing, so the message may not narrow the clause.
+            // ADR-063 requires every key-export accessor to leave the custody adapters and all
+            // three bridges, not only for governance signing, so the message may not narrow the
+            // clause.
             assertTrue(message.contains("every key-export accessor"), message)
             assertTrue(!message.contains("for governance signing"), message)
             // The curve slice has not landed, so the message may not state its signer path as current.

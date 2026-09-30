@@ -19,8 +19,8 @@
 //   refuses to export. It accepts any Ed25519 id in softwareKeys, not only a generateKeypair handle.
 //   ADR-027 acceptance criterion 14 (private key isolation) says the Rust engine receives only
 //   signatures and public keys, never private key material. The UniFFI KeyCustodyProvider
-//   callback declares export_signing_key_bytes, which carries this seed to Rust, so this method
-//   diverges from criterion 14.
+//   callback declares export_signing_key_bytes, which would carry this seed to Rust, so this
+//   method's design diverges from criterion 14.
 // - sign signs any caller-supplied bytes with a hardware identity key, and derivePseudonymSecret
 //   derives every pseudonym secret of that key from its signature over the public string
 //   "scp-pseudonym-secret-v1". A caller that signs that string derives every pseudonym private
