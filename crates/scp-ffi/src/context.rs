@@ -274,9 +274,10 @@ pub struct PyContextParams {
     /// This field holds the ceiling the context runs under, and no later
     /// stage substitutes a default into it. `from_py_dict` rejects an absent,
     /// `None`, or empty declaration. `from_core_params`, which builds a Welcome
-    /// joiner's params, copies the joined context's signed ceiling as it is,
-    /// and a context created through a path that does not check the ceiling
-    /// (see `ContextError::CeilingRequired`) can carry an empty one.
+    /// joiner's params, copies the joined context's signed ceiling as it is:
+    /// the runtime rejects an empty ceiling on a local create (see
+    /// `ContextError::CeilingRequired`), but a joiner does not re-check the
+    /// ceiling another member's software created the context with.
     ceiling: Vec<String>,
     /// Role definitions mapping role names to capability lists.
     roles: HashMap<String, Vec<String>>,
@@ -2518,7 +2519,15 @@ impl crate::scp::PyScp {
             rt.block_on(async move {
                 sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
                     .await
-                    .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+                    .map_err(|e| match e {
+                        // The core's empty-ceiling rejection stays typed so
+                        // it surfaces with its validation code
+                        // (construction.md M2).
+                        scp_core::context::builder::ContextCreationError::StateTransition(
+                            inner @ scp_core::context::ContextError::CeilingRequired(_),
+                        ) => inner,
+                        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
+                    })?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
@@ -2535,7 +2544,14 @@ impl crate::scp::PyScp {
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
-                PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
+                match e {
+                    scp_core::context::ContextError::CeilingRequired(_) => {
+                        PyErr::from(crate::error::ScpPyError::from(e))
+                    }
+                    other => PyRuntimeError::new_err(format!(
+                        "ContextManager create_context failed: {other}"
+                    )),
+                }
             })?;
         }
 
@@ -7772,7 +7788,10 @@ mod tests {
         let rt = crate::runtime().unwrap();
         rt.block_on(sup.create_context(
             ctx_id.clone(),
-            scp_core::context::ContextParams::default(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
             scp_did::DID(creator.to_owned()),
             None,
         ))
@@ -9092,7 +9111,10 @@ class SignOnlyCustody:
             let sup = Arc::clone(sup);
             rt.block_on(sup.create_context(
                 ctx_id.clone(),
-                scp_core::context::ContextParams::default(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
                 scp_did::DID(creator.clone()),
                 None,
             ))

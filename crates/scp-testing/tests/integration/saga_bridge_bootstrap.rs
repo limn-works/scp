@@ -225,6 +225,7 @@ async fn bridge_restore_entry_runs_restore_and_replay_legs() {
         // lives in the shared OpenMLS storage and the restore leg reinstates it.
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)

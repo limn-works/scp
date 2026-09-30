@@ -375,6 +375,13 @@ impl SelfHostDeployer {
             // scope is `Ephemeral`, which `create_context` rejects for
             // broadcast mode.
             memory_scope: scp_core::context::params::MemoryScope::Full,
+            // A create must declare a non-empty ceiling (construction.md M2);
+            // the site's author publishes content and its subscribers read
+            // it, so the ceiling is messaging only.
+            ceiling: vec![
+                scp_core::context::roles::Capability::MessagesRead,
+                scp_core::context::roles::Capability::MessagesWrite,
+            ],
             ..Default::default()
         };
         supervisor

@@ -1383,8 +1383,8 @@ impl From<scp_core::context::ContextError> for ScpError {
             },
             // construction.md M2: a create with no ceiling or a null one omits
             // a required field; an empty one is an invalid field value. The
-            // UniFFI create path does not raise this variant yet; the arm keeps
-            // the translation identical across the three bridges.
+            // UniFFI create path reaches this arm with `Empty` through the
+            // `ContextCreationError` translation below.
             CE::CeilingRequired(declared) => Self::Validation {
                 msg: format!("{e}"),
                 code: match declared {
@@ -1495,6 +1495,14 @@ impl From<scp_core::context::ContextError> for ScpError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
+        // construction.md M2: the runtime's empty-ceiling rejection keeps its
+        // own validation code; every other creation failure is SCP-CTX-2002.
+        if let scp_core::context::builder::ContextCreationError::StateTransition(
+            inner @ scp_core::context::ContextError::CeilingRequired(_),
+        ) = e
+        {
+            return inner.into();
+        }
         Self::Context {
             msg: format!("context creation failed: {e} — check context parameters and identity"),
             code: codes::CTX_2002.to_owned(),
@@ -19575,7 +19583,8 @@ mod tests {
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            // A create must declare a non-empty ceiling (construction.md M2).
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: CeilingPolicy::Immutable,
             governance: GovernanceModel::SingleAdmin,
             memory_scope: MemoryScope::Ephemeral,
@@ -23507,6 +23516,25 @@ mod tests {
                 other => panic!("expected ScpError::Validation, got {other:?}"),
             }
         }
+    }
+
+    /// construction.md M2: the core's empty-ceiling rejection, which reaches
+    /// the bridge wrapped in `ContextCreationError::StateTransition`, keeps
+    /// `SCP-VALID-7005`; every other creation failure keeps `SCP-CTX-2002`.
+    #[test]
+    fn creation_ceiling_required_keeps_valid_7005() {
+        use scp_core::context::builder::ContextCreationError as CCE;
+        let err: ScpError = CCE::StateTransition(scp_core::context::ContextError::CeilingRequired(
+            scp_core::context::CeilingDeclaration::Empty,
+        ))
+        .into();
+        match err {
+            ScpError::Validation { code, .. } => assert_eq!(code, codes::VALID_7005),
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+        let err: ScpError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingImmutable).into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
     }
 
     /// ADR-049 §10: a poisoned context must surface the dedicated

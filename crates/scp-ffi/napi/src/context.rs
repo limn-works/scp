@@ -834,11 +834,16 @@ pub(crate) async fn context_create_on(
                     code: codes::CTX_2000.to_owned(),
                 })
             })?
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("create_context failed: {e}"),
+            .map_err(|e| match e {
+                // The core's empty-ceiling rejection keeps its typed
+                // validation code (construction.md M2).
+                scp_core::context::builder::ContextCreationError::StateTransition(
+                    scp_core::context::ContextError::CeilingRequired(_),
+                ) => NapiError::from(ScpNapiError::from(e)),
+                other => NapiError::from(ScpNapiError::Context {
+                    message: format!("create_context failed: {other}"),
                     code: codes::CTX_2000.to_owned(),
-                })
+                }),
             })?
     };
 

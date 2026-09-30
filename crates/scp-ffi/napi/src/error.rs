@@ -411,6 +411,14 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpNapiError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
+        // The core's empty-ceiling rejection keeps its own validation code
+        // (construction.md M2), the one the parser's rejection carries.
+        if let scp_core::context::builder::ContextCreationError::StateTransition(
+            inner @ scp_core::context::ContextError::CeilingRequired(_),
+        ) = e
+        {
+            return inner.into();
+        }
         Self::Context {
             message: format!(
                 "context creation failed: {e} — check context parameters and identity"
@@ -788,6 +796,26 @@ mod tests {
         let err: ScpNapiError =
             scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2130);
+    }
+
+    /// construction.md M2: the core's empty-ceiling rejection, which reaches
+    /// the bridge wrapped in `ContextCreationError::StateTransition`, keeps
+    /// `SCP-VALID-7005`; every other creation failure keeps `SCP-CTX-2002`.
+    #[test]
+    fn creation_ceiling_required_keeps_valid_7005() {
+        use scp_core::context::builder::ContextCreationError as CCE;
+        let err: ScpNapiError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingRequired(
+                scp_core::context::CeilingDeclaration::Empty,
+            ))
+            .into();
+        match err {
+            ScpNapiError::Validation { code, .. } => assert_eq!(code, codes::VALID_7005),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let err: ScpNapiError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingImmutable).into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
     }
 
     /// construction.md M2: a create that declared no usable ceiling surfaces

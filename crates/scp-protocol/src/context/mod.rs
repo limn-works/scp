@@ -300,17 +300,15 @@ pub enum ContextError {
     ///
     /// An undeclared ceiling leaves the context's security boundary to a
     /// default nobody chose, and an empty ceiling describes a context no
-    /// member can use, so neither is created. Three sites raise this
-    /// variant, each before any context state exists: the NAPI and `PyO3`
-    /// context-parameter parsers, and the runtime's `Supervisor::create` for
-    /// a `ContextCreation::Explicit` config with an empty ceiling (wrapped in
-    /// [`builder::ContextCreationError::StateTransition`]); no production
-    /// code calls `Supervisor::create`. Every production create reaches the
-    /// runtime's `Supervisor::create_context`, which takes [`ContextParams`]
-    /// directly, or the `CreateContext` lifecycle command it dispatches, and
-    /// neither raises it. So the `UniFFI` create, `scp-node`'s self-hosted
-    /// site context, and any Rust caller of `create_context` that passes an
-    /// empty ceiling still create a context. Each bridge's error translator maps
+    /// member can use, so neither is created. Two kinds of site raise this
+    /// variant, each before any context state exists. The runtime's
+    /// context-creation step raises [`CeilingDeclaration::Empty`] (wrapped in
+    /// [`builder::ContextCreationError::StateTransition`]) for every create
+    /// whose [`ContextParams`] ceiling is empty; `Supervisor::create`,
+    /// `Supervisor::create_context`, and the `CreateContext` lifecycle
+    /// command all reach that step. The NAPI and `PyO3` context-parameter
+    /// parsers raise all three declarations, because their parameters can
+    /// omit the ceiling or set it to null. Each bridge's error translator maps
     /// [`CeilingDeclaration::Absent`] and [`CeilingDeclaration::Null`] to
     /// `SCP-VALID-7004` (missing required field) and
     /// [`CeilingDeclaration::Empty`] to `SCP-VALID-7005` (invalid field

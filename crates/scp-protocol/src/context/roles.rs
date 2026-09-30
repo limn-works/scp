@@ -820,12 +820,11 @@ impl CapabilityCeiling {
 /// management, role assignment, membership control, governance, and context
 /// close.
 ///
-/// The NAPI and `PyO3` `context_create` paths never substitute it for an
-/// undeclared ceiling: a create whose ceiling is absent, null, or empty fails
-/// with [`ContextError::CeilingRequired`](crate::context::ContextError::CeilingRequired)
-/// (`.docs/standards/construction.md` M2), as does the runtime's
-/// `Supervisor::create` for an empty `Explicit` ceiling. That variant's doc
-/// names the create paths that do not raise it.
+/// No create substitutes it for an undeclared ceiling: the runtime rejects a
+/// create whose ceiling is empty, and the NAPI and `PyO3` `context_create`
+/// paths reject an absent, null, or empty one, each with
+/// [`ContextError::CeilingRequired`](crate::context::ContextError::CeilingRequired)
+/// (`.docs/standards/construction.md` M2).
 #[must_use]
 pub fn default_ceiling() -> CapabilityCeiling {
     CapabilityCeiling::new([

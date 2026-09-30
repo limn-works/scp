@@ -302,3 +302,68 @@ async fn create_with_non_empty_explicit_ceiling_succeeds() {
     assert_eq!(handle.state(), ContextState::Active);
     assert_eq!(handle.params().ceiling, ceiling);
 }
+
+fn params_with_ceiling(ceiling: Vec<Capability>) -> ContextParams {
+    ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    }
+}
+
+/// Every production create reaches `Supervisor::create_context`, directly or
+/// through the `CreateContext` lifecycle command it dispatches, and the
+/// empty-ceiling rejection runs on that path: an empty ceiling fails with
+/// `ContextError::CeilingRequired(CeilingDeclaration::Empty)` and creates no
+/// context.
+#[tokio::test]
+async fn create_context_with_empty_ceiling_is_rejected() {
+    let manager = new_manager();
+
+    let result = manager
+        .create_context(
+            "ctx-params-empty-ceiling".into(),
+            params_with_ceiling(Vec::new()),
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::CeilingRequired(CeilingDeclaration::Empty)
+            ))
+        ),
+        "create_context must reject an empty ceiling with CeilingRequired(Empty); got {result:?}"
+    );
+    assert!(
+        manager
+            .read_context_state("ctx-params-empty-ceiling")
+            .await
+            .is_none(),
+        "a rejected empty-ceiling create_context must not leave a context behind"
+    );
+}
+
+/// The `create_context` guard rejects only an empty ceiling: a non-empty one
+/// creates an `Active` context carrying exactly that ceiling.
+#[tokio::test]
+async fn create_context_with_non_empty_ceiling_succeeds() {
+    let manager = new_manager();
+    let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+
+    let handle = manager
+        .create_context(
+            "ctx-params-ceiling".into(),
+            params_with_ceiling(ceiling.clone()),
+            alice(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(handle.state(), ContextState::Active);
+    assert_eq!(handle.params().ceiling, ceiling);
+}

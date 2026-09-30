@@ -73,7 +73,9 @@ pub enum ContextCreation {
     /// per-variant): there is no over-broad default capability ceiling, and
     /// [`Supervisor::create`](crate::context::supervisor::Supervisor::create)
     /// rejects an empty one with
-    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired).
+    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired),
+    /// as does every other create path, because each reaches the same
+    /// creation step.
     Explicit {
         /// Capability ceiling — the maximum set of capabilities any participant
         /// can hold. Required and non-empty (M2): no over-broad default.
