@@ -15,6 +15,15 @@ cargo run -p scp-node --example website
 
 Then open the printed URL in a browser.
 
+**On a shipped build with no identity in storage, this exits 1 — on the first run
+and every later one.** `host_site` asks for
+`IdentitySource::Persisted`, and creating a new identity needs a
+`PreRotationCustody` backend whose only implementation is the test harness, so a
+shipped build fails closed rather than mint a nullifier-backed identity. The
+example's own doc comment quotes the exact error. Reloading a stored identity
+carries no gate and works on a shipped build; what fails is creating one. Build
+with `--features testing` to run the example end to end.
+
 ### What this example does
 
 It hosts the small site under [`website-site/`](./website-site/) (an
@@ -25,7 +34,7 @@ traditional web server and no DNS.
 ### Local demo vs public hosting
 
 The example is a **LOCAL demo**: `HostSiteConfig::defaults(Reach::Local)` with
-`tls: TlsMode::Plaintext` and `dht: DhtMode::Memory` — no NAT probe, no router
+`tls: TlsMode::Plaintext` and `dht: DhtMode::Disabled` — no NAT probe, no router
 port opened, nothing published. (The source doc-comment explains each choice.)
 
 For **public hosting** (direct IP, outbound tunnel, or reverse proxy), see the
@@ -41,7 +50,12 @@ If you don't need to embed hosting in your own program, the `scp-node` binary
 hosts a site directly:
 
 ```sh
-scp-node --self-host --site-dir ./my-site
+SCP_NODE_DHT_MODE=disabled scp-node --self-host --site-dir ./my-site
 ```
+
+`--self-host` on its own defaults to publishing: `SCP_NODE_DHT_MODE` defaults to
+`production`, which puts the host's public IP, bound to its DID, on the global
+Mainline DHT. Set it to `disabled` for a site that publishes nothing. This path
+hits the same wall as the example above.
 
 [`scp_node::host_site`]: https://docs.rs/scp-node

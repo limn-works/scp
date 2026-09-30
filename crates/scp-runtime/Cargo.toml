@@ -14,7 +14,21 @@ categories = ["cryptography", "network-programming"]
 # Enables non-standard did:key:{hex} DID format acceptance. Only for
 # integration tests that run outside `#[cfg(test)]`. Production builds
 # must never enable this feature. See issue #128.
-testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing"]
+#
+# Carries `scp-dht/testing` so a consumer who enables `scp-runtime/testing` gets
+# `InMemoryDhtClient`, exactly as `scp-identity`, `scp-node`, `scp-ffi`,
+# `scp-ffi-napi`, and `scp-ffi-uniffi` carry that edge in their own `testing`
+# lists (ADR-062, capability injection, §Decision 1; story SCP-CAPINJECT-001, the
+# DHT capability-injection slice in `.docs/prds/adr062-capability-injection.json`,
+# requires the edge of every consumer). `scp-dht` is a normal dependency and
+# survives publication, so the edge makes `examples/identity.rs` compile for a
+# consumer of the published crate under `--features testing`. The
+# `[dev-dependencies]` edge on `scp-dht` below activates the same feature for this
+# crate's own `cargo test -p scp-runtime`. `scp-dht/testing` appears in no
+# default or non-testing list, and no shipped artifact resolves
+# `scp-runtime/testing`, so `scripts/check-shipped-feature-graph.sh` keeps
+# proving `InMemoryDhtClient` absent from every shipped feature graph.
+testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
 # Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
 # without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
 # requires `EncryptedStorage`. Follows the test-harness feature-gating pattern
