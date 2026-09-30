@@ -560,8 +560,10 @@ struct ParsedContextParams {
     economic_policy: Option<String>,
 }
 
-/// `default_ceiling()` rendered as the `{resource}:{action}` capability strings
-/// a `context_create` caller supplies.
+/// `default_ceiling()` rendered as `Capability::name()` strings (the colon
+/// form, such as `outlet:call:*`), a ceiling-entry form a `context_create`
+/// caller may write. These are not the UCAN `{resource}:{action}` names
+/// (`outlet_call:*`) that `Capability::ucan_capability_name()` returns.
 ///
 /// `parse_context_params` carries a caller's vocabulary to the shared
 /// `build_context_params` parser, so a default this bridge substitutes has to
