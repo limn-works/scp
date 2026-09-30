@@ -4,13 +4,18 @@
 // dispatches runs on an injected `ioDispatcher`, so a test can substitute a
 // `StandardTestDispatcher`. This test reads the `scp-kt` and `scp-kt-android` main sources and
 // fails on any `withContext(...)` call whose first argument, the coroutine context, names
-// `Dispatchers.IO`. A lexer removes comments (nested block comments included) and the content of
-// string and character literals first, so KDoc that names the default and a string holding `//`
-// or `/*` neither counts nor hides code; a string template's `${...}` expression stays code. Two
-// files are not scanned, because neither calls the SCP FFI: `platform/AndroidDeviceAttestation.kt`
-// dispatches only the Play Integrity token request, and `platform/AndroidPushProvider.kt` only the
-// Firebase token request. The generated UniFFI bindings under `internal/uniffi` are not scanned,
-// because the SDK does not author them.
+// `Dispatchers.IO`, and on each other spelling that reaches the IO dispatcher under another name:
+// an import of the `Dispatchers.IO` member, an import alias or typealias that renames
+// `Dispatchers`, and a `val`, `var`, or `fun` whose value is `Dispatchers.IO`. A parameter default
+// of `Dispatchers.IO` passes, because a caller overrides it. A lexer removes comments (nested block
+// comments included) and the content of string and character literals first, so KDoc that names
+// the default and a string holding `//` or `/*` neither counts nor hides code; a string template's
+// `${...}` expression stays code. Two call sites may name `Dispatchers.IO`, because neither calls
+// the SCP FFI: the Play Integrity token request in `platform/AndroidDeviceAttestation.kt` and the
+// Firebase token request in `platform/AndroidPushProvider.kt`. Each file may hold its one
+// dispatch, with exactly the block [ALLOWED_DISPATCHES] records, so a second dispatch in either
+// file, or a call added to either block, fails the scan. The generated UniFFI bindings under
+// `internal/uniffi` are not scanned, because the SDK does not author them.
 //
 // Provenance: ADR-028 acceptance criterion 6, SCP-117
 
@@ -25,37 +30,51 @@ import java.io.File
 class DispatcherInjectionScanTest {
     @Test
     fun `no scp-kt or scp-kt-android main source dispatches onto a hardcoded Dispatchers IO`() {
-        val offenders = scannedSources().flatMap { file ->
-            hardcodedIoDispatches(file.readText()).map { "${file.path}: $it" }
+        val offenders = scannedSources().flatMap { (relative, file) ->
+            offenders(relative, file.readText()).map { "${file.path}: $it" }
         }
         assertEquals(
-            "these sources name Dispatchers.IO in withContext instead of the injected ioDispatcher",
+            "these sources reach Dispatchers.IO instead of the injected ioDispatcher",
             emptyList<String>(),
             offenders,
         )
     }
 
     @Test
-    fun `the scan reaches both modules' main sources and skips only the two named platform files`() {
-        val kotlinRoot = locateKotlinRoot()
-        val paths = scannedSources().map { it.invariantSeparatorsPath }
-        assertTrue("the scan read no scp-kt source", paths.any { it.endsWith("works/limn/scp/stream/Streams.kt") })
+    fun `the scan reaches every main source but the generated bindings, and each allowance names one live site`() {
+        val sources = scannedSources().toMap()
+        val paths = sources.keys
+        assertTrue("the scan read no scp-kt source", "works/limn/scp/stream/Streams.kt" in paths)
+        assertTrue("the scan read no scp-kt-android source", "works/limn/scp/android/compose/StateHolders.kt" in paths)
         assertTrue(
-            "the scan read no scp-kt-android source",
-            paths.any { it.endsWith("works/limn/scp/android/compose/StateHolders.kt") },
+            "the scan skipped a platform file",
+            "works/limn/scp/android/platform/AndroidStorage.kt" in paths &&
+                "works/limn/scp/android/platform/AndroidKeyCustody.kt" in paths,
         )
-        assertTrue(
-            "the scan skipped a platform file outside the two named exclusions",
-            paths.any { it.endsWith("works/limn/scp/android/platform/AndroidStorage.kt") } &&
-                paths.any { it.endsWith("works/limn/scp/android/platform/AndroidKeyCustody.kt") },
-        )
-        for (excluded in EXCLUDED_FILES) {
-            assertTrue(
-                "the exclusion $excluded names no file",
-                File(kotlinRoot, "scp-kt-android/src/main/kotlin/$excluded").isFile,
-            )
-            assertFalse("the scan read the excluded $excluded", paths.any { it.endsWith(excluded) })
+        assertFalse("the scan read generated bindings", paths.any { it.startsWith(GENERATED_PREFIX) })
+        for ((relative, allowed) in ALLOWED_DISPATCHES) {
+            // Null when the scan did not read the file, which fails the comparison too.
+            val held = sources[relative]?.let { file -> hardcodedIoDispatches(file.readText()).count { it == allowed } }
+            assertEquals("$relative does not hold its allowed dispatch exactly once", 1, held)
         }
+    }
+
+    @Test
+    fun `an allowed platform dispatch passes only verbatim, once, and in its own file`() {
+        val push = "works/limn/scp/android/platform/AndroidPushProvider.kt"
+        val allowedSource = "suspend fun register(): String {\n    return withContext(Dispatchers.IO) {\n" +
+            "        FirebaseMessaging.getInstance().token.await()\n    }\n}"
+        assertEquals(emptyList<String>(), offenders(push, allowedSource))
+        // An SCP FFI call added to the allowed block.
+        val widened = allowedSource.replace(".await()", ".await().also { bindings.pushRegister(it) }")
+        assertEquals(1, offenders(push, widened).size)
+        // A second dispatch in the same file.
+        val second = "$allowedSource\nsuspend fun b() = withContext(Dispatchers.IO) { call() }"
+        assertEquals(1, offenders(push, second).size)
+        // The allowed block twice.
+        assertEquals(1, offenders(push, "$allowedSource\n$allowedSource").size)
+        // The allowed block in a file it does not belong to.
+        assertEquals(1, offenders("works/limn/scp/android/platform/AndroidStorage.kt", allowedSource).size)
     }
 
     @Test
@@ -78,6 +97,14 @@ class DispatcherInjectionScanTest {
                 "/* outer /* inner */ still comment */ suspend fun k() = withContext(Dispatchers.IO) { call() }",
                 // A string template's expression is code.
                 "val m = \"\${withContext(Dispatchers.IO) { call() }}\"",
+                // Spellings that reach the IO dispatcher under another name.
+                "import kotlinx.coroutines.Dispatchers.IO\nsuspend fun l() = withContext(IO) { call() }",
+                "import kotlinx.coroutines.Dispatchers.IO as Io",
+                "import kotlinx.coroutines.Dispatchers as D\nsuspend fun n() = withContext(D.IO) { call() }",
+                "typealias D = kotlinx.coroutines.Dispatchers",
+                "private val io = Dispatchers.IO\nsuspend fun o() = withContext(io) { call() }",
+                "private val io: CoroutineDispatcher get() = Dispatchers.IO",
+                "private fun io() = Dispatchers.IO",
             )
         for (source in planted) {
             assertEquals("the scan missed: $source", 1, hardcodedIoDispatches(source).size)
@@ -91,6 +118,10 @@ class DispatcherInjectionScanTest {
                 "// `withContext(Dispatchers.IO)` is what this class avoids.",
                 "/** Runs on [Dispatchers.IO] by default; never `withContext(Dispatchers.IO)`. */",
                 "class A(private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO)",
+                "class B(\n    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,\n)",
+                "fun f(ioDispatcher: CoroutineDispatcher = Dispatchers.IO) = ioDispatcher",
+                "import kotlinx.coroutines.Dispatchers",
+                "import kotlinx.coroutines.Dispatchers.Default",
                 "suspend fun a() = withContext(ioDispatcher) { call() }",
                 "suspend fun b() = withContext(NonCancellable + ioDispatcher) { release() }",
                 "suspend fun c() = withContext(CoroutineName(\"x\") + ioDispatcher) { call() }",
@@ -105,16 +136,15 @@ class DispatcherInjectionScanTest {
         }
     }
 
-    private fun scannedSources(): List<File> {
+    /** Each scanned main source, keyed by its path relative to its module's `src/main/kotlin`. */
+    private fun scannedSources(): List<Pair<String, File>> {
         val kotlinRoot = locateKotlinRoot()
         return listOf("scp-kt", "scp-kt-android").flatMap { module ->
             val main = File(kotlinRoot, "$module/src/main/kotlin")
             main.walkTopDown()
                 .filter { it.isFile && it.extension == "kt" }
-                .filterNot { file ->
-                    val relative = file.relativeTo(main).invariantSeparatorsPath
-                    relative in EXCLUDED_FILES || relative.startsWith("works/limn/scp/internal/uniffi/")
-                }
+                .map { it.relativeTo(main).invariantSeparatorsPath to it }
+                .filterNot { (relative, _) -> relative.startsWith(GENERATED_PREFIX) }
                 .toList()
         }
     }
@@ -132,29 +162,78 @@ class DispatcherInjectionScanTest {
     }
 
     private companion object {
-        /** Main sources, relative to `scp-kt-android/src/main/kotlin`, that dispatch no SCP FFI call. */
-        val EXCLUDED_FILES =
-            setOf(
-                "works/limn/scp/android/platform/AndroidDeviceAttestation.kt",
-                "works/limn/scp/android/platform/AndroidPushProvider.kt",
+        const val GENERATED_PREFIX = "works/limn/scp/internal/uniffi/"
+
+        /**
+         * The one hardcoded dispatch each of two platform files may hold, keyed by path relative
+         * to `scp-kt-android/src/main/kotlin`, as [hardcodedIoDispatches] reports it (whitespace
+         * removed). Neither block calls the SCP FFI: one requests a Play Integrity token, the
+         * other a Firebase token.
+         */
+        val ALLOWED_DISPATCHES =
+            mapOf(
+                "works/limn/scp/android/platform/AndroidDeviceAttestation.kt" to
+                    "withContext(Dispatchers.IO){IntegrityManagerFactory.create(context)" +
+                    ".requestIntegrityToken(IntegrityTokenRequest.builder().setNonce(nonce).build()).await()}",
+                "works/limn/scp/android/platform/AndroidPushProvider.kt" to
+                    "withContext(Dispatchers.IO){FirebaseMessaging.getInstance().token.await()}",
             )
         val WITH_CONTEXT_CALL = Regex("""\bwithContext\s*(?:<[^()]*?>\s*)?\(""")
         val DISPATCHERS_IO = Regex("""\bDispatchers\s*\.\s*IO\b""")
+        const val COROUTINES = """kotlinx\s*\.\s*coroutines\s*\."""
+
+        /** Spellings that reach the IO dispatcher under a name the context-argument check misses. */
+        val IO_REBINDINGS =
+            listOf(
+                // An import of the IO member, aliased or not, lets a bare name reach it.
+                Regex("""\bimport\s+$COROUTINES\s*Dispatchers\s*\.\s*IO\b"""),
+                // An import alias or a typealias renames `Dispatchers`, so `D.IO` reaches it.
+                Regex("""\bimport\s+$COROUTINES\s*Dispatchers\s+as\b"""),
+                Regex("""\btypealias\s+\w+\s*=\s*(?:$COROUTINES\s*)?Dispatchers\b"""),
+                // A val, var, or fun whose value is Dispatchers.IO. A parameter default, which a
+                // caller overrides, is followed by ',' or ')' and passes.
+                Regex("""\b(?:val|var|fun)\s+\w+[^=\n]*=\s*(?:$COROUTINES\s*)?Dispatchers\s*\.\s*IO\b(?!\s*[,)])"""),
+            )
         val WHITESPACE = Regex("""\s+""")
         const val OPENERS = "([{"
         const val CLOSERS = ")]}"
 
-        /** Every `withContext(...)` in [source] whose context argument names `Dispatchers.IO`. */
+        /** [hardcodedIoDispatches] in the file at [relative], less the one dispatch that file may hold. */
+        fun offenders(relative: String, source: String): List<String> {
+            val found = hardcodedIoDispatches(source).toMutableList()
+            ALLOWED_DISPATCHES[relative]?.let { found.remove(it) }
+            return found
+        }
+
+        /**
+         * Every `withContext(...)` in [source] whose context argument names `Dispatchers.IO`,
+         * reported with its trailing block and without whitespace, and every [IO_REBINDINGS] match.
+         */
         fun hardcodedIoDispatches(source: String): List<String> {
             val code = codeOnly(source)
-            return WITH_CONTEXT_CALL.findAll(code).mapNotNull { call ->
-                val context = contextArgument(code, call.range.last + 1)
-                if (DISPATCHERS_IO.containsMatchIn(context)) {
-                    "withContext(${context.trim().replace(WHITESPACE, " ")})"
-                } else {
-                    null
-                }
-            }.toList()
+            val dispatches = WITH_CONTEXT_CALL.findAll(code).filter { call ->
+                DISPATCHERS_IO.containsMatchIn(contextArgument(code, call.range.last + 1))
+            }.map { call ->
+                var end = closeOf(code, call.range.last)
+                var next = end
+                while (next < code.length && code[next].isWhitespace()) next++
+                if (next < code.length && code[next] == '{') end = closeOf(code, next)
+                code.substring(call.range.first, end).replace(WHITESPACE, "")
+            }
+            val rebindings = IO_REBINDINGS.flatMap { regex ->
+                regex.findAll(code).map { it.value.replace(WHITESPACE, " ") }.toList()
+            }
+            return dispatches.toList() + rebindings
+        }
+
+        /** The index just past the closer that matches the opener at [open]. */
+        fun closeOf(code: String, open: Int): Int {
+            var depth = 0
+            for (i in open until code.length) {
+                if (code[i] in OPENERS) depth++
+                if (code[i] in CLOSERS && --depth == 0) return i + 1
+            }
+            return code.length
         }
 
         /** The text from [start] to the `,` or `)` that closes the first argument of a call. */

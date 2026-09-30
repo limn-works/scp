@@ -6,7 +6,7 @@ Build blueprint for the SCP Kotlin SDK: package structure, UniFFI bridge pattern
 
 ## Package Layout
 
-The tree lists the files `git ls-tree` shows under `bindings/kotlin/`, plus the generated UniFFI bindings, which the build writes and the repository does not track.
+The tree lists every file `git ls-tree` shows under `bindings/kotlin/` except the four `.gitkeep` directory placeholders, plus the generated UniFFI bindings, which the build writes and the repository does not track.
 
 ```
 bindings/kotlin/
@@ -16,7 +16,8 @@ bindings/kotlin/
   settings.gradle.kts
   gradle.properties
   detekt.yml
-  gradlew, gradlew.bat, gradle/wrapper/
+  gradlew, gradlew.bat
+  gradle/wrapper/gradle-wrapper.jar, gradle/wrapper/gradle-wrapper.properties
   examples/
     BasicMessaging.kt
     McpIntegration.kt
@@ -171,7 +172,7 @@ UniFFI generates:
 
 ### Async bridging
 
-UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`, and this SDK does not depend on that plugin until the plugin stabilizes. `CoroutineBridge`, `ServerBridge`, and the stream factories in `stream/Streams.kt` run each blocking FFI call they dispatch and each subscription release on an injected `ioDispatcher`, which defaults to `Dispatchers.IO`, so a test can inject a `StandardTestDispatcher`. The `SCP` class's synchronous forwarders dispatch nothing: each one runs on its caller's thread, so the caller picks the dispatcher (ADR-028, the Kotlin SDK, Dispatcher strategy). `DispatcherInjectionScanTest` in `scp-kt-android` fails on a `withContext` call whose context names `Dispatchers.IO` in either module's main sources. The scan skips two files, because neither calls the SCP FFI: `platform/AndroidDeviceAttestation.kt` dispatches only the Play Integrity token request, and `platform/AndroidPushProvider.kt` dispatches only the Firebase token request. The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
+UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`, and this SDK does not depend on that plugin until the plugin stabilizes. `CoroutineBridge`, `ServerBridge`, and the stream factories in `stream/Streams.kt` run each blocking FFI call they dispatch and each subscription release on an injected `ioDispatcher`, which defaults to `Dispatchers.IO`, so a test can inject a `StandardTestDispatcher`. The `SCP` class's `shutdown`, `suspendInstance`, and `resume` take a `CoroutineBridge` and dispatch on its `ioDispatcher`. The class's other methods forward to UniFFI and dispatch nothing: a synchronous forwarder runs on its caller's thread, so the caller picks the dispatcher (ADR-028, the Kotlin SDK, Dispatcher strategy). `DispatcherInjectionScanTest` in `scp-kt-android` reads both modules' main sources, apart from the generated UniFFI bindings under `internal/uniffi`. It fails on a `withContext` call whose context names `Dispatchers.IO`, and on an import, an alias, or a `val`, `var`, or `fun` that reaches `Dispatchers.IO` under another name; a parameter default of `Dispatchers.IO` passes. It allows one dispatch in `platform/AndroidDeviceAttestation.kt`, the Play Integrity token request, and one in `platform/AndroidPushProvider.kt`, the Firebase token request, because neither calls the SCP FFI, and it allows each only with the exact block the test records (ADR-028 acceptance criterion 6). The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
 
 ```kotlin
 class Context internal constructor(
@@ -193,9 +194,10 @@ class Context internal constructor(
             Json.decodeFromString(result)
         }
 
-    // Subscribe under NonCancellable and record the subscription inside that block: a
-    // collector cancelled mid-call makes withContext throw on resumption and drop the block's
-    // return value. Release it by suspending in a finally: awaitClose's lambda runs on the
+    // Subscribe under NonCancellable and record the subscription inside that block: when
+    // ioDispatcher differs from the collector's dispatcher, so that withContext resumes the
+    // collector by dispatch, a collector cancelled mid-call makes withContext throw on that
+    // resumption and drop the block's return value. Release it by suspending in a finally: awaitClose's lambda runs on the
     // collector's thread, an Android main thread under collectAsState. Log a release that
     // throws instead of rethrowing it (sdk-common.md §Cleanup error handling): rethrown from
     // the finally, it would replace the collector's cancellation as the failure and propagate
