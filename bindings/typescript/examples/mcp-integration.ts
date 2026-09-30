@@ -64,9 +64,13 @@ async function main(): Promise<void> {
       // lives only in this process's in-memory instance, and the server this
       // example starts above uses stdio. The SSE server must expose a context
       // holding a `summarize` outlet; this example reads that context's ID
-      // from SCP_MCP_SSE_CONTEXT_ID. An SCP SSE server always runs a bearer
-      // check (ADR-015), so pass the token that server's operator gives you;
-      // this example reads it from SCP_MCP_SSE_TOKEN. The transport has no
+      // from SCP_MCP_SSE_CONTEXT_ID. An SCP server lists each outlet as
+      // `<context_id>/call.<outlet>` or `<context_id>/query.<outlet>` and
+      // refuses a bare outlet name in `tools/call`, so the example invokes the
+      // name `mcpClientListTools` returns; the context ID passed to
+      // `mcpClientInvoke` feeds only local provenance. An SCP SSE server
+      // always runs a bearer check (ADR-015), so pass the token that server's
+      // operator gives you; this example reads it from SCP_MCP_SSE_TOKEN. The transport has no
       // TLS, so a token is sent only to a loopback host.
       const sseToken = process.env.SCP_MCP_SSE_TOKEN;
       if (sseToken === undefined || sseToken === "") {
@@ -82,10 +86,17 @@ async function main(): Promise<void> {
       try {
         const outlets = await scp.mcpClientListTools(client);
         console.log(`The server offers ${outlets.length} outlet(s)`);
+        const summarizeNames = [`${sseContextId}/call.summarize`, `${sseContextId}/query.summarize`];
+        const summarize = outlets
+          .map((t) => (t as { name?: unknown }).name)
+          .find((n): n is string => typeof n === "string" && summarizeNames.includes(n));
+        if (summarize === undefined) {
+          throw new Error(`context ${sseContextId} offers no summarize outlet`);
+        }
 
         const result = await scp.mcpClientInvoke(
           client,
-          "summarize",
+          summarize,
           JSON.stringify({ text: "SCP is a protocol for..." }),
           sseContextId,
           identity.did,
