@@ -61,18 +61,15 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * The nonce is `Base64(SHA-256(clientDataJSON))`. The adapter requests a
      * Classic Play Integrity token with this nonce and returns it as UTF-8
      * encoded JWT bytes. ADR-027 acceptance criterion 7 requires, among
-     * other things, the following five, and this adapter meets none of the five:
+     * other things, the following four, and this adapter meets none of the four:
      *   1. a Standard integrity token, not a Classic one;
      *   2. a token prepared with the `cloudProjectNumber` of the package
      *      verifier's `PlayIntegrityVerifier` entry;
      *   3. a `requestHash` equal to the lowercase hexadecimal form of the
      *      binding digest `D`;
-     *   4. an adapter that does not read [deviceId];
-     *   5. an adapter that throws [ScpException] with code `SCP-ATTEST-9001`
-     *      for every failure, because a UniFFI callback that throws any other
-     *      exception panics the Rust caller.
+     *   4. an adapter that does not read [deviceId].
      * The reopen note of story SCP-111, which stands in progress, names all
-     * five.
+     * four.
      *
      * @param challenge The 32-byte binding digest `D` of
      *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
@@ -85,8 +82,11 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
      * @throws ScpException with code `SCP-ATTEST-9001` if the Play Integrity
      *   call throws an `ApiException`, a [SecurityException] or an
-     *   [IllegalStateException]. Any other exception from the call, and any
-     *   exception thrown before or after it, propagates unconverted.
+     *   [IllegalStateException]. A coroutine `CancellationException` is an
+     *   [IllegalStateException], so cancelling the calling coroutine while the
+     *   call runs also yields `SCP-ATTEST-9001` and not a cancellation. Any other
+     *   exception from the call, and any exception thrown before or after it,
+     *   propagates unconverted.
      */
     override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray {
         val clientDataJSON = buildClientDataJSON(challenge, deviceId)
@@ -152,11 +152,9 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
      * @throws ScpException with code `SCP-ATTEST-9001` if [attest] converts the
      *   failure; [attest] converts only an `ApiException`, a [SecurityException]
-     *   or an [IllegalStateException] from the Play Integrity call, and any other
-     *   exception propagates unconverted. ADR-027's Implementation paragraph
-     *   on `AndroidDeviceAttestation.kt` requires every failure to leave the
-     *   adapter as [ScpException]; acceptance criterion 8, which covers this
-     *   method, names no error rule.
+     *   or an [IllegalStateException] from the Play Integrity call, including
+     *   a coroutine `CancellationException`, which is an
+     *   [IllegalStateException]; any other exception propagates unconverted.
      */
     override suspend fun assertRequest(requestHash: ByteArray): ByteArray {
         // Play Integrity does not have a per-request assertion flow equivalent
