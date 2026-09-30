@@ -42,37 +42,13 @@ of them reopens a bypass this repository has already measured:
    A body under `#[cfg(feature = "testing")] fn main()`, beside an empty
    `#[cfg(not(feature = "testing"))] fn main() {}`, compiles to nothing on the feature set
    the lint call builds, and the target still counts as checked (row 9a). The script reads
-   each target's source and every `.rs` file under the package's `examples/`, following
-   symbolic links as rustc follows them when it resolves `mod`, after blanking string
-   literals, char literals and comments, with block comments nested as rustc nests them.
-   The blanking must lex a literal where rustc does: a scan that reads the `r` of a literal
-   suffix or a lifetime (`1r"\" "`, `"x"r"\" "`, `'r"\" "`) as a raw-string prefix, refuses
-   a raw string after a `#` token (`#r"\"`), or stops a char literal at a one-character
-   escape (`'\x41'`), ends the literal at the wrong quote and blanks the real code after
-   it, feature cfg included, as a string. A lookbehind cannot tell a closing raw hash
-   (`r#"x"#r"`) from a `#` token, so the scan takes each literal's suffix with the
-   literal. rustc strips a first line that starts with `#!` (after an optional byte-order
-   mark) when the next token is not `[`, so a scan that lexes that line reads a `"` in
-   `#!/x "` as the start of a string and blanks the feature cfg after it; the scan rejects
-   any first line whose `#!` is not followed by `[` after spaces, tabs and line breaks
-   alone, and blanks it. It fails on a `cfg(` or `cfg!(` predicate that names anything but `not`,
-   `any`, `all`, `unix`, `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
-   `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
-   gate (row 9b), and on a predicate value that holds a backslash: rustc compares the value
-   after unescaping it, so it reads `target_family = "un\x69x"`, and a value continued
-   across a line break by a trailing backslash, as `target_family = "unix"`, while a scan
-   comparing source bytes finds no host key of that spelling and evaluates `not(...)` of it
-   as true. It fails on any identifier that starts with `cfg_`, which covers
-   `cfg_attr` and std's stable `cfg_select!` (it keeps only the arm whose predicate holds,
-   and its predicates are not `cfg(` calls), and on `#[path]` (also written `#[r#path]`), `include`, `macro_rules` and
-   `stringify` (std's `stringify!` turns its input into a string without type-checking it). It fails on the identifier `test`, `bench` or `test_case` wherever it
-   stands: the lint call is not a `--test` build, so rustc deletes a `#[test]` item before
-   name resolution and a body in `#[test] fn body()` beside an empty `fn main()` is never
-   type-checked, and the attribute also works path-qualified and renamed through `use`, so
-   the rule matches the name rather than the attribute form. It fails on a U+200E or U+200F
-   outside a literal or comment: rustc lexes both as whitespace and Perl's `\s` matches
-   neither, so `#[cfg<U+200E>(feature = "testing")]` is a live attribute the `cfg(` matcher
-   would miss. It fails on a block comment or string literal it cannot close.
+   each example target's source file and every `.rs` file under the package's `examples/`
+   directory, symbolic links followed, in every workspace package, and fails on code it
+   cannot show compiles on the Linux runner of the rust-clippy job. The header and scan of
+   `scripts/check-examples-compile.sh` are the one statement of the rules that scan
+   applies. This lesson does not restate them: while the gate was under review, every
+   prose copy of those rules fell behind the scan, because review rounds kept adding and
+   narrowing rules.
 
 Row 8 is answered by none of them. Three kinds of bypass are known to
 remain: the dev-dependency closure (row 4b), code outside `examples/` that an example calls
@@ -106,11 +82,11 @@ mechanisms listed above, and row 6c by reading with `while IFS= read -r` instead
 word-splitting. Row 9a was measured with mechanism 7 removed: the gate compiled the
 feature-gated fixture of case `cfgbody` and exited 0.
 
-Row 9b is closed by mechanism 7 for every route in its row, and the case suite's
-`falsecfg`, `escapedcfg`, `continuedcfg`, `emptyany`, `nestedcomment`, `include`, `pathmod`, `rawpath`, `macrorules`,
-`stringify`, `lrmcfg`, `lrmcfgmacro`, `rlmpath`, `cfgselect`, `testattr`, `testpath`,
-`testalias`, `shebang`, `bomshebang` and `nbspshebang` cases each fail on one of those routes. The row lists the routes
-reviewers have found, not a proof that no other exists.
+Row 9b is closed by mechanism 7 for every route in its row, and each route has a case in
+`scripts/tests/examples-compile/run-tests.sh` that must fail. The row records the routes
+reviewers have found. It is not the scan's rule set, which the gate states, and not a
+proof that no other route exists.
+
 Row 9c is open, and no human has ruled it acceptable. Mechanism 7 reads example sources
 only, so a lib item compiled only under a feature key beside an empty default twin, or a lib
 or dependency macro that drops or feature-gates its input, removes code the scan never
