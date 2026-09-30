@@ -48,9 +48,10 @@
 //!   re-validates every KeyPackage-sourced leaf against the injected hardened
 //!   clock, with the maximum-range bound, after `into_group` and before the
 //!   group is adopted.
-//! - **openmls's internal check still runs.** openmls 0.9.0 has no
-//!   time-provider seam, so its own `Lifetime::validate` on `KeyPackageIn` and on
-//!   Welcome tree leaves still reads `web_time`'s `Date.now()`, in addition to
+//! - **openmls's internal check still runs.** openmls 0.9.0's internal checks
+//!   call `Lifetime::validate`, never `validate_with_time` with a caller's time,
+//!   so its own check on `KeyPackageIn` and on Welcome tree leaves still reads
+//!   `web_time`'s `Date.now()`, in addition to
 //!   SCP's checks. Page same-origin integrity (CSP/SRI/COOP/COEP) stays
 //!   load-bearing only for that internal check, not for Welcome-leaf freshness.
 

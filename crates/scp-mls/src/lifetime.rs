@@ -17,18 +17,20 @@
 //! confidentiality — group secrets stay sound — but it defeats `KeyPackage`
 //! freshness/expiry as a defense.
 //!
-//! `openmls` 0.9.0 exposes **no** clock-injection seam on `Lifetime`. The
-//! real seam the cryptographer review identified is
-//! [`Lifetime::init`](openmls::prelude::Lifetime) — a pure constructor that
-//! takes caller-supplied `not_before`/`not_after` bounds and bypasses the
-//! internal `SystemTime::now()`. This module:
+//! `openmls` 0.9.0 reads its own clock in `Lifetime::new`, `Lifetime::default`,
+//! and the `Lifetime::validate` its internal checks run, and offers no way to
+//! route those reads through a caller's clock. It exposes two caller-side entry
+//! points that take the time from the caller, and this module uses both:
+//! [`Lifetime::init`](openmls::prelude::Lifetime), a pure constructor that takes
+//! caller-supplied `not_before`/`not_after` bounds, and
+//! `Lifetime::validate_with_time(now)`, new in 0.9.0. This module:
 //!
 //! - **Mints** every `Lifetime` SCP generates via [`key_package_lifetime`],
 //!   which reads the injected [`Clock`](scp_clock::Clock) and calls
 //!   `Lifetime::init` with bounds derived from it (never the openmls default).
 //! - **Validates** every `Lifetime` SCP accepts via
-//!   [`validate_key_package_lifetime`], which re-checks temporal validity
-//!   against the injected [`Clock`](scp_clock::Clock) wherever openmls exposes
+//!   [`validate_key_package_lifetime`], which runs `validate_with_time` with a
+//!   `now` built from the injected [`Clock`](scp_clock::Clock) wherever openmls exposes
 //!   the accepted `Lifetime` (post-`validate` on `KeyPackageIn`, pre-merge on
 //!   staged-commit Add proposals, and on Welcome tree leaves post-`into_group`
 //!   and pre-adoption), and additionally enforces the RFC 9420
@@ -39,7 +41,8 @@
 //! openmls's own `Lifetime::validate` still runs inside `KeyPackageIn::validate`
 //! and inside Welcome tree-leaf validation, against openmls's internal clock
 //! (the real wall clock natively; the attacker-overridable `Date.now()` through
-//! `web_time` on wasm), because openmls 0.9.0 has no time-provider seam. SCP
+//! `web_time` on wasm), because those checks call `validate`, never
+//! `validate_with_time` with a caller's time. SCP
 //! brackets both paths against the injected clock, in addition to that internal
 //! check and never in place of it:
 //!
@@ -65,6 +68,8 @@
 //! rejected by openmls's *own* internal validation before this module's check
 //! ever runs. Seed test clocks from `SystemClock.now_secs()` and apply small
 //! relative offsets; do not use absolute fixed epochs far from the real present.
+
+use core::time::Duration;
 
 use openmls::prelude::{Lifetime, MlsGroup};
 use openmls::treesync::LeafNodeSource;
@@ -128,9 +133,13 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 /// This is SCP's hardened counterpart to openmls's `Lifetime::validate`, which
 /// reads openmls's un-injectable internal clock. It performs two checks:
 ///
-/// 1. **Temporal validity** — the bounds of openmls 0.9.0
-///    `Lifetime::validate_with_time`: `not_before <= now && now < not_after`,
-///    with `now` read from the injected clock.
+/// 1. **Temporal validity** — openmls 0.9.0 `Lifetime::validate_with_time`,
+///    which accepts `not_before <= now && now < not_after`, called with `now`
+///    read from the injected clock. `now` is a `web_time::SystemTime`, the type
+///    `validate_with_time` takes on every target: `web_time` re-exports
+///    `std::time::SystemTime` natively and supplies its own type on
+///    `wasm32-unknown-unknown`, where openmls uses it. One call therefore
+///    compiles on both without a cfg branch.
 /// 2. **Maximum range** — enforces the RFC 9420 bound that openmls's own
 ///    `validate` path never applies: `not_after - not_before <=
 ///    KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`. A legitimately-signed `Lifetime`
@@ -152,9 +161,11 @@ pub fn validate_key_package_lifetime(
     let not_before = lifetime.not_before();
     let not_after = lifetime.not_after();
 
-    // The bounds of openmls 0.9.0 `Lifetime::validate_with_time`, which rejects
-    // `not_after <= now` (expired) and `not_before > now` (not yet valid).
-    let temporally_valid = not_before <= now && now < not_after;
+    // openmls 0.9.0 rejects `not_after <= now` (expired) and `not_before > now`
+    // (not yet valid). A `now` too large for `SystemTime` fails closed.
+    let temporally_valid = web_time::UNIX_EPOCH
+        .checked_add(Duration::from_secs(now))
+        .is_some_and(|at| lifetime.validate_with_time(at).is_ok());
 
     // RFC 9420 (ValSem / openmls annotations #32) maximum-range bound. openmls
     // exposes `has_acceptable_range` but does NOT call it in `validate`, so we
@@ -288,6 +299,31 @@ mod tests {
         let lt = Lifetime::init(not_before, not_before + 100);
         let err = validate_key_package_lifetime(&lt, &TestClock::new(not_before - 1)).unwrap_err();
         assert!(matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }));
+    }
+
+    /// A clock reading too large for `SystemTime` fails closed rather than
+    /// panicking in `UNIX_EPOCH + now`. `TestClock` stores milliseconds and
+    /// cannot reach that range, so this clock reports seconds directly.
+    #[test]
+    fn validate_rejects_now_beyond_system_time_range() {
+        const FAR_NOW: u64 = u64::MAX - 5;
+        struct FarClock;
+        impl Clock for FarClock {
+            fn now_secs(&self) -> u64 {
+                FAR_NOW
+            }
+            fn now_millis(&self) -> u64 {
+                u64::MAX
+            }
+        }
+        // The bounds hold (`not_before <= FAR_NOW < not_after`) and the range
+        // is 10s, so only the `SystemTime` overflow can reject this lifetime.
+        let lt = Lifetime::init(FAR_NOW - 5, FAR_NOW + 5);
+        let err = validate_key_package_lifetime(&lt, &FarClock).unwrap_err();
+        assert!(matches!(
+            err,
+            MlsError::KeyPackageLifetimeInvalid { now, .. } if now == FAR_NOW
+        ));
     }
 
     #[test]

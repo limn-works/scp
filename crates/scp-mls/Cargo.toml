@@ -41,6 +41,12 @@ openmls_basic_credential = { workspace = true }
 openmls_rust_crypto = { workspace = true }
 openmls_memory_storage = { workspace = true }
 tls_codec = "0.5"
+# `lifetime.rs` builds the `now` it passes to openmls's `Lifetime::validate_with_time`
+# as a `web_time::SystemTime`. That is the type the method takes on every target:
+# web-time re-exports `std::time::SystemTime` natively and supplies its own type on
+# wasm32-unknown-unknown, where openmls's `js` feature uses it. Naming it here keeps
+# the call free of cfg branches. The version matches openmls 0.9.0's `web-time = "1.1"`.
+web-time = "1.1"
 
 serde = { workspace = true }
 rmp-serde = { workspace = true }
