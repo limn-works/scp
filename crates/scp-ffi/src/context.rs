@@ -100,81 +100,6 @@ fn require_active_context(
     .into())
 }
 
-/// Installs a committed Welcome join's role state from the supervisor into
-/// the bridge's `role_state`, and tears the join down when the supervisor no
-/// longer serves it.
-///
-/// BLACK-2JF-01 — post-irreversible-commit compensation. The read is
-/// `get_role_state_checked`, which keeps three outcomes apart:
-///   - `Ok(Some(_))`: install it. The install fails only if a concurrent
-///     close/leave removed the just-registered FFI state.
-///   - `Ok(None)`: the supervisor holds no actor, no poison flag and no
-///     respawn marker for the id, so a concurrent close/leave removed the
-///     actor in the window since the spawn returned.
-///   - `Err(_)`: the actor is busy or timed out, mid-respawn, or
-///     poisoned. The join is committed and the context still exists.
-///
-/// For the first two, returning `Err` without tearing the actor down
-/// would strand an orphaned actor for a join that never fully
-/// materialized at the bridge. Compensate with the COMPLETE teardown
-/// (`discard_joined_context`): it removes the actor handle AND destroys
-/// the resident MLS group AND deletes the durable Class-S snapshot the
-/// join persisted — a bare `despawn_actor` would leave the crypto group
-/// and snapshot behind, resurrecting the context on restart and blocking
-/// a fresh re-join. Then purge residual bridge state and surface the
-/// error.
-///
-/// The third must NOT discard: the single-use key package is consumed,
-/// so destroying the group would turn a transient miss into a permanent
-/// loss of membership. It must NOT fail the join either: the caller's
-/// only way to reach the joined context is the handle
-/// `context_join_from_welcome` returns after this step, and a retry fails
-/// on the already-registered FFI state. So it logs the supervisor's error
-/// and returns `Ok`, leaving the bridge's `role_state` as the join
-/// registered it, built from an empty ceiling: no outlet or MCP role check
-/// grants anything until a later `sync_role_state_from_manager` replaces it.
-/// The join, leave, send and receive gates read the supervisor and surface a
-/// busy, crashed (`SCP-CTX-2135`) or poisoned (`SCP-CTX-2134`) actor
-/// themselves.
-///
-/// # Errors
-///
-/// Returns a `RuntimeError` after the teardown for the first two failures.
-fn install_joined_role_state(
-    bi: &crate::runtime::PyBridgeInstance,
-    rt: &tokio::runtime::Runtime,
-    sup: &scp_core::context::supervisor::Supervisor,
-    context_id: &str,
-) -> PyResult<()> {
-    let discard_reason = match rt.block_on(sup.get_role_state_checked(context_id)) {
-        Ok(Some(role_state)) => crate::runtime::with_ffi_state(bi, context_id, |st| {
-            st.role_state = role_state;
-            Ok(())
-        })
-        .err()
-        .map(|e| e.to_string()),
-        Ok(None) => Some(format!(
-            "context '{context_id}' not found in supervisor after the join committed"
-        )),
-        Err(e) => {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %crate::error::ScpPyError::from(e),
-                "context_join_from_welcome committed the join, but the supervisor did not \
-                 answer the role-state read; this bridge's role state stays the empty-ceiling \
-                 precheck until a later re-sync"
-            );
-            None
-        }
-    };
-    if let Some(reason) = discard_reason {
-        rt.block_on(sup.discard_joined_context(context_id));
-        crate::runtime::remove_context(bi, context_id);
-        return Err(PyRuntimeError::new_err(reason));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // PyContextHandle
 // ---------------------------------------------------------------------------
@@ -326,8 +251,9 @@ impl PyContextHandle {
 /// The dict may contain any of these keys (all optional):
 /// - `ceiling` -- list of capability strings. Omitting this key, or passing
 ///   `None`, declares no ceiling and gets `default_ceiling()`. Passing `[]`
-///   declares a ceiling that grants nothing, and this bridge builds that
-///   deny-all context rather than reading the empty list as an omission.
+///   declares a ceiling that grants nothing, and the supervisor creates the
+///   context under that deny-all ceiling rather than reading the empty list as
+///   an omission.
 /// - `roles` -- dict mapping role names to lists of capability strings
 /// - `outlets` -- list of outlet name strings
 /// - `ttl` -- float (seconds) or `None`
@@ -3036,14 +2962,12 @@ impl crate::scp::PyScp {
         // role-state admin (bundle-derived); the joiner is added as a member
         // below.
         //
-        // FLAG-1: the caller no longer supplies a ceiling, so register with an
-        // empty, deny-all ceiling (`&[]`) until the join authenticates one.
-        // The Occupied dedup is keyed on `context_id`,
+        // FLAG-1: the caller no longer supplies a ceiling, so register with the
+        // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`,
         // so the "detect a duplicate BEFORE consuming the single-use KeyPackage"
         // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-        // ceiling is re-synced from the joined handle's signed params, and the
-        // role state from the supervisor, AFTER a successful spawn (see
-        // `sync_ceiling_from_params` and `install_joined_role_state` below).
+        // ceiling is re-synced from the joined handle's signed params AFTER a
+        // successful spawn (see `sync_ceiling_from_params` below).
         //
         // Ordering matters for two reasons:
         //   1. `register_ffi_state` hard-errors on an already-registered context
@@ -3097,7 +3021,7 @@ impl crate::scp::PyScp {
             };
 
         // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-        // signed params, overwriting the empty ceiling used for the reversible
+        // signed params, overwriting the default ceiling used for the reversible
         // precheck. The authoritative ceiling lives in the bundle the creator
         // signed — never in caller input. This runs AFTER the irreversible
         // commit; the FFI state was just registered (and not removed on this
@@ -3124,13 +3048,6 @@ impl crate::scp::PyScp {
             crate::runtime::remove_context(bi, &sealed.context_id);
             return Err(PyRuntimeError::new_err(e.to_string()));
         }
-        // The precheck role state was built from an empty ceiling, so its
-        // built-in role definitions and the creator's admin grant grant
-        // nothing; replace it with the role state the supervisor built from
-        // the authenticated params, so role-derived checks (outlet
-        // registration, outlet invocation, MCP) read the joined context's
-        // roles. The same compensation applies: see `install_joined_role_state`.
-        install_joined_role_state(bi, rt, &sup, &sealed.context_id)?;
 
         // Runtime join committed. Register the context in the known-contexts
         // discovery registry so a Welcome-joined context is surfaced by
@@ -8210,74 +8127,6 @@ mod tests {
             .expect("receive must pass the gate for an active context");
     }
 
-    /// The post-commit step of a Welcome join keeps apart the three answers
-    /// `get_role_state_checked` gives: it installs a served role state, tears
-    /// down a join the supervisor no longer serves, and keeps a join whose
-    /// actor is poisoned instead of destroying it or failing it, with the
-    /// empty-ceiling precheck role state left in place.
-    #[cfg(feature = "testing")]
-    #[test]
-    fn install_joined_role_state_discards_only_a_join_the_supervisor_does_not_serve() {
-        crate::init_runtime().ok();
-        let rt = crate::runtime().unwrap();
-        let creator = "did:dht:z6MkJoinedRoleState";
-        let setup = |prefix: &str, spawn: bool| {
-            let bi = __bi();
-            crate::runtime::init_context_manager_for_test(&bi);
-            let ctx_id = format!("{prefix}{}", "0".repeat(60));
-            if spawn {
-                crate::runtime::create_supervisor_context_for_test(
-                    &bi,
-                    &ctx_id,
-                    creator,
-                    &["messages:read".to_owned()],
-                );
-            }
-            crate::runtime::register_ffi_state(&bi, &ctx_id, creator, &[]).unwrap();
-            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
-            (bi, ctx_id, sup)
-        };
-        let role_ceiling = |bi: &crate::runtime::PyBridgeInstance, ctx_id: &str| {
-            crate::runtime::with_ffi_state(bi, ctx_id, |st| Ok(st.role_state.ceiling().clone()))
-        };
-
-        // Served: the role state comes from the supervisor.
-        let (bi, ctx_id, sup) = setup("7a01", true);
-        install_joined_role_state(&bi, rt, &sup, &ctx_id).expect("a served join installs");
-        assert!(
-            role_ceiling(&bi, &ctx_id)
-                .unwrap()
-                .contains(&scp_core::context::roles::Capability::MessagesRead)
-        );
-        crate::runtime::remove_context(&bi, &ctx_id);
-
-        // Absent: the join is torn down and its bridge state removed.
-        let (bi, ctx_id, sup) = setup("7a02", false);
-        let err = install_joined_role_state(&bi, rt, &sup, &ctx_id).unwrap_err();
-        assert!(
-            err.to_string().contains("not found in supervisor"),
-            "got: {err}"
-        );
-        assert!(
-            role_ceiling(&bi, &ctx_id).is_err(),
-            "an absent join's bridge state must be removed"
-        );
-
-        // Poisoned: the join stays committed and succeeds, so the caller still
-        // gets its handle, and its role state stays the empty-ceiling precheck.
-        let (bi, ctx_id, sup) = setup("7a03", true);
-        rt.block_on(sup.test_poison_context(&ctx_id));
-        install_joined_role_state(&bi, rt, &sup, &ctx_id)
-            .expect("a poisoned join keeps the commit and returns Ok");
-        assert!(
-            role_ceiling(&bi, &ctx_id)
-                .expect("a poisoned join keeps its bridge state")
-                .is_empty(),
-            "the precheck role state stays deny-all"
-        );
-        crate::runtime::remove_context(&bi, &ctx_id);
-    }
-
     /// Every lifecycle gate refuses a context the crash watchdog poisoned with
     /// `SCP-CTX-2134` `ContextPoisoned`, the code ADR-049 §10 makes the
     /// authoritative poison signal, and not with the gate's own code.
@@ -8460,141 +8309,6 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             "every rendered name parses back into the built-in capability it names"
         );
-    }
-
-    /// Creates a context through `context_create` with `ceiling` set to
-    /// `ceiling` (or no `ceiling` key when `None`), then mints a
-    /// `messages:write` UCAN in it through `ucan_mint`, which checks the
-    /// bridge's `ceiling_strings` copy.
-    #[cfg(feature = "testing")]
-    fn mint_in_created_context(ceiling: Option<Vec<String>>) -> PyResult<()> {
-        pyo3::prepare_freethreaded_python();
-        crate::init_runtime().ok();
-        Python::with_gil(|py| {
-            let scp = crate::scp::PyScp::new_in_memory_for_test();
-            let creator = scp.identity_create(py, "in_memory", None).unwrap();
-            let creator_did = creator.did().to_owned();
-            let params = PyDict::new(py);
-            params.set_item("mode", "encrypted").unwrap();
-            params.set_item("governance", "single_admin").unwrap();
-            if let Some(ceiling) = ceiling {
-                params.set_item("ceiling", ceiling).unwrap();
-            }
-            let handle = scp
-                .context_create(&creator_did, &params)
-                .expect("context_create succeeds");
-            scp.ucan_mint(
-                &handle.context_id,
-                "did:dht:z6MkDenyAllMintMember",
-                vec!["messages:write".to_owned()],
-                None,
-            )
-            .map(drop)
-        })
-    }
-
-    /// A context created with `ceiling=[]` grants nothing, so the bridge
-    /// refuses to mint a capability in it: the UCAN copy the mint checks holds
-    /// the same empty ceiling the supervisor holds, not `default_ceiling()`.
-    #[test]
-    #[cfg(feature = "testing")]
-    fn ucan_mint_is_refused_in_a_deny_all_context() {
-        let err = mint_in_created_context(Some(Vec::new()))
-            .expect_err("a deny-all context must refuse every mint");
-        assert!(
-            err.to_string().contains("outside ceiling"),
-            "the refusal must name the ceiling, got: {err}"
-        );
-    }
-
-    /// The same mint succeeds in a context that declared no ceiling and so
-    /// runs under `default_ceiling()`. Without this case the refusal above
-    /// would also pass for a mint that failed for every context.
-    #[test]
-    #[cfg(feature = "testing")]
-    fn ucan_mint_is_admitted_under_the_default_ceiling() {
-        mint_in_created_context(None).expect("messages:write is in default_ceiling()");
-    }
-
-    /// Builds an outlet registration dict whose operator is `operator` and
-    /// whose schema meets the specificity floor.
-    fn outlet_registration_dict<'py>(
-        py: Python<'py>,
-        name: &str,
-        operator: &str,
-    ) -> Bound<'py, PyDict> {
-        let str_type = PyDict::new(py);
-        str_type.set_item("type", "string").unwrap();
-        let num_type = PyDict::new(py);
-        num_type.set_item("type", "number").unwrap();
-        let props = PyDict::new(py);
-        props.set_item("a", str_type).unwrap();
-        props.set_item("b", num_type).unwrap();
-        let input = PyDict::new(py);
-        input.set_item("type", "object").unwrap();
-        input.set_item("properties", props).unwrap();
-        let output = PyDict::new(py);
-        output.set_item("type", "object").unwrap();
-        let schema = PyDict::new(py);
-        schema.set_item("input_schema", input).unwrap();
-        schema.set_item("output_schema", output).unwrap();
-        let dict = PyDict::new(py);
-        dict.set_item("name", name).unwrap();
-        dict.set_item("description", "probes the bridge role check")
-            .unwrap();
-        dict.set_item("operator_did", operator).unwrap();
-        dict.set_item("schema", schema).unwrap();
-        dict
-    }
-
-    /// Creates a context through `context_create` with `ceiling` set to
-    /// `ceiling` (or no `ceiling` key when `None`), then registers an outlet in
-    /// it through `outlet_register`, whose `OutletRegister` check reads the
-    /// bridge's `role_state`, not its `ceiling_strings`.
-    #[cfg(feature = "testing")]
-    fn register_outlet_in_created_context(ceiling: Option<Vec<String>>) -> PyResult<String> {
-        pyo3::prepare_freethreaded_python();
-        crate::init_runtime().ok();
-        Python::with_gil(|py| {
-            let scp = crate::scp::PyScp::new_in_memory_for_test();
-            let creator = scp.identity_create(py, "in_memory", None).unwrap();
-            let creator_did = creator.did().to_owned();
-            let params = PyDict::new(py);
-            params.set_item("mode", "encrypted").unwrap();
-            params.set_item("governance", "single_admin").unwrap();
-            if let Some(ceiling) = ceiling {
-                params.set_item("ceiling", ceiling).unwrap();
-            }
-            let handle = scp
-                .context_create(&creator_did, &params)
-                .expect("context_create succeeds");
-            let dict = outlet_registration_dict(py, "ceiling-probe", &creator_did);
-            scp.outlet_register(&handle.context_id, &dict.as_borrowed())
-        })
-    }
-
-    /// Outlet registration is role-gated at the bridge: the creator's admin
-    /// role grants `outlet:register` only when the ceiling holds it. A `[]`
-    /// context and a context narrowed to `messages:read` both refuse it, and a
-    /// context under `default_ceiling()` admits it. The admitted case is what
-    /// makes the refusals mean something: without it, a registration that
-    /// failed for every context would pass.
-    #[test]
-    #[cfg(feature = "testing")]
-    fn outlet_register_is_refused_unless_the_ceiling_grants_it() {
-        for (label, ceiling) in [
-            ("deny-all", Vec::new()),
-            ("narrowed", vec!["messages:read".to_owned()]),
-        ] {
-            let err = register_outlet_in_created_context(Some(ceiling))
-                .expect_err("a ceiling without outlet:register must refuse registration");
-            assert!(
-                err.to_string().contains("outlet registration failed"),
-                "{label}: the refusal must come from the role check, got: {err}"
-            );
-        }
-        register_outlet_in_created_context(None)
-            .expect("outlet:register is in default_ceiling(), so registration succeeds");
     }
 
     /// Creates a context through `context_create` with `ceiling` set to

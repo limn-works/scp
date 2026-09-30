@@ -2731,13 +2731,7 @@ mod tests {
         let bi = &*scp.inner;
 
         // Register FFI state so the context exists in the runtime registry.
-        crate::runtime::register_ffi_state(
-            bi,
-            &ctx_id,
-            creator_did,
-            &crate::context::default_ceiling_strings(),
-        )
-        .unwrap();
+        crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
 
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
