@@ -154,7 +154,8 @@ the deadlock `ScpViewModelTest` observed that drove it.
 requires a `kotlin.coroutines.Continuation` parameter on every method `Relay`, `Node`, or `SCP`
 declares under a stop name (`shutdown`, `close`, `stop`, or `dispose`, compiled overloads
 included), so a non-suspending method under one of those names fails it. It reads signatures only,
-so it catches no blocking call inside a method body.
+so it catches no blocking call inside a method body. `ScpHotStreamsTeardownShapeTest`, in
+`scp-kt-android`'s `compose/StateHoldersTest.kt`, holds `ScpHotStreams` to the same two checks.
 
 ## Affected files
 

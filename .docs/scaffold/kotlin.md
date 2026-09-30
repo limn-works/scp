@@ -241,7 +241,7 @@ class Identity private constructor(private val handle: IdentityHandle) {
 
 ## Resource Management
 
-`SCP`, `Relay`, `Node` (`scp-kt`), and `ScpHotStreams` (`scp-kt-android`) each expose their teardown as one `suspend` function, `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()`, and `ScpHotStreams.close()`, and implement no `AutoCloseable` or `Closeable`, so no `use { }` block applies to them. The classes UniFFI generates, such as `Scp`, keep the synchronous `close()` UniFFI gives them. `AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` whose teardown suspends on an injected dispatcher could keep that promise only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. `ScpViewModel.onCleared()` cannot suspend and promises no finished teardown, so it launches its `leave` calls on a scope that outlives it and returns. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
+`SCP`, `Relay`, `Node` (`scp-kt`), and `ScpHotStreams` (`scp-kt-android`) each expose their teardown as one `suspend` function, `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()`, and `ScpHotStreams.close()`, and implement no `AutoCloseable` or `Closeable`, so no `use { }` block applies to them. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" states why.
 
 ```kotlin
 // Call shutdown() from a coroutine the caller owns, never through runBlocking. Run it under

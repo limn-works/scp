@@ -20,7 +20,7 @@ Kotlin conventions, toolchain, and CI for the SCP Kotlin SDK. References `sdk-co
 
 ### Coroutine-first
 
-All I/O operations are `suspend` functions. Streaming uses `Flow<T>`. Blocking FFI calls are wrapped in `withContext(Dispatchers.IO)` to keep callers off the main thread. SDK code that dispatches a blocking FFI call or a subscription release takes an injected `ioDispatcher` that defaults to `Dispatchers.IO`, so a test can inject a test dispatcher (ADR-028 criterion 6).
+All I/O operations are `suspend` functions. Streaming uses `Flow<T>`. Blocking FFI calls are wrapped in `withContext(Dispatchers.IO)` to keep callers off the main thread.
 
 ### Naming
 

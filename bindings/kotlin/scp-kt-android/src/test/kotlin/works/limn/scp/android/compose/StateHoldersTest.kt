@@ -31,6 +31,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -1573,6 +1574,54 @@ class ScpHotStreamCancelledStopTest {
         assertSame("the onStop's own failure was not the logged cause", failure, warning.throwable)
     }
 }
+
+/**
+ * `ScpHotStreams` exposes its teardown as the suspending `close()` alone and implements no
+ * `AutoCloseable`, the rule `ServerTest` holds for `Relay`, `Node`, and `SCP`
+ * (`.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`"). A blocking `close()` would
+ * park the calling thread on the stops it waits for, which never finish under a
+ * `StandardTestDispatcher` and risk an ANR on an Android main thread.
+ */
+class ScpHotStreamsTeardownShapeTest {
+    @Test
+    fun `ScpHotStreams implements no AutoCloseable and every stop method suspends`() {
+        assertFalse(
+            "ScpHotStreams must expose a suspend teardown alone, never a blocking close()",
+            AutoCloseable::class.java.isAssignableFrom(ScpHotStreams::class.java),
+        )
+        assertTrue(
+            "ScpHotStreams must declare a stop method",
+            ScpHotStreams::class.java.declaredMethods.any { isStopMethodName(it.name) },
+        )
+        assertEquals(emptyList<String>(), blockingStopMethods(ScpHotStreams::class.java))
+    }
+
+    @Test
+    fun `the teardown-shape check rejects a blocking close`() {
+        assertTrue(AutoCloseable::class.java.isAssignableFrom(BlockingCloser::class.java))
+        assertEquals(listOf("close"), blockingStopMethods(BlockingCloser::class.java))
+    }
+
+    /** A type with the blocking `close()` the check above must reject. */
+    private class BlockingCloser : AutoCloseable {
+        override fun close() = Unit
+    }
+}
+
+/**
+ * Names of [type]'s declared stop methods (`shutdown`, `close`, `stop`, `dispose`) that take no
+ * `Continuation`, so do not suspend. The JVM-name suffixes `$default` and `-<hash>` are stripped
+ * before matching, and a `$lambda` body is not a stop method.
+ */
+private fun blockingStopMethods(type: Class<*>): List<String> =
+    type.declaredMethods
+        .filter { isStopMethodName(it.name) }
+        .filterNot { method -> method.parameterTypes.any { it.name == "kotlin.coroutines.Continuation" } }
+        .map { it.name }
+
+private fun isStopMethodName(jvmName: String): Boolean =
+    !jvmName.contains("\$lambda") &&
+        jvmName.substringBefore('$').substringBefore('-') in setOf("shutdown", "close", "stop", "dispose")
 
 /** Upper bound on how long a test waits for a latch that another thread opens. */
 private const val AWAIT_TIMEOUT_SECONDS = 10L
