@@ -317,8 +317,10 @@ its DHT stays process-local.
 it, every build exits 1 when given two or more of `--relay-only`, `--self-host` (or
 `SCP_NODE_SELF_HOST`) and `--ephemeral`, because `main` refuses a second mode flag. A
 shipped binary also exits 1 on `--ephemeral` alone: in a build without `--features
-testing`, the `--ephemeral` branch of `main` (`crates/scp-node/src/main.rs`) prints an
-error and exits instead of calling `run_full_node_ephemeral`. In a shipped binary the
+testing`, `main` (`crates/scp-node/src/main.rs`) calls `unavailable_mode` right after
+the two-mode check and before the `--health` probe and the mode dispatch, and it
+prints `ERROR: --ephemeral is a test-harness mode ...` and exits there, so the binary
+never reaches `run_full_node_ephemeral`. In a shipped binary the
 full node and `--self-host` exit 1 on `SCP_NODE_DHT_MODE=memory`; a `--features testing`
 build accepts it on both. `--relay-only` runs no DHT client and never reads the variable.
 The call to `run_full_node_ephemeral` and the `"memory"` match arm
