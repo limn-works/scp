@@ -14795,7 +14795,12 @@ impl Supervisor {
     ///
     /// Returns
     /// [`ContextCreationError::BilateralPeerNotSupported`](scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported)
-    /// when the config carries a bilateral peer (see above). Otherwise
+    /// when the config carries a bilateral peer (see above), and
+    /// [`ContextCreationError::StateTransition`](scp_protocol::context::builder::ContextCreationError::StateTransition)
+    /// wrapping
+    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+    /// when a [`ContextCreation::Explicit`](crate::context::config::ContextCreation::Explicit)
+    /// config carries an empty ceiling. Otherwise
     /// propagates
     /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
     /// from [`Self::create_context`].
@@ -14807,6 +14812,20 @@ impl Supervisor {
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
+        // An `Explicit` ceiling must be non-empty (construction.md M2): an
+        // empty ceiling describes a context no member can use, so it is
+        // rejected before any context state exists.
+        if let crate::context::config::ContextCreation::Explicit { ceiling, .. } = &config.creation
+            && ceiling.is_empty()
+        {
+            return Err(
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    scp_protocol::context::ContextError::CeilingRequired(
+                        scp_protocol::context::CeilingDeclaration::Empty,
+                    ),
+                ),
+            );
+        }
         // Fail loud, never silent (AGENTS.md "no silent" tenet): a supplied
         // bilateral peer cannot be honored here because invitation/Welcome
         // delivery lives in a higher SDK layer. `into_params` carries the peer

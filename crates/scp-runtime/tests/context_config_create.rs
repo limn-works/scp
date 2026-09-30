@@ -16,8 +16,10 @@ use std::time::Duration;
 use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::params::{ContextParams, TemplateId};
-use scp_protocol::context::{ContextError, ContextState};
+use scp_protocol::context::params::{
+    Capability, ContextParams, GovernanceModel, MemoryScope, TemplateId,
+};
+use scp_protocol::context::{CeilingDeclaration, ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::config::{ContextConfig, ContextCreation};
 use scp_runtime::context::supervisor::Supervisor;
@@ -233,4 +235,70 @@ async fn create_without_peer_succeeds() {
         .await
         .unwrap();
     assert_eq!(handle.state(), ContextState::Active);
+}
+
+const fn explicit_config(ceiling: Vec<Capability>) -> ContextConfig {
+    ContextConfig::defaults(ContextCreation::Explicit {
+        ceiling,
+        roles: Vec::new(),
+        governance: GovernanceModel::SingleAdmin,
+        memory_scope: MemoryScope::Ephemeral,
+    })
+}
+
+/// An `Explicit` config with an empty ceiling describes a context no member
+/// can use (construction.md M2), so `Supervisor::create` rejects it with
+/// `ContextError::CeilingRequired(CeilingDeclaration::Empty)` and creates no
+/// context.
+#[tokio::test]
+async fn create_with_empty_explicit_ceiling_is_rejected() {
+    let manager = new_manager();
+
+    let result = manager
+        .create(
+            "ctx-empty-ceiling".into(),
+            explicit_config(Vec::new()),
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::CeilingRequired(CeilingDeclaration::Empty)
+            ))
+        ),
+        "an empty Explicit ceiling must be rejected with CeilingRequired(Empty); got {result:?}"
+    );
+    assert!(
+        manager
+            .read_context_state("ctx-empty-ceiling")
+            .await
+            .is_none(),
+        "a rejected empty-ceiling create must not leave a context behind"
+    );
+}
+
+/// The empty-ceiling guard rejects only an empty ceiling: an `Explicit`
+/// config naming a non-empty ceiling creates an `Active` context carrying
+/// exactly that ceiling.
+#[tokio::test]
+async fn create_with_non_empty_explicit_ceiling_succeeds() {
+    let manager = new_manager();
+    let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+
+    let handle = manager
+        .create(
+            "ctx-explicit-ceiling".into(),
+            explicit_config(ceiling.clone()),
+            alice(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(handle.state(), ContextState::Active);
+    assert_eq!(handle.params().ceiling, ceiling);
 }

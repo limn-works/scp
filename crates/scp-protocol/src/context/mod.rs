@@ -300,10 +300,14 @@ pub enum ContextError {
     ///
     /// An undeclared ceiling leaves the context's security boundary to a
     /// default nobody chose, and an empty ceiling describes a context no
-    /// member can use, so neither is created. The NAPI and `PyO3` bridges
-    /// raise this variant from their context-parameter parsers, before any
-    /// context state exists; the core create path does not raise it, so a
-    /// Rust or `UniFFI` caller that passes an empty ceiling still creates a
+    /// member can use, so neither is created. Three sites raise this
+    /// variant, each before any context state exists: the NAPI and `PyO3`
+    /// context-parameter parsers, and the runtime's `Supervisor::create` for
+    /// a `ContextCreation::Explicit` config with an empty ceiling (wrapped in
+    /// [`builder::ContextCreationError::StateTransition`]). The runtime's
+    /// `Supervisor::create_context`, which takes [`ContextParams`] directly,
+    /// does not raise it, so a `UniFFI` caller, or a Rust caller of
+    /// `create_context`, that passes an empty ceiling still creates a
     /// context. Each bridge's error translator maps
     /// [`CeilingDeclaration::Absent`] and [`CeilingDeclaration::Null`] to
     /// `SCP-VALID-7004` (missing required field) and

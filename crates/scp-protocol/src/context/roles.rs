@@ -823,7 +823,9 @@ impl CapabilityCeiling {
 /// The NAPI and `PyO3` `context_create` paths never substitute it for an
 /// undeclared ceiling: a create whose ceiling is absent, null, or empty fails
 /// with [`ContextError::CeilingRequired`](crate::context::ContextError::CeilingRequired)
-/// (`.docs/standards/construction.md` M2).
+/// (`.docs/standards/construction.md` M2), as does the runtime's
+/// `Supervisor::create` for an empty `Explicit` ceiling. That variant's doc
+/// names the create paths that do not raise it.
 #[must_use]
 pub fn default_ceiling() -> CapabilityCeiling {
     CapabilityCeiling::new([
