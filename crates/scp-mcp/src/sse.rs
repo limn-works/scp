@@ -1651,9 +1651,10 @@ mod tests {
         }
     }
 
-    /// Connects to the `run_sse` server at `addr`, opens `GET /sse` with
-    /// `Connection: close`, and returns the connection once the session's
-    /// `endpoint` event has arrived.
+    /// Connects to the `run_sse` server at `addr`, sends the `GET /sse` that
+    /// `SseClientTransport` sends (its `Connection: close` makes the server
+    /// close the connection once the stream ends), and returns the connection
+    /// once the session's `endpoint` event has arrived.
     async fn attach_session(addr: SocketAddr, token: &str) -> tokio::net::TcpStream {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1666,15 +1667,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let mut conn = conn.expect("run_sse never started listening");
-        conn.write_all(
-            format!(
-                "GET /sse HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\
-                 Connection: close\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
+        let auth_header = crate::sse_client::sse_auth_header(Some(token)).unwrap();
+        let request = crate::sse_client::sse_get_request("/sse", "localhost", &auth_header);
+        conn.write_all(request.as_bytes()).await.unwrap();
         let mut seen = Vec::new();
         let mut buf = [0u8; 1024];
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -2763,7 +2758,8 @@ mod tests {
         config.auth_token = "abort-secret".to_owned();
 
         let task = tokio::spawn(run_sse(bundle, config, ShutdownHandle::new()));
-        // `Connection: close`, so the connection closes once the stream ends.
+        // The client's own `GET`, so this also checks that the connection
+        // closes once the stream ends.
         let mut conn = attach_session(addr, "abort-secret").await;
         assert!(!task.is_finished(), "run_sse exited before it was aborted");
         assert_pump_consumes(&event_tx).await;
@@ -2793,5 +2789,41 @@ mod tests {
         })
         .await
         .expect("an attached SSE stream outlived the aborted run_sse");
+    }
+
+    /// A session evicted by a newer admission must see its connection close,
+    /// not only its chunked body end: `SseClientTransport` reads the raw
+    /// stream and treats only end of file as a closed stream, so a connection
+    /// left open and idle would hold a waiting call until its 30-second read
+    /// timeout. Both connections send the client's own `GET`.
+    #[tokio::test]
+    async fn an_evicted_client_sees_its_connection_close() {
+        use tokio::io::AsyncReadExt;
+
+        let (_event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+        let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
+        let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut config = SseConfig::new(addr);
+        config.auth_token = "evict-secret".to_owned();
+        let handle = ShutdownHandle::new();
+        let task = tokio::spawn(run_sse(bundle, config, handle.clone()));
+
+        let mut first = attach_session(addr, "evict-secret").await;
+        let second = attach_session(addr, "evict-secret").await;
+
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first.read(&mut buf).await.unwrap_or(0) > 0 {}
+        })
+        .await
+        .expect("the evicted client's connection stayed open after its stream ended");
+
+        drop(second);
+        handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 }

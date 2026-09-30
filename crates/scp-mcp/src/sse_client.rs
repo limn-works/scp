@@ -104,7 +104,7 @@ fn http_status(status_line: &str) -> u16 {
 ///
 /// Returns an error when the token is empty or holds a byte outside visible
 /// ASCII, because a CR, LF or space would let the token inject header lines.
-fn sse_auth_header(auth_token: Option<&str>) -> Result<String, String> {
+pub(crate) fn sse_auth_header(auth_token: Option<&str>) -> Result<String, String> {
     let Some(token) = auth_token else {
         return Ok(String::new());
     };
@@ -112,6 +112,25 @@ fn sse_auth_header(auth_token: Option<&str>) -> Result<String, String> {
         return Err("SSE auth token must be non-empty visible ASCII".to_owned());
     }
     Ok(format!("Authorization: Bearer {token}\r\n"))
+}
+
+/// Builds the `GET` that opens the SSE stream; `auth_header` is empty or a
+/// line from [`sse_auth_header`].
+///
+/// It sends `Connection: close`, so when the server ends the stream (a lagged
+/// or evicted session, a dropped `run_sse`) it also closes the connection, and
+/// a read waiting on the stream sees end of file. Under keep-alive the server
+/// ends only the chunked body and leaves the connection open and idle, so that
+/// read would wait out the 30-second read timeout instead.
+pub(crate) fn sse_get_request(path: &str, host: &str, auth_header: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         {auth_header}\
+         Accept: text/event-stream\r\n\
+         Connection: close\r\n\
+         \r\n"
+    )
 }
 
 /// Opens a TCP connection to `addr` (`host:port`), connecting only to the
@@ -179,14 +198,7 @@ impl SseClientTransport {
         );
 
         // Send HTTP GET for SSE.
-        let get_request = format!(
-            "GET {path} HTTP/1.1\r\n\
-             Host: {host}\r\n\
-             {auth_header}\
-             Accept: text/event-stream\r\n\
-             Connection: keep-alive\r\n\
-             \r\n"
-        );
+        let get_request = sse_get_request(&path, &host, &auth_header);
         writer
             .write_all(get_request.as_bytes())
             .map_err(|e| format!("failed to send GET request: {e}"))?;
