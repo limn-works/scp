@@ -84,7 +84,8 @@ sentence it replaced:
   reason.
 - The citations of spec §9.7.4.1 in `crates/scp-identity/src/config.rs`,
   `crates/scp-identity/src/lib.rs`, `crates/scp-node/src/lib.rs`,
-  `crates/scp-ffi/common/src/error_codes.rs`, `crates/scp-ffi/napi/src/identity.rs`,
+  `crates/scp-ffi/common/src/error_codes.rs`, `crates/scp-ffi/src/identity.rs` (a rustdoc
+  and a comment), `crates/scp-ffi/napi/src/identity.rs`,
   `crates/scp-ffi/napi/src/scp.rs` and `crates/scp-ffi/uniffi/src/bridge.rs`, which cited
   the section as "§3" for mandatory pre-rotation and credited the whole section with
   recovery from `#0` compromise; they now cite item 5(a) for the mandatory commitment and
