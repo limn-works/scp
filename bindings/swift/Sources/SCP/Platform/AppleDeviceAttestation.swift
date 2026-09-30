@@ -169,11 +169,13 @@
     /// call never starts an App Attest method after it ended. A caller
     /// cancelled while queued leaves the queue and never
     /// reaches Apple. After a timeout or a cancellation, Apple can still be
-    /// working on the abandoned call while the next call runs, so App Attest
-    /// can then hold two outstanding calls, and a `generateKey` that ended
-    /// that way leaves a key no stored ID names, so the next `attest`
-    /// generates another. The time limit starts when a call starts: time a
-    /// caller spends queued counts against no limit.
+    /// working on the abandoned call while the next call runs, and the
+    /// adapter neither waits for nor counts abandoned calls, so after `k`
+    /// abandoned calls App Attest can hold up to `k + 1` outstanding calls.
+    /// Each `generateKey` abandoned that way can leave a key no stored ID
+    /// names, and the next `attest` generates another. The time limit
+    /// starts when a call starts: time a caller spends queued counts
+    /// against no limit.
     ///
     /// The lock and the serializer belong to the `UserDefaults` object that
     /// holds the key ID, not to one instance: `AppAttestKeyStateGuard`
