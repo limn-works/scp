@@ -171,7 +171,7 @@ UniFFI generates:
 
 ### Async bridging
 
-UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`. This SDK wraps blocking FFI calls in an injected `ioDispatcher` (`CoroutineBridge.ioDispatcher`, which defaults to `Dispatchers.IO`) to avoid depending on the multiplatform plugin until it stabilizes. A test injects a `StandardTestDispatcher` there, so no FFI call and no subscription release in SDK code may name `Dispatchers.IO` directly; `DispatcherInjectionScanTest` in `scp-kt-android` fails on a `withContext` over `Dispatchers.IO` in either module's main sources outside the `platform` package, whose adapters call Play Integrity and Firebase and never the SCP FFI. The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
+UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`, and this SDK does not depend on that plugin until the plugin stabilizes. `CoroutineBridge`, `ServerBridge`, and the stream factories in `stream/Streams.kt` run each blocking FFI call they dispatch and each subscription release on an injected `ioDispatcher`, which defaults to `Dispatchers.IO`, so a test can inject a `StandardTestDispatcher`. The `SCP` class's synchronous forwarders dispatch nothing: each one runs on its caller's thread, so the caller picks the dispatcher (ADR-028, the Kotlin SDK, Dispatcher strategy). `DispatcherInjectionScanTest` in `scp-kt-android` fails on a `withContext` call whose context names `Dispatchers.IO` in either module's main sources. The scan skips two files, because neither calls the SCP FFI: `platform/AndroidDeviceAttestation.kt` dispatches only the Play Integrity token request, and `platform/AndroidPushProvider.kt` dispatches only the Firebase token request. The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
 
 ```kotlin
 class Context internal constructor(
@@ -220,8 +220,10 @@ class Context internal constructor(
                     try {
                         opened.unsubscribe()
                     } catch (e: Exception) {
-                        System.getLogger("works.limn.scp.Context")
-                            .log(System.Logger.Level.WARNING, "unsubscribe failed when receiveFlow() closed", e)
+                        // java.util.logging, as stream/Streams.kt uses: scp-kt also runs on
+                        // Android, where java.lang.System.Logger is absent.
+                        java.util.logging.Logger.getLogger("works.limn.scp.Context")
+                            .log(java.util.logging.Level.WARNING, "unsubscribe failed when receiveFlow() closed", e)
                     }
                 }
             }
@@ -380,8 +382,9 @@ class SCP internal constructor(
 // Run it under NonCancellable: a finally block usually runs because the coroutine was
 // cancelled, and in a cancelled coroutine the bridge's withContext(ioDispatcher) throws
 // CancellationException before the FFI call starts, so a bare shutdown() tears nothing down.
-// SCP.withStorage blocks, so the caller runs it on a dispatcher it injects (ioDispatcher,
-// defaulting to Dispatchers.IO), never on Dispatchers.IO named at the call.
+// SCP.withStorage blocks its calling thread, and SCP dispatches none of its forwarders, so the
+// caller picks the dispatcher (ADR-028, Dispatcher strategy). This sample takes an injected
+// ioDispatcher so that a test can substitute a StandardTestDispatcher.
 val scp = withContext(ioDispatcher) { SCP.withStorage(config) }
 try {
     scp.contextCreate(identity, params)

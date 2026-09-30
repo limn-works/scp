@@ -553,7 +553,7 @@ Kotlin 2.x with JVM 11+ is the baseline. The SDK targets both Android (API 26+) 
 
 ### Decision
 
-Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/`. The SDK module imports the UniFFI-generated `NativeLib.kt` from `internal/`, re-exports its types through the ergonomics layer in `src/main/kotlin/works/limn/scp/`, and builds a pure Kotlin ergonomics layer on top. The top-level entry point is `Scp` — a class that initializes the identity and injects the Android platform adapter. `Context` is the primary interactive type — exposing `Flow<Message>` for streaming and one `suspend` teardown, with no `AutoCloseable` (amended; see the `AutoCloseable` bullet under Rationale, which also records that ADR-048 later removed `Context` from the Kotlin surface).
+Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/`. The build generates the UniFFI bindings into `src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt` (package `uniffi.scp`), and the Kotlin layer in `src/main/kotlin/works/limn/scp/` builds on them (amended: the original design named a generated `internal/NativeLib.kt`, which never shipped). The top-level entry point is the `SCP` class, which wraps the UniFFI-generated `Scp` object, is built through companion factories such as `SCP.withStorage`, and forwards each UniFFI method (amended by ADR-048, SCP as a first-class multi-instance SDK object; the original design named an `Scp` class that initialized the identity and injected the Android platform adapter). ADR-048 also removed the original design's `Context` type, which exposed `Flow<Message>` and one `suspend` teardown: a context is a handle that `CoroutineBridge.context` operates on, and the stream factories in `stream/Streams.kt` expose its messages as a `Flow`. Every type whose teardown reaches the Rust engine exposes one `suspend` teardown and no `AutoCloseable` (amended; see the `AutoCloseable` bullet under Rationale).
 
 **Dispatcher strategy:**
 - Every FFI call that an SDK type dispatches runs on an injected `ioDispatcher` that defaults to `Dispatchers.IO`, the designated dispatcher for blocking I/O in Kotlin coroutines, backed by a thread pool sized for blocking work. The rule binds any SDK code that makes an FFI call through `withContext`, and the types that do so today are indicators of it, not its boundary: `CoroutineBridge` runs each call through `ffiCall` or `ffiCallSuspend` on `CoroutineBridge.ioDispatcher`; `ServerBridge` routes every call through its `CoroutineBridge`; `HotStreamFactory`, `ColdStreamFactory`, and the `ColdMessageFlow` function subscribe, query, and release on the `ioDispatcher` each one takes; and `works.limn:scp-kt-android`'s `ScpHotStreams` passes the `ioDispatcher` its constructor takes to the `HotStreamFactory` it constructs. `SCP` dispatches three calls this way: `shutdown`, `suspendInstance`, and `resume` take a `CoroutineBridge`. None of these FFI calls names `Dispatchers.IO` directly: a test injects a `StandardTestDispatcher` into that parameter, and a call hardwired to `Dispatchers.IO` would race a real IO thread that the test scheduler does not control.
@@ -610,55 +610,50 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 
 **Package:** `bindings/kotlin/` published as `works.limn:scp-kt` on Maven Central.
 
-**Dependencies from UniFFI:** `identityCreate()`, `identityLoad()`, `identityResolve()`, `contextCreate()`, `contextJoin()`, `contextLeave()`, `contextClose()`, `contextSend()`, `contextSubscribe()` (callback interface), `outletRegister()`, `outletInvoke()`, `outletVerify()`, `ucanValidate()`, `ucanMint()`, `ucanRevoke()`, `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()`, and the `ScpError` enum — all from `internal/NativeLib.kt`.
+**Dependencies from UniFFI:** `identityCreate()`, `identityLoad()`, `identityResolve()`, `contextCreate()`, `contextJoin()`, `contextLeave()`, `contextClose()`, `contextSend()`, `contextSubscribe()` (callback interface), `outletRegister()`, `outletInvoke()`, `outletVerify()`, `ucanValidate()`, `ucanMint()`, `ucanRevoke()`, `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()`, and the `ScpError` enum — all from `internal/NativeLib.kt`. Superseded: this list is the original design and binds no code. ADR-048 made the UniFFI operations methods of the generated `Scp` object, which the build writes into `internal/uniffi/scp/scp.kt`, and no `NativeLib.kt` ships.
 
-**File layout:**
+**File layout:** amended. The tree lists the tracked sources under `bindings/kotlin/` and the generated UniFFI bindings, which the build writes and the repository does not track. The original design's `Context.kt`, `EventLog.kt`, `Transport.kt`, `Ucan.kt`, `Mcp.kt`, `Errors.kt`, `internal/NativeLib.kt`, and per-module test files never shipped: ADR-048 removed `Context` and moved the UniFFI operations onto the `SCP` class, and the UniFFI-generated `ScpException`, which UniFFI generates from the Rust `ScpError` enum, carries the SDK's errors. `.docs/scaffold/kotlin.md` §Package Layout lists every test file.
 
 ```
 bindings/kotlin/
   build.gradle.kts                         # Root Gradle build (multi-module)
   settings.gradle.kts                      # Module declarations
   scp-kt/
-    build.gradle.kts                       # SDK core module (JVM + Android)
+    build.gradle.kts                       # SDK core module; runs the UniFFI generator
     src/
       main/kotlin/works/limn/scp/
-        SCP.kt                             # SCP class — top-level entry point (context creation superseded: ADR-048 removed Context)
+        SCP.kt                             # SCP class: wraps the UniFFI Scp object; suspend shutdown(bridge, timeout)
+        Server.kt                          # ServerBindings, ServerBridge, Relay and Node with their suspend shutdown()
         Identity.kt                        # IdentityAdvancedBridge and its data classes (no Identity class ships)
-        Context.kt                         # Context class (superseded: ADR-048 removed it; no Context.kt ships)
-        Outlets.kt                           # OutletDefinition, TestVector data classes
-        Trust.kt                           # evaluateTrust(), TrustEvaluation data class
-        EventLog.kt                        # EventLog class, Event, Proof, Checkpoint data classes
-        Transport.kt                       # TransportConfig data class, transport helpers
-        Types.kt                           # Shared types: Message, Provenance, Capability, ContextParams
-        Ucan.kt                            # ucanValidate(), ucanMint(), ucanRevoke() top-level functions
-        Mcp.kt                             # serveMcp(), McpClient class
-        Errors.kt                          # ScpException hierarchy
-        internal/
-          NativeLib.kt                     # UniFFI-generated native bindings (auto-generated, do not edit)
-      main/resources/
-        works/limn/scp/native/
-          linux-x86-64/libscp_ffi.so
-          linux-aarch64/libscp_ffi.so
-          osx-x86-64/libscp_ffi.dylib
-          osx-aarch64/libscp_ffi.dylib
-          win32-x86-64/scp_ffi.dll
-      test/kotlin/works/limn/scp/
-        IdentityTest.kt
-        ContextTest.kt
-        OutletsTest.kt
-        UcanTest.kt
-        TransportTest.kt
-        EventLogTest.kt
-        McpTest.kt
-        conformance/
-          ConformanceTest.kt               # Cross-language conformance test suite runner
+        BridgeConnector.kt
+        ConsequenceRule.kt
+        Discovery.kt
+        Economy.kt
+        Media.kt
+        Metadata.kt
+        Outlets.kt                         # Outlets class
+        OutletsStreaming.kt                # InvocationHandle and its suspend cancel()
+        Provenance.kt
+        Sync.kt
+        Trust.kt                           # TrustEvaluation and the other trust data classes
+        TrustAdmission.kt
+        TrustAggregate.kt
+        Types.kt                           # Shared data carrier types, such as CustodyType and OutletDefinition
+        auth/ScpId.kt
+        bridge/CoroutineBridge.kt          # CoroutineBridge and its injected ioDispatcher
+        stream/Streams.kt                  # ColdStreamFactory, HotStreamFactory, ColdMessageFlow
+        internal/uniffi/scp/scp.kt         # UniFFI-generated bindings, package uniffi.scp (generated, not tracked)
+      test/kotlin/works/limn/scp/          # Unit and FFI tests; conformance/ holds the cross-language conformance suite
   scp-kt-android/
-    build.gradle.kts                       # Android lifecycle extension module
+    build.gradle.kts                       # Android lifecycle, Compose, and platform adapter module
     src/
       main/kotlin/works/limn/scp/android/
         ContextLifecycle.kt                # Flow<T>.asLifecycleFlow(LifecycleOwner) extension
-        ScpViewModel.kt                    # Base ViewModel with SCP resource management
+        ScpViewModel.kt                    # Base ViewModel; onCleared() launches its leave calls and returns
         compose/StateHolders.kt            # Compose state holders: ScpHotStreams, rememberContextEvents, rememberIncomingMessages
+        platform/                          # Android platform adapters (ADR-027): AndroidDeviceAttestation, AndroidKeyCustody,
+                                           # AndroidPushProvider, AndroidStorage, PlatformAdapter, and the shared Types.kt
+      test/kotlin/works/limn/scp/android/  # Unit and Robolectric tests, including DispatcherInjectionScanTest
 ```
 
 **`build.gradle.kts` (SDK core module):**
@@ -933,13 +928,16 @@ class Context internal constructor(
         }
     }
 
+    // java.util.logging, as stream/Streams.kt uses: scp-kt also runs on Android, where
+    // java.lang.System.Logger is absent.
     private fun logCleanupFailure(what: String, cause: Throwable) {
-        System.getLogger("works.limn.scp.Context").log(System.Logger.Level.WARNING, what, cause)
+        java.util.logging.Logger.getLogger("works.limn.scp.Context")
+            .log(java.util.logging.Level.WARNING, what, cause)
     }
 }
 ```
 
-**`Errors.kt` — exception hierarchy:**
+**`Errors.kt` — exception hierarchy:** superseded. No `Errors.kt` ships, so this sketch binds no code: SDK operations throw the `ScpException` that UniFFI generates from the Rust `ScpError` enum, into `internal/uniffi/scp/scp.kt`.
 
 ```kotlin
 /**
@@ -972,7 +970,7 @@ class OutletException(message: String, code: String) : ScpException(message, cod
 class ValidationException(message: String, code: String) : ScpException(message, code)
 ```
 
-**`Types.kt` — data carrier types:**
+**`Types.kt` — data carrier types:** superseded. The shipped `Types.kt` defines neither `Message` nor `ContextParams`, so this sketch binds no code; read `Types.kt` for the data carrier types it ships.
 
 ```kotlin
 /** An incoming SCP message. Immutable data class — safe to pass across coroutine boundaries. */
@@ -1025,7 +1023,7 @@ data class ContextParams(
 )
 ```
 
-**`Ucan.kt` — top-level UCAN functions:**
+**`Ucan.kt` — top-level UCAN functions:** superseded. No `Ucan.kt` ships, so this sketch, its `ioDispatcher` parameters included, binds no code. `SCP.ucanValidate`, `SCP.ucanMint`, and `SCP.ucanRevoke` forward to the UniFFI-generated `Scp` object and dispatch nothing (Dispatcher strategy, above).
 
 ```kotlin
 /** Validate a UCAN token for a capability in a context. Throws PermissionException if invalid. */
@@ -1270,8 +1268,8 @@ dependencies {
 
 ### Dependencies
 
-- **ADR-021 (UniFFI Bridge):** The Kotlin SDK wraps the UniFFI-generated `NativeLib.kt`. Every SDK public method calls exactly one UniFFI bridge function. The bridge defines the flat function surface (`identityCreate`, `contextCreate`, etc.), opaque object handles (`IdentityHandle`, `ContextHandle`), value records (`ScpMessage`, `ContextParams`), the `ScpError` sealed class, and the `MessageListener` callback interface.
-- **ADR-027 (Android Platform Adapter):** The `AndroidPlatformAdapter` (implemented in ADR-027) is instantiated by `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` and injected into the Rust engine via UniFFI callback interfaces. The Kotlin SDK `Scp.create()` factory accepts a `PlatformAdapter` parameter; ADR-027 provides the Android-specific implementation.
+- **ADR-021 (UniFFI Bridge):** The Kotlin SDK wraps the UniFFI-generated `NativeLib.kt`. Every SDK public method calls exactly one UniFFI bridge function. The bridge defines the flat function surface (`identityCreate`, `contextCreate`, etc.), opaque object handles (`IdentityHandle`, `ContextHandle`), value records (`ScpMessage`, `ContextParams`), the `ScpError` sealed class, and the `MessageListener` callback interface. Amended: the build generates the bindings into `internal/uniffi/scp/scp.kt`, no `NativeLib.kt` ships, and ADR-048 made the flat functions methods of the generated `Scp` object, so the function, handle, and record names in this bullet are the original design and bind no code.
+- **ADR-027 (Android Platform Adapter):** The `AndroidPlatformAdapter` (implemented in ADR-027) is instantiated by `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` and injected into the Rust engine via UniFFI callback interfaces. The Kotlin SDK `Scp.create()` factory accepts a `PlatformAdapter` parameter; ADR-027 provides the Android-specific implementation. Superseded: no `Scp.create()` factory ships; ADR-048 replaced it with the `SCP` class and its companion factories, such as `SCP.withStorage`.
 - **ADR-006 (Platform Abstraction):** Platform trait definitions (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) shape the UniFFI callback interface contracts that the Kotlin platform adapter implements.
 - **ADR-026 (Swift SDK):** Parallel reference. Same flat delegation pattern, same "no logic in the wrapper layer" principle, same FFI bridge → idiomatic language wrapper architecture. Key differences: Kotlin uses `suspend` functions and `Flow<Message>` where Swift uses `async/await` and `AsyncStream<Message>`; Kotlin uses one `suspend` teardown and no `AutoCloseable` (amended; see Rationale) where Swift uses `deinit` + `close()`; Kotlin uses `@Observable`-equivalent via `StateFlow` where Swift uses `@Observable` macro.
 - **ADR-014 (Python SDK) / ADR-013 (PyO3 Bridge):** The ergonomics layer pattern — flat FFI bridge → idiomatic language wrapper — is established here and applied to Kotlin. Kotlin SDK mirrors the structural choices (no logic in the wrapper layer, delegation only) and the type category decisions (opaque handles for crypto state, data classes for data).
@@ -1288,12 +1286,12 @@ dependencies {
 
    Both commands exit 0. Zero ktlint violations. Zero detekt findings.
 
-2. **`Scp.create()` factory:**
+2. **`Scp.create()` factory** (superseded: ADR-048, SCP as a first-class multi-instance SDK object, replaced the `Scp.create()` factory with the `SCP` class and its companion factories, such as `SCP.withStorage`, so no bullet of this criterion binds a test):
    - `Scp.create(custody = "in_memory")` returns an `Scp` instance with a 32-byte `identity.identifier`.
    - `Scp.create(custody = "platform", platformAdapter = AndroidPlatformAdapter.make(context))` returns an `Scp` instance with hardware-backed identity on API 33+.
    - `Scp.create()` with an unknown custody string throws `IdentityException` with code `"SCP-IDENT-1001"`.
 
-3. **`Identity` operations:**
+3. **`Identity` operations** (superseded: `scp-kt` ships no `Identity` class and `SCP` has no `identity` property, so this sample binds no test):
 
    ```kotlin
    val scp = Scp.create(custody = "in_memory")
@@ -1335,23 +1333,23 @@ dependencies {
    ```
 
 6. **Dispatcher isolation:**
-   - Every FFI call and every subscription release that SDK code dispatches through `withContext` runs on an injected `ioDispatcher`, the type's own or that of the `CoroutineBridge` it calls through, and none of those calls names `Dispatchers.IO` directly. That covers `CoroutineBridge`, `ServerBridge`, `HotStreamFactory`, `ColdStreamFactory`, `ColdMessageFlow`, `ScpHotStreams`, and `SCP`'s `shutdown`, `suspendInstance`, and `resume`. `SCP`'s other methods forward to UniFFI and dispatch nothing, so this bullet binds no test for them. Every `ioDispatcher` parameter those types declare defaults to `Dispatchers.IO`; `ServerBridge` and `SCP` declare none and dispatch through their `CoroutineBridge`'s. `DispatcherInjectionScanTest` in `scp-kt-android`'s test source set reads every `scp-kt` and `scp-kt-android` main source and fails on a `withContext` call whose context names `Dispatchers.IO` outside a comment. It skips the `works.limn.scp.android.platform` package, whose adapters call Play Integrity and Firebase and never the SCP FFI, and the generated UniFFI bindings under `internal/uniffi`. `StateHoldersTest`'s `ScpHotStreams subscribes and releases on its injected dispatcher` checks that an `ScpHotStreams` subscribe and release both wait for, and run on, the dispatcher it was given.
+   - Every FFI call and every subscription release that SDK code dispatches through `withContext` runs on an injected `ioDispatcher`, the type's own or that of the `CoroutineBridge` it calls through, and none of those calls names `Dispatchers.IO` directly. That covers `CoroutineBridge`, `ServerBridge`, `HotStreamFactory`, `ColdStreamFactory`, `ColdMessageFlow`, `ScpHotStreams`, and `SCP`'s `shutdown`, `suspendInstance`, and `resume`. `SCP`'s other methods forward to UniFFI and dispatch nothing, so this bullet binds no test for them. Every `ioDispatcher` parameter those types declare defaults to `Dispatchers.IO`; `ServerBridge` and `SCP` declare none and dispatch through their `CoroutineBridge`'s. `DispatcherInjectionScanTest` in `scp-kt-android`'s test source set reads every `scp-kt` and `scp-kt-android` main source and fails on a `withContext` call whose context argument names `Dispatchers.IO` outside a comment or a string literal. It skips the generated UniFFI bindings under `internal/uniffi` and two files that never call the SCP FFI: `platform/AndroidDeviceAttestation.kt`, which dispatches only the Play Integrity token request, and `platform/AndroidPushProvider.kt`, which dispatches only the Firebase token request. The test flags planted dispatches, such as `withContext(CoroutineName("x") + Dispatchers.IO)`, and passes planted clean sources, so it can fail. `StateHoldersTest`'s `ScpHotStreams subscribes and releases on its injected dispatcher` checks that an `ScpHotStreams` subscribe and release both wait for, and run on, the dispatcher it was given.
    - The `receiveFlow()` bullet that stood here is superseded: ADR-048 removed `Context` and its `receiveFlow()` from the Kotlin surface, so that bullet binds no test.
 
-7. **`ScpException` hierarchy:**
+7. **`ScpException` hierarchy** (superseded: no `Errors.kt` ships and no `ScpException.fromFfi` exists; SDK operations throw the `ScpException` that UniFFI generates from the Rust `ScpError` enum, so no bullet of this criterion binds a test):
    - All UniFFI `ScpError` variants map 1:1 to `ScpException` subclasses.
    - Each subclass has `message: String` and `code: String`.
    - Error codes follow the `SCP-{CATEGORY}-{NUMBER}` format.
    - `ScpException.fromFfi(error)` returns the correct subclass for each `ScpError` variant.
    - Exceptions thrown from bridge functions surface as `ScpException` subclasses (not raw UniFFI types) in the ergonomics layer.
 
-8. **UCAN operations:**
+8. **UCAN operations** (superseded: no top-level UCAN functions ship; `SCP.ucanMint`, `SCP.ucanValidate`, and `SCP.ucanRevoke` forward to the UniFFI-generated `Scp` object with the signatures UniFFI generates, so the signatures below bind no test):
    - `ucanMint(identity, memberDid, capabilities)` returns a non-empty token string.
    - `ucanValidate(token, capability, contextId)` does not throw for a valid token and matching capability.
    - `ucanValidate(token, capability, contextId)` throws `PermissionException` for an invalid or expired token.
    - `ucanRevoke(identity, tokenId)` does not throw for a valid token ID.
 
-9. **Outlet operations:**
+9. **Outlet operations** (superseded: ADR-048, SCP as a first-class multi-instance SDK object, removed `Context`, so `context.registerOutlet` does not exist and this sample binds no test):
 
    ```kotlin
    val outletId = context.registerOutlet(OutletDefinition(
@@ -1364,7 +1362,7 @@ dependencies {
    assertTrue(outletId.startsWith("outlet-"))
    ```
 
-10. **Event log queries:**
+10. **Event log queries** (superseded: ADR-048, SCP as a first-class multi-instance SDK object, removed `Context`, so `context.eventLog()` does not exist and this sample binds no test):
 
     ```kotlin
     val log = context.eventLog()
@@ -1388,7 +1386,7 @@ dependencies {
     - A `start` that throws is logged, never reaches the thread's uncaught-exception handler, leaves that mount's `State` null, and still has its `onStop` run on disposal — verified in `StateHoldersTest.kt` by `rememberScpHotStream logs a throwing start, keeps State null, and still runs onStop`.
 
 13. **No logic in Kotlin layer:**
-    - Code review: every public SDK method body contains exactly one `NativeLib.*` call (plus `withContext` and error mapping). No branching protocol logic exists in any ergonomics-layer file.
+    - Code review: every public SDK method body contains exactly one call into the UniFFI-generated bindings in `internal/uniffi/scp/scp.kt` (plus `withContext` and error mapping). No branching protocol logic exists in any ergonomics-layer file. Amended: the original design named a generated `NativeLib` object, which never shipped.
 
 14. **Test suite passes:**
 
@@ -1397,7 +1395,7 @@ dependencies {
     ./gradlew test -Ptarget=android  # Android instrumented tests (requires connected device or emulator)
     ```
 
-    All tests use JUnit 5 (`@Test`, `runTest`). No JUnit 4.
+    Every test runs on the JUnit Platform. Amended: a `scp-kt-android` test that needs Robolectric (`android.util.Base64`, an application `Context`, or a Compose rule) is a JUnit 4 class, which `junit-vintage-engine` runs on that platform; every other test uses JUnit 5 (`bindings/kotlin/AGENTS.md` §Tests).
 
 15. **Conformance tests:**
     - The cross-language conformance test suite (from `scaffold/shared.md`) passes for Kotlin.
@@ -1417,27 +1415,21 @@ dependencies {
 
 ### Scope
 
-**Files (~14):**
+**Files** (amended: this table lists the files this ADR's decisions bind at the head. The original design's `Context.kt`, `EventLog.kt`, `Transport.kt`, `Ucan.kt`, `Mcp.kt`, `Errors.kt`, and `internal/NativeLib.kt` never shipped, because ADR-048 removed `Context` and moved the UniFFI operations onto `SCP`, and the File layout tree above lists every shipped source file):
 
 | File | Purpose |
 |------|---------|
-| `scp-kt/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt |
-| `src/main/kotlin/works/limn/scp/SCP.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()`. Superseded except for `shutdown()`: the shipped class is `SCP`, built through companion factories such as `SCP.withStorage`, and ADR-048 removed `Context` |
-| `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `identifier`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `ResolutionOutcome` data class. Superseded: no `Identity` class ships; the file holds `IdentityAdvancedBridge` and the data classes its operations return |
-| `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeOutlet()`, `registerOutlet()`, `leave()`, `closeContext()`, suspend `close()` (no `AutoCloseable`). Superseded: ADR-048 removed `Context`, and this file does not ship |
-| `src/main/kotlin/works/limn/scp/Outlets.kt` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` data classes |
-| `src/main/kotlin/works/limn/scp/Trust.kt` | `evaluateTrust()`, `TrustEvaluation` data class |
-| `src/main/kotlin/works/limn/scp/EventLog.kt` | `EventLog` class, `Event`, `Proof`, `Checkpoint` data classes |
-| `src/main/kotlin/works/limn/scp/Transport.kt` | `TransportConfig` data class, transport helpers |
-| `src/main/kotlin/works/limn/scp/Types.kt` | `Message`, `Provenance`, `Capability`, `ContextParams` data classes |
-| `src/main/kotlin/works/limn/scp/Ucan.kt` | `ucanValidate()`, `ucanMint()`, `ucanRevoke()` top-level suspend functions |
-| `src/main/kotlin/works/limn/scp/Mcp.kt` | `serveMcp()`, `McpClient` class |
-| `src/main/kotlin/works/limn/scp/Errors.kt` | `ScpException` hierarchy, `ScpException.fromFfi()` mapping |
-| `src/main/kotlin/works/limn/scp/internal/NativeLib.kt` | UniFFI-generated bindings (auto-generated, never edit manually) |
-| `scp-kt-android/src/main/kotlin/works/limn/scp/android/ContextLifecycle.kt` | `Flow<T>.asLifecycleFlow()` extension; `ScpViewModel` base class ships in `ScpViewModel.kt` |
+| `scp-kt/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt, and the UniFFI generator task |
+| `scp-kt/src/main/kotlin/works/limn/scp/SCP.kt` | `SCP` class — wraps the UniFFI-generated `Scp` object, built through companion factories such as `SCP.withStorage`; forwards each UniFFI method without dispatching; `suspend fun shutdown(bridge, timeout)`, `suspendInstance`, and `resume` dispatch through a `CoroutineBridge` |
+| `scp-kt/src/main/kotlin/works/limn/scp/Server.kt` | `ServerBindings`, `ServerBridge`, and `Relay` and `Node` with their `suspend fun shutdown()` (no `AutoCloseable`) |
+| `scp-kt/src/main/kotlin/works/limn/scp/Identity.kt` | `IdentityAdvancedBridge` and the data classes its operations return; no `Identity` class ships |
+| `scp-kt/src/main/kotlin/works/limn/scp/OutletsStreaming.kt` | `InvocationHandle` and its `suspend fun cancel()` |
+| `scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt` | `CoroutineBridge`, its injected `ioDispatcher`, and `ContextBridge` (`CoroutineBridge.context`), which holds the context operations and the context message subscription |
+| `scp-kt/src/main/kotlin/works/limn/scp/stream/Streams.kt` | `ColdStreamFactory`, `HotStreamFactory` (with `stopAll()`), and `ColdMessageFlow`, each on an injected `ioDispatcher` |
+| `scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt` | UniFFI-generated bindings, package `uniffi.scp` (generated by the build, not tracked, never edited) |
+| `scp-kt-android/src/main/kotlin/works/limn/scp/android/ContextLifecycle.kt` | `Flow<T>.asLifecycleFlow()` extension |
+| `scp-kt-android/src/main/kotlin/works/limn/scp/android/ScpViewModel.kt` | `ScpViewModel` base class; `onCleared()` launches its `leave` calls and returns, and `onCleanupFailure` receives each failure |
 | `scp-kt-android/src/main/kotlin/works/limn/scp/android/compose/StateHolders.kt` | Compose state holders (SCP-118): `ScpHotStreams`, `rememberContextEvents`, `rememberIncomingMessages`, `rememberScpContext`, `rememberScpFlow`, and the module-internal `rememberScpHotStream` and `ScpHotStreamCoordinator` |
-
-**Estimated functions:** ~30 public functions/methods, ~12 public types (classes + data classes + exception hierarchy), ~6 internal helpers.
 
 ---
 

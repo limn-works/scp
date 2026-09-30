@@ -20,7 +20,7 @@ Kotlin conventions, toolchain, and CI for the SCP Kotlin SDK. References `sdk-co
 
 ### Coroutine-first
 
-All I/O operations are `suspend` functions. Streaming uses `Flow<T>`. Blocking FFI calls are wrapped in `withContext(Dispatchers.IO)` to keep callers off the main thread.
+Streaming uses `Flow<T>`. SDK code that dispatches a blocking FFI call or a subscription release runs it through `withContext` on an injected `ioDispatcher` that defaults to `Dispatchers.IO`, and never names `Dispatchers.IO` at the call, so that a test can inject a `StandardTestDispatcher` (ADR-028, the Kotlin SDK, acceptance criterion 6). `DispatcherInjectionScanTest` in `scp-kt-android` fails on a `withContext` call whose context names `Dispatchers.IO` in the `scp-kt` or `scp-kt-android` main sources, apart from `platform/AndroidDeviceAttestation.kt` and `platform/AndroidPushProvider.kt`, which call Play Integrity and Firebase and no SCP FFI. The `SCP` class's forwarders dispatch nothing: UniFFI generates a `suspend fun` for a Rust `async fn` and a blocking `fun` for a synchronous Rust method, and the caller of a blocking forwarder picks the dispatcher it runs on, never an Android main thread.
 
 ### Naming
 

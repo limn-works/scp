@@ -66,7 +66,11 @@ would leave the test racing an IO thread that may not have enqueued its continua
 `ScpViewModelTest` carries a class-level
 `@Timeout(value = 30, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)`.
 `SEPARATE_THREAD` runs each method on its own thread and aborts it at the limit, so a reintroduced
-block fails as one named test in 31 seconds. Without that annotation, a deadlocked test holds the
+block fails as one named test once that method's limit expires. The class-level limit is 30
+seconds. Three methods override it with a method-level 10-second `@Timeout` of the same thread
+mode: `onCleanupFailure calls from parallel cleanup coroutines never overlap`,
+`an inline-bridge failure waits for a running onCleanupFailure and runs on its thread`, and
+`an inline leave retried from onCleanupFailure runs before trackContext returns`. Without that annotation, a deadlocked test holds the
 `kotlin-test` runner until that job's 45-minute `timeout-minutes` expires, and it surfaces as a job
 timeout rather than as a named failing test.
 
