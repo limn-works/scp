@@ -531,7 +531,12 @@ pub trait PushProvider: Send + Sync {
 
     /// Handle an incoming push notification `payload`.
     ///
-    /// Returns wake signal bytes indicating which context has new messages.
+    /// An implementation returns fixed wake signal bytes that do not depend on
+    /// `payload` and copy no byte of it. §10.7 of the infrastructure spec
+    /// states: "Push payloads MUST contain a wake signal and nothing else. No
+    /// context ID, no sender identifier, no message preview, no metadata of any
+    /// kind." A wake signal built from the received bytes would hand the caller
+    /// whatever a relay put in them. No Rust code calls this method yet.
     async fn handle_notification(&self, payload: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 }
 

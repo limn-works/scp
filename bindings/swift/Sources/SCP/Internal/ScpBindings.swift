@@ -15521,7 +15521,12 @@ public protocol PushProvider: AnyObject, Sendable {
     /**
      * Handle an incoming push notification `payload`.
      *
-     * Returns wake signal bytes indicating which context has new messages.
+     * An implementation returns fixed wake signal bytes that do not depend on
+     * `payload` and copy no byte of it. §10.7 of the infrastructure spec
+     * states: "Push payloads MUST contain a wake signal and nothing else. No
+     * context ID, no sender identifier, no message preview, no metadata of any
+     * kind." A wake signal built from the received bytes would hand the caller
+     * whatever a relay put in them. No Rust code calls this method yet.
      */
     func handleNotification(payload: Data) async throws  -> Data
     
@@ -18372,7 +18377,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_register_push() != 31432) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 49354) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 50826) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_storageprovider_get() != 34518) {
