@@ -576,21 +576,28 @@ private class SubscriptionSlot(
 }
 
 /**
- * Improved cold message flow that fixes SCP-115 review issues.
+ * Cold flow of a context's messages, built on [ContextBindings] rather than on a
+ * [works.limn.scp.bridge.CoroutineBridge] (SCP-115).
  *
- * This is the recommended replacement for [works.limn.scp.bridge.ContextBridge.subscribe]
- * in public API code. Differences from the bridge-level subscribe:
+ * It shares these behaviours with [works.limn.scp.bridge.ContextBridge.subscribe]:
  *
- * 1. Handles [trySend] result explicitly: closes the flow with [BridgeException] on
- *    buffer overflow instead of silently discarding messages. The callback runs on a
- *    non-suspending Rust thread, so suspending [send] cannot be used.
- * 2. No double-buffering: `callbackFlow` already uses `Channel.BUFFERED` internally
- *    (64 items). Does NOT chain an additional `.buffer(Channel.BUFFERED)`.
- * 3. Every subscription the flow opens is released: the subscribe call runs to
- *    completion even when the collector is cancelled during it, and closing the flow
- *    then calls the unsubscribe function, suspending on [ioDispatcher] rather than
- *    blocking the collector's thread while it runs.
- * 4. Guards against post-close emissions with [AtomicBoolean] flag.
+ * - A message that does not fit the `callbackFlow` buffer (`Channel.BUFFERED`, 64 items)
+ *   closes the flow with [BridgeException] code `SCP-CTX-2001`, found through the [trySend]
+ *   result; the callback runs on a non-suspending Rust thread, so it cannot call [send]. No
+ *   `.buffer(...)` is chained after the `callbackFlow`.
+ * - The subscribe call runs under [NonCancellable], so a collector cancelled during it still
+ *   records the handle. Closing the flow then calls the unsubscribe function, suspending on
+ *   the IO dispatcher rather than blocking the collector's thread. An unsubscribe that throws
+ *   is logged at WARNING and not rethrown, and the Rust subscription may then stay live.
+ *
+ * It differs from [works.limn.scp.bridge.ContextBridge.subscribe] in three ways:
+ *
+ * 1. It takes the bindings and [ioDispatcher] as parameters instead of reading them from a
+ *    [works.limn.scp.bridge.CoroutineBridge].
+ * 2. It sets an [AtomicBoolean] when the flow begins closing and skips [trySend] for a
+ *    message the engine delivers after that. [works.limn.scp.bridge.ContextBridge.subscribe]
+ *    calls [trySend] for such a message and ignores the failure on the closed channel.
+ * 3. It logs a failed release to the [COLD_MESSAGE_FLOW_LOGGER] logger.
  *
  * @param contextBindings The context FFI bindings.
  * @param contextHandle Opaque context handle from create/join.

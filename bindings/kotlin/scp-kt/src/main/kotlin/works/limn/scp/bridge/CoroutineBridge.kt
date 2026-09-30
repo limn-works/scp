@@ -1688,9 +1688,12 @@ class ContextBridge internal constructor(
     /**
      * Subscribe to incoming messages on a context as a cold [Flow].
      *
-     * Collection begins the UniFFI subscription; cancellation ends it.
-     * Uses [callbackFlow] with [Channel.BUFFERED] capacity (64 items) to
-     * absorb burst delivery from the Rust engine without dropping messages.
+     * Collection begins the UniFFI subscription; closing the flow calls the unsubscribe
+     * function on the bridge's IO dispatcher. An unsubscribe that throws is logged at
+     * WARNING and not rethrown, and the Rust subscription may then stay live.
+     * Uses [callbackFlow] with [Channel.BUFFERED] capacity (64 items) to absorb burst
+     * delivery from the Rust engine; a message that does not fit closes the flow with
+     * [BridgeException] code `SCP-CTX-2001` rather than being dropped silently.
      *
      * Per ADR-028: `callbackFlow` is the streaming primitive for message
      * reception. Cold stream semantics: the subscription starts when the
