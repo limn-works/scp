@@ -13,9 +13,11 @@
  * carries the wake signal to Android as the FCM data-only message `{"data": {"scp": "1"}}`,
  * with no notification fields and no other SCP-specific content, so FCM learns only that
  * the device received a data message at a specific time. No relay or other code in this
- * repository sends an FCM message, and no SDK code wakes the app, connects to a relay,
- * or pulls envelopes: the caller does all three when [handleNotification] returns
- * [WakeSignal.PULL].
+ * repository sends an FCM message. When one arrives, FCM starts the app if it is not
+ * running (Android delivers nothing to an app the user force-stopped) and delivers the
+ * message to `FirebaseMessagingService.onMessageReceived`, where the caller passes its
+ * data to [handleNotification]. No SDK code connects to a relay or pulls envelopes: the
+ * caller does both when [handleNotification] returns [WakeSignal.PULL].
  *
  * [handleNotification] checks only the `scp` field. It rejects a payload that lacks the
  * field with [ScpException] code `SCP-TRANS-5001`, and a payload whose field is not

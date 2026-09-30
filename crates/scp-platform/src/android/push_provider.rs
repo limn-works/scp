@@ -19,9 +19,12 @@
 //! payload as `{ "scp": 1 }`. ADR-027 carries the wake signal to Android as
 //! the FCM data-only message `{"data": {"scp": "1"}}`, with no notification
 //! fields and no other SCP-specific content. No relay or other code in this
-//! repository sends an FCM message, and no SDK code wakes the app, connects to
-//! a relay, or pulls envelopes: the caller does all three when the Kotlin
-//! adapter returns `WakeSignal.PULL`.
+//! repository sends an FCM message. When one arrives, FCM starts the app if it
+//! is not running (Android delivers nothing to an app the user force-stopped)
+//! and delivers the message to `FirebaseMessagingService.onMessageReceived`,
+//! where the caller passes its data to the Kotlin adapter. No SDK code
+//! connects to a relay or pulls envelopes: the caller does both when the
+//! Kotlin adapter returns `WakeSignal.PULL`.
 //!
 //! Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send
 //! exactly `{ "scp": 1 }`. FCM has carried every field of a payload before
