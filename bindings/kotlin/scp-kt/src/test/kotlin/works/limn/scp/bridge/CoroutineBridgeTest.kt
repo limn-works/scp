@@ -27,6 +27,8 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import works.limn.scp.stream.assertReleaseLeavesCollectorFree
+import works.limn.scp.stream.captureLogs
+import java.util.logging.Level
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -574,6 +576,31 @@ class CoroutineBridgeTest {
 
                 assertTrue(stubBindings.contextUnsubscribeCalled)
                 assertEquals(100L, stubBindings.lastUnsubscribeHandle)
+            }
+
+        @Test
+        fun `contextSubscribe logs a release that throws and its collector ends cancelled`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
+                val failure = IllegalStateException("subscription 100 already torn down")
+                stubBindings.onUnsubscribe = { throw failure }
+                val flow = bridge.context.subscribe(42L)
+
+                // A release that rethrew would fail this job with the stub's exception, and
+                // that failure would fail runTest's scope.
+                lateinit var collecting: Job
+                val records =
+                    captureLogs(ContextBridge::class.java.name) {
+                        collecting = launch { flow.collect {} }
+                        advanceUntilIdle()
+                        collecting.cancelAndJoin()
+                    }
+
+                assertTrue(collecting.isCancelled)
+                assertEquals(1, records.size)
+                assertEquals(Level.WARNING, records[0].level)
+                assertEquals(failure.message, records[0].thrown?.message)
+                assertTrue(records[0].message.startsWith("ContextBridge.subscribe: releasing subscription 100 "))
             }
 
         @Test

@@ -25,13 +25,9 @@ import org.junit.jupiter.api.Test
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CancellationHandle
 import works.limn.scp.bridge.MessageCallback
-import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.logging.Handler
 import java.util.logging.Level
-import java.util.logging.LogRecord
-import java.util.logging.Logger
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -875,6 +871,31 @@ class StreamsTest {
             }
 
         @Test
+        fun `ColdMessageFlow logs a release that throws and its collector ends cancelled`() =
+            runTest(testDispatcher) {
+                stubBindings.contextSubscribeResult = 100L
+                val failure = IllegalStateException("subscription 100 already torn down")
+                stubBindings.onUnsubscribe = { throw failure }
+                val flow = ColdMessageFlow(stubBindings, 42L, testDispatcher)
+
+                // A release that rethrew would fail this job with the stub's exception, and
+                // that failure would fail runTest's scope.
+                lateinit var collecting: Job
+                val records =
+                    captureLogs(COLD_MESSAGE_FLOW_LOGGER) {
+                        collecting = launch { flow.collect {} }
+                        advanceUntilIdle()
+                        collecting.cancelAndJoin()
+                    }
+
+                assertTrue(collecting.isCancelled)
+                assertEquals(1, records.size)
+                assertEquals(Level.WARNING, records[0].level)
+                assertEquals(failure.message, records[0].thrown?.message)
+                assertTrue(records[0].message.startsWith("ColdMessageFlow: releasing subscription 100 "))
+            }
+
+        @Test
         fun `ColdMessageFlow releases its subscription without parking the collector thread`() {
             stubBindings.contextSubscribeResult = 100L
 
@@ -1106,35 +1127,6 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
     override fun transportStatus(transportHandle: Long): String = transportStatusResult
 
     override fun transportDisconnect(transportHandle: Long) { /* no-op */ }
-}
-
-/**
- * Runs [block] with a handler on the [Logger] named [loggerName] and returns every record that
- * logger published meanwhile. The handler is removed even when [block] throws.
- */
-private suspend fun captureLogs(
-    loggerName: String,
-    block: suspend () -> Unit,
-): List<LogRecord> {
-    val records = Collections.synchronizedList(mutableListOf<LogRecord>())
-    val handler =
-        object : Handler() {
-            override fun publish(record: LogRecord) {
-                records += record
-            }
-
-            override fun flush() = Unit
-
-            override fun close() = Unit
-        }
-    val logger = Logger.getLogger(loggerName)
-    logger.addHandler(handler)
-    try {
-        block()
-    } finally {
-        logger.removeHandler(handler)
-    }
-    return records.toList()
 }
 
 /** Context handle that every subscription-ownership test subscribes against. */

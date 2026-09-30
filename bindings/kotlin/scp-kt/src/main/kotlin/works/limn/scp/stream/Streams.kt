@@ -626,7 +626,10 @@ fun ColdMessageFlow(
         // Release the subscription by suspending on ioDispatcher, never by blocking:
         // awaitClose's lambda runs on the collector's thread, which is an Android main
         // thread under collectAsState (ADR-028's AutoCloseable amendment). NonCancellable
-        // lets the release run although the collector was cancelled.
+        // lets the release run although the collector was cancelled. A release that throws
+        // is logged, never rethrown (sdk-common.md §Cleanup error handling): rethrown from
+        // this finally, it would replace the collector's cancellation as the failure and
+        // propagate to the collector's parent scope.
         try {
             withContext(NonCancellable + ioDispatcher) {
                 subscriptionHandle = contextBindings.contextSubscribe(contextHandle, callback)
@@ -637,11 +640,39 @@ fun ColdMessageFlow(
             val opened = subscriptionHandle
             if (opened != null) {
                 withContext(NonCancellable + ioDispatcher) {
-                    contextBindings.contextUnsubscribe(opened)
+                    releaseColdMessageSubscription(contextBindings, opened, contextHandle)
                 }
             }
         }
     }
+
+/**
+ * Unsubscribe one [ColdMessageFlow] subscription and log its failure instead of throwing it.
+ *
+ * Catches [Exception], not [Throwable], so an [Error] such as an out-of-memory condition still
+ * propagates. The caller runs this under [NonCancellable], so no cancellation of the collector
+ * reaches this catch.
+ */
+@Suppress("TooGenericExceptionCaught")
+private fun releaseColdMessageSubscription(
+    contextBindings: ContextBindings,
+    subscriptionHandle: Long,
+    contextHandle: Long,
+) {
+    try {
+        contextBindings.contextUnsubscribe(subscriptionHandle)
+    } catch (e: Exception) {
+        Logger.getLogger(COLD_MESSAGE_FLOW_LOGGER).log(
+            Level.WARNING,
+            "ColdMessageFlow: releasing subscription $subscriptionHandle for context handle " +
+                "$contextHandle failed; the Rust subscription may stay live",
+            e,
+        )
+    }
+}
+
+/** Logger name for [ColdMessageFlow]'s release failures. */
+internal const val COLD_MESSAGE_FLOW_LOGGER = "works.limn.scp.stream.ColdMessageFlow"
 
 /**
  * Buffer capacity for hot streams (SharedFlow extraBufferCapacity).

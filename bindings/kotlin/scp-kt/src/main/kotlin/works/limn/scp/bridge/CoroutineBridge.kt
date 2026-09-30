@@ -68,6 +68,8 @@ import works.limn.scp.validateContentPath
 import works.limn.scp.validateDeployId
 import works.limn.scp.validateMimeType
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.logging.Level
+import java.util.logging.Logger
 import kotlin.coroutines.cancellation.CancellationException
 
 /**
@@ -1731,7 +1733,10 @@ class ContextBridge internal constructor(
             // blocking: awaitClose's lambda runs on the collector's thread, which is an
             // Android main thread under collectAsState, so a runBlocking there parks that
             // thread until the FFI call returns (ADR-028's AutoCloseable amendment).
-            // NonCancellable lets the release run although the collector was cancelled.
+            // NonCancellable lets the release run although the collector was cancelled. A
+            // release that throws is logged, never rethrown (sdk-common.md §Cleanup error
+            // handling): rethrown from this finally, it would replace the collector's
+            // cancellation as the failure and propagate to the collector's parent scope.
             try {
                 withContext(NonCancellable + bridge.ioDispatcher) {
                     subscriptionHandle = bindings.contextSubscribe(contextHandle, callback)
@@ -1741,11 +1746,39 @@ class ContextBridge internal constructor(
                 val opened = subscriptionHandle
                 if (opened != null) {
                     withContext(NonCancellable + bridge.ioDispatcher) {
-                        bindings.contextUnsubscribe(opened)
+                        releaseSubscriptionLogged(opened, contextHandle)
                     }
                 }
             }
         }
+
+    /**
+     * Unsubscribe [subscriptionHandle] and log its failure instead of throwing it.
+     *
+     * Catches [Exception], not [Throwable], so an [Error] such as an out-of-memory condition
+     * still propagates. The caller runs this under [NonCancellable], so no cancellation of the
+     * collector reaches this catch.
+     */
+    @Suppress("TooGenericExceptionCaught")
+    private fun releaseSubscriptionLogged(
+        subscriptionHandle: Long,
+        contextHandle: Long,
+    ) {
+        try {
+            bindings.contextUnsubscribe(subscriptionHandle)
+        } catch (e: Exception) {
+            logger.log(
+                Level.WARNING,
+                "ContextBridge.subscribe: releasing subscription $subscriptionHandle for context " +
+                    "handle $contextHandle failed; the Rust subscription may stay live",
+                e,
+            )
+        }
+    }
+
+    private companion object {
+        val logger: Logger = Logger.getLogger(ContextBridge::class.java.name)
+    }
 }
 
 /**

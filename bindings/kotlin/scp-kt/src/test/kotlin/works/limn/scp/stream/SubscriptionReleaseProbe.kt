@@ -5,11 +5,15 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.util.Collections
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.logging.Handler
+import java.util.logging.LogRecord
+import java.util.logging.Logger
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -68,6 +72,35 @@ internal fun assertReleaseLeavesCollectorFree(
         collectorExecutor.shutdownNow()
         ffiExecutor.shutdownNow()
     }
+}
+
+/**
+ * Runs [block] with a handler on the [Logger] named [loggerName] and returns every record that
+ * logger published meanwhile. The handler is removed even when [block] throws.
+ */
+internal suspend fun captureLogs(
+    loggerName: String,
+    block: suspend () -> Unit,
+): List<LogRecord> {
+    val records = Collections.synchronizedList(mutableListOf<LogRecord>())
+    val handler =
+        object : Handler() {
+            override fun publish(record: LogRecord) {
+                records += record
+            }
+
+            override fun flush() = Unit
+
+            override fun close() = Unit
+        }
+    val logger = Logger.getLogger(loggerName)
+    logger.addHandler(handler)
+    try {
+        block()
+    } finally {
+        logger.removeHandler(handler)
+    }
+    return records.toList()
 }
 
 private const val WAIT_SECONDS = 5L
