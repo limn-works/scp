@@ -3391,9 +3391,12 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
 ///
 /// Application messages ride a per-sender AEAD layer on top of the MLS group key,
 /// so for the creator (Alice) to open a joiner's (Bob's) application traffic she
-/// must first hold Bob's sender key. A Welcome-joiner cannot PUSH its key (a push
-/// seals to each incumbent's STABLE `0xFF01` wrapping key, which openmls 0.8.1
-/// does not expose from a joined group, ADR-057), so incumbents PULL it (§9.16.2).
+/// must first hold Bob's sender key. A Welcome-joiner does not PUSH its key (a
+/// push seals to each incumbent's STABLE `0xFF01` wrapping key; the signed leaf
+/// extension is readable through `scp_mls::extract_member_wrapping_key`, but
+/// binding a DID to a leaf is open until the leaf-signing / custody slice, per
+/// ADR-057's T4 residual (3), the self-certifying directory, and §23.13, Event
+/// Verification During Reconciliation), so incumbents PULL it (§9.16.2).
 /// The pull answer originally gated membership on the `member_wrapping_keys` cache
 /// — EMPTY for a joiner — and rejected every incumbent's request as "from a
 /// non-member", leaving the joiner RECEIVE-ONLY. The fix reads membership from the

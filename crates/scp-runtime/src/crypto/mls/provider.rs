@@ -732,10 +732,13 @@ impl NodeMlsFactory {
     /// `pending_distributions`, and `member_wrapping_keys` start empty — the same
     /// initial shape a fresh join produces. `member_wrapping_keys` STAYS empty
     /// for a joiner: it caches other members' STABLE wrapping keys, used ONLY by
-    /// the proactive/offline PUSH path and populated on the incumbent/adder side;
-    /// openmls 0.8.1 exposes no way to read a remote member's `scp_wrapping_key`
-    /// `LeafNode` extension from a joined group (ADR-057), and a joiner does not
-    /// need them — it reaches every incumbent through the pull protocol and
+    /// the proactive/offline PUSH path and populated on the incumbent/adder side.
+    /// A remote member's signed `scp_wrapping_key` leaf extension is readable
+    /// through `scp_mls::extract_member_wrapping_key`, but a leaf's credential
+    /// DID is self-asserted, and binding a DID to a leaf is the leaf-signing /
+    /// custody slice's work (ADR-057's T4 residual (3), the self-certifying
+    /// directory; §23.13, Event Verification During Reconciliation). A joiner
+    /// does not need the cache — it reaches every incumbent through the pull protocol and
     /// answers incumbents' pulls via the ephemeral key in their requests.
     pub fn install_joined_group(&self, group: ScpMlsGroup) -> OwnedMlsCryptoState {
         // Direct assembly — the joined group moves in verbatim; `fresh_birth`

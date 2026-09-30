@@ -787,10 +787,13 @@ impl ScpClient {
         //
         // The authenticated source is each member's signed
         // `scp_wrapping_key` leaf extension in the (now Welcome-embedded) ratchet
-        // tree; sourcing recipients from there is blocked only because openmls does
-        // not expose remote leaf extensions via its public API, and lands with the
-        // leaf-signing / custody slice (§23.13) — the same residual T3/T4 name for
-        // the convergent timestamp. Triggers 1 (adder→joiner) and 3
+        // tree, which `scp_mls::extract_member_wrapping_key` now reads for any
+        // member. What stays open is binding a DID to a leaf: a leaf's credential
+        // DID is self-asserted, so the tree alone cannot say which leaf a DID's
+        // holder controls. ADR-057's T4 residual (3), the self-certifying
+        // directory, assigns that binding to the leaf-signing / custody slice
+        // (§23.13, Event Verification During Reconciliation) — the same residual
+        // T3/T4 name for the convergent timestamp. Triggers 1 (adder→joiner) and 3
         // (bystander→joiner) do NOT share this gap: they read the wrapping key from
         // a validated KeyPackage / Add proposal.
         for (member_did, member_wrapping_key) in wrapping_keys {

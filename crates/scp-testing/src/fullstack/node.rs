@@ -586,10 +586,13 @@ impl FullStackNode {
         //    (§9.16.2), the canonical new-member mechanism. Neither `invite_member`
         //    nor the Welcome carries the joiner's sender key to the incumbents, so
         //    without this a B→A send fails at the receiver with `sender key lookup
-        //    failed`. The joiner CANNOT proactively PUSH its key: a push seals to
-        //    each incumbent's STABLE `0xFF01` wrapping key, and openmls 0.8.1
-        //    exposes no way to read a remote member's LeafNode extension from a
-        //    joined group (ADR-057) — a joiner's `member_wrapping_keys` is empty.
+        //    failed`. The joiner does not proactively PUSH its key: a push seals
+        //    to each incumbent's STABLE `0xFF01` wrapping key, and although the
+        //    signed leaf extension is readable through
+        //    `scp_mls::extract_member_wrapping_key`, binding a DID to a leaf is
+        //    open until the leaf-signing / custody slice (ADR-057's T4 residual
+        //    (3), the self-certifying directory; §23.13, Event Verification During
+        //    Reconciliation) — a joiner's `member_wrapping_keys` is empty.
         //    Instead each incumbent PULLS the joiner's key (see the helper).
         self.incumbents_pull_joiner_sender_key(context_id, &handle)
             .await?;

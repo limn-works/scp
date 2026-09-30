@@ -151,9 +151,12 @@ async fn cross_process_welcome_delivery() {
 ///
 /// Application messages ride the per-sender key layer on top of the MLS group
 /// key. For Alice to open Bob's traffic she must hold Bob's sender key. A
-/// Welcome-joiner cannot PUSH its key (a push seals to each incumbent's stable
-/// `0xFF01` wrapping key, which openmls 0.8.1 does not expose from a joined group,
-/// ADR-057); incumbents PULL it (§9.16.2). That PULL runs inside
+/// Welcome-joiner does not PUSH its key (a push seals to each incumbent's stable
+/// `0xFF01` wrapping key; the signed leaf extension is readable through
+/// `scp_mls::extract_member_wrapping_key`, but binding a DID to a leaf is open
+/// until the leaf-signing / custody slice, per ADR-057's T4 residual (3), the
+/// self-certifying directory, and §23.13, Event Verification During
+/// Reconciliation); incumbents PULL it (§9.16.2). That PULL runs inside
 /// `join_from_welcome` via the harness `incumbents_pull_joiner_sender_key` — the
 /// sanctioned stand-in for deferred #2049 request-initiation — so by the time Bob
 /// sends below, Alice already holds Bob's key. If the §9.16.6 Mitigation-1
