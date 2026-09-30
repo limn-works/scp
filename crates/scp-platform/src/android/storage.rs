@@ -6,9 +6,10 @@
 //! docs list where the two differ. ADR-021 and ADR-027 require the class to
 //! implement the `UniFFI` `StorageProvider` callback interface and to be injected
 //! into the Rust engine. The class does neither, and no code injects it into
-//! the Rust engine. Story SCP-113 stays in progress while the class fails its
-//! trait criterion. This module documents the Rust-side contract and
-//! re-exports the trait type for Android builds.
+//! the Rust engine. Story SCP-113 stays in progress while any acceptance
+//! criterion its description in `.docs/prds/main.json` records as unmet
+//! stands; the trait criterion is one of them. This module documents the
+//! Rust-side contract and re-exports the trait type for Android builds.
 //!
 //! # Encryption Architecture (ADR-027)
 //!
