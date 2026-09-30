@@ -1079,9 +1079,11 @@ pub enum HostSiteError {
     /// The self-signed TLS configuration could not be built.
     #[error("TLS config error: {0}")]
     Tls(String),
-    /// The site deploy (publish + commit) failed.
+    /// The site deploy (publish + commit) failed. The `SelfHostError` text is
+    /// in this variant's Display and not returned from `source()`, so a
+    /// chain-walking reporter prints it once.
     #[error("deploy error: {0}")]
-    Deploy(#[from] SelfHostError),
+    Deploy(SelfHostError),
     /// The deployer setup (loopback supervisor / broadcast group) failed.
     #[error("deployer setup error: {0}")]
     DeployerSetup(String),
@@ -2533,7 +2535,8 @@ mod tests {
 
     /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
     /// detects a missing pre-rotation backend by pattern, and the same pattern
-    /// rejects every other node-build failure.
+    /// rejects every other node-build failure. `NodeBuild` and `Deploy` each
+    /// print their wrapped error once, in Display, and return no `source()`.
     #[test]
     fn node_build_error_keeps_typed_no_pre_rotation_backend() {
         let is_missing_backend = |e: &HostSiteError| {
@@ -2556,6 +2559,17 @@ mod tests {
                 .to_string()
                 .starts_with("node build error: identity error: no production pre-rotation"),
             "Display keeps the message text: {missing}"
+        );
+
+        // `Deploy` wraps a typed error the same way and follows the same rule.
+        let deploy = HostSiteError::Deploy(SelfHostError::CommitDeploy("x".to_owned()));
+        assert!(
+            std::error::Error::source(&deploy).is_none(),
+            "Deploy must not return its SelfHostError from source(), Display already carries it"
+        );
+        assert_eq!(
+            deploy.to_string(),
+            "deploy error: failed to commit deploy: x"
         );
 
         let other = HostSiteError::NodeBuild(NodeError::Nat("no tier".to_owned()));
