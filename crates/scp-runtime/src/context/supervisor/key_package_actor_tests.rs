@@ -2879,6 +2879,91 @@ async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
     handle.send_shutdown().await.unwrap();
 }
 
+/// A Welcome whose tree holds a KeyPackage-sourced leaf that expired under the
+/// actor backend's injected clock fails the fused join with the typed
+/// `InvalidKeyPackage`, not the `CryptoFailed` a corrupt Welcome gets, and the
+/// reserved KeyPackage is not burned.
+#[tokio::test]
+async fn fused_confirm_rejects_expired_tree_leaf_as_invalid_key_package() {
+    use scp_clock::TestClock;
+    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+    let real_now = SystemClock.now_secs();
+    let storage = in_memory_storage();
+    let backend = Arc::new(ProductionMlsBackend::new(Arc::new(TestClock::new(
+        real_now + 1200,
+    ))));
+    backend.set_consumed_init_key_store(Arc::clone(&storage));
+    let mls: Arc<dyn MlsBackend> = backend;
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+    );
+    let _ = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await;
+    let kp_ref = live_index(&storage, &alice()).await[0].clone();
+    let (reservation_id, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::Reserve {
+            kp_ref: kp_ref.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+
+    // Carol's leaf expires at `real_now + 600`: valid under the real clock
+    // openmls reads, expired under the actor backend's clock. Carol never
+    // commits, so her leaf keeps its KeyPackage `Lifetime` in the joined tree.
+    let inviter = ScpCredential::new(
+        "did:dht:z6MkInviterExpiredLeaf".to_owned(),
+        None,
+        scp_did::SigningKeyId::Active,
+    )
+    .unwrap();
+    let carol = ScpCredential::new(
+        "did:dht:z6MkCarolExpiredLeaf".to_owned(),
+        None,
+        scp_did::SigningKeyId::Active,
+    )
+    .unwrap();
+    let mut group = scp_mls::group::create_group(&inviter, &SystemClock).unwrap();
+    let (carol_bundle, _carol_signer, _carol_provider) = scp_mls::group::generate_key_package(
+        &carol,
+        &TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
+    )
+    .unwrap();
+    scp_mls::group::add_member(
+        &mut group,
+        carol_bundle.key_package().clone().into(),
+        &SystemClock,
+    )
+    .unwrap();
+    let added = real_backend()
+        .add_member_raw(&mut group, &public_bytes)
+        .await
+        .unwrap();
+
+    let err = handle
+        .send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id: reservation_id.clone(),
+            welcome_bytes: added.welcome,
+            reply,
+        })
+        .await
+        .err()
+        .expect("a Welcome holding an expired leaf makes the fused join fail");
+    assert!(
+        matches!(err, ContextError::InvalidKeyPackage(_)),
+        "expected InvalidKeyPackage, got {err:?}"
+    );
+    assert!(
+        kp_record_present(&storage, &alice(), &kp_ref).await,
+        "a rejected join must not burn the KP"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn fused_welcome_cancel_flow() {
     let storage = in_memory_storage();
