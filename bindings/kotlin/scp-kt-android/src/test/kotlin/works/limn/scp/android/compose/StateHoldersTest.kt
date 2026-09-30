@@ -311,9 +311,12 @@ class StateHoldersTest {
     /**
      * A throwing `start` must not escape rememberScpHotStream's launch: that launch's scope has
      * no CoroutineExceptionHandler, so an escaping throw reaches the thread's uncaught-exception
-     * handler, which on Android kills the process. The default handler installed here records
-     * that escape. The throw is logged, the State stays null, and the mount's onStop still runs
-     * on disposal, because that `start` may have opened a subscription it did not return.
+     * handler, which on Android kills the process. Such an escape fails this test: the default
+     * handler installed here records it, and kotlinx-coroutines-test's own exception handler,
+     * which sees an uncaught coroutine exception first when it is on the classpath, reports it
+     * as `UncaughtExceptionsBeforeTest` (observed with the pre-fix catch). The throw is logged,
+     * the State stays null, and the mount's onStop still runs on disposal, because that `start`
+     * may have opened a subscription it did not return.
      */
     @Test(timeout = DISPOSAL_TIMEOUT_MS)
     fun `rememberScpHotStream logs a throwing start, keeps State null, and still runs onStop`() {
@@ -355,7 +358,10 @@ class StateHoldersTest {
             assertEquals("a throwing start escaped to the uncaught-exception handler", null, escaped.get())
             val warning = ShadowLog.getLogsForTag("ScpHotStreamCoordinator").single()
             assertEquals(Log.WARN, warning.type)
-            assertSame(failure, warning.throwable)
+            // Coroutine stack-trace recovery may rethrow a copy of `failure`, so compare its
+            // type and message rather than its identity.
+            assertTrue(warning.throwable is IllegalStateException)
+            assertEquals(failure.message, warning.throwable.message)
             assertEquals(null, flowState?.value)
 
             showComposable.value = false
