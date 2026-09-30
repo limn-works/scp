@@ -59,23 +59,20 @@ impl OpenMlsProvider for InMemoryMlsProvider {
 }
 
 impl Drop for InMemoryMlsProvider {
+    /// Zeroizes every storage value before `MemoryStorage` frees the map.
+    ///
+    /// A poisoned lock does not stop the wipe: the map is taken from the poison
+    /// error and wiped anyway, because a panic elsewhere does not make the key
+    /// material less sensitive.
     fn drop(&mut self) {
-        wipe_memory_storage(self.inner.storage());
+        let mut values = self
+            .inner
+            .storage()
+            .values
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        zeroize_values(&mut values);
     }
-}
-
-/// Zeroizes every value in `storage`, then empties it.
-///
-/// A poisoned lock does not stop the wipe: the map is taken from the poison
-/// error and wiped anyway, because a panic elsewhere does not make the key
-/// material less sensitive.
-fn wipe_memory_storage(storage: &MemoryStorage) {
-    let mut values = storage
-        .values
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    zeroize_values(&mut values);
-    values.clear();
 }
 
 /// Zeroizes every value in `values` in place, leaving each an empty vector with
@@ -92,7 +89,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zeroize_values_empties_every_value_before_the_map_is_cleared() {
+    fn zeroize_values_empties_every_value_in_its_own_allocation() {
         let mut values: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         values.insert(b"EpochSecrets-a".to_vec(), vec![0xAB; 64]);
         values.insert(b"EncryptionKeyPair-b".to_vec(), vec![0xCD; 32]);
@@ -113,17 +110,27 @@ mod tests {
         }
     }
 
+    /// `Drop` recovers a poisoned storage lock and wipes anyway instead of
+    /// panicking (a panic inside `drop` during unwinding aborts the process).
     #[test]
-    fn wipe_memory_storage_leaves_no_entry() {
-        let storage = MemoryStorage::default();
-        storage
+    #[allow(clippy::panic)]
+    fn drop_wipes_through_a_poisoned_storage_lock() {
+        let provider = InMemoryMlsProvider::default();
+        provider
+            .storage()
             .values
             .write()
             .unwrap()
-            .insert(b"MessageSecrets-x".to_vec(), vec![0x11; 48]);
+            .insert(b"EpochSecrets-a".to_vec(), vec![0xAB; 64]);
+        std::thread::scope(|s| {
+            let poisoner = s.spawn(|| {
+                let _guard = provider.storage().values.write().unwrap();
+                panic!("poison the storage lock");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(provider.storage().values.is_poisoned());
 
-        wipe_memory_storage(&storage);
-
-        assert!(storage.values.read().unwrap().is_empty());
+        drop(provider);
     }
 }
