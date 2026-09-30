@@ -1384,12 +1384,13 @@ jobs:
   # `bindings/python/pyproject.toml` names (`extension-module`,
   # `vendored-openssl`), and `vendored-openssl` compiles OpenSSL from source
   # through openssl-src for a Linux or Windows target and activates nothing for an
-  # Apple target, whose SQLCipher keeps CommonCrypto. A third step checks that
-  # split with `cargo tree` for each wheel target, and a fourth builds the library
-  # with exactly that list, read from the file, so a PR that breaks the OpenSSL or
-  # SQLCipher source build fails here instead of in the release run. The build
-  # covers the Linux x86_64 host only; the manylinux_2_28 container, the universal2
-  # macOS build, and the Windows NASM build still run only in `build-matrix.yml`.
+  # Apple target, whose SQLCipher keeps CommonCrypto when an Apple host builds it.
+  # A third step checks that split with `cargo tree` for each wheel target, and a
+  # fourth builds the library with exactly that list, read from the file, so a PR
+  # that breaks the OpenSSL or SQLCipher source build fails here instead of in the
+  # release run. The build covers the Linux x86_64 host only; the manylinux_2_28
+  # container, the universal2 macOS build, and the Windows NASM build still run
+  # only in `build-matrix.yml`.
   #
   # This job carried a "build-only" note claiming a pyo3 test suite assumes
   # in-memory custody and does not compile in prod config. Measured on this tree,

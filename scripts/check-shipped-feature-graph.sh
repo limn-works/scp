@@ -166,9 +166,9 @@ cd "$REPO_ROOT"
 #     crate declares for non-Apple targets only. For a Linux or Windows target it
 #     compiles the same SQLCipher against an OpenSSL this build produces instead
 #     of the host's libcrypto; for an Apple target it activates nothing, so
-#     SQLCipher stays on CommonCrypto unless OPENSSL_DIR (or OPENSSL_LIB_DIR plus
-#     OPENSSL_INCLUDE_DIR), bare or prefixed with the target triple, is set; and
-#     it activates nothing when `sqlite` is off.
+#     SQLCipher built on an Apple host stays on CommonCrypto unless OPENSSL_DIR (or
+#     OPENSSL_LIB_DIR plus OPENSSL_INCLUDE_DIR), bare or prefixed with the target
+#     triple, is set; and it activates nothing when `sqlite` is off.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
 # The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
