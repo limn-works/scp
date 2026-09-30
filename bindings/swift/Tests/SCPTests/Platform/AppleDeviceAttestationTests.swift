@@ -199,8 +199,8 @@
     }
 
     /// A `DCAppAttestService` that answers `attestKey` and `generateAssertion`
-    /// from a script after a scripted delay, and records the most calls it had
-    /// outstanding at one moment.
+    /// from a script after a scripted delay, and records how many of each call
+    /// reached it and the most calls it had outstanding at one moment.
     ///
     /// Each script is consumed front to back, and its last entry answers every
     /// call after it.
@@ -225,10 +225,22 @@
         private var outstandingCalls = 0
         private var peakOutstandingCalls = 0
         private var keyGenerationCallCount = 0
+        private var attestKeyCalls = 0
+        private var generateAssertionCalls = 0
 
         /// Most calls this double had outstanding at one moment.
         var peakConcurrency: Int {
             lock.withLock { peakOutstandingCalls }
+        }
+
+        /// How many `attestKey` calls reached this double.
+        var attestKeyCallCount: Int {
+            lock.withLock { attestKeyCalls }
+        }
+
+        /// How many `generateAssertion` calls reached this double.
+        var generateAssertionCallCount: Int {
+            lock.withLock { generateAssertionCalls }
         }
 
         init(attestScript: [Answer], assertScript: [Answer]) {
@@ -254,6 +266,7 @@
             clientDataHash _: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            lock.withLock { attestKeyCalls += 1 }
             answer(from: \.attestScript, to: completionHandler)
         }
 
@@ -262,6 +275,7 @@
             clientDataHash _: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            lock.withLock { generateAssertionCalls += 1 }
             answer(from: \.assertScript, to: completionHandler)
         }
 
@@ -765,7 +779,10 @@
         func appAttestCallsNeverOverlap() async {
             // `peakConcurrency` counts calls this double had outstanding at
             // once. Six callers starting together drive it above one for an
-            // adapter that hands every caller straight to App Attest.
+            // adapter that hands every caller straight to App Attest. The call
+            // counts prove the first attestation and all six callers reached
+            // Apple, so a peak of one cannot come from callers that failed
+            // before calling out.
             let service = OverlapDetectingAppAttestService(
                 attestScript: [.init(result: .success(Data([0xA1])), delay: 0.05)],
                 assertScript: [.init(result: .success(Data([0xB1])), delay: 0.05)]
@@ -795,6 +812,14 @@
             #expect(
                 service.peakConcurrency == 1,
                 "App Attest saw \(service.peakConcurrency) outstanding calls at once"
+            )
+            #expect(
+                service.attestKeyCallCount == 4,
+                "attestKey reached Apple \(service.attestKeyCallCount) times, expected 4"
+            )
+            #expect(
+                service.generateAssertionCallCount == 3,
+                "generateAssertion reached Apple \(service.generateAssertionCallCount) times, expected 3"
             )
         }
 
