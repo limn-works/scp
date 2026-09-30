@@ -171,15 +171,23 @@
 #      step. Assertion 2 runs `cargo package --list -p` on every workspace package and
 #      fails when that command fails, as it does on a readme key naming a missing file, or
 #      when a published `examples/NAME.rs` or `examples/NAME/main.rs` file is no example
-#      target's source. No run starts that gate, so this script prints up to three NOT
-#      CHECKED lines for it. A run
-#      that compiles at least one crate prints the assertion 2 line, naming every crate it
-#      compiled. That run also prints the assertion 1 line when at least one crate it
-#      compiled is a package some example target compiles, and names only those packages.
-#      A run that cannot read the example targets out of cargo metadata prints the
-#      assertion 1 line over every crate it compiled, with a clause saying some of them may
-#      have no example target.
-#      A run that compiles no crate prints neither line. A branch that edits
+#      target's source. Assertion 1 also scans source: each example target's source file
+#      and every `.rs` file under the `examples/` directory of every workspace package,
+#      including a package with no example target, and it fails on a `cfg(` or `cfg!(`
+#      predicate naming anything but `not`, `any`, `all` and nine platform keys, on a
+#      platform predicate false on the Linux runner, on an empty `any()` or `all()`, on any
+#      `cfg_attr`, `include`, `macro_rules` or `#[path]`, and on a block comment or string
+#      literal it cannot close. No run starts that gate, so this script prints up to four
+#      NOT CHECKED lines for it. A run that compiles at least one crate prints the
+#      assertion 2 line, naming every crate it compiled. That run also prints the
+#      assertion 1 line when at least one crate it compiled is a package some example
+#      target compiles, and names only those packages, and prints the source-scan line
+#      when at least one crate it compiled owns an example target or holds an `examples/`
+#      directory, and names only those packages. A run that cannot read the example
+#      targets out of cargo metadata prints the assertion 1 line and the source-scan line
+#      over every crate it compiled, each with a clause saying some of them may have no
+#      example target.
+#      A run that compiles no crate prints none of these three lines. A branch that edits
 #      `scripts/check-examples-compile.sh`, or any other GATES_NOT_RUN entry this run never
 #      starts, gets one more line naming that edit, whatever it compiled.
 #
@@ -778,7 +786,7 @@ else
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
     # scripts/check-examples-compile.sh makes two assertions, and each gets its own line
-    # when it reads a package this run compiled.
+    # when it reads a package this run compiled; assertion 1's source scan gets a third.
     # Assertion 2 runs `cargo package --list` on every workspace package, whether or not
     # it has an example target, so its line names every package compiled. Assertion 1
     # lints each `example` target, which compiles against the owning package's normal,
@@ -801,6 +809,7 @@ deps = {p["name"]: [(d["name"], d.get("kind")) for d in p.get("dependencies", []
     for p in pkgs}
 reached = {p["name"] for p in pkgs
     if any("example" in t.get("kind", []) for t in p.get("targets", []))}
+owners = set(reached)
 todo = [d for o in reached for d, _ in deps[o] if d in deps]
 while todo:
     n = todo.pop()
@@ -808,14 +817,37 @@ while todo:
         continue
     reached.add(n)
     todo.extend(d for d, k in deps[n] if k != "dev" and d in deps)
-print(", ".join(sorted(selected & reached)))
+print(" ".join(sorted(selected & reached)))
+print(" ".join(sorted(selected & owners)))
 ' "${CRATES[@]}" 2>/dev/null) || example_rc=$?
     fi
+    # The gate's source scan reads each example target's source file and every .rs file
+    # under a package's examples/ directory, and it scans that directory in every workspace
+    # package, including one with no example target, so its line names each package this
+    # run compiled that owns an example target or holds an examples/ directory.
+    scan_list=""
     if [[ $example_rc -ne 0 ]]; then
         example_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target)"
+        scan_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target and no examples/ directory)"
+    else
+        example_owners=$(printf '%s\n' "$example_list" | sed -n 2p)
+        example_list=$(printf '%s\n' "$example_list" | sed -n 1p)
+        example_list=${example_list// /, }
+        for c in "${CRATES[@]}"; do
+            scan_dir=""
+            for i in "${!MANIFEST_NAMES[@]}"; do
+                [[ ${MANIFEST_NAMES[$i]} == "$c" ]] && scan_dir=${MANIFEST_DIRS[$i]}
+            done
+            if [[ " $example_owners " == *" $c "* || ( -n $scan_dir && -d $scan_dir/examples ) ]]; then
+                scan_list+="${scan_list:+, }$c"
+            fi
+        done
     fi
     if [[ -n $example_list ]]; then
-        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone and without --no-deps, so it lints the example and every workspace library that example compiles, in that one package's dev-target feature set and without the --features list the compile above passed; an example with a clippy warning, an example that names an item behind a feature the compile above turned on, and a library with a clippy warning that only that narrower feature set raises, such as an import left unused when a feature is off, each pass here and fail that gate in the rust-clippy job of .github/workflows/ci.yml; that assertion also fails when a cfg(, cfg_attr( or cfg!( predicate in an example target's source file, or in any .rs file under a package's examples/, names anything but not, any, all, unix, windows or a target_ key such as target_os, or is an empty any() or all(), and the compile above never reads those predicates, so such a file passes here and fails that gate in the same job")
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone and without --no-deps, so it lints the example and every workspace library that example compiles, in that one package's dev-target feature set and without the --features list the compile above passed; an example with a clippy warning, an example that names an item behind a feature the compile above turned on, and a library with a clippy warning that only that narrower feature set raises, such as an import left unused when a feature is off, each pass here and fail that gate in the rust-clippy job of .github/workflows/ci.yml")
+    fi
+    if [[ -n $scan_list ]]; then
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 source scan over $scan_list: that gate reads each example target's source file and every .rs file under the package's examples/ directory, symbolic links followed, in every workspace package whether or not it has an example target, and fails on a cfg( or cfg!( predicate that names anything but not, any, all and the nine platform keys unix, windows, target_os, target_family, target_arch, target_pointer_width, target_endian, target_env and target_vendor, so target_feature and target_has_atomic fail; on a platform predicate that is false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows), cfg(not(unix)) and cfg(target_os = \"macos\") fail there; on an empty any() or all(); on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds; and on a block comment or string literal the scan cannot close; the compile above reads none of those files this way, so such a file passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     fi
 
     declare -a SELECTED_WASM=()

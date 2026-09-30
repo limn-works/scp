@@ -116,8 +116,8 @@
 #     run that activates a narrower feature set than the merge gate resolves and prints
 #     `compile ok` says nothing about the modules it skipped. The same run cannot read
 #     which package has an example target, so case 22 also asserts that the
-#     `scripts/check-examples-compile.sh` assertion 1 line names the changed package and
-#     says the run could not read the targets.
+#     `scripts/check-examples-compile.sh` assertion 1 line and its source-scan line each
+#     name the changed package and say the run could not read the targets.
 #
 #     Case 22b changes scp-clock, scp-transport and scp-ffi under a metadata answer in
 #     which only scp-transport owns an example, and scp-transport reaches scp-clock through
@@ -125,9 +125,12 @@
 #     and scp-transport and not scp-ffi, which no example compiles; that the line says the
 #     gate lints every workspace library an example compiles; that the assertion 2 line
 #     names all three packages and both example file forms, `examples/NAME.rs` and
-#     `examples/NAME/main.rs`; and that no gate-edit line appears on a branch that left
-#     the gate alone. A run that drops either line, the dependency walk or the
-#     reachability filter reports green over a change the rust-clippy job turns red.
+#     `examples/NAME/main.rs`; that the assertion 1 source-scan line names scp-ffi, whose
+#     `examples/` holds a helper and no target, and scp-transport and not scp-clock, and
+#     states every source rule the gate applies; and that no gate-edit line appears on a
+#     branch that left the gate alone. A run that drops any of the three lines, the
+#     dependency walk or the reachability filter reports green over a change the
+#     rust-clippy job turns red.
 #
 #     Case 22c changes only `scripts/check-examples-compile.sh` and asserts that the
 #     summary names that gate as unrun over this repository's workspace, and that it prints
@@ -1182,6 +1185,11 @@ if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 over 
 else
     report "case 22 names the examples gate over every package when it cannot read targets" 1 "the output holds no qualified NOT CHECKED line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
 fi
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 source scan over scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
+    report "case 22 names the examples source scan over every package when it cannot read targets" 0 ""
+else
+    report "case 22 names the examples source scan over every package when it cannot read targets" 1 "the output holds no qualified source-scan line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
+fi
 
 # ── Case 22b: the examples gate over the packages each of its assertions reads ──────
 #
@@ -1207,6 +1215,8 @@ build_fixture "$FIXTURE22B"
 fixture_commit "$FIXTURE22B" crates/scp-clock/src/lib.rs
 fixture_commit "$FIXTURE22B" crates/scp-transport/src/lib.rs
 fixture_commit "$FIXTURE22B" crates/scp-ffi/src/lib.rs
+mkdir -p "$FIXTURE22B/crates/scp-ffi/examples/support"
+fixture_commit "$FIXTURE22B" crates/scp-ffi/examples/support/helpers.rs
 HARNESS22B="$FIXTURE22B.harness"
 write_stubs "$HARNESS22B" "$PIN_CHANNEL" 0 0 ""
 cat > "$HARNESS22B/metadata.json" <<'JSON'
@@ -1252,14 +1262,42 @@ if grep -F 'check-examples-compile.sh assertion 1 over the example targets that 
 else
     report "case 22b says the examples gate lints each library an example compiles" 1 "the assertion 1 line gives no library-lint reason: $(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
 fi
-# Assertion 1 also rejects a non-platform cfg predicate in example source, which the
-# compile above never reads; a line without that clause tells the reader a feature-gated
-# example body passed the gate.
-if grep -F 'check-examples-compile.sh assertion 1 over the example targets that compile' "$HARNESS22B/out.txt" |
-    grep -qF 'a cfg(, cfg_attr( or cfg!( predicate'; then
-    report "case 22b says the examples gate rejects a non-platform cfg predicate" 0 ""
+# Assertion 1's source scan reads every .rs file under examples/ in every package, with
+# or without an example target, so its line must name scp-ffi, whose examples/ holds a
+# helper and no target, and scp-transport, which owns a target, and must not name
+# scp-clock, which has neither. The mutations it kills: seeding the scan line from the
+# reachability walk leaves scp-ffi out and names scp-clock; seeding it from target owners
+# alone leaves scp-ffi out; naming every compiled package names scp-clock.
+SCAN_LINE=$(grep -F 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 source scan over ' "$HARNESS22B/out.txt")
+if [[ $SCAN_LINE == *'source scan over scp-ffi, scp-transport:'* ]]; then
+    report "case 22b names the source scan over each package with an example target or examples/" 0 ""
 else
-    report "case 22b says the examples gate rejects a non-platform cfg predicate" 1 "the assertion 1 line names no cfg predicate check: $(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
+    report "case 22b names the source scan over each package with an example target or examples/" 1 "the source-scan line reads: ${SCAN_LINE:-<absent>}"
+fi
+# The line must state the rules the gate applies, as check-examples-compile.sh's header
+# gives them. A line that admits windows or any target_ key, or that leaves out the
+# outright cfg_attr, include, macro_rules and #[path] rejections, tells a fix agent that
+# code the gate rejects will pass.
+scan_rules_missing=""
+for want in 'target_feature and target_has_atomic fail' \
+    'false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows)' \
+    'on an empty any() or all()' \
+    'on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds' \
+    'a block comment or string literal the scan cannot close' \
+    'in every workspace package whether or not it has an example target'; do
+    [[ $SCAN_LINE == *"$want"* ]] || scan_rules_missing+="[$want] "
+done
+if [[ -z $scan_rules_missing ]]; then
+    report "case 22b states every source rule the examples gate applies" 0 ""
+else
+    report "case 22b states every source rule the examples gate applies" 1 "the source-scan line lacks $scan_rules_missing: ${SCAN_LINE:-<absent>}"
+fi
+# The retired wording admitted any target_ key and a cfg_attr whose predicate names a
+# platform key; neither the scan line nor the assertion 1 line may carry it.
+if grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt" | grep -qF 'or a target_ key such as target_os'; then
+    report "case 22b carries no stale cfg rule" 1 "$(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
+else
+    report "case 22b carries no stale cfg rule" 0 ""
 fi
 if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over this repository' "$HARNESS22B/out.txt"; then
     report "case 22b names no unrun gate edit on a branch that left the gate alone" 1 "$(grep -F 'check-examples-compile.sh over this repository' "$HARNESS22B/out.txt")"
