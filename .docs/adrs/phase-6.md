@@ -1169,8 +1169,9 @@ fun ContextScreen(
     // Released when the last screen collecting this context's incoming messages through
     // hotStreams leaves.
     val incoming by rememberIncomingMessages(hotStreams, contextHandle)
-    val messages = remember { mutableStateListOf<String>() }
-    LaunchedEffect(incoming) { incoming?.collect { messages.add(it) } }
+    // rememberScpEventList keeps the newest 100 messages and discards its list when its flow
+    // changes, so a new contextHandle starts an empty list instead of appending to the old one.
+    val messages = incoming?.let { rememberScpEventList(it).value }.orEmpty()
 
     LazyColumn {
         items(messages) { message ->

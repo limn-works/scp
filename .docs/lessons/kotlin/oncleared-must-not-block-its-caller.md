@@ -150,8 +150,10 @@ Before matching, it strips the `$default` and `-<hash>` suffixes Kotlin appends 
 compiled overloads, and it skips every method whose name contains `$lambda`. A non-suspend lambda
 written inside `shutdown()`, such as one handed to `CoroutineBridge.ffiCall`, compiles to a
 non-suspending `shutdown$lambda$0` method on the same class, and the check skips it; a suspend
-lambda compiles to a separate class that the check never inspects. The check therefore catches a
-blocking call inside neither kind of lambda, nor a blocking stop method under any other name.
+lambda compiles to a separate class that the check never inspects. The check reads signatures
+only and inspects no method body, so it catches no blocking call anywhere: not one written directly
+in a suspending stop method's body, such as `runBlocking` inside `suspend fun shutdown()`, not one
+inside either kind of lambda, and not a blocking stop method under any other name.
 `ServerBridge.shutdownRelay` and `shutdownNode` set the shutdown flag inside their bridge call for a
 different reason: `withContext` checks for cancellation as it returns, so a flag that `shutdown()`
 set after the bridge call returned would stay false when the caller was cancelled after the
