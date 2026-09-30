@@ -567,7 +567,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 **Android lifecycle integration:**
 - Android lifecycle integration is implemented via an extension function `Context.asFlow(lifecycleOwner: LifecycleOwner): Flow<Message>` in a separate `scp-kt-android` artifact. This artifact depends on `androidx.lifecycle:lifecycle-runtime-ktx` — a dependency the core SDK does not take on, keeping the JVM artifact Android-free.
 - The extension launches collection in `lifecycleOwner.lifecycleScope` and cancels when the `LifecycleOwner` reaches `DESTROYED`. This prevents resource leaks when an `Activity` or `Fragment` is destroyed while a context subscription is live.
-- `ViewModel`-based usage is the recommended pattern: hold the `SCP` instance and its context handles in a `ViewModel` that extends `ScpViewModel` (amended: ADR-048 removed `Context` from the Kotlin surface), expose `Flow<Message>` as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override launches `leave` for every tracked context on a scope it never cancels and returns without waiting (amended: `viewModelScope` is already cancelled when `onCleared()` runs, and blocking `onCleared()` on a teardown deadlocks or risks an ANR; see the `AutoCloseable` bullet under Rationale).
+- `ViewModel`-based usage is the recommended pattern: hold the `SCP` instance and its context handles in a `ViewModel` that extends `ScpViewModel` (amended: ADR-048 removed `Context` from the Kotlin surface), expose `Flow<Message>` as a `StateFlow<List<Message>>` using `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`. The `ViewModel.onCleared()` override launches `leave` for every tracked context, and then the held `SCP` instance's `shutdown`, on a scope it never cancels and returns without waiting (amended: `viewModelScope` is already cancelled when `onCleared()` runs, and blocking `onCleared()` on a teardown deadlocks or risks an ANR; see the `AutoCloseable` bullet under Rationale).
 
 **Jetpack Compose integration:**
 - The core artifact `works.limn:scp-kt` takes no Compose dependency. `works.limn:scp-kt-android` carries the Compose state holders (SCP-118), and they build on standard Kotlin patterns the SDK already provides: `Flow<Message>` collected via `collectAsState()`, and resources held in `remember { }` blocks whose `DisposableEffect` `onDispose` launches their `suspend` teardown on a scope that disposal never cancels, then returns (amended; see the `AutoCloseable` bullet under Rationale).
@@ -997,9 +997,14 @@ fun Context.asLifecycleFlow(
 // ScpViewModel.kt — in works.limn.scp.android package
 
 /**
- * Base ViewModel that leaves every tracked context when the ViewModel is cleared.
+ * Base ViewModel that leaves every tracked context and shuts down the SCP instance it holds
+ * when the ViewModel is cleared.
  */
-abstract class ScpViewModel : ViewModel() {
+abstract class ScpViewModel(
+    // The SCP instance this ViewModel holds and the bridge its shutdown runs on.
+    private val scp: SCP,
+    private val scpBridge: CoroutineBridge,
+) : ViewModel() {
 
     private val contextsLock = Any()
     private val activeContexts = mutableListOf<TrackedContext>()
@@ -1032,10 +1037,13 @@ abstract class ScpViewModel : ViewModel() {
         }
         // Dispatch and return: blocking the main thread on a teardown deadlocks or
         // risks an ANR (see the amended Rationale bullet).
-        launchLeave(contexts)
+        launchLeave(contexts, shutdownAfter = true)
     }
 
-    private fun launchLeave(contexts: List<TrackedContext>) {
+    private fun launchLeave(
+        contexts: List<TrackedContext>,
+        shutdownAfter: Boolean = false,
+    ) {
         // UNDISPATCHED runs the coroutine on the calling thread up to its first suspension. A
         // default start, from a caller already inside a Dispatchers.Unconfined coroutine (a
         // retry from onCleanupFailure), would queue it until that caller suspends, and an
@@ -1047,6 +1055,11 @@ abstract class ScpViewModel : ViewModel() {
                 // A throwing override must not stop the remaining leaves.
                 cleanupFailureLock.withLock { runCatching { onCleanupFailure(ctx, failure) } }
                     .onFailure { Log.w("ScpViewModel", "onCleanupFailure threw", it) }
+            }
+            // After every leave: a leave needs the engine that shutdown stops.
+            if (shutdownAfter) {
+                runCatching { scp.shutdown(scpBridge) }
+                    .onFailure { Log.w("ScpViewModel", "SCP shutdown failed during ViewModel cleanup", it) }
             }
         }
     }

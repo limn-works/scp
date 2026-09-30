@@ -106,6 +106,13 @@ class Context internal constructor(private val handle: ContextHandle) {
             val result = handle.invokeTool(toolId, json)
             Json.decodeFromString(result)
         }
+
+    fun receiveFlow(): Flow<Message> = callbackFlow {
+        handle.subscribe { envelope ->
+            trySend(envelope.toMessage())
+        }
+        awaitClose { handle.unsubscribe() }
+    }
 }
 ```
 
