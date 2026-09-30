@@ -470,6 +470,18 @@ class AndroidKeyCustodyTest {
                 assertEquals("SCP-CRYPTO-4003", exception.code)
             }
         }
+
+        @Test
+        fun `dhAgree lets IllegalStateException escape for an all-zero low-order peer key`() {
+            val handle = custody.generateKeypair(KeyType.X25519)
+            // A 32-byte peer key passes the length check, so only the low order of the point
+            // separates this call from the successful agreements above.
+            val exception = assertThrows<IllegalStateException> {
+                custody.dhAgree(handle, ByteArray(32))
+            }
+            // assertThrows fails on an ScpException, which is not an IllegalStateException.
+            assertEquals("X25519 agreement failed", exception.message)
+        }
     }
 
     // -------------------------------------------------------------------

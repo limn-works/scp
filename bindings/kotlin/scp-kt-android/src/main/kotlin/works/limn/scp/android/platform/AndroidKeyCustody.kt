@@ -116,7 +116,9 @@ import java.security.SecureRandom
  *
  * This class converts no exception to [ScpException]. Each method throws [ScpException] only for
  * the codes its KDoc names, and every other failure escapes as the original throwable. The
- * KDoc of [KeyCustodyProvider] lists the Keystore and JCA exceptions each method can let escape.
+ * KDoc of [KeyCustodyProvider] lists the Keystore and JCA exceptions each method can let escape,
+ * and the [dhAgree] KDoc names the Bouncy Castle `IllegalStateException` a low-order peer key
+ * raises.
  *
  * ## Thread safety
  *
@@ -332,11 +334,15 @@ class AndroidKeyCustody internal constructor(
      * @param keyHandle Handle to an X25519 key from [generateKeypair].
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4002` if no software key sits under
-     *   [keyHandle]: a destroyed or unknown handle, or a Keystore Ed25519 handle, which never
-     *   enters [softwareKeyTypes] and so skips the key-type check.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long or
-     *   [keyHandle] names a software Ed25519 key.
+     * @throws ScpException with code `SCP-CRYPTO-4002` if [peerPublic] is 32 bytes long and no
+     *   software key sits under [keyHandle]: a destroyed or unknown handle, or a Keystore
+     *   Ed25519 handle, which never enters [softwareKeyTypes] and so skips the key-type check.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
+     *   checked before any key lookup, or [keyHandle] names a software Ed25519 key.
+     * @throws IllegalStateException from Bouncy Castle ("X25519 agreement failed") if
+     *   [peerPublic] is 32 bytes long but a low-order point, such as 32 zero bytes, which makes
+     *   the shared secret all zero. This method checks no point order, so a peer that publishes
+     *   such a key reaches this exception, and a `catch (e: ScpException)` does not catch it.
      */
     override fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
         if (peerPublic.size != 32) {
