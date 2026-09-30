@@ -3,12 +3,14 @@
 //! UNTIL A PRODUCTION `PreRotationCustody` BACKEND EXISTS, NO BUILD RUNS THIS
 //! EXAMPLE WITHOUT A TEST-HARNESS STAND-IN. `cargo run -p scp-node --example
 //! website` compiles, then exits 1 on every run with
-//! `IdentityError::NoPreRotationBackend`, whose message begins:
+//! `IdentityError::NoPreRotationBackend`, which `main` prints as:
 //!
 //! ```text
-//! Error: NodeBuild("identity error: no production pre-rotation custody backend
-//! available; pre-rotation recovery custody is not yet implemented
+//! Error: NodeBuild(Identity(NoPreRotationBackend))
 //! ```
+//!
+//! An embedder detects the same failure by matching
+//! `HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))`.
 //!
 //! A `testing` build is not a way to run it: `testing` mints the identity
 //! through `scp_platform::testing::InMemoryPreRotationCustody`, which holds the

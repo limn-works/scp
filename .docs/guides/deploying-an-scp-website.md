@@ -8,8 +8,9 @@ no separate web server and no DNS requirement on the origin). See the example at
 [`self-hosting-a-website-on-scp.md`](./self-hosting-a-website-on-scp.md).
 
 On every build without `scp-node`'s `testing` feature, `host_site` fails closed when it has
-to create an identity, with `IdentityError::NoPreRotationBackend` (`NodeBuild("identity
-error: no production pre-rotation custody backend available; …")`). `host_site` first
+to create an identity, returning
+`HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))`, a typed
+value a caller matches without reading the message text. `host_site` first
 reloads any identity its storage directory holds, and creates one on `Node::start`'s
 `Generate` path only when the directory holds none. On a build without `testing`, that path
 returns `NoPreRotationBackend` whatever custody or storage the caller supplies: it takes no

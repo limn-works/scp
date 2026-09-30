@@ -47,7 +47,7 @@ use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 
 use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
-use crate::{ApplicationNode, PublicSurface, projection};
+use crate::{ApplicationNode, NodeError, PublicSurface, projection};
 
 /// A single static asset to publish: HTTP path, content type, and body bytes.
 ///
@@ -884,8 +884,9 @@ pub struct HostSiteReady {
 /// `PreRotationCustody` backend exists, [`host_site`] and [`host_site_until`]
 /// fail on every build without the `testing` feature whenever the resolved
 /// `storage_path` directory holds no persisted identity, a first deployment
-/// included: they return [`HostSiteError::NodeBuild`] wrapping
-/// `IdentityError::NoPreRotationBackend`, and the example exits 1 with it. A
+/// included: they return [`HostSiteError::NodeBuild`] holding
+/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value,
+/// and the example exits 1 with it. A
 /// `testing` build creates the identity only through the test-harness
 /// `InMemoryPreRotationCustody` stand-in.
 pub struct HostSiteConfig {
@@ -1064,9 +1065,12 @@ pub enum HostSiteError {
     /// The DID method (DHT client) could not be constructed.
     #[error("DID method error: {0}")]
     DidMethod(String),
-    /// The application node failed to build.
+    /// The application node failed to build. Carries the typed [`NodeError`],
+    /// so a caller matches `NodeBuild(NodeError::Identity(
+    /// IdentityError::NoPreRotationBackend))` to detect a missing pre-rotation
+    /// custody backend without reading the message text.
     #[error("node build error: {0}")]
-    NodeBuild(String),
+    NodeBuild(#[source] NodeError),
     /// The site assets could not be loaded from the site directory.
     #[error("load assets error: {0}")]
     LoadAssets(String),
@@ -1207,7 +1211,8 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
 ///
 /// On every build without the `testing` feature, returns
-/// [`HostSiteError::NodeBuild`] wrapping `IdentityError::NoPreRotationBackend`
+/// [`HostSiteError::NodeBuild`] holding
+/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value
 /// whenever the resolved `storage_path` directory holds no persisted
 /// identity, because no production `PreRotationCustody` backend exists to
 /// create one.
@@ -2302,7 +2307,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
             // `Node::start` establishes the inbound port mapping during NAT tier
             // selection and CAN still fail afterward, so release best-effort.
             release_self_host_mappings(upnp_mapper, natpmp_mapper, http_addr.port()).await;
-            Err(HostSiteError::NodeBuild(e.to_string()))
+            Err(HostSiteError::NodeBuild(e))
         }
     }
 }
@@ -2523,6 +2528,38 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
+    /// detects a missing pre-rotation backend by pattern, and the same pattern
+    /// rejects every other node-build failure.
+    #[test]
+    fn node_build_error_keeps_typed_no_pre_rotation_backend() {
+        let is_missing_backend = |e: &HostSiteError| {
+            matches!(
+                e,
+                HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))
+            )
+        };
+        let missing =
+            HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend));
+        assert!(is_missing_backend(&missing));
+        let source = std::error::Error::source(&missing).expect("NodeBuild has a source");
+        assert!(matches!(
+            source.downcast_ref::<NodeError>(),
+            Some(NodeError::Identity(IdentityError::NoPreRotationBackend))
+        ));
+        assert!(
+            missing
+                .to_string()
+                .starts_with("node build error: identity error: no production pre-rotation"),
+            "Display keeps the message text: {missing}"
+        );
+
+        let other = HostSiteError::NodeBuild(NodeError::Nat("no tier".to_owned()));
+        assert!(!is_missing_backend(&other));
+        let other_config = HostSiteError::InvalidConfig("x".to_owned());
+        assert!(!is_missing_backend(&other_config));
+    }
 
     // -----------------------------------------------------------------------
     // HostSiteConfig shape + reach/tls lowering (`lower_host_site_reach_tls`)
