@@ -101,8 +101,9 @@ private class InMemorySharedPreferences : SharedPreferences {
  * - Software X25519 key generation and DH agreement
  * - Pseudonym derivation determinism
  * - Key destruction, and the error codes a destroyed handle yields
- * - Signing-key export, including its rejection of a [CustodyType.HARDWARE] handle, which
- *   throws before it reads Keystore
+ * - Signing-key export: the seed of a software Ed25519 key and of a derived pseudonym key,
+ *   `SCP-CRYPTO-4003` for an X25519 key, `SCP-CRYPTO-4001` for a missing key, and
+ *   `SCP-CRYPTO-4005` for a [CustodyType.HARDWARE] handle, which throws before it reads Keystore
  * - Error handling (key not found, wrong key type)
  * - Ed25519 key persistence to EncryptedSharedPreferences
  *
@@ -622,6 +623,47 @@ class AndroidKeyCustodyTest {
             // The adapter never reads KeyInfo.securityLevel, so the message may not claim a TEE.
             assertTrue(message.contains("Android Keystore custody"), message)
             assertTrue(!message.contains("TEE"), message)
+        }
+
+        @Test
+        fun `exportSigningKeyBytes returns the 32-byte seed of a software Ed25519 key`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val seed = custody.exportSigningKeyBytes(handle)
+            assertEquals(32, seed.size)
+            // The exported seed regenerates the handle's public key, so it is that key's seed.
+            val derivedPublic = Ed25519PrivateKeyParameters(seed, 0).generatePublicKey().encoded
+            assertArrayEquals(custody.publicKey(handle), derivedPublic)
+        }
+
+        @Test
+        fun `exportSigningKeyBytes returns the seed of a derived pseudonym key`() {
+            val identityHandle = custody.generateKeypair(KeyType.ED25519)
+            val pseudonym = custody.derivePseudonym(identityHandle, "export-ctx".toByteArray())
+            val pseudonymHandle = KeyHandle(id = pseudonym.id, custodyType = pseudonym.custodyType)
+            val seed = custody.exportSigningKeyBytes(pseudonymHandle)
+            assertEquals(32, seed.size)
+            val derivedPublic = Ed25519PrivateKeyParameters(seed, 0).generatePublicKey().encoded
+            assertArrayEquals(custody.publicKey(pseudonymHandle), derivedPublic)
+            // The pseudonym seed is not the identity seed.
+            assertTrue(!seed.contentEquals(custody.exportSigningKeyBytes(identityHandle)))
+        }
+
+        @Test
+        fun `exportSigningKeyBytes throws SCP-CRYPTO-4003 for an X25519 key`() {
+            val x25519Handle = custody.generateKeypair(KeyType.X25519)
+            val exception = assertThrows<ScpException> {
+                custody.exportSigningKeyBytes(x25519Handle)
+            }
+            assertEquals("SCP-CRYPTO-4003", exception.code)
+        }
+
+        @Test
+        fun `exportSigningKeyBytes throws SCP-CRYPTO-4001 for a missing software key`() {
+            val missing = KeyHandle(id = "nonexistent-key", custodyType = CustodyType.SOFTWARE)
+            val exception = assertThrows<ScpException> {
+                custody.exportSigningKeyBytes(missing)
+            }
+            assertEquals("SCP-CRYPTO-4001", exception.code)
         }
     }
 
