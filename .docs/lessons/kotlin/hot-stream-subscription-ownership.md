@@ -103,7 +103,9 @@ subscription that a different caller had just opened.
   waited on `HotStreamFactory`'s mutex kept one more `onStop` for good. A mount whose `start`
   threw keeps its `onStop`, because that start may have opened what it did not return, so the
   bound adds one entry per start that threw and one for the start running under the key's
-  mutex. Discarding an early
+  mutex. `rememberScpHotStream` logs that throw and leaves the mount's State null: its launch
+  scope has no exception handler, so a throw escaping it reaches the thread's uncaught-exception
+  handler, which on Android kills the process before the held `onStop` can run. Discarding an early
   mount's `onStop` whose `start` returned a different object instead leaks a subscription
   whenever two different streams share a key, such as a `contextEvents` and an
   `incomingMessages` stream both keyed by one context handle.

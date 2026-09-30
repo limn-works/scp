@@ -693,8 +693,11 @@ class ScpHotStreams(
  *
  * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens. A
  *   mount that starts after [hotStreams] is closed or its scope is cancelled has its start
- *   refused, and its [State] stays `null`. A mount that already holds a [SharedFlow] keeps it;
- *   once [ScpHotStreams.close] runs, that flow receives nothing further.
+ *   refused, and its [State] stays `null`. A subscribe that throws (for example on a context
+ *   the engine has already dropped) is logged at warning level under `ScpHotStreamCoordinator`
+ *   and leaves its [State] `null`; the release still runs once the last mount of that stream
+ *   leaves composition. A mount that already holds a [SharedFlow] keeps it; once
+ *   [ScpHotStreams.close] runs, that flow receives nothing further.
  */
 @Composable
 fun rememberContextEvents(
@@ -715,8 +718,11 @@ fun rememberContextEvents(
  *
  * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens. A
  *   mount that starts after [hotStreams] is closed or its scope is cancelled has its start
- *   refused, and its [State] stays `null`. A mount that already holds a [SharedFlow] keeps it;
- *   once [ScpHotStreams.close] runs, that flow receives nothing further.
+ *   refused, and its [State] stays `null`. A subscribe that throws (for example on a context
+ *   the engine has already dropped) is logged at warning level under `ScpHotStreamCoordinator`
+ *   and leaves its [State] `null`; the release still runs once the last mount of that stream
+ *   leaves composition. A mount that already holds a [SharedFlow] keeps it; once
+ *   [ScpHotStreams.close] runs, that flow receives nothing further.
  */
 @Composable
 fun rememberIncomingMessages(
@@ -764,7 +770,9 @@ internal enum class HotStreamKind {
  *   mounts that got one subscription as different instances each have their own [onStop] run.
  *   Disposal returns without waiting for it.
  * @return Compose [State] holding the [SharedFlow], or `null` until the subscription is
- *   established.
+ *   established. A [start] that throws is logged at warning level under
+ *   `ScpHotStreamCoordinator` and leaves the [State] `null` for this mount; its [onStop] still
+ *   runs once the last live mount under [key] leaves.
  */
 @Composable
 internal fun <T> rememberScpHotStream(
@@ -791,11 +799,23 @@ internal fun <T> rememberScpHotStream(
         // leak when Compose abandons that composition.
         val mount = coordinator.mount(key)
         scope.launch {
-            try {
-                flowState.value = coordinator.startMounted(mount, start)
-            } catch (closed: ScpHotStreamCoordinatorClosedException) {
-                Log.w(COORDINATOR_TAG, "hot stream not started", closed)
-            }
+            // `scope` has no CoroutineExceptionHandler, so an exception escaping this launch
+            // reaches the thread's uncaught-exception handler, which on Android kills the
+            // process. A throwing `start` (an FFI subscribe on a context the engine dropped)
+            // is logged here instead and leaves `flowState` null; the coordinator keeps this
+            // mount's onStop, because that `start` may have opened a subscription it did not
+            // return. Cancellation and an Error (a JVM fault) still propagate.
+            runCatching { coordinator.startMounted(mount, start) }
+                .onSuccess { flowState.value = it }
+                .onFailure { failure ->
+                    if (failure is CancellationException || failure is Error) throw failure
+                    val message = if (failure is ScpHotStreamCoordinatorClosedException) {
+                        "hot stream not started"
+                    } else {
+                        "hot stream start threw; its State stays null"
+                    }
+                    Log.w(COORDINATOR_TAG, message, failure)
+                }
         }
         onDispose {
             // onDispose runs on a composition thread, which on Android is a main thread.

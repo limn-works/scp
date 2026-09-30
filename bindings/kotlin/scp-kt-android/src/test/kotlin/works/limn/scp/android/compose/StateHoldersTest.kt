@@ -50,6 +50,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.coroutines.CoroutineContext
 
@@ -305,6 +306,68 @@ class StateHoldersTest {
         composeRule.waitUntil(WAIT_TIMEOUT_MS) { flowState?.value === eventFlow }
         composeRule.waitForIdle()
         assertTrue(capturedFlow === eventFlow)
+    }
+
+    /**
+     * A throwing `start` must not escape rememberScpHotStream's launch: that launch's scope has
+     * no CoroutineExceptionHandler, so an escaping throw reaches the thread's uncaught-exception
+     * handler, which on Android kills the process. The default handler installed here records
+     * that escape. The throw is logged, the State stays null, and the mount's onStop still runs
+     * on disposal, because that `start` may have opened a subscription it did not return.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `rememberScpHotStream logs a throwing start, keeps State null, and still runs onStop`() {
+        ShadowLog.clear()
+        val escaped = AtomicReference<Throwable?>(null)
+        val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { _, thrown -> escaped.set(thrown) }
+        try {
+            val failure = IllegalStateException("engine already dropped the context")
+            val startThrew = CountDownLatch(1)
+            val stopped = CountDownLatch(1)
+            val showComposable = MutableStateFlow(true)
+            var flowState: State<SharedFlow<String>?>? = null
+            val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+
+            composeRule.setContent {
+                val show by showComposable.collectAsStateCompat()
+                if (show) {
+                    flowState = rememberScpHotStream<String>(
+                        key = "throwing-start",
+                        coordinator = coordinator,
+                        start = {
+                            startThrew.countDown()
+                            throw failure
+                        },
+                        onStop = { stopped.countDown() },
+                    )
+                }
+            }
+
+            composeRule.waitForIdle()
+            assertTrue(
+                "start did not run within $AWAIT_TIMEOUT_SECONDS seconds of composition",
+                startThrew.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+            )
+            composeRule.waitUntil(WAIT_TIMEOUT_MS) {
+                ShadowLog.getLogsForTag("ScpHotStreamCoordinator").isNotEmpty() || escaped.get() != null
+            }
+            assertEquals("a throwing start escaped to the uncaught-exception handler", null, escaped.get())
+            val warning = ShadowLog.getLogsForTag("ScpHotStreamCoordinator").single()
+            assertEquals(Log.WARN, warning.type)
+            assertSame(failure, warning.throwable)
+            assertEquals(null, flowState?.value)
+
+            showComposable.value = false
+            composeRule.waitForIdle()
+            assertTrue(
+                "onStop of a mount whose start threw did not run within $AWAIT_TIMEOUT_SECONDS seconds of disposal",
+                stopped.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+            )
+            assertEquals("a throwing start escaped to the uncaught-exception handler", null, escaped.get())
+        } finally {
+            Thread.setDefaultUncaughtExceptionHandler(previousHandler)
+        }
     }
 
     @Test
