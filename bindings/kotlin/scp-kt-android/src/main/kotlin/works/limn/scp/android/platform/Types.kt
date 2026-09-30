@@ -372,9 +372,11 @@ interface KeyCustodyProvider {
      * Destroy key material associated with a handle.
      *
      * After this call, operations with the same handle in the same process throw [ScpException]
-     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, and
-     * [exportSigningKeyBytes] on a Keystore handle ([CustodyType.HARDWARE]) throws
-     * `SCP-CRYPTO-4005`, because it refuses on [KeyHandle.custodyType] before any key lookup.
+     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, or
+     * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
+     * length before any key lookup; and [exportSigningKeyBytes] on a Keystore handle
+     * ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
+     * [KeyHandle.custodyType] before any key lookup.
      * [AndroidKeyCustody] removes the persisted seed of a software Ed25519 key that
      * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
      * can restore the key when this process dies before the removal reaches disk (see
@@ -398,9 +400,11 @@ interface KeyCustodyProvider {
      * @param keyHandle Handle to an X25519 key.
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4002` if no software key sits under
-     *   [keyHandle]: a destroyed or unknown handle, or a Keystore Ed25519 handle.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long or
+     * @throws ScpException with code `SCP-CRYPTO-4002` if [peerPublic] is 32 bytes long and no
+     *   software key sits under [keyHandle]: a destroyed or unknown handle, or a Keystore
+     *   Ed25519 handle.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
+     *   checked before any key lookup, or
      *   [keyHandle] names a software Ed25519 key.
      */
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
