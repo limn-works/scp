@@ -79,12 +79,12 @@ export interface ContextParams {
   /**
    * Capability ceiling — maximum capabilities available in this context.
    *
-   * Required: the bridge refuses params JSON with no `ceiling` key or a
-   * `null` one (`SCP-VALID-7000`). An empty array declares a ceiling that
-   * grants nothing: every UCAN mint, delegation and outlet registration in
-   * the context is refused. An empty array is never widened to a default.
+   * Omit it (or pass `null` in hand-written JSON) to get the protocol's
+   * default ceiling. An empty array declares a ceiling that grants nothing:
+   * every UCAN mint, delegation and outlet registration in the context is
+   * refused. An empty array is never widened to the default.
    */
-  readonly ceiling: readonly string[];
+  readonly ceiling?: readonly string[];
   /** Outlet definitions to register at context creation. */
   readonly outlets?: readonly OutletDefinition[];
   /** Role definitions: role name to capability list mapping. */

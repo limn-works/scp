@@ -55,25 +55,24 @@ describe("Capability strings", () => {
 });
 
 describe("type definitions", () => {
-  it("ContextParams has required ceiling field", () => {
+  it("ContextParams accepts an explicit ceiling", () => {
     const params: ContextParams = {
       ceiling: ["messages:read", "messages:write"],
     };
     expect(params.ceiling).toHaveLength(2);
   });
 
-  it("ContextParams without a ceiling does not compile", () => {
-    // The bridge refuses params with no ceiling, so the type must refuse
-    // them first. `tsc -p tsconfig.test.json` fails if this stops being an
-    // error.
-    // @ts-expect-error the ceiling is required.
+  it("ContextParams may omit the ceiling, which serializes with no ceiling key", () => {
+    // An absent ceiling is the bridge's cue to apply the default ceiling, so
+    // the serialized params must carry no `ceiling` key at all.
     const params: ContextParams = { mode: "Encrypted" };
-    expect(params.mode).toBe("Encrypted");
+    expect(params.ceiling).toBeUndefined();
+    expect(Object.hasOwn(JSON.parse(JSON.stringify(params)), "ceiling")).toBe(false);
   });
 
   it("ContextParams keeps an empty ceiling as an empty array when serialized", () => {
     // An empty ceiling is deny-all at the bridge; serialization must not drop
-    // it, or the bridge would read it as absent and refuse the params.
+    // it, or the bridge would read it as absent and apply the default.
     const params: ContextParams = { ceiling: [] };
     expect(JSON.parse(JSON.stringify(params)).ceiling).toEqual([]);
   });

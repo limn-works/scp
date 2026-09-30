@@ -1656,8 +1656,9 @@ fn build_ucan_context_state(
     // agreement on one canonical form (BLACK-003), and still rejects a
     // no-colon `payments` that would otherwise be widened to `payments:*`.
     //
-    // An empty `user_ceiling` stays empty. `parse_context_params` rejects an
-    // omitted ceiling, so an empty one here is a declared deny-all ceiling that the supervisor installed verbatim on
+    // An empty `user_ceiling` stays empty. `parse_context_params` already
+    // resolved an omitted ceiling to `default_ceiling()`, so an empty one here
+    // is a declared deny-all ceiling that the supervisor installed verbatim on
     // the actor; widening it would let this bridge's mint, delegate and
     // validate checks admit what the actor refuses.
     let mut capabilities = Vec::with_capacity(user_ceiling.len());
@@ -1948,8 +1949,9 @@ pub fn sync_ceiling_from_params(
 /// mailbox send that failed or timed out (a saturated mailbox, or a closed one
 /// because the actor task has terminated and the watchdog has not yet
 /// despawned it), a reply channel the actor dropped, or a reply that missed
-/// the reply timeout — reads as an error, never as `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
-/// `None`; this function calls `Supervisor::read_context_state_checked`, which
+/// the reply timeout — reads as an error, never as `Ok(None)`.
+/// `Supervisor::read_context_state` folds that outcome into `None`; this
+/// function calls `Supervisor::read_context_state_checked`, which
 /// keeps the two outcomes apart.
 ///
 /// # Errors
