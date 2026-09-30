@@ -70,9 +70,12 @@ data class AndroidPlatformAdapterImpl(
  * unavailable or FCM not configured). [make] does neither. It calls the four constructors once,
  * passes no `cloudProjectNumber`, and probes no provider:
  *
- * - [AndroidKeyCustody]'s constructor gets or creates the Keystore master key and opens
- *   EncryptedSharedPreferences, and an exception from either reaches the caller as thrown,
- *   not wrapped in [ScpException].
+ * - [AndroidKeyCustody]'s constructor gets or creates the Keystore master key, opens
+ *   EncryptedSharedPreferences, and restores every persisted software Ed25519 seed from it.
+ *   An exception from any of the three reaches the caller as thrown, not wrapped in
+ *   [ScpException]. The restore decrypts every entry of the file and Base64-decodes each
+ *   seed, so a file the master key no longer decrypts, such as after a backup restore, or a
+ *   seed that is not valid Base64 makes [make] throw.
  * - [AndroidDeviceAttestation] creates its `IntegrityManager` inside each
  *   [AndroidDeviceAttestation.attest] call, so an absent Play Integrity service surfaces at
  *   that call.
