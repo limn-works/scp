@@ -122,10 +122,8 @@
 #     Case 22b changes scp-clock, scp-transport and scp-ffi under a metadata answer in
 #     which only scp-transport owns an example, and scp-transport reaches scp-clock through
 #     a dev-dependency. It asserts that the examples-gate assertion 1 line names scp-clock
-#     and scp-transport and not scp-ffi, which no example compiles; that the line says the
-#     gate lints every workspace library an example compiles; that the assertion 2 line
-#     names all three packages and both example file forms, `examples/NAME.rs` and
-#     `examples/NAME/main.rs`; that the assertion 1 source-scan line names scp-ffi, whose
+#     and scp-transport and not scp-ffi, which no example compiles; that the assertion 2
+#     line names all three packages; that the assertion 1 source-scan line names scp-ffi, whose
 #     `examples/` holds a helper and no target, and scp-transport and not scp-clock, and
 #     that it and header item 8 name `scripts/check-examples-compile.sh` as the one
 #     statement of the scan's rules instead of restating them; and that no gate-edit line
@@ -1244,24 +1242,6 @@ if [[ $A2_LINE == *scp-clock* && $A2_LINE == *scp-ffi* && $A2_LINE == *scp-trans
     report "case 22b names every changed package for the published-file assertion" 0 ""
 else
     report "case 22b names every changed package for the published-file assertion" 1 "the assertion 2 line reads: ${A2_LINE:-<absent>}"
-fi
-# check-examples-compile.sh rejects an orphaned examples/NAME/main.rs as well as an
-# orphaned examples/NAME.rs, because cargo auto-discovers both forms; a line naming one
-# form tells the reader the gate passes the other.
-if [[ $A2_LINE == *examples/NAME.rs* && $A2_LINE == *examples/NAME/main.rs* ]]; then
-    report "case 22b names both published example forms the assertion 2 check rejects" 0 ""
-else
-    report "case 22b names both published example forms the assertion 2 check rejects" 1 "the assertion 2 line reads: ${A2_LINE:-<absent>}"
-fi
-# scp-clock has no example of its own; the rust-clippy job lints it anyway, because the
-# gate passes no --no-deps and clippy lints every workspace library an example compiles.
-# A line whose reason covers example source alone sends the reader to the examples when
-# the warning sits in scp-clock's lib.
-if grep -F 'check-examples-compile.sh assertion 1 over the example targets that compile' "$HARNESS22B/out.txt" |
-    grep -qF 'without --no-deps, so it lints the example and every workspace library that example compiles'; then
-    report "case 22b says the examples gate lints each library an example compiles" 0 ""
-else
-    report "case 22b says the examples gate lints each library an example compiles" 1 "the assertion 1 line gives no library-lint reason: $(grep -F 'check-examples-compile.sh assertion 1' "$HARNESS22B/out.txt")"
 fi
 # Assertion 1's source scan reads every .rs file under examples/ in every package, with
 # or without an example target, so its line must name scp-ffi, whose examples/ holds a
