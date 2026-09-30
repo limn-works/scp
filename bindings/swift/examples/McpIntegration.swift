@@ -62,6 +62,10 @@ struct McpIntegration {
         //   // store, so that server cannot expose it: the example invokes a
         //   // context the server exposes, read from SCP_MCP_SSE_CONTEXT_ID,
         //   // and that context must offer an outlet named `summarize`. An SCP
+        //   // server lists each outlet as `<context_id>/call.<outlet>` or
+        //   // `<context_id>/query.<outlet>` and refuses a bare outlet name in
+        //   // `tools/call`, so the example invokes the name `listTools()` returns;
+        //   // `contextId` on `invoke` feeds only local provenance. An SCP
         //   // SSE server always runs a bearer check (ADR-015), so pass the
         //   // token that server's operator gives you, read here from
         //   // SCP_MCP_SSE_TOKEN. The transport has no TLS, so a token is sent
@@ -76,8 +80,12 @@ struct McpIntegration {
         //       config: .sse(url: "http://127.0.0.1:8080/sse", authToken: sseToken)
         //   )
         //   let outlets = try await client.listTools()
+        //   let summarizeNames = ["\(sseContextId)/call.summarize", "\(sseContextId)/query.summarize"]
+        //   guard let summarize = outlets.first(where: { summarizeNames.contains($0.name) }) else {
+        //       fatalError("context \(sseContextId) offers no `summarize` outlet")
+        //   }
         //   let result = try await client.invoke(
-        //       tool: "summarize",
+        //       tool: summarize.name,
         //       input: Data(#"{"text":"SCP is a protocol for..."}"#.utf8),
         //       contextId: sseContextId,
         //       invokerDid: identity.did()
