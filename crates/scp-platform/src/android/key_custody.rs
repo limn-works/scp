@@ -1,4 +1,4 @@
-//! Re-exports the key custody trait for the Android Keystore adapter.
+//! Re-exports the key custody trait and its types for the Android Keystore adapter.
 //!
 //! The Kotlin class `AndroidKeyCustody` in
 //! `bindings/kotlin/scp-kt-android/.../AndroidKeyCustody.kt` implements the Kotlin
@@ -9,12 +9,15 @@
 //! the Rust engine. Story SCP-110 stays in progress while any acceptance
 //! criterion its description in `.docs/prds/main.json` records as unmet
 //! stands: the trait criterion, the Keystore-attested key-destruction
-//! criterion, and the criteria for the move to P-256, the P-256 pseudonym
+//! criterion, the criteria for the move to P-256, the P-256 pseudonym
 //! keypair and the TEE-generated pseudonym secret, which the shipped Ed25519
-//! and X25519 keys and the signature-derived pseudonym secret fail. That
-//! description also records that neither ADR-027 nor SCP-110 says what the
-//! adapter reports for a Keystore key held outside the TEE, and leaves that
-//! decision to ADR-027. This module documents the Rust-side contract and
+//! and X25519 keys and the signature-derived pseudonym secret fail, and
+//! acceptance criteria 2, 3 and 10. That description records that neither
+//! ADR-027 nor SCP-110 says what the adapter reports for a Keystore key held
+//! outside the TEE, puts that decision to a human through the open question
+//! "Android Keystore key outside the TEE" in
+//! `.docs/specs/00-open-questions.md`, and keeps criteria 2, 3 and 10 unmet
+//! until it is decided. This module documents the Rust-side contract and
 //! re-exports the trait types for Android builds.
 //!
 //! # Key Storage Strategy
