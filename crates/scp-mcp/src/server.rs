@@ -512,7 +512,8 @@ pub struct McpServer<P: ContextProvider> {
     /// it: `tools/list` writes the tools half, `resources/list` the readable
     /// half, and a pump evaluation both halves (see [`Self::record_view`]).
     /// A list response that omits a recorded context, and a broadcast lag,
-    /// set both halves to `None` ([`ContextView::UNKNOWN`]).
+    /// set both halves to `None` ([`ContextView::UNKNOWN`]); a view that
+    /// cannot be read when it is first recorded starts from that record.
     ///
     /// [`Self::notifications_for_event`] sends the `tools/list_changed` +
     /// `resources/list_changed` pair and the `scp://{ctx}/tools` update only
@@ -1306,14 +1307,15 @@ impl<P: ContextProvider> McpServer<P> {
 
     /// Applies [`Self::resource_access`] to a `resources/read` or
     /// `resources/subscribe` request and turns a denial into its JSON-RPC
-    /// error response.
+    /// error response. On success, returns the served contexts the check
+    /// read, so a caller needs no second, separately failing read.
     fn authorize_resource(
         &self,
         uri: &str,
         context_id: &str,
         kind: ResourceKind,
         request_id: &RequestId,
-    ) -> Result<(), Box<JsonRpcResponse>> {
+    ) -> Result<Vec<ContextId>, Box<JsonRpcResponse>> {
         let served = self
             .provider
             .active_context_ids()
@@ -1344,7 +1346,8 @@ impl<P: ContextProvider> McpServer<P> {
                 ResourceDenial::Unreadable(msg) => {
                     Box::new(internal_error(request_id.clone(), &msg))
                 }
-            })
+            })?;
+        Ok(served)
     }
 
     /// Handles `resources/read` -- returns the current state of a resource.
@@ -1426,9 +1429,10 @@ impl<P: ContextProvider> McpServer<P> {
             Err(msg) => return resource_not_found(request.id.clone(), &params.uri, msg),
         };
 
-        if let Err(resp) = self.authorize_resource(&params.uri, &context_id, kind, &request.id) {
-            return *resp;
-        }
+        let served = match self.authorize_resource(&params.uri, &context_id, kind, &request.id) {
+            Ok(served) => served,
+            Err(resp) => return *resp,
+        };
 
         self.subscriptions.insert(params.uri);
         // A successful subscribe tells the client the context is served, as a
@@ -1448,11 +1452,9 @@ impl<P: ContextProvider> McpServer<P> {
         // the context joined the served set, or could not read its view then,
         // so its cached lists lack or misstate the context; recording the
         // current view would make the pump's next event for the context
-        // silent. A failed read records nothing, which makes the next event
-        // notify.
-        if !self.client_listed.load(std::sync::atomic::Ordering::SeqCst)
-            && let Ok(served) = self.provider.active_context_ids()
-        {
+        // silent. A view that cannot be read is recorded as
+        // `ContextView::UNKNOWN`, which makes the next event notify.
+        if !self.client_listed.load(std::sync::atomic::Ordering::SeqCst) {
             self.record_view(&served, &context_id, false, |_| {});
         }
 
@@ -1464,10 +1466,13 @@ impl<P: ContextProvider> McpServer<P> {
 
     /// Handles `resources/unsubscribe` -- cancels a resource subscription.
     ///
-    /// Idempotent: unsubscribing from a URI that is not currently subscribed
-    /// succeeds. The MCP spec defines no distinct "not subscribed" error, and
-    /// a client retrying an unsubscribe after a dropped response must not see
-    /// a spurious failure.
+    /// Idempotent on a server with an event source: unsubscribing from a
+    /// well-formed `scp://` resource URI that is not currently subscribed
+    /// succeeds. A URI that `parse_resource_uri` rejects gets
+    /// `RESOURCE_NOT_FOUND`, and a server with no event source answers every
+    /// unsubscribe with `METHOD_NOT_FOUND`. The MCP spec defines no distinct
+    /// "not subscribed" error, and a client retrying an unsubscribe after a
+    /// dropped response must not see a spurious failure.
     fn handle_resources_unsubscribe(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
         if let Some(resp) = self.reject_if_subscriptions_unwired(request) {
             return resp;
@@ -1615,7 +1620,9 @@ impl<P: ContextProvider> McpServer<P> {
     /// resource, whose only requirement is membership. With no view recorded,
     /// a session whose client has not listed records the current view and
     /// sends nothing, because it holds no list to re-read (see
-    /// [`Self::refresh_view`]).
+    /// [`Self::refresh_view`]). A subscribe in such a session records the
+    /// view, or [`ContextView::UNKNOWN`] when the view cannot be read, so an
+    /// event after it compares against that record.
     ///
     /// # Re-authorization on every emission
     ///
@@ -1815,7 +1822,9 @@ impl<P: ContextProvider> McpServer<P> {
     /// this context, so this first records the provider's current view and
     /// then applies `listed`. A half recorded that way cannot hide a change
     /// from the client, because the client has no cached list of that half.
-    /// When the current view cannot be read, nothing is recorded, and the next
+    /// When the current view cannot be read, [`ContextView::UNKNOWN`] is
+    /// recorded before `listed` applies, so the half this response did not
+    /// carry stays `None`, no current view equals the record, and the next
     /// event notifies.
     ///
     /// When no view is recorded and the client had listed before, every list
@@ -1848,10 +1857,10 @@ impl<P: ContextProvider> McpServer<P> {
         } else if listed_before {
             Some(ContextView::UNKNOWN)
         } else {
-            match self.context_view(served, context_id) {
-                Some(view) => Some(view),
-                None => return,
-            }
+            Some(
+                self.context_view(served, context_id)
+                    .unwrap_or(ContextView::UNKNOWN),
+            )
         };
         let mut views = self
             .client_views
@@ -2138,7 +2147,8 @@ enum ResourceDenial {
 /// resource kinds the agent may read.
 ///
 /// In a recorded view, `None` marks a half the client has not listed since
-/// the context joined its served set. A current view has both halves, so it
+/// the context joined its served set, or a half whose value could not be
+/// read when it was recorded. A current view has both halves, so it
 /// never equals a record with a `None` half, and the next event for the
 /// context sends the list-changed pair.
 #[derive(Debug, Clone, PartialEq)]
@@ -4327,6 +4337,49 @@ mod tests {
                 .is_empty(),
             "the view the client last saw is unchanged, so the next event is silent"
         );
+    }
+
+    /// A subscribe in a session that has not listed, made while the view
+    /// cannot be read, records `ContextView::UNKNOWN`, so the next event
+    /// announces the view the client has never seen: the `scp://{ctx}/tools`
+    /// update and the list-changed pair, whether or not the view reads by
+    /// then. An unchanged view after that is silent.
+    #[test]
+    fn subscribe_without_a_list_while_the_view_is_unreadable_notifies_next_event() {
+        for still_unreadable in [false, true] {
+            let mut server = subscribing_server(MockProvider::default());
+            // The role read fails, so `visible_tools` and the view fail, while
+            // the tools resource, which needs membership only, stays readable.
+            server.provider.unreadable_roles.push("ctx_a".to_owned());
+            subscribe(&mut server, "scp://ctx_a/tools");
+            if !still_unreadable {
+                server.provider.unreadable_roles.clear();
+            }
+
+            let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
+            assert!(
+                list_changed_pair_sent(&notifs),
+                "unreadable={still_unreadable}: the list-changed pair must go out, got: {notifs:?}"
+            );
+            assert!(
+                notifs.iter().any(|n| {
+                    n.method == protocol::METHOD_RESOURCES_UPDATED
+                        && n.params.as_ref().and_then(|p| p.get("uri"))
+                            == Some(&serde_json::json!("scp://ctx_a/tools"))
+                }),
+                "unreadable={still_unreadable}: the subscribed tools resource must be \
+                 announced, got: {notifs:?}"
+            );
+
+            server.provider.unreadable_roles.clear();
+            let _ = server.notifications_for_event("ctx_a", &members_and_tools_event());
+            assert!(
+                server
+                    .notifications_for_event("ctx_a", &members_and_tools_event())
+                    .is_empty(),
+                "unreadable={still_unreadable}: an unchanged view must be silent"
+            );
+        }
     }
 
     fn list_changed_pair_sent(notifs: &[JsonRpcNotification]) -> bool {
