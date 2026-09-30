@@ -164,12 +164,10 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 ///    read from the injected clock. SCP calls openmls's comparison instead of
 ///    keeping its own, so SCP's temporal rule cannot drift from openmls's (a
 ///    hand-written copy went stale when openmls 0.9.0 moved the `not_before`
-///    bound from strict `<` to `<=`). The call compiles on both targets because
-///    `now` is a `web_time::SystemTime`, the type `validate_with_time` takes on
-///    every target: `web_time` re-exports
-///    `std::time::SystemTime` natively and supplies its own type on
-///    `wasm32-unknown-unknown`, where openmls uses it. One call therefore
-///    compiles on both without a cfg branch.
+///    bound from strict `<` to `<=`). No cfg branch is needed because `now` is
+///    a `web_time::SystemTime`, the type `validate_with_time` takes on every
+///    target: `web_time` re-exports `std::time::SystemTime` natively and
+///    supplies its own type on `wasm32-unknown-unknown`, where openmls uses it.
 /// 2. **Maximum range** — enforces the RFC 9420 bound that openmls's own
 ///    `validate` path never applies: `not_after - not_before <=
 ///    KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`. A legitimately-signed `Lifetime`

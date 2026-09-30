@@ -939,8 +939,8 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // leaving `None`, and the taken value is dropped at the end of the
     // statement. This releases:
     //   - MlsGroup: tree secrets, epoch key schedules, ratchet state, zeroized on
-    //     drop: openmls 0.9.0's `Secret`, `AeadKey`, and `HpkePrivateKey` hold a
-    //     `tls_codec::SecretVLBytes`
+    //     drop: openmls 0.9.0's `Secret` and `AeadKey`, and `openmls_traits`
+    //     0.6.0's `HpkePrivateKey`, hold a `tls_codec::SecretVLBytes`
     //   - SignatureKeyPair: Ed25519 private key, zeroized on drop by `SecretVLBytes`
     drop(group.group.take());
     drop(group.signer.take());
