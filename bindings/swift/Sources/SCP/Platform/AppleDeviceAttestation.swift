@@ -164,7 +164,10 @@
     /// `AttestationError.serviceError`. Either way the serializer runs the
     /// next queued call, and a completion handler Apple runs after the call
     /// ended stores no key ID, starts no further App Attest call, and reaches
-    /// no caller. A caller cancelled while queued leaves the queue and never
+    /// no caller. An end that arrives while the adapter stores a key ID or
+    /// hands App Attest a method takes effect when that step returns, so a
+    /// call never starts an App Attest method after it ended. A caller
+    /// cancelled while queued leaves the queue and never
     /// reaches Apple. After a timeout or a cancellation, Apple can still be
     /// working on the abandoned call while the next call runs, so App Attest
     /// can then hold two outstanding calls, and a `generateKey` that ended
@@ -395,9 +398,14 @@
                         call.end(with: .failure(.fromAppAttest(error, call: "generateKey")))
                     } else if let keyId {
                         // A key ID that arrives after the call ended is
-                        // discarded: it is neither stored nor attested.
-                        guard call.whileOpen({ storeKeyId(keyId) }) else { return }
-                        requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                        // discarded: it is neither stored nor attested. The
+                        // store and the `attestKey` call run inside one
+                        // `issue`, so an end that arrives between them takes
+                        // effect after `attestKey` started.
+                        call.issue {
+                            storeKeyId(keyId)
+                            requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                        }
                     } else {
                         call.end(with: .failure(.internalError("generateKey returned neither keyId nor error")))
                     }
@@ -668,20 +676,52 @@
     /// One App Attest call the serializer runs, which ends exactly once.
     ///
     /// Apple's answer, the time limit and the caller's cancellation each try
-    /// to end the call; the first one ends it and resumes its caller, and each
-    /// later one does nothing. A completion handler therefore stores a key ID
-    /// only through `whileOpen(_:)`, which stores nothing once the call ended.
+    /// to end the call; the first one ends it, and each later one does
+    /// nothing. The adapter stores a key ID and hands App Attest a method only
+    /// inside `issue(_:)`, which runs nothing once the call ended. An end that
+    /// arrives while an `issue(_:)` body runs takes effect, and resumes the
+    /// caller, when that body returns, so every key ID a call stores and every
+    /// App Attest method it starts comes before the call ends.
     private final class AppAttestCall: Sendable {
+        /// What ending the call hands its caller.
+        private struct Delivery: Sendable {
+            let waiter: CheckedContinuation<Result<Data, AttestationError>, Never>
+            let timer: Task<Void, Never>?
+            let outcome: Result<Data, AttestationError>
+
+            func perform() {
+                timer?.cancel()
+                waiter.resume(returning: outcome)
+            }
+        }
+
         /// The call's mutable state. `OSAllocatedUnfairLock` guards it, so
         /// the class conforms to `Sendable` with the compiler checking every
         /// access.
         private struct State: Sendable {
-            var ended = false
-            /// The outcome of a call that ended before `run` installed
-            /// `waiter`.
-            var endedEarly: Result<Data, AttestationError>?
+            /// The outcome the first `end(with:)` set; `nil` while the call
+            /// is open.
+            var outcome: Result<Data, AttestationError>?
+            /// Whether the caller has received `outcome`.
+            var delivered = false
+            /// The number of `issue(_:)` bodies running.
+            var issuing = 0
             var waiter: CheckedContinuation<Result<Data, AttestationError>, Never>?
             var timer: Task<Void, Never>?
+
+            /// Take what resumes the caller when the call ended, no
+            /// `issue(_:)` body runs, and `run` installed the caller's
+            /// continuation; otherwise return `nil`.
+            mutating func takeDelivery() -> Delivery? {
+                guard let outcome, !delivered, issuing == 0, let waiter else {
+                    return nil
+                }
+                delivered = true
+                let delivery = Delivery(waiter: waiter, timer: timer, outcome: outcome)
+                self.waiter = nil
+                timer = nil
+                return delivery
+            }
         }
 
         private let state = OSAllocatedUnfairLock(initialState: State())
@@ -703,12 +743,11 @@
         ) async -> Result<Data, AttestationError> {
             await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
-                    let starts: Bool = state.withLock { state in
-                        if let endedEarly = state.endedEarly {
-                            continuation.resume(returning: endedEarly)
+                    let open: Bool = state.withLock { state in
+                        state.waiter = continuation
+                        guard state.outcome == nil else {
                             return false
                         }
-                        state.waiter = continuation
                         state.timer = Task { [self] in
                             do {
                                 try await Task.sleep(for: timeLimit)
@@ -722,8 +761,11 @@
                         }
                         return true
                     }
-                    if starts {
-                        start(self)
+                    // A call that ended before the lock above, or between
+                    // that lock and `issue`, starts nothing; its caller
+                    // receives the outcome here or from `end(with:)`.
+                    if !open || !issue({ start(self) }) {
+                        deliverIfEnded()
                     }
                 }
             } onCancel: {
@@ -731,37 +773,51 @@
             }
         }
 
-        /// End the call with `outcome` and resume its caller, unless the call
-        /// already ended.
+        /// End the call with `outcome`, unless the call already ended. The
+        /// caller resumes now, or when the running `issue(_:)` body returns.
         func end(with outcome: Result<Data, AttestationError>) {
-            let (waiter, timer): (CheckedContinuation<Result<Data, AttestationError>, Never>?, Task<Void, Never>?) =
-                state.withLock { state in
-                    guard !state.ended else {
-                        return (nil, nil)
-                    }
-                    state.ended = true
-                    let taken = (state.waiter, state.timer)
-                    if state.waiter == nil {
-                        state.endedEarly = outcome
-                    }
-                    state.waiter = nil
-                    state.timer = nil
-                    return taken
+            let delivery: Delivery? = state.withLock { state in
+                guard state.outcome == nil else {
+                    return nil
                 }
-            timer?.cancel()
-            waiter?.resume(returning: outcome)
+                state.outcome = outcome
+                return state.takeDelivery()
+            }
+            delivery?.perform()
         }
 
-        /// Run `effect` while holding the call open, and report whether the
-        /// call was still open. Once the call ended, `effect` does not run.
-        func whileOpen(_ effect: @Sendable () -> Void) -> Bool {
-            state.withLock { state in
-                guard !state.ended else {
+        /// Run `body`, which stores a key ID or hands App Attest a method,
+        /// while the call is open, and report whether it ran. Once the call
+        /// ended, `body` does not run. An `end(with:)` that arrives while
+        /// `body` runs takes effect when `body` returns. `body` runs outside
+        /// the lock, so a completion handler that answers inside `body` ends
+        /// the call without taking the lock twice.
+        @discardableResult
+        func issue(_ body: () -> Void) -> Bool {
+            let open: Bool = state.withLock { state in
+                guard state.outcome == nil else {
                     return false
                 }
-                effect()
+                state.issuing += 1
                 return true
             }
+            guard open else {
+                return false
+            }
+            body()
+            let delivery: Delivery? = state.withLock { state in
+                state.issuing -= 1
+                return state.takeDelivery()
+            }
+            delivery?.perform()
+            return true
+        }
+
+        /// Resume the caller when the call ended and the caller has not
+        /// received its outcome.
+        private func deliverIfEnded() {
+            let delivery: Delivery? = state.withLock { $0.takeDelivery() }
+            delivery?.perform()
         }
     }
 
