@@ -28,7 +28,7 @@
 # empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
 # the same on `nestedcomment`, dropping the `include`, `#[path]`, `macro_rules` or
 # `stringify` rule does the same on `include`, `pathmod`, `macrorules` or `stringify`,
-dropping the U+200E and U+200F rule does the same on `lrmcfg`, `lrmcfgmacro` and `rlmpath`,
+# dropping the U+200E and U+200F rule does the same on `lrmcfg`, `lrmcfgmacro` and `rlmpath`,
 # matching `path` only directly after `[` does the same on `rawpath`, and listing `examples/` without
 # following symbolic links does the same on `symlinkmod` and `symlinkdir`, matching only
 # `cfg_attr` in place of every `cfg_` name does the same on `cfgselect`, dropping the
