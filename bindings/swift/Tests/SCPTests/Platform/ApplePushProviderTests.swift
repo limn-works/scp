@@ -101,12 +101,12 @@
             #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))
         }
 
-        @Test("handleNotification accepts the permitted payload with whitespace between its tokens")
-        func handleNotificationAcceptsWhitespaceBetweenTokens() async throws {
-            // JSON whitespace may sit between any two tokens, so the byte
-            // comparison must remove it before comparing.
+        @Test("handleNotification accepts the permitted payload with whitespace outside its string literals")
+        func handleNotificationAcceptsWhitespaceOutsideStringLiterals() async throws {
+            // JSON whitespace may sit before, between, and after the tokens, so
+            // the byte comparison must remove it before comparing.
             let provider = ApplePushProvider()
-            let bytes = Data("{ \"aps\" :\t{\r\n  \"content-available\" : 1\n}\n}".utf8)
+            let bytes = Data("\r\n\t { \"aps\" :\t{\r\n  \"content-available\" : 1\n}\n}\n\t ".utf8)
 
             let signal = try await provider.handleNotification(payload: bytes)
             #expect(signal == Data(#"{"aps":{"content-available":1}}"#.utf8))

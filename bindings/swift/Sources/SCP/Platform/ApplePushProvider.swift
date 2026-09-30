@@ -24,7 +24,7 @@
 //
 // `handleNotification(payload:)` **enforces** this invariant on receipt: a JSON
 // object whose bytes differ from `{"aps":{"content-available":1}}` by anything but
-// whitespace between tokens is rejected with ``PushError/opaquePayloadViolation``.
+// whitespace outside string literals is rejected with ``PushError/opaquePayloadViolation``.
 // ADR-025 criterion 4 names this payload for APNs.
 //
 // ## Token Registration Lifecycle
@@ -259,7 +259,7 @@
         ///     top-level structure is not a dictionary.
         ///   - ``PushError/opaquePayloadViolation(_:)`` if the payload exceeds 4096 bytes,
         ///     or is a JSON object whose bytes differ from `{"aps":{"content-available":1}}`
-        ///     by anything but JSON whitespace between tokens: any other field, a repeated
+        ///     by anything but JSON whitespace outside string literals: any other field, a repeated
         ///     key, or any `content-available` value other than the token `1`.
         public func handleNotification(payload: Data) throws -> Data {
             try validateOpaquePayload(payload)
@@ -330,8 +330,8 @@
         ///
         /// Rules 1 and 3 together decide which payload is accepted: rule 3
         /// decides among payloads of at most 4096 bytes, and rule 1 rejects a
-        /// payload rule 3 would accept when whitespace between its tokens takes
-        /// it past 4096 bytes. Rule 3 reads the received
+        /// payload rule 3 would accept when whitespace outside its string literals
+        /// takes it past 4096 bytes. Rule 3 reads the received
         /// bytes, not the dictionary `JSONSerialization` builds, because
         /// `JSONSerialization` keeps one value for a key the object repeats: a
         /// second `aps` or `content-available` member carrying a context ID
@@ -345,7 +345,7 @@
         /// ``wakeSignal`` holds no backslash, so such a payload never matches.
         ///
         /// Every payload rule 3 accepts is ``wakeSignal`` with whitespace
-        /// between its tokens, which is a JSON object, so rule 2 rejects no
+        /// outside its string literals, which is a JSON object, so rule 2 rejects no
         /// payload rule 3 would accept. Rule 2 decides only which error a
         /// caller receives: ``PushError/invalidPayload(_:)`` for bytes that are
         /// not a JSON object, ``PushError/opaquePayloadViolation(_:)`` for a
@@ -387,7 +387,7 @@
             }
             guard stripped == Self.wakeSignal else {
                 throw PushError.opaquePayloadViolation(
-                    "payload bytes differ from {\"aps\":{\"content-available\":1}} by more than whitespace between tokens"
+                    "payload bytes differ from {\"aps\":{\"content-available\":1}} by more than whitespace outside string literals"
                 )
             }
         }
