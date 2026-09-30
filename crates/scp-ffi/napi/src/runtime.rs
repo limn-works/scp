@@ -1656,9 +1656,8 @@ fn build_ucan_context_state(
     // agreement on one canonical form (BLACK-003), and still rejects a
     // no-colon `payments` that would otherwise be widened to `payments:*`.
     //
-    // An empty `user_ceiling` stays empty. `parse_context_params` already
-    // resolved an omitted ceiling to `default_ceiling()`, so an empty one here
-    // is a declared deny-all ceiling that the supervisor installed verbatim on
+    // An empty `user_ceiling` stays empty. `parse_context_params` rejects an
+    // omitted ceiling, so an empty one here is a declared deny-all ceiling that the supervisor installed verbatim on
     // the actor; widening it would let this bridge's mint, delegate and
     // validate checks admit what the actor refuses.
     let mut capabilities = Vec::with_capacity(user_ceiling.len());
@@ -1891,8 +1890,6 @@ pub async fn sync_role_state_from_manager(
 /// by the joined MLS group's signed context binding. The ceiling entries are
 /// normalized to their enforced UCAN capability-name form (`{resource}:{action}`),
 /// matching the set [`build_ucan_context_state`] builds on the create path.
-/// The `PyO3` reference bridge's `sync_ceiling_from_params` sets only the UCAN
-/// set.
 ///
 /// # Errors
 ///
@@ -1947,10 +1944,11 @@ pub fn sync_ceiling_from_params(
 /// [`require_active_context`] is the gate form: it turns `None` into an error so
 /// a gate never admits an operation on an absent answer.
 ///
-/// An actor the supervisor still holds but this call could not reach — a
-/// mailbox send that timed out against a saturated mailbox, or a wedged actor
-/// that took longer than the reply timeout — reads as an error, never as
-/// `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
+/// An actor the supervisor still holds but this call got no answer from — a
+/// mailbox send that failed or timed out (a saturated mailbox, or a closed one
+/// because the actor task has terminated and the watchdog has not yet
+/// despawned it), a reply channel the actor dropped, or a reply that missed
+/// the reply timeout — reads as an error, never as `Ok(None)`. `Supervisor::read_context_state` folds that outcome into
 /// `None`; this function calls `Supervisor::read_context_state_checked`, which
 /// keeps the two outcomes apart.
 ///
@@ -2156,18 +2154,17 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
 /// tests, and the production test lane (`--features server`) must compile it
 /// out rather than warn that it is unused.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when no supervisor can be attached or when `create_context` rejects
-/// the request: either one is a broken test fixture rather than a condition
-/// under test.
+/// Returns the bridge error when no supervisor is attached or when
+/// `create_context` rejects the request. The calling test fails on either,
+/// because both are a broken fixture rather than a condition under test.
 #[cfg(all(test, feature = "testing"))]
-#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
 pub(crate) async fn create_supervisor_context_for_test(
     bi: &NapiBridgeInstance,
     context_id: &str,
     creator_did: &str,
-) {
+) -> napi::Result<()> {
     init_supervisor_for_test_on(bi);
     let params = scp_core::context::ContextParams {
         ceiling: scp_core::context::roles::default_ceiling()
@@ -2176,7 +2173,7 @@ pub(crate) async fn create_supervisor_context_for_test(
             .collect(),
         ..scp_core::context::ContextParams::default()
     };
-    let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
+    let sup = Arc::clone(supervisor(bi)?);
     sup.create_context(
         context_id.to_owned(),
         params,
@@ -2184,7 +2181,8 @@ pub(crate) async fn create_supervisor_context_for_test(
         None,
     )
     .await
-    .expect("test supervisor context creation must succeed");
+    .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

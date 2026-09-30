@@ -1381,11 +1381,13 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
-            // ADR-049 §10: the supervisor holds an actor for the context, but
-            // the actor did not answer (saturated mailbox or a reply timeout).
+            // ADR-049 §10: the supervisor still held an actor for the context,
+            // but the call got no answer: a full or closed (terminated actor)
+            // mailbox, a dropped reply channel, or a reply timeout.
             // Dedicated SCP-CTX-2130 instead of CTX_2001 so a Swift / Kotlin
-            // caller can retry a busy actor rather than treat it as a
-            // permanent failure.
+            // caller retries with a fresh call, which reads the current state
+            // (possibly SCP-CTX-2135 or SCP-CTX-2134), rather than treat it as
+            // permanent.
             CE::ActorBusy(_) => Self::Context {
                 msg: format!("{e}"),
                 code: codes::CTX_2130.to_owned(),

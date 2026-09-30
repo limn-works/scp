@@ -340,9 +340,9 @@ impl NapiContextHandle {
     /// instance's id. Suitable for testing bridge functions that only need
     /// UCAN state (set up via `ensure_registered`).
     ///
-    /// The handle carries `default_ceiling()`, the ceiling `context_create`
-    /// resolves an omitted declaration to, because `ensure_registered` keeps
-    /// an empty ceiling empty (deny-all).
+    /// The handle carries `default_ceiling()`, because `ensure_registered`
+    /// keeps an empty ceiling empty (deny-all) and a UCAN test needs a ceiling
+    /// that admits the capabilities it mints.
     pub(crate) fn test_active_on(
         bi: &Arc<NapiBridgeInstance>,
         context_id: String,
@@ -570,9 +570,9 @@ struct ParsedContextParams {
 /// `default_ceiling()` rendered as the `{resource}:{action}` capability strings
 /// a `context_create` caller supplies.
 ///
-/// `parse_context_params` carries a caller's vocabulary to the shared
-/// `build_context_params` parser, so a default this bridge substitutes has to
-/// arrive in the same form a caller would have written.
+/// The Welcome-join precheck registers the joiner's FFI state with this
+/// ceiling until the authenticated ceiling replaces it, so the precheck's
+/// state holds the same form a caller would have written.
 fn default_ceiling_strings() -> Vec<String> {
     scp_core::context::roles::default_ceiling()
         .iter()
@@ -602,9 +602,9 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
     })?;
     // Every field below indexes `params` by key, and serde_json's index reads
     // `Null` for any key of a non-object value, so an array, string, number,
-    // bool, or `null` would otherwise build a context from the defaults of
-    // every field, including the full default ceiling, that the caller never
-    // declared.
+    // bool, or `null` would otherwise read as an object that declared no
+    // field at all, and the caller would see a missing-ceiling error that
+    // misnames the mistake.
     if !params.is_object() {
         return Err(NapiError::from(ScpNapiError::Validation {
             message: format!(
@@ -615,24 +615,29 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
     }
 
     let mode_str = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
-    // ceiling: string[] (default: `default_ceiling()`).
+    // ceiling: string[], required.
     //
-    // An absent key and a `null` value both mean "this caller declared no
-    // ceiling", and `default_ceiling`'s own doc comment states that every FFI
-    // bridge applies it "when no explicit ceiling is provided". A supplied
-    // array stands as written, so an empty array declares a ceiling that
-    // grants nothing rather than reading as an absent key, and the supervisor
-    // installs that empty ceiling as the actor's ceiling. The supervisor
-    // installs this vector verbatim, so this substitution is the only place an
-    // omitted declaration receives its default. Any other JSON
-    // type, and any non-string entry inside the array, is a malformed
-    // declaration and rejects, because dropping the entry would hand the
-    // caller a narrower ceiling than the one they wrote and hide the mistake
-    // behind a context that refuses the capability.
-    // `PyContextParams::from_py_dict` rejects the same two shapes through
-    // `extract::<Vec<String>>()`.
+    // The ceiling is the security-critical choice of an explicit context
+    // creation, and `.docs/standards/construction.md` M2 makes it a required
+    // field with no over-broad default ceiling, never reachable by omission.
+    // An absent key and a `null` value therefore reject: substituting
+    // `default_ceiling()` would hand an undeclared context role assignment,
+    // member control, governance and context close. A supplied array stands
+    // as written, so an empty array declares a ceiling that grants nothing,
+    // and the supervisor installs that empty ceiling as the actor's ceiling.
+    // Any other JSON type, and any non-string entry inside the array, is a
+    // malformed declaration and rejects, because dropping the entry would hand
+    // the caller a narrower ceiling than the one they wrote and hide the
+    // mistake behind a context that refuses the capability.
     let ceiling: Vec<String> = match &params["ceiling"] {
-        serde_json::Value::Null => default_ceiling_strings(),
+        serde_json::Value::Null => {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: "ceiling is required: declare the context's capability ceiling as an \
+                          array of capability strings (an empty array grants nothing)"
+                    .to_owned(),
+                code: codes::VALID_7000.to_owned(),
+            }));
+        }
         serde_json::Value::Array(entries) => entries
             .iter()
             .map(|entry| {
@@ -646,9 +651,7 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
             .collect::<napi::Result<Vec<String>>>()?,
         other => {
             return Err(NapiError::from(ScpNapiError::Validation {
-                message: format!(
-                    "ceiling must be an array of capability strings or omitted, got {other}"
-                ),
+                message: format!("ceiling must be an array of capability strings, got {other}"),
                 code: codes::VALID_7000.to_owned(),
             }));
         }
@@ -6772,7 +6775,9 @@ mod tests {
             ("unreachable", codes::CTX_2130),
         ] {
             let ctx_id = format!("napi-gate-{fault}-{}", uuid::Uuid::new_v4());
-            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator).await;
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+                .await
+                .expect("test supervisor context creation must succeed");
             crate::runtime::register_test_context(&bi, &ctx_id, creator);
             let handle = active_handle_for(&bi, &ctx_id, creator);
             match fault {
@@ -6821,15 +6826,6 @@ mod tests {
     // Ceiling: an absent declaration and an empty one are different
     // -------------------------------------------------------------------
 
-    /// The capability names `default_ceiling()` carries, in the form a
-    /// `context_create` caller writes them.
-    fn default_ceiling_names() -> std::collections::HashSet<String> {
-        scp_core::context::roles::default_ceiling()
-            .iter()
-            .map(|cap| cap.name().into_owned())
-            .collect()
-    }
-
     /// The capability names a parsed ceiling carries.
     fn parsed_ceiling_names(params_json: &str) -> std::collections::HashSet<String> {
         super::parse_context_params(params_json)
@@ -6841,25 +6837,34 @@ mod tests {
             .collect()
     }
 
-    /// An absent `ceiling` key resolves to `default_ceiling()`.
+    /// An absent `ceiling` key rejects instead of resolving to a default.
     ///
-    /// `default_ceiling`'s doc comment says every FFI bridge applies it "when
-    /// no explicit ceiling is provided". Before this test existed the parser
-    /// read an absent key as an empty vector, and the supervisor installed
-    /// that empty vector verbatim as the actor's ceiling.
+    /// `.docs/standards/construction.md` M2 makes the ceiling a required
+    /// field of an explicit context creation, so omitting it must never reach
+    /// `default_ceiling()` (role assignment, member control, governance,
+    /// context close) or any other ceiling.
     #[test]
-    fn parse_context_params_resolves_an_absent_ceiling_to_default_ceiling() {
-        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted"}"#);
-        assert_eq!(actual.len(), 11, "default_ceiling() carries 11 entries");
-        assert_eq!(actual, default_ceiling_names());
+    fn parse_context_params_rejects_an_absent_ceiling() {
+        let err = super::parse_context_params(r#"{"mode":"Encrypted"}"#)
+            .err()
+            .expect("an absent ceiling must not parse");
+        assert!(
+            err.to_string().contains("ceiling is required"),
+            "parser reported: {err}"
+        );
     }
 
     /// A `ceiling` key holding `null` declares no ceiling, the same as an
-    /// absent key.
+    /// absent key, and rejects the same way.
     #[test]
-    fn parse_context_params_resolves_a_null_ceiling_to_default_ceiling() {
-        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted","ceiling":null}"#);
-        assert_eq!(actual, default_ceiling_names());
+    fn parse_context_params_rejects_a_null_ceiling() {
+        let err = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":null}"#)
+            .err()
+            .expect("a null ceiling must not parse");
+        assert!(
+            err.to_string().contains("ceiling is required"),
+            "parser reported: {err}"
+        );
     }
 
     /// An empty `ceiling` array stands as written: a deny-all context.
@@ -6919,13 +6924,13 @@ mod tests {
     }
 
     /// A top-level `params_json` that is not a JSON object rejects with
-    /// `SCP-VALID-7000` instead of building a context from every field's
-    /// default, while an empty object parses to those defaults.
+    /// `SCP-VALID-7000` at the object check, while an object that declares
+    /// only a ceiling parses.
     ///
     /// `serde_json`'s index reads `Null` for every key of a non-object value, so
     /// without the object check an array, a double-encoded string, a number, a
-    /// bool, or `null` would create an Encrypted context with the full default
-    /// ceiling.
+    /// bool, or `null` would read as an object that declared nothing and fail
+    /// on the missing ceiling instead.
     #[test]
     fn parse_context_params_rejects_a_non_object_params_json() {
         for params_json in [
@@ -6950,7 +6955,10 @@ mod tests {
                 err.reason
             );
         }
-        assert_eq!(parsed_ceiling_names("{}"), default_ceiling_names());
+        assert_eq!(
+            parsed_ceiling_names(r#"{"ceiling":["messages:write"]}"#),
+            std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
+        );
     }
 
     /// A rejected direct-execute leaves context membership/role state unchanged

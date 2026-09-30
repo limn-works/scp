@@ -545,11 +545,15 @@ pub enum ContextError {
         attempts: u32,
     },
 
-    /// A caller-side mailbox send exceeded the 30-second per-command
-    /// backpressure deadline (ADR-049 §"Mailbox parameters"). The target
-    /// [`ContextActor`](https://example.invalid) is draining slowly or
-    /// backed up; the caller's command was never delivered to the actor
-    /// and may be retried. Distinct from
+    /// A registered context actor gave the caller no answer (ADR-049 §10).
+    ///
+    /// The mailbox send failed or exceeded the 30-second per-command
+    /// backpressure deadline (ADR-049 §"Mailbox parameters"), which covers a
+    /// backed-up mailbox and a closed one whose actor task has terminated,
+    /// or the actor dropped the reply channel, or the reply missed the reply
+    /// timeout. A retry is a fresh call that reads the context's current
+    /// state; it can meet a respawning or poisoned context rather than a live
+    /// actor. Distinct from
     /// [`Self::RateLimited`], which rejects pre-mailbox on capability
     /// grounds.
     ///
