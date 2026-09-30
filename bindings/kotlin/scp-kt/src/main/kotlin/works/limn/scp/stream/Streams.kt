@@ -594,11 +594,13 @@ private class SubscriptionSlot(
  *
  * 1. It takes the bindings and [ioDispatcher] as parameters instead of reading them from a
  *    [works.limn.scp.bridge.CoroutineBridge].
- * 2. It sets an [AtomicBoolean] as the first statement of the producer's `finally`, which
- *    runs after the channel has closed, and skips [trySend] for a message the engine delivers
- *    from then on. A message the engine delivers between the channel closing and that
- *    `finally` still reaches [trySend], which fails on the closed channel, and the callback
- *    ignores that failure.
+ * 2. It sets an [AtomicBoolean] as the first statement of the producer's `finally`, and skips
+ *    [trySend] for a message the engine delivers from then on. That `finally` runs when the
+ *    producer leaves its `try` block: after the channel closed and `awaitClose()` returned, or
+ *    with the channel still open when an exception ended the block (the subscribe call threw,
+ *    or the collector was cancelled). A message the engine delivers before the flag is set
+ *    still reaches [trySend]; on a closed channel [trySend] fails and the callback ignores that
+ *    failure.
  *    [works.limn.scp.bridge.ContextBridge.subscribe] has no such flag, so it calls [trySend]
  *    for every late message and ignores the failure the same way.
  * 3. It logs a failed release to the [COLD_MESSAGE_FLOW_LOGGER] logger.
