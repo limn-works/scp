@@ -4589,9 +4589,10 @@ impl Supervisor {
             if self.actors.contains_key(&ctx_id_str) {
                 // Losing duplicate birth: this `state` never becomes a live
                 // actor, so dispose its seeded crypto (#2148 F6) — `destroy_group`
-                // eagerly frees the group (the OpenMLS signer zeroizes on drop).
-                // `state` drops on the very next line regardless, so this is
-                // defense-in-depth, matching
+                // releases the group (the OpenMLS signer zeroizes on drop).
+                // `state` drops on the very next line, so the call is equivalent
+                // to that drop (issue #2594, deleting dispose_secrets calls that
+                // precede a drop), matching
                 // the close-seam teardown. A no-op for a broadcast /
                 // never-seeded state.
                 // #2199: rollback path — no attestation is built here, so discard
@@ -14350,7 +14351,8 @@ impl Supervisor {
                     //    releases the same material eagerly (the `SenderKey` zeroizes on
                     //    its own drop).
                     //    On this branch `owned` drops immediately after, so the dispose is
-                    //    defense-in-depth / forward-compat. Nothing is provider-resident
+                    //    equivalent to that drop (issue #2594, deleting dispose_secrets
+                    //    calls that precede a drop). Nothing is provider-resident
                     //    and no durable snapshot exists yet, so there is nothing else to
                     //    tear down.
                     let mut state = match Self::build_welcome_joiner_state(
@@ -14401,7 +14403,8 @@ impl Supervisor {
                     //     `dispose_secrets` (`destroy_group`) eagerly frees the group NOW;
                     //     the signer zeroizes on drop — same as the bare drop
                     //     that follows this early return (the `SenderKey` zeroizes on its
-                    //     own drop), so this is defense-in-depth. Nothing is persisted or
+                    //     own drop), so the call is equivalent to that drop (issue #2594,
+                    //     deleting dispose_secrets calls that precede a drop). Nothing is persisted or
                     //     registered yet.
                     if let Err(e) =
                         handle.transition_to(&scp_protocol::context::ContextState::Active)
@@ -14429,7 +14432,9 @@ impl Supervisor {
                     //     `state` owns the born crypto. `dispose_secrets` (`destroy_group`)
                     //     eagerly frees the group NOW; the signer zeroizes on drop — same
                     //     as the bare drop that follows this early return (the
-                    //     `SenderKey` zeroizes on its own drop), so this is defense-in-depth.
+                    //     `SenderKey` zeroizes on its own drop), so the call is equivalent to
+                    //     that drop (issue #2594, deleting dispose_secrets calls that precede
+                    //     a drop).
                     //     Nothing has been persisted yet, so there is no durable snapshot to
                     //     delete (strictly cleaner than persist-then-delete, same
                     //     fail-closed guarantee).
@@ -14489,9 +14494,9 @@ impl Supervisor {
                     //    so a crash after this point rehydrates a fully-keyed context. A
                     //    persist failure deletes any partial durable snapshot and returns
                     //    `Err`; before the early return, dispose the seeded `state`'s
-                    //    crypto (#2148 F6) — `destroy_group` eagerly frees the group (the
-                    //    OpenMLS signer zeroizes on drop; same as the bare drop
-                    //    that follows) — never a live half-keyed actor and never an
+                    //    crypto (#2148 F6) — the call is equivalent to the bare drop that
+                    //    follows (issue #2594, deleting dispose_secrets calls that precede
+                    //    a drop) — never a live half-keyed actor and never an
                     //    orphaned/clobbered durable snapshot.
                     if let Err(e) = crate::context::messaging_helpers::persist_state_fail_closed(
                         &state,

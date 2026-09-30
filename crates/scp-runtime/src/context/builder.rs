@@ -706,9 +706,10 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 // material is disposed on the rollback branch (`OwnedMlsCryptoState::dispose_secrets`,
 // F6) — a bare drop FREES the group's in-memory OpenMLS storage and zeroizes
 // the Ed25519 signer (OpenMLS `SignatureKeyPair` holds its private key in
-// `SecretVLBytes`). `destroy_group` releases the same material eagerly; on this
-// rollback branch the owner drops immediately after, so the explicit dispose is
-// defense-in-depth. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
+// `SecretVLBytes`). `destroy_group` releases the same material; on this rollback
+// branch the owner drops immediately after, so the explicit dispose is
+// equivalent to that drop (issue #2594, deleting dispose_secrets calls that
+// precede a drop). The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
 // Only the event log retains a provider-resident rollback handle.
 
 /// Opaque handle representing ownership of a created event log.
@@ -774,7 +775,8 @@ impl CreationReceipt {
     /// rollback branch (`dispose_secrets` eagerly frees the group via
     /// `destroy_group` — the signer and the `SenderKey` zeroize on drop). On
     /// this branch the owner drops immediately after, so the dispose is
-    /// defense-in-depth. Only the event
+    /// equivalent to that drop (issue #2594, deleting `dispose_secrets` calls
+    /// that precede a drop). Only the event
     /// log + publication are reversed here.
     pub async fn rollback(
         &self,
@@ -1008,10 +1010,11 @@ pub async fn create_context(
 
     // Step 4: Initialise event log.
     if let Err(e) = event_log_provider.init_event_log(&id_bytes).await {
-        // Eagerly free the born-but-never-seeded crypto's OpenMLS
-        // group (`destroy_group`) before `owned` drops on this rollback. A bare
-        // drop already frees the in-memory group storage and zeroizes the
-        // signer — so this explicit dispose is defense-in-depth. `SenderKey`
+        // Dispose the born-but-never-seeded crypto's OpenMLS group
+        // (`destroy_group`) before `owned` drops on this rollback. A bare drop
+        // already wipes the in-memory group storage and zeroizes the signer, so
+        // this explicit dispose is equivalent to that drop (issue #2594,
+        // deleting dispose_secrets calls that precede a drop). `SenderKey`
         // zeroizes on its own drop.
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
@@ -1046,8 +1049,9 @@ pub async fn create_context(
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active) {
-        // Eagerly free the born-but-never-seeded crypto (the signer
-        // zeroizes on drop) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop (issue #2594, deleting
+        // dispose_secrets calls that precede a drop).
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
@@ -1070,8 +1074,9 @@ pub async fn create_context(
         )
         .await
     {
-        // Eagerly free the born-but-never-seeded crypto (the signer
-        // zeroizes on drop) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop (issue #2594, deleting
+        // dispose_secrets calls that precede a drop).
         // The handle is Active but `owned_crypto` is still live (returned to the
         // caller on success at step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {
@@ -1108,8 +1113,9 @@ pub async fn create_context(
         )
         .await
     {
-        // Eagerly free the born-but-never-seeded crypto (the signer
-        // zeroizes on drop) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop (issue #2594, deleting
+        // dispose_secrets calls that precede a drop).
         // `owned_crypto` is still live (returned to the caller on success at
         // step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {
@@ -1184,8 +1190,9 @@ pub async fn create_context(
     }
     .await;
     if let Err(e) = genesis_outlet_leaves {
-        // Eagerly free the born-but-never-seeded crypto (the signer
-        // zeroizes on drop) before it drops on this rollback.
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop (issue #2594, deleting
+        // dispose_secrets calls that precede a drop).
         // `owned_crypto` is still live (returned to the caller on success at
         // step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {

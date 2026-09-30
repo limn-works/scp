@@ -382,13 +382,16 @@ impl OwnedMlsCryptoState {
         }
     }
 
-    /// Best-effort teardown of a born-but-never-seeded payload's secrets on a
+    /// Teardown of a born-but-never-seeded payload's secrets on a
     /// creation-rollback path (#2148 F6). A bare drop zeroizes every value in
     /// the group's in-memory `OpenMLS` provider storage (`scp_mls::InMemoryMlsProvider`
     /// wipes on drop); the Ed25519 signer zeroizes on drop (`OpenMLS` `SignatureKeyPair` holds its
     /// private key in `SecretVLBytes`), and [`scp_mls::group::destroy_group`]
-    /// drops it eagerly. The
+    /// drops both. The
     /// [`SenderKey`] zeroizes on its own `ZeroizeOnDrop` when the payload drops.
+    /// Every caller drops the payload right after this call, so the call is
+    /// equivalent to that drop (issue #2594, deleting `dispose_secrets` calls
+    /// that precede a drop).
     pub(crate) fn dispose_secrets(&mut self) {
         let _ = scp_mls::group::destroy_group(&mut self.mls_group);
     }
