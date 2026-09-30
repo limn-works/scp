@@ -10,7 +10,7 @@
 //! validation time. Under the `openmls` `js` feature (the wasm build) that
 //! `SystemTime` is `web_time::SystemTime` (openmls 0.9.0), which reads a *live,
 //! un-captured* `Date.now()` — a **second, unhardened clock**, distinct from the
-//! SCP-layer hardened [`Clock`](scp_clock::Clock) injected through the rest of
+//! SCP-layer hardened [`Clock`] injected through the rest of
 //! the client, and fully attacker-overridable in-tab. Left as-is, a hostile
 //! same-origin script can mint or accept `KeyPackage`s with forged `Lifetime`s
 //! (expiry / `not_before` manipulation). This does not break MLS
@@ -29,11 +29,11 @@
 //! `Lifetime::validate_with_time(now)`, new in 0.9.0. This module:
 //!
 //! - **Mints** every `Lifetime` SCP generates via [`key_package_lifetime`],
-//!   which reads the injected [`Clock`](scp_clock::Clock) and calls
+//!   which reads the injected [`Clock`] and calls
 //!   `Lifetime::init` with bounds derived from it (never the openmls default).
 //! - **Validates** every `Lifetime` SCP accepts via
 //!   [`validate_key_package_lifetime`], which runs `validate_with_time` with a
-//!   `now` built from the injected [`Clock`](scp_clock::Clock) wherever openmls exposes
+//!   `now` built from the injected [`Clock`] wherever openmls exposes
 //!   the accepted `Lifetime` (post-`validate` on `KeyPackageIn`, pre-merge on
 //!   staged-commit Add proposals, and on Welcome tree leaves post-`into_group`
 //!   and pre-adoption), and additionally enforces the RFC 9420
@@ -88,7 +88,7 @@
 //!
 //! Because openmls's un-injectable internal `validate`/`Lifetime::new` still
 //! runs against the **real** system clock at every openmls validation/generation
-//! site (every one except a Welcome's tree leaves), an injected [`Clock`](scp_clock::Clock) used in a test must sit within
+//! site (every one except a Welcome's tree leaves), an injected [`Clock`] used in a test must sit within
 //! `(real_now - KEY_PACKAGE_LIFETIME_SECS, real_now + KEY_PACKAGE_LIFETIME_MARGIN_SECS)`
 //! of the real clock — otherwise a `KeyPackage` minted from the injected clock is
 //! rejected by openmls's *own* internal validation before this module's check
@@ -108,7 +108,7 @@ use crate::error::MlsError;
 /// Mirrors openmls's private `DEFAULT_KEY_PACKAGE_LIFETIME_SECONDS`
 /// (`60 * 60 * 24 * 28 * 3`). Kept in sync deliberately so an SCP-minted
 /// `Lifetime` matches the shape openmls's own default would have produced,
-/// only sourced from the injected [`Clock`](scp_clock::Clock) instead of
+/// only sourced from the injected [`Clock`] instead of
 /// openmls's internal one.
 pub const KEY_PACKAGE_LIFETIME_SECS: u64 = 60 * 60 * 24 * 28 * 3;
 
@@ -133,7 +133,7 @@ pub const KEY_PACKAGE_LIFETIME_MARGIN_SECS: u64 = 60 * 60;
 pub const KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS: u64 =
     KEY_PACKAGE_LIFETIME_MARGIN_SECS + KEY_PACKAGE_LIFETIME_SECS;
 
-/// Mints a `KeyPackage` [`Lifetime`] from the injected [`Clock`](scp_clock::Clock).
+/// Mints a `KeyPackage` [`Lifetime`] from the injected [`Clock`].
 ///
 /// Reads `now` from the hardened clock and constructs the `Lifetime` via
 /// [`Lifetime::init`](openmls::prelude::Lifetime) — the pure constructor that
@@ -154,7 +154,7 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 }
 
 /// Validates a `KeyPackage` [`Lifetime`] against the injected
-/// [`Clock`](scp_clock::Clock).
+/// [`Clock`].
 ///
 /// This is SCP's hardened counterpart to openmls's `Lifetime::validate`, which
 /// reads openmls's un-injectable internal clock. It performs two checks:
@@ -217,7 +217,7 @@ pub fn validate_key_package_lifetime(
 }
 
 /// Validates the `Lifetime` of every KeyPackage-sourced leaf in a joined
-/// group's tree against the injected [`Clock`](scp_clock::Clock), through
+/// group's tree against the injected [`Clock`], through
 /// [`validate_key_package_lifetime`] (ADR-057 §Prereq-1).
 ///
 /// `MlsGroup::treesync().full_leaves()` (openmls 0.9.0

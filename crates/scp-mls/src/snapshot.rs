@@ -18,7 +18,7 @@
 //!
 //! # Security — this blob contains raw private key material
 //!
-//! [`MlsGroupSnapshot`] carries the Ed25519 signer private key and the `OpenMLS`
+//! `MlsGroupSnapshot` carries the Ed25519 signer private key and the `OpenMLS`
 //! `MemoryStorage` dump (which includes MLS epoch secrets and HPKE private
 //! keys). It is NOT self-encrypting: the `Storage` backend that persists it MUST
 //! provide encryption at rest (§17.5, and the ADR-057 tab-boundary consequence —

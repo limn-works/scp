@@ -414,7 +414,7 @@ pub fn create_group_with_wrapping_key(
 ///   into the MLS key schedule and read back identically by every member
 ///   (spec §5.13.3, finding FFI-02).
 ///
-/// Members' [`Capabilities`](openmls::prelude::Capabilities) declare both
+/// Members' [`Capabilities`] declare both
 /// extension types via
 /// [`scp_capabilities_with_context_params`](crate::context_extension::scp_capabilities_with_context_params).
 /// A joiner must present a `KeyPackage` from
@@ -667,7 +667,7 @@ pub fn add_member(
 ///
 /// Identical to [`add_member`] except it sets the group's ephemeral AAD to the
 /// 13-byte convergent-timestamp blob
-/// ([`encode_convergent_timestamp_aad`](crate::convergent_timestamp::encode_convergent_timestamp_aad))
+/// ([`encode_convergent_timestamp_aad`])
 /// immediately before delegating. openmls folds that AAD into the Commit's
 /// `FramedContent.authenticated_data`, which is covered by the committer's leaf
 /// signature (and, under the `PURE_CIPHERTEXT` policy, the AEAD tag), so an
