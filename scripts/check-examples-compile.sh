@@ -74,14 +74,26 @@
 #     running this gate, as `rustc --print cfg` reports it. A false platform predicate
 #     removes code as a feature key does: `#[cfg(not(unix))]` on the Linux CI runner.
 #     An empty `any()` or `all()` fails too.
-#   - `cfg_attr`, `#[path]`, `include` and `macro_rules`. `cfg_attr` can carry a `path`
-#     key, `#[path]` and `include!` bring in a file the scan never opens, and a local macro
-#     can build a `cfg` attribute from an ident or drop its input tokens. No example in the
-#     workspace uses any of the four.
+#   - Any identifier that starts with `cfg_`, and `#[path]`, `include` and `macro_rules`.
+#     The `cfg_` rule covers `cfg_attr`, which can carry a `path` key, and std's stable
+#     `cfg_select!`, which keeps only the arm whose predicate holds, so a body under
+#     `feature = "testing" => { ... }` beside an empty `_` arm compiles to nothing; it
+#     rejects every other `cfg_` name too, `cfg_if!` included, so a new macro of that
+#     family fails instead of passing. `#[path]` and `include!` bring in a file the scan
+#     never opens, and a local macro can build a `cfg` attribute from an ident or drop its
+#     input tokens.
+#   - The identifier `test`, `bench` or `test_case`, wherever it stands. The lint build
+#     is not a `--test` build, so rustc deletes a `#[test]` item before name resolution,
+#     and a body in `#[test] fn body()` beside an empty `fn main()` is never type-checked.
+#     The attribute also works path-qualified (`#[core::prelude::v1::test]`, and
+#     `#[tokio::test]` expands to it) and renamed (`use core::prelude::v1::test as t;`
+#     then `#[t]`), so the rule matches the name, not the attribute form; a function or
+#     variable named `test` fails too. No example in the workspace uses a construct that
+#     this item or the one before it names.
 #   - A block comment or string literal the scan cannot close. Block comments nest, as
 #     rustc reads them, and an unclosed one fails the scan instead of desynchronizing it.
 # String literals and comments are blanked first, so neither hides a predicate from the
-# scan nor fakes one into it. Cases `cfgbody` to `macrorules` pin this, and case
+# scan nor fakes one into it. Cases `cfgbody` to `testalias` pin this, and case
 # `platformcfg` pins what passes.
 #
 # RESIDUAL LIMITS. These are the bypasses known to the gate's authors, not a proof that
@@ -129,7 +141,8 @@ print "unbalanced string literal\n" if s/"\d+"//gr =~ /"/;
 print "include!\n" if /\binclude\b/;
 print "macro_rules!\n" if /\bmacro_rules\b/;
 print "#[path]\n" if /#\s*!?\s*\[\s*path\b/;
-print "cfg_attr\n" if /\bcfg_attr\b/;
+print "$1\n" while /\b(cfg_\w+)/g;
+print "test-attribute name $1\n" while /\b(test|bench|test_case)\b/g;
 sub ev {
   my $t = shift; my $k = shift @$t;
   return undef unless defined $k && $k =~ /^[A-Za-z_]/;

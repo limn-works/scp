@@ -48,8 +48,14 @@ of them reopens a bypass this repository has already measured:
    `cfg(` or `cfg!(` predicate that names anything but `not`, `any`, `all`, `unix`,
    `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
    `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
-   gate (row 9b), and on `cfg_attr`, `#[path]`, `include` and `macro_rules`, and on a block
-   comment or string literal it cannot close.
+   gate (row 9b). It fails on any identifier that starts with `cfg_`, which covers
+   `cfg_attr` and std's stable `cfg_select!` (it keeps only the arm whose predicate holds,
+   and its predicates are not `cfg(` calls), and on `#[path]`, `include` and
+   `macro_rules`. It fails on the identifier `test`, `bench` or `test_case` wherever it
+   stands: the lint call is not a `--test` build, so rustc deletes a `#[test]` item before
+   name resolution and a body in `#[test] fn body()` beside an empty `fn main()` is never
+   type-checked, and the attribute also works path-qualified and renamed through `use`, so
+   the rule matches the name rather than the attribute form. It fails on a block comment or string literal it cannot close.
 
 Row 8 is answered by none of them, and deliberately so. Three kinds of bypass are known to
 remain: the dev-dependency closure (row 4b), code outside `examples/` that an example calls
@@ -80,8 +86,10 @@ mechanisms listed above, and row 6c by reading with `while IFS= read -r` instead
 word-splitting. Row 9a was measured with mechanism 7 removed: the gate compiled the
 feature-gated fixture of case `cfgbody` and exited 0.
 
-Row 9b is closed by mechanism 7, and the case suite's `falsecfg`, `emptyany`,
-`nestedcomment`, `include`, `pathmod` and `macrorules` cases each fail on one of its routes.
+Row 9b is closed by mechanism 7 for every route in its row, and the case suite's
+`falsecfg`, `emptyany`, `nestedcomment`, `include`, `pathmod`, `macrorules`, `cfgselect`,
+`testattr`, `testpath` and `testalias` cases each fail on one of those routes. The row lists the routes
+reviewers have found, not a proof that no other exists.
 Row 9c is open, and no human has ruled it acceptable. Mechanism 7 reads example sources
 only, so a lib item compiled only under a feature key beside an empty default twin, or a lib
 or dependency macro that drops or feature-gates its input, removes code the scan never
@@ -127,7 +135,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
 | 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
 | 9a | example body under `#[cfg(feature = "testing")] fn main()` beside an empty `#[cfg(not(feature = "testing"))] fn main() {}` | the compile saw only the empty `main` and counted the target as checked |
-| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]`, a local `macro_rules!` that builds the `cfg` attribute | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
+| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]`, a local `macro_rules!` that builds the `cfg` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
 | 9c | a lib item under a feature key beside an empty default twin, a lib or dependency macro that drops or feature-gates its input | open, unmeasured: the code sits outside `examples/`, which is all mechanism 7 reads |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both
@@ -342,9 +350,11 @@ Run the widened invocation before adopting it.
 The script header states this in full; it is the text an editor of the gate reads.
 In short: cargo builds an example as a dev target and gives it the crate's
 dev-dependencies, and no invocation inside the workspace switches that off, so the check
-proves that every example target compiles in this workspace and proves neither that an example
-compiles for someone who installs the crate nor anything about which constructs it
-names. `DhtMode::Memory` was caught only because it sits behind `scp-node`'s OWN
+proves that every example target compiles in this workspace, and that no example source
+holds a construct mechanism 7 rejects. It does not prove that an example compiles for
+someone who installs the crate, and it does not prove that an example avoids a test-only
+item: an unconditional call to one compiles here when a dev-dependency turns on the
+feature that defines it. `DhtMode::Memory` was caught only because it sits behind `scp-node`'s OWN
 `testing` feature, which scp-node's dev-dependencies do not enable.
 
 One correction worth keeping: `scp-transport` has no `testing` feature of its own.

@@ -23,14 +23,18 @@
 # makes the gate exit 1 on `spaced`, which expects exit 0. Ending the package loop after its
 # first package makes the gate exit 0 on `secondbroken` and `secondorphan`, which expect exit 1.
 # Dropping the source scan makes the gate exit 0 on every case from `cfgbody` to
-# `macrorules`, which expect exit 1: each fixture compiles on default features. Accepting a
+# `testalias`, which expect exit 1: each fixture compiles on default features. Accepting a
 # platform predicate false on the host makes the gate exit 0 on `falsecfg`, accepting an
 # empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
 # the same on `nestedcomment`, dropping the `include`, `#[path]` or `macro_rules` rule
 # does the same on `include`, `pathmod` or `macrorules`, and listing `examples/` without
-# following symbolic links does the same on `symlinkmod` and `symlinkdir`. Scanning string literals or
-# comments, rejecting a platform predicate true on the host, or rejecting `include_str!`
-# makes the gate exit 1 on `platformcfg`, which expects exit 0.
+# following symbolic links does the same on `symlinkmod` and `symlinkdir`, matching only
+# `cfg_attr` in place of every `cfg_` name does the same on `cfgselect`, dropping the
+# test-name rule does the same on `testattr`, `testpath` and `testalias`, and matching only
+# the attribute form `#[...test]` in place of the name does the same on `testalias`.
+# Scanning string literals or comments, rejecting a platform predicate true on the host,
+# rejecting `include_str!`, or rejecting an identifier that merely starts with `test` or
+# `bench` makes the gate exit 1 on `platformcfg`, which expects exit 0.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -222,6 +226,30 @@ printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo
 printf 'macro_rules! gate {\n    ($k:ident) => {\n        #[$k(feature = "testing")]\n        fn main() { demo::t(); }\n        #[$k(not(feature = "testing"))]\n        fn main() {}\n    };\n}\ngate!(cfg);\n' > "$ws/demo/examples/good.rs"
 expect "cfg attribute built by a local macro" "$ws" 1 "      macro_rules!"
 
+# std's stable `cfg_select!` keeps only the arm whose predicate holds, and its predicates
+# are not `cfg(` calls, so a scan that matched only `cfg(` would pass this file.
+ws="$(new_ws cfgselect $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf 'cfg_select! {\n    feature = "testing" => { fn main() { demo::t(); } }\n    _ => { fn main() {} }\n}\n' > "$ws/demo/examples/good.rs"
+expect "example body behind a cfg_select! arm" "$ws" 1 "      cfg_select"
+
+# A non-`--test` build deletes a `#[test]` item before name resolution, so the body below
+# names an item that does not exist on default features and the compile still exits 0.
+ws="$(new_ws testattr $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf 'fn main() {}\n#[test]\nfn body() { demo::t(); }\n' > "$ws/demo/examples/good.rs"
+expect "example body in a #[test] function" "$ws" 1 "      test-attribute name test"
+
+ws="$(new_ws testpath $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf 'fn main() {}\n#[core::prelude::v1::test]\nfn body() { demo::t(); }\n' > "$ws/demo/examples/good.rs"
+expect "example body in a path-qualified test function" "$ws" 1 "      test-attribute name test"
+
+ws="$(new_ws testalias $'[features]\ntesting = []')"
+printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+printf 'use core::prelude::v1::test as check;\nfn main() {}\n#[check]\nfn body() { demo::t(); }\n' > "$ws/demo/examples/good.rs"
+expect "example body in a test function under a renamed attribute" "$ws" 1 "      test-attribute name test"
+
 ws="$(new_ws platformcfg)"
 cat > "$ws/demo/examples/good.rs" <<'RS'
 // #[cfg(feature = "testing")] in a comment is not a predicate.
@@ -239,7 +267,14 @@ fn main() {
     }
     let _ = cfg!(all(target_family = "unix", not(windows)));
     let _ = (include_str!("good.rs"), r#"cfg(windows) "include" macro_rules"#);
+    let _ = ("cfg_select! { _ => {} } #[test]", tested(), testing(), benches());
 }
+// cfg_if! and #[bench] in a comment are not constructs either.
+#[inline]
+fn tested() -> u8 { 0 }
+#[must_use]
+fn testing() -> u8 { 0 }
+fn benches() -> u8 { 0 }
 RS
 expect "platform predicates true on the host, and scan text in strings and comments" "$ws" 0 "OK: 1 example target(s) compile"
 
