@@ -43,7 +43,7 @@ sentence it replaced:
     runtime effect.
 - `docs/guides/relay-operations.md`:
   - the modes sentence, which counted three modes; the Identity and Use case cells of the
-    full-node row and the Flag cell of the ephemeral row in the modes table; and the
+    full-node row and the Mode cell of the ephemeral row in the modes table; and the
     comments on the full-node and ephemeral commands below it, which presented both as
     commands that run;
   - the `SCP_NODE_DHT_MODE` row, which offered `memory`, a value a shipped binary rejects,
