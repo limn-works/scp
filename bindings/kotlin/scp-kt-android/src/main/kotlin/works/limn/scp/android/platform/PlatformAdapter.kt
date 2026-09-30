@@ -60,6 +60,22 @@ data class AndroidPlatformAdapterImpl(
  *   `FirebaseMessaging.getInstance()`, and the caller initialises Firebase.
  * - [AndroidStorage] requires context for the database file path and the SQLCipher open helper.
  *
+ * ## Divergence from ADR-027 acceptance criterion 12
+ *
+ * The criterion requires [make] to construct [AndroidDeviceAttestation] for each call with the
+ * `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry, and to throw
+ * [ScpException] when any provider fails to initialize (for example, Play Integrity
+ * unavailable or FCM not configured). [make] does neither. It calls the four constructors once,
+ * passes no `cloudProjectNumber`, and probes no provider:
+ *
+ * - [AndroidKeyCustody]'s constructor creates the Keystore master key and opens
+ *   EncryptedSharedPreferences, and an exception from either reaches the caller as thrown,
+ *   not wrapped in [ScpException].
+ * - [AndroidDeviceAttestation] creates its `IntegrityManager` inside each attest call, so an
+ *   absent Play Integrity service surfaces at that call.
+ * - [AndroidPushProvider] does not touch Firebase until [AndroidPushProvider.register].
+ * - [AndroidStorage] opens its database on its first method call.
+ *
  * See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
  */
 object AndroidPlatformAdapter {
@@ -69,7 +85,9 @@ object AndroidPlatformAdapter {
      *
      * @param context Android application context. Must be an application context
      *   (not an activity context) to avoid memory leaks from long-lived references.
-     * @return [AndroidPlatformAdapterImpl] with all four providers initialized.
+     * @return [AndroidPlatformAdapterImpl] holding the four constructed providers. [make] checks
+     *   no provider's backend, so a missing Play Integrity service, an unconfigured Firebase or
+     *   an unopenable database surfaces at the first call that needs it, not here.
      */
     fun make(context: Context): AndroidPlatformAdapterImpl {
         return AndroidPlatformAdapterImpl(

@@ -6317,7 +6317,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidKeyCustody.kt and Types.kt implemented. Ed25519 keys are held by Android Keystore on API 33+ and reported as `CustodyType.HARDWARE` without a `KeyInfo.securityLevel` check, so the adapter does not know whether a key sits in the TEE or in software; API 26-32 falls back to Bouncy Castle software keys, and X25519 keys are software keys. ADR-027 requires P-256. `AndroidKeyCustodyTest.kt` holds 53 JVM unit tests."
+      "result": "AndroidKeyCustody.kt and Types.kt implemented. Ed25519 keys are held by Android Keystore on API 33+ and reported as `CustodyType.HARDWARE` without a `KeyInfo.securityLevel` check, so the adapter does not know whether a key sits in the TEE or in software; API 26-32 falls back to Bouncy Castle software keys, and X25519 keys are software keys. ADR-027 requires P-256. `AndroidKeyCustodyTest.kt` holds 54 JVM unit tests."
     },
     {
       "id": "SCP-111",
