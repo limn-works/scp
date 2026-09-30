@@ -394,10 +394,27 @@ home line doesn't have. Honest, not fixable from here.
   over `host_site_until` (env/CLI parsing, the loud banner, and the live-URL
   print stay binary-only via an `on_ready` callback). A runnable example lives at
   `crates/scp-node/examples/website.rs` (`cargo run -p scp-node --example
-  website`). The library default is **fail-safe**: `DhtMode::Memory` publishes
-  nothing; public hosting is a deliberate `DhtMode::Production` opt-in (which
-  publishes the host's address bound to its DID to the DHT — the same IP-to-
-  identity disclosure the binary gates behind `--self-host` + its banner). No new
+  website`). The library default is **fail-safe**: it publishes nothing; public
+  hosting is a deliberate `DhtMode::Production` opt-in (which publishes the
+  host's address bound to its DID to the DHT — the same IP-to-identity
+  disclosure the binary gates behind `--self-host` + its banner). *(This entry
+  named that default `DhtMode::Memory`. ADR-062, capability injection, kept
+  `DhtMode::Memory` behind `scp-node`'s `testing` feature, because the in-memory
+  client answered resolutions from a process-local map, and added a separate
+  fail-closed variant, `DhtMode::Disabled`, which publishes nothing and whose
+  DHT resolution arm answers `Ok(None)`. The relay layer that `host_site` wires
+  is `NoOpRelayQuerier`, which also answers `Ok(None)`, so a `Disabled` node
+  resolves only documents already in its cache until the relay-client bind
+  (SCP-RELAYRES-006) lands. `HostSiteConfig::defaults` in
+  `crates/scp-node/src/self_host.rs` sets `dht: DhtMode::Disabled`. The example
+  command above now builds without `testing` and exits 1 on every run, because
+  the example gives `Node::start` a storage directory that holds no identity and, on a build
+  without `testing`, its identity-creation (`Generate`) path returns
+  `NoPreRotationBackend` whatever custody or storage the caller supplies. A `testing` build
+  is not a way to run it: it mints the identity through the test-harness
+  `InMemoryPreRotationCustody`. No build runs the example without that
+  stand-in until a production `PreRotationCustody` backend exists;
+  `crates/scp-node/examples/README.md` states the limit.)* No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
 - **2026-06-16 (ADR-052 P3a/P5)** — `ApplicationNodeBuilder` and its `.no_domain()` / `.identity_with_storage()` methods were deleted in ADR-052 Phase B-P3a (PR #1815). The `--self-host` binary path now builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until` directly (`crates/scp-node/src/main.rs` `run_self_host`). Updated §3, §4, §5, and §6 to reflect the current API. Running log entries from 2026-06-13/2026-06-14 referenced the former typestate builder and are preserved as historical record.

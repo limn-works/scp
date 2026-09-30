@@ -279,7 +279,7 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and `scp-node`
 /// when a production identity-creation path is invoked on a shipped (no-`testing`)
 /// build. Every identity commits a pre-rotation commitment at creation (spec
-/// §9.7.4.1 §3 — mandatory), which requires a `PreRotationCustody` backend; the
+/// §9.7.4.1 item 5(a)), which requires a `PreRotationCustody` backend; the
 /// only implementation that exists today is the in-memory test nullifier
 /// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062
 /// §Decision 6). Rather than silently mint the nullifier (which would ship a

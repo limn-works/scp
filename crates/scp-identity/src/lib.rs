@@ -172,7 +172,7 @@ pub enum IdentityError {
     /// No production pre-rotation custody backend is available.
     ///
     /// Every identity-creation path commits a pre-rotation commitment at
-    /// creation time (spec §9.7.4.1 §3 — pre-rotation is mandatory, not
+    /// creation time (spec §9.7.4.1 item 5(a) — pre-rotation is mandatory, not
     /// optional), which requires a [`PreRotationCustody`](scp_platform::PreRotationCustody)
     /// backend. The only implementation that exists today is the in-memory test
     /// nullifier (`InMemoryPreRotationCustody`), which is now gated to the test
