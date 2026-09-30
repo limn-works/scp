@@ -1394,10 +1394,11 @@ impl Drop for McpClientState {
 /// `crate::runtime::build_supervisor`). The bundle is unwired in three cases:
 /// no supervisor is attached, the supervisor has no channel, or the instance
 /// is suspended when the server is created, because
-/// `crate::runtime::supervisor` refuses a suspended instance. The last case
-/// lasts the server's life: `resume()` does not rewire a server built while
-/// suspended, so the host creates the server again after `resume()` to get
-/// subscriptions. An unwired server advertises every capability the event pump
+/// `crate::runtime::supervisor` refuses a suspended instance. Each case lasts
+/// the server's life, because this function runs once per serve call: neither
+/// a supervisor attached later nor a `resume()` rewires the server, so the
+/// host creates the server again once the instance has a supervisor and is
+/// not suspended to get subscriptions. An unwired server advertises every capability the event pump
 /// backs as false (`resources.subscribe`, `resources.listChanged`,
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
@@ -1489,6 +1490,14 @@ fn generate_handle_id(prefix: &str) -> String {
 /// `"sse"` transport, the server binds a loopback HTTP server on an ephemeral
 /// port behind a per-server bearer token. This function returns neither the
 /// port nor the token, so no client can reach an SSE server it starts.
+///
+/// A server started while no supervisor is attached, or while the instance
+/// is suspended, has no resource subscriptions for its whole life: it
+/// advertises `resources.subscribe`, `resources.listChanged` and
+/// `tools.listChanged` as false, rejects `resources/subscribe`, and sends no
+/// `list_changed` notification. With no supervisor attached it also refuses
+/// every `tools/call`. Attaching a supervisor or calling `resume()` later
+/// does not change a running server; stop it and serve again.
 ///
 /// # Arguments
 ///
