@@ -4975,7 +4975,7 @@ impl McpStdioTransport {
         })
     }
 
-    /// The server process, for [`McpClientEntry::stdio_server`].
+    /// The server process, for the entry's [`McpClientCloser::Stdio`].
     fn server_process(&self) -> Arc<std::sync::Mutex<Option<std::process::Child>>> {
         Arc::clone(&self.child)
     }
