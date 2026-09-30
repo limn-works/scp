@@ -905,6 +905,15 @@ fn mcp_server_bundle(
 }
 
 /// Per-bridge-instance implementation of [`Scp::mcp_server_create`](crate::scp::Scp::mcp_server_create).
+///
+/// A server started while no supervisor is attached, or while the instance
+/// is suspended, has no resource subscriptions for its whole life: it
+/// advertises `resources.subscribe`, `resources.listChanged` and
+/// `tools.listChanged` as false, rejects `resources/subscribe`, and sends no
+/// `list_changed` notification. With or without a supervisor, this server
+/// lists no tools and refuses every `tools/call`. Attaching a supervisor or
+/// calling `resume()` later does not change a running server; stop it and
+/// serve again.
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
     bi: &Arc<NapiBridgeInstance>,

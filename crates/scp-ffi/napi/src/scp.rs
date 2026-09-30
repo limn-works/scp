@@ -4045,7 +4045,17 @@ impl Scp {
     // MCP
     // -------------------------------------------------------------------
 
-    /// Per-instance equivalent of the free-function `mcp_server_create`.
+    /// Starts an MCP server over this instance's contexts on the `stdio` or
+    /// `sse` transport.
+    ///
+    /// A server started while no supervisor is attached, or while the instance
+    /// is suspended, has no resource subscriptions for its whole life: it
+    /// advertises `resources.subscribe`, `resources.listChanged` and
+    /// `tools.listChanged` as false, rejects `resources/subscribe`, and sends
+    /// no `list_changed` notification. With or without a supervisor, this
+    /// server lists no tools and refuses every `tools/call`. Attaching a
+    /// supervisor or calling `resume()` later does not change a running
+    /// server; stop it and serve again.
     #[napi(js_name = "mcpServerCreate")]
     pub async fn mcp_server_create(
         &self,
