@@ -443,9 +443,18 @@ class HotStreamFactory(
      *
      * Attempts every release it holds and never throws a release's failure
      * (`.docs/standards/sdk-common.md` §Cleanup error handling): an unsubscribe call that
-     * throws is logged at warning level, and the loop moves on to the next handle. Every
-     * registry entry is gone when this returns, the failed ones included, because that
-     * section requires local state to be released whatever a remote call reports.
+     * throws is logged at warning level, and the loop moves on to the next handle. Each
+     * pass removes every entry its registry held when the pass took that registry's mutex,
+     * the failed ones included, because that section requires local state to be released
+     * whatever a remote call reports.
+     *
+     * Nothing here refuses a new subscription. The event pass releases [eventMutex] before
+     * the message pass takes [messageMutex], and neither is held after its pass, so a
+     * [contextEvents] or [incomingMessages] call queued behind a pass, or started after it,
+     * registers an entry that this call does not remove, and that entry may still be in the
+     * registry when this returns. A caller that must end with no live subscription refuses
+     * new starts and waits for the starts already running before it calls this, as
+     * `ScpHotStreams.close` does, or stops the late entry itself.
      */
     suspend fun stopAll() {
         withContext(NonCancellable) {

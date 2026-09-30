@@ -592,17 +592,23 @@ class CoroutineBridgeTest {
                 stubBindings.onUnsubscribe = { throw failure }
                 val flow = bridge.context.subscribe(42L)
 
-                // A release that rethrew would fail this job with the stub's exception, and
-                // that failure would fail runTest's scope.
+                // A release that rethrew would fail this job with the stub's exception instead
+                // of cancelling it. The completion cause recorded below tells the two apart:
+                // a failed job completes with the stub's exception, a cancelled one with a
+                // CancellationException. runTest's scope would also fail on that exception.
                 lateinit var collecting: Job
+                var completionCause: Throwable? = null
                 val records =
                     captureLogs(ContextBridge::class.java.name) {
                         collecting = launch { flow.collect {} }
+                        collecting.invokeOnCompletion { completionCause = it }
                         advanceUntilIdle()
                         collecting.cancelAndJoin()
                     }
 
-                assertTrue(collecting.isCancelled)
+                val cause = completionCause
+                assertTrue(cause is CancellationException, "collector completed with $cause")
+                assertFalse(generateSequence(cause) { it.cause }.any { it === failure })
                 assertEquals(1, records.size)
                 assertEquals(Level.WARNING, records[0].level)
                 assertEquals(failure.message, records[0].thrown?.message)
