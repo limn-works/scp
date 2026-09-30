@@ -101,6 +101,15 @@
 #     `#[<U+200F>path = "x"]` would slip past the `cfg(` and `#[path]` matchers. Outside a
 #     literal or comment rustc accepts either character only as whitespace, so the rule
 #     rejects every such use and every `\s` in the scan stays sound.
+#   - A first line that starts with `#!`, after an optional U+FEFF byte-order mark, and
+#     whose `#!` is not followed by `[` after spaces, tabs and line breaks alone. rustc
+#     strips such a line as a shebang, so a `"` in it would open a string for the scan
+#     that swallows every predicate after it. Measured on rustc 1.98.0: `#!<U+00A0>[` is
+#     stripped, because U+00A0 is not Rust whitespace, while `#! [` is an inner
+#     attribute. rustc also reads `#!/**/[` as an inner attribute; the rule rejects that
+#     form as well instead of lexing comments there, which costs nothing because no
+#     example in the workspace starts with `#!` and then a comment. The scan reads the
+#     rest of the file with the rejected line blanked.
 #   - A block comment or string literal the scan cannot close. Block comments nest, as
 #     rustc reads them, and an unclosed one fails the scan instead of desynchronizing it.
 # String literals, char literals and comments are blanked first, so neither hides a
@@ -114,7 +123,7 @@
 # token before the prefix (`#r"\"`) leaves it a raw string. A char literal takes the
 # `\x41` and `\u{41}` escapes, and the source is decoded as UTF-8, so `'é'` is one char. A file that is not UTF-8 is
 # scanned as bytes; rustc rejects such a file, so it compiles into no target. Cases
-# `cfgbody` to `hashraw` pin this, and case `platformcfg` pins what passes.
+# `cfgbody` to `nbspshebang` pin this, and case `platformcfg` pins what passes.
 #
 # RESIDUAL LIMITS. These are the bypasses known to the gate's authors, not a proof that
 # no other exists:
@@ -156,6 +165,7 @@ my @str;
 my %plat = map { $_ => 1 } qw(unix windows target_os target_family target_arch
   target_pointer_width target_endian target_env target_vendor);
 my %host = map { $_ => 1 } split /\n/, $ENV{HOST_CFG};
+print "shebang line\n" if s/\A(\x{FEFF}?)#!(?![ \t\r\n]*\[)[^\n]*/$1/;
 s{((?:(?<![\w'])[bc]?r(\#*)"(.*?)"\2|b?"((?:[^"\\]|\\.)*)"|b?'(?:[^'\\]|\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|.))')\w*)|//[^\n]*|(/\*(?:[^/*]++|/(?!\*)|\*(?!/)|(?5))*+\*/)}{
   !defined $1 ? ' ' : $1 =~ /^b?'/ ? '0' : do { push @str, defined $3 ? $3 : $4; qq{"$#str"} }
 }gse;

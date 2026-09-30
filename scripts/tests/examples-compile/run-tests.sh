@@ -23,7 +23,7 @@
 # makes the gate exit 1 on `spaced`, which expects exit 0. Ending the package loop after its
 # first package makes the gate exit 0 on `secondbroken` and `secondorphan`, which expect exit 1.
 # Dropping the source scan makes the gate exit 0 on every case from `cfgbody` to
-# `hashraw`, which expect exit 1: each fixture compiles on default features. Accepting a
+# `nbspshebang`, which expect exit 1: each fixture compiles on default features. Accepting a
 # platform predicate false on the host makes the gate exit 0 on `falsecfg`, accepting an
 # empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
 # the same on `nestedcomment`, dropping the `include`, `#[path]`, `macro_rules` or
@@ -34,18 +34,23 @@
 # `cfg_attr` in place of every `cfg_` name does the same on `cfgselect`, dropping the
 # test-name rule does the same on `testattr`, `testpath` and `testalias`, and matching only
 # the attribute form `#[...test]` in place of the name does the same on `testalias`.
-# The lexer cases below hold their literal in `stringify!`, so the gate exits 1 on each of
-# them through the `stringify` rule too; each case also wants the feature-cfg line, and each
+# The `suffix` cases and `hashraw` hold their literal in `stringify!`, so the gate exits 1 on
+# each of them through the `stringify` rule too; each lexer case below, from `suffixnum` to
+# `nbspshebang`, also wants the feature-cfg line, and each
 # mutation that follows drops that line from the output. Reading `r"` as a raw string after
 # a number or a lifetime does so on `suffixnum` and `suffixlifetime`; ending a string or raw
 # string at its closing quote or hash without taking its suffix does so on `suffixstring`
 # and `suffixrawhash`; a char literal pattern that accepts only one-character escapes does
 # so on `charhex` and `charunicode`; and refusing a raw string whose prefix follows a `#`
-# token does so on `hashraw`.
+# token does so on `hashraw`. Dropping the shebang rule, or rejecting the line without
+# blanking it, does so on `shebang`, `bomshebang` and `nbspshebang`; matching the shebang only
+# at the first byte does so on `bomshebang`; and accepting any `\s` between `#!` and `[` as
+# an inner attribute does so on `nbspshebang`.
 # Scanning string literals or comments, rejecting a platform predicate true on the host,
 # rejecting `include_str!`, rejecting a U+200E or U+200F inside a literal or comment, rejecting an identifier that merely starts with `test`,
 # `bench` or `stringify`, rejecting an identifier `path` or `r#path` outside an attribute,
-# refusing a raw string whose prefix follows `(` or a space, or
+# refusing a raw string whose prefix follows `(` or a space, rejecting the inner attribute
+# `#! [allow(dead_code)]` because a space stands between `#!` and `[`, or
 # matching a char literal byte by byte in place of decoding the source as UTF-8 makes the
 # gate exit 1 on `platformcfg`, which expects exit 0.
 set -euo pipefail
@@ -322,8 +327,20 @@ printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo
 printf 'const _: &str = stringify!(#r"\\");\n#[cfg(feature = "testing")]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n// "\n' > "$ws/demo/examples/good.rs"
 expect "feature cfg after the raw string #r\"\\\"" "$ws" 1 '      cfg(feature = "testing")'
 
+# A first line rustc strips as a shebang. rustc drops `#!/x "` before it lexes, and drops
+# `#!<U+00A0>[doc = "` too because U+00A0 is not Rust whitespace, so the feature cfg below is
+# real code. A scan that lexes the line reads its `"` as the start of a string that swallows
+# the cfg; a U+FEFF byte-order mark before the `#!` changes nothing for rustc.
+for sb in shebang:'#!/x "' bomshebang:'\xef\xbb\xbf#!/x "' nbspshebang:'#!\xc2\xa0[doc = "'; do
+    ws="$(new_ws "${sb%%:*}" $'[features]\ntesting = []')"
+    printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+    printf "${sb#*:}"'\n#[cfg(feature = "testing")]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n// "\n' > "$ws/demo/examples/good.rs"
+    expect "feature cfg after the shebang line of case ${sb%%:*}" "$ws" 1 '      cfg(feature = "testing")'
+done
+
 ws="$(new_ws platformcfg)"
 cat > "$ws/demo/examples/good.rs" <<'RS'
+#! [allow(dead_code)]
 // #[cfg(feature = "testing")] in a comment is not a predicate.
 /* nor cfg(test) in a /* nested */ block comment, nor include!("x.rs") */
 fn main() {

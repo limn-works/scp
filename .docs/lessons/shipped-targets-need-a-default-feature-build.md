@@ -51,7 +51,11 @@ of them reopens a bypass this repository has already measured:
    escape (`'\x41'`), ends the literal at the wrong quote and blanks the real code after
    it, feature cfg included, as a string. A lookbehind cannot tell a closing raw hash
    (`r#"x"#r"`) from a `#` token, so the scan takes each literal's suffix with the
-   literal. It fails on a `cfg(` or `cfg!(` predicate that names anything but `not`,
+   literal. rustc strips a first line that starts with `#!` (after an optional byte-order
+   mark) when the next token is not `[`, so a scan that lexes that line reads a `"` in
+   `#!/x "` as the start of a string and blanks the feature cfg after it; the scan rejects
+   any first line whose `#!` is not followed by `[` after spaces, tabs and line breaks
+   alone, and blanks it. It fails on a `cfg(` or `cfg!(` predicate that names anything but `not`,
    `any`, `all`, `unix`, `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
    `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
    gate (row 9b). It fails on any identifier that starts with `cfg_`, which covers
@@ -100,8 +104,8 @@ feature-gated fixture of case `cfgbody` and exited 0.
 
 Row 9b is closed by mechanism 7 for every route in its row, and the case suite's
 `falsecfg`, `emptyany`, `nestedcomment`, `include`, `pathmod`, `rawpath`, `macrorules`,
-`stringify`, `lrmcfg`, `lrmcfgmacro`, `rlmpath`, `cfgselect`, `testattr`, `testpath` and
-`testalias` cases each fail on one of those routes. The row lists the routes
+`stringify`, `lrmcfg`, `lrmcfgmacro`, `rlmpath`, `cfgselect`, `testattr`, `testpath`,
+`testalias`, `shebang`, `bomshebang` and `nbspshebang` cases each fail on one of those routes. The row lists the routes
 reviewers have found, not a proof that no other exists.
 Row 9c is open, and no human has ruled it acceptable. Mechanism 7 reads example sources
 only, so a lib item compiled only under a feature key beside an empty default twin, or a lib
@@ -148,7 +152,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
 | 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
 | 9a | example body under `#[cfg(feature = "testing")] fn main()` beside an empty `#[cfg(not(feature = "testing"))] fn main() {}` | the compile saw only the empty `main` and counted the target as checked |
-| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, a U+200E or U+200F that rustc lexes as whitespace inside a `cfg(`, `cfg!(` or `#[path]` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
+| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, a first line rustc strips as a shebang (`#!/x "`, with or without a byte-order mark, and `#!<U+00A0>[`) whose quote opened a string for the scan, a U+200E or U+200F that rustc lexes as whitespace inside a `cfg(`, `cfg!(` or `#[path]` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
 | 9c | a lib item under a feature key beside an empty default twin, a lib or dependency macro that drops or feature-gates its input | open, unmeasured: the code sits outside `examples/`, which is all mechanism 7 reads |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both
