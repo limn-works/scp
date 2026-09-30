@@ -2891,7 +2891,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * call fails on the closed stdout. An SSE client's POST and `GET`
      * sockets are shut down, and the call fails as closed. A call queued
      * behind the in-flight one, on a stdio or an SSE client, fails as
-     * disconnected once it takes the client's lock and sends nothing.
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
     func mcpClientDisconnect(handle: String) async throws 
     
@@ -2949,6 +2952,27 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Routes through `&*self.inner`. The MCP server registry is
      * module-level (not per-instance) so the returned opaque handle
      * string is globally unique; this method preserves that behaviour.
+     *
+     * A server created while the instance has no supervisor or is
+     * suspended serves no resource subscriptions for its whole life: it
+     * advertises `resources.subscribe: false` and rejects
+     * `resources/subscribe`, and neither attaching a supervisor nor
+     * `resume()` changes that. Create the server again once the instance
+     * has a supervisor and is not suspended to get subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
      */
     func mcpServerCreate(config: McpServerConfig) async throws  -> String
     
@@ -5930,7 +5954,10 @@ open func mcpClientConnectStdio(command: [String])async throws  -> String  {
      * call fails on the closed stdout. An SSE client's POST and `GET`
      * sockets are shut down, and the call fails as closed. A call queued
      * behind the in-flight one, on a stdio or an SSE client, fails as
-     * disconnected once it takes the client's lock and sends nothing.
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
 open func mcpClientDisconnect(handle: String)async throws   {
     return
@@ -6051,6 +6078,27 @@ open func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTy
      * Routes through `&*self.inner`. The MCP server registry is
      * module-level (not per-instance) so the returned opaque handle
      * string is globally unique; this method preserves that behaviour.
+     *
+     * A server created while the instance has no supervisor or is
+     * suspended serves no resource subscriptions for its whole life: it
+     * advertises `resources.subscribe: false` and rejects
+     * `resources/subscribe`, and neither attaching a supervisor nor
+     * `resume()` changes that. Create the server again once the instance
+     * has a supervisor and is not suspended to get subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
      */
 open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
     return
@@ -18087,7 +18135,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 50660) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 7965) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 16053) {
@@ -18108,7 +18156,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 39655) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 11371) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 36262) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
