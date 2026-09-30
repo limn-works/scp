@@ -30,9 +30,9 @@ import android.content.Context
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging; checks only the `scp` wake field of a data-only
- *   payload and returns the same [WakeSignal.PULL] whatever other fields it carries; §10.7
- *   opacity is the sender's obligation (§10.7.1 step 5), and no code in this repository sends a
- *   push.
+ *   payload and returns the same [WakeSignal.PULL] whatever other fields it carries. §10.7
+ *   opacity binds the sender (§10.7.1 step 5), and no code in this repository sends a push, so
+ *   SCP-112's opacity criterion is unmet.
  * @property storage SQLCipher encrypted storage whose 32-byte passphrase is derived from a
  *   Keystore-held AES-256 key; SQLCipher derives the database key from that passphrase.
  */

@@ -29,7 +29,7 @@
 
 ## Android platform adapters
 
-- UniFFI renames Rust methods to camelCase (`assert_request` → `assertRequest`); ADR-027's `assert()` sample is wrong. Read the Rust callback interface in `crates/scp-ffi/uniffi/src/lib.rs` for signatures.
+- UniFFI renames Rust methods to camelCase (`assert_request` → `assertRequest`); ADR-021's UDL sketch still names the method `assert`. Read the Rust callback interface in `crates/scp-ffi/uniffi/src/lib.rs` for signatures.
 - Shared types and the Kotlin platform interfaces live in `platform/Types.kt`; never redefine one in an adapter file. The Kotlin `StorageProvider` uses `set`/`get` like the UniFFI interface, although the Rust `Storage` trait says `store`/`retrieve`.
 - `net.zetetic:sqlcipher-android` 4.6+ uses package `net.zetetic.database.sqlcipher.*`, loads with `System.loadLibrary("sqlcipher")` (there is no `loadLibs()`), takes the passphrase in the `SQLiteOpenHelper` constructor, and needs `androidx.sqlite:sqlite`.
 - Generate an Android Keystore Ed25519 key with `NamedParameterSpec.ED25519`; `EdDSAParameterSpec` sets prehash mode and context, not the curve.

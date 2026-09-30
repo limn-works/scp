@@ -1,16 +1,17 @@
 //! Android platform adapter modules for SCP.
 //!
-//! This module declares four modules, one per Android adapter capability; each
-//! only re-exports the platform trait for its capability from
-//! [`crate::traits`]. The adapters themselves are Kotlin classes in
-//! `bindings/kotlin/scp-kt-android/`.
+//! This module declares four modules, one per Android adapter capability. Each
+//! re-exports from [`crate::traits`] the platform trait for its capability
+//! and, except [`storage`], that trait's types, and holds no adapter code.
+//! The adapters themselves are Kotlin classes in `bindings/kotlin/scp-kt-android/`.
 //! ADR-021 (the `UniFFI` bridge) and ADR-027 (the Android platform adapter)
 //! require each Kotlin class to implement the `UniFFI` callback interface for
 //! its capability and to be injected into the Rust engine. No shipped class
 //! does either. Each Kotlin class implements a Kotlin interface in `Types.kt`,
 //! and no code injects any of them into the Rust engine. Stories SCP-110 to
-//! SCP-113 of `.docs/prds/main.json` stay in progress while their adapters
-//! fail their trait criteria, and story SCP-214 tracks injecting a
+//! SCP-113 of `.docs/prds/main.json` stay in progress while any acceptance
+//! criterion their descriptions record as unmet stands; each adapter's trait
+//! criterion is one of them. Story SCP-214 tracks injecting a
 //! key-custody provider into the Rust engine. No Kotlin interface matches both
 //! the Rust trait in [`crate::traits`] and the `UniFFI` callback interface in
 //! `crates/scp-ffi/uniffi/src/lib.rs` for its capability:
@@ -72,9 +73,9 @@
 //!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
 //! - [`push_provider`] — Firebase Cloud Messaging; checks only the `scp` wake
 //!   field of a data-only payload and returns the same wake signal whatever
-//!   other fields it carries; §10.7 opacity is the sender's obligation
-//!   (§10.7.1 step 5 of the infrastructure spec), and no code in this
-//!   repository sends a push.
+//!   other fields it carries. §10.7 opacity binds the sender (§10.7.1 step 5
+//!   of the infrastructure spec), and no code in this repository sends a push,
+//!   so SCP-112's opacity criterion is unmet.
 //! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte passphrase is
 //!   derived from a Keystore-held AES-256 key; `SQLCipher` derives the database
 //!   key from that passphrase.

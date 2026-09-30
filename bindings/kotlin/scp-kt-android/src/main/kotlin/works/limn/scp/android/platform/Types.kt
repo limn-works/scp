@@ -9,8 +9,9 @@
 // `uniffi.scp.KeyCustodyProvider`, which these interfaces are not. ADR-021 (the UniFFI bridge)
 // and ADR-027 require each Android adapter to implement its UniFFI callback interface and to be
 // injected into the Rust engine, so these interfaces diverge from both ADRs. Stories SCP-110 to
-// SCP-113 of `.docs/prds/main.json` stay in progress while their adapters fail their trait
-// criteria, and story SCP-214 tracks injecting a key custody provider into the Rust engine.
+// SCP-113 of `.docs/prds/main.json` stay in progress while any acceptance criterion their
+// descriptions record as unmet stands; each adapter's trait criterion is one of them. Story
+// SCP-214 tracks injecting a key custody provider into the Rust engine.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference).
