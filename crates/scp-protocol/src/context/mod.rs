@@ -545,15 +545,19 @@ pub enum ContextError {
         attempts: u32,
     },
 
-    /// A registered context actor gave the caller no answer (ADR-049 §10).
+    /// An actor or a reservation the call needed gave no answer, and a fresh
+    /// call may succeed (ADR-049 §10).
     ///
-    /// The mailbox send failed or exceeded the 30-second per-command
-    /// backpressure deadline (ADR-049 §"Mailbox parameters"), which covers a
-    /// backed-up mailbox and a closed one whose actor task has terminated,
-    /// or the actor dropped the reply channel, or the reply missed the reply
-    /// timeout. A retry is a fresh call that reads the context's current
-    /// state; it can meet a respawning or poisoned context rather than a live
-    /// actor. Distinct from
+    /// Producers: a per-context actor whose mailbox send failed or exceeded
+    /// `SEND_TIMEOUT` (a backed-up mailbox, or a closed one whose actor task
+    /// has terminated), that dropped the reply channel, or whose reply missed
+    /// `REPLY_TIMEOUT`; the per-identity key-package actor on the same
+    /// faults; `start_saga`, when the saga's participant context set overlaps
+    /// an in-flight saga; and the checked role read, when an actor registers
+    /// while it classifies a miss. A retry after a per-context actor fault
+    /// reads the context's current state and can meet a respawning or
+    /// poisoned context rather than a live actor; a retry after any other
+    /// producer reads no context lifecycle state. Distinct from
     /// [`Self::RateLimited`], which rejects pre-mailbox on capability
     /// grounds.
     ///

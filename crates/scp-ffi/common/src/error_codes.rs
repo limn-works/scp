@@ -535,19 +535,28 @@ pub const CTX_2095: &str = "SCP-CTX-2095";
 ///
 /// Maps from `ContextError::NotPseudonymousContext`.
 pub const CTX_2096: &str = "SCP-CTX-2096";
-/// Context actor busy: the supervisor still held an actor for the context, but
-/// the call got no answer from it (ADR-049 §10).
+/// Actor busy: an actor or a reservation the call needed gave no answer, and
+/// a fresh call may succeed (ADR-049 §10).
 ///
-/// The mailbox send failed or timed out, which covers a saturated mailbox and a closed one whose actor
-/// task has terminated before the crash watchdog despawned it, or the actor
-/// dropped the reply channel, or the reply missed the reply timeout.
+/// The producers are:
+/// - a per-context actor whose mailbox send failed or timed out (a saturated
+///   mailbox, or a closed one whose task terminated before the crash watchdog
+///   despawned it), that dropped the reply channel, or whose reply missed the
+///   reply timeout;
+/// - the per-identity key-package actor on the same four faults, reached by a
+///   key-package reservation such as a Welcome join's;
+/// - `start_saga`, when the saga's participant context set overlaps an
+///   in-flight saga;
+/// - the checked role read, when an actor registers while it classifies a
+///   miss.
 ///
-/// Retryable as a fresh call, not as a promise that the actor is live: the
-/// retry reads the context's current state, which can be an answer,
-/// `CTX_2135` while a respawn of a terminated actor runs, or `CTX_2134` once
-/// the watchdog poisons the context. `CTX_2135` is retryable only while a
-/// respawn runs, and `CTX_2134` is not retryable until an operator clears the
-/// poison or the process restarts.
+/// A retry after a per-context actor fault reads the context's current
+/// state, which can be an answer, `CTX_2135` while a respawn of a terminated
+/// actor runs, or `CTX_2134` once the watchdog poisons the context. A retry
+/// after any other producer reaches that producer again and reads no context
+/// lifecycle state. `CTX_2135` is retryable only while a respawn runs, and
+/// `CTX_2134` is not retryable until an operator clears the poison or the
+/// process restarts.
 ///
 /// Maps from `ContextError::ActorBusy`.
 pub const CTX_2130: &str = "SCP-CTX-2130";
