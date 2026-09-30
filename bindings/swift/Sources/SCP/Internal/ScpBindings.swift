@@ -17306,6 +17306,24 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
+ * The compressed pseudonym point of a §9.10.4 `context_seed`.
+ *
+ * The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
+ * host that computes the seed inside its
+ * keystore. No scalar reaches the host.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `context_seed` is not 32 bytes.
+ */
+public func p256PseudonymPoint(contextSeed: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_pseudonym_point(
+        FfiConverterData.lower(contextSeed),$0
+    )
+})
+}
+/**
  * Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
  * scalar in `[1, n − 1]`.
  *
@@ -17356,6 +17374,26 @@ public func p256SignPrehashRfc6979(scalar: Data, digest: Data)throws  -> Data  {
     uniffi_scp_ffi_uniffi_fn_func_p256_sign_prehash_rfc6979(
         FfiConverterData.lower(scalar),
         FfiConverterData.lower(digest),$0
+    )
+})
+}
+/**
+ * The compressed pseudonym point a software custody derives (§9.10.4.A).
+ *
+ * From the 32-byte identity key material `ikm`: the v1 point for
+ * `context_id` when `epoch` is `None`, the v2 point at `epoch` otherwise. No
+ * scalar reaches the host.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `ikm` is not 32 bytes.
+ */
+public func p256SoftwarePseudonymPoint(ikm: Data, contextId: Data, epoch: UInt64?)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_software_pseudonym_point(
+        FfiConverterData.lower(ikm),
+        FfiConverterData.lower(contextId),
+        FfiConverterOptionUInt64.lower(epoch),$0
     )
 })
 }
@@ -17748,6 +17786,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_point() != 20989) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_scalar() != 7172) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17755,6 +17796,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_p256_sign_prehash_rfc6979() != 49215) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_software_pseudonym_point() != 30231) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {

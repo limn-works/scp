@@ -1,8 +1,12 @@
 """The SDK's P-256 custody-host helpers against pinned outputs.
 
+``scp_sdk.p256_pseudonym_point``, ``scp_sdk.p256_software_pseudonym_point``,
 ``scp_sdk.p256_pseudonym_scalar``, ``scp_sdk.p256_public_key`` and
 ``scp_sdk.p256_sign_prehash_rfc6979``:
 
+- spec §25.19 Vectors 30 and 31: each ``identity_scalar`` over
+  "context-alpha" gives the v1 point, and at epoch 1 the v2 point; each
+  context seed gives its point directly;
 - spec §25.19 Vectors 30 and 31: each ``context_seed_v1`` and
   ``context_seed_v2`` maps to the spec's v1 and v2 points;
 - RFC 6979 A.2.5 (P-256, SHA-256, "sample"): the RFC's ``r``, and the low-s
@@ -26,9 +30,11 @@ pytest.importorskip("scp_sdk._scp_core")
 from scp_sdk import (
     CryptoError,
     ValidationError,
+    p256_pseudonym_point,
     p256_pseudonym_scalar,
     p256_public_key,
     p256_sign_prehash_rfc6979,
+    p256_software_pseudonym_point,
 )
 
 from .pseudonym_recipe import p256_sign_prehash
@@ -52,6 +58,45 @@ VECTORS = [
         "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
     ),
 ]
+
+
+# §25.19 identity_scalar of each vector, the ikm of the software recipe.
+IDENTITY_SCALARS = {
+    "Vector 30": "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+    "Vector 31": "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "seed_v1", "v1", "seed_v2", "v2"), VECTORS, ids=[v[0] for v in VECTORS]
+)
+def test_software_pseudonym_point_reproduces_spec_25_19(
+    name: str, seed_v1: str, v1: str, seed_v2: str, v2: str
+) -> None:
+    ikm = bytes.fromhex(IDENTITY_SCALARS[name])
+    assert p256_software_pseudonym_point(ikm, b"context-alpha").hex() == v1
+    assert p256_software_pseudonym_point(bytearray(ikm), b"context-alpha", 1).hex() == v2
+
+
+@pytest.mark.parametrize(
+    ("name", "seed_v1", "v1", "seed_v2", "v2"), VECTORS, ids=[v[0] for v in VECTORS]
+)
+def test_pseudonym_point_reproduces_spec_25_19(
+    name: str, seed_v1: str, v1: str, seed_v2: str, v2: str
+) -> None:
+    assert p256_pseudonym_point(bytes.fromhex(seed_v1)).hex() == v1
+    assert p256_pseudonym_point(bytearray.fromhex(seed_v2)).hex() == v2
+
+
+@pytest.mark.parametrize("size", [0, 31, 33])
+def test_point_helpers_reject_a_wrong_length_seed(size: int) -> None:
+    for call in (
+        lambda: p256_pseudonym_point(bytes(size)),
+        lambda: p256_software_pseudonym_point(bytes(size), b"context-alpha"),
+    ):
+        with pytest.raises(ValidationError) as info:
+            call()
+        assert info.value.code == "SCP-VALID-7005"
 
 
 @pytest.mark.parametrize(

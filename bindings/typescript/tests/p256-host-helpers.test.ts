@@ -1,7 +1,11 @@
 /**
- * The SDK's P-256 custody-host helpers (`p256PseudonymScalar`, `p256PublicKey`,
+ * The SDK's P-256 custody-host helpers (`p256PseudonymPoint`,
+ * `p256SoftwarePseudonymPoint`, `p256PseudonymScalar`, `p256PublicKey`,
  * `p256SignPrehashRfc6979`, exported from the package root) against pinned
  * outputs:
+ *   - spec §25.19 Vectors 30 and 31: each `identity_scalar` over
+ *     "context-alpha" gives the v1 point, and at epoch 1 the v2 point; each
+ *     context seed gives its point directly;
  *   - spec §25.19 Vectors 30 and 31: each `context_seed_v1` and
  *     `context_seed_v2` maps through `p256PseudonymScalar` (whose
  *     `SCP-PSEUDONYM-P256-V1` label is fixed inside the helper) and
@@ -19,14 +23,20 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
 import { CryptoError, type ScpError, ValidationError } from "../src/errors";
-import { p256PseudonymScalar, p256PublicKey, p256SignPrehashRfc6979 } from "../src/index";
+import {
+  p256PseudonymPoint,
+  p256PseudonymScalar,
+  p256PublicKey,
+  p256SignPrehashRfc6979,
+  p256SoftwarePseudonymPoint,
+} from "../src/index";
 import { loadNativeAddon } from "../src/internal/native";
 import { __p256HostInvokeForTests } from "../src/scp";
 import { bytesToBigInt, P256_N, p256SignPrehash } from "./pseudonym-recipe";
 
 let skipReason = "";
 try {
-  if (typeof loadNativeAddon().p256PseudonymScalar !== "function") {
+  if (typeof loadNativeAddon().p256SoftwarePseudonymPoint !== "function") {
     skipReason = "native addon predates the P-256 host helpers";
   }
 } catch (e: unknown) {
@@ -40,6 +50,7 @@ const unhex = (s: string) => new Uint8Array(Buffer.from(s, "hex"));
 const VECTORS = [
   {
     name: "Vector 30",
+    identityScalar: "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
     seedV1: "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b",
     v1: "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
     seedV2: "6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38",
@@ -47,6 +58,7 @@ const VECTORS = [
   },
   {
     name: "Vector 31",
+    identityScalar: "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
     seedV1: "5157d14a2362044199ba88d66d6a52a4bfbe0598ebe921c5fb9c362d3bebaedd",
     v1: "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
     seedV2: "8133a9d716dcbe729b1f447ac0efccf3795e8bf28da2db4744090d0316ead730",
@@ -55,6 +67,51 @@ const VECTORS = [
 ];
 
 describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
+  const contextAlpha = new TextEncoder().encode("context-alpha");
+
+  for (const v of VECTORS) {
+    test(`${v.name}: software pseudonym point reproduces spec 25.19`, () => {
+      const ikm = unhex(v.identityScalar);
+      expect(hex(p256SoftwarePseudonymPoint(ikm, contextAlpha))).toBe(v.v1);
+      expect(hex(p256SoftwarePseudonymPoint(ikm, contextAlpha, 1n))).toBe(v.v2);
+      expect(hex(ikm)).toBe(v.identityScalar);
+    });
+
+    test(`${v.name}: pseudonym point reproduces spec 25.19`, () => {
+      expect(hex(p256PseudonymPoint(unhex(v.seedV1)))).toBe(v.v1);
+      expect(hex(p256PseudonymPoint(unhex(v.seedV2)))).toBe(v.v2);
+    });
+  }
+
+  test("point helpers reject a wrong-length seed with SCP-VALID-7005", () => {
+    for (const size of [0, 31, 33]) {
+      for (const call of [
+        () => p256PseudonymPoint(new Uint8Array(size)),
+        () => p256SoftwarePseudonymPoint(new Uint8Array(size), contextAlpha),
+      ]) {
+        let caught: unknown;
+        try {
+          call();
+        } catch (e: unknown) {
+          caught = e;
+        }
+        expect(caught).toBeInstanceOf(ValidationError);
+        expect((caught as ScpError).code).toBe("SCP-VALID-7005");
+      }
+    }
+  });
+
+  test("a negative epoch is rejected with SCP-VALID-7005", () => {
+    let caught: unknown;
+    try {
+      p256SoftwarePseudonymPoint(new Uint8Array(32).fill(1), contextAlpha, -1n);
+    } catch (e: unknown) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ValidationError);
+    expect((caught as ScpError).code).toBe("SCP-VALID-7005");
+  });
+
   for (const v of VECTORS) {
     test(`${v.name}: context seeds map to the spec's v1 and v2 points`, () => {
       const d1 = p256PseudonymScalar(unhex(v.seedV1));

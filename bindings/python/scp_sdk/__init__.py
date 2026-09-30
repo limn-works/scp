@@ -171,9 +171,11 @@ from scp_sdk.scp import (
     SqlitePassphraseStorage,
     SqliteStorage,
     StorageConfig,
+    p256_pseudonym_point,
     p256_pseudonym_scalar,
     p256_public_key,
     p256_sign_prehash_rfc6979,
+    p256_software_pseudonym_point,
 )
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
@@ -366,9 +368,11 @@ __all__ = [
     "media_send_signaling",
     "media_verify_sender_attribution",
     "normalize_address",
+    "p256_pseudonym_point",
     "p256_pseudonym_scalar",
     "p256_public_key",
     "p256_sign_prehash_rfc6979",
+    "p256_software_pseudonym_point",
     "parse_address",
     "policy_requires_payment",
     "run_sync",

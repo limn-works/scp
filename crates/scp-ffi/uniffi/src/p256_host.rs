@@ -87,6 +87,46 @@ pub fn p256_sign_prehash_rfc6979(scalar: Vec<u8>, digest: Vec<u8>) -> Result<Vec
         .to_vec())
 }
 
+/// The compressed pseudonym point of a §9.10.4 `context_seed`.
+///
+/// The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
+/// host that computes the seed inside its
+/// keystore. No scalar reaches the host.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `context_seed` is not 32 bytes.
+#[uniffi::export]
+pub fn p256_pseudonym_point(context_seed: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+    let context_seed = Zeroizing::new(context_seed);
+    Ok(shared::p256_pseudonym_point(&context_seed)
+        .map_err(scp_error)?
+        .to_vec())
+}
+
+/// The compressed pseudonym point a software custody derives (§9.10.4.A).
+///
+/// From the 32-byte identity key material `ikm`: the v1 point for
+/// `context_id` when `epoch` is `None`, the v2 point at `epoch` otherwise. No
+/// scalar reaches the host.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `ikm` is not 32 bytes.
+#[uniffi::export]
+pub fn p256_software_pseudonym_point(
+    ikm: Vec<u8>,
+    context_id: Vec<u8>,
+    epoch: Option<u64>,
+) -> Result<Vec<u8>, ScpError> {
+    let ikm = Zeroizing::new(ikm);
+    Ok(
+        shared::p256_software_pseudonym_point(&ikm, &context_id, epoch)
+            .map_err(scp_error)?
+            .to_vec(),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

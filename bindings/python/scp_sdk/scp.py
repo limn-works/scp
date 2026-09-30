@@ -89,9 +89,11 @@ __all__ = [
     "SealedInvitation",
     "SqliteStorage",
     "StorageConfig",
+    "p256_pseudonym_point",
     "p256_pseudonym_scalar",
     "p256_public_key",
     "p256_sign_prehash_rfc6979",
+    "p256_software_pseudonym_point",
 ]
 
 
@@ -445,6 +447,44 @@ def p256_sign_prehash_rfc6979(scalar: bytes | bytearray, digest: bytes) -> bytes
             signing fails.
     """
     return _p256_host_call("p256_sign_prehash_rfc6979", scalar, digest)
+
+
+def p256_pseudonym_point(context_seed: bytes | bytearray) -> bytes:
+    """Return the 33-byte SEC1 compressed pseudonym point of a 32-byte §9.10.4 ``context_seed``.
+
+    For a host that computes the v1 or v2 seed itself, such as inside a
+    keystore. The seed is reduced to a scalar under the fixed
+    ``SCP-PSEUDONYM-P256-V1`` label (FIPS 186-5 A.2.1) and only the point
+    ``d * G`` is returned: no scalar reaches the host.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``context_seed`` is not 32 bytes.
+    """
+    return _p256_host_call("p256_pseudonym_point", context_seed)
+
+
+def p256_software_pseudonym_point(
+    ikm: bytes | bytearray, context_id: bytes, epoch: int | None = None
+) -> bytes:
+    """Return the 33-byte SEC1 compressed pseudonym point a software custody derives from ``ikm``.
+
+    ``09-security-model.md`` §9.10.4.A: ``pseudonym_secret =
+    HKDF-SHA256(ikm, "scp-pseudonym-secret-v1")``, the v1 context seed when
+    ``epoch`` is ``None`` and the v2 seed at ``epoch`` otherwise, then the
+    point. No scalar reaches the host; a host that must wipe ``ikm`` passes
+    it as a ``bytearray`` and clears it after the call.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``ikm`` is not 32 bytes.
+        OverflowError: when ``epoch`` is negative or wider than 64 bits.
+    """
+    fn = _native_mod().p256_software_pseudonym_point
+    try:
+        return fn(ikm, context_id, epoch)
+    except OverflowError:
+        raise
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
 
 
 def _native_cls() -> Any:

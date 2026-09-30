@@ -13,6 +13,7 @@
 //! array without wiping either, and the returned scalar `Vec` is freed
 //! unwiped. The host wipes its own arrays.
 
+use napi::bindgen_prelude::BigInt;
 use napi_derive::napi;
 use scp_ffi_common::p256_host::{self as shared, P256HostError};
 use zeroize::Zeroizing;
@@ -76,6 +77,60 @@ pub fn p256_sign_prehash_rfc6979(scalar: Vec<u8>, digest: Vec<u8>) -> napi::Resu
         .to_vec())
 }
 
+/// The compressed pseudonym point of a §9.10.4 `context_seed`.
+///
+/// The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
+/// host that computes the seed itself. No
+/// scalar reaches the host.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `context_seed` is not 32 bytes.
+#[napi(js_name = "p256PseudonymPoint")]
+pub fn p256_pseudonym_point(context_seed: Vec<u8>) -> napi::Result<Vec<u8>> {
+    let context_seed = Zeroizing::new(context_seed);
+    Ok(shared::p256_pseudonym_point(&context_seed)
+        .map_err(napi_error)?
+        .to_vec())
+}
+
+/// The compressed pseudonym point a software custody derives (§9.10.4.A).
+///
+/// From the 32-byte identity key material `ikm`: the v1 point for
+/// `context_id` when `epoch` is omitted, the v2 point at `epoch` otherwise.
+/// `epoch` is a `bigint` so the full unsigned 64-bit range crosses exactly.
+/// No scalar reaches the host.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `ikm` is not 32 bytes, or `epoch` is negative or
+/// wider than 64 bits.
+#[napi(js_name = "p256SoftwarePseudonymPoint")]
+pub fn p256_software_pseudonym_point(
+    ikm: Vec<u8>,
+    context_id: Vec<u8>,
+    epoch: Option<BigInt>,
+) -> napi::Result<Vec<u8>> {
+    let ikm = Zeroizing::new(ikm);
+    let epoch = epoch.as_ref().map(epoch_u64).transpose()?;
+    Ok(
+        shared::p256_software_pseudonym_point(&ikm, &context_id, epoch)
+            .map_err(napi_error)?
+            .to_vec(),
+    )
+}
+
+fn epoch_u64(epoch: &BigInt) -> napi::Result<u64> {
+    let (signed, value, lossless) = epoch.get_u64();
+    if signed || !lossless {
+        return Err(napi_error(P256HostError::Validation(
+            "epoch must be a non-negative integer that fits in an unsigned 64-bit integer"
+                .to_owned(),
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -92,6 +147,19 @@ mod tests {
             hex::encode(p256_public_key(scalar).expect("point")),
             "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72"
         );
+    }
+
+    /// An epoch of 2^64, wider than 64 bits, is `SCP-VALID-7005` rather than
+    /// the truncated epoch 0. (The TypeScript suite covers a negative epoch.)
+    #[test]
+    fn software_point_rejects_an_epoch_wider_than_64_bits() {
+        let wide = BigInt {
+            sign_bit: false,
+            words: vec![0, 1],
+        };
+        let err = p256_software_pseudonym_point(vec![1; 32], b"ctx".to_vec(), Some(wide))
+            .expect_err("epoch 2^64");
+        assert!(err.reason.contains("SCP-VALID-7005"), "{}", err.reason);
     }
 
     #[test]

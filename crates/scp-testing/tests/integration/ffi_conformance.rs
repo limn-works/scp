@@ -1446,7 +1446,13 @@ fn discovery_and_provenance_coverage() {
 // exported by UniFFI alone and now by PyO3 and NAPI too, so their
 // `ffi-export-allowlist.json` bridge-specific entries are gone. Pure coverage
 // expansion, not a swap for the removed `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 112;
+//
+// Subsequently RAISED 112 -> 114 by the two pseudonym point helpers
+// (`p256_pseudonym_point` / `p256_software_pseudonym_point`, §9.10.4.A): a
+// keystore host and a software host each get the pseudonym point without any
+// scalar reaching them, exported by all three native bridges. Pure coverage
+// expansion, not a swap for the removed `economy_adjust_relay_price`.
+const MIN_PARITY_OPERATIONS: usize = 114;
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement

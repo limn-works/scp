@@ -86,6 +86,50 @@ pub fn py_p256_sign_prehash_rfc6979(
     Ok(PyBytes::new(py, &sig))
 }
 
+/// The compressed pseudonym point of a §9.10.4 `context_seed`.
+///
+/// The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
+/// host that computes the seed itself. No
+/// scalar reaches the host.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `context_seed` is not 32 bytes.
+#[pyfunction]
+#[pyo3(name = "p256_pseudonym_point")]
+pub fn py_p256_pseudonym_point(
+    py: Python<'_>,
+    context_seed: Vec<u8>,
+) -> PyResult<Bound<'_, PyBytes>> {
+    let context_seed = Zeroizing::new(context_seed);
+    let point = shared::p256_pseudonym_point(&context_seed).map_err(py_error)?;
+    Ok(PyBytes::new(py, &point))
+}
+
+/// The compressed pseudonym point a software custody derives (§9.10.4.A).
+///
+/// From the 32-byte identity key material `ikm`: the v1 point for
+/// `context_id` when `epoch` is `None`, the v2 point at `epoch` otherwise. No
+/// scalar reaches the host.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `ikm` is not 32 bytes; `OverflowError` (raised by
+/// `PyO3`) when `epoch` is negative or wider than 64 bits.
+#[pyfunction]
+#[pyo3(name = "p256_software_pseudonym_point", signature = (ikm, context_id, epoch = None))]
+pub fn py_p256_software_pseudonym_point(
+    py: Python<'_>,
+    ikm: Vec<u8>,
+    context_id: Vec<u8>,
+    epoch: Option<u64>,
+) -> PyResult<Bound<'_, PyBytes>> {
+    let ikm = Zeroizing::new(ikm);
+    let point =
+        shared::p256_software_pseudonym_point(&ikm, &context_id, epoch).map_err(py_error)?;
+    Ok(PyBytes::new(py, &point))
+}
+
 /// Registers the P-256 host helpers on the `_scp_core` module.
 ///
 /// # Errors
@@ -95,5 +139,7 @@ pub fn register_p256_host(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_p256_pseudonym_scalar, m)?)?;
     m.add_function(wrap_pyfunction!(py_p256_public_key, m)?)?;
     m.add_function(wrap_pyfunction!(py_p256_sign_prehash_rfc6979, m)?)?;
+    m.add_function(wrap_pyfunction!(py_p256_pseudonym_point, m)?)?;
+    m.add_function(wrap_pyfunction!(py_p256_software_pseudonym_point, m)?)?;
     Ok(())
 }

@@ -124,6 +124,8 @@ type NativeAddon = RawNativeAddon & {
   p256PseudonymScalar?: unknown;
   p256PublicKey?: unknown;
   p256SignPrehashRfc6979?: unknown;
+  p256PseudonymPoint?: unknown;
+  p256SoftwarePseudonymPoint?: unknown;
 };
 
 /**
@@ -617,7 +619,7 @@ export interface KeyCustodyProvider {
 
 /** Calls the addon's P-256 host helper `name`, mapping its errors. */
 function p256HostCall(
-  name: "p256PseudonymScalar" | "p256PublicKey" | "p256SignPrehashRfc6979",
+  name: "p256PseudonymScalar" | "p256PublicKey" | "p256SignPrehashRfc6979" | "p256PseudonymPoint",
   ...args: Uint8Array[]
 ): Uint8Array {
   return __p256HostInvokeForTests(nativeFreeFn<(...a: number[][]) => number[]>(name), args);
@@ -669,6 +671,43 @@ export function p256PublicKey(scalar: Uint8Array): Uint8Array {
  */
 export function p256SignPrehashRfc6979(scalar: Uint8Array, digest: Uint8Array): Uint8Array {
   return p256HostCall("p256SignPrehashRfc6979", scalar, digest);
+}
+
+/**
+ * Returns the 33-byte SEC1 compressed pseudonym point of a 32-byte §9.10.4
+ * `context_seed` (v1 or v2), for a host that computes the seed itself, such
+ * as inside a keystore.
+ *
+ * The seed is reduced to a scalar under the fixed `SCP-PSEUDONYM-P256-V1`
+ * label (FIPS 186-5 A.2.1) and only the point `d·G` is returned: no scalar
+ * reaches the host.
+ *
+ * @throws {ValidationError} `SCP-VALID-7005` when `contextSeed` is not 32 bytes.
+ */
+export function p256PseudonymPoint(contextSeed: Uint8Array): Uint8Array {
+  return p256HostCall("p256PseudonymPoint", contextSeed);
+}
+
+/**
+ * Returns the 33-byte SEC1 compressed pseudonym point that a software custody
+ * derives from its 32-byte identity key material `ikm` (spec §9.10.4.A):
+ * `pseudonym_secret = HKDF-SHA256(ikm, "scp-pseudonym-secret-v1")`, the v1
+ * context seed when `epoch` is omitted and the v2 seed at `epoch` otherwise,
+ * then the point. No scalar reaches the host.
+ *
+ * @param epoch The rotation epoch, an unsigned 64-bit value.
+ * @throws {ValidationError} `SCP-VALID-7005` when `ikm` is not 32 bytes or
+ *   `epoch` is negative or wider than 64 bits.
+ */
+export function p256SoftwarePseudonymPoint(
+  ikm: Uint8Array,
+  contextId: Uint8Array,
+  epoch?: bigint,
+): Uint8Array {
+  const native = nativeFreeFn<(i: number[], c: number[], e?: bigint) => number[]>(
+    "p256SoftwarePseudonymPoint",
+  );
+  return __p256HostInvokeForTests((i, c) => native(i, c, epoch), [ikm, contextId]);
 }
 
 // ---------------------------------------------------------------------------
