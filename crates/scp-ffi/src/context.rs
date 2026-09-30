@@ -74,6 +74,13 @@ const fn context_state_str(state: &scp_core::context::ContextState) -> &'static 
 /// context a TTL expiry, another member's close, a migration, or an actor
 /// poison had already taken out of service, because that string only records a
 /// transition this bridge itself observed.
+///
+/// Once the supervisor reports the context active, the gate runs
+/// [`crate::runtime::resync_fenced_role_state`], so a bridge capability copy a
+/// failed role-state re-read fenced deny-all is re-read from the supervisor on
+/// the member's next join, leave, send or receive. A re-read that fails again
+/// is logged and leaves the copy fenced; it does not refuse the operation,
+/// because the supervisor, not that copy, enforces these four.
 fn require_active_context(
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
@@ -82,6 +89,14 @@ fn require_active_context(
 ) -> PyResult<()> {
     let state = crate::runtime::live_context_state(bi, context_id, code)?;
     if matches!(state, scp_core::context::ContextState::Active) {
+        if let Err(e) = crate::runtime::resync_fenced_role_state(bi, context_id) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "the bridge's fenced capability copy could not be re-read from the \
+                 supervisor; it stays deny-all until the next lifecycle-gated operation"
+            );
+        }
         return Ok(());
     }
     if matches!(state, scp_core::context::ContextState::Poisoned) {
@@ -129,11 +144,14 @@ fn require_active_context(
 /// only way to reach the joined context is the handle
 /// `context_join_from_welcome` returns after this step, and a retry fails
 /// on the already-registered FFI state. So it logs the supervisor's error
-/// and returns `Ok`, leaving the FFI state holding the deny-all precheck
-/// role state: no UCAN, outlet or MCP check grants more than the empty
-/// ceiling until a later role-state sync, and join, leave, send and
-/// receive read the supervisor and surface the busy, crashed
-/// (`SCP-CTX-2135`) or poisoned (`SCP-CTX-2134`) actor themselves.
+/// and returns `Ok` after fencing the FFI state's role state deny-all with
+/// [`crate::runtime::fence_role_state_deny_all`]: no UCAN, outlet or MCP
+/// check grants more than the empty ceiling, and the fence flag makes the
+/// member's next join, leave, send or receive that finds the context active
+/// re-read the supervisor's role state
+/// ([`crate::runtime::resync_fenced_role_state`]). Those four gates read the
+/// supervisor and surface a busy, crashed (`SCP-CTX-2135`) or poisoned
+/// (`SCP-CTX-2134`) actor themselves.
 ///
 /// # Errors
 ///
@@ -156,9 +174,18 @@ fn install_joined_role_state(
                 context_id = %context_id,
                 error = %crate::error::ScpPyError::from(e),
                 "context_join_from_welcome committed the join, but the supervisor did not \
-                 answer the role-state read; this bridge's capability copy stays deny-all \
-                 until a later role-state sync"
+                 answer the role-state read; this bridge's capability copy is fenced \
+                 deny-all until the next join, leave, send or receive re-reads it"
             );
+            // The FFI state is missing only when a concurrent close or leave
+            // removed it, and then no copy is left to grant anything.
+            if let Err(fence) = crate::runtime::fence_role_state_deny_all(bi, context_id) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %fence,
+                    "context_join_from_welcome could not fence the joined context's bridge copy"
+                );
+            }
             None
         }
     };
@@ -2656,7 +2683,10 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` if the context is not in "active" state.
+    /// Returns `ContextError` carrying `SCP-CTX-2013` when the supervisor reports
+    /// the context in any state but active or no actor serves it,
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager, syncs FFI state
     pub fn context_join(
@@ -3293,7 +3323,10 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` if the context is not in "active" state.
+    /// Returns `ContextError` carrying `SCP-CTX-2015` when the supervisor reports
+    /// the context in any state but active or no actor serves it,
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn.
     #[pyo3(signature = (handle, identity_did))]
     pub fn context_leave(&self, handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -3499,8 +3532,11 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` if the context is not in "active" state, or
-    /// `TypeError` if the payload is not bytes or str.
+    /// Returns `ContextError` carrying `SCP-CTX-2019` when the supervisor reports
+    /// the context in any state but active or no actor serves it,
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn.
+    /// Returns `TypeError` if the payload is not bytes or str.
     #[pyo3(signature = (handle, identity_did, payload, spending_ucan_jwt=None))]
     pub fn context_send(
         &self,
@@ -3601,7 +3637,10 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` if the context is not in "active" state.
+    /// Returns `ContextError` carrying `SCP-CTX-2021` when the supervisor reports
+    /// the context in any state but active or no actor serves it,
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn.
     #[pyo3(signature = (handle,))]
     pub fn context_receive(&self, handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
         let bi = &*self.inner;
@@ -4000,15 +4039,13 @@ impl crate::scp::PyScp {
             // `apply_pending_ceiling_modification`, which re-syncs both copies
             // itself. The async variant runs because this closure is already inside
             // `rt.block_on`, where the sync wrapper's nested `block_on` panics.
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
+            if let Err(e) = crate::runtime::sync_role_state_or_fence_async(bi, &context_id).await {
                 tracing::warn!(
                     context_id = %context_id,
                     proposal_id = %proposal_id_log,
                     error = %e,
                     "failed to sync role state after governance action — \
-                     local capability checks may be stale"
+                     local capability checks are fenced deny-all until re-read"
                 );
             }
 
@@ -4248,15 +4285,13 @@ impl crate::scp::PyScp {
 
             // Re-sync local role state cache from ContextManager after any
             // governance action that may have modified roles/membership (#560).
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
+            if let Err(e) = crate::runtime::sync_role_state_or_fence_async(bi, &context_id).await {
                 tracing::warn!(
                     context_id = %context_id,
                     action = action_name,
                     error = %e,
                     "failed to sync role state after governance proposal — \
-                     local capability checks may be stale"
+                     local capability checks are fenced deny-all until re-read"
                 );
             }
 
@@ -4343,9 +4378,7 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
+            if let Err(e) = crate::runtime::sync_role_state_or_fence_async(bi, &context_id).await {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -4427,9 +4460,7 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
+            if let Err(e) = crate::runtime::sync_role_state_or_fence_async(bi, &context_id).await {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -4487,9 +4518,7 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
+            if let Err(e) = crate::runtime::sync_role_state_or_fence_async(bi, &context_id).await {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -4586,7 +4615,8 @@ impl crate::scp::PyScp {
     ///
     /// Returns `RuntimeError` (SCP-CTX-2060) if the operation fails, or if the
     /// role-state re-read fails; in the second case the bridge's capability
-    /// copy is left deny-all until a later role-state sync.
+    /// copy is fenced deny-all until the next join, leave, send or receive
+    /// that finds the context active re-reads it.
     #[pyo3(signature = (handle, current_timestamp))]
     pub fn apply_pending_ceiling_modification(
         &self,
@@ -4622,15 +4652,12 @@ impl crate::scp::PyScp {
             // persist fails and it replies with an error. When the re-sync
             // fails, fence both copies deny-all, because the older copy may
             // grant a capability the supervisor's ceiling removed.
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                crate::runtime::fence_role_state_deny_all(bi, &context_id)
-                    .map_err(|fence| PyRuntimeError::new_err(fence.to_string()))?;
+            if let Err(e) = crate::runtime::sync_role_state_or_fence_async(bi, &context_id).await {
                 return Err(PyRuntimeError::new_err(format!(
                     "SCP-CTX-2060: apply_pending_ceiling_modification could not re-read \
                      the supervisor's role state, so this bridge's capability copy is \
-                     deny-all until a later role-state sync: {e}"
+                     fenced deny-all until the next lifecycle-gated operation re-reads \
+                     it: {e}"
                 )));
             }
             reply
@@ -8260,6 +8287,10 @@ mod tests {
                 .is_empty(),
             "the bridge copy stays deny-all"
         );
+        assert!(
+            crate::runtime::with_ffi_state(&bi, &ctx_id, |st| Ok(st.role_state_fenced)).unwrap(),
+            "the unanswered read fences the copy, so a later lifecycle gate re-reads it"
+        );
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
@@ -8687,6 +8718,118 @@ mod tests {
             "the fenced copy grants nothing and keeps membership"
         );
         crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Reads a bridge copy as (fenced flag, UCAN ceiling strings, whether the
+    /// role state grants `creator` `outlet:register`).
+    #[cfg(feature = "testing")]
+    fn bridge_copy(
+        bi: &crate::runtime::PyBridgeInstance,
+        ctx_id: &str,
+        creator: &str,
+    ) -> (bool, std::collections::HashSet<String>, bool) {
+        use scp_core::context::roles::Capability;
+        crate::runtime::with_ffi_state(bi, ctx_id, |st| {
+            Ok((
+                st.role_state_fenced,
+                st.ceiling_strings.clone(),
+                st.role_state
+                    .member_has_capability(creator, &Capability::OutletRegister),
+            ))
+        })
+        .unwrap()
+    }
+
+    /// Adds a UCAN ceiling entry the supervisor never granted, so a test can
+    /// tell whether a call rewrote the bridge copy from the supervisor.
+    #[cfg(feature = "testing")]
+    fn plant_stale_ceiling_entry(bi: &crate::runtime::PyBridgeInstance, ctx_id: &str) {
+        crate::runtime::with_ffi_state(bi, ctx_id, |st| {
+            st.ceiling_strings.insert("probe:stale".to_owned());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A lifecycle gate that finds the context active re-reads a fenced bridge
+    /// copy from the supervisor, leaves an unfenced copy alone, and keeps the
+    /// fence when the supervisor refuses the operation.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn lifecycle_gate_re_reads_only_a_fenced_bridge_copy() {
+        let creator = "did:dht:z6MkFenceLiftCreator";
+        let (scp, handle) = lifecycle_fixture("b7", creator);
+        let bi = &*scp.inner;
+        let ctx_id = handle.context_id.as_str();
+        let gate = || require_active_context(bi, ctx_id, "receive from", codes::CTX_2021);
+
+        // Unfenced: the gate does not rewrite the copy, so the stale entry stays.
+        plant_stale_ceiling_entry(bi, ctx_id);
+        gate().expect("an active context passes the gate");
+        assert!(bridge_copy(bi, ctx_id, creator).1.contains("probe:stale"));
+
+        // Fenced: deny-all until the gate re-reads the supervisor's role state.
+        crate::runtime::fence_role_state_deny_all(bi, ctx_id).unwrap();
+        let (fenced, strings, grants) = bridge_copy(bi, ctx_id, creator);
+        assert!(
+            fenced && strings.is_empty() && !grants,
+            "the fence denies all"
+        );
+        gate().expect("an active context passes the gate");
+        let (fenced, strings, grants) = bridge_copy(bi, ctx_id, creator);
+        assert!(!fenced, "the re-read lifts the fence");
+        assert!(
+            grants && strings.contains("outlet:register") && !strings.contains("probe:stale"),
+            "the copy is the supervisor's again, got: {strings:?}"
+        );
+
+        // Refused: a poisoned context fails the gate and the fence stays.
+        crate::runtime::fence_role_state_deny_all(bi, ctx_id).unwrap();
+        let sup = Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        crate::runtime()
+            .unwrap()
+            .block_on(sup.test_poison_context(ctx_id));
+        let err = gate().expect_err("a poisoned context fails the gate");
+        assert!(err.to_string().contains(codes::CTX_2134), "got: {err}");
+        let (fenced, strings, grants) = bridge_copy(bi, ctx_id, creator);
+        assert!(fenced && strings.is_empty() && !grants, "the fence stays");
+    }
+
+    /// `sync_role_state_or_fence_async`, which every governance re-sync and
+    /// `apply_pending_ceiling_modification` run, installs the supervisor's
+    /// role state when the re-read succeeds and fences the copy deny-all when
+    /// it fails. A re-read failure that kept the older copy fails the second
+    /// half: the planted entry and the `outlet:register` grant survive.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn sync_role_state_or_fence_fences_the_copy_only_when_the_re_read_fails() {
+        let creator = "did:dht:z6MkOrFenceCreator";
+        let (scp, handle) = lifecycle_fixture("b8", creator);
+        let bi = &*scp.inner;
+        let ctx_id = handle.context_id.as_str();
+        let rt = crate::runtime().unwrap();
+
+        plant_stale_ceiling_entry(bi, ctx_id);
+        rt.block_on(crate::runtime::sync_role_state_or_fence_async(bi, ctx_id))
+            .expect("a served re-read succeeds");
+        let (fenced, strings, grants) = bridge_copy(bi, ctx_id, creator);
+        assert!(
+            !fenced && grants && !strings.contains("probe:stale"),
+            "the served re-read installs the supervisor's copy, got: {strings:?}"
+        );
+
+        plant_stale_ceiling_entry(bi, ctx_id);
+        let sup = Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        rt.block_on(sup.test_poison_context(ctx_id));
+        let err = rt
+            .block_on(crate::runtime::sync_role_state_or_fence_async(bi, ctx_id))
+            .expect_err("a poisoned context fails the re-read");
+        assert!(err.to_string().contains(codes::CTX_2134), "got: {err}");
+        let (fenced, strings, grants) = bridge_copy(bi, ctx_id, creator);
+        assert!(
+            fenced && strings.is_empty() && !grants,
+            "the failed re-read fences the copy, got: {strings:?}"
+        );
     }
 
     #[test]

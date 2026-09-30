@@ -1480,6 +1480,12 @@ pub struct FfiBridgeState {
     /// Capability ceiling as a set of `{resource}:{action}` strings for
     /// UCAN validation (ADR-016 step 8).
     pub ceiling_strings: HashSet<String>,
+    /// `true` while [`fence_role_state_deny_all`] holds `role_state` and
+    /// `ceiling_strings` at deny-all because a re-read of the supervisor's role
+    /// state failed. [`install_role_state`] clears it, and
+    /// [`resync_fenced_role_state`], which the join, leave, send and receive
+    /// lifecycle gates run, re-reads the supervisor while it is set.
+    pub role_state_fenced: bool,
     /// The DID of the context creator.
     pub creator_did: String,
     /// Registered outlet handlers keyed by outlet ID.
@@ -1615,6 +1621,7 @@ pub fn register_ffi_state(
                 revocation_list,
                 nonce_tracker,
                 ceiling_strings,
+                role_state_fenced: false,
                 creator_did: creator_did.to_owned(),
                 outlet_handlers: HashMap::new(),
                 message_tx: None,
@@ -1923,7 +1930,7 @@ pub async fn sync_role_state_from_manager_async(
 /// Writes `role_state` and the ceiling string set derived from its ceiling into
 /// the context's `FfiBridgeState`, in the enforced UCAN capability-name form
 /// (`{resource}:{action}`) that [`register_ffi_state`] builds on the create
-/// path.
+/// path, and clears the fence flag [`fence_role_state_deny_all`] sets.
 ///
 /// `context_join_from_welcome` calls it directly with the role state the
 /// supervisor built from the ceiling AUTHENTICATED by the joined MLS group's
@@ -1944,6 +1951,7 @@ pub(crate) fn install_role_state(
     with_ffi_state(bi, context_id, |st| {
         st.role_state = role_state;
         st.ceiling_strings = ceiling_strings;
+        st.role_state_fenced = false;
         Ok(())
     })
 }
@@ -1954,8 +1962,11 @@ pub(crate) fn install_role_state(
 ///
 /// A caller runs it when the supervisor may have narrowed the ceiling but the
 /// re-sync read failed: keeping the older, broader copy would admit a
-/// capability the supervisor's ceiling no longer holds. A later successful
-/// [`sync_role_state_from_manager`] restores the supervisor's role state.
+/// capability the supervisor's ceiling no longer holds. It sets
+/// `role_state_fenced`, so the next join, leave, send or receive lifecycle gate
+/// that finds the context active re-reads the supervisor's role state through
+/// [`resync_fenced_role_state`]; any other successful
+/// [`sync_role_state_from_manager`] restores it too.
 ///
 /// # Errors
 ///
@@ -1977,8 +1988,72 @@ pub(crate) fn fence_role_state_deny_all(
         role_state.members = std::mem::take(&mut st.role_state.members);
         st.role_state = role_state;
         st.ceiling_strings.clear();
+        st.role_state_fenced = true;
         Ok(())
     })
+}
+
+/// Re-reads the supervisor's role state into the bridge, and fences both
+/// bridge copies deny-all through [`fence_role_state_deny_all`] when that
+/// re-read fails.
+///
+/// Every caller that re-syncs after the supervisor may have narrowed a
+/// ceiling, a role or the member set (the governance propose, approve, reject,
+/// withdraw and execute flows and `apply_pending_ceiling_modification`) runs
+/// this, so a failed re-read never leaves an older, broader copy granting a
+/// capability the supervisor removed.
+///
+/// # Errors
+///
+/// Returns the re-read's error once the fence is in place, or the fence's
+/// error when the FFI state registry holds no entry for `context_id`.
+pub async fn sync_role_state_or_fence_async(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    match sync_role_state_from_manager_async(bi, context_id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            fence_role_state_deny_all(bi, context_id)?;
+            Err(e)
+        }
+    }
+}
+
+/// Re-reads the supervisor's role state into a bridge copy that
+/// [`fence_role_state_deny_all`] left deny-all, and does nothing for a copy
+/// that is not fenced or a context this bridge holds no FFI state for.
+///
+/// The join, leave, send and receive lifecycle gates in `context.rs` run it
+/// once the supervisor reports the context active, so a fence a failed
+/// re-read left, including the one a committed Welcome join keeps when the
+/// supervisor did not answer its role-state read, lifts on the member's next
+/// lifecycle-gated operation.
+///
+/// # Errors
+///
+/// Returns `ScpPyError` when the supervisor is unavailable, the
+/// sync-to-async bridge fails, the supervisor could not answer the read or
+/// serves no context for `context_id`. The copy then stays fenced.
+pub(crate) fn resync_fenced_role_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    let fenced = ffi_state_registry(bi)
+        .get(context_id)
+        .is_some_and(|st| st.role_state_fenced);
+    if !fenced {
+        return Ok(());
+    }
+    let sup = Arc::clone(supervisor(bi)?);
+    let ctx = context_id.to_owned();
+    let role_state =
+        block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })?
+            .map_err(ScpPyError::from)?
+            .ok_or_else(|| {
+                ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
+            })?;
+    install_role_state(bi, context_id, role_state)
 }
 
 /// Test-only: spawns the per-context supervisor actor whose lifecycle state
