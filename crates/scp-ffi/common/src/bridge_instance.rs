@@ -4777,7 +4777,10 @@ mod tests {
         assert!(instance.is_shutdown());
     }
 
-    #[tokio::test]
+    // `start_paused` makes the runtime clock jump to the 500 ms drain
+    // deadline once the sleeping task is the only one left, so the test
+    // reaches `TimedOut` without waiting on wall-clock time.
+    #[tokio::test(start_paused = true)]
     async fn shutdown_core_async_times_out_with_long_task() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         {
@@ -4787,15 +4790,6 @@ mod tests {
                 tokio::time::sleep(Duration::from_mins(1)).await;
             });
         }
-        // Review feedback (test-quality, review-round-N): the original
-        // 100 ms budget was flaky on slow CI runners — `drain_under_deadline`
-        // uses `std::time::Instant::now()` (wall-clock), so
-        // `tokio::time::pause()` would not help here. Raising the budget
-        // to 500 ms keeps the test's intent (a sub-second deadline on a
-        // task that sleeps for a full minute) while tolerating scheduler
-        // jitter. If CI flakiness recurs, bump further — the test's
-        // correctness signal is the `TimedOut` outcome, not the wall-
-        // clock bound.
         let outcome = instance
             .shutdown_core_async(Duration::from_millis(500))
             .await
@@ -4840,41 +4834,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// Drain deadline for [`shutdown_core_async_counts_panicked_tasks`].
+    const SLOW_PANIC_DEADLINE: Duration = Duration::from_millis(100);
+    /// Wall-clock time one panicking task holds the runtime thread before it
+    /// panics. It exceeds [`SLOW_PANIC_DEADLINE`] on purpose.
+    const SLOW_PANIC_STALL: Duration = Duration::from_millis(300);
+
+    // `drain_under_deadline` bounds the drain with `tokio::time::timeout`,
+    // which reads the runtime clock. On a real clock, wall time that a task
+    // spends holding the only runtime thread counts against the deadline. A
+    // panicking task holds that thread while the panic hook runs, and with
+    // `RUST_BACKTRACE=1` (set in `.github/workflows/ci.yml`) the default hook
+    // captures and symbolizes a backtrace, which took over 2 s on a loaded CI
+    // runner. The time driver then fired the deadline before the clean task's
+    // `yield_now` returned, so shutdown aborted that task and reported
+    // `TimedOut { aborted_tasks: 1, panicked_tasks: 2 }`. That outcome is
+    // correct shutdown behaviour for a deadline that has passed, so the defect
+    // was the test's assumption that panicking takes less than the deadline.
+    //
+    // `start_paused` freezes the runtime clock: it moves only when every task
+    // is idle, and no task in this test ever waits on time, so the deadline
+    // cannot fire before the drain completes. `SLOW_PANIC_STALL` blocks the
+    // thread for longer than the deadline to stand in for a slow panic hook;
+    // on a real clock this test fails every run with the outcome above.
+    #[tokio::test(start_paused = true)]
     #[allow(clippy::panic)]
     async fn shutdown_core_async_counts_panicked_tasks() {
-        // Spawn a task that panics quickly — the drain should observe it
-        // and surface the count in `GracefulWithin.panicked_tasks`.
+        // The drain must count the two panicking tasks in
+        // `GracefulWithin.panicked_tasks` and must not count the clean task.
         let instance = CoreFields::with_supervisor(test_supervisor());
         {
             let mut tasks = instance.task_handle().await;
             tasks.spawn(async move {
+                std::thread::sleep(SLOW_PANIC_STALL);
                 panic!("intentional panic — shutdown_core_async_counts_panicked_tasks");
             });
             tasks.spawn(async move {
                 panic!("intentional panic #2");
             });
             tasks.spawn(async move {
-                // This one exits cleanly — must not be counted as panicked.
-                //
-                // Uses `yield_now()` (one scheduler round-trip, then a clean
-                // exit) rather than a real-time `sleep`. A `sleep` here made
-                // the test flaky: the clean task then had to wait on the timer
-                // wheel to complete, and `drain_under_deadline` gates the
-                // outcome on a wall-clock deadline. Under CI scheduler
-                // starvation the drain could lose that race, flipping the
-                // outcome from `GracefulWithin` to `TimedOut` and blowing the
-                // `unreachable!` below — even though the panicked count itself
-                // is always correct. `yield_now()` completes without ever
-                // touching the timer wheel, so the drain finishes in a couple
-                // of poll cycles and never approaches the (generous) deadline,
-                // making the `GracefulWithin` outcome deterministic while still
-                // exercising a genuine clean-exit task the drain must not count.
+                // This task exits cleanly after one scheduler round-trip, so
+                // it is still unfinished when the panicking tasks complete.
                 tokio::task::yield_now().await;
             });
         }
         let outcome = instance
-            .shutdown_core_async(Duration::from_secs(2))
+            .shutdown_core_async(SLOW_PANIC_DEADLINE)
             .await
             .unwrap();
         let ShutdownOutcome::GracefulWithin { panicked_tasks, .. } = outcome else {

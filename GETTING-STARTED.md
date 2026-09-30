@@ -5,7 +5,7 @@
 Install these manually before running setup:
 
 - [Homebrew](https://brew.sh)
-- [mise](https://mise.jdx.dev): `brew install mise`
+- [mise](https://mise.jdx.dev) 2026.9.15 or newer: `brew install mise`. `.mise.toml` sets `min_version = "2026.9.15"`, so an older mise exits with an error in this repository, and `./scripts/setup-toolchain.sh` stops before `mise install`; run `brew upgrade mise` to move an older install past the floor.
 - Xcode Command Line Tools: `xcode-select --install`
 
 ## Setup

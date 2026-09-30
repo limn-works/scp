@@ -1,6 +1,6 @@
 // Tests for adapter `AppleDeviceAttestation`.
 //
-// These tests pin three properties of `AppleDeviceAttestation`:
+// These tests pin four properties of `AppleDeviceAttestation`:
 //
 // 1. When `DCAppAttestService.isSupported` is `false`, `attest` and
 //    `assertRequest` throw `ScpError` code `SCP-ATTEST-9019`, the type the
@@ -24,6 +24,13 @@
 //    `assertRequest` passes the stored key ID and `requestHash` to
 //    `generateAssertion` unchanged, and `attest` attests the key ID
 //    `generateKey` produced.
+// 4. `attest` hands Apple its 32-byte `challenge` as `clientDataHash`
+//    unchanged, whatever `deviceId` is, and `assertRequest` hands Apple its
+//    32-byte `requestHash` unchanged. Each method rejects an input of any
+//    other length with `SCP-ATTEST-9026` before it calls App Attest, and
+//    `attest` then generates no key. ADR-025 acceptance criterion 3 has the
+//    Rust core pass the binding digest `D` and the assertion digest `A` of
+//    §9.3.1 of the security model spec as those two inputs.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and the
 // UniFFI `DeviceAttestationProvider` callback interface in
@@ -31,7 +38,6 @@
 
 #if os(iOS) || os(macOS)
 
-    import CryptoKit
     import DeviceCheck
     import Foundation
     @testable import SCP
@@ -145,6 +151,75 @@
         }
     }
 
+    /// A `DCAppAttestService` that reports `isSupported == true`, answers every
+    /// call with a value, and records the key ID and `clientDataHash` of every
+    /// `attestKey` and `generateAssertion` call in arrival order, so a test
+    /// checks the exact bytes the adapter hands Apple.
+    private final class RecordingAppAttestService: DCAppAttestService {
+        /// The key ID the `ordinal`th `generateKey` call hands back, counting
+        /// from 1. Apple returns a new key ID for every generated key, so each
+        /// call answers a different ID.
+        static func generatedKeyId(_ ordinal: Int) -> String {
+            Data(repeating: UInt8(0x50 + ordinal), count: 32).base64EncodedString()
+        }
+
+        /// One App Attest call this double received.
+        struct Call: Equatable {
+            let keyId: String
+            let clientDataHash: Data
+        }
+
+        private let lock = NSLock()
+        private var attestCalls: [Call] = []
+        private var assertCalls: [Call] = []
+        private var keysGenerated = 0
+
+        /// Every `attestKey` call, in arrival order.
+        var attestations: [Call] {
+            lock.withLock { attestCalls }
+        }
+
+        /// Every `generateAssertion` call, in arrival order.
+        var assertions: [Call] {
+            lock.withLock { assertCalls }
+        }
+
+        /// The number of `generateKey` calls this double answered.
+        var generatedKeyCount: Int {
+            lock.withLock { keysGenerated }
+        }
+
+        override var isSupported: Bool {
+            true
+        }
+
+        override func generateKey(completionHandler: @escaping (String?, Error?) -> Void) {
+            let ordinal: Int = lock.withLock {
+                keysGenerated += 1
+                return keysGenerated
+            }
+            completionHandler(Self.generatedKeyId(ordinal), nil)
+        }
+
+        override func attestKey(
+            _ keyId: String,
+            clientDataHash: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            lock.withLock { attestCalls.append(Call(keyId: keyId, clientDataHash: clientDataHash)) }
+            completionHandler(scriptedAttestation, nil)
+        }
+
+        override func generateAssertion(
+            _ keyId: String,
+            clientDataHash: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            lock.withLock { assertCalls.append(Call(keyId: keyId, clientDataHash: clientDataHash)) }
+            completionHandler(scriptedAssertion, nil)
+        }
+    }
+
     /// A `UserDefaults` that keeps every value in memory.
     ///
     /// `AppleDeviceAttestation` reads its key ID through `string(forKey:)` and
@@ -255,16 +330,41 @@
             #expect(msg?.contains("isSupported") == true)
         }
 
+        /// The supported-device side of this order is pinned by the SCP-ATTEST-9026
+        /// tests over `RecordingAppAttestService`, whose `isSupported` is true.
+        @Test("attest throws SCP-ATTEST-9019, not SCP-ATTEST-9026, for a wrong-length challenge when App Attest is unavailable")
+        func attestUnsupportedPrecedesLengthCheck() async {
+            for length in [0, 31, 33] {
+                let harness = makeAdapter(ScriptedAppAttestService(supported: false))
+                let msg = await expectCode("SCP-ATTEST-9019", from: "attest (\(length) bytes)") { () async throws(ScpError) -> Data in
+                    try await harness.adapter.attest(challenge: Data(repeating: 0x01, count: length), deviceId: deviceId)
+                }
+                #expect(msg?.contains("isSupported") == true)
+                #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == nil)
+            }
+        }
+
+        @Test("assertRequest throws SCP-ATTEST-9019, not SCP-ATTEST-9026, for a wrong-length requestHash when App Attest is unavailable")
+        func assertRequestUnsupportedPrecedesLengthCheck() async {
+            for length in [0, 31, 33] {
+                let harness = makeAdapter(ScriptedAppAttestService(supported: false), storedKeyId: scriptedKeyId)
+                let msg = await expectCode("SCP-ATTEST-9019", from: "assertRequest (\(length) bytes)") { () async throws(ScpError) -> Data in
+                    try await harness.adapter.assertRequest(requestHash: Data(repeating: 0xAB, count: length))
+                }
+                #expect(msg?.contains("isSupported") == true)
+            }
+        }
+
         @Test("every AttestationError case maps to its own SCP-ATTEST code")
         func everyCaseHasItsOwnCode() {
             let cases: [AttestationError] = [
-                .serviceError("m"), .unsupported("m"), .keyNotFound, .internalError("m")
+                .serviceError("m"), .unsupported("m"), .keyNotFound, .internalError("m"), .invalidClientDataHash("m")
             ]
             let codes = cases.compactMap { error -> String? in
                 guard case let .Identity(_, code) = error.scpError else { return nil }
                 return code
             }
-            let expected = ["9001", "9019", "9020", "9025"]
+            let expected = ["9001", "9019", "9020", "9025", "9026"]
             #expect(codes == expected.map { "SCP-ATTEST-\($0)" })
         }
 
@@ -352,6 +452,76 @@
                     try await harness.adapter.assertRequest(requestHash: requestHash)
                 }
             }
+        }
+    }
+
+    // MARK: - Client data tests
+
+    /// Cases that pin the bytes `AppleDeviceAttestation` hands Apple.
+    struct AppAttestClientDataTests {
+        @Test("attest hands Apple challenge unchanged, whatever deviceId is, and returns the raw attestation object")
+        func attestForwardsChallenge() async throws {
+            let service = RecordingAppAttestService()
+            let adapter = AppleDeviceAttestation(service: service, defaults: InMemoryUserDefaults())
+            let challenge = Data((0 ..< 32).map { UInt8($0) })
+
+            let attestation = try await adapter.attest(challenge: challenge, deviceId: Data([0xFF, 0xEE]))
+
+            #expect(attestation == scriptedAttestation)
+            #expect(service.attestations == [
+                .init(keyId: RecordingAppAttestService.generatedKeyId(1), clientDataHash: challenge)
+            ])
+        }
+
+        @Test("attest rejects a challenge that is not 32 bytes before it generates a key or calls Apple")
+        func attestRejectsWrongLengthChallenge() async {
+            for length in [0, 31, 33] {
+                let service = RecordingAppAttestService()
+                let defaults = InMemoryUserDefaults()
+                let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+
+                let msg = await expectCode("SCP-ATTEST-9026", from: "attest (\(length) bytes)") { () async throws(ScpError) -> Data in
+                    try await adapter.attest(challenge: Data(repeating: 0x01, count: length), deviceId: deviceId)
+                }
+                #expect(msg?.contains("\(length) bytes") == true)
+                #expect(service.generatedKeyCount == 0)
+                #expect(defaults.string(forKey: keyIdDefaultsKey) == nil)
+                #expect(service.attestations.isEmpty)
+                #expect(service.assertions.isEmpty)
+            }
+        }
+
+        @Test("assertRequest rejects a requestHash that is not 32 bytes before it calls Apple")
+        func assertRequestRejectsWrongLengthRequestHash() async {
+            for length in [0, 31, 33, 57] {
+                let service = RecordingAppAttestService()
+                let defaults = InMemoryUserDefaults()
+                // A stored key ID, so an adapter without the length check would
+                // reach `generateAssertion` rather than throw SCP-ATTEST-9020.
+                defaults.set(RecordingAppAttestService.generatedKeyId(1), forKey: keyIdDefaultsKey)
+                let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+
+                let msg = await expectCode("SCP-ATTEST-9026", from: "assertRequest (\(length) bytes)") { () async throws(ScpError) -> Data in
+                    try await adapter.assertRequest(requestHash: Data(repeating: 0x01, count: length))
+                }
+                #expect(msg?.contains("\(length) bytes") == true)
+                #expect(service.assertions.isEmpty)
+            }
+        }
+
+        @Test("assertRequest hands Apple requestHash unchanged")
+        func assertRequestForwardsRequestHash() async throws {
+            let service = RecordingAppAttestService()
+            let adapter = AppleDeviceAttestation(service: service, defaults: InMemoryUserDefaults())
+            _ = try await adapter.attest(challenge: challenge, deviceId: deviceId)
+
+            let requestHash = Data((0 ..< 32).map { UInt8(0xFF - $0) })
+            let assertion = try await adapter.assertRequest(requestHash: requestHash)
+
+            #expect(assertion == scriptedAssertion)
+            #expect(service.assertions == [
+                .init(keyId: RecordingAppAttestService.generatedKeyId(1), clientDataHash: requestHash)
+            ])
         }
     }
 
