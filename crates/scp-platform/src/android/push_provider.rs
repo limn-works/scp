@@ -1,4 +1,5 @@
-//! Firebase Cloud Messaging push adapter for Android.
+//! Re-exports the push trait and its types for the Android Firebase Cloud
+//! Messaging adapter.
 //!
 //! The Kotlin class `AndroidPushProvider` in
 //! `bindings/kotlin/scp-kt-android/.../AndroidPushProvider.kt` implements the Kotlin
@@ -9,8 +10,7 @@
 //! the Rust engine. Story SCP-112 stays in progress while any acceptance
 //! criterion its description in `.docs/prds/main.json` records as unmet
 //! stands; the trait criterion is one of five. This module documents the
-//! Rust-side contract and
-//! re-exports the trait types for Android builds.
+//! Rust-side contract and re-exports the trait types for Android builds.
 //!
 //! # FCM Payload Opacity (ADR-027, section 10.7)
 //!
