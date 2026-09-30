@@ -543,7 +543,9 @@ pub trait PushProvider: Send + Sync {
 /// Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
 /// Kotlin SDK: Play Integrity API on Android.
 ///
-/// Implemented by Swift/Kotlin code and injected into the Rust engine.
+/// The Swift SDK's `AppleDeviceAttestation` conforms to this callback
+/// interface. No Rust code holds or calls it yet, so nothing injects an
+/// implementation into the Rust engine.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -559,12 +561,20 @@ pub trait PushProvider: Send + Sync {
 pub trait DeviceAttestationProvider: Send + Sync {
     /// Generate a cryptographic attestation for this device.
     ///
-    /// `challenge` — server-provided challenge bytes (SHA-256 digested with
-    ///   `device_id` before submission to the platform attestation service).
-    /// `device_id` — stable identifier for this device instance.
+    /// `challenge` — Apple: the 32-byte binding digest `D` of
+    ///   `09-security-model.md` §9.3.1, which the Swift adapter hands App
+    ///   Attest as `clientDataHash` unchanged. When App Attest is supported,
+    ///   the adapter rejects a `challenge` that is not 32 bytes with
+    ///   `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3); when it is not
+    ///   supported, the adapter throws `SCP-ATTEST-9019` before it reads the
+    ///   length. Android: ADR-027, the Android platform adapter, states
+    ///   what it binds.
+    /// `device_id` — stable identifier for this device instance. The Swift
+    ///   adapter does not read it.
     ///
-    /// Returns the platform attestation object bytes (Apple: CBOR-encoded
-    /// attestation; Android: Play Integrity token bytes).
+    /// Returns the platform attestation bytes. Apple: the raw CBOR attestation
+    /// object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+    /// Integrity token bytes.
     async fn attest(&self, challenge: Vec<u8>, device_id: Vec<u8>) -> Result<Vec<u8>, ScpError>;
 
     /// Generate a per-request assertion proving key possession.
@@ -573,7 +583,12 @@ pub trait DeviceAttestationProvider: Send + Sync {
     ///   `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
     ///   `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
     ///   never `SHA-256(m)` and never `m` itself. The domain separator keeps
-    ///   every `A` distinct from every attestation binding digest `D`.
+    ///   every `A` distinct from every attestation binding digest `D`. The
+    ///   Swift adapter hands `A` to App Attest as `clientDataHash` unchanged.
+    ///   When App Attest is supported, the adapter rejects an `A` that is not
+    ///   32 bytes with `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3);
+    ///   when it is not supported, the adapter throws `SCP-ATTEST-9019`
+    ///   before it reads the length.
     ///
     /// Returns the platform assertion object bytes (Apple: CBOR assertion;
     /// Android: integrity verdict).

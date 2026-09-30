@@ -45,24 +45,41 @@ markers = [
   "parity: cross-bridge runtime parity test (ADR-046)",
 ]
 
+# ruff and mypy target the `requires-python` floor, 3.10. CI's python-lint job runs
+# ruff, which rejects syntax the cp310 and cp311 wheels cannot parse, such as the
+# PEP 695 `type` statement and type parameters, and whose UP rules never rewrite
+# code into it. ruff does not check standard-library names, so an import added
+# after 3.10 (`typing.Self`, `tomllib`) passes it; mypy with the setting below
+# rejects one, but no CI job runs mypy.
 [tool.ruff]
-target-version = "py312"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "RUF"]
-# UP040/UP047: PEP 695 `type` statement and type params require Python 3.12+; we support 3.10+.
-# The `X: TypeAlias = ...` annotation is the only type-alias form legal on 3.10/3.11.
-ignore = ["UP040", "UP047"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
 
 [tool.maturin]
-features = ["extension-module"]
+# Features of `scp-ffi`, the package `manifest-path` below names. `extension-module`
+# forwards `pyo3/extension-module`. `vendored-openssl` forwards
+# `scp-platform/vendored-openssl`, which on a Linux or Windows target compiles
+# OpenSSL from source into SQLCipher, because a `pip install` of the wheel runs no
+# linker and the wheel installs onto a machine whose OpenSSL the build never saw.
+# On a macOS target, the universal2 wheel and a macOS install from the sdist
+# alike, it changes nothing: built on a macOS host, SQLCipher uses CommonCrypto
+# from the OS unless the build environment sets OPENSSL_DIR (or both
+# OPENSSL_LIB_DIR and OPENSSL_INCLUDE_DIR), in which case libsqlite3-sys links
+# that OpenSSL's libcrypto dynamically. On Linux and Windows, OPENSSL_NO_VENDOR
+# set to anything but `0` makes openssl-sys skip the source build and link the host's OpenSSL.
+# libsqlite3-sys and openssl-sys read each of these variables first under the
+# target triple as a prefix (`AARCH64_APPLE_DARWIN_OPENSSL_DIR`), which acts as
+# the bare name does for that target.
+features = ["extension-module", "vendored-openssl"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"
 python-source = "."
