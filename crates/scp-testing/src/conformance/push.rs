@@ -11,13 +11,14 @@
 //!    signal for it. Every other payload the adapter accepts, whether another
 //!    permitted payload, a permitted payload with trailing whitespace a relay
 //!    chose, or one of [`METADATA_PAYLOADS`], yields a signal byte-identical
-//!    to that first one; the adapter may reject any of them instead. The fixed
-//!    signal is this suite's reading of §10.7's opacity rule
+//!    to that first one; the adapter may reject any of them instead. Spec
+//!    §16.12.5 (`.docs/specs/16-test-infrastructure.md`) and ADR-006's testing
+//!    harness paragraph, both amended 2026-09-29, state this contract for
+//!    every adapter. It follows §10.7's opacity rule
 //!    (`.docs/specs/10-infrastructure-and-self-hosting.md`: a push payload
 //!    carries "no context ID, no sender identifier, no message preview, no
 //!    metadata of any kind"): a signal that varied with the payload would hand
-//!    the caller whatever a relay put in it. ADR-006, as amended 2026-09-29,
-//!    states the same rule for `InMemoryPush`.
+//!    the caller whatever a relay put in it.
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 

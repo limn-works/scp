@@ -28,9 +28,9 @@
 // `register()` reaches APNs through the shared application, and a `swift test`
 // host holds no APNs entitlement and receives no device token. The callback
 // cases therefore build the provider with a registration trigger that does
-// nothing and deliver the AppDelegate callbacks themselves. Acceptance
-// criterion 7 requires a test in which `register()` returns a token, and a
-// `swift test` host cannot run that test.
+// nothing and deliver the AppDelegate callbacks themselves: in
+// `tokenDidRegisterResumesPendingRegistrationOnce`, `register()` returns the
+// token bytes the test delivers through `tokenDidRegister`.
 
 #if os(iOS) || os(macOS)
 

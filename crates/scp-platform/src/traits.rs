@@ -298,14 +298,16 @@ impl PushToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeSignal {
     /// The bytes the [`Push`] implementation chose as the wake signal. They
-    /// must carry no content from the notification payload (§10.7).
+    /// must not depend on the notification payload, and the implementation
+    /// copies no byte of the payload into them (§10.7).
     pub payload: Vec<u8>,
 }
 
 impl WakeSignal {
     /// Creates a wake signal holding `payload`, the bytes the [`Push`]
-    /// implementation chose to return. The caller passes bytes that carry no
-    /// content from the received notification (§10.7).
+    /// implementation chose to return. The caller passes bytes that do not
+    /// depend on the received notification and copies no byte of it into
+    /// them (§10.7).
     #[must_use]
     pub const fn new(payload: Vec<u8>) -> Self {
         Self { payload }

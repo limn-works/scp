@@ -866,7 +866,7 @@ pub enum TransportEvent {
 
 ## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (`InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling) and 2026-09-29 (`InMemoryPush` returns a fixed wake signal and copies no payload byte into it; acceptance criterion 3; `push_conformance!()` requires a fixed wake signal of every adapter, in the testing harness paragraph).
 
 **Amendment (2026-09-10 — the `KeyCustody` key types are both P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The `KeyType` enum this ADR defines named one variant per curve and now names both by purpose: `P256Signing` and `P256Agreement`. Every method contract below reads the same way afterwards — `sign` rejects an agreement-only handle, `dh_agree` rejects a signing-only handle — because the split was always a purpose split and the curve names hid that. The pseudonym derivation gains the seed-to-scalar step of §9.10.4 of the security-model spec, because P-256 has no analogue of the seed expansion RFC 8032 fixed for the superseded curve. This ADR's adapter is the in-memory testing one, so no custody claim changes.
 
@@ -1024,7 +1024,7 @@ pub trait Storage: Send + Sync {
 
 **Estimated functions:** ~4-5 per trait implementation, ~15-20 total.
 
-**Testing harness.** These in-memory adapters are consumed by the `scp-testing` crate (§16), which composes them into a full network simulation harness: `SimulatedIdentity` wraps a real `Identity` with `InMemoryKeyCustody` + `InMemoryStorage` + `InMemoryTransport` instances. Trait conformance macros (`key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`) verify that every adapter implementation — in-memory and production — satisfies the same contract.
+**Testing harness.** These in-memory adapters are consumed by the `scp-testing` crate (§16), which composes them into a full network simulation harness: `SimulatedIdentity` wraps a real `Identity` with `InMemoryKeyCustody` + `InMemoryStorage` + `InMemoryTransport` instances. Trait conformance macros (`key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`) verify that every adapter implementation — in-memory and production — satisfies the same contract. `push_conformance!()` requires each adapter to accept at least one permitted wake payload and to return one fixed, non-empty wake signal for every payload it accepts, as `16-test-infrastructure.md` §16.12.5 states; the adapter may reject any other payload. (Amended 2026-09-29; the macro previously required only that a wake signal be returned.)
 
 ---
 

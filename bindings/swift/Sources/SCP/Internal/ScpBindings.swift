@@ -15506,8 +15506,8 @@ public protocol PushProvider: AnyObject, Sendable {
     /**
      * Handle an incoming push notification `payload`.
      *
-     * An implementation returns fixed wake signal bytes that carry no content
-     * from `payload`. §10.7 of the infrastructure spec forbids a context ID, a
+     * An implementation returns fixed wake signal bytes that do not depend on
+     * `payload` and copy no byte of it. §10.7 of the infrastructure spec forbids a context ID, a
      * sender identifier, and a message count in a push payload, so the wake
      * signal names no context. No Rust code calls this method yet.
      */

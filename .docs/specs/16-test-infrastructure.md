@@ -1242,8 +1242,18 @@ macro_rules! push_conformance {
 
             #[tokio::test]
             async fn handle_notification_returns_wake() {
-                // Register, handle_notification with test payload,
-                // verify WakeSignal is returned.
+                // The adapter accepts at least one permitted wake payload:
+                // the APNs payload {"aps":{"content-available":1}}
+                // (ADR-025 criterion 4), the FCM payload
+                // {"data": {"scp": "1"}} (ADR-027), or the relay payload
+                // { "scp": 1 } (§10.7.1 step 5). It returns a non-empty
+                // WakeSignal for it. Every other payload the adapter
+                // accepts (another permitted payload, a permitted payload
+                // with trailing whitespace, or a payload carrying metadata
+                // §10.7 forbids) yields a byte-identical WakeSignal; the
+                // adapter may reject any of them instead. A signal that
+                // varied with the payload would hand the caller whatever
+                // a relay put in it, which §10.7 forbids.
             }
         }
     };
