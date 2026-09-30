@@ -2887,7 +2887,6 @@ async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
 #[tokio::test]
 async fn fused_confirm_rejects_expired_tree_leaf_as_crypto_failed() {
     use scp_clock::TestClock;
-    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
 
     let real_now = SystemClock.now_secs();
     let storage = in_memory_storage();
@@ -2913,32 +2912,8 @@ async fn fused_confirm_rejects_expired_tree_leaf_as_crypto_failed() {
         .unwrap();
 
     // Carol's leaf expires at `real_now + 600`: valid under the real clock
-    // openmls reads, expired under the actor backend's clock. Carol never
-    // commits, so her leaf keeps its KeyPackage `Lifetime` in the joined tree.
-    let inviter = ScpCredential::new(
-        "did:dht:z6MkInviterExpiredLeaf".to_owned(),
-        None,
-        scp_did::SigningKeyId::Active,
-    )
-    .unwrap();
-    let carol = ScpCredential::new(
-        "did:dht:z6MkCarolExpiredLeaf".to_owned(),
-        None,
-        scp_did::SigningKeyId::Active,
-    )
-    .unwrap();
-    let mut group = scp_mls::group::create_group(&inviter, &SystemClock).unwrap();
-    let (carol_bundle, _carol_signer, _carol_provider) = scp_mls::group::generate_key_package(
-        &carol,
-        &TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
-    )
-    .unwrap();
-    scp_mls::group::add_member(
-        &mut group,
-        carol_bundle.key_package().clone().into(),
-        &SystemClock,
-    )
-    .unwrap();
+    // openmls reads, expired under the actor backend's clock.
+    let mut group = scp_mls::group::group_holding_carol_leaf_expiring_soon(real_now).unwrap();
     let added = real_backend()
         .add_member_raw(&mut group, &public_bytes)
         .await

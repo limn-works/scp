@@ -844,7 +844,6 @@ mod tests {
     #[tokio::test]
     async fn join_from_welcome_rejects_expired_tree_leaf_and_records_no_consumed_key() {
         use scp_clock::TestClock;
-        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
 
         let real_now = SystemClock.now_secs();
         let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
@@ -860,22 +859,8 @@ mod tests {
             .unwrap();
 
         // Carol's leaf expires at `real_now + 600`: valid under the real clock
-        // openmls reads, expired under the joiner's clock. Carol never commits,
-        // so her leaf keeps its KeyPackage `Lifetime` into Bob's tree; Alice's
-        // own leaf turns `Commit`-sourced when her add commits with a path.
-        let mut alice =
-            group::create_group(&test_credential("alice-expired-leaf"), &SystemClock).unwrap();
-        let (carol_bundle, _carol_signer, _carol_provider) = group::generate_key_package(
-            &test_credential("carol-expired-leaf"),
-            &TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
-        )
-        .unwrap();
-        group::add_member(
-            &mut alice,
-            carol_bundle.key_package().clone().into(),
-            &SystemClock,
-        )
-        .unwrap();
+        // openmls reads, expired under the joiner's clock.
+        let mut alice = group::group_holding_carol_leaf_expiring_soon(real_now).unwrap();
         let added = ProductionMlsBackend::new(Arc::new(SystemClock))
             .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
             .await

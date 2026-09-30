@@ -1301,6 +1301,43 @@ pub fn join_group_from_bytes(
     })
 }
 
+/// Test fixture: Alice's group holding Carol, whose leaf is `KeyPackage`-sourced
+/// and expires at `real_now + 600`. Every clock reads `real_now` except the one
+/// that mints Carol's `KeyPackage`.
+///
+/// Carol is the member whose leaf carries a `Lifetime` into a later joiner's
+/// tree: openmls's `add_members` commits with an `UpdatePath`, which turns
+/// Alice's own leaf `Commit`-sourced, while Carol never commits, so her leaf
+/// keeps `LeafNodeSource::KeyPackage`.
+///
+/// # Errors
+///
+/// Returns the [`MlsError`] from creating the group, minting Carol's
+/// `KeyPackage`, or adding her.
+#[cfg(any(test, feature = "testing"))]
+pub fn group_holding_carol_leaf_expiring_soon(real_now: u64) -> Result<ScpMlsGroup, MlsError> {
+    use crate::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+    let credential = |name: &str| {
+        ScpCredential::new(
+            format!("did:dht:z6Mk{name}ExpiringLeaf"),
+            None,
+            scp_did::SigningKeyId::Active,
+        )
+    };
+    let now_clock = scp_clock::TestClock::new(real_now);
+    let mut alice = create_group(&credential("Alice")?, &now_clock)?;
+    let (carol_bundle, _carol_signer, _carol_provider) = generate_key_package(
+        &credential("Carol")?,
+        &scp_clock::TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
+    )?;
+    add_member(
+        &mut alice,
+        carol_bundle.key_package().clone().into(),
+        &now_clock,
+    )?;
+    Ok(alice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1865,32 +1902,15 @@ mod tests {
     // real-clock `Lifetime::validate` on the tree leaves passes and only SCP's
     // injected-clock check can reject.
 
-    /// Alice's group holding Carol, whose leaf expires at `real_now + 600`,
-    /// with Bob then added through a `KeyPackage` minted at `real_now`. Returns
-    /// the Welcome and Bob's join material.
-    ///
-    /// Carol is the member whose leaf carries a `Lifetime` into Bob's tree:
-    /// openmls's `add_members` commits with an `UpdatePath`, which turns Alice's
-    /// own leaf `Commit`-sourced, while Carol never commits, so her leaf keeps
-    /// `LeafNodeSource::KeyPackage`.
+    /// [`group_holding_carol_leaf_expiring_soon`] with Bob then added through
+    /// a `KeyPackage` minted at `real_now`. Returns the Welcome and Bob's join
+    /// material.
     #[allow(clippy::unwrap_used)]
     fn welcome_with_carol_leaf_expiring_soon(
         real_now: u64,
     ) -> (MlsMessageOut, SignatureKeyPair, InMemoryMlsProvider) {
-        use crate::lifetime::KEY_PACKAGE_LIFETIME_SECS;
         let now_clock = scp_clock::TestClock::new(real_now);
-        let mut alice = create_group(&test_credential("alice"), &now_clock).unwrap();
-        let (carol_bundle, _carol_signer, _carol_provider) = generate_key_package(
-            &test_credential("carol"),
-            &scp_clock::TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
-        )
-        .unwrap();
-        add_member(
-            &mut alice,
-            carol_bundle.key_package().clone().into(),
-            &now_clock,
-        )
-        .unwrap();
+        let mut alice = group_holding_carol_leaf_expiring_soon(real_now).unwrap();
         let (bob_bundle, bob_signer, bob_provider) =
             generate_key_package(&test_credential("bob"), &now_clock).unwrap();
         let add = add_member(
