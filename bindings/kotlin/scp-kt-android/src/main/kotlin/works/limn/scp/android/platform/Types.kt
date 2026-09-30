@@ -462,14 +462,18 @@ interface KeyCustodyProvider {
     /**
      * Derive a deterministic, context-scoped pseudonym keypair.
      *
-     * Algorithm (spec §9.10.4.A). The HMAC key is a private-derived
-     * `pseudonym_secret`, NEVER the public key (public-key keying would be a
-     * membership-enumeration oracle):
+     * Shipped algorithm. The HMAC key is a private-derived `pseudonym_secret`, NEVER the
+     * public key (public-key keying would be a membership-enumeration oracle):
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`
      *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Keystore
+     * salt="scp-pseudonym-secret-v1")`. This Ed25519 derivation diverges from spec §9.10.4
+     * and §9.10.4.A and from ADR-027 acceptance criterion 6, which key the software
+     * `pseudonym_secret` on the P-256 private scalar and turn `seed` into a P-256 keypair
+     * through the FIPS 186-5 Appendix A.2.1 seed-to-scalar step. Android software pseudonyms
+     * therefore do not match the spec §25.19 known-answer vectors. Story SCP-110 tracks the
+     * move to P-256. Keystore
      * custody ([CustodyType.HARDWARE]): [AndroidKeyCustody] computes
      * `pseudonym_secret = SHA-256(sign(keyHandle, "scp-pseudonym-secret-v1"))`.
      * [sign] returns that signature to any caller holding the custody object, so
@@ -492,7 +496,8 @@ interface KeyCustodyProvider {
      * big-endian epoch counter are mixed into the HMAC body, so each epoch yields an
      * independent, unlinkable pseudonym for the same identity and context (spec
      * §9.10.4.A). The HMAC key is the private-derived `pseudonym_secret`, NEVER the
-     * public key (public-key keying would be a membership-enumeration oracle):
+     * public key (public-key keying would be a membership-enumeration oracle). Shipped
+     * algorithm:
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || BE64(epoch) || "scp-pseudonym-v2")`
      *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
      *
@@ -500,7 +505,11 @@ interface KeyCustodyProvider {
      * so v2 at any epoch never collides with the v1 [derivePseudonym] output.
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")` — cross-platform deterministic. Keystore
+     * salt="scp-pseudonym-secret-v1")`. This Ed25519 derivation diverges from spec §9.10.4.A,
+     * which keys the software `pseudonym_secret` on the P-256 private scalar and turns `seed`
+     * into a P-256 keypair through the seed-to-scalar step of §9.10.4 (FIPS 186-5 Appendix
+     * A.2.1), so Android software pseudonyms do not match the spec §25.19 known-answer vectors.
+     * Story SCP-110 tracks the move to P-256. Keystore
      * custody ([CustodyType.HARDWARE]): [AndroidKeyCustody] computes
      * `pseudonym_secret = SHA-256(sign(keyHandle, "scp-pseudonym-secret-v1"))`.
      * [sign] returns that signature to any caller holding the custody object, so
