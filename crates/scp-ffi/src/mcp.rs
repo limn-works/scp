@@ -1939,7 +1939,7 @@ impl crate::scp::PyScp {
 
         // The GIL is released for the blocking request, so another Python
         // thread can run, including a `py_mcp_client_disconnect` that ends
-        // this call against a silent stdio server.
+        // this call against a silent stdio or SSE server.
         let outlets = py.allow_threads(|| {
             let client_guard = client.lock(handle)?;
             client_guard
@@ -4409,6 +4409,206 @@ mod tests {
         assert!(
             client_registry_of(&scp.inner).is_empty(),
             "the ended connect must leave the registry empty"
+        );
+    }
+
+    /// Reads one HTTP request from `conn`, head and `Content-Length` body, and
+    /// returns the JSON-RPC `id` of its body, or `None` for a request without
+    /// a body or without an `id` (a `GET`, or a notification).
+    #[cfg(unix)]
+    fn read_request_id(conn: &std::net::TcpStream) -> Option<serde_json::Value> {
+        use std::io::{BufRead as _, Read as _};
+        let mut reader = BufReader::new(conn);
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).ok()? == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().ok()?;
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).ok()?;
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()?
+            .get("id")
+            .cloned()
+    }
+
+    /// Answers a POST with `202 Accepted` and writes `result` under `id` on
+    /// the SSE stream, the way an SCP SSE server answers a request.
+    #[cfg(unix)]
+    fn answer_on_the_stream(
+        post: &mut std::net::TcpStream,
+        sse: &mut std::net::TcpStream,
+        id: &serde_json::Value,
+        result: &serde_json::Value,
+    ) -> Option<()> {
+        post.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+            .ok()?;
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        sse.write_all(format!("event: message\ndata: {response}\n\n").as_bytes())
+            .ok()
+    }
+
+    /// Connects `scp` through `py_mcp_client_connect_sse` to a stub server
+    /// that answers the handshake and one `tools/list`, which must succeed,
+    /// and then starts a second `tools/list` from a Python thread whose POST
+    /// the stub accepts and never answers. The stub holds every connection
+    /// open until the returned sender drops, so only closing the transport
+    /// ends that call. Returns once the stub has accepted the silent POST,
+    /// with the handle, a receiver that yields the call's error message (or
+    /// `None` if it succeeded), and the sender that releases the stub.
+    #[cfg(unix)]
+    fn start_call_on_a_silent_sse_server(
+        scp: &crate::scp::PyScp,
+    ) -> (String, CallOutcome, std::sync::mpsc::Sender<()>) {
+        pyo3::prepare_freethreaded_python();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stub");
+        let port = listener.local_addr().expect("stub address").port();
+        let (silent_tx, silent_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || -> Option<()> {
+            let mut sse = listener.accept().ok()?.0;
+            read_request_id(&sse);
+            sse.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                  event: endpoint\ndata: /message\n\n",
+            )
+            .ok()?;
+            let mut initialize = listener.accept().ok()?.0;
+            let id = read_request_id(&initialize)?;
+            let info = serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "stub"},
+            });
+            answer_on_the_stream(&mut initialize, &mut sse, &id, &info)?;
+            let mut initialized = listener.accept().ok()?.0;
+            read_request_id(&initialized);
+            initialized
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
+                .ok()?;
+            let mut answered = listener.accept().ok()?.0;
+            let id = read_request_id(&answered)?;
+            let tools = serde_json::json!({"tools": [{
+                "name": "echo",
+                "description": "echoes",
+                "inputSchema": {"type": "object"},
+            }]});
+            answer_on_the_stream(&mut answered, &mut sse, &id, &tools)?;
+            let silent = listener.accept().ok()?.0;
+            read_request_id(&silent)?;
+            let _ = silent_tx.send(());
+            let _ = release_rx.recv();
+            drop((sse, initialize, initialized, answered, silent));
+            Some(())
+        });
+        let handle = Python::with_gil(|py| {
+            scp.py_mcp_client_connect_sse(py, &format!("http://127.0.0.1:{port}/sse"), None)
+        })
+        .expect("connect to the stub server");
+        let listed = Python::with_gil(|py| {
+            scp.py_mcp_client_list_tools(py, &handle)
+                .map(|tools| tools.bind(py).to_string())
+        })
+        .expect("a tools/list the server answers must succeed");
+        assert!(listed.contains("echo"), "unexpected tools: {listed}");
+
+        let caller = crate::scp::PyScp {
+            inner: Arc::clone(&scp.inner),
+        };
+        let call_handle = handle.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let error = Python::with_gil(|py| {
+                caller
+                    .py_mcp_client_list_tools(py, &call_handle)
+                    .err()
+                    .map(|e| e.to_string())
+            });
+            let _ = done_tx.send(error);
+        });
+        silent_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second tools/list must reach the stub");
+        (handle, done_rx, release_tx)
+    }
+
+    /// Asserts that the in-flight SSE call ended within two seconds of
+    /// `stopped_at` and failed because its transport was closed.
+    #[cfg(unix)]
+    fn assert_closed_in_flight(done_rx: &CallOutcome, stopped_at: std::time::Instant) {
+        let error = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("closing the transport must end the SSE call in flight")
+            .expect("the silent stub sent no tools/list response");
+        assert!(
+            stopped_at.elapsed() < std::time::Duration::from_secs(2),
+            "the call must end at once, not on a read timeout"
+        );
+        assert!(
+            error.contains("tools/list failed") && error.contains("SSE connection is closed"),
+            "the call must fail on its closed transport, got: {error}"
+        );
+    }
+
+    /// `py_mcp_client_disconnect`, called from a second Python thread, ends
+    /// a `tools/list` in flight on an SSE client whose server accepted the
+    /// POST and never answers: the state's drop shuts the POST's socket down.
+    /// The handle then fails as not found.
+    #[cfg(unix)]
+    #[test]
+    fn disconnect_ends_an_sse_call_in_flight() {
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let (handle, done_rx, release) = start_call_on_a_silent_sse_server(&scp);
+
+        let disconnector = crate::scp::PyScp {
+            inner: Arc::clone(&scp.inner),
+        };
+        let disconnected = handle.clone();
+        let stopped_at = std::time::Instant::now();
+        run_on_a_second_python_thread(move |_py| {
+            disconnector
+                .py_mcp_client_disconnect(&disconnected)
+                .expect("disconnect a known handle");
+        });
+
+        assert_closed_in_flight(&done_rx, stopped_at);
+        drop(release);
+        let after = Python::with_gil(|py| scp.py_mcp_client_list_tools(py, &handle))
+            .expect_err("a disconnected handle must refuse a call")
+            .to_string();
+        assert!(after.contains("not found"), "got: {after}");
+    }
+
+    /// Instance shutdown clears the client registry while a `tools/list` is
+    /// in flight on an SSE client whose server never answers; the state's
+    /// drop closes the transport, as a disconnect does, and the call ends.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_ends_an_sse_call_in_flight() {
+        crate::init_runtime().expect("tokio runtime for SCP.shutdown");
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let (_handle, done_rx, release) = start_call_on_a_silent_sse_server(&scp);
+
+        let owner = crate::scp::PyScp {
+            inner: Arc::clone(&scp.inner),
+        };
+        let stopped_at = std::time::Instant::now();
+        run_on_a_second_python_thread(move |py| {
+            owner.shutdown(py, 1_000).expect("shut the instance down");
+        });
+
+        assert_closed_in_flight(&done_rx, stopped_at);
+        drop(release);
+        assert!(
+            client_registry_of(&scp.inner).is_empty(),
+            "shutdown must clear the client registry"
         );
     }
 
