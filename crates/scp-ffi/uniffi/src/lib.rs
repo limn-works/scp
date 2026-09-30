@@ -439,8 +439,7 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// # Default
     ///
     /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. The Swift `AppleKeyCustody` overrides this with a real
-    /// implementation. No Kotlin class implements this callback: the Kotlin
+    /// implemented. No Kotlin class implements this callback: the Kotlin
     /// `AndroidKeyCustody` implements the Kotlin SDK's own `KeyCustodyProvider`
     /// interface, and no code passes it to the Rust engine. Third-party
     /// `KeyCustodyProvider` implementations that do not need governance vote
