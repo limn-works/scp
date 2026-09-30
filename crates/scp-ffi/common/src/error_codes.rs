@@ -550,10 +550,11 @@ pub const CTX_2096: &str = "SCP-CTX-2096";
 /// - the checked role read, when an actor registers while it classifies a
 ///   miss.
 ///
-/// A retry after a per-context actor fault reads the context's current
-/// state, which can be an answer, `CTX_2135` while a respawn of a terminated
-/// actor runs, or `CTX_2134` once the watchdog poisons the context. A retry
-/// after any other producer reaches that producer again and reads no context
+/// A retry after a per-context actor fault or a checked role read reads the
+/// context's current state, which can be an answer, `CTX_2135` while a
+/// respawn of a terminated actor runs or after a failed respawn, or `CTX_2134`
+/// once the watchdog poisons the context. A retry after the key-package actor
+/// or `start_saga` reaches that producer again and reads no context
 /// lifecycle state. `CTX_2135` is retryable only while a respawn runs, and
 /// `CTX_2134` is not retryable until an operator clears the poison or the
 /// process restarts.

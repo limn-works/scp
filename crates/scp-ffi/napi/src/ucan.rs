@@ -483,10 +483,9 @@ pub(crate) async fn ucan_mint_on(
 
     // Get ceiling from the context handle for mint-time enforcement (#339).
     // Always `Some`, because `None` makes the runtime apply `default_ceiling()`.
-    // An empty ceiling is the deny-all ceiling the caller declared with `[]`
-    // and the actor enforces, so it stays empty: context creation resolves an
-    // omitted ceiling to `default_ceiling()`, so an empty one is always
-    // declared.
+    // The handle's ceiling equals the ceiling the context actor holds, so an
+    // empty one is the actor's deny-all ceiling and stays empty; widening it
+    // would let this mint admit what the actor refuses.
     let ceiling = Some(
         handle
             .ceiling()
@@ -612,10 +611,9 @@ pub(crate) async fn ucan_delegate_on(
 
     // Get ceiling from the context handle for delegation-time enforcement (#339).
     // Always `Some`, because `None` makes the runtime apply `default_ceiling()`.
-    // An empty ceiling is the deny-all ceiling the caller declared with `[]`
-    // and the actor enforces, so it stays empty: context creation resolves an
-    // omitted ceiling to `default_ceiling()`, so an empty one is always
-    // declared.
+    // The handle's ceiling equals the ceiling the context actor holds, so an
+    // empty one is the actor's deny-all ceiling and stays empty; widening it
+    // would let this mint admit what the actor refuses.
     let ceiling = Some(
         handle
             .ceiling()

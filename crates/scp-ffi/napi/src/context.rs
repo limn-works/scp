@@ -1471,10 +1471,7 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(NapiError::from(ScpNapiError::Context {
-                message: format!("context_join_from_welcome failed: {e}"),
-                code: codes::CTX_2013.to_owned(),
-            }));
+            return Err(NapiError::from(welcome_join_error(&e)));
         }
     };
 
@@ -5578,6 +5575,24 @@ fn parse_template_id_napi(
     }
 }
 
+/// Maps a failed `spawn_actor_from_welcome` to the bridge error.
+///
+/// `ActorBusy` keeps its retryable `SCP-CTX-2130` code (ADR-049 §10): an
+/// actor the join needed, such as the joiner's key-package actor, gave no
+/// answer, and a fresh call can complete the join. Every other failure is
+/// `SCP-CTX-2013`.
+fn welcome_join_error(e: &scp_core::context::ContextError) -> ScpNapiError {
+    let code = if matches!(e, scp_core::context::ContextError::ActorBusy(_)) {
+        codes::CTX_2130
+    } else {
+        codes::CTX_2013
+    };
+    ScpNapiError::Context {
+        message: format!("context_join_from_welcome failed: {e}"),
+        code: code.to_owned(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -6818,6 +6833,29 @@ mod tests {
                 "a refused subscribe must reset the subscription flag ({fault})"
             );
         }
+    }
+
+    /// A Welcome join that meets a busy actor keeps the retryable
+    /// `SCP-CTX-2130` code, and any other failure reads `SCP-CTX-2013`.
+    #[test]
+    fn welcome_join_error_keeps_actor_busy_retryable() {
+        use scp_core::context::ContextError;
+        let code_of = |e: crate::error::ScpNapiError| match e {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected ScpNapiError::Context, got {other:?}"),
+        };
+        assert_eq!(
+            code_of(super::welcome_join_error(&ContextError::ActorBusy(
+                "key-package actor".to_owned()
+            ))),
+            codes::CTX_2130
+        );
+        assert_eq!(
+            code_of(super::welcome_join_error(&ContextError::MembershipFailed(
+                "bad welcome".to_owned()
+            ))),
+            codes::CTX_2013
+        );
     }
 
     // -------------------------------------------------------------------

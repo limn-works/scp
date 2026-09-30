@@ -1656,11 +1656,13 @@ fn build_ucan_context_state(
     // agreement on one canonical form (BLACK-003), and still rejects a
     // no-colon `payments` that would otherwise be widened to `payments:*`.
     //
-    // An empty `user_ceiling` stays empty. `parse_context_params` already
-    // resolved an omitted ceiling to `default_ceiling()`, so an empty one here
-    // is a declared deny-all ceiling that the supervisor installed verbatim on
-    // the actor; widening it would let this bridge's mint, delegate and
-    // validate checks admit what the actor refuses.
+    // An empty `user_ceiling` stays empty. Every caller passes either the
+    // ceiling the context actor holds (the parsed params a NAPI create
+    // installs, or a handle's ceiling) or the explicit `default_ceiling()` a
+    // Welcome join registers before its spawn, so an empty one is the actor's
+    // deny-all ceiling, whichever client created the context; widening it
+    // would let this bridge's mint, delegate and validate checks admit what
+    // the actor refuses.
     let mut capabilities = Vec::with_capacity(user_ceiling.len());
     for entry in user_ceiling {
         // Fail-closed: a malformed capability string (deleted legacy

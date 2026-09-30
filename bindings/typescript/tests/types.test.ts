@@ -62,19 +62,11 @@ describe("type definitions", () => {
     expect(params.ceiling).toHaveLength(2);
   });
 
-  it("ContextParams may omit the ceiling, which serializes with no ceiling key", () => {
-    // An absent ceiling is the bridge's cue to apply the default ceiling, so
-    // the serialized params must carry no `ceiling` key at all.
+  it("ContextParams may omit the ceiling", () => {
+    // Type-level only: the bridge's reading of an absent and an empty ceiling
+    // is tested against the real addon in real-napi.test.ts.
     const params: ContextParams = { mode: "Encrypted" };
     expect(params.ceiling).toBeUndefined();
-    expect(Object.hasOwn(JSON.parse(JSON.stringify(params)), "ceiling")).toBe(false);
-  });
-
-  it("ContextParams keeps an empty ceiling as an empty array when serialized", () => {
-    // An empty ceiling is deny-all at the bridge; serialization must not drop
-    // it, or the bridge would read it as absent and apply the default.
-    const params: ContextParams = { ceiling: [] };
-    expect(JSON.parse(JSON.stringify(params)).ceiling).toEqual([]);
   });
 
   it("ContextParams accepts all optional fields", () => {

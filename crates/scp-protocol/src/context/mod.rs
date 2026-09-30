@@ -554,10 +554,11 @@ pub enum ContextError {
     /// `REPLY_TIMEOUT`; the per-identity key-package actor on the same
     /// faults; `start_saga`, when the saga's participant context set overlaps
     /// an in-flight saga; and the checked role read, when an actor registers
-    /// while it classifies a miss. A retry after a per-context actor fault
-    /// reads the context's current state and can meet a respawning or
-    /// poisoned context rather than a live actor; a retry after any other
-    /// producer reads no context lifecycle state. Distinct from
+    /// while it classifies a miss. A retry after a per-context actor fault or
+    /// a checked role read reads the context's current state and can meet a
+    /// respawning, failed-respawn, or poisoned context rather than a live
+    /// actor; a retry after the key-package actor or `start_saga` reads no
+    /// context lifecycle state. Distinct from
     /// [`Self::RateLimited`], which rejects pre-mailbox on capability
     /// grounds.
     ///

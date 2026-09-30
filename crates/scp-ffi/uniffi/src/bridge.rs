@@ -23474,8 +23474,9 @@ mod tests {
     }
 
     /// ADR-049 §10: `ContextError::ActorBusy` must surface the dedicated
-    /// retryable SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001, so the
-    /// Swift and Kotlin SDKs see the same code as the NAPI and `PyO3` bridges.
+    /// retryable SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001, as the
+    /// NAPI and `PyO3` translators do. The code reaches Swift and Kotlin only
+    /// where the failing operation routes its error through this translator.
     #[test]
     fn actor_busy_surfaces_ctx_2130() {
         let err: ScpError = scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
