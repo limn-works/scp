@@ -3038,10 +3038,10 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// "The instance its provider reads" is pinned by `serve_path`: each of its
 /// pins occurs exactly once in the text of `serve_fn` (the binding of the
 /// instance, the provider's `Weak` over it, and the `mcp_server_bundle` call
-/// on it), and `let bi` occurs exactly as often as the pins bind `bi` or
-/// `bi_arc`, so no other `let` rebinds either name before the call. A
-/// rebinding through a pattern, closure parameter or `match` arm is not
-/// checked.
+/// on it), and `let bi` and `let mut bi` together occur exactly as often as
+/// the pins bind `bi` or `bi_arc`, so no other `let` rebinds either name
+/// before the call. A rebinding through a pattern, closure parameter or
+/// `match` arm is not checked.
 ///
 /// "The Supervisor's receiver" is pinned by the `match` that binds it: its
 /// scrutinee is exactly `supervisor_of_bi`, the bridge's accessor for its own
@@ -3100,15 +3100,15 @@ fn serves_the_supervisor_event_source(
         let (pins, instance_lets) = serve_path;
         pins.iter().all(|pin| body.matches(pin).count() == 1)
             && body.matches("mcp_server_bundle(").count() == 1
-            && body.matches("let bi").count() == instance_lets
+            && body.matches("let bi").count() + body.matches("let mut bi").count() == instance_lets
     });
     bundle_wired && serve_uses_bundle && code.matches("with_optional_event_source(").count() == 1
 }
 
 /// A serve path's pins (see [`serves_the_supervisor_event_source`]): the
 /// statements that must each occur once in the serve function, and how many
-/// `let bi` bindings (of `bi` or `bi_arc`) the function holds, all of them
-/// among the pins. The function must also call `mcp_server_bundle` only once,
+/// `let bi` bindings (of `bi` or `bi_arc`, none of them `let mut`) the
+/// function holds, all of them among the pins. The function must also call `mcp_server_bundle` only once,
 /// in its pinned call.
 type ServePath = (&'static [&'static str], usize);
 
@@ -3298,7 +3298,8 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 /// The event-source gate must go red when the serve path hands
 /// `mcp_server_bundle` an instance other than the one its provider reads:
 /// another instance in the call, a provider over another instance, `bi`
-/// rebound before the call, or a second call over another instance.
+/// rebound (by `let` or `let mut`) before the call, or a second call over
+/// another instance.
 #[test]
 fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
     let wired = WIRED_BUNDLE;
@@ -3318,6 +3319,11 @@ fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
         "    let server = mcp_server_bundle(bi, provider);",
         "    let bi = &other_instance;\n    let server = mcp_server_bundle(bi, provider);",
     );
+    // The same rebinding through `let mut`.
+    let serve_bi_rebound_mut = wired.replace(
+        "    let server = mcp_server_bundle(bi, provider);",
+        "    let mut bi = &other_instance;\n    let server = mcp_server_bundle(bi, provider);",
+    );
     // The pinned call survives, and a second call over another instance
     // builds the server the serve path runs.
     let second_call = wired.replace(
@@ -3329,6 +3335,7 @@ fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
         serve_other_instance,
         provider_other_instance,
         serve_bi_rebound,
+        serve_bi_rebound_mut,
         second_call,
     ] {
         assert_ne!(regression, wired);
