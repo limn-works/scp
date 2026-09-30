@@ -108,9 +108,10 @@ const DEFAULT_RETRY_MS: u64 = 3000;
 /// up to the outlet's timeout. Third, the event pump holds `state.server`
 /// while it computes and broadcasts one event's notifications or a lagged
 /// resync, and computing them runs the provider's re-authorization calls
-/// (`active_context_ids`, `validate_resource_access`), which on the `UniFFI`
-/// bridge are `block_in_place` actor round-trips. No outlet timeout bounds
-/// the pump's hold.
+/// (`active_context_ids`, `validate_resource_access`), which are
+/// `block_in_place` actor round-trips on every bridge, because a pump runs
+/// only when a supervisor is attached. No outlet timeout bounds the pump's
+/// hold.
 const EVICTION_WAIT: Duration = Duration::from_secs(5);
 
 /// Configuration for the SSE transport server.
@@ -930,8 +931,9 @@ async fn pump_events<P: ContextProvider + 'static>(
 
         // Contention trade-off, kept deliberately: the session mutex is held
         // across BOTH the provider re-authorization calls
-        // (`validate_resource_access`, `active_context_ids`), which on the
-        // UniFFI bridge are `block_in_place` actor round-trips, AND the
+        // (`validate_resource_access`, `active_context_ids`), which are
+        // `block_in_place` actor round-trips on every bridge, because a pump
+        // runs only when a supervisor is attached, AND the
         // broadcast — so a burst of events briefly serializes POST handlers
         // behind the pump. Holding the lock across the broadcast is required,
         // not incidental: releasing it before emitting would (a) let
