@@ -104,6 +104,12 @@ pub enum MlsError {
     #[error("member not found at leaf index {0}")]
     MemberNotFound(u32),
 
+    /// More than one leaf's credential claims the requested DID, and it is not
+    /// the local member's DID. The credential DID is self-asserted, so the
+    /// lookup cannot tell which leaf the DID's holder controls and fails closed.
+    #[error("more than one leaf claims DID {0}")]
+    DuplicateMemberDid(String),
+
     /// A join was attempted with a `KeyPackage` whose HPKE init key is already
     /// in the durable consumed-init-key set — a replay of a single-use
     /// `KeyPackage`, rejected at the crypto layer (ADR-049 §9 two-anchor

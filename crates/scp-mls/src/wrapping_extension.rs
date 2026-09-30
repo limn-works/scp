@@ -145,27 +145,53 @@ pub fn extract_own_wrapping_key(
 /// Extracts the `scp_wrapping_key` from a member's `LeafNode`, identified by
 /// their DID in the SCP credential.
 ///
-/// Works for the local member and for every remote member: the member's leaf
-/// index comes from [`find_leaf_index_by_did`], and its `LeafNode` from
-/// `MlsGroup::public_group().leaf(index)` (public since openmls 0.9.0).
+/// When `target_did` is the local member's DID, the lookup resolves to the
+/// local member's own leaf, even when other leaves claim the same DID. For
+/// any other DID, exactly one leaf must claim it; its `LeafNode` comes from
+/// `MlsGroup::public_group().leaf(index)` (public since openmls 0.9.0). A
+/// credential DID is self-asserted, so two leaves claiming one remote DID
+/// fail closed rather than returning whichever leaf sorts first.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
 /// Returns [`MlsError::MemberNotFound`] if no member carries `target_did`, or
 ///   the member's leaf is absent from the tree.
+/// Returns [`MlsError::DuplicateMemberDid`] if more than one leaf claims a
+///   `target_did` that is not the local member's DID.
 /// Returns [`MlsError::ExtensionError`] if the extension data is malformed.
 pub fn extract_member_wrapping_key(
     group: &crate::group::ScpMlsGroup,
     target_did: &str,
 ) -> Result<Option<[u8; X25519_PUBLIC_KEY_SIZE]>, MlsError> {
     let g = group.inner()?;
-    let idx = find_leaf_index_by_did(g, target_did)?;
+    if let Some(own) = g.own_leaf_node()
+        && credential_did(own.credential()).as_deref() == Some(target_did)
+    {
+        return extract_wrapping_key(own.extensions());
+    }
+    let mut claims = g
+        .members()
+        .filter(|m| credential_did(&m.credential).as_deref() == Some(target_did))
+        .map(|m| m.index);
+    let idx = claims.next().ok_or(MlsError::MemberNotFound(u32::MAX))?;
+    if claims.next().is_some() {
+        return Err(MlsError::DuplicateMemberDid(target_did.to_owned()));
+    }
     let leaf = g
         .public_group()
         .leaf(idx)
         .ok_or_else(|| MlsError::MemberNotFound(idx.u32()))?;
     extract_wrapping_key(leaf.extensions())
+}
+
+/// The DID in an SCP `BasicCredential`, or `None` when the credential is not
+/// one.
+fn credential_did(credential: &Credential) -> Option<String> {
+    let basic = BasicCredential::try_from(credential.clone()).ok()?;
+    crate::credential::ScpCredential::from_bytes(basic.identity())
+        .ok()
+        .map(|c| c.did)
 }
 
 /// Finds a member's leaf index by their DID in the SCP credential.
@@ -374,6 +400,59 @@ mod tests {
             extract_member_wrapping_key(&alice_group, &carol_cred.did),
             Err(MlsError::MemberNotFound(_))
         ));
+    }
+
+    /// Two leaves claim Bob's DID (leaf 1, then leaf 2). A remote lookup of
+    /// that DID fails closed, while the member at leaf 2 resolves its own DID to
+    /// its own leaf, not to the lower-indexed leaf 1 a first-match scan returns.
+    #[test]
+    fn extract_member_wrapping_key_duplicate_did_fails_closed_except_for_own_did() {
+        let alice_cred = test_credential("alice");
+        let alice_wrapping = [0xA1_u8; 32];
+        let mut alice_group = crate::group::create_group_with_wrapping_key(
+            &alice_cred,
+            Some(&alice_wrapping),
+            &SystemClock,
+        )
+        .unwrap();
+
+        let bob_cred = test_credential("bob");
+        let mut add_bob = |wrapping: [u8; 32]| {
+            let (kp, signer, provider) = crate::group::generate_key_package_with_wrapping_key(
+                &bob_cred,
+                Some(&wrapping),
+                &SystemClock,
+            )
+            .unwrap();
+            let kp_in: KeyPackageIn = kp.key_package().clone().into();
+            let added = crate::group::add_member(&mut alice_group, kp_in, &SystemClock).unwrap();
+            (added, signer, provider)
+        };
+        let _first = add_bob([0xB1_u8; 32]);
+        let (second, second_signer, second_provider) = add_bob([0xB2_u8; 32]);
+        let second_group = crate::group::join_group(
+            &second.welcome,
+            second_provider,
+            second_signer,
+            &SystemClock,
+        )
+        .unwrap();
+        assert_eq!(second_group.own_leaf_index().unwrap().u32(), 2);
+
+        assert!(matches!(
+            extract_member_wrapping_key(&alice_group, &bob_cred.did),
+            Err(MlsError::DuplicateMemberDid(did)) if did == bob_cred.did
+        ));
+        assert_eq!(
+            extract_member_wrapping_key(&second_group, &bob_cred.did).unwrap(),
+            Some([0xB2_u8; 32]),
+            "the local member's own DID resolves to its own leaf"
+        );
+        assert_eq!(
+            extract_member_wrapping_key(&second_group, &alice_cred.did).unwrap(),
+            Some(alice_wrapping),
+            "a DID exactly one leaf claims still resolves"
+        );
     }
 
     /// AC: advance MLS epoch via Commit -> extract LeafNode -> scp_wrapping_key
