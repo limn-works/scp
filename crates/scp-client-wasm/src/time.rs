@@ -41,22 +41,24 @@
 //!   (add-member / key-package-DID) and pre-merge on staged-commit Add proposals
 //!   — and the RFC 9420 maximum-range bound openmls never enforces is added
 //!   there too.
-//! - **Welcome tree leaves are bracketed (V3).** openmls 0.9.0 exposes
-//!   `MlsGroup::treesync()`, so `treesync().full_leaves()` with
-//!   `leaf_node_source()` reaches every joined-tree leaf's
+//! - **Welcome tree leaves: one check, against this module's clock (V3).**
+//!   openmls 0.9.0 exposes `MlsGroup::treesync()`, so `treesync().full_leaves()`
+//!   with `leaf_node_source()` reaches every joined-tree leaf's
 //!   `LeafNodeSource::KeyPackage(Lifetime)`. `scp_mls::group::join_group_from_bytes`
-//!   re-validates every KeyPackage-sourced leaf against the injected hardened
-//!   clock, with the maximum-range bound, after `into_group` and before the
-//!   group is adopted.
-//! - **Residual: openmls's internal check still runs.** openmls 0.9.0's
-//!   internal checks call `Lifetime::validate`, never `validate_with_time` with
-//!   a caller's time, so its own check inside `KeyPackageIn::validate`,
-//!   `process_message`, and Welcome processing still reads `web_time`'s
+//!   switches openmls's own tree-leaf `Lifetime` check off
+//!   (`skip_lifetime_validation`) and validates every KeyPackage-sourced leaf
+//!   against the injected hardened clock, with the maximum-range bound, after
+//!   `into_group` and before the group is adopted. `Date.now()` plays no part
+//!   in a Welcome's `Lifetime` decision.
+//! - **Residual: openmls's internal check still runs on two paths.** openmls
+//!   0.9.0's internal checks call `Lifetime::validate`, never
+//!   `validate_with_time` with a caller's time, so its own check inside
+//!   `KeyPackageIn::validate` and `process_message` still reads `web_time`'s
 //!   `Date.now()`, in addition to SCP's checks. Prerequisite 1's one-clock
-//!   criterion is therefore not yet met. Every accept decision also needs
-//!   SCP's check against this module's clock, so openmls's clock can only add
-//!   rejections: a page script that overrides `Date.now()` can make an honest
-//!   `KeyPackage`, commit, or Welcome fail, but cannot get a forged `Lifetime`
+//!   criterion is therefore not yet met. Every accept decision on those paths
+//!   also needs SCP's check against this module's clock, so openmls's clock can
+//!   only add rejections: a page script that overrides `Date.now()` can make an
+//!   honest `KeyPackage` or commit fail, but cannot get a forged `Lifetime`
 //!   accepted. Page same-origin integrity (CSP/SRI/COOP/COEP) stays
 //!   load-bearing only against that denial of service, not for `Lifetime`
 //!   acceptance.

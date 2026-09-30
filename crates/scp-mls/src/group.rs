@@ -550,10 +550,10 @@ fn create_group_inner(
     // Create the MLS group with the creator as the sole member. The creator's
     // own `LeafNode` `Lifetime` was routed through the injected `Clock` via the
     // `.lifetime(...)` call on the create-config builder above (ADR-057
-    // §Prereq-1). On the receive side, `join_group_from_bytes` brackets every
+    // §Prereq-1). On the receive side, `join_group_from_bytes` validates every
     // KeyPackage-sourced Welcome tree leaf against the injected clock, and
-    // openmls's internal `Lifetime::validate` also runs on those leaves — see the
-    // module docs in `crate::lifetime`.
+    // switches openmls's own check on those leaves off — see the module docs in
+    // `crate::lifetime`.
     let group = MlsGroup::new(
         &provider,
         &signer,
@@ -1153,10 +1153,11 @@ fn generate_key_package_inner(
     // clock — under the wasm `js` feature `web_time::SystemTime`, an
     // attacker-overridable `Date.now()`. Generation is fully routed. On the
     // receive side, add_member / key_package_in_did / the staged-commit Add
-    // paths re-validate accepted `Lifetime`s against the injected clock, and
-    // `join_group_from_bytes` brackets every KeyPackage-sourced Welcome tree
-    // leaf against it; openmls's internal `Lifetime::validate` also runs on each
-    // of those paths (see `crate::lifetime` module docs).
+    // paths re-validate accepted `Lifetime`s against the injected clock, with
+    // openmls's internal `Lifetime::validate` also running on them, and
+    // `join_group_from_bytes` validates every KeyPackage-sourced Welcome tree
+    // leaf against it as the only check on those leaves (see `crate::lifetime`
+    // module docs).
     let key_package_bundle = builder
         .key_package_lifetime(key_package_lifetime(clock))
         .build(SCP_CIPHERSUITE, &provider, &signer, credential_with_key)
@@ -1269,19 +1270,27 @@ pub fn join_group_from_bytes(
         .use_ratchet_tree_extension(true)
         .build();
 
-    let staged_welcome = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
+    // openmls's own tree-leaf `Lifetime` check reads openmls's clock (wasm:
+    // `web_time`'s `Date.now()`), so it is switched off here and
+    // `validate_tree_leaf_lifetimes` below is the only tree-leaf lifetime check,
+    // against the injected clock (ADR-057 §Prereq-1). The skip covers only that
+    // check; openmls still runs the rest of its leaf validation.
+    let staged_welcome = StagedWelcome::build_from_welcome(&provider, &join_config, welcome)
+        .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?
+        .skip_lifetime_validation()
+        .build()
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
 
     let group = staged_welcome
         .into_group(&provider)
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
 
-    // SECURITY (ADR-057 §Prereq-1): openmls validated each KeyPackage-sourced
-    // tree leaf's `Lifetime` inside `new_from_welcome` against its own clock
-    // (wasm: `web_time`'s `Date.now()`). Re-validate every such leaf against the
-    // injected hardened clock, with the RFC 9420 maximum-range bound, before the
-    // group is adopted. On failure the `MlsGroup` and the provider it wrote into
-    // are dropped here and the caller never receives a group.
+    // SECURITY (ADR-057 §Prereq-1): validate every KeyPackage-sourced tree
+    // leaf's `Lifetime` against the injected hardened clock, with the RFC 9420
+    // maximum-range bound, before the group is adopted. This is the only
+    // tree-leaf lifetime check on the Welcome path. On failure the `MlsGroup`
+    // and the provider it wrote into are dropped here and the caller never
+    // receives a group.
     validate_tree_leaf_lifetimes(&group, clock)?;
 
     Ok(ScpMlsGroup {
@@ -1931,6 +1940,49 @@ mod tests {
         let bob_clock = scp_clock::TestClock::new(real_now);
         let bob = join_group(&welcome, bob_provider, bob_signer, &bob_clock).unwrap();
         assert_eq!(bob.members().unwrap().len(), 3);
+    }
+
+    /// `validate_tree_leaf_lifetimes` is the only Welcome tree-leaf lifetime
+    /// check: a leaf that is valid under the injected clock joins even when
+    /// openmls's own clock (the real one here) would call it not yet valid.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn join_accepts_tree_leaf_valid_under_injected_clock_but_not_yet_valid_under_real_clock() {
+        let real_now = SystemClock.now_secs();
+        let one_day = 24 * 60 * 60;
+        let future_clock = scp_clock::TestClock::new(real_now + one_day);
+
+        // Alice's own leaf is KeyPackage-sourced, with a `Lifetime` built from a
+        // clock one day ahead: its not_before lies after the real clock's now,
+        // so openmls's real-clock check calls it not yet valid, and the
+        // injected clock one day ahead calls it valid.
+        let mut alice = create_group(&test_credential("alice"), &future_clock).unwrap();
+
+        let (bob_bundle, bob_signer, bob_provider) =
+            generate_key_package(&test_credential("bob"), &SystemClock).unwrap();
+        // Alice adds Bob without an UpdatePath, so her leaf keeps its
+        // KeyPackage source (and its future `Lifetime`) in the Welcome's tree.
+        // SCP's `add_member` commits through `add_members`, whose UpdatePath
+        // makes her leaf Commit-sourced and takes it out of the lifetime check;
+        // a non-SCP member of the group can commit without a path.
+        let welcome = {
+            let signer = alice.signer.as_ref().unwrap();
+            let g = alice.group.as_mut().unwrap();
+            let (_commit, welcome, _group_info) = g
+                .add_members_without_update(
+                    &alice.provider,
+                    signer,
+                    &[bob_bundle.key_package().clone()],
+                )
+                .unwrap();
+            g.merge_pending_commit(&alice.provider).unwrap();
+            welcome
+        };
+
+        // Bob's injected clock is one day ahead, inside Alice's and Bob's
+        // `Lifetime`s, so every KeyPackage-sourced leaf is valid under it.
+        let bob = join_group(&welcome, bob_provider, bob_signer, &future_clock).unwrap();
+        assert_eq!(bob.members().unwrap().len(), 2);
     }
 
     #[test]

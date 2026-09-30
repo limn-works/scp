@@ -19,8 +19,10 @@
 //!
 //! `openmls` 0.9.0 reads its own clock in `Lifetime::new`, `Lifetime::default`,
 //! and the `Lifetime::validate` its internal checks run, and offers no way to
-//! route those reads through a caller's clock. It exposes two caller-side entry
-//! points that take the time from the caller, and this module uses both:
+//! route those reads through a caller's clock. Only its Welcome tree-leaf check
+//! can be switched off, and SCP switches it off (see below). It exposes two
+//! caller-side entry points that take the time from the caller, and this module
+//! uses both:
 //! [`Lifetime::init`](openmls::prelude::Lifetime), a pure constructor that takes
 //! caller-supplied `not_before`/`not_after` bounds, and
 //! `Lifetime::validate_with_time(now)`, new in 0.9.0. This module:
@@ -39,19 +41,21 @@
 //!   (`crates/scp-mls/src/ratchet.rs`), a path only tests call, merges a
 //!   Commit's staged Add proposals without the pre-merge check.
 //!
-//! # openmls's internal check still runs, and SCP brackets it
+//! # openmls's internal check, bracketed or switched off
 //!
-//! openmls's own `Lifetime::validate` still runs inside `KeyPackageIn::validate`,
-//! `process_message`, and Welcome processing, against openmls's internal clock
-//! (the real wall clock natively; the attacker-overridable `Date.now()` through
-//! `web_time` on wasm), because those checks call `validate`, never
-//! `validate_with_time` with a caller's time. This is the residual ADR-057
-//! Prerequisite 1 records: there are still two clocks. SCP brackets every
-//! production accept path against the injected clock, in addition to that
-//! internal check and never in place of it, so an accept decision needs both
-//! checks to pass and openmls's clock can only add rejections. A page script that overrides
-//! `Date.now()` can make an honest `KeyPackage`, commit, or Welcome fail, but
-//! cannot get a forged `Lifetime` accepted. The bracketed paths:
+//! openmls's own `Lifetime::validate` still runs inside `KeyPackageIn::validate`
+//! and `process_message`, against openmls's internal clock (the real wall clock
+//! natively; the attacker-overridable `Date.now()` through `web_time` on wasm),
+//! because those checks call `validate`, never `validate_with_time` with a
+//! caller's time, and neither can be switched off. This is the residual ADR-057
+//! Prerequisite 1 records: there are still two clocks. SCP brackets both paths
+//! against the injected clock, in addition to that internal check and never in
+//! place of it, so an accept decision needs both checks to pass and openmls's
+//! clock can only add rejections. A page script that overrides `Date.now()` can
+//! make an honest `KeyPackage` or commit fail, but cannot get a forged
+//! `Lifetime` accepted. On the Welcome path openmls's tree-leaf check is
+//! switched off and SCP's check is the only one, so there openmls's clock is
+//! never read for a `Lifetime`. The paths:
 //!
 //! - `KeyPackageIn::validate`: [`crate::group::add_member`],
 //!   [`crate::group::key_package_in_did`], and the runtime backend's
@@ -61,18 +65,22 @@
 //!   [`crate::encrypt::decrypt_with_sender_did`] and
 //!   [`crate::encrypt::decrypt_with_membership_changes`], checked before the
 //!   merge.
-//! - Welcome tree leaves: `validate_tree_leaf_lifetimes`, called by
-//!   [`crate::group::join_group_from_bytes`] after `StagedWelcome::into_group`
-//!   and before it builds the `ScpMlsGroup`. openmls 0.9.0 exposes
-//!   `MlsGroup::treesync()`, and `TreeSync::full_leaves()` yields every
-//!   non-blank leaf of the joined tree with its
-//!   `LeafNodeSource::KeyPackage(Lifetime)`.
+//! - Welcome tree leaves, the one check: [`crate::group::join_group_from_bytes`]
+//!   builds the staged Welcome through
+//!   `StagedWelcome::build_from_welcome(...)?.skip_lifetime_validation().build()`,
+//!   which switches off openmls's tree-leaf `Lifetime` check and keeps the rest
+//!   of its leaf validation, then calls `validate_tree_leaf_lifetimes` after
+//!   `StagedWelcome::into_group` and before it builds the `ScpMlsGroup`.
+//!   openmls 0.9.0 exposes `MlsGroup::treesync()`, and `TreeSync::full_leaves()`
+//!   yields every non-blank leaf of the joined tree with its
+//!   `LeafNodeSource::KeyPackage(Lifetime)`, the same leaf set openmls's
+//!   switched-off check covered.
 //!
 //! # Test-clock realism constraint (IMPORTANT)
 //!
 //! Because openmls's un-injectable internal `validate`/`Lifetime::new` still
 //! runs against the **real** system clock at every openmls validation/generation
-//! site — including every KeyPackage-sourced leaf of a Welcome's tree — an injected [`Clock`](scp_clock::Clock) used in a test must sit within
+//! site (every one except a Welcome's tree leaves) — an injected [`Clock`](scp_clock::Clock) used in a test must sit within
 //! `(real_now - KEY_PACKAGE_LIFETIME_SECS, real_now + KEY_PACKAGE_LIFETIME_MARGIN_SECS)`
 //! of the real clock — otherwise a `KeyPackage` minted from the injected clock is
 //! rejected by openmls's *own* internal validation before this module's check
