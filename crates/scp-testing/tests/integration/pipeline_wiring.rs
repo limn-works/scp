@@ -3048,7 +3048,8 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// through `mcp_server_bundle` over the instance its provider reads, and
 /// `mcp_server_bundle` both obtains the Supervisor's receiver and passes that
 /// receiver to `McpServer::with_optional_event_source`, which `code` calls
-/// nowhere else.
+/// nowhere else, and `code` calls `mcp_server_bundle` nowhere but in the
+/// pinned call.
 ///
 /// "The instance its provider reads" is pinned by `serve_path`: each of its
 /// pins occurs exactly once in the text of `serve_fn` (the binding of the
@@ -3118,7 +3119,12 @@ fn serves_the_supervisor_event_source(
             && body.matches("mcp_server_bundle(").count() == 1
             && body.matches("let bi").count() + body.matches("let mut bi").count() == instance_lets
     });
-    bundle_wired && serve_uses_bundle && code.matches("with_optional_event_source(").count() == 1
+    // The definition and the pinned call are the file's only two mentions, so
+    // no other production function serves a bundle over another instance.
+    bundle_wired
+        && serve_uses_bundle
+        && code.matches("mcp_server_bundle(").count() == 2
+        && code.matches("with_optional_event_source(").count() == 1
 }
 
 /// A serve path's pins (see [`serves_the_supervisor_event_source`]): the
@@ -3315,7 +3321,7 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 /// `mcp_server_bundle` an instance other than the one its provider reads:
 /// another instance in the call, a provider over another instance, `bi`
 /// rebound (by `let` or `let mut`) before the call, or a second call over
-/// another instance.
+/// another instance, in the serve function or in another production function.
 #[test]
 fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
     let wired = WIRED_BUNDLE;
@@ -3347,12 +3353,22 @@ fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
         "    let server = mcp_server_bundle(bi, provider);\n    \
          let server = mcp_server_bundle(&other_instance, provider);",
     );
+    // The serve function keeps its one pinned call, and a second production
+    // function serves a bundle over another instance.
+    let second_serve_fn = wired.replace(
+        "mod tests {",
+        "fn serve_other(bi: &Arc<Bi>, other: &Arc<Bi>) {\n    \
+         let provider = P {\n        bi: Arc::downgrade(bi),\n    };\n    \
+         let server = mcp_server_bundle(other, provider);\n}\n\
+         mod tests {",
+    );
     for regression in [
         serve_other_instance,
         provider_other_instance,
         serve_bi_rebound,
         serve_bi_rebound_mut,
         second_call,
+        second_serve_fn,
     ] {
         assert_ne!(regression, wired);
         assert!(
