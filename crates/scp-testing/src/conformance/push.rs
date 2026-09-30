@@ -147,10 +147,7 @@ macro_rules! push_conformance {
 }
 
 #[cfg(test)]
-#[allow(clippy::manual_async_fn)]
 mod tests {
-    use std::future::Future;
-
     use scp_platform::PushToken;
     use scp_platform::error::PlatformError;
     use scp_platform::in_memory::InMemoryPush;
@@ -161,21 +158,15 @@ mod tests {
     struct StrictPush(&'static [u8]);
 
     impl Push for StrictPush {
-        fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send {
-            async { Ok(PushToken::new(b"token".to_vec())) }
+        async fn register(&self) -> Result<PushToken, PlatformError> {
+            Ok(PushToken::new(b"token".to_vec()))
         }
 
-        fn handle_notification(
-            &self,
-            payload: &[u8],
-        ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-            let accepted = payload == self.0;
-            async move {
-                if accepted {
-                    Ok(WakeSignal::new(b"wake".to_vec()))
-                } else {
-                    Err(PlatformError::PushError("opaque payload violation".into()))
-                }
+        async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError> {
+            if payload == self.0 {
+                Ok(WakeSignal::new(b"wake".to_vec()))
+            } else {
+                Err(PlatformError::PushError("opaque payload violation".into()))
             }
         }
     }
@@ -184,16 +175,12 @@ mod tests {
     struct DerivingPush(fn(&[u8]) -> Vec<u8>);
 
     impl Push for DerivingPush {
-        fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send {
-            async { Ok(PushToken::new(b"token".to_vec())) }
+        async fn register(&self) -> Result<PushToken, PlatformError> {
+            Ok(PushToken::new(b"token".to_vec()))
         }
 
-        fn handle_notification(
-            &self,
-            payload: &[u8],
-        ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-            let signal = WakeSignal::new((self.0)(payload));
-            async move { Ok(signal) }
+        async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError> {
+            Ok(WakeSignal::new((self.0)(payload)))
         }
     }
 
@@ -203,20 +190,16 @@ mod tests {
     struct EchoingStrictPush;
 
     impl Push for EchoingStrictPush {
-        fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send {
-            async { Ok(PushToken::new(b"token".to_vec())) }
+        async fn register(&self) -> Result<PushToken, PlatformError> {
+            Ok(PushToken::new(b"token".to_vec()))
         }
 
-        fn handle_notification(
-            &self,
-            payload: &[u8],
-        ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-            let result = if payload.trim_ascii_end() == PERMITTED_PAYLOADS[0] {
+        async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError> {
+            if payload.trim_ascii_end() == PERMITTED_PAYLOADS[0] {
                 Ok(WakeSignal::new(payload.to_vec()))
             } else {
                 Err(PlatformError::PushError("opaque payload violation".into()))
-            };
-            async move { result }
+            }
         }
     }
 
@@ -284,14 +267,14 @@ mod tests {
     async fn rejects_adapter_refusing_permitted_payload() {
         struct RefusingPush;
         impl Push for RefusingPush {
-            fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send {
-                async { Ok(PushToken::new(b"token".to_vec())) }
+            async fn register(&self) -> Result<PushToken, PlatformError> {
+                Ok(PushToken::new(b"token".to_vec()))
             }
-            fn handle_notification(
+            async fn handle_notification(
                 &self,
                 _payload: &[u8],
-            ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-                async { Err(PlatformError::PushError("refused".into())) }
+            ) -> Result<WakeSignal, PlatformError> {
+                Err(PlatformError::PushError("refused".into()))
             }
         }
         check_fixed_wake_signal(&RefusingPush).await;
