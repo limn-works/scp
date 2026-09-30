@@ -12,13 +12,8 @@
 //! stands: the trait criterion, the Keystore-attested key-destruction
 //! criterion, the criteria for the move to P-256, the P-256 pseudonym
 //! keypair and the TEE-generated pseudonym secret, which the shipped Ed25519
-//! and X25519 keys and the signature-derived pseudonym secret fail, and
-//! acceptance criteria 2, 3 and 10. That description records that neither
-//! ADR-027 nor SCP-110 says what the adapter reports for a Keystore key held
-//! outside the TEE, puts that decision to a human through the open question
-//! "Android Keystore key outside the TEE" in
-//! `.docs/specs/00-open-questions.md`, and keeps criteria 2, 3 and 10 unmet
-//! until it is decided. This module documents the Rust-side contract and
+//! and X25519 keys and the signature-derived pseudonym secret fail. This
+//! module documents the Rust-side contract and
 //! re-exports the trait with its handle, key-type and custody-type types for
 //! Android builds.
 //!

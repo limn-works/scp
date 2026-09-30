@@ -627,8 +627,8 @@ class AndroidKeyCustody internal constructor(
      * not hand the private key bytes to the app, so a Keystore key cannot sign a governance vote through
      * this adapter. ADR-063's curve slice requires every core function that takes a raw
      * signing key to take a signer instead, and every key-export accessor to leave the
-     * custody adapters. That slice has not landed, so this accessor still exports the seed
-     * of a software key. ADR-027 acceptance criterion 14 (private key isolation) already says
+     * custody adapters and all three bridges. That slice has not landed, so this accessor
+     * still exports the seed of a software key. ADR-027 acceptance criterion 14 (private key isolation) already says
      * the Rust engine receives only signatures and public keys, never private key material,
      * and the UniFFI `KeyCustodyProvider` callback's `export_signing_key_bytes` would carry this
      * seed to Rust, so this method's design diverges from criterion 14. No code passes this

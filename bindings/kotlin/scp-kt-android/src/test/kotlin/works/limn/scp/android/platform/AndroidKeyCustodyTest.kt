@@ -3,9 +3,10 @@
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
 // is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
 // requires an Android device or emulator; the module has no instrumented tests, so no test
-// covers it. Two checks on a hardware handle throw before they read Keystore, so a JVM test
-// reaches them: exportSigningKeyBytes's SCP-CRYPTO-4005, and dhAgree's SCP-CRYPTO-4002 for a
-// 32-byte peer key, because a Keystore handle never enters softwareKeys.
+// covers it. Three checks on a hardware handle throw before they read Keystore, so a JVM
+// test reaches them: exportSigningKeyBytes's SCP-CRYPTO-4005, dhAgree's SCP-CRYPTO-4003 for a
+// peer key that is not 32 bytes, and dhAgree's SCP-CRYPTO-4002 for a 32-byte peer key,
+// because a Keystore handle never enters softwareKeys.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework.
@@ -94,13 +95,14 @@ private class InMemorySharedPreferences : SharedPreferences {
 }
 
 /**
- * Unit tests for [AndroidKeyCustody]: the software fallback path, plus the two Keystore-handle
+ * Unit tests for [AndroidKeyCustody]: the software fallback path, plus the three Keystore-handle
  * checks a JVM test reaches.
  *
  * Android Keystore is not available in JVM unit tests. These tests verify:
  * - Software Ed25519 key generation, signing, and public key extraction
- * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4002` from dhAgree for a
- *   [CustodyType.HARDWARE] handle, which throws before it reads Keystore
+ * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4003` for a peer key that
+ *   is not 32 bytes and `SCP-CRYPTO-4002` for a 32-byte one from dhAgree for a
+ *   [CustodyType.HARDWARE] handle, each thrown before it reads Keystore
  * - Pseudonym derivation determinism
  * - Key destruction, and the error codes a destroyed handle yields
  * - Signing-key export: the seed of a software Ed25519 key and of a derived pseudonym key,
