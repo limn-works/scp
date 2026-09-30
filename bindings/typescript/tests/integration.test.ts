@@ -38,7 +38,6 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, test } from "bun:test";
-import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,18 +57,23 @@ import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } fr
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /**
- * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
- * broadcast key-distribution tests. Uses Node/Bun's WebCrypto-backed
- * `generateKeyPairSync('x25519')` and extracts the raw scalars from the JWK
- * `d` (private) and `x` (public) base64url fields — no third-party dependency.
+ * Generates a DHKEM(P-256) wrapping keypair (32-byte secret scalar + 65-byte
+ * uncompressed public point, spec §9.5) for broadcast key-distribution tests.
+ * Uses WebCrypto ECDH P-256: the public key is exported raw (65 bytes) and the
+ * scalar is the JWK `d` field — no third-party dependency.
  */
-function generateX25519KeyPair(): { secret: Uint8Array; publicKey: Uint8Array } {
-  const { publicKey: pub, privateKey: priv } = generateKeyPairSync("x25519");
-  const pubJwk = pub.export({ format: "jwk" }) as { x: string };
-  const privJwk = priv.export({ format: "jwk" }) as { d: string };
+async function generateP256WrappingKeyPair(): Promise<{
+  secret: Uint8Array;
+  publicKey: Uint8Array;
+}> {
+  const pair = (await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  const publicKey = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
   return {
-    publicKey: new Uint8Array(Buffer.from(pubJwk.x, "base64url")),
-    secret: new Uint8Array(Buffer.from(privJwk.d, "base64url")),
+    publicKey,
+    secret: new Uint8Array(Buffer.from(jwk.d as string, "base64url")),
   };
 }
 
@@ -1572,7 +1576,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const { ctx, identity } = await makeBroadcast();
       const subscriber = await scp.identityCreate("in_memory");
       await scp.broadcastSubscribe(ctx._rawHandle, subscriber.did);
-      const { secret, publicKey } = generateX25519KeyPair();
+      const { secret, publicKey } = await generateP256WrappingKeyPair();
       const sealedJson = await scp.broadcastHandleKeyRequest(
         ctx._rawHandle,
         identity.did,
@@ -1582,7 +1586,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(sealedJson).not.toBeNull();
       expect(typeof sealedJson).toBe("string");
       expect((sealedJson as string).length).toBeGreaterThan(0);
-      // Subscriber opens the sealed key with the matching X25519 secret.
+      // Subscriber opens the sealed key with the matching P-256 scalar.
       const key = await scp.broadcastOpenKey(sealedJson as string, secret);
       expect(key.length).toBe(32);
     });
@@ -1590,7 +1594,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     it("scp.broadcastHandleKeyRequest returns null for a non-subscriber", async () => {
       const { ctx, identity } = await makeBroadcast();
       const stranger = await scp.identityCreate("in_memory");
-      const { publicKey } = generateX25519KeyPair();
+      const { publicKey } = await generateP256WrappingKeyPair();
       const decision = await scp.broadcastHandleKeyRequest(
         ctx._rawHandle,
         identity.did,

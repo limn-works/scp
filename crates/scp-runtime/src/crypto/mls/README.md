@@ -4,7 +4,8 @@ Every SCP context maps to exactly one MLS (Messaging Layer Security, RFC 9420)
 group. SCP layers its own concerns on top of `OpenMLS`: DID-bearing
 credentials, per-author sender keys, HPKE wrapping-key distribution, epoch
 grace windows, and fail-closed commit broadcast. The single ciphersuite is
-`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` — no negotiation (ADR-001).
+`MLS_128_DHKEMP256_AES128GCM_SHA256_P256` (ciphersuite 2, §9.5) — no
+negotiation; a group or snapshot on any other suite is rejected.
 
 ## Where the code lives — sync core vs async bridge (ADR-057)
 
@@ -35,7 +36,7 @@ inject test doubles:
   (the `ContextCryptoProvider` trait was deleted in ADR-049; the provider is
   now a concrete type held as `Arc<NodeMlsFactory>`). It owns the
   per-context crypto state — a `DashMap` of per-context MLS state, a `DashMap`
-  of broadcast sender keys, and each identity's X25519 wrapping keypair in an
+  of broadcast sender keys, and each identity's DHKEM(P-256) wrapping keypair in an
   `ArcSwap` for atomic rotation (Decision 12, §9.16.1) — but delegates every
   raw MLS/HPKE primitive to two injected trait objects:
   - `mls_backend: Arc<dyn MlsBackend>` (`backend.rs`)
@@ -46,7 +47,7 @@ inject test doubles:
   failure-driven mocks via `NodeMlsFactory::with_backends`.
 - **`ProductionMlsBackend`** (`production_backend.rs`) — a stateless struct
   that delegates each primitive to the `scp_mls` crate's `group` / `encrypt` /
-  `ratchet` free functions (e.g. `scp_mls::group::create_group_with_wrapping_key`).
+  `ratchet` free functions (e.g. `scp_mls::group::create_group`).
   It wraps those calls exactly, so the async bridge does not perturb the wire
   bytes the sync state machine produces.
 - **`MlsBackend`** (`backend.rs`) / **`HpkeBackend`** (`../hpke_backend.rs`)
@@ -94,7 +95,7 @@ through the backend traits above.
 - **`scp_mls::epoch_grace`** — `EpochGraceStore`. When a Commit advances the
   epoch, old-epoch key material is retained briefly so in-flight messages
   under the prior epoch still decrypt.
-- **`scp_mls::wrapping_extension`** — the X25519 **wrapping key** each member
+- **`scp_mls::wrapping_extension`** — the 65-byte DHKEM(P-256) **wrapping key** each member
   publishes in its `LeafNode` `scp_wrapping_key` extension (§9.16.1).
 - **Sender keys** (`crypto/sender_keys/`, sibling runtime module) — per-author
   AES-256-GCM keys distributed via HPKE using each member's published wrapping

@@ -10,6 +10,8 @@
 //! - [`serde_hash_32`] — SHA-256 hashes (exactly 32 bytes)
 //! - [`serde_id_16`] — 128-bit opaque identifiers (exactly 16 bytes)
 //! - [`serde_pubkey_32`] — X25519 / Ed25519 public keys (exactly 32 bytes)
+//! - [`serde_pubkey_65`] — uncompressed P-256 public keys (exactly 65 bytes)
+//! - [`serde_wrapping_key_list_65`] — `(did, 65-byte P-256 key)` directories
 //! - [`serde_hpke_sealed_48`] — HPKE-sealed sender key (exactly 48 bytes)
 //!
 //! # Bounded variable-size
@@ -175,6 +177,117 @@ pub mod serde_pubkey_32 {
                 v.len()
             ))
         })
+    }
+}
+
+/// Serde module for `[u8; 65]` fields: SEC1 uncompressed P-256 public keys
+/// (DHKEM(P-256) wrapping keys and `enc` values, 09 §9.5).
+///
+/// Serializes as compact binary via `serde_bytes`. Deserialization checks the
+/// length only; each consumer validates the point with
+/// [`crate::crypto::hpke::p256::validate_uncompressed_point`] where it uses the
+/// key. serde implements no `Serialize` for arrays longer than 32, so every
+/// `[u8; 65]` field needs this module.
+pub mod serde_pubkey_65 {
+    use serde::{self, Deserializer, Serializer};
+
+    /// Serializes a 65-byte public key as compact binary via `serde_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever error the underlying serializer returns.
+    pub fn serialize<S>(bytes: &[u8; 65], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    /// Deserializes exactly 65 bytes as a public key, rejecting any other length.
+    ///
+    /// # Errors
+    ///
+    /// A custom error naming the length when the input is not 65 bytes, or the
+    /// underlying deserializer's error.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 65], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!(
+                "expected 65-byte P-256 public key, got {} bytes",
+                v.len()
+            ))
+        })
+    }
+}
+
+/// Serde module for `Vec<(String, [u8; 65])>`: a `(did, P-256 wrapping key)`
+/// directory. Each key is encoded as in [`serde_pubkey_65`], and its length is
+/// checked on deserialization.
+pub mod serde_wrapping_key_list_65 {
+    use serde::de::{SeqAccess, Visitor};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct EntryRef<'a>(&'a str, KeyRef<'a>);
+
+    /// Borrowed key encoded as [`serde_pubkey_65`](super::serde_pubkey_65).
+    struct KeyRef<'a>(&'a [u8; 65]);
+
+    impl Serialize for KeyRef<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            super::serde_pubkey_65::serialize(self.0, serializer)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct Entry(String, #[serde(with = "super::serde_pubkey_65")] [u8; 65]);
+
+    /// Serializes the directory as a sequence of `(did, bytes)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// Whatever error the underlying serializer returns.
+    pub fn serialize<S>(list: &[(String, [u8; 65])], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(list.len()))?;
+        for (did, key) in list {
+            seq.serialize_element(&EntryRef(did, KeyRef(key)))?;
+        }
+        seq.end()
+    }
+
+    /// Deserializes a sequence of `(did, 65-byte key)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// A custom error when any key is not 65 bytes, or the underlying
+    /// deserializer's error.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<(String, [u8; 65])>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ListVisitor;
+        impl<'de> Visitor<'de> for ListVisitor {
+            type Value = Vec<(String, [u8; 65])>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sequence of (did, 65-byte P-256 key) pairs")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // The size hint comes from untrusted input, so cap the preallocation.
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
+                while let Some(Entry(did, key)) = seq.next_element()? {
+                    out.push((did, key));
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_seq(ListVisitor)
     }
 }
 
@@ -823,6 +936,74 @@ mod tests {
             err.contains("32-byte public key"),
             "error should mention 32-byte public key: {err}"
         );
+    }
+
+    // --- pubkey_65 and wrapping_key_list_65 tests ---
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Pubkey65Wrapper {
+        #[serde(with = "serde_pubkey_65")]
+        key: [u8; 65],
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct KeyList65Wrapper {
+        #[serde(with = "serde_wrapping_key_list_65")]
+        keys: Vec<(String, [u8; 65])>,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct BadKeyListWrapper {
+        keys: Vec<(String, serde_bytes::ByteBuf)>,
+    }
+
+    #[test]
+    fn pubkey_65_roundtrip() {
+        let mut key = [0x5A; 65];
+        key[0] = 0x04;
+        let serialized = rmp_serde::to_vec_named(&Pubkey65Wrapper { key }).unwrap();
+        let back: Pubkey65Wrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(back.key, key);
+    }
+
+    #[test]
+    fn pubkey_65_rejects_32_64_and_66_bytes() {
+        for len in [32usize, 64, 66] {
+            let bad = BadPubkeyWrapper {
+                key: vec![4u8; len],
+            };
+            let serialized = rmp_serde::to_vec_named(&bad).unwrap();
+            let err = rmp_serde::from_slice::<Pubkey65Wrapper>(&serialized)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("65-byte P-256 public key, got {len} bytes")),
+                "{len}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_key_list_65_roundtrip_and_rejects_short_key() {
+        let keys = vec![
+            ("did:a".to_owned(), [4u8; 65]),
+            ("did:b".to_owned(), [7u8; 65]),
+        ];
+        let serialized = rmp_serde::to_vec_named(&KeyList65Wrapper { keys: keys.clone() }).unwrap();
+        let back: KeyList65Wrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(back.keys, keys);
+
+        let bad = BadKeyListWrapper {
+            keys: vec![(
+                "did:a".to_owned(),
+                serde_bytes::ByteBuf::from(vec![4u8; 32]),
+            )],
+        };
+        let serialized = rmp_serde::to_vec_named(&bad).unwrap();
+        let err = rmp_serde::from_slice::<KeyList65Wrapper>(&serialized)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("got 32 bytes"), "{err}");
     }
 
     // --- hpke_sealed_48 tests ---

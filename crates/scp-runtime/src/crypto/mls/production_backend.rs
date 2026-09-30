@@ -29,7 +29,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
+use tls_codec::Serialize as TlsSerializeTrait;
 use zeroize::Zeroizing;
 
 use super::backend::{
@@ -181,12 +181,11 @@ impl ProductionMlsBackend {
     /// Returns [`MlsError::WelcomeProcessingFailed`] if the public bytes do
     /// not deserialize / validate as an SCP `KeyPackage`.
     fn consumed_init_key_key(key_package_public_bytes: &[u8]) -> Result<String, MlsError> {
-        let kp_in =
-            KeyPackageIn::tls_deserialize(&mut &*key_package_public_bytes).map_err(|e| {
-                MlsError::WelcomeProcessingFailed(format!(
-                    "deserializing key package for init-key: {e}"
-                ))
-            })?;
+        let kp_in = scp_mls::wire::parse_key_package_in(key_package_public_bytes).map_err(|e| {
+            MlsError::WelcomeProcessingFailed(format!(
+                "deserializing key package for init-key: {e}"
+            ))
+        })?;
         let provider = new_provider();
         let validated = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
@@ -297,6 +296,9 @@ fn signer_and_provider_from_wrapper(
 ) -> Result<(SignatureKeyPair, InMemoryMlsProvider), MlsError> {
     let signer: SignatureKeyPair = rmp_serde::from_slice(&wrapper.signer_bytes)
         .map_err(|e| MlsError::StorageError(format!("signer deserialization: {e}")))?;
+    // The restored signer must be a P-256 pair whose public key is scalar·G
+    // before OpenMLS signs anything with it (spec 09 §9.5).
+    group::check_p256_signer(&signer)?;
 
     let provider = new_provider();
     {
@@ -332,13 +334,13 @@ impl MlsBackend for ProductionMlsBackend {
     async fn create_group(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<ScpMlsGroup, MlsError> {
         // Delegate to the free function; byte-identical to
         // `NodeMlsFactory::create_mls_group` (which also calls the same
         // primitive). The creator's own leaf `Lifetime` is stamped from the
         // injected hardened clock (ADR-057 §Prereq-1).
-        group::create_group_with_wrapping_key(credential, wrapping_pubkey, self.clock.as_ref())
+        group::create_group(credential, wrapping_pubkey, self.clock.as_ref())
     }
 
     async fn add_member_raw(
@@ -350,7 +352,7 @@ impl MlsBackend for ProductionMlsBackend {
         // the existing `add_member` API which accepts a pre-deserialized KP;
         // the trait boundary takes raw bytes so callers do not need to
         // depend on OpenMLS types directly.
-        let kp = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
+        let kp = scp_mls::wire::parse_key_package_in(&*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
         let result = group::add_member(group, kp, self.clock.as_ref())?;
@@ -425,13 +427,16 @@ impl MlsBackend for ProductionMlsBackend {
         &self,
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
-    ) -> Result<(), MlsError> {
+    ) -> Result<Vec<(String, [u8; 65])>, MlsError> {
         // Parse the incoming Commit bytes and process via `decrypt_with_sender_did`
         // path, but only accept Commit outcomes. This reuses the existing
         // `process_message` + `merge_staged_commit` sequence verbatim.
         let content = decrypt_with_sender_did(group, commit_bytes, self.clock.as_ref())?;
         match content {
-            DecryptedContent::Commit { .. } => Ok(()),
+            DecryptedContent::Commit {
+                wrapping_key_updates,
+                ..
+            } => Ok(wrapping_key_updates),
             DecryptedContent::Application { .. } => Err(MlsError::CommitProcessingFailed(
                 "expected Commit, got Application message".to_string(),
             )),
@@ -444,14 +449,9 @@ impl MlsBackend for ProductionMlsBackend {
     async fn advance_epoch(
         &self,
         group: &mut ScpMlsGroup,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<Vec<u8>, MlsError> {
-        // Match the existing `NodeMlsFactory::advance_epoch` semantics:
-        // the pre-refactor code defaulted the wrapping key to zero-bytes
-        // when the provider had not yet generated one (rare but possible
-        // during test flows). Mirror that behaviour byte-for-byte.
-        let wrap = wrapping_pubkey.map_or([0u8; 32], |k| *k);
-        let commit = scp_mls::ratchet::propose_update_with_wrapping_key(group, &wrap)?;
+        let commit = scp_mls::ratchet::propose_update_with_wrapping_key(group, wrapping_pubkey)?;
         commit
             .tls_serialize_detached()
             .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing commit: {e}")))
@@ -464,7 +464,7 @@ impl MlsBackend for ProductionMlsBackend {
     ) -> Result<ValidatedKeyPackage, MlsError> {
         // Deserialize and validate against the SCP ciphersuite. This runs the
         // OpenMLS-side validation without holding any group state.
-        let kp_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
+        let kp_in = scp_mls::wire::parse_key_package_in(&*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
         let provider = new_provider();
@@ -517,7 +517,7 @@ impl MlsBackend for ProductionMlsBackend {
     async fn generate_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 32]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<GeneratedKeyPackage, MlsError> {
         // Every pooled KeyPackage must be joinable into an SCP *context* group,
         // whose `group_context` carries the `scp_context_params` (`0xFF02`)
@@ -527,17 +527,9 @@ impl MlsBackend for ProductionMlsBackend {
         // `0xFF02` capability regardless of whether a wrapping key is available.
         //
         // `generate_key_package_with_context_params` declares BOTH `0xFF01` +
-        // `0xFF02` *capabilities* unconditionally, and attaches the `0xFF01`
-        // wrapping-key *leaf extension* only when a key is present (§9.16.1).
-        // The capability is what `valn0502` requires (no key material); the
-        // leaf extension is the optional enhancement that lets other members
-        // HPKE-seal sender keys to this member. Passing `wrapping_pubkey`
-        // straight through therefore yields a context-joinable KP in BOTH
-        // cases: `Some` → full participant (declares `0xFF02`, carries the
-        // wrapping key); `None` → context-joinable but non-receiving until the
-        // identity publishes a wrapping key. A `None` KP is NOT downgraded to a
-        // wrapping-only (`0xFF01`-only) KeyPackage, which real MLS would reject
-        // from a context group.
+        // `0xFF02` capabilities and carries `wrapping_pubkey` as the `0xFF01`
+        // leaf extension, which SCP admission requires of every added leaf
+        // (spec 09 §9.16.1).
         //
         // The injected `Clock` mints the KeyPackage `Lifetime` (ADR-057
         // Prereq-1, #2026) — never wall-clock `SystemTime::now()`.
@@ -744,6 +736,59 @@ mod tests {
     use scp_mls::credential::ScpCredential;
     use scp_platform::in_memory::InMemoryStorage;
 
+    /// Runs the Welcome-join signer restore on a wrapper whose signer bytes
+    /// hold `signer` and whose storage is empty.
+    fn restore_signer(signer: &SignatureKeyPair) -> Result<(), MlsError> {
+        let wrapper = SerializedSigner {
+            signer_bytes: rmp_serde::to_vec(signer).unwrap(),
+            mls_storage_entries: Vec::new(),
+            key_package_public_bytes: Vec::new(),
+        };
+        signer_and_provider_from_wrapper(wrapper).map(|_| ())
+    }
+
+    /// T7 / C19(c): the `join_from_welcome` signer restore refuses a P-256
+    /// signer whose public key is a valid point that is not `scalar·G`, and an
+    /// Ed25519 signer, each with a typed `InvalidSigner`; a valid pair passes.
+    #[test]
+    fn signer_restore_rejects_mismatched_or_non_p256_signer() {
+        let key = scp_crypto::p256::P256SigningKey::from_seed(b"backend-t7", &[3; 32]).unwrap();
+        let other = scp_crypto::p256::P256SigningKey::from_seed(b"backend-t7", &[4; 32]).unwrap();
+        let scheme = group::SCP_CIPHERSUITE.signature_algorithm();
+        let tampered = SignatureKeyPair::from_raw(
+            scheme,
+            key.to_scalar_bytes().to_vec(),
+            other.public_key().to_uncompressed().to_vec(),
+        );
+        assert!(
+            matches!(
+                restore_signer(&tampered),
+                Err(MlsError::InvalidSigner(scp_mls::SignerDefect::KeyPair(
+                    scp_crypto::p256::P256Error::VerificationFailed
+                )))
+            ),
+            "mismatched P-256 signer must be refused"
+        );
+
+        let ed25519 = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        assert!(
+            matches!(
+                restore_signer(&ed25519),
+                Err(MlsError::InvalidSigner(
+                    scp_mls::SignerDefect::WrongScheme { .. }
+                ))
+            ),
+            "Ed25519 signer must be refused"
+        );
+
+        let valid = SignatureKeyPair::from_raw(
+            scheme,
+            key.to_scalar_bytes().to_vec(),
+            key.public_key().to_uncompressed().to_vec(),
+        );
+        restore_signer(&valid).expect("a valid P-256 pair restores");
+    }
+
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()
     }
@@ -779,17 +824,35 @@ mod tests {
         // Two inviter groups each add the SAME KeyPackage, producing two
         // distinct (cryptographically single-use) Welcomes for one init key.
         let kp_cred = test_credential("bob-race");
-        let kp_gen = backend.generate_key_package(&kp_cred, None).await.unwrap();
+        let kp_gen = backend
+            .generate_key_package(
+                &kp_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&kp_cred.did),
+            )
+            .await
+            .unwrap();
 
         let inviter_a = test_credential("alice-race-a");
-        let mut grp_a = backend.create_group(&inviter_a, None).await.unwrap();
+        let mut grp_a = backend
+            .create_group(
+                &inviter_a,
+                &scp_crypto::p256::testing::uncompressed_point_for(&inviter_a.did),
+            )
+            .await
+            .unwrap();
         let added_a = backend
             .add_member_raw(&mut grp_a, &kp_gen.key_package_bytes)
             .await
             .unwrap();
 
         let inviter_b = test_credential("alice-race-b");
-        let mut grp_b = backend.create_group(&inviter_b, None).await.unwrap();
+        let mut grp_b = backend
+            .create_group(
+                &inviter_b,
+                &scp_crypto::p256::testing::uncompressed_point_for(&inviter_b.did),
+            )
+            .await
+            .unwrap();
         let added_b = backend
             .add_member_raw(&mut grp_b, &kp_gen.key_package_bytes)
             .await
@@ -844,8 +907,19 @@ mod tests {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("alice-create");
 
-        let via_backend = backend.create_group(&cred, None).await.unwrap();
-        let via_primitive = group::create_group(&cred, &SystemClock).unwrap();
+        let via_backend = backend
+            .create_group(
+                &cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            )
+            .await
+            .unwrap();
+        let via_primitive = group::create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Both groups are single-member at epoch 0 with the SCP ciphersuite.
         assert_groups_equivalent(&via_backend, &via_primitive).expect("groups diverge");
@@ -858,9 +932,9 @@ mod tests {
     async fn create_group_with_wrapping_key_propagates_extension() {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("alice-wrap");
-        let wrap_pub = [0x11u8; 32];
+        let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x11);
 
-        let grp = backend.create_group(&cred, Some(&wrap_pub)).await.unwrap();
+        let grp = backend.create_group(&cred, &wrap_pub).await.unwrap();
 
         // Reading the wrapping key back via the existing helper proves the
         // extension was placed correctly — byte-for-byte with the primitive
@@ -876,11 +950,23 @@ mod tests {
         let backend = joinable_backend();
 
         let alice_cred = test_credential("alice-add");
-        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
+        let mut alice_grp = backend
+            .create_group(
+                &alice_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            )
+            .await
+            .unwrap();
 
         // Bob generates a KP via the backend.
         let bob_cred = test_credential("bob-add");
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_key_package(
+                &bob_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            )
+            .await
+            .unwrap();
 
         // Alice adds Bob via backend primitive.
         let added = backend
@@ -915,8 +1001,20 @@ mod tests {
         // Alice + Bob setup.
         let alice_cred = test_credential("alice-enc");
         let bob_cred = test_credential("bob-enc");
-        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let mut alice_grp = backend
+            .create_group(
+                &alice_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            )
+            .await
+            .unwrap();
+        let bob_gen = backend
+            .generate_key_package(
+                &bob_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            )
+            .await
+            .unwrap();
         let added = backend
             .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
             .await
@@ -952,8 +1050,20 @@ mod tests {
 
         let alice_cred = test_credential("alice-rem");
         let bob_cred = test_credential("bob-rem");
-        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let mut alice_grp = backend
+            .create_group(
+                &alice_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            )
+            .await
+            .unwrap();
+        let bob_gen = backend
+            .generate_key_package(
+                &bob_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            )
+            .await
+            .unwrap();
         let _added = backend
             .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
             .await
@@ -979,25 +1089,37 @@ mod tests {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
 
         let alice_cred = test_credential("alice-adv");
-        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let wrap_pub = [0x22u8; 32];
+        let mut alice_grp = backend
+            .create_group(
+                &alice_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            )
+            .await
+            .unwrap();
+        let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x22);
 
         let commit_bytes = backend
-            .advance_epoch(&mut alice_grp, Some(&wrap_pub))
+            .advance_epoch(&mut alice_grp, &wrap_pub)
             .await
             .unwrap();
         assert!(!commit_bytes.is_empty());
         assert_eq!(alice_grp.epoch().unwrap(), 1);
 
         // Re-deserialize to confirm the commit is TLS-valid.
-        let _reparsed = MlsMessageIn::tls_deserialize(&mut &*commit_bytes).unwrap();
+        let _reparsed = scp_mls::wire::parse_mls_message_in(&commit_bytes).unwrap();
     }
 
     #[tokio::test]
     async fn validate_key_package_accepts_valid_scp_kp() {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let bob_cred = test_credential("bob-val");
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_key_package(
+                &bob_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            )
+            .await
+            .unwrap();
 
         let validated = backend
             .validate_key_package(&bob_gen.key_package_bytes, &SystemClock)
@@ -1038,7 +1160,13 @@ mod tests {
         // `clock` param is what drives the SCP hardened re-check below.
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("carol-stateless");
-        let generated = backend.generate_key_package(&cred, None).await.unwrap();
+        let generated = backend
+            .generate_key_package(
+                &cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            )
+            .await
+            .unwrap();
 
         // Valid arm: clock at the real present → Ok(ValidatedKeyPackage).
         let validated = backend
@@ -1071,16 +1199,13 @@ mod tests {
         // subsequent `advance_epoch` call MUST agree on the wrapping
         // extension being present. We pass the same `wrap_pub` to
         // `create_group`, `generate_key_package`, and `advance_epoch`.
-        let wrap_pub = [0x42u8; 32];
+        let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x42);
 
         let alice_cred = test_credential("alice-pc");
         let bob_cred = test_credential("bob-pc");
-        let mut alice_grp = backend
-            .create_group(&alice_cred, Some(&wrap_pub))
-            .await
-            .unwrap();
+        let mut alice_grp = backend.create_group(&alice_cred, &wrap_pub).await.unwrap();
         let bob_gen = backend
-            .generate_key_package(&bob_cred, Some(&wrap_pub))
+            .generate_key_package(&bob_cred, &wrap_pub)
             .await
             .unwrap();
         let added = backend
@@ -1098,16 +1223,17 @@ mod tests {
 
         // Alice advances epoch again; Bob processes the Commit.
         let adv_commit = backend
-            .advance_epoch(&mut alice_grp, Some(&wrap_pub))
+            .advance_epoch(&mut alice_grp, &wrap_pub)
             .await
             .unwrap();
         assert_eq!(alice_grp.epoch().unwrap(), 2);
 
-        backend
+        let updates = backend
             .process_commit(&mut bob_grp, &adv_commit)
             .await
             .unwrap();
         assert_eq!(bob_grp.epoch().unwrap(), 2);
+        assert!(updates.is_empty(), "Alice republished her key unchanged");
     }
 
     /// Byte-level equivalence: a backend-produced encryption can be
@@ -1119,8 +1245,20 @@ mod tests {
 
         let alice_cred = test_credential("alice-wire");
         let bob_cred = test_credential("bob-wire");
-        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let mut alice_grp = backend
+            .create_group(
+                &alice_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            )
+            .await
+            .unwrap();
+        let bob_gen = backend
+            .generate_key_package(
+                &bob_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            )
+            .await
+            .unwrap();
         let added = backend
             .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
             .await
@@ -1191,7 +1329,7 @@ mod tests {
 
         // Creator side: a context group carrying the 0xFF02 extension.
         let alice_cred = test_credential("alice-ctx");
-        let alice_wrap = [0xA1u8; 32];
+        let alice_wrap = scp_crypto::p256::testing::valid_uncompressed_point(0xA1);
         let ctx_ext = sample_context_extension("ctx:prod-join");
         let mut alice_group = group::create_group_with_context(
             &alice_cred,
@@ -1204,9 +1342,9 @@ mod tests {
         // Joiner side: KP via the PRODUCTION generate_key_package path WITH a
         // wrapping key — now declares 0xFF01 + 0xFF02.
         let bob_cred = test_credential("bob-ctx");
-        let bob_wrap = [0xB2u8; 32];
+        let bob_wrap = scp_crypto::p256::testing::valid_uncompressed_point(0xB2);
         let bob_gen = backend
-            .generate_key_package(&bob_cred, Some(&bob_wrap))
+            .generate_key_package(&bob_cred, &bob_wrap)
             .await
             .unwrap();
 
@@ -1260,7 +1398,7 @@ mod tests {
         let backend = joinable_backend();
 
         let alice_cred = test_credential("alice-ctx-neg");
-        let alice_wrap = [0xA3u8; 32];
+        let alice_wrap = scp_crypto::p256::testing::valid_uncompressed_point(0xA3);
         let ctx_ext = sample_context_extension("ctx:prod-neg");
         let mut alice_group = group::create_group_with_context(
             &alice_cred,
@@ -1273,7 +1411,13 @@ mod tests {
         // Reserve-path KP: generated WITHOUT a wrapping key (the production
         // reserve path today, since supervisor `wrapping_keys` is unwired).
         let bob_cred = test_credential("bob-ctx-neg");
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let bob_gen = backend
+            .generate_key_package(
+                &bob_cred,
+                &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            )
+            .await
+            .unwrap();
 
         // The Add SUCCEEDS: bob's leaf declares 0xFF02 (capability, no key
         // material required), satisfying valn0502 for the context group.

@@ -459,7 +459,12 @@ class SCP internal constructor(
         blockerDid = blockerDid,
     )
 
-    /** Forwards to [NativeScp.broadcastHandleKeyRequest] on [inner]. */
+    /**
+     * Forwards to [NativeScp.broadcastHandleKeyRequest] on [inner].
+     * [wrappingPubkey] is the requester's 65-byte uncompressed DHKEM(P-256)
+     * public key (§5.14.2, §9.5); any other length or an invalid point throws a
+     * validation error.
+     */
     suspend fun broadcastHandleKeyRequest(
         handle: ContextHandle,
         authorDid: String,
@@ -475,7 +480,7 @@ class SCP internal constructor(
 
     /**
      * Opens an HPKE-sealed broadcast key (§5.14.2) using the subscriber's
-     * 32-byte X25519 [wrappingSecret], returning the raw 32-byte AES-256
+     * 32-byte DHKEM(P-256) [wrappingSecret] scalar, returning the raw 32-byte AES-256
      * broadcast key. [sealedJson] is the JSON returned by
      * [broadcastHandleKeyRequest] on grant. Delegates to the generated
      * module-level `broadcastOpenKey` UniFFI free function (fully qualified to

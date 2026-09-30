@@ -723,7 +723,6 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
 | Identity backend | `IdentityBackend` | `scp-identity/src/lib.rs` | Full | Nothing — the seam ADR-063 names, behind which the key-event-log implementation sits. |
 | MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
-| HPKE primitives | `HpkeBackend` | `scp-runtime/src/crypto/` | Full | Nothing — any RFC 9180 implementation with the SCP suite. |
 | OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
 | Context transport | `ContextTransportProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
 | Context event log | `ContextEventLogProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — in-memory, SQLite, custom backend. |
@@ -777,13 +776,11 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - **Rollback idempotency.** Any rollback helper (e.g., reverting a provisional member-add when a downstream step fails) MUST be idempotent: calling it twice is equivalent to calling it once. Handlers rely on this when unwinding on error.
 - Orchestration (seal/open envelopes, rotate_sender_key, execute_revoke, etc.) lives in handler functions on `&mut PerContextState`, NOT in the trait.
 
-**`HpkeBackend`** (scp-runtime/crypto) — `Send + Sync`, async methods. Replaces the deleted `ContextCryptoProvider` HPKE surface.
-- Three methods: `seal`, `unseal`, `generate_wrapping_keypair`.
+**HPKE primitives (direct call, no trait)** — `scp_protocol::crypto::hpke::p256`. HPKE is not injected through a trait: an `HpkeBackend` trait had one implementation and no method callers and was deleted (ADR-049 §6). The direct call carries these requirements:
 - **RFC 9180 conformance required**, with the SCP HPKE suite (§9.5): KEM `DHKEM(P-256, HKDF-SHA256)` (0x0010), KDF `HKDF-SHA256` (0x0001), AEAD `AES-128-GCM` (0x0001).
-- **AAD discipline.** Callers pass `info` bytes that act as the HPKE context-binding / AAD. The backend MUST pass `info` through to RFC 9180 unchanged — no implicit prefixing, no truncation.
-- **Randomness.** `seal` is randomized per RFC 9180 (nonce managed internally). `generate_wrapping_keypair` MUST use a cryptographically secure random source (OsRng or equivalent); deterministic key generation is not permitted.
-- **Cancellation.** All three methods are cancel-safe: they allocate and compute locally; cancellation before return drops transient buffers and produces no visible effect.
-- Used by sender-key distribution; independent of `MlsBackend` so tests may mock one without the other.
+- **AAD discipline.** Callers pass `info` bytes that act as the HPKE context-binding / AAD. The call MUST pass `info` through to RFC 9180 unchanged — no implicit prefixing, no truncation.
+- **Randomness.** Sealing is randomized per RFC 9180 (nonce managed internally). Wrapping-keypair generation MUST use a cryptographically secure random source (OsRng or equivalent); deterministic key generation is not permitted.
+- Used by sender-key distribution, access-key distribution, and invitation sealing.
 
 **`OpenMlsStorageAdapter`** (scp-runtime/crypto/mls/storage) — `Send + Sync`, async methods. **Internal to the OpenMLS-based `MlsBackend`; not intended as an independent replacement point.**
 - Bridges OpenMLS's sync `StorageProvider` trait to SCP's async `Storage`.

@@ -123,6 +123,16 @@ BAN_ENTRIES=(
     # prepare_key_package_for_join has zero live definitions in any form.
     "fn prepare_key_package_for_join|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy prepare_key_package_for_join provider method; joiners reserve KeyPackages via the KeyPackageStoreActor reserve/confirm protocol"
     "pub fn join_from_welcome\\(|crates/scp-runtime|*.rs|ADR-049 2F-residual deleted the legacy synchronous NodeMlsFactory::join_from_welcome provider method; every join flows through the async MlsBackend::join_from_welcome fused-confirm primitive"
+    # A peer's MLS bytes are decoded only through `crates/scp-mls/src/wire.rs`,
+    # which runs tls_codec under `catch_unwind` because tls_codec
+    # `debug_assert!`s on a peer-controlled length header. wire.rs decodes
+    # through one generic `T::tls_deserialize`, so these type-named tokens
+    # match every other call site. The profile override that once hid the
+    # assertion covered only the root workspace; it must not return.
+    "MlsMessageIn::tls_deserialize|crates|*.rs|Decode peer MLS messages with scp_mls::wire::parse_mls_message_in (catch_unwind over tls_codec's debug assertion)"
+    "KeyPackageIn::tls_deserialize|crates|*.rs|Decode peer KeyPackages with scp_mls::wire::parse_key_package_in (catch_unwind over tls_codec's debug assertion)"
+    "Welcome::tls_deserialize|crates|*.rs|Decode Welcome bodies with scp_mls::wire::parse_welcome (catch_unwind over tls_codec's debug assertion)"
+    "profile\\.dev\\.package\\.tls_codec|.|Cargo.toml|The tls_codec debug-assertions override covered one workspace root only; scp_mls::wire handles the assertion in every build"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned
@@ -182,6 +192,7 @@ for entry in "${BAN_ENTRIES[@]}"; do
             --exclude-dir=target \
             --exclude-dir=.git \
             --exclude-dir=node_modules \
+            --exclude-dir=.claude \
             -- \
             "$token" \
             "$scope" 2>/dev/null || true

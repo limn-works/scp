@@ -18,8 +18,8 @@
 //!
 //! - The joiner reserves its OWN pooled MLS `KeyPackage` on its OWN supervisor's
 //!   `KeyPackageStoreActor` (which retains the private signer state).
-//! - The creator's [`add_member`](FullStackNode::add_member) publishes the
-//!   joiner's wrapping keypair, reserves that `KeyPackage`, calls
+//! - The creator's [`add_member`](FullStackNode::add_member) reserves that
+//!   `KeyPackage` (which carries the joiner identity's wrapping key), calls
 //!   `Supervisor::invite_member` (real in-actor MLS add → broadcast epoch
 //!   Commit → creator `role_state` update → creator-signed, HPKE-sealed §5.12.3
 //!   bundle), distributes the creator's sender key, then deposits the sealed
@@ -49,7 +49,6 @@ use scp_core::context::supervisor::{
 use scp_core::context::{ContextError, ContextHandle, ContextParams, context_routing_id};
 use scp_did::DID;
 use scp_platform::testing::InMemoryKeyCustody;
-use zeroize::Zeroizing;
 
 use super::crypto::E2eCryptoProvider;
 use super::exchange::PendingJoin;
@@ -57,25 +56,19 @@ use super::exchange::PendingJoin;
 /// Shared buffer of `(routing_id, ciphertext)` pairs captured by the transport.
 type SentBuffer = Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>;
 
-/// A node's shared, cloneable handles — its `Supervisor` and crypto helper.
-/// The creator side reaches a joiner's supervisor (to reserve the joiner's own
-/// `KeyPackage`) and its crypto helper (to publish the joiner's wrapping keypair)
-/// during `add_member`.
+/// A node's shared, cloneable handle — its `Supervisor`.
+/// The creator side reaches a joiner's supervisor to reserve the joiner's own
+/// `KeyPackage` during `add_member`.
 #[derive(Clone)]
 pub(super) struct NodeShared {
     /// The joiner's `Supervisor` — the creator reserves the joiner's own pooled
-    /// `KeyPackage` on it and (via the joiner) publishes its wrapping keypair.
+    /// `KeyPackage` on it.
     pub manager: Arc<Supervisor>,
-    /// The joiner's crypto helper — source of the provider's own wrapping
-    /// keypair so the reserved KP's `0xFF01` leaf and the secret the provider
-    /// opens sender keys with are the SAME keypair.
-    pub crypto: Arc<E2eCryptoProvider>,
 }
 
 /// Registry of every node's shared handles in a `FullStackNetwork`, keyed by
-/// DID. Lets the creator side reach a joiner's supervisor + crypto helper to
-/// reserve its real MLS key package and publish its wrapping keypair during
-/// `add_member`.
+/// DID. Lets the creator side reach a joiner's supervisor to reserve its real
+/// MLS key package during `add_member`.
 pub(super) type NodeRegistry = Arc<Mutex<HashMap<String, NodeShared>>>;
 
 /// Derives a deterministic 32-byte seed from a DID string for test key
@@ -358,7 +351,7 @@ impl FullStackNode {
         // id and key the wrong MLS group / key-exchange slot).
         let ctx_bytes = context_id_to_bytes(context_id);
 
-        // 1. Reach the joiner's shared handles (its supervisor + crypto helper).
+        // 1. Reach the joiner's supervisor.
         let joiner: NodeShared = {
             let registry = self
                 .registry
@@ -371,34 +364,21 @@ impl FullStackNode {
             })?
         };
 
-        // 2. Publish the joiner's OWN provider wrapping keypair into its
-        //    supervisor slot BEFORE reserving, so the pooled KeyPackage embeds
-        //    the matching `0xFF01` wrapping-leaf pubkey and the secret the
-        //    provider opens sender keys with stays the SAME keypair across the
-        //    reserve → spawn_actor_from_welcome migration.
-        let (wpub, wsec) = joiner.crypto.provider.wrapping_keypair_snapshot();
-        joiner
-            .manager
-            .set_wrapping_keys(
-                DID::from(member_did),
-                wpub.to_vec(),
-                Zeroizing::new(wsec.to_vec()),
-            )
-            .await?;
-
-        // 3. Reserve the joiner's own pooled KeyPackage on the joiner's
+        // 2. Reserve the joiner's own pooled KeyPackage on the joiner's
         //    supervisor (its KeyPackageStoreActor mints + retains the private
         //    signer state; only the reservation id + public bytes come back).
+        //    The KeyPackage carries the joiner identity's wrapping key in
+        //    `0xFF01`, which its supervisor loads or creates on first use.
         let (reservation_id, kp_bytes) = joiner
             .manager
             .reserve_key_package(DID::from(member_did))
             .await?;
 
-        // 4. Capture the set of existing members BEFORE the add — they need the
+        // 3. Capture the set of existing members BEFORE the add — they need the
         //    epoch-advance Commit so their MLS groups stay in lockstep.
         let existing_members = self.manager.member_dids(context_id).await;
 
-        // 5. Invite the joiner: the add is routed through the context actor's
+        // 4. Invite the joiner: the add is routed through the context actor's
         //    governance gate (SingleAdmin → auto-executes the real in-actor MLS
         //    add + broadcasts the epoch Commit), and the returned Welcome is
         //    signed + HPKE-sealed into a §5.12.3 bundle with this node's #active
@@ -416,7 +396,7 @@ impl FullStackNode {
             .await?;
         let InviteMemberOutcome::Sealed { bundle, .. } = outcome;
 
-        // 6. Deposit the sealed invitation (+ reservation id) for the joiner to
+        // 5. Deposit the sealed invitation (+ reservation id) for the joiner to
         //    feed into `spawn_actor_from_welcome`.
         self.crypto.deposit_pending_join(
             &ctx_bytes,
@@ -427,13 +407,13 @@ impl FullStackNode {
             },
         );
 
-        // 7. Extract the epoch-advance Commit from the actor's WelcomeGenerated
+        // 6. Extract the epoch-advance Commit from the actor's WelcomeGenerated
         //    event and deposit it for every existing member so their MLS group
         //    advances to the new epoch. The Welcome itself travels INSIDE the
         //    sealed bundle, so `welcome_bytes` is discarded here. Every OTHER
         //    event is buffered so the tests' later `drain_events` still sees it.
         //    Capture the (broadcast) Commit ciphertext so the sender-key harvest
-        //    in step 8 can distinguish it from the inviter's sender-key push.
+        //    in step 7 can distinguish it from the inviter's sender-key push.
         let drained = self.manager.drain_events(context_id).await;
         let mut commit_ct: Option<Vec<u8>> = None;
         {
@@ -467,7 +447,7 @@ impl FullStackNode {
             }
         }
 
-        // 8. Harvest THIS node's sender-key distribution for the new member.
+        // 7. Harvest THIS node's sender-key distribution for the new member.
         //    ADR-049 PR-7 (SCP-CRYPTOMOVE-001): `invite_member` runs the add in
         //    the inviter's actor, whose drain-and-deliver pushes the inviter's
         //    MLS-wrapped sender key onto the transport (captured in `self.sent`).
@@ -829,7 +809,7 @@ impl FullStackNode {
                 })?;
 
             // 3. Incumbent opens the ephemeral-sealed response with its own
-            //    custody (unchanged — the wrapping secret is node-resident), then
+            //    custody, then
             //    lands the joiner's key onto its OWN actor store via the
             //    GATE-BEFORE-INSTALL `LandSenderKeyResponse` mailbox command
             //    (ADR-049 PR-7): the incumbent's provider is likewise taken, so

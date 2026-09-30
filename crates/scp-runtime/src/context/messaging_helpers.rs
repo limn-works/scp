@@ -2536,15 +2536,12 @@ pub fn build_snapshot_for_persist(
     // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
     // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
     // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
-    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
-    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
-    // sequence is read from `state.send_tracker` inside the twin.
-    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    // on the actor's `state` (was the provider), and the send sequence is read
+    // from `state.send_tracker` inside the twin. The blob carries no wrapping
+    // key: the identity's pair persists on its own (spec 09 §9.16.1).
     match state.export_crypto_state(
         deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
         deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
-        wrapping_public_key,
-        &*wrapping_secret_key,
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
@@ -3044,8 +3041,8 @@ pub fn decrypt_and_dispatch(
     // field-granular Class-C `&mut ContextCryptoState` (driven from
     // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
     // provider `open` twin (the 16 golden tests hold). `process_incoming_sender_key`
-    // below stays on the provider (it HPKE-opens with the NODE-RESIDENT wrapping
-    // secret — receive-side, NOT in the delete set); the sender-key INSTALL,
+    // below stays on the provider (it HPKE-opens with the owning identity's
+    // wrapping secret — receive-side, NOT in the delete set); the sender-key INSTALL,
     // however, now writes to the ACTOR-owned `cs.sender_key_store.set_unchecked`
     // (the provider store is empty on a taken context — see the KeyResponse arm
     // below), and `local_did` is likewise retained. A `None` crypto
@@ -3171,19 +3168,23 @@ pub fn decrypt_and_dispatch(
                 scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(_) => {
                     // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
                     // fix. `process_incoming_sender_key` HPKE-opens with the
-                    // NODE-RESIDENT wrapping secret (unaffected by the crypto move)
-                    // and returns the authenticated `(key, epoch)`; the
+                    // owning identity's wrapping secret (spec 09 §9.16.1; with
+                    // none loaded it fails closed) and returns the authenticated
+                    // `(key, epoch)`; the
                     // authoritative Class-M registry gates epoch monotonicity + the
                     // poisoning ceiling FAIL-CLOSED BEFORE install; the install then
                     // writes to the ACTOR's OWNED `cs.sender_key_store`. The provider
                     // store is EMPTY on a taken (actor-owned) context, so the former
                     // `deps.crypto.set_sender_key_unchecked` was a silent no-op — the
                     // latent bug this fixes (D1 close, fail-safe ordering preserved).
+                    let wrapping = deps.supervisor.my_wrapping_keypair(&deps.owned_identity)?;
                     let (sender_key, epoch) = deps.crypto.process_incoming_sender_key(
                         context_id_bytes,
                         &sender_did,
                         &payload,
+                        wrapping.secret(),
                     )?;
+                    drop(wrapping);
                     deps.supervisor.check_and_advance_sender_epoch(
                         context_id_bytes,
                         &sender_did,

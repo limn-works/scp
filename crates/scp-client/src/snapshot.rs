@@ -77,6 +77,7 @@ use scp_event_log::tree::{append_unsigned_event, root};
 use scp_event_log::{Event, EventLog};
 use scp_mls::ScpMlsGroup;
 use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::crypto::hpke::p256::validate_uncompressed_point;
 use scp_protocol::crypto::sender_keys::{SenderKey, SenderKeyStore};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -205,10 +206,14 @@ pub struct ContextSnapshot {
     /// buffers `MessageSent` (a sender's own history) and `MessageReceived`, so
     /// [`BufferedEvent`]'s two variants are its complete representation.
     buffered_events: Vec<BufferedEvent>,
-    /// This participant's §9.16.1 stable wrapping public key (X25519). Persisted
-    /// so a reopened tab republishes/uses the same key peers seal to.
-    wrapping_public: [u8; 32],
-    /// This participant's §9.16.1 stable wrapping secret key (X25519). Persisted
+    /// This participant's §9.16.1 stable wrapping public key: a 65-byte
+    /// uncompressed DHKEM(P-256) point (§9.5). Persisted so a reopened tab
+    /// republishes/uses the same key peers seal to. Decoding rejects any other
+    /// length; [`Self::restore`] checks it against the secret.
+    #[serde(with = "scp_protocol::serde_util::serde_pubkey_65")]
+    wrapping_public: [u8; 65],
+    /// This participant's §9.16.1 stable wrapping secret key: the 32-byte
+    /// DHKEM(P-256) scalar. Persisted
     /// so a reopened tab can HPKE-open the next distribution sealed to it.
     /// Zeroized after reconstruction. Depends on the backend's authenticated
     /// encryption at rest (see the module security note).
@@ -217,7 +222,8 @@ pub struct ContextSnapshot {
     /// IS the membership set (ADR-057 sender-key distribution INVARIANT 1) — it
     /// replaced the bare `members` DID list — so a reopened tab can seal sender
     /// keys to every member on the next add/rotate.
-    member_wrapping_keys: Vec<(String, [u8; 32])>,
+    #[serde(with = "scp_protocol::serde_util::serde_wrapping_key_list_65")]
+    member_wrapping_keys: Vec<(String, [u8; 65])>,
     /// Per-member next-outgoing message sequence numbers: `(did, sequence)`.
     member_sequence_numbers: Vec<(String, u64)>,
     /// The §9.10.4 peer-pseudonym registry: `(peer_did, routing_id)` pairs — every
@@ -390,6 +396,32 @@ impl ContextSnapshot {
         })
     }
 
+    /// Checks the persisted wrapping material against §9.5.
+    ///
+    /// The persisted wrapping secret must be a valid P-256 scalar whose
+    /// public key is exactly the persisted point, and every directory key must
+    /// be a valid uncompressed point. A corrupt blob fails closed rather than
+    /// installing a key no peer can seal to, or sealing to an invalid point.
+    fn check_wrapping_material(&self) -> Result<(), ClientError> {
+        scp_crypto::p256::check_keypair(&self.wrapping_secret, &self.wrapping_public).map_err(
+            |e| {
+                ClientError::StorageCorrupt(format!(
+                    "snapshot for context '{}' carries an invalid wrapping keypair: {e}",
+                    self.context_id
+                ))
+            },
+        )?;
+        for (did, key) in &self.member_wrapping_keys {
+            validate_uncompressed_point(key).map_err(|e| {
+                ClientError::StorageCorrupt(format!(
+                    "snapshot for context '{}' carries an invalid wrapping key for '{did}': {e}",
+                    self.context_id
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Reconstructs a live [`PerContextState`] from this snapshot, verifying the
     /// `owner_did` binding and the §9.9.3 checkpoint.
     ///
@@ -422,7 +454,11 @@ impl ContextSnapshot {
             )));
         }
 
-        // Reconstruct crypto state.
+        self.check_wrapping_material()?;
+
+        // Reconstruct crypto state. `deserialize_state` fails closed on a group
+        // that is not on the SCP ciphersuite or whose signer is not a valid P-256
+        // pair.
         let mls_group = ScpMlsGroup::deserialize_state(&self.mls_state)?;
 
         let mut sender_key_store = SenderKeyStore::new();
@@ -448,7 +484,7 @@ impl ContextSnapshot {
             std::mem::replace(&mut self.local_sender_key, SenderKey::from_bytes([0u8; 32]));
 
         // Rebuild the member-wrapping-key directory (the authoritative member set).
-        let member_wrapping_keys: HashMap<String, [u8; 32]> =
+        let member_wrapping_keys: HashMap<String, [u8; 65]> =
             std::mem::take(&mut self.member_wrapping_keys)
                 .into_iter()
                 .collect();
@@ -629,10 +665,10 @@ impl Drop for ContextSnapshot {
     }
 }
 
-/// Renders a 32-byte root as a short hex string for diagnostics (never secret —
-/// the Merkle root is public).
-fn hex_root(root: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
+/// Renders public bytes (the Merkle root or the wrapping public key) as a hex
+/// string for diagnostics. Never pass secret material.
+fn hex_root(root: &[u8]) -> String {
+    let mut s = String::with_capacity(root.len() * 2);
     for byte in root {
         use std::fmt::Write as _;
         let _ = write!(s, "{byte:02x}");
@@ -658,8 +694,15 @@ mod tests {
     fn fresh_state() -> PerContextState {
         let credential =
             ScpCredential::new(CREATOR.to_owned(), None, SigningKeyId::Active).unwrap();
-        let crypto =
-            ContextCryptoState::from_group(CTX, create_group(&credential, &SystemClock).unwrap());
+        let crypto = ContextCryptoState::from_group(
+            CTX,
+            create_group(
+                &credential,
+                &scp_crypto::p256::testing::uncompressed_point_for(&credential.did),
+                &SystemClock,
+            )
+            .unwrap(),
+        );
         let mut state = PerContextState::new(CTX, CREATOR, crypto);
         state
             .append_log_event(EventType::ContextCreated, CREATOR, Vec::new(), 1_000)
@@ -796,5 +839,120 @@ mod tests {
     fn garbage_blob_is_rejected() {
         let err = ContextSnapshot::from_bytes(b"not a snapshot").unwrap_err();
         assert!(matches!(err, ClientError::StorageCorrupt(_)));
+    }
+
+    /// Re-encodes `blob` with the named top-level field replaced by `value`.
+    fn rewrite_field(blob: &[u8], field: &str, value: rmpv::Value) -> Vec<u8> {
+        let mut decoded: rmpv::Value = rmp_serde::from_slice(blob).unwrap();
+        let rmpv::Value::Map(entries) = &mut decoded else {
+            panic!("a snapshot encodes as a named map");
+        };
+        let slot = entries
+            .iter_mut()
+            .find(|(k, _)| k.as_str() == Some(field))
+            .unwrap_or_else(|| panic!("snapshot has no field {field}"));
+        slot.1 = value;
+        rmp_serde::to_vec_named(&decoded).unwrap()
+    }
+
+    #[test]
+    fn wrapping_public_of_other_than_65_bytes_is_rejected_at_decode() {
+        // §9.5: the stored wrapping public key is the 65-byte uncompressed
+        // DHKEM(P-256) point. A blob carrying a 32-byte key (the retired
+        // X25519 width) fails decode with a typed error under the unchanged
+        // format version; it is never zero-padded or truncated into a key.
+        assert_eq!(SNAPSHOT_FORMAT_VERSION, 4);
+        let state = fresh_state();
+        let blob = ContextSnapshot::capture(CTX, CREATOR, &state)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+
+        // Positive control: the untouched blob re-encoded through the same
+        // path decodes.
+        let wrapping_public = state.crypto.wrapping_public.to_vec();
+        let control = rewrite_field(
+            &blob,
+            "wrapping_public",
+            rmpv::Value::Binary(wrapping_public),
+        );
+        assert!(
+            ContextSnapshot::from_bytes(&control).is_ok(),
+            "the re-encoded valid blob decodes"
+        );
+
+        let short = rewrite_field(
+            &blob,
+            "wrapping_public",
+            rmpv::Value::Binary(vec![0x42; 32]),
+        );
+        match ContextSnapshot::from_bytes(&short) {
+            Err(ClientError::StorageCorrupt(msg)) => {
+                assert!(msg.contains("deserializing context snapshot"), "got: {msg}");
+                assert!(msg.contains("got 32 bytes"), "got: {msg}");
+            }
+            Err(other) => panic!("expected a StorageCorrupt decode error, got {other:?}"),
+            Ok(_) => panic!("a 32-byte wrapping public key must not decode"),
+        }
+    }
+
+    #[test]
+    fn mismatched_wrapping_keypair_fails_closed() {
+        // §9.5: restore refuses a stored public key that is a valid point but
+        // not the public key of the stored secret.
+        let state = fresh_state();
+        let mut snapshot = ContextSnapshot::capture(CTX, CREATOR, &state).unwrap();
+        let (other_public, _other_secret) =
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        snapshot.wrapping_public = other_public;
+
+        match snapshot.restore(CREATOR) {
+            Err(ClientError::StorageCorrupt(msg)) => {
+                assert!(msg.contains("invalid wrapping keypair"), "got: {msg}");
+            }
+            Err(other) => panic!("expected StorageCorrupt, got {other:?}"),
+            Ok(_) => panic!("a mismatched wrapping keypair must not restore"),
+        }
+    }
+
+    #[test]
+    fn invalid_directory_wrapping_key_fails_closed() {
+        // §9.5: every directory key is a valid uncompressed P-256 point, or a
+        // later sender-key distribution would seal to an invalid point.
+        const PEER: &str = "did:key:zSnapshotPeer";
+        let state = fresh_state();
+
+        // Positive control: a valid directory key restores and is kept.
+        let (peer_public, _peer_secret) =
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        let mut valid = ContextSnapshot::capture(CTX, CREATOR, &state).unwrap();
+        valid
+            .member_wrapping_keys
+            .push((PEER.to_owned(), peer_public));
+        let restored = valid
+            .restore(CREATOR)
+            .unwrap_or_else(|e| panic!("a valid directory key restores: {e:?}"));
+        assert_eq!(
+            restored.crypto.member_wrapping_keys.get(PEER),
+            Some(&peer_public)
+        );
+
+        // The uncompressed tag with the point (0, 0), which is not on the curve.
+        let mut off_curve = [0u8; 65];
+        off_curve[0] = 0x04;
+        let mut invalid = ContextSnapshot::capture(CTX, CREATOR, &state).unwrap();
+        invalid
+            .member_wrapping_keys
+            .push((PEER.to_owned(), off_curve));
+        match invalid.restore(CREATOR) {
+            Err(ClientError::StorageCorrupt(msg)) => {
+                assert!(
+                    msg.contains(&format!("invalid wrapping key for '{PEER}'")),
+                    "got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected StorageCorrupt, got {other:?}"),
+            Ok(_) => panic!("an off-curve directory key must not restore"),
+        }
     }
 }

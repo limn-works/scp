@@ -677,6 +677,8 @@ interface BroadcastBindings {
      * @param contextHandle Opaque handle from context create or join.
      * @param authorDid DID of the broadcast author handling the request.
      * @param requesterDid DID of the subscriber requesting the key.
+     * @param wrappingPubkey The requester's 65-byte uncompressed DHKEM(P-256)
+     *   public key (§9.5); any other length or an invalid point is rejected.
      * @return JSON string describing the key request decision.
      * @throws BridgeException if the request cannot be processed.
      */
@@ -2484,6 +2486,8 @@ class BroadcastBridgeOps internal constructor(
      * @param contextHandle Handle from context create or join.
      * @param authorDid The DID of the author handling the request.
      * @param requesterDid The DID of the requester.
+     * @param wrappingPubkey The requester's 65-byte uncompressed DHKEM(P-256)
+     *   public key (§9.5).
      * @return A string describing the key request decision.
      */
     suspend fun handleKeyRequest(

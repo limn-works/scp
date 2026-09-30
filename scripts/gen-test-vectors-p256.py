@@ -443,6 +443,44 @@ def canonical_preimage(domain: str, *fields: bytes) -> bytes:
     return domain.encode() + b"".join(fields)
 
 
+def scp_text_form(identifier: bytes) -> str:
+    """§25.29 Vector 57: `scp:` plus lowercase unpadded base32, 56 characters."""
+    return "scp:" + base64.b32encode(identifier).decode().rstrip("=").lower()
+
+
+def fixture_identifier(role: str) -> str:
+    """A fixture party's identifier in text form, following the §25.9
+    precedent: the identifier is SHA-256 of a stated ASCII label, one label
+    per role, so no fixture claims a binding to a key it does not hold."""
+    return scp_text_form(sha256(f"SCP test vector identifier {role}".encode()))
+
+
+ID_SENDER = fixture_identifier("sender")
+ID_VOTER = fixture_identifier("voter")
+ID_SYNC_MEMBER = fixture_identifier("sync member")
+ID_EVENT_LOG_ACTOR = fixture_identifier("event-log actor")
+ID_APP = fixture_identifier("app")
+ID_AGENT = fixture_identifier("agent")
+ID_TTL_MEMBER_A = fixture_identifier("a")
+ID_TTL_MEMBER_B = fixture_identifier("b")
+ID_CONSEQUENCE_MEMBER = fixture_identifier("m")
+ID_CAROL = fixture_identifier("carol")
+ID_DAVE = fixture_identifier("dave")
+ID_ALICE = fixture_identifier("alice")
+ID_BOB = fixture_identifier("bob")
+ID_CLAIMANT = fixture_identifier("claimant")
+ID_PROPOSER = fixture_identifier("proposer")
+ID_NEW_MEMBER = fixture_identifier("new member")
+ID_HPKE_SENDER = fixture_identifier("hpke sender")
+ID_HPKE_MEMBER = fixture_identifier("hpke member")
+ID_ISSUER = fixture_identifier("issuer")
+ID_SUBJECT = fixture_identifier("subject")
+ID_PSEUDONYMIZED_MEMBER = fixture_identifier("pseudonymized member")
+ID_ANNOUNCING_MEMBER = fixture_identifier("announcing member")
+ID_OTHER_MEMBER = fixture_identifier("other member")
+ID_LEAF_ATTESTER = fixture_identifier("leaf attester")
+
+
 # ---------------------------------------------------------------------------
 # RFC 6962 Merkle construction (§9.5)
 # ---------------------------------------------------------------------------
@@ -627,9 +665,11 @@ def self_test() -> None:
     ), "RFC 5869 A.1 mismatch"
 
     # The MessagePack subset, against the §25.8 Vector 35 `DataProvenance`
-    # hash, which is curve-independent and predates the P-256 change.
+    # hash. The scp-protocol KAT `vector_35_data_provenance_hash_kat` derives
+    # the same value independently through `rmp_serde`, so this pins the
+    # encoder here to the encoder production uses.
     assert hexs(sha256(data_provenance_bytes())) == (
-        "12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68"
+        "fa9cbfad74121473e2df010ac3b39f74bc30912d9168bc2efc77a25077ad1c01"
     ), "DataProvenance MessagePack mismatch"
 
 
@@ -745,7 +785,7 @@ def inner_envelope_preimage(provenance: bytes | None) -> bytes:
         u16(256),
         u8(0x00),
         var_field("test-context-01"),
-        var_field("did:dht:z6MkTest"),
+        var_field(ID_SENDER),
         u64(1),
         u64(0),
         u64(0),
@@ -777,7 +817,7 @@ def emit_signing_vectors() -> None:
         canonical_preimage(
             "SCP-VOTE-V1:",
             fixed_field(VOTE_PROPOSAL_ID),
-            var_field("did:dht:z6MkVoter"),
+            var_field(ID_VOTER),
             var_field('"Approve"'),
             u64(1_700_000_000),
         ),
@@ -789,7 +829,7 @@ def emit_signing_vectors() -> None:
         canonical_preimage(
             "SCP-RESET-REQUEST-V1:",
             var_field("sync-test-context"),
-            var_field("did:dht:z6MkSync"),
+            var_field(ID_SYNC_MEMBER),
             u64(42),
             var_field("extended offline (8 days)"),
             fixed_field(RESET_NONCE),
@@ -864,7 +904,7 @@ def emit_merkle() -> None:
 # ---------------------------------------------------------------------------
 
 KAT_CONTEXT_ID = "ctx-kat"
-KAT_ACTOR_DID = "did:dht:z6MkEventLogKat"
+KAT_ACTOR_DID = ID_EVENT_LOG_ACTOR
 
 
 def event_canonical_hash(
@@ -910,7 +950,7 @@ KAT_EVENTS = [
         1_700_000_000,
         mp_array(
             [
-                mp_str("did:key:app"),
+                mp_str(ID_APP),
                 mp_str("Scheduler"),
                 mp_str("1.0.0"),
                 mp_array([mp_str("outlet:call:*")]),
@@ -921,7 +961,7 @@ KAT_EVENTS = [
         "SpendApproved",
         65,
         1_700_000_001,
-        mp_array([mp_str("did:key:agent"), mp_uint(5000), mp_str("inference")]),
+        mp_array([mp_str(ID_AGENT), mp_uint(5000), mp_str("inference")]),
     ),
     (
         "TtlExtended",
@@ -932,7 +972,7 @@ KAT_EVENTS = [
                 mp_uint(1_700_000_000),
                 mp_uint(1_800_000_000),
                 mp_byte_array(b"\xab" * 32),
-                mp_array([mp_str("did:key:a"), mp_str("did:key:b")]),
+                mp_array([mp_str(ID_TTL_MEMBER_A), mp_str(ID_TTL_MEMBER_B)]),
             ]
         ),
     ),
@@ -952,7 +992,10 @@ KAT_EVENTS = [
         "ConsequenceTriggered",
         67,
         1_700_000_005,
-        b"member_did=did:key:m;rule_index=2;trigger_kind=absence;action_type=suspend",
+        (
+            f"member_did={ID_CONSEQUENCE_MEMBER};rule_index=2;"
+            "trigger_kind=absence;action_type=suspend"
+        ).encode(),
     ),
     (
         "CommitBroadcastSucceeded",
@@ -964,13 +1007,13 @@ KAT_EVENTS = [
         "RoleAssigned",
         6,
         1_700_000_007,
-        mp_array([mp_str("did:key:carol"), mp_str("admin")]),
+        mp_array([mp_str(ID_CAROL), mp_str("admin")]),
     ),
     (
         "MemberJoined",
         4,
         1_700_000_008,
-        mp_array([mp_str("did:key:dave"), mp_str("member")]),
+        mp_array([mp_str(ID_DAVE), mp_str("member")]),
     ),
 ]
 
@@ -1009,7 +1052,7 @@ def data_provenance_bytes() -> bytes:
         [
             mp_str("ctx-kat-provenance"),
             mp_str("Persistent"),
-            mp_array([mp_str("did:key:alice"), mp_str("did:key:bob")]),
+            mp_array([mp_str(ID_ALICE), mp_str(ID_BOB)]),
             mp_str("kat"),
             mp_map([("SharedContext", mp_str("ctx-shared"))]),
             mp_array([mp_uint(300), mp_uint(0)]),
@@ -1114,7 +1157,7 @@ def emit_claim_and_proposal() -> None:
     claim_preimage = canonical_preimage(
         "SCP-CLAIM-V1:",
         var_field("shadow-alice-x-12345"),
-        var_field("did:dht:z6MkClaim"),
+        var_field(ID_CLAIMANT),
         var_field("bridge-test-context"),
         u64(1_700_000_000),
     )
@@ -1124,7 +1167,7 @@ def emit_claim_and_proposal() -> None:
 
     section("§25.11 Governance proposal ID")
     action_bytes = json.dumps(
-        {"AddMember": {"did": "did:dht:z6MkNewMember", "role": "member"}},
+        {"AddMember": {"did": ID_NEW_MEMBER, "role": "member"}},
         separators=(",", ":"),
         sort_keys=False,
     ).encode()
@@ -1134,7 +1177,7 @@ def emit_claim_and_proposal() -> None:
     proposal_preimage = canonical_preimage(
         "SCP-PROPOSAL-V1:",
         var_field("gov-proposal-context"),
-        var_field("did:dht:z6MkProposer"),
+        var_field(ID_PROPOSER),
         var_field(action_bytes),
         u64(1_700_000_000),
     )
@@ -1148,13 +1191,13 @@ def emit_hpke_info() -> None:
     sender_info = (
         b"scp-sender-key-v1"
         + var_field("hpke-test-context")
-        + var_field("did:dht:z6MkSender")
+        + var_field(ID_HPKE_SENDER)
         + u64(42)
     )
     access_info = (
         b"scp-access-key-v1"
         + var_field("hpke-test-context")
-        + var_field("did:dht:z6MkMember")
+        + var_field(ID_HPKE_MEMBER)
         + u64(42)
     )
     emit("vector_24.info_len", len(sender_info))
@@ -1201,8 +1244,8 @@ def emit_identity_link_attestation() -> None:
             "SCP-IDENTITY-LINK-ATTESTATION-V1:",
             var_field("att-001"),
             var_field("identity_link"),
-            var_field("did:dht:z6MkIssuer"),
-            var_field("did:dht:z6MkIssuer"),
+            var_field(ID_ISSUER),
+            var_field(ID_ISSUER),
             u64(1_700_000_000),
             absent_fixed(),
             var_field(claim),
@@ -1224,8 +1267,8 @@ def emit_trust_attestation() -> None:
             "SCP-ATTESTATION-V1:",
             var_field("att-trust-001"),
             u16(4),
-            var_field("did:dht:z6MkIssuer"),
-            var_field("did:dht:z6MkSubject"),
+            var_field(ID_ISSUER),
+            var_field(ID_SUBJECT),
             var_field(jcs_claim),
             absent_fixed(),
             u64(1_700_000_000),
@@ -1246,7 +1289,7 @@ def emit_hash_only_vectors() -> None:
         "SCP-PSEUDONYM-V1:",
         var_field(b"test-pseudonym-key"),
         var_field("test-context-01"),
-        var_field("did:dht:z6MkTest"),
+        var_field(ID_PSEUDONYMIZED_MEMBER),
     )
     emit("vector_27.preimage_len", len(pseudonym_preimage))
     emit_hex("vector_27.pseudonym_hash", sha256(pseudonym_preimage))
@@ -1265,7 +1308,7 @@ def emit_hash_only_vectors() -> None:
     section("§25.16 Attestation ID")
     attestation_id_preimage = canonical_preimage(
         "SCP-ATTESTATION-ID-V1:",
-        var_field("did:dht:z6MkIssuer"),
+        var_field(ID_ISSUER),
         var_field("google.com"),
         var_field("alice@gmail.com"),
         u64(1_700_000_000),
@@ -1338,11 +1381,13 @@ def emit_pseudonym_announcement() -> None:
             ("tag", mp_str("\0scp:pseudonym-announce:v1")),
             (
                 "member_did",
-                mp_str("did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA"),
+                mp_str(ID_ANNOUNCING_MEMBER),
             ),
             ("pseudonym", mp_bin(b"\x42" * 32)),
         ]
     )
+    emit("vector_36.member_did", ID_ANNOUNCING_MEMBER)
+    emit("vector_36.other_member_did", ID_OTHER_MEMBER)
     emit_hex("vector_36.wire", wire)
 
 
@@ -1374,7 +1419,7 @@ def emit_keypackage_attestation() -> None:
     assert len(set(keys)) == 4, "the four bound leaf keys must be distinct"
 
     body_fields = (
-        var_field("did:dht:z6MkLeafAttest")
+        var_field(ID_LEAF_ATTESTER)
         + b"".join(fixed_field(key) for key in keys)
         + var_field("#active")
         + u64(1_700_000_000)
@@ -2371,10 +2416,6 @@ def rank_first_reveal(
     return (
         1 if ecdsa_verify(REF_KEY_1.point, digest, signatures[root_group_index]) else 2
     )
-
-
-def scp_text_form(identifier: bytes) -> str:
-    return "scp:" + base64.b32encode(identifier).decode().rstrip("=").lower()
 
 
 def emit_reveal_ranking_and_text_form() -> None:

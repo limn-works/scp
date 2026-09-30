@@ -141,7 +141,8 @@ pub enum AccessKeyError {
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
 
-    /// Custody returned a wrapping (X25519) public key that is not 32 bytes.
+    /// Custody returned a wrapping (DHKEM P-256) public key that is not a
+    /// 65-byte uncompressed point.
     #[error("malformed wrapping public key: {0}")]
     MalformedWrappingPublicKey(String),
 

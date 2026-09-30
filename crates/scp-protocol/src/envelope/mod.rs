@@ -201,9 +201,24 @@ pub enum EnvelopeError {
     #[error("sender key decryption failed: {0}")]
     SenderKeyDecryptionFailed(String),
 
-    /// The sender is not a member of the MLS group.
-    #[error("unknown sender: {0}")]
-    UnknownSender(String),
+    /// The three sender identities of a received envelope disagree (09
+    /// §9.8.1): the DID in the MLS sender's credential, the inner envelope's
+    /// `sender_did`, and the sender DID the caller expects must all be equal.
+    /// A member who holds another member's sender key cannot re-send that
+    /// member's signed inner envelope from its own MLS leaf.
+    #[error(
+        "sender mismatch: mls_sender={mls_sender}, inner_sender={inner_sender}, \
+         caller_sender={caller_sender}"
+    )]
+    SenderMismatch {
+        /// The DID in the MLS sender's credential.
+        mls_sender: String,
+        /// The inner envelope's `sender_did` (empty when the check runs
+        /// before the inner envelope is decoded).
+        inner_sender: String,
+        /// The sender DID the caller expects.
+        caller_sender: String,
+    },
 
     /// The envelope timestamp is too far in the future (§9.8.2(c)).
     #[error(

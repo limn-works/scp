@@ -15,9 +15,10 @@
 //! [`NodeMlsFactory::install_joined_group`]) plus the production
 //! [`PerContextState::seed_encrypted_crypto_from_owned`] seed primitive — never
 //! through a provider-resident insert + `take_crypto_state` round-trip. The
-//! returned providers are kept ONLY as the node-resident source of each party's
-//! X25519 wrapping keypair (`wrapping_keypair_snapshot`); they never own the
-//! per-context crypto.
+//! returned providers never own the per-context crypto. Each party's
+//! DHKEM(P-256) wrapping keypair is returned beside its state: Bob's is the one
+//! his supervisor loaded for his identity, which his `KeyPackage` publishes in
+//! `0xFF01`.
 //!
 //! Alice creates the honest SCP context group (`0xFF02`) on her owned state and
 //! adds Bob's reserved KP through the actor-native
@@ -31,11 +32,9 @@
 //!
 //! The helper is SYNC (its callers are sync `#[test]` functions) and drives the
 //! async join on an internal current-thread runtime. It returns a
-//! [`TwoPartyPair`] (named fields `alice_provider` / `alice_state` /
-//! `bob_provider` / `bob_state` / `ctx_bytes`): each [`PerContextState`] already
-//! OWNS its per-context crypto (seeded from the owned constructor), and each
-//! `Arc<NodeMlsFactory>` is retained solely for its node-resident wrapping
-//! keypair.
+//! [`TwoPartyPair`]: each [`PerContextState`] already OWNS its per-context
+//! crypto (seeded from the owned constructor), beside each party's provider and
+//! wrapping keypair.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // `spawn_actor_from_welcome` returns a deliberately large state-building future;
@@ -58,6 +57,7 @@ use scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage;
 use zeroize::Zeroizing;
 
 use crate::context::actor::{ContextCryptoState, ContextModeState, PerContextState};
+use crate::crypto::wrapping::WrappingKeyPair;
 
 use super::provider::NodeMlsFactory;
 use super::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
@@ -204,12 +204,17 @@ fn encrypted_crypto_mut(state: &mut PerContextState) -> &mut ContextCryptoState 
 /// [`PerContextState`], plus the shared 32-byte context id (#2148 F12 —
 /// replaces the former positional 5-tuple return).
 pub struct TwoPartyPair {
-    /// Alice's provider, retained solely for its node-resident wrapping keypair.
+    /// Alice's provider.
     pub alice_provider: Arc<NodeMlsFactory>,
+    /// Alice's wrapping keypair, published in her own leaf's `0xFF01`.
+    pub alice_wrapping: Arc<WrappingKeyPair>,
     /// Alice's actor state (OWNS her group + sender key).
     pub alice_state: PerContextState,
-    /// Bob's provider, retained solely for its node-resident wrapping keypair.
+    /// Bob's provider.
     pub bob_provider: Arc<NodeMlsFactory>,
+    /// Bob's identity wrapping keypair, as his supervisor loaded it; his
+    /// `KeyPackage` published its public key in `0xFF01`.
+    pub bob_wrapping: Arc<WrappingKeyPair>,
     /// Bob's actor state (OWNS his group + Alice's pulled sender key at epoch 1).
     pub bob_state: PerContextState,
     /// The shared context id, `context_id_bytes(ctx_str)`.
@@ -224,8 +229,7 @@ pub struct TwoPartyPair {
 /// the ACTOR-native [`ContextCryptoState::handle_sender_key_request`] (Bob's
 /// installed sender-key for Alice becomes epoch 1). Returns a [`TwoPartyPair`]
 /// where each [`PerContextState`] OWNS the per-context crypto for the group
-/// keyed by `context_id_bytes(ctx_str)` and each provider is retained solely for
-/// its node-resident wrapping keypair.
+/// keyed by `context_id_bytes(ctx_str)`.
 ///
 /// # Panics
 ///
@@ -250,33 +254,26 @@ pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoP
             let clock = scp_clock::SystemClock;
             let bob = DID::from(bob_did);
 
-            // Bob's joiner supervisor + a clone of his provider. The provider is
-            // retained ONLY as the node-resident source of Bob's X25519 wrapping
-            // keypair (`wrapping_keypair_snapshot`); the joined crypto is born onto
-            // Bob's actor state below, never installed into the provider.
+            // Bob's joiner supervisor + a clone of his provider. The joined
+            // crypto is born onto Bob's actor state below, never installed into
+            // the provider.
             let (bob_sup, bob_crypto) = bob_supervisor(bob_did, pair_resolver(alice_did, bob_did));
 
-            // Publish Bob's OWN provider wrapping keypair BEFORE the KeyPackage
-            // store spawns, so the pooled KP's `0xFF01` wrapping-leaf pubkey and
-            // the secret `bob_crypto` opens distributed sender keys with stay the
-            // SAME keypair across the reserve → join migration
-            // (`wrapping_keypair_snapshot`). This makes Alice's sender-key
-            // distribution — a real X25519 DH to that wrapping key — decryptable by
-            // Bob. The KP also declares `0xFF02` (`scp_context_params`)
-            // unconditionally.
-            let (bob_wrap_public, bob_wrap_secret) = bob_crypto.wrapping_keypair_snapshot();
-            bob_sup
-                .set_wrapping_keys(
-                    bob.clone(),
-                    bob_wrap_public.to_vec(),
-                    Zeroizing::new(bob_wrap_secret.to_vec()),
-                )
-                .await
-                .expect("publish bob's wrapping key");
+            // Reserving spawns Bob's KeyPackage store, which first loads (here:
+            // generates and stores) Bob's identity wrapping keypair; the pooled
+            // KP publishes its public key in `0xFF01`. Alice's sender-key
+            // distribution is sealed to that key, so Bob opens it with the same
+            // pair read back from his supervisor. The KP also declares `0xFF02`
+            // (`scp_context_params`) unconditionally.
             let (reservation_id, kp_public_bytes) = bob_sup
                 .reserve_key_package(bob.clone())
                 .await
                 .expect("bob reserves a real KeyPackage from his own store");
+            let bob_wrapping = bob_sup
+                .ensure_wrapping_key(&bob)
+                .await
+                .expect("bob's wrapping keypair is loaded")
+                .load_full();
 
             // Alice (bare creator provider) BIRTHS the honest SCP context group
             // (committing her DID + params into `0xFF02`) DIRECTLY onto owned
@@ -288,8 +285,12 @@ pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoP
                 alice_did.to_owned(),
                 Arc::new(scp_clock::SystemClock),
             ));
+            let alice_wrapping = Arc::new(WrappingKeyPair::generate());
             let alice_owned = alice_crypto
-                .create_mls_group_with_context(&honest_ext(ctx_str, alice_did, &params))
+                .create_mls_group_with_context(
+                    &honest_ext(ctx_str, alice_did, &params),
+                    alice_wrapping.public(),
+                )
                 .expect("alice births the owned SCP context group (0xFF02)");
             let mut alice_state = PerContextState::new_for_test_encrypted(
                 ctx_bytes,
@@ -398,8 +399,10 @@ pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoP
 
             TwoPartyPair {
                 alice_provider: alice_crypto,
+                alice_wrapping,
                 alice_state,
                 bob_provider: bob_crypto,
+                bob_wrapping,
                 bob_state,
                 ctx_bytes,
             }

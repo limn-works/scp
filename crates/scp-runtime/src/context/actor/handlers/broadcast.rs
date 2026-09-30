@@ -387,7 +387,7 @@ async fn handle_handle_broadcast_key_request(
     context_id: &str,
     author_did: &scp_did::DID,
     requester_did: &scp_did::DID,
-    wrapping_pubkey: [u8; 32],
+    wrapping_pubkey: [u8; 65],
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
     let key_req_fut = async {
@@ -1643,8 +1643,7 @@ mod tests {
 
         // Baseline: BEFORE the ban, the creator (an author) IS granted a key —
         // proving the ban is what flips the outcome, not some other check.
-        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let pubkey = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let (pubkey, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
         assert!(
             matches!(
                 crate::context::broadcast_helpers::handle_broadcast_key_request(

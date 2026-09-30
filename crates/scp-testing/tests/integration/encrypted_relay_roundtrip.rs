@@ -35,123 +35,26 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::mls::group::{
-    ScpMlsGroup, add_member, create_group, generate_key_package, join_group,
-};
+use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_core::crypto::sender_keys::{
     SenderKeyStore, generate_sender_key, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
 };
 use scp_core::envelope::inner::{InnerEnvelopeParams, MessageType, create_inner_envelope};
+use scp_core::envelope::outer::ops::SenderLayerAad;
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
+use scp_did::{DID, SigningKeyId};
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
-use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
-};
+use scp_platform::traits::KeyCustody;
+use scp_protocol::context::governance::KeyResolver;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
-
-/// A [`KeyCustody`] adapter that delegates signing to an [`ScpMlsGroup`]'s
-/// MLS signer key. This is used in integration tests to create inner envelopes
-/// signed by the correct MLS key, as required by SCP-177.
-///
-/// Only `sign` and `public_key` are implemented; other methods return errors
-/// since they are not needed for inner envelope creation.
-struct MlsGroupKeyCustody<'a> {
-    group: &'a ScpMlsGroup,
-}
-
-#[allow(clippy::manual_async_fn)]
-impl KeyCustody for MlsGroupKeyCustody<'_> {
-    fn generate_keypair(
-        &self,
-        _key_type: KeyType,
-    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-    fn generate_identity_keypair(
-        &self,
-    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-
-    fn sign(
-        &self,
-        _key: &KeyHandle,
-        data: &[u8],
-    ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
-        let result = self
-            .group
-            .sign(data)
-            .map(Signature::new)
-            .map_err(|e| PlatformError::CustodyError(e.to_string()));
-        async { result }
-    }
-
-    fn public_key(
-        &self,
-        _key: &KeyHandle,
-    ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
-        let result = self
-            .group
-            .signer_public_key()
-            .map(PublicKey::new)
-            .map_err(|e| PlatformError::CustodyError(e.to_string()));
-        async { result }
-    }
-
-    fn destroy_key(
-        &self,
-        _key: &KeyHandle,
-    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-
-    fn dh_agree(
-        &self,
-        _key: &KeyHandle,
-        _peer_public: &[u8],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-
-    fn derive_pseudonym(
-        &self,
-        _key: &KeyHandle,
-        _context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-
-    fn derive_rotatable_pseudonym(
-        &self,
-        _key: &KeyHandle,
-        _context_id: &[u8],
-        _pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-
-    fn ed25519_to_x25519_agree(
-        &self,
-        _key: &KeyHandle,
-        _peer_x25519_public: &[u8; 32],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
-        async { Err(PlatformError::CustodyError("not supported".into())) }
-    }
-
-    fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
-        CustodyType::InMemory
-    }
-}
 
 /// Starts a native relay server on an ephemeral port and returns its address.
 async fn start_relay() -> SocketAddr {
@@ -232,7 +135,12 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let alice_cred =
         ScpCredential::new(alice_id.did.clone(), None, scp_did::SigningKeyId::Active).unwrap();
-    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
+    let mut alice_group = create_group(
+        &alice_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     // ---------------------------------------------------------------
     // Step 4: Alice generates a sender key and publishes epoch advance (ADR-007)
@@ -263,8 +171,12 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let bob_cred =
         ScpCredential::new(bob_id.did.clone(), None, scp_did::SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+        &bob_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     // ---------------------------------------------------------------
     // Step 6: Alice adds Bob to the group using his key package (ADR-001)
@@ -348,16 +260,8 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let original_msg = b"Hello Bob, this is a secret message from Alice!";
 
-    // 8a. Create inner envelope with signature (ADR-002).
-    //     The inner envelope must be signed with the MLS group signer's key
-    //     (not Alice's identity key) because open_envelope resolves the
-    //     sender's public key from the MLS group tree (SCP-177).
-    let alice_mls_custody = MlsGroupKeyCustody {
-        group: &alice_group,
-    };
-    // The handle value doesn't matter — MlsGroupKeyCustody ignores it
-    // and always delegates to the group's signer.
-    let dummy_handle = KeyHandle::new(0);
+    // 8a. Create inner envelope with signature (ADR-002), signed with Alice's
+    //     identity key — never her MLS leaf key (09 §9.8.1; 09:856).
     let inner_env = create_inner_envelope(
         &InnerEnvelopeParams {
             context_id: ctx_id,
@@ -372,8 +276,8 @@ async fn alice_bob_encrypted_message_via_relay() {
             signing_key_id: scp_did::SigningKeyId::Active,
             version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
         },
-        &alice_mls_custody,
-        &dummy_handle,
+        &alice_custody,
+        &alice_id.active_signing_key,
     )
     .await
     .unwrap();
@@ -442,9 +346,21 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
 
     // 11a. Open outer envelope: MLS decrypt + sender key decrypt + inner
-    //      signature verification (ADR-001, ADR-002, ADR-007).
-    //      The sender's Ed25519 public key is resolved internally from the
-    //      MLS group state (SCP-177) — no explicit public key argument needed.
+    //      signature verification (ADR-001, ADR-002, ADR-007). The inner
+    //      signature verifies against the key resolved for (alice, #active),
+    //      after binding MLS sender = inner sender = expected sender
+    //      (09 §9.8.1; 09:856).
+    let alice_vk = ed25519_dalek::VerifyingKey::from_bytes(
+        alice_pubkey
+            .as_slice()
+            .try_into()
+            .expect("Ed25519 key is 32 bytes"),
+    )
+    .unwrap();
+    let signer_did = alice_id.did.clone();
+    let key_resolver: KeyResolver = Arc::new(move |did: &DID, key_id: SigningKeyId| {
+        (did.0 == signer_did && key_id == SigningKeyId::Active).then_some(alice_vk)
+    });
     let bob_alice_sk = bob_sk_store
         .get(ctx_id, &alice_id.did)
         .expect("Bob must have Alice's sender key");
@@ -452,10 +368,14 @@ async fn alice_bob_encrypted_message_via_relay() {
         &received_outer,
         &mut bob_group,
         bob_alice_sk,
-        &inner_env.context_id,
-        &inner_env.sender_did,
-        inner_env.epoch,
-        inner_env.sequence,
+        &SenderLayerAad {
+            context_id: &inner_env.context_id,
+            sender_did: &inner_env.sender_did,
+            epoch: inner_env.epoch,
+            sequence: inner_env.sequence,
+        },
+        &key_resolver,
+        &scp_clock::SystemClock,
     )
     .unwrap();
 

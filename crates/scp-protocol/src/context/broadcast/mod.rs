@@ -67,8 +67,10 @@ pub enum BroadcastAdmission {
 pub struct SubscriberRegistration {
     /// The subscriber's DID (identity).
     pub subscriber_did: DID,
-    /// X25519 public key for HPKE key wrapping. Authors use this to encrypt
-    /// broadcast key material for the subscriber.
+    /// DHKEM(P-256) public key for HPKE key wrapping (05 §5.14.3
+    /// `HpkeP256PublicKey`): a 65-byte uncompressed point, validated by
+    /// [`verify_signature`](Self::verify_signature). Authors use this to
+    /// encrypt broadcast key material for the subscriber.
     #[serde(with = "serde_bytes")]
     pub wrapping_pubkey: Vec<u8>,
     /// Optional UCAN token. Required for gated broadcast contexts
@@ -113,7 +115,7 @@ impl SubscriberRegistration {
         #[allow(clippy::cast_possible_truncation)]
         input.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
         input.extend_from_slice(did_bytes);
-        // wrapping_pubkey is fixed-size (32 bytes) and timestamp is fixed-size (8 bytes)
+        // wrapping_pubkey is fixed-size (65 bytes) and timestamp is fixed-size (8 bytes)
         // so no length prefix needed.
         input.extend_from_slice(wrapping_pubkey);
         input.extend_from_slice(&timestamp.to_be_bytes());
@@ -134,13 +136,10 @@ impl SubscriberRegistration {
         context_id: &str,
         did_resolver: &D,
     ) -> Result<(), ContextError> {
-        // Validate X25519 wrapping public key length (must be exactly 32 bytes).
-        if self.wrapping_pubkey.len() != 32 {
-            return Err(ContextError::PermissionDenied(format!(
-                "invalid wrapping_pubkey length: expected 32, got {}",
-                self.wrapping_pubkey.len()
-            )));
-        }
+        // Validate the DHKEM(P-256) wrapping public key: 65 bytes, 0x04
+        // prefix, on the curve (09 §9.5).
+        crate::crypto::hpke::p256::validate_uncompressed_point(&self.wrapping_pubkey)
+            .map_err(|e| ContextError::PermissionDenied(format!("invalid wrapping_pubkey: {e}")))?;
 
         // Resolve the subscriber's Ed25519 public key.
         let pub_key_bytes = did_resolver
@@ -446,11 +445,11 @@ pub struct AuthorKeyRotation {
 pub enum KeyRequestDecision {
     /// Grant: subscriber is authorized. The author's current broadcast key
     /// has been HPKE-sealed (RFC 9180 Base mode, §5.14.2) to the requester's
-    /// X25519 `wrapping_pubkey` — the raw AES-256 key never leaves the
+    /// DHKEM(P-256) `wrapping_pubkey` — the raw AES-256 key never leaves the
     /// protocol layer (it is not present in this variant).
     Grant {
-        /// HPKE encapsulated key (32 bytes).
-        enc: [u8; 32],
+        /// HPKE encapsulated key (65-byte uncompressed P-256 point).
+        enc: [u8; 65],
         /// HPKE ciphertext: 32-byte sealed key + 16-byte AEAD tag (48 bytes).
         ct: Vec<u8>,
         /// The current key epoch.
@@ -491,9 +490,11 @@ impl std::fmt::Debug for KeyRequestDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealedBroadcastKey {
-    /// HPKE encapsulated key (32 bytes). Fixed-size array, bounded by
-    /// construction.
-    pub enc: [u8; 32],
+    /// HPKE encapsulated key (65-byte uncompressed P-256 point). Fixed-size
+    /// array, bounded by construction; point-validated by
+    /// [`open_broadcast_key`](crate::crypto::sender_keys::broadcast::open_broadcast_key).
+    #[serde(with = "crate::serde_util::serde_pubkey_65")]
+    pub enc: [u8; 65],
     /// HPKE ciphertext (sealed key || tag, exactly 48 bytes for a legitimate
     /// payload). Deserialized from attacker-supplied JSON, so the serde-level
     /// [`serde_bounded_bytes`](crate::serde_util::serde_bounded_bytes) cap rejects multi-gigabyte allocations before any
@@ -1253,7 +1254,8 @@ impl BroadcastContext {
     ///
     /// 1. Verifies the Ed25519 signature on the registration against the
     ///    subscriber's Active Signing Key (resolved via `DidResolver`).
-    /// 2. Validates the wrapping public key length (32 bytes for X25519).
+    /// 2. Validates the wrapping public key (a 65-byte uncompressed P-256
+    ///    point).
     /// 3. Delegates to [`subscribe()`](Self::subscribe) for admission policy
     ///    enforcement (open vs gated) and UCAN validation.
     /// 4. Returns a [`SubscriptionResult`] containing author epochs and
@@ -1296,13 +1298,11 @@ impl BroadcastContext {
         // Step 2: Verify the Ed25519 signature.
         registration.verify_signature(&self.context_id, did_resolver)?;
 
-        // Step 3: Validate wrapping key length (X25519 = 32 bytes).
-        if registration.wrapping_pubkey.len() != 32 {
-            return Err(ContextError::PermissionDenied(format!(
-                "invalid wrapping public key length: expected 32, got {}",
-                registration.wrapping_pubkey.len()
-            )));
-        }
+        // Step 3: Validate the DHKEM(P-256) wrapping key (09 §9.5).
+        crate::crypto::hpke::p256::validate_uncompressed_point(&registration.wrapping_pubkey)
+            .map_err(|e| {
+                ContextError::PermissionDenied(format!("invalid wrapping public key: {e}"))
+            })?;
 
         // Step 4: Delegate to subscribe() for admission policy and UCAN validation.
         self.subscribe(
@@ -2041,7 +2041,7 @@ impl BroadcastContext {
         &self,
         author_did: &str,
         requester_did: &str,
-        wrapping_pubkey: &[u8; 32],
+        wrapping_pubkey: &[u8; 65],
     ) -> KeyRequestDecision {
         // All deny paths use a uniform reason string so denial causes
         // (blocked, unsubscribed, gated, unknown author) are indistinguishable
@@ -2103,7 +2103,7 @@ impl BroadcastContext {
             };
         }
 
-        // Seal the broadcast key to the requester's X25519 wrapping pubkey
+        // Seal the broadcast key to the requester's DHKEM(P-256) wrapping pubkey
         // (HPKE Base mode, §5.14.2). The raw key MUST NOT leave this layer —
         // only the sealed `enc`/`ct` are returned to the caller/FFI boundary.
         // A seal failure is an INTERNAL error, not an authorization denial, so
@@ -2329,7 +2329,7 @@ mod tests {
         // Python/TypeScript bridges assert, and `deny_unknown_fields` rejection
         // of extra fields from hostile JSON.
         let original = SealedBroadcastKey {
-            enc: [1u8; 32],
+            enc: [1u8; 65],
             ct: vec![2u8; 48],
             epoch: 7,
             author_did: "did:example:a".to_owned(),
@@ -2363,9 +2363,9 @@ mod tests {
         );
 
         // deny_unknown_fields: an object carrying an extra unknown field must be
-        // rejected on deserialize. Build valid 32/48-number arrays programmatically
+        // rejected on deserialize. Build valid 65/48-number arrays programmatically
         // for readability.
-        let enc_arr = (0..32).map(|_| "1").collect::<Vec<_>>().join(",");
+        let enc_arr = (0..65).map(|_| "1").collect::<Vec<_>>().join(",");
         let ct_arr = (0..48).map(|_| "2").collect::<Vec<_>>().join(",");
         let bogus_json = format!(
             "{{\"enc\":[{enc_arr}],\"ct\":[{ct_arr}],\"epoch\":7,\"author_did\":\"did:example:a\",\"context_id\":\"ctx-1\",\"bogus\":1}}"
@@ -2385,6 +2385,14 @@ mod tests {
         let clean: SealedBroadcastKey = serde_json::from_str(&clean_json).unwrap();
         assert_eq!(clean.epoch, 7);
         assert_eq!(clean.ct.len(), 48);
+
+        // A 32-number (X25519-sized) `enc` is rejected: `enc` is a 65-byte
+        // DHKEM(P-256) point.
+        let short_enc = (0..32).map(|_| "1").collect::<Vec<_>>().join(",");
+        let short_json = format!(
+            "{{\"enc\":[{short_enc}],\"ct\":[{ct_arr}],\"epoch\":7,\"author_did\":\"did:example:a\",\"context_id\":\"ctx-1\"}}"
+        );
+        assert!(serde_json::from_str::<SealedBroadcastKey>(&short_json).is_err());
     }
 
     use crate::context::governance::AccessScope;
@@ -2806,7 +2814,7 @@ mod tests {
                 "ctx-gated-1",
                 "did:example:bob",
                 &bob_key,
-                [7u8; 32],
+                scp_crypto::p256::testing::valid_uncompressed_point(7),
                 2000,
                 Some(ucan.clone()),
             );
@@ -3212,7 +3220,11 @@ mod tests {
 
         // Key request for the blocked author returns Deny.
         assert!(matches!(
-            ctx.handle_key_request("did:example:sole-author", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:sole-author",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Deny { .. }
         ));
     }
@@ -3241,7 +3253,11 @@ mod tests {
 
         // Key request succeeds before block.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
 
@@ -3249,7 +3265,11 @@ mod tests {
 
         // Key request fails after block (author not found).
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Deny { .. }
         ));
     }
@@ -3314,8 +3334,11 @@ mod tests {
         let _alice_envelope = test_publish(&mut ctx, "did:example:alice", alice_msg2).unwrap();
 
         // Subscribers can still decrypt Alice's messages via key request.
-        let alice_decision =
-            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]);
+        let alice_decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:sub1",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(matches!(alice_decision, KeyRequestDecision::Grant { .. }));
 
         // Bob cannot publish (PermissionDenied).
@@ -3323,8 +3346,11 @@ mod tests {
         assert!(bob_result.is_err());
 
         // Key request for Bob returns Deny (author not found).
-        let bob_decision =
-            ctx.handle_key_request("did:example:bob", "did:example:sub1", &[0u8; 32]);
+        let bob_decision = ctx.handle_key_request(
+            "did:example:bob",
+            "did:example:sub1",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(matches!(bob_decision, KeyRequestDecision::Deny { .. }));
 
         // Subscribers cannot get Bob's key at any epoch — his key is destroyed.
@@ -3999,7 +4025,11 @@ mod tests {
             .unwrap();
 
         // Key request should now succeed (not blocked).
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:dave",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(
             !matches!(decision, KeyRequestDecision::Deny { .. }),
             "unblocked subscriber should be able to request keys"
@@ -4240,20 +4270,19 @@ mod tests {
     #[test]
     fn handle_key_request_grants_registered_subscriber() {
         use crate::crypto::sender_keys::broadcast::open_broadcast_key;
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        // The subscriber's X25519 wrapping keypair travels with the request.
-        let subscriber_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let subscriber_pub = X25519Pub::from(&subscriber_secret);
+        // The subscriber's P-256 wrapping keypair travels with the request.
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut rand::rngs::OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
 
         let decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:bob",
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
         );
         match decision {
             KeyRequestDecision::Grant { enc, ct, epoch } => {
@@ -4266,7 +4295,7 @@ mod tests {
                 let recovered = open_broadcast_key(
                     &ct,
                     &enc,
-                    &subscriber_secret.to_bytes(),
+                    &subscriber_secret.to_scalar_bytes(),
                     ctx.context_id(),
                     "did:example:alice",
                     epoch,
@@ -4294,7 +4323,11 @@ mod tests {
         ctx.block_subscriber("did:example:alice", "did:example:dave")
             .unwrap();
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:dave",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "blocked subscriber must be denied"
@@ -4306,8 +4339,11 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let decision =
-            ctx.handle_key_request("did:example:alice", "did:example:unknown", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:unknown",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "unregistered DID must be denied"
@@ -4319,7 +4355,11 @@ mod tests {
         let mut ctx = make_open_ctx();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        let decision = ctx.handle_key_request("did:example:unknown", "did:example:bob", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:unknown",
+            "did:example:bob",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "unknown author must result in deny"
@@ -4333,7 +4373,11 @@ mod tests {
         ctx.add_author("did:example:carol").unwrap();
 
         // Authors have implicit read access and can request each other's keys.
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:carol", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:carol",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(
             matches!(decision, KeyRequestDecision::Grant { .. }),
             "authors should be able to request each other's keys"
@@ -4350,14 +4394,12 @@ mod tests {
     /// consults the durable ban record, closing the author-side laundering hole.
     #[test]
     fn handle_key_request_denies_banned_author() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         ctx.add_author("did:example:evil").unwrap(); // evil is an author (like the creator)
 
-        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let pubkey = X25519Pub::from(&secret).to_bytes();
+        let secret = scp_crypto::p256::P256SigningKey::random(&mut rand::rngs::OsRng);
+        let pubkey = secret.public_key().to_uncompressed();
 
         // Baseline: as an author, evil may request alice's key (author bypass).
         assert!(
@@ -4408,7 +4450,11 @@ mod tests {
         // Serve path STILL denies: authorship grants write, not read; ban stands.
         assert!(
             matches!(
-                ctx.handle_key_request("did:example:alice", "did:example:evil", &[0u8; 32]),
+                ctx.handle_key_request(
+                    "did:example:alice",
+                    "did:example:evil",
+                    &scp_crypto::p256::testing::valid_uncompressed_point(0)
+                ),
                 KeyRequestDecision::Deny { .. }
             ),
             "becoming an author must NOT launder a durable ban (still denied)"
@@ -4420,14 +4466,12 @@ mod tests {
     /// serve-path gate is exactly ban-scoped and authority-reversible.
     #[test]
     fn handle_key_request_grants_after_unban() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         ctx.add_author("did:example:evil").unwrap();
 
-        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let pubkey = X25519Pub::from(&secret).to_bytes();
+        let secret = scp_crypto::p256::P256SigningKey::random(&mut rand::rngs::OsRng);
+        let pubkey = secret.public_key().to_uncompressed();
 
         ctx.governance_ban_subscriber("did:example:evil", AccessScope::Read)
             .unwrap();
@@ -4460,7 +4504,11 @@ mod tests {
         ctx.block_subscriber("did:example:alice", "did:example:eve")
             .unwrap();
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:bob",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         match decision {
             KeyRequestDecision::Grant { epoch, .. } => {
                 assert_eq!(epoch, 1, "should return the post-rotation epoch");
@@ -4490,7 +4538,11 @@ mod tests {
             },
         );
 
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:bob", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:bob",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(
             matches!(decision, KeyRequestDecision::Deny { .. }),
             "gated context must deny subscriber without UCAN"
@@ -4676,15 +4728,15 @@ mod tests {
         assert_eq!(sub_result.author_epochs["did:example:alice"], 0);
         assert!(ctx.is_subscriber("did:example:bob"));
 
-        // Step 2: Key request succeeds. The subscriber's X25519 wrapping
+        // Step 2: Key request succeeds. The subscriber's P-256 wrapping
         // keypair travels with the request; the Grant carries only the
         // HPKE-sealed key material.
-        let subscriber_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let subscriber_pub = x25519_dalek::PublicKey::from(&subscriber_secret);
+        let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut rand::rngs::OsRng);
+        let subscriber_pub = subscriber_secret.public_key();
         let key_decision = ctx.handle_key_request(
             "did:example:alice",
             "did:example:bob",
-            &subscriber_pub.to_bytes(),
+            &subscriber_pub.to_uncompressed(),
         );
         let (enc, ct, epoch) = match key_decision {
             KeyRequestDecision::Grant { enc, ct, epoch } => (enc, ct, epoch),
@@ -4696,7 +4748,7 @@ mod tests {
         let received_key = crate::crypto::sender_keys::broadcast::open_broadcast_key(
             &ct,
             &enc,
-            &subscriber_secret.to_bytes(),
+            &subscriber_secret.to_scalar_bytes(),
             ctx.context_id(),
             "did:example:alice",
             epoch,
@@ -4721,7 +4773,11 @@ mod tests {
         assert!(!ctx.can_read_any("did:example:bob"));
 
         // Step 6: Key request now denied.
-        let denied = ctx.handle_key_request("did:example:alice", "did:example:bob", &[0u8; 32]);
+        let denied = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:bob",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(matches!(denied, KeyRequestDecision::Deny { .. }));
 
         // Step 7: Old key cannot decrypt new content.
@@ -4765,7 +4821,11 @@ mod tests {
         assert!(ctx.is_subscriber("did:example:sub1"));
 
         // Key request succeeds (has_ucan = true).
-        let decision = ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]);
+        let decision = ctx.handle_key_request(
+            "did:example:alice",
+            "did:example:sub1",
+            &scp_crypto::p256::testing::valid_uncompressed_point(0),
+        );
         assert!(matches!(decision, KeyRequestDecision::Grant { .. }));
 
         // Unsubscribe.
@@ -4790,17 +4850,29 @@ mod tests {
 
         // sub1 and sub3 can still request keys.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub3", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub3",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
 
         // sub2 is denied.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub2", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub2",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Deny { .. }
         ));
     }
@@ -4839,7 +4911,7 @@ mod tests {
         // The Grant variant carries only sealed HPKE material (enc/ct), never
         // the raw key. Its Debug output prints only lengths + epoch — no bytes.
         let decision = KeyRequestDecision::Grant {
-            enc: [0xAB; 32],
+            enc: [0xAB; 65],
             ct: vec![0xCD; 48],
             epoch: 5,
         };
@@ -5491,8 +5563,6 @@ mod tests {
     /// serve path to the NEW epoch — the rotation does not lock out honest readers.
     #[test]
     fn legitimate_subscriber_rekeys_after_ban_rotation() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
@@ -5504,8 +5574,8 @@ mod tests {
         assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 1);
 
         // Legitimate sub1 (not banned) requests alice's key → GRANTED at epoch 1.
-        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let pubkey = X25519Pub::from(&secret).to_bytes();
+        let secret = scp_crypto::p256::P256SigningKey::random(&mut rand::rngs::OsRng);
+        let pubkey = secret.public_key().to_uncompressed();
         match ctx.handle_key_request("did:example:alice", "did:example:sub1", &pubkey) {
             KeyRequestDecision::Grant { epoch, .. } => assert_eq!(
                 epoch, 1,
@@ -5521,8 +5591,6 @@ mod tests {
     /// `RestoreAccess` gets the CURRENT key epoch via the serve path — no stale key.
     #[test]
     fn resubscribe_after_unban_gets_current_key_epoch() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
@@ -5544,8 +5612,8 @@ mod tests {
 
         // sub1 re-subscribes and requests alice's key → CURRENT epoch (1), not stale.
         subscribe_open(&mut ctx, "did:example:sub1", None, 2000).unwrap();
-        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let pubkey = X25519Pub::from(&secret).to_bytes();
+        let secret = scp_crypto::p256::P256SigningKey::random(&mut rand::rngs::OsRng);
+        let pubkey = secret.public_key().to_uncompressed();
         match ctx.handle_key_request("did:example:alice", "did:example:sub1", &pubkey) {
             KeyRequestDecision::Grant { epoch, .. } => assert_eq!(
                 epoch, 1,
@@ -5591,15 +5659,27 @@ mod tests {
 
         // Before ban: sub1 can get keys from all authors.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:bob", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:bob",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:carol", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:carol",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
 
@@ -5609,29 +5689,53 @@ mod tests {
 
         // After ban: sub1 is denied from ALL authors.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Deny { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:bob", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:bob",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Deny { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:carol", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:carol",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Deny { .. }
         ));
 
         // sub2 is unaffected — still granted from all authors.
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub2", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub2",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:bob", "did:example:sub2", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:bob",
+                "did:example:sub2",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
         assert!(matches!(
-            ctx.handle_key_request("did:example:carol", "did:example:sub2", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:carol",
+                "did:example:sub2",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
     }
@@ -5651,7 +5755,11 @@ mod tests {
         // After re-subscription, key requests are granted.
         assert!(ctx.is_subscriber("did:example:sub1"));
         assert!(matches!(
-            ctx.handle_key_request("did:example:alice", "did:example:sub1", &[0u8; 32]),
+            ctx.handle_key_request(
+                "did:example:alice",
+                "did:example:sub1",
+                &scp_crypto::p256::testing::valid_uncompressed_point(0)
+            ),
             KeyRequestDecision::Grant { .. }
         ));
     }
@@ -5718,7 +5826,7 @@ mod tests {
         context_id: &str,
         subscriber_did: &str,
         signing_key: &ed25519_dalek::SigningKey,
-        wrapping_pubkey: [u8; 32],
+        wrapping_pubkey: [u8; 65],
         timestamp: u64,
         ucan: Option<UcanToken>,
     ) -> SubscriberRegistration {
@@ -5744,15 +5852,15 @@ mod tests {
         seed: [u8; 32],
         did_str: &str,
         did_resolver: &mut InMemoryDidResolver,
-    ) -> (ed25519_dalek::SigningKey, [u8; 32]) {
+    ) -> (ed25519_dalek::SigningKey, [u8; 65]) {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
         did_resolver
             .keys
             .insert(did_str.to_owned(), verifying_key.to_bytes());
 
-        // Generate a deterministic X25519 wrapping key for testing.
-        let wrapping_pubkey = [seed[0]; 32];
+        // A deterministic, valid DHKEM(P-256) wrapping key for testing.
+        let wrapping_pubkey = scp_crypto::p256::testing::valid_uncompressed_point(seed[0]);
 
         (signing_key, wrapping_pubkey)
     }
@@ -5765,13 +5873,13 @@ mod tests {
     fn subscriber_registration_struct_has_required_fields() {
         let reg = SubscriberRegistration {
             subscriber_did: DID("did:example:test".to_owned()),
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(0).to_vec(),
             ucan: None,
             timestamp: 1_700_000_000,
             signature: vec![0u8; 64],
         };
         assert_eq!(reg.subscriber_did.0, "did:example:test");
-        assert_eq!(reg.wrapping_pubkey.len(), 32);
+        assert_eq!(reg.wrapping_pubkey.len(), 65);
         assert!(reg.ucan.is_none());
         assert_eq!(reg.timestamp, 1_700_000_000);
         assert_eq!(reg.signature.len(), 64);
@@ -5780,7 +5888,7 @@ mod tests {
     #[test]
     fn subscriber_registration_signing_input_is_deterministic() {
         let did = DID("did:example:sub".to_owned());
-        let pubkey = [42u8; 32];
+        let pubkey = scp_crypto::p256::testing::valid_uncompressed_point(42);
         let ts = 1_700_000_000u64;
 
         let input1 = SubscriberRegistration::signing_input("ctx-1", &did, &pubkey, ts);
@@ -5971,6 +6079,26 @@ mod tests {
 
     #[test]
     fn register_subscriber_rejects_invalid_wrapping_key_length() {
+        // A validly signed registration whose wrapping key is not a 65-byte
+        // uncompressed P-256 point (05 §5.14.3 `HpkeP256PublicKey`, 09 §9.5)
+        // is rejected: 16 bytes, 32 bytes (X25519-sized), a compressed-form
+        // prefix, and an off-curve point.
+        let good = scp_crypto::p256::testing::valid_uncompressed_point(1);
+        let mut compressed_prefix = good;
+        compressed_prefix[0] = 0x02;
+        let mut off_curve = good;
+        off_curve[64] ^= 0x01;
+        for bad_pubkey in [
+            vec![0u8; 16],
+            good[1..33].to_vec(),
+            compressed_prefix.to_vec(),
+            off_curve.to_vec(),
+        ] {
+            assert_registration_rejects_wrapping_key(&bad_pubkey);
+        }
+    }
+
+    fn assert_registration_rejects_wrapping_key(bad_pubkey: &[u8]) {
         use ed25519_dalek::Signer;
 
         let mut ctx = make_open_ctx();
@@ -5979,13 +6107,11 @@ mod tests {
         let sub_did = "did:example:subscriber";
         let (sub_key, _) = make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
 
-        // Use a 16-byte wrapping key instead of 32.
-        let bad_pubkey = [0u8; 16];
         let did = DID(sub_did.to_owned());
         let signing_input = SubscriberRegistration::signing_input(
             "ctx-broadcast-1",
             &did,
-            &bad_pubkey,
+            bad_pubkey,
             1_700_000_000,
         );
         let signature = sub_key.sign(&signing_input);
@@ -6015,9 +6141,11 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("invalid wrapping_pubkey length"),
-            "must indicate wrapping key issue: {err_msg}"
+            err_msg.contains("invalid wrapping_pubkey"),
+            "must indicate wrapping key issue for {} bytes: {err_msg}",
+            bad_pubkey.len()
         );
+        assert!(!ctx.is_subscriber(sub_did));
     }
 
     // -----------------------------------------------------------------------
@@ -6252,7 +6380,7 @@ mod tests {
     fn subscriber_registration_serde_roundtrip() {
         let reg = SubscriberRegistration {
             subscriber_did: DID("did:example:test".to_owned()),
-            wrapping_pubkey: vec![42u8; 32],
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(42).to_vec(),
             ucan: None,
             timestamp: 1_700_000_000,
             signature: vec![0xAA; 64],
@@ -6271,7 +6399,7 @@ mod tests {
     fn subscriber_registration_msgpack_roundtrip() {
         let reg = SubscriberRegistration {
             subscriber_did: DID("did:example:msgpack-test".to_owned()),
-            wrapping_pubkey: vec![77u8; 32],
+            wrapping_pubkey: scp_crypto::p256::testing::valid_uncompressed_point(77).to_vec(),
             ucan: None,
             timestamp: 1_700_000_000,
             signature: vec![0xBB; 64],

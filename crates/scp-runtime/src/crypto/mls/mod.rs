@@ -14,8 +14,8 @@
 //!
 //! # Ciphersuite
 //!
-//! All groups use `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (no
-//! ciphersuite negotiation). See ADR-001 for the rationale.
+//! All groups use `MLS_128_DHKEMP256_AES128GCM_SHA256_P256` (ciphersuite 2,
+//! §9.5; no ciphersuite negotiation). See ADR-001 for the rationale.
 //!
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.

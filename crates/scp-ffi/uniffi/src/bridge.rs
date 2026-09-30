@@ -89,18 +89,21 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 /// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
 /// used to accept `None`, but real MLS rejects it.
 ///
-/// Uses `None` for the wrapping key so the leaf **declares the `0xFF02`
-/// (`scp_context_params`) capability** — mandatory to be added to an encrypted
-/// context group (`valn0502`, §5.13.3) — without attaching a wrapping-key leaf
-/// extension (this single-process membership path retains no joiner private
-/// state). The base `generate_key_package` declares no SCP capabilities and
-/// real MLS rejects it from a context group.
+/// The leaf **declares the `0xFF02` (`scp_context_params`) capability** —
+/// mandatory to be added to an encrypted context group (`valn0502`, §5.13.3) —
+/// and carries `wrapping_public` as its `0xFF01` extension: the identity's
+/// wrapping public key, whose secret the supervisor holds (spec 09 §9.16.1).
+/// The base `generate_key_package` declares no `0xFF02` capability, so real
+/// MLS rejects it from a context group.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Crypto` if the DID format is invalid (must be
 /// `did:dht:z…`), key package generation fails, or TLS serialization fails.
-fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
+fn generate_mls_key_package_bytes(
+    did: &str,
+    wrapping_public: &[u8; 65],
+) -> Result<Vec<u8>, ScpError> {
     use scp_core::crypto::mls::credential::ScpCredential;
     use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -114,12 +117,11 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
         })?;
 
     let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| ScpError::Crypto {
-                msg: format!("MLS key package generation failed: {e}"),
-                code: codes::CRYPTO_4011.to_owned(),
-            },
-        )?;
+        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
+            .map_err(|e| ScpError::Crypto {
+            msg: format!("MLS key package generation failed: {e}"),
+            code: codes::CRYPTO_4011.to_owned(),
+        })?;
 
     kp_bundle
         .key_package()
@@ -6938,12 +6940,12 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
 // Broadcast key distribution (§5.14.2)
 // ---------------------------------------------------------------------------
 
-/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held X25519
-/// wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+/// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held 32-byte
+/// DHKEM(P-256) wrapping scalar, returning the raw 32-byte AES-256 broadcast key.
 ///
 /// Pure crypto — no `SCP` instance state. `sealed_json` is the JSON returned by
 /// [`Scp::broadcast_handle_key_request`] on grant; `wrapping_secret` is the
-/// subscriber's 32-byte X25519 secret matching the `wrapping_pubkey` presented
+/// subscriber's 32-byte P-256 scalar matching the `wrapping_pubkey` presented
 /// on the request.
 ///
 /// # Errors
@@ -11167,7 +11169,11 @@ impl Scp {
                 // `NodeMlsFactory` requires `Some(bytes)` — the old DID-less
                 // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
                 // it with real MLS crypto across every bridge entry point.
-                let kp_bytes = generate_mls_key_package_bytes(&identity.did)?;
+                let wrapping_public = sup
+                    .wrapping_public_key(&identity.did.clone().into())
+                    .await
+                    .map_err(ScpError::from)?;
+                let kp_bytes = generate_mls_key_package_bytes(&identity.did, &wrapping_public)?;
                 let key_package = KeyPackage {
                     owner_did: identity.did.clone().into(),
                     mls_key_package_bytes: Some(kp_bytes),
@@ -13335,7 +13341,9 @@ impl Scp {
     /// `broadcast_handle_key_request`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-    /// `instance_id` does not match this `SCP`'s.
+    /// `instance_id` does not match this `SCP`'s. `wrapping_pubkey` is the
+    /// requester's 65-byte uncompressed DHKEM(P-256) public key (§5.14.2, §9.5);
+    /// any other length or an invalid point returns `ScpError::Validation`.
     pub async fn broadcast_handle_key_request(
         &self,
         handle: Arc<ContextHandle>,
@@ -13349,17 +13357,13 @@ impl Scp {
             .map_err(ScpError::from)?;
         validate_did(&author_did)?;
         validate_did(&requester_did)?;
-        let wrapping: [u8; 32] =
-            wrapping_pubkey
-                .as_slice()
-                .try_into()
-                .map_err(|_| ScpError::Validation {
-                    msg: format!(
-                        "wrapping_pubkey must be 32 bytes, got {}",
-                        wrapping_pubkey.len()
-                    ),
+        let wrapping =
+            scp_ffi_common::broadcast::parse_wrapping_pubkey(&wrapping_pubkey).map_err(|e| {
+                ScpError::Validation {
+                    msg: e.to_string(),
                     code: codes::VALID_7007.to_owned(),
-                })?;
+                }
+            })?;
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {

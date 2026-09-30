@@ -937,3 +937,83 @@ fn close_deletes_durable_state_forward_secrecy() {
         "the closed context's snapshot was deleted and is not restored"
     );
 }
+
+/// Re-encodes a pending-join blob with its `wrapping_public` field replaced.
+fn rewrite_pending_wrapping_public(blob: &[u8], replacement: Vec<u8>) -> Vec<u8> {
+    let mut decoded: rmpv::Value = rmp_serde::from_slice(blob).expect("pending blob decodes");
+    let rmpv::Value::Map(entries) = &mut decoded else {
+        panic!("a pending blob encodes as a named map");
+    };
+    let slot = entries
+        .iter_mut()
+        .find(|(k, _)| k.as_str() == Some("wrapping_public"))
+        .expect("pending blob carries wrapping_public");
+    slot.1 = rmpv::Value::Binary(replacement);
+    rmp_serde::to_vec_named(&decoded).expect("re-encode")
+}
+
+#[test]
+fn pending_join_with_mismatched_wrapping_keypair_fails_construction_closed() {
+    // §9.5: a pending join whose stored wrapping public key is a valid point but
+    // not the public key of the stored secret would complete a join that opens
+    // with a key no peer seals to. Construction fails closed.
+    let blob = bob_pending_blob("ctx-pending-wk");
+
+    // Positive control: the same blob re-encoded through the same path restores.
+    let decoded: rmpv::Value = rmp_serde::from_slice(&blob).expect("pending blob decodes");
+    let original = decoded
+        .as_map()
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("wrapping_public"))
+        })
+        .and_then(|(_, v)| v.as_slice())
+        .expect("wrapping_public is binary")
+        .to_vec();
+    let control_store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    control_store
+        .put(
+            "scp-client/pending/ctx-pending-wk",
+            rewrite_pending_wrapping_public(&blob, original),
+        )
+        .expect("put");
+    let relay = Relay::new();
+    let _bob = client_over(&relay, BOB_DID, control_store, seed(100));
+
+    let (other_public, _other_secret) =
+        scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+    let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    store
+        .put(
+            "scp-client/pending/ctx-pending-wk",
+            rewrite_pending_wrapping_public(&blob, other_public.to_vec()),
+        )
+        .expect("put");
+    match expect_construction_error(store) {
+        ClientError::StorageCorrupt(msg) => {
+            assert!(msg.contains("invalid wrapping keypair"), "got: {msg}");
+        }
+        other => panic!("expected StorageCorrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn pending_join_with_32_byte_wrapping_public_fails_construction_closed() {
+    // §9.5: the pending blob's wrapping public key is the 65-byte uncompressed
+    // point; a 32-byte key (the retired X25519 width) fails decode, typed.
+    let blob = bob_pending_blob("ctx-pending-wk32");
+    let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    store
+        .put(
+            "scp-client/pending/ctx-pending-wk32",
+            rewrite_pending_wrapping_public(&blob, vec![0x42; 32]),
+        )
+        .expect("put");
+    match expect_construction_error(store) {
+        ClientError::StorageCorrupt(msg) => {
+            assert!(msg.contains("deserializing pending join"), "got: {msg}");
+            assert!(msg.contains("got 32 bytes"), "got: {msg}");
+        }
+        other => panic!("expected StorageCorrupt, got {other:?}"),
+    }
+}

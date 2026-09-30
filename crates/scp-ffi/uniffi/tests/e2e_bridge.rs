@@ -32,6 +32,7 @@ use scp_ffi_uniffi::{
     OutletDefinition,
     OutletKind,
     Scp,
+    ScpError,
     // Free functions — bridge trust
     bridge_evaluate_trust,
     // Free functions — discovery
@@ -1487,4 +1488,90 @@ async fn context_import_rejects_tampered_signature_with_2093() {
         ),
         other => panic!("expected ScpError::Context with SCP-CTX-2093, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast key distribution — the requester's wrapping key (§5.14.2, §9.5)
+// ---------------------------------------------------------------------------
+
+fn broadcast_params() -> ContextParams {
+    ContextParams {
+        mode: ContextMode::Broadcast,
+        ceiling: vec!["messages:read".to_owned()],
+        memory_scope: MemoryScope::Full,
+        ..default_encrypted_params()
+    }
+}
+
+#[tokio::test]
+async fn broadcast_key_request_requires_a_65_byte_p256_wrapping_key() {
+    let scp = Scp::new_in_memory_for_test();
+    let author = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let subscriber = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let handle = scp
+        .context_create(author.clone(), broadcast_params())
+        .await
+        .unwrap();
+    scp.broadcast_subscribe(Arc::clone(&handle), subscriber.did(), None)
+        .await
+        .unwrap();
+
+    // A 32-byte key (the retired X25519 width) is a validation error.
+    match scp
+        .broadcast_handle_key_request(
+            Arc::clone(&handle),
+            author.did(),
+            subscriber.did(),
+            vec![0x42; 32],
+        )
+        .await
+    {
+        Err(ScpError::Validation { msg, code }) => {
+            assert_eq!(code, "SCP-VALID-7007");
+            assert!(msg.contains("must be 65 bytes"), "got: {msg}");
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+
+    // A 65-byte value that is not on the curve is a validation error too.
+    let mut off_curve = vec![0u8; 65];
+    off_curve[0] = 0x04;
+    match scp
+        .broadcast_handle_key_request(
+            Arc::clone(&handle),
+            author.did(),
+            subscriber.did(),
+            off_curve,
+        )
+        .await
+    {
+        Err(ScpError::Validation { msg, .. }) => {
+            assert!(
+                msg.contains("not a valid uncompressed P-256 point"),
+                "got: {msg}"
+            );
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+
+    // A valid point is accepted, and its secret opens the sealed key.
+    let (public, secret) = scp_core::crypto::sender_keys::generate_wrapping_keypair();
+    let sealed_json = scp
+        .broadcast_handle_key_request(
+            Arc::clone(&handle),
+            author.did(),
+            subscriber.did(),
+            public.to_vec(),
+        )
+        .await
+        .unwrap()
+        .expect("a registered subscriber is granted the key");
+    let key = scp_ffi_uniffi::bridge::broadcast_open_key(sealed_json, secret.to_vec()).unwrap();
+    assert_eq!(key.len(), 32);
 }

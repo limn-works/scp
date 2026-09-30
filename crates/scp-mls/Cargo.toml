@@ -63,11 +63,12 @@ getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] 
 uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]
+# The shared valid-P-256-point test fixture (`scp_crypto::p256::testing`).
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 scp-did = { path = "../scp-did", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 ed25519-dalek = { workspace = true }
-x25519-dalek = { workspace = true }
 rand = { workspace = true }
 bs58 = { workspace = true }
 serde = { workspace = true }

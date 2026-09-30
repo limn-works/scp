@@ -744,7 +744,21 @@ fn malformed_key_package_add_member_is_rejected_without_mutation() {
         "a rejected wrong-type KeyPackage must leave the adder's state UNCHANGED"
     );
 
-    // (c) An empty buffer (degenerate truncation).
+    // (c) A KeyPackage prefix (version 1, ciphersuite 2) whose `init_key` length
+    // header has length-of-length 3 (0xC0), which MLS forbids: rejected as an
+    // error, never a panic, in every build profile.
+    let bad_header = [0x00u8, 0x01, 0x00, 0x02, 0xC0, 0, 0, 0, 0, 0, 0, 0];
+    assert!(
+        alice.client.add_member(CTX, &bad_header).is_err(),
+        "a vector header with length-of-length 3 is rejected"
+    );
+    assert_eq!(
+        StateSnapshot::capture(&alice.client, CTX),
+        before,
+        "a rejected bad-header KeyPackage must leave the adder's state UNCHANGED"
+    );
+
+    // (d) An empty buffer (degenerate truncation).
     assert!(
         alice.client.add_member(CTX, &[]).is_err(),
         "an empty KeyPackage is rejected"
@@ -978,4 +992,56 @@ fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
         "the misdirected distribution installed no key and did not wedge Bob's \
          receive path"
     );
+}
+
+// ===========================================================================
+// An invalid directory wrapping key is rejected before the pending material
+// is consumed
+// ===========================================================================
+
+#[test]
+fn join_rejects_off_curve_directory_wrapping_key_and_stays_retryable() {
+    // §9.5: the transported member-wrapping-key directory is untrusted input.
+    // A key that is not a valid uncompressed P-256 point is rejected, typed and
+    // naming the member, before the in-memory pending material is consumed, so
+    // the same tab can retry with a correct directory.
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    let mut bob = relay.new_party(BOB_DID, 100);
+    alice.client.create_context(CTX).expect("Alice creates");
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+
+    // The uncompressed tag with the point (0, 0), which is not on the curve.
+    let mut off_curve = [0u8; 65];
+    off_curve[0] = 0x04;
+    let mut tampered = add.wrapping_keys.clone();
+    let alice_entry = tampered
+        .iter_mut()
+        .find(|(did, _)| did == ALICE_DID)
+        .expect("the directory carries Alice's key");
+    alice_entry.1 = off_curve;
+
+    match bob
+        .client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &tampered)
+    {
+        Err(ClientError::SenderKey(
+            scp_protocol::crypto::sender_keys::SenderKeyError::MalformedWrappingPublicKey(msg),
+        )) => assert!(msg.contains(ALICE_DID), "got: {msg}"),
+        other => panic!("expected MalformedWrappingPublicKey, got {other:?}"),
+    }
+    assert_eq!(bob.client.member_dids(CTX), None);
+
+    // The pending material survived: the correct directory joins.
+    bob.client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .expect("the retry with a valid directory joins");
+    assert!(bob.client.member_dids(CTX).is_some());
 }

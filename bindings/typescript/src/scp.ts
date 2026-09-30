@@ -2069,18 +2069,21 @@ export class SCP {
   }
 
   /**
-   * Seals the author's current broadcast key to the requester's 32-byte
-   * X25519 `wrappingPubkey` (HPKE, spec §5.14.2).
+   * Seals the author's current broadcast key to the requester's
+   * `wrappingPubkey`, a 65-byte uncompressed DHKEM(P-256) point (HPKE, spec
+   * §5.14.2, §9.5). Any other length or an invalid point is rejected with a
+   * validation error.
    *
    * On grant, returns a JSON string encoding the sealed broadcast key; feed
-   * that exact string into {@link broadcastOpenKey} together with the X25519
-   * `wrappingSecret` matching the `wrappingPubkey` presented here to recover
+   * that exact string into {@link broadcastOpenKey} together with the P-256
+   * `wrappingSecret` scalar matching the `wrappingPubkey` presented here to recover
    * the raw key. On deny (§5.14.8 — a blocked, unregistered, or unauthorized
    * requester), returns `null` and no key material is produced. The raw
    * AES-256 broadcast key never crosses the FFI boundary; only sealed material
    * is returned.
    *
-   * @param wrappingPubkey - the requester's 32-byte X25519 public key.
+   * @param wrappingPubkey - the requester's 65-byte uncompressed DHKEM(P-256)
+   *   public key.
    */
   async broadcastHandleKeyRequest(
     handle: unknown,
@@ -2106,7 +2109,7 @@ export class SCP {
 
   /**
    * Opens an HPKE-sealed broadcast key (spec §5.14.2) using the subscriber's
-   * 32-byte X25519 `wrappingSecret`, returning the raw 32-byte AES-256
+   * 32-byte DHKEM(P-256) `wrappingSecret` scalar, returning the raw 32-byte AES-256
    * broadcast key.
    *
    * `sealedJson` is the JSON string returned by
@@ -2115,7 +2118,7 @@ export class SCP {
    * state.
    *
    * @param sealedJson - the sealed-key JSON from `broadcastHandleKeyRequest`.
-   * @param wrappingSecret - the subscriber's 32-byte X25519 secret.
+   * @param wrappingSecret - the subscriber's 32-byte DHKEM(P-256) scalar.
    */
   // why: `broadcastOpenKey` is a module-level NAPI free function
   // (`#[napi] pub fn broadcast_open_key`), not an SCP-class method, so it

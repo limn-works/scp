@@ -9,8 +9,11 @@ use sha2::{Digest, Sha256};
 
 use super::{OuterEnvelope, create_outer_envelope};
 use crate::envelope::inner::{InnerEnvelope, verify_inner_signature};
-use scp_mls::encrypt::{decrypt_with_sender_key, encrypt, serialize_ciphertext};
+use scp_clock::Clock;
+use scp_did::DID;
+use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did, encrypt, serialize_ciphertext};
 use scp_mls::group::ScpMlsGroup;
+use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::sender_keys::SenderKey;
 use scp_protocol::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 use scp_protocol::envelope::EnvelopeError;
@@ -98,33 +101,64 @@ pub fn seal_envelope(
     create_outer_envelope(routing_id, recipient_hint, blob_ttl, encrypted_blob)
 }
 
-/// Opens a received outer envelope: decrypts via MLS, decrypts with the
-/// sender key, deserializes, strips padding, verifies content integrity,
-/// and verifies the inner signature.
+/// The sender-layer AAD fields a receiver expects on an envelope (ADR-007).
+///
+/// The fields are the context, the sender DID, the sender-key epoch, and the
+/// sequence number. [`open_envelope`] authenticates them through the
+/// sender-layer AEAD and also requires `sender_did` to equal both the MLS sender's
+/// credential DID and the inner envelope's `sender_did` (09 §9.8.1).
+#[derive(Debug, Clone, Copy)]
+pub struct SenderLayerAad<'a> {
+    /// The context the envelope belongs to.
+    pub context_id: &'a str,
+    /// The DID the receiver expects sent the envelope.
+    pub sender_did: &'a str,
+    /// The sender-key epoch.
+    pub epoch: u64,
+    /// The sender's per-epoch sequence number.
+    pub sequence: u64,
+}
+
+/// Opens and verifies a received outer envelope.
+///
+/// It decrypts via MLS, binds the sender identities, decrypts with the sender
+/// key, deserializes, strips padding, verifies content integrity, and verifies
+/// the inner signature.
 ///
 /// This is the primary **receive-path** function with full integrity
 /// verification. It rejects messages that fail any verification step.
 ///
-/// The sender's Ed25519 public key is resolved internally from the MLS
-/// group state — the caller does not need to supply it. This prevents
-/// callers from accidentally providing the wrong key. See SCP-177.
+/// The sender's identity comes from the inner-envelope signature, checked
+/// against the key `key_resolver` resolves for `(inner.sender_did,
+/// inner.signing_key_id)` — never from the MLS leaf signature key, which is a
+/// P-256 MLS key distinct from the DID's signing keys (09 §9.8.1; 09:856).
+/// Because every member holds every other member's sender key, the DID in
+/// the MLS sender's credential, the inner `sender_did`, and the caller's
+/// `aad.sender_did` must all be equal; otherwise a member could re-send another
+/// member's signed inner envelope from its own leaf.
 ///
 /// # Processing order
 ///
-/// 1. Decrypt the `encrypted_blob` via MLS and extract the sender's
-///    signature key from the MLS group tree (membership tag verification and
-///    generation-number replay prevention are enforced by the MLS layer).
-/// 2. Decrypt the MLS plaintext with the sender's AES-256-GCM key
-///    (per-sender forward secrecy layer — see ADR-007).
-/// 3. Deserialize the sender-key-decrypted bytes into an [`InnerEnvelope`].
-/// 4. Verify the inner envelope's `sender_did` is a member of the MLS group.
+/// 1. Decrypt the `encrypted_blob` via MLS and read the sender DID from the
+///    MLS sender's credential (membership tag verification and
+///    generation-number replay prevention are enforced by the MLS layer). A
+///    Commit or Proposal is not an envelope and is rejected; a Commit has
+///    already been merged into `group` by then, as on the production receive
+///    path.
+/// 2. Require the MLS sender DID to equal `aad.sender_did`.
+/// 3. Decrypt the MLS plaintext with the sender's AES-256-GCM key
+///    (per-sender forward secrecy layer — see ADR-007); the AAD binds
+///    `aad.sender_did`.
+/// 4. Deserialize the sender-key-decrypted bytes into an [`InnerEnvelope`]
+///    and require its `sender_did` to equal `aad.sender_did`.
 /// 5. Strip bucket padding from the payload to recover the original
 ///    plaintext.
 /// 6. Verify `payload_hash == SHA-256(stripped_payload)` — reject on content
 ///    integrity failure.
-/// 7. Verify the inner Ed25519 signature against the sender's public key
-///    (resolved from MLS) — reject on signature mismatch.
-/// 8. Return the verified inner envelope.
+/// 7. Resolve the verification key for `(inner.sender_did,
+///    inner.signing_key_id)` (`#active` or `#agent`).
+/// 8. Verify the inner Ed25519 signature against it — reject on mismatch.
+/// 9. Return the verified inner envelope.
 ///
 /// # Arguments
 ///
@@ -132,51 +166,79 @@ pub fn seal_envelope(
 /// * `group` - The MLS group to decrypt within. Must be active.
 /// * `sender_key` - The sender's current AES-256 sender key for this
 ///   context.
+/// * `aad` - The sender-layer AAD fields; its `sender_did` is also the
+///   sender the caller expects.
+/// * `key_resolver` - Resolves a DID's `#active` or `#agent` verification
+///   key.
+/// * `clock` - The injected clock `decrypt_with_sender_did` validates a
+///   Commit's `KeyPackage` lifetimes against.
 ///
 /// # Errors
 ///
 /// Returns [`EnvelopeError::MlsDecryptionFailed`] if MLS decryption fails
-/// (including replay rejection via generation number).
+/// (including replay rejection via generation number) or the message is a
+/// Commit or Proposal rather than an application message.
+/// Returns [`EnvelopeError::SenderMismatch`] if the MLS sender DID or the
+/// inner `sender_did` differs from `aad.sender_did`.
 /// Returns [`EnvelopeError::SenderKeyDecryptionFailed`] if sender key
 /// AES-256-GCM decryption fails (wrong key, tampered, or corrupted).
 /// Returns [`EnvelopeError::DeserializationFailed`] if the decrypted bytes
 /// are not a valid inner envelope.
-/// Returns [`EnvelopeError::UnknownSender`] if the inner envelope's
-/// `sender_did` is not found in the MLS group member list.
 /// Returns [`EnvelopeError::InvalidPadding`] if padding cannot be stripped.
 /// Returns [`EnvelopeError::ContentIntegrityFailed`] if `payload_hash` does
 /// not match `SHA-256(stripped_payload)`.
-/// Returns [`EnvelopeError::VerificationFailed`] if the public key or
-/// signature bytes are malformed.
+/// Returns [`EnvelopeError::VerificationFailed`] if no key resolves for the
+/// inner sender and signing key id, or the key or signature bytes are
+/// malformed.
 /// Returns [`EnvelopeError::InnerSignatureMismatch`] if the signature is
 /// well-formed but does not match.
 ///
-/// See ADR-002 acceptance criterion 5, ADR-007, and SCP-177.
+/// See ADR-002 acceptance criterion 5, ADR-007, and 09 §9.8.1.
 pub fn open_envelope(
     outer: &OuterEnvelope,
     group: &mut ScpMlsGroup,
     sender_key: &SenderKey,
-    context_id: &str,
-    sender_did: &str,
-    epoch: u64,
-    sequence: u64,
+    aad: &SenderLayerAad<'_>,
+    key_resolver: &KeyResolver,
+    clock: &dyn Clock,
 ) -> Result<InnerEnvelope, EnvelopeError> {
-    // 1. MLS decrypt and extract sender's signature key from MLS tree.
-    let (mls_plaintext, sender_public_key) = decrypt_with_sender_key(group, &outer.encrypted_blob)
-        .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?;
+    // 1. MLS decrypt; the sender DID comes from the MLS sender's credential.
+    let (mls_plaintext, mls_sender) =
+        match decrypt_with_sender_did(group, &outer.encrypted_blob, clock)
+            .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?
+        {
+            DecryptedContent::Application {
+                plaintext,
+                sender_did,
+            } => (plaintext, sender_did),
+            DecryptedContent::Commit { .. } | DecryptedContent::Proposal { .. } => {
+                return Err(EnvelopeError::MlsDecryptionFailed(
+                    "not an application message".to_owned(),
+                ));
+            }
+        };
 
-    // 2. Decrypt sender key layer (AES-256-GCM), verifying AAD binding.
+    // 2. The MLS sender must be the sender the caller expects (09 §9.8.1).
+    if mls_sender != aad.sender_did {
+        return Err(EnvelopeError::SenderMismatch {
+            mls_sender,
+            inner_sender: String::new(),
+            caller_sender: aad.sender_did.to_owned(),
+        });
+    }
+
+    // 3. Decrypt sender key layer (AES-256-GCM), verifying AAD binding.
     let plaintext = decrypt_sender_layer(
         sender_key,
         &mls_plaintext,
-        context_id,
-        sender_did,
-        epoch,
-        sequence,
+        aad.context_id,
+        aad.sender_did,
+        aad.epoch,
+        aad.sequence,
     )
     .map_err(|e| EnvelopeError::SenderKeyDecryptionFailed(e.to_string()))?;
 
-    // 3. Deserialize inner envelope via `from_bytes` (#347, #863).
+    // 4. Deserialize inner envelope via `from_bytes` (#347, #863).
     //    `from_bytes` applies a pre-deserialization size check against
     //    `MAX_ENVELOPE_SIZE` before invoking the deserializer, preventing
     //    `serde`'s `#[serde(flatten)]` buffering from allocating memory for
@@ -185,13 +247,20 @@ pub fn open_envelope(
     //    `from_bytes` acts as defense in depth.
     let inner = InnerEnvelope::from_bytes(&plaintext)?;
 
-    // 3a. Version compatibility is checked inside `verify_inner_signature`
-    //     (step 7 below), which rejects incompatible major versions and warns
+    // 4a. Version compatibility is checked inside `verify_inner_signature`
+    //     (step 8 below), which rejects incompatible major versions and warns
     //     on minor mismatches. No duplicate check here — standalone callers of
     //     `verify_inner_signature` still get the check.
 
-    // 4. Verify sender_did is a member of the MLS group.
-    verify_sender_in_group(group, &inner.sender_did)?;
+    // 4b. The inner sender must be the sender the caller expects, which step 2
+    //     already bound to the MLS sender (09 §9.8.1).
+    if inner.sender_did != aad.sender_did {
+        return Err(EnvelopeError::SenderMismatch {
+            mls_sender,
+            inner_sender: inner.sender_did,
+            caller_sender: aad.sender_did.to_owned(),
+        });
+    }
 
     // 5. Strip padding to recover original payload.
     let stripped_payload = strip_padding(&inner.payload)?;
@@ -206,42 +275,24 @@ pub fn open_envelope(
         return Err(EnvelopeError::ContentIntegrityFailed);
     }
 
-    // 7. Verify inner signature using the sender's public key resolved from MLS.
-    let valid = verify_inner_signature(&inner, &sender_public_key)?;
+    // 7. Resolve the key the inner envelope declares it was signed with
+    //    (`#active` or `#agent`) for the bound sender DID.
+    let verifying_key = key_resolver(&DID(inner.sender_did.clone()), inner.signing_key_id)
+        .ok_or_else(|| {
+            EnvelopeError::VerificationFailed(format!(
+                "no key for {}{}",
+                inner.sender_did, inner.signing_key_id
+            ))
+        })?;
+
+    // 8. Verify the inner signature against the resolved key.
+    let valid = verify_inner_signature(&inner, verifying_key.as_bytes())?;
     if !valid {
         return Err(EnvelopeError::InnerSignatureMismatch);
     }
 
-    // 8. Return the verified inner envelope.
+    // 9. Return the verified inner envelope.
     Ok(inner)
-}
-
-/// Verifies that the given `sender_did` corresponds to a member of the MLS
-/// group by checking the SCP credentials embedded in each member's leaf node.
-///
-/// # Errors
-///
-/// Returns [`EnvelopeError::MlsDecryptionFailed`] if the group is destroyed.
-/// Returns [`EnvelopeError::UnknownSender`] if no member's credential
-/// contains the given DID.
-fn verify_sender_in_group(group: &ScpMlsGroup, sender_did: &str) -> Result<(), EnvelopeError> {
-    use openmls::prelude::BasicCredential;
-    use scp_mls::credential::ScpCredential;
-
-    let members = group
-        .members()
-        .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?;
-
-    for member in &members {
-        if let Ok(basic_cred) = BasicCredential::try_from(member.credential.clone())
-            && let Ok(scp_cred) = ScpCredential::from_bytes(basic_cred.identity())
-            && scp_cred.did == sender_did
-        {
-            return Ok(());
-        }
-    }
-
-    Err(EnvelopeError::UnknownSender(sender_did.to_owned()))
 }
 
 /// Integration tests for the high-level seal/open envelope operations.
@@ -252,9 +303,12 @@ fn verify_sender_in_group(group: &ScpMlsGroup, sender_did: &str) -> Result<(), E
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod seal_open_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use openmls::prelude::*;
+    use scp_clock::SystemClock;
     use scp_platform::testing::InMemoryKeyCustody;
-    use scp_platform::traits::{KeyCustody, KeyType};
     use sha2::{Digest, Sha256};
 
     use super::*;
@@ -266,93 +320,117 @@ mod seal_open_tests {
     use scp_protocol::crypto::sender_keys::generate_sender_key;
     use scp_protocol::envelope::padding::strip_padding;
 
-    #[allow(clippy::unwrap_used)]
-    fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(
-            format!("did:dht:z6Mk{name}"),
-            None,
-            scp_did::SigningKeyId::Active,
+    /// One group member: the DID in its MLS credential and its view of the
+    /// group. Its identity keys are separate from its P-256 MLS leaf key
+    /// (09 §9.8.1).
+    struct Member {
+        did: String,
+        group: ScpMlsGroup,
+    }
+
+    fn did_of(name: &str) -> String {
+        format!("did:dht:z6Mk{name}")
+    }
+
+    fn credential(name: &str) -> ScpCredential {
+        ScpCredential::new(did_of(name), None, SigningKeyId::Active).unwrap()
+    }
+
+    /// The fixed Ed25519 seed of `did`'s `key_id` identity key.
+    fn identity_seed(did: &str, key_id: SigningKeyId) -> [u8; 32] {
+        Sha256::new()
+            .chain_update(b"ops-test-identity")
+            .chain_update(did.as_bytes())
+            .chain_update(key_id.to_string().as_bytes())
+            .finalize()
+            .into()
+    }
+
+    fn verifying_key(did: &str, key_id: SigningKeyId) -> ed25519_dalek::VerifyingKey {
+        ed25519_dalek::SigningKey::from_bytes(&identity_seed(did, key_id)).verifying_key()
+    }
+
+    /// A resolver that resolves exactly `entries` and nothing else.
+    fn resolver(entries: Vec<(String, SigningKeyId, ed25519_dalek::VerifyingKey)>) -> KeyResolver {
+        let map: HashMap<(String, SigningKeyId), ed25519_dalek::VerifyingKey> = entries
+            .into_iter()
+            .map(|(did, key_id, key)| ((did, key_id), key))
+            .collect();
+        Arc::new(move |did: &DID, key_id: SigningKeyId| map.get(&(did.0.clone(), key_id)).copied())
+    }
+
+    /// A resolver holding each DID's `#active` identity key.
+    fn active_resolver(dids: &[&str]) -> KeyResolver {
+        resolver(
+            dids.iter()
+                .map(|did| {
+                    (
+                        (*did).to_owned(),
+                        SigningKeyId::Active,
+                        verifying_key(did, SigningKeyId::Active),
+                    )
+                })
+                .collect(),
         )
-        .unwrap()
     }
 
-    /// Sets up Alice and Bob in a shared MLS group.
-    /// Returns (`alice_group`, `bob_group`).
-    fn setup_mls_groups() -> (ScpMlsGroup, ScpMlsGroup) {
-        let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
-
-        let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
-        let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-
-        let add_result = add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).unwrap();
-        let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
-
-        (alice_group, bob_group)
+    /// The first name creates the group and adds each later name in order;
+    /// every earlier joiner processes each later Add commit. Returns the
+    /// members in `names` order, all at the same epoch.
+    fn setup_group(names: &[&str]) -> Vec<Member> {
+        let mut members = vec![Member {
+            did: did_of(names[0]),
+            group: create_group(
+                &credential(names[0]),
+                &scp_crypto::p256::testing::uncompressed_point_for(&(credential(names[0])).did),
+                &SystemClock,
+            )
+            .unwrap(),
+        }];
+        for name in &names[1..] {
+            let (bundle, signer, provider) = generate_key_package(
+                &credential(name),
+                &scp_crypto::p256::testing::uncompressed_point_for(&(credential(name)).did),
+                &SystemClock,
+            )
+            .unwrap();
+            let key_package: KeyPackageIn = bundle.key_package().clone().into();
+            let added = add_member(&mut members[0].group, key_package, &SystemClock).unwrap();
+            let commit = serialize_ciphertext(&added.commit).unwrap();
+            for member in members.iter_mut().skip(1) {
+                let processed =
+                    decrypt_with_sender_did(&mut member.group, &commit, &SystemClock).unwrap();
+                assert!(matches!(processed, DecryptedContent::Commit { .. }));
+            }
+            let group = join_group(&added.welcome, provider, signer).unwrap();
+            members.push(Member {
+                did: did_of(name),
+                group,
+            });
+        }
+        members
     }
 
-    /// Creates an inner envelope signed by the MLS group member's own signing
-    /// key, ensuring the signature matches what `open_envelope` will resolve
-    /// from the MLS group state.
-    ///
-    /// The `sender_did` is extracted from the credential in the MLS group,
-    /// and the signing key is imported from the MLS signer's private key
-    /// into an `InMemoryKeyCustody` instance.
-    async fn create_test_inner(
-        group: &ScpMlsGroup,
+    /// Alice and Bob in one group.
+    fn alice_and_bob() -> (Member, Member) {
+        let mut members = setup_group(&["alice", "bob"]);
+        let bob = members.pop().unwrap();
+        let alice = members.pop().unwrap();
+        (alice, bob)
+    }
+
+    /// An inner envelope from `sender_did`, signed with its `key_id` identity
+    /// key and declaring that key id.
+    async fn sign_inner_as(
+        sender_did: &str,
+        key_id: SigningKeyId,
         payload: &[u8],
         provenance: Option<Provenance>,
     ) -> InnerEnvelope {
-        // Extract the MLS signer's private key bytes.
-        let signer = group.signer_key_pair().expect("group must have a signer");
-        let private_key_bytes: [u8; 32] = signer
-            .private()
-            .try_into()
-            .expect("Ed25519 private key must be 32 bytes");
-
-        // Extract the sender DID from the credential.
-        let members = group.members().unwrap();
-        let own_index = group.own_leaf_index().unwrap();
-        let own_member = members
-            .iter()
-            .find(|m| m.index == own_index)
-            .expect("must find own member");
-        let basic_cred = BasicCredential::try_from(own_member.credential.clone()).unwrap();
-        let scp_cred = ScpCredential::from_bytes(basic_cred.identity()).unwrap();
-
-        // Import the MLS signer's private key into an InMemoryKeyCustody.
         let custody = InMemoryKeyCustody::new();
-        let signing_key = custody.import_ed25519_key(&private_key_bytes).await;
-
-        create_inner_envelope(
-            &InnerEnvelopeParams {
-                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
-                context_id: "ctx-1",
-                sender_did: &scp_cred.did,
-                epoch: group.epoch().unwrap(),
-                generation: 0,
-                sequence: 1,
-                timestamp: 1_700_000_000,
-                message_type: MessageType::Content,
-                payload,
-                provenance,
-                signing_key_id: SigningKeyId::Active,
-            },
-            &custody,
-            &signing_key,
-        )
-        .await
-        .unwrap()
-    }
-
-    /// Creates an inner envelope signed by a random key (not the MLS group
-    /// member's key). Used to test signature mismatch detection.
-    async fn create_test_inner_with_random_key(payload: &[u8], sender_did: &str) -> InnerEnvelope {
-        let custody = InMemoryKeyCustody::new();
-        let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-
+        let signing_key = custody
+            .import_ed25519_key(&identity_seed(sender_did, key_id))
+            .await;
         create_inner_envelope(
             &InnerEnvelopeParams {
                 version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
@@ -364,8 +442,8 @@ mod seal_open_tests {
                 timestamp: 1_700_000_000,
                 message_type: MessageType::Content,
                 payload,
-                provenance: None,
-                signing_key_id: SigningKeyId::Active,
+                provenance,
+                signing_key_id: key_id,
             },
             &custody,
             &signing_key,
@@ -374,20 +452,68 @@ mod seal_open_tests {
         .unwrap()
     }
 
+    /// An inner envelope from `sender`, signed with its `#active` key.
+    async fn create_test_inner(
+        sender: &Member,
+        payload: &[u8],
+        provenance: Option<Provenance>,
+    ) -> InnerEnvelope {
+        sign_inner_as(&sender.did, SigningKeyId::Active, payload, provenance).await
+    }
+
+    /// The AAD fields an honest receiver expects for `inner`.
+    fn aad(inner: &InnerEnvelope) -> SenderLayerAad<'_> {
+        SenderLayerAad {
+            context_id: &inner.context_id,
+            sender_did: &inner.sender_did,
+            epoch: inner.epoch,
+            sequence: inner.sequence,
+        }
+    }
+
+    fn seal(inner: &InnerEnvelope, sender: &mut Member, sender_key: &SenderKey) -> OuterEnvelope {
+        seal_envelope(
+            inner,
+            &mut sender.group,
+            sender_key,
+            &[0xAA; 32],
+            None,
+            3600,
+        )
+        .unwrap()
+    }
+
+    fn open_as(
+        outer: &OuterEnvelope,
+        receiver: &mut Member,
+        sender_key: &SenderKey,
+        aad: &SenderLayerAad<'_>,
+        key_resolver: &KeyResolver,
+    ) -> Result<InnerEnvelope, EnvelopeError> {
+        open_envelope(
+            outer,
+            &mut receiver.group,
+            sender_key,
+            aad,
+            key_resolver,
+            &SystemClock,
+        )
+    }
+
     // -----------------------------------------------------------------------
     // seal_envelope tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn seal_envelope_produces_valid_outer_envelope() {
-        let (mut alice_group, _bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"hello world", None).await;
+        let (mut alice, _bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"hello world", None).await;
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
         let outer = seal_envelope(
             &inner,
-            &mut alice_group,
+            &mut alice.group,
             &sender_key,
             &routing_id,
             None,
@@ -406,15 +532,15 @@ mod seal_open_tests {
 
     #[tokio::test]
     async fn seal_envelope_with_recipient_hint() {
-        let (mut alice_group, _bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"directed message", None).await;
+        let (mut alice, _bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"directed message", None).await;
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
         let recipient = [0xBB; 32];
 
         let outer = seal_envelope(
             &inner,
-            &mut alice_group,
+            &mut alice.group,
             &sender_key,
             &routing_id,
             Some(&recipient),
@@ -428,13 +554,13 @@ mod seal_open_tests {
 
     #[tokio::test]
     async fn seal_envelope_rejects_invalid_routing_id() {
-        let (mut alice_group, _bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"test", None).await;
+        let (mut alice, _bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"test", None).await;
         let sender_key = generate_sender_key();
 
         let result = seal_envelope(
             &inner,
-            &mut alice_group,
+            &mut alice.group,
             &sender_key,
             &[0xAA; 16],
             None,
@@ -449,36 +575,23 @@ mod seal_open_tests {
 
     #[tokio::test]
     async fn seal_then_open_roundtrip_produces_original_content() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
+        let (mut alice, mut bob) = alice_and_bob();
         let original_payload = b"hello, sealed world!";
-        let inner = create_test_inner(&alice_group, original_payload, None).await;
+        let inner = create_test_inner(&alice, original_payload, None).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
+        let outer = seal(&inner, &mut alice, &sender_key);
 
-        // Seal (Alice sends).
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
-
-        // Open (Bob receives) — no sender_public_key needed (SCP-177).
-        let recovered = open_envelope(
+        // Bob verifies against Alice's resolved `#active` identity key
+        // (09 §9.8.1; 09:856).
+        let recovered = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
+            &aad(&inner),
+            &active_resolver(&[&alice.did]),
         )
         .unwrap();
 
-        // Verify all inner envelope fields match.
         assert_eq!(recovered.context_id, inner.context_id);
         assert_eq!(recovered.sender_did, inner.sender_did);
         assert_eq!(recovered.epoch, inner.epoch);
@@ -489,44 +602,28 @@ mod seal_open_tests {
         assert_eq!(recovered.payload, inner.payload);
         assert_eq!(recovered.signature, inner.signature);
 
-        // Verify we can strip padding to recover original payload.
         let stripped = strip_padding(&recovered.payload).unwrap();
         assert_eq!(stripped, original_payload);
     }
 
     #[tokio::test]
     async fn seal_then_open_roundtrip_with_provenance() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
+        let (mut alice, mut bob) = alice_and_bob();
         let provenance = Provenance {
             source: "test-outlet".into(),
             upstream_hash: Some("abc123".into()),
         };
-        let inner = create_test_inner(
-            &alice_group,
-            b"payload with provenance",
-            Some(provenance.clone()),
-        )
-        .await;
+        let inner =
+            create_test_inner(&alice, b"payload with provenance", Some(provenance.clone())).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
+        let outer = seal(&inner, &mut alice, &sender_key);
 
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
-        let recovered = open_envelope(
+        let recovered = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
+            &aad(&inner),
+            &active_resolver(&[&alice.did]),
         )
         .unwrap();
 
@@ -536,20 +633,10 @@ mod seal_open_tests {
 
     #[tokio::test]
     async fn open_envelope_rejects_tampered_encrypted_blob() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"test", None).await;
+        let (mut alice, mut bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"test", None).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
-
-        let mut outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
+        let mut outer = seal(&inner, &mut alice, &sender_key);
 
         // Tamper with the encrypted blob (corrupt AEAD tag).
         if let Some(byte) = outer.encrypted_blob.last_mut() {
@@ -558,194 +645,80 @@ mod seal_open_tests {
 
         // OpenMLS can panic on AEAD decryption failure; the
         // catch_unwind guard converts the panic to an error.
-        let result = open_envelope(
+        let result = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
+            &aad(&inner),
+            &active_resolver(&[&alice.did]),
         );
         assert!(
-            result.is_err(),
-            "open_envelope must reject tampered encrypted_blob"
-        );
-
-        let err_msg = format!("{result:?}");
-        assert!(
-            err_msg.contains("MlsDecryptionFailed"),
-            "error should be MlsDecryptionFailed, got: {err_msg}"
+            matches!(result, Err(EnvelopeError::MlsDecryptionFailed(_))),
+            "error should be MlsDecryptionFailed, got: {result:?}"
         );
     }
 
     #[tokio::test]
     async fn open_envelope_rejects_mismatched_payload_hash() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
+        let (mut alice, mut bob) = alice_and_bob();
+        let mut inner = create_test_inner(&alice, b"original data", None).await;
 
-        // Extract Alice's MLS signer key to create a properly signed inner.
-        let signer = alice_group
-            .signer_key_pair()
-            .expect("group must have a signer");
-        let private_key_bytes: [u8; 32] = signer.private().try_into().unwrap();
-        let members = alice_group.members().unwrap();
-        let own_index = alice_group.own_leaf_index().unwrap();
-        let own_member = members.iter().find(|m| m.index == own_index).unwrap();
-        let basic_cred = BasicCredential::try_from(own_member.credential.clone()).unwrap();
-        let scp_cred = ScpCredential::from_bytes(basic_cred.identity()).unwrap();
-
-        let custody = InMemoryKeyCustody::new();
-        let signing_key = custody.import_ed25519_key(&private_key_bytes).await;
-
-        // Create a legitimate inner envelope.
-        let mut inner = create_inner_envelope(
-            &InnerEnvelopeParams {
-                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
-                context_id: "ctx-1",
-                sender_did: &scp_cred.did,
-                epoch: alice_group.epoch().unwrap(),
-                generation: 0,
-                sequence: 1,
-                timestamp: 1_700_000_000,
-                message_type: MessageType::Content,
-                payload: b"original data",
-                provenance: None,
-                signing_key_id: SigningKeyId::Active,
-            },
-            &custody,
-            &signing_key,
-        )
-        .await
-        .unwrap();
-
-        // Tamper with payload_hash (this also breaks the signature, but
+        // Tamper with payload_hash (this also breaks the signature, but the
         // content integrity check runs first).
         inner.payload_hash = [0xFF; 32];
 
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
+        let outer = seal(&inner, &mut alice, &sender_key);
 
-        let result = open_envelope(
+        let result = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
+            &aad(&inner),
+            &active_resolver(&[&alice.did]),
         );
         assert!(
-            result.is_err(),
-            "open_envelope must reject mismatched payload_hash"
-        );
-
-        // Verify it's specifically a content integrity error.
-        let err_msg = format!("{result:?}");
-        assert!(
-            err_msg.contains("ContentIntegrityFailed"),
-            "error should be ContentIntegrityFailed, got: {err_msg}"
+            matches!(result, Err(EnvelopeError::ContentIntegrityFailed)),
+            "error should be ContentIntegrityFailed, got: {result:?}"
         );
     }
 
-    /// SCP-177: Verifies that `open_envelope` rejects an inner envelope signed
-    /// by a key different from the MLS group member's signing key.
+    /// 09 §9.8.1: an inner envelope whose signature does not verify under the
+    /// key resolved for its sender is rejected. Here the resolver returns a
+    /// key other than the one Alice signed with.
     #[tokio::test]
     async fn open_envelope_rejects_wrong_signing_key() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-
-        // Create an inner envelope signed by a random key (not Alice's MLS
-        // signer). The sender_did matches Alice's credential, but the
-        // signature won't match the MLS-resolved public key.
-        let members = alice_group.members().unwrap();
-        let own_index = alice_group.own_leaf_index().unwrap();
-        let own_member = members.iter().find(|m| m.index == own_index).unwrap();
-        let basic_cred = BasicCredential::try_from(own_member.credential.clone()).unwrap();
-        let scp_cred = ScpCredential::from_bytes(basic_cred.identity()).unwrap();
-
-        let inner = create_test_inner_with_random_key(b"signed by wrong key", &scp_cred.did).await;
+        let (mut alice, mut bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"signed by alice", None).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
+        let outer = seal(&inner, &mut alice, &sender_key);
 
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
-
-        let result = open_envelope(
-            &outer,
-            &mut bob_group,
-            &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
-        );
+        let wrong_key = resolver(vec![(
+            alice.did.clone(),
+            SigningKeyId::Active,
+            verifying_key("did:dht:z6MkSomeoneElse", SigningKeyId::Active),
+        )]);
+        let result = open_as(&outer, &mut bob, &sender_key, &aad(&inner), &wrong_key);
         assert!(
-            result.is_err(),
-            "open_envelope must reject wrong sender public key"
-        );
-
-        let err_msg = format!("{result:?}");
-        assert!(
-            err_msg.contains("InnerSignatureMismatch"),
-            "error should be InnerSignatureMismatch, got: {err_msg}"
+            matches!(result, Err(EnvelopeError::InnerSignatureMismatch)),
+            "error should be InnerSignatureMismatch, got: {result:?}"
         );
     }
 
     #[tokio::test]
     async fn open_envelope_rejects_replayed_message() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"replay me", None).await;
+        let (mut alice, mut bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"replay me", None).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
-
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
+        let outer = seal(&inner, &mut alice, &sender_key);
+        let keys = active_resolver(&[&alice.did]);
 
         // First open succeeds.
-        let _recovered = open_envelope(
-            &outer,
-            &mut bob_group,
-            &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
-        )
-        .unwrap();
+        let _recovered = open_as(&outer, &mut bob, &sender_key, &aad(&inner), &keys).unwrap();
 
         // Second open with same ciphertext should fail (MLS generation
         // number replay prevention).
-        let replay_result = open_envelope(
-            &outer,
-            &mut bob_group,
-            &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
-        );
+        let replay_result = open_as(&outer, &mut bob, &sender_key, &aad(&inner), &keys);
         assert!(
             replay_result.is_err(),
             "open_envelope must reject replayed ciphertext"
@@ -754,7 +727,7 @@ mod seal_open_tests {
 
     #[tokio::test]
     async fn open_envelope_rejects_garbage_encrypted_blob() {
-        let (_alice_group, mut bob_group) = setup_mls_groups();
+        let (_alice, mut bob) = alice_and_bob();
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
@@ -763,45 +736,37 @@ mod seal_open_tests {
 
         // AAD values are irrelevant: MLS decrypt fails on garbage before
         // the sender key layer is reached.
-        let result = open_envelope(
+        let result = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            "ctx-1",
-            "did:dht:z6MkDummy",
-            0,
-            0,
+            &SenderLayerAad {
+                context_id: "ctx-1",
+                sender_did: "did:dht:z6MkDummy",
+                epoch: 0,
+                sequence: 0,
+            },
+            &active_resolver(&[]),
         );
         assert!(
-            result.is_err(),
-            "open_envelope must reject garbage encrypted_blob"
+            matches!(result, Err(EnvelopeError::MlsDecryptionFailed(_))),
+            "open_envelope must reject garbage encrypted_blob, got: {result:?}"
         );
     }
 
     #[tokio::test]
     async fn seal_then_open_empty_payload_roundtrip() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"", None).await;
+        let (mut alice, mut bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"", None).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
+        let outer = seal(&inner, &mut alice, &sender_key);
 
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
-        let recovered = open_envelope(
+        let recovered = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
+            &aad(&inner),
+            &active_resolver(&[&alice.did]),
         )
         .unwrap();
 
@@ -815,9 +780,9 @@ mod seal_open_tests {
 
     #[tokio::test]
     async fn seal_then_open_multiple_messages() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
+        let (mut alice, mut bob) = alice_and_bob();
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
+        let keys = active_resolver(&[&alice.did]);
 
         let messages: &[&[u8]] = &[b"first", b"second", b"third"];
 
@@ -825,33 +790,14 @@ mod seal_open_tests {
         let mut outers = Vec::new();
         let mut inners = Vec::new();
         for msg in messages {
-            let inner = create_test_inner(&alice_group, msg, None).await;
-            let outer = seal_envelope(
-                &inner,
-                &mut alice_group,
-                &sender_key,
-                &routing_id,
-                None,
-                3600,
-            )
-            .unwrap();
-            outers.push(outer);
+            let inner = create_test_inner(&alice, msg, None).await;
+            outers.push(seal(&inner, &mut alice, &sender_key));
             inners.push(inner);
         }
 
         // Open all messages in order.
         for (i, outer) in outers.iter().enumerate() {
-            let ref_inner = &inners[i];
-            let recovered = open_envelope(
-                outer,
-                &mut bob_group,
-                &sender_key,
-                &ref_inner.context_id,
-                &ref_inner.sender_did,
-                ref_inner.epoch,
-                ref_inner.sequence,
-            )
-            .unwrap();
+            let recovered = open_as(outer, &mut bob, &sender_key, &aad(&inners[i]), &keys).unwrap();
             let stripped = strip_padding(&recovered.payload).unwrap();
             assert_eq!(
                 stripped, messages[i],
@@ -861,111 +807,196 @@ mod seal_open_tests {
     }
 
     // -----------------------------------------------------------------------
-    // SCP-177 specific tests
+    // Sender binding and key resolution (09 §9.8.1; 09:856)
     // -----------------------------------------------------------------------
 
-    /// SCP-177 AC: envelope from valid group member decrypted with internally
-    /// resolved key.
+    /// An envelope whose inner and expected sender is a DID other than the
+    /// MLS sender's credential DID is rejected with `SenderMismatch`, even
+    /// though the resolver holds a key that verifies its signature.
     #[tokio::test]
-    async fn open_envelope_resolves_sender_key_from_group() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"internally resolved key test", None).await;
+    async fn open_envelope_rejects_sender_other_than_mls_sender() {
+        let (mut alice, mut bob) = alice_and_bob();
+        let nobody = did_of("NOBODY");
+        let inner = sign_inner_as(&nobody, SigningKeyId::Active, b"from nobody", None).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
+        let outer = seal(&inner, &mut alice, &sender_key);
 
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
-
-        // open_envelope resolves the sender key internally — no public key arg.
-        let recovered = open_envelope(
+        let result = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
-        )
-        .unwrap();
-        let stripped = strip_padding(&recovered.payload).unwrap();
-        assert_eq!(stripped, b"internally resolved key test");
+            &aad(&inner),
+            &active_resolver(&[&alice.did, &nobody]),
+        );
+        match result {
+            Err(EnvelopeError::SenderMismatch {
+                mls_sender,
+                caller_sender,
+                ..
+            }) => {
+                assert_eq!(mls_sender, alice.did);
+                assert_eq!(caller_sender, nobody);
+            }
+            other => panic!("expected SenderMismatch, got {other:?}"),
+        }
     }
 
-    /// SCP-177 AC: `sender_id` not in group returns `UnknownSender` error.
+    /// T10: an envelope signed with Alice's `#agent` key verifies when the
+    /// resolver resolves `(alice, #agent)`, and fails closed with
+    /// `VerificationFailed` when the resolver holds only Alice's `#active`
+    /// key. A receiver that always resolved `#active` rejects every
+    /// agent-signed envelope.
     #[tokio::test]
-    async fn open_envelope_rejects_unknown_sender_did() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-
-        // Create an inner envelope with a DID that is NOT in the group.
-        // Sign with Alice's MLS signer key so signature verification would
-        // pass, but the DID check should fail first.
-        let signer = alice_group
-            .signer_key_pair()
-            .expect("group must have a signer");
-        let private_key_bytes: [u8; 32] = signer.private().try_into().unwrap();
-
-        let custody = InMemoryKeyCustody::new();
-        let signing_key = custody.import_ed25519_key(&private_key_bytes).await;
-
-        let inner = create_inner_envelope(
-            &InnerEnvelopeParams {
-                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
-                context_id: "ctx-1",
-                sender_did: "did:dht:z6MkNOBODY",
-                epoch: alice_group.epoch().unwrap(),
-                generation: 0,
-                sequence: 1,
-                timestamp: 1_700_000_000,
-                message_type: MessageType::Content,
-                payload: b"from unknown sender",
-                provenance: None,
-                signing_key_id: SigningKeyId::Active,
-            },
-            &custody,
-            &signing_key,
-        )
-        .await
-        .unwrap();
-
+    async fn open_envelope_verifies_agent_signed_envelope_against_agent_key() {
+        let (mut alice, mut bob) = alice_and_bob();
+        let inner = sign_inner_as(&alice.did, SigningKeyId::Agent, b"agent says", None).await;
         let sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
+        let first = seal(&inner, &mut alice, &sender_key);
+        let second = seal(&inner, &mut alice, &sender_key);
 
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
+        let active_only = active_resolver(&[&alice.did]);
+        match open_as(&first, &mut bob, &sender_key, &aad(&inner), &active_only) {
+            Err(EnvelopeError::VerificationFailed(msg)) => {
+                assert!(msg.contains("#agent"), "{msg}");
+                assert!(msg.contains(&alice.did), "{msg}");
+            }
+            other => panic!("expected VerificationFailed, got {other:?}"),
+        }
 
-        let result = open_envelope(
-            &outer,
-            &mut bob_group,
-            &sender_key,
+        let agent = resolver(vec![(
+            alice.did.clone(),
+            SigningKeyId::Agent,
+            verifying_key(&alice.did, SigningKeyId::Agent),
+        )]);
+        let recovered = open_as(&second, &mut bob, &sender_key, &aad(&inner), &agent).unwrap();
+        assert_eq!(recovered.signing_key_id, SigningKeyId::Agent);
+        assert_eq!(recovered.sender_did, alice.did);
+    }
+
+    /// Alice, Bob and Mallory in one group, Alice's sender key (which every
+    /// member holds), and an inner envelope Alice signed.
+    async fn replay_fixture() -> (Member, Member, Member, SenderKey, InnerEnvelope) {
+        let mut members = setup_group(&["alice", "bob", "mallory"]);
+        let mallory = members.pop().unwrap();
+        let bob = members.pop().unwrap();
+        let alice = members.pop().unwrap();
+        let alice_sender_key = generate_sender_key();
+        let inner = create_test_inner(&alice, b"alice's words", None).await;
+        (alice, bob, mallory, alice_sender_key, inner)
+    }
+
+    /// T11(i): Mallory re-sends Alice's signed inner envelope from Mallory's
+    /// own MLS leaf, sealed with Alice's sender key under Alice's AAD. Bob,
+    /// expecting Alice, rejects it because the MLS sender is Mallory. The
+    /// honest control shows the same inner envelope opens when Alice sends it.
+    #[tokio::test]
+    async fn open_envelope_rejects_replay_under_other_members_leaf() {
+        let (mut alice, mut bob, mut mallory, alice_sk, inner) = replay_fixture().await;
+        let keys = active_resolver(&[&alice.did, &mallory.did]);
+
+        let honest = seal(&inner, &mut alice, &alice_sk);
+        open_as(&honest, &mut bob, &alice_sk, &aad(&inner), &keys).unwrap();
+
+        let replayed = seal(&inner, &mut mallory, &alice_sk);
+        match open_as(&replayed, &mut bob, &alice_sk, &aad(&inner), &keys) {
+            Err(EnvelopeError::SenderMismatch {
+                mls_sender,
+                caller_sender,
+                ..
+            }) => {
+                assert_eq!(mls_sender, mallory.did);
+                assert_eq!(caller_sender, alice.did);
+            }
+            other => panic!("expected SenderMismatch, got {other:?}"),
+        }
+    }
+
+    /// T11(ii): Mallory re-sends Alice's signed inner envelope from Mallory's
+    /// own leaf under Mallory's own sender key and AAD. The MLS sender and
+    /// the expected sender agree (Mallory), but the inner sender is Alice, so
+    /// Bob rejects it; without that check the resolver would return Alice's
+    /// key and the signature would verify.
+    #[tokio::test]
+    async fn open_envelope_rejects_inner_sender_other_than_caller_sender() {
+        let (alice, mut bob, mut mallory, _alice_sk, inner) = replay_fixture().await;
+        let keys = active_resolver(&[&alice.did, &mallory.did]);
+        let mallory_sk = generate_sender_key();
+
+        let serialized = rmp_serde::to_vec_named(&inner).unwrap();
+        let sender_layer = encrypt_sender_layer(
+            &mallory_sk,
+            &serialized,
             &inner.context_id,
-            &inner.sender_did,
+            &mallory.did,
             inner.epoch,
             inner.sequence,
-        );
-        assert!(
-            result.is_err(),
-            "open_envelope must reject unknown sender DID"
-        );
+        )
+        .unwrap();
+        let mls_message = encrypt(&mut mallory.group, &sender_layer).unwrap();
+        let ciphertext = serialize_ciphertext(&mls_message).unwrap();
+        let outer = create_outer_envelope(&[0xAA; 32], None, 3600, ciphertext).unwrap();
 
-        let err_msg = format!("{result:?}");
-        assert!(
-            err_msg.contains("UnknownSender"),
-            "error should be UnknownSender, got: {err_msg}"
+        let expected = SenderLayerAad {
+            context_id: &inner.context_id,
+            sender_did: &mallory.did,
+            epoch: inner.epoch,
+            sequence: inner.sequence,
+        };
+        match open_as(&outer, &mut bob, &mallory_sk, &expected, &keys) {
+            Err(EnvelopeError::SenderMismatch {
+                mls_sender,
+                inner_sender,
+                caller_sender,
+            }) => {
+                assert_eq!(mls_sender, mallory.did);
+                assert_eq!(inner_sender, alice.did);
+                assert_eq!(caller_sender, mallory.did);
+            }
+            other => panic!("expected SenderMismatch, got {other:?}"),
+        }
+    }
+
+    /// T12: a Commit handed to `open_envelope` is not an envelope and is
+    /// rejected with `MlsDecryptionFailed`; the commit has been merged by
+    /// then, as on the production receive path.
+    #[tokio::test]
+    async fn open_envelope_rejects_commit_input() {
+        let (mut alice, mut bob) = alice_and_bob();
+        let (bundle, _signer, _provider) = generate_key_package(
+            &credential("carol"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&(credential("carol")).did),
+            &SystemClock,
+        )
+        .unwrap();
+        let added = add_member(
+            &mut alice.group,
+            bundle.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
+        let commit = serialize_ciphertext(&added.commit).unwrap();
+        let outer = create_outer_envelope(&[0xAA; 32], None, 3600, commit).unwrap();
+        let epoch_before = bob.group.epoch().unwrap();
+
+        let result = open_as(
+            &outer,
+            &mut bob,
+            &generate_sender_key(),
+            &SenderLayerAad {
+                context_id: "ctx-1",
+                sender_did: &alice.did,
+                epoch: 1,
+                sequence: 1,
+            },
+            &active_resolver(&[&alice.did]),
         );
+        match result {
+            Err(EnvelopeError::MlsDecryptionFailed(msg)) => {
+                assert_eq!(msg, "not an application message");
+            }
+            other => panic!("expected MlsDecryptionFailed, got {other:?}"),
+        }
+        assert_eq!(bob.group.epoch().unwrap(), epoch_before + 1);
     }
 
     // -----------------------------------------------------------------------
@@ -977,43 +1008,24 @@ mod seal_open_tests {
     /// Using the wrong sender key must yield `SenderKeyDecryptionFailed`.
     #[tokio::test]
     async fn open_envelope_rejects_wrong_sender_key() {
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"sender key protected", None).await;
+        let (mut alice, mut bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"sender key protected", None).await;
         let correct_sender_key = generate_sender_key();
         let wrong_sender_key = generate_sender_key();
-        let routing_id = [0xAA; 32];
-
-        // Seal with the correct sender key.
-        let outer = seal_envelope(
-            &inner,
-            &mut alice_group,
-            &correct_sender_key,
-            &routing_id,
-            None,
-            3600,
-        )
-        .unwrap();
+        let outer = seal(&inner, &mut alice, &correct_sender_key);
 
         // Open with a different sender key — MLS decryption succeeds, but
         // sender key decryption must fail.
-        let result = open_envelope(
+        let result = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &wrong_sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
+            &aad(&inner),
+            &active_resolver(&[&alice.did]),
         );
         assert!(
-            result.is_err(),
-            "open_envelope must reject wrong sender key"
-        );
-
-        let err_msg = format!("{result:?}");
-        assert!(
-            err_msg.contains("SenderKeyDecryptionFailed"),
-            "error should be SenderKeyDecryptionFailed, got: {err_msg}"
+            matches!(result, Err(EnvelopeError::SenderKeyDecryptionFailed(_))),
+            "error should be SenderKeyDecryptionFailed, got: {result:?}"
         );
     }
 
@@ -1024,11 +1036,8 @@ mod seal_open_tests {
     /// MLS encrypt).
     #[tokio::test]
     async fn open_envelope_rejects_tampered_sender_key_ciphertext() {
-        use scp_mls::encrypt::{encrypt as mls_encrypt, serialize_ciphertext as mls_serialize};
-        use scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer;
-
-        let (mut alice_group, mut bob_group) = setup_mls_groups();
-        let inner = create_test_inner(&alice_group, b"tamper target", None).await;
+        let (mut alice, mut bob) = alice_and_bob();
+        let inner = create_test_inner(&alice, b"tamper target", None).await;
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
 
@@ -1048,40 +1057,31 @@ mod seal_open_tests {
 
         // Step 3: Tamper with the sender-key ciphertext (flip a byte in
         // the encrypted portion, after the 12-byte nonce).
-        let tamper_index = 12 + 1; // nonce is 12 bytes, tamper first encrypted byte
+        let tamper_index = 12 + 1;
         sender_encrypted[tamper_index] ^= 0xFF;
 
         // Step 4: MLS-encrypt the tampered bytes (MLS doesn't know they're
         // tampered — it just encrypts whatever it receives).
-        let mls_message = mls_encrypt(&mut alice_group, &sender_encrypted).unwrap();
-        let encrypted_blob = mls_serialize(&mls_message).unwrap();
+        let mls_message = encrypt(&mut alice.group, &sender_encrypted).unwrap();
+        let encrypted_blob = serialize_ciphertext(&mls_message).unwrap();
 
         // Step 5: Wrap in outer envelope.
         let outer = create_outer_envelope(&routing_id, None, 3600, encrypted_blob).unwrap();
 
         // Step 6: Try to open — MLS decryption succeeds, but sender key
         // authentication tag verification must fail.
-        let result = open_envelope(
+        let result = open_as(
             &outer,
-            &mut bob_group,
+            &mut bob,
             &sender_key,
-            &inner.context_id,
-            &inner.sender_did,
-            inner.epoch,
-            inner.sequence,
+            &aad(&inner),
+            &active_resolver(&[&alice.did]),
         );
-        assert!(
-            result.is_err(),
-            "open_envelope must reject tampered sender-key ciphertext"
-        );
-
         let err_msg = format!("{result:?}");
         assert!(
-            err_msg.contains("SenderKeyDecryptionFailed"),
+            matches!(result, Err(EnvelopeError::SenderKeyDecryptionFailed(_))),
             "error should be SenderKeyDecryptionFailed (auth tag failure), got: {err_msg}"
         );
-
-        // Verify the error message traces back to AuthenticationFailed.
         assert!(
             err_msg.contains("authentication tag verification failed"),
             "error should mention authentication tag failure, got: {err_msg}"
@@ -1101,28 +1101,17 @@ mod seal_open_tests {
             ) {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    let (mut alice_group, mut bob_group) = setup_mls_groups();
-                    let inner = create_test_inner(&alice_group, &payload, None).await;
+                    let (mut alice, mut bob) = alice_and_bob();
+                    let inner = create_test_inner(&alice, &payload, None).await;
                     let sender_key = generate_sender_key();
-                    let routing_id = [0xAA; 32];
+                    let outer = seal(&inner, &mut alice, &sender_key);
 
-                    let outer = seal_envelope(
-                        &inner,
-                        &mut alice_group,
-                        &sender_key,
-                        &routing_id,
-                        None,
-                        3600,
-                    ).unwrap();
-
-                    let recovered = open_envelope(
+                    let recovered = open_as(
                         &outer,
-                        &mut bob_group,
+                        &mut bob,
                         &sender_key,
-                        &inner.context_id,
-                        &inner.sender_did,
-                        inner.epoch,
-                        inner.sequence,
+                        &aad(&inner),
+                        &active_resolver(&[&alice.did]),
                     ).unwrap();
 
                     let stripped = strip_padding(&recovered.payload).unwrap();

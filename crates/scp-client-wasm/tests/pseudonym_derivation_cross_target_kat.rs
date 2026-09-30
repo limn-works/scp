@@ -165,7 +165,7 @@ fn pseudonym_derivation_matches_golden_vectors() {
 // C2 — the FULL `ScpMlsGroup::derive_pseudonym` serde-extraction path, driven on
 // BOTH native and wasm32. The KAT above pins the raw `derive_pseudonym_keypair`
 // recipe; this exercises the driver's actual reach into the openmls
-// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed, the S0 ikm, through the type's serde
+// `SignatureKeyPair` (recovering the 32-byte P-256 scalar, the S0 ikm, through the type's serde
 // form — the step whose wasm32 32-bit-`usize` behavior the byte-parity claim
 // depends on). The MLS key is random, so this is not a fixed-byte golden; instead
 // it pins determinism + context-separation + restore-stability of the serde path
@@ -191,15 +191,20 @@ fn mls_group_derive_pseudonym_serde_path_is_stable_cross_target() {
         SigningKeyId::Active,
     )
     .expect("credential");
-    let group = create_group(&cred, &clock).expect("create group");
+    let group = create_group(
+        &cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+        &clock,
+    )
+    .expect("create group");
     let ctx = b"scp-mls-derive-serde-path-kat";
 
-    // Determinism: the serde seed-extraction recovers the same seed each call.
+    // Determinism: the serde scalar extraction recovers the same scalar each call.
     let p1 = group.derive_pseudonym(ctx).expect("derive p1");
     let p2 = group.derive_pseudonym(ctx).expect("derive p2");
     assert_eq!(
         p1, p2,
-        "derive_pseudonym is deterministic (serde seed-extraction stable) on this target"
+        "derive_pseudonym is deterministic (serde scalar extraction stable) on this target"
     );
     assert_ne!(p1, [0u8; 32], "a real pseudonym routing id is non-zero");
 
@@ -218,6 +223,6 @@ fn mls_group_derive_pseudonym_serde_path_is_stable_cross_target() {
             .derive_pseudonym(ctx)
             .expect("derive after restore"),
         p1,
-        "serde seed-extraction is stable across a state restore on this target"
+        "serde scalar extraction is stable across a state restore on this target"
     );
 }

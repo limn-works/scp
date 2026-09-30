@@ -100,6 +100,16 @@ pub enum MlsError {
     #[error("extension error: {0}")]
     ExtensionError(String),
 
+    /// A leaf openmls accepted failed SCP admission (spec 09 §9.16.1, spec 10
+    /// §10.8.1(7)); the Commit carrying it is not merged.
+    #[error("leaf admission rejected for {did}: {reason}")]
+    LeafAdmissionRejected {
+        /// The DID the rejected leaf's credential names.
+        did: String,
+        /// Which admission rule the leaf broke.
+        reason: crate::admission::LeafAdmissionRejection,
+    },
+
     /// A member with the given leaf index was not found in the group.
     #[error("member not found at leaf index {0}")]
     MemberNotFound(u32),
@@ -132,6 +142,12 @@ pub enum MlsError {
         /// (Unix seconds).
         now: u64,
     },
+
+    /// MLS wire bytes from a peer did not decode: a malformed `MlsMessage`,
+    /// `KeyPackage` or `Welcome`, including a length header the decoder
+    /// asserts against (see [`crate::wire`]).
+    #[error("MLS wire decoding failed: {0}")]
+    DeserializationFailed(String),
 
     /// Serializing or deserializing an [`crate::ScpMlsGroup`] state snapshot
     /// failed (the out-of-band persistence path used by the in-browser driver
@@ -182,10 +198,64 @@ pub enum MlsError {
     /// The per-context pseudonym could not be derived from this member's MLS
     /// signing key (ADR-057 Option A, §9.10.4.A). Raised by
     /// [`ScpMlsGroup::derive_pseudonym`](crate::group::ScpMlsGroup::derive_pseudonym)
-    /// if the signer's private seed cannot be recovered, or is not the expected
-    /// 32-byte Ed25519 seed (a non-Ed25519 or malformed signer — SCP groups are
-    /// Ed25519-only per `SCP_CIPHERSUITE`). Fail-closed: never truncate a
-    /// wrong-size key into the derivation.
+    /// when the signer fails the checks [`MlsError::InvalidSigner`] names (SCP
+    /// groups sign with P-256 per `SCP_CIPHERSUITE`). Fail-closed: never
+    /// truncate a wrong-size key into the derivation.
     #[error("pseudonym derivation failed: {0}")]
     PseudonymDerivationFailed(String),
+
+    /// A restored MLS group runs a ciphersuite other than `SCP_CIPHERSUITE`.
+    ///
+    /// Raised on every group restore (snapshot load, runtime provider
+    /// restore). SCP pins one ciphersuite and migrates no older state (plan
+    /// decision C1), so a group persisted under another suite fails closed.
+    #[error("unsupported MLS ciphersuite {got:#06x}, expected {expected:#06x}")]
+    UnsupportedCiphersuite {
+        /// The ciphersuite SCP requires (`SCP_CIPHERSUITE` as its RFC 9420
+        /// code point).
+        expected: u16,
+        /// The ciphersuite the restored group carries.
+        got: u16,
+    },
+
+    /// An MLS signer is not a valid P-256 key pair for `SCP_CIPHERSUITE`.
+    ///
+    /// Raised when a signer is restored (group snapshot, pending join, runtime
+    /// provider, Welcome join) and when its scalar is read for a pseudonym.
+    #[error("invalid MLS signer: {0}")]
+    InvalidSigner(SignerDefect),
+}
+
+/// Why an MLS signer failed the P-256 check that every restore runs.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SignerDefect {
+    /// The signer's scheme is not the SCP ciphersuite's signature scheme.
+    #[error("signature scheme is {got}, expected {expected} (P-256)")]
+    WrongScheme {
+        /// The expected scheme (`ECDSA_SECP256R1_SHA256`), as its `Debug` name.
+        expected: String,
+        /// The signer's scheme, as its `Debug` name.
+        got: String,
+    },
+    /// The signer's private or public key bytes could not be read back.
+    #[error("signer key bytes unreadable: {0}")]
+    Unreadable(String),
+    /// The private key is not a 32-byte P-256 scalar.
+    #[error("private key is {0} bytes, expected a 32-byte P-256 scalar")]
+    PrivateKeyLength(usize),
+    /// The public key is not a 65-byte uncompressed P-256 point.
+    #[error("public key is {0} bytes, expected a 65-byte uncompressed P-256 point")]
+    PublicKeyLength(usize),
+    /// The scalar is zero or not below the group order, or the public key is
+    /// not `scalar·G`.
+    #[error("key pair check failed: {0}")]
+    KeyPair(scp_crypto::p256::P256Error),
+    /// The signer's public key is not the signature key of the group's own
+    /// leaf, so the group would sign with a key no member can verify.
+    #[error("signer public key is not the own leaf's signature key")]
+    LeafKeyMismatch,
+    /// The group has no own leaf to compare the signer against.
+    #[error("group has no own leaf")]
+    NoOwnLeaf,
 }

@@ -1159,13 +1159,15 @@ fn resolve_future(
 /// Uses [`generate_key_package_with_context_params`](scp_core::crypto::mls::group::generate_key_package_with_context_params) with `None` so the leaf
 /// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
 /// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` (which declares no SCP capabilities) produces a KP
+/// `generate_key_package` (which declares no `0xFF02` capability) produces a KP
 /// that real MLS rejects from a context group ("the capabilities of the add
-/// proposal are insufficient for this group"). No wrapping-key leaf extension
-/// is attached: this single-process membership path retains no joiner private
-/// state, so a wrapping key here would advertise a key whose secret is
-/// discarded; sender-key distribution to such a member is correctly skipped.
-fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::ScpPyError> {
+/// proposal are insufficient for this group"). The leaf carries `wrapping_public`
+/// as its `0xFF01` extension: the identity's wrapping public key, whose secret
+/// the supervisor holds (spec 09 §9.16.1).
+fn generate_mls_key_package_bytes(
+    did: &str,
+    wrapping_public: &[u8; 65],
+) -> Result<Vec<u8>, crate::error::ScpPyError> {
     use scp_core::crypto::mls::credential::ScpCredential;
     use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
@@ -1178,9 +1180,10 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
         })?;
 
     let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
-            |e| crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}")),
-        )?;
+        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
+            .map_err(|e| {
+            crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
+        })?;
 
     kp_bundle
         .key_package()
@@ -2547,7 +2550,10 @@ impl crate::scp::PyScp {
             // The key package contains the joiner's SCP credential (DID) and is
             // validated by NodeMlsFactory::validate_key_package before MLS
             // group addition.
-            let kp_bytes = generate_mls_key_package_bytes(identity_did)
+            let wrapping_public = rt
+                .block_on(sup.wrapping_public_key(&scp_did::DID(member_did.clone())))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             let key_package = scp_core::context::membership::KeyPackage {
@@ -5401,8 +5407,8 @@ impl crate::scp::PyScp {
     }
 
     /// Handles a broadcast key request from a subscriber, sealing the author's
-    /// current broadcast key to the requester's X25519 `wrapping_pubkey`
-    /// (HPKE Base mode, §5.14.2). The raw broadcast key never crosses the FFI
+    /// current broadcast key to the requester's `wrapping_pubkey`, a 65-byte
+    /// uncompressed DHKEM(P-256) point (HPKE Base mode, §5.14.2, §9.5). The raw broadcast key never crosses the FFI
     /// boundary — only the sealed material is returned.
     ///
     /// # Returns
@@ -5415,7 +5421,8 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `ValueError` if `wrapping_pubkey` is not exactly 32 bytes, or
+    /// Returns `ValueError` if `wrapping_pubkey` is not exactly 65 bytes or not
+    /// a valid uncompressed P-256 point, or
     /// `RuntimeError` if the operation fails.
     #[pyo3(signature = (handle, author_did, requester_did, wrapping_pubkey))]
     pub fn broadcast_handle_key_request(
@@ -5429,12 +5436,8 @@ impl crate::scp::PyScp {
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(author_did)?;
         validate::validate_did(requester_did)?;
-        let wrapping: [u8; 32] = wrapping_pubkey.try_into().map_err(|_| {
-            PyValueError::new_err(format!(
-                "wrapping_pubkey must be 32 bytes, got {}",
-                wrapping_pubkey.len()
-            ))
-        })?;
+        let wrapping = scp_ffi_common::broadcast::parse_wrapping_pubkey(wrapping_pubkey)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -5478,7 +5481,8 @@ impl crate::scp::PyScp {
     }
 
     /// Opens an HPKE-sealed broadcast key (§5.14.2) using a software-held
-    /// X25519 wrapping secret, returning the raw 32-byte AES-256 broadcast key.
+    /// 32-byte DHKEM(P-256) wrapping scalar, returning the raw 32-byte AES-256
+    /// broadcast key.
     ///
     /// Pure crypto — no handle, no `self` state. The `sealed_json` is the
     /// JSON produced by [`Self::broadcast_handle_key_request`] on grant.
