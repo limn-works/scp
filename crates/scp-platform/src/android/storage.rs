@@ -1,4 +1,4 @@
-//! `SQLCipher` storage adapter for Android.
+//! Re-exports the storage trait for the Android `SQLCipher` adapter.
 //!
 //! The Kotlin class `AndroidStorage` in
 //! `bindings/kotlin/scp-kt-android/.../AndroidStorage.kt` implements the Kotlin
