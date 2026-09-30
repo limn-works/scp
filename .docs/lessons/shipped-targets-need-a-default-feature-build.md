@@ -72,7 +72,7 @@ rows 4b and 9c.
 The table below has sixteen rows. Five are not measured bypasses: row 2 records an
 overclaim, row 4c records a premise this branch measured and found false (the section on
 `required-features` below), row 8 is a hypothesis two reproduction attempts failed to
-demonstrate, row 9b names routes reviewers found by reading the scan, and row 9c names
+demonstrate, row 9b stands for the routes reviewers found by reading the scan, and row 9c names
 routes no round has run. The remaining eleven are
 measured bypasses, found across seven of the nine rounds — rounds 1, 3, 4, 5, 6, 7, and 9.
 They do not share one root, and no single change closed them.
@@ -82,10 +82,11 @@ mechanisms listed above, and row 6c by reading with `while IFS= read -r` instead
 word-splitting. Row 9a was measured with mechanism 7 removed: the gate compiled the
 feature-gated fixture of case `cfgbody` and exited 0.
 
-Row 9b is closed by mechanism 7 for every route in its row, and each route has a case in
-`scripts/tests/examples-compile/run-tests.sh` that must fail. The row records the routes
-reviewers have found. It is not the scan's rule set, which the gate states, and not a
-proof that no other route exists.
+Row 9b is closed by mechanism 7. The row does not list its routes: the header and scan of
+`scripts/check-examples-compile.sh` state every rule the scan applies, and
+`scripts/tests/examples-compile/run-tests.sh` holds a case that must fail for each route
+reviewers have found. An earlier draft listed the routes in the row, and that list fell
+behind the case suite. Neither the gate nor its cases prove that no other route exists.
 
 Row 9c is open, and no human has ruled it acceptable. Mechanism 7 reads example sources
 only, so a lib item compiled only under a feature key beside an empty default twin, or a lib
@@ -132,7 +133,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
 | 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
 | 9a | example body under `#[cfg(feature = "testing")] fn main()` beside an empty `#[cfg(not(feature = "testing"))] fn main() {}` | the compile saw only the empty `main` and counted the target as checked |
-| 9b | platform predicate false on the CI host, a platform value rustc unescapes into a host value (`"un\x69x"`, or a string continued across a line break), empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, a first line rustc strips as a shebang (`#!/x "`, with or without a byte-order mark, and `#!<U+00A0>[`) whose quote opened a string for the scan, a U+200E or U+200F that rustc lexes as whitespace inside a `cfg(`, `cfg!(` or `#[path]` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
+| 9b | source-scan routes that hide an example body from the compile or from the scan; the header and scan of `scripts/check-examples-compile.sh` state every rule that closes one, and each route has a must-fail case in `scripts/tests/examples-compile/run-tests.sh` | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
 | 9c | a lib item under a feature key beside an empty default twin, a lib or dependency macro that drops or feature-gates its input | open, unmeasured: the code sits outside `examples/`, which is all mechanism 7 reads |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both
