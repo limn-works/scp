@@ -494,11 +494,11 @@ interface KeyCustodyProvider {
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for a key handle.
      *
-     * Governance vote signing takes raw signing key bytes, and this method is where a caller
-     * gets them. Software-backed keys can export their private material.
-     * Keystore keys ([CustodyType.HARDWARE]) are non-extractable, so the method MUST throw
-     * for one, with a clear message indicating that governance signing is not supported
-     * on Keystore keys.
+     * A software-backed key ([CustodyType.SOFTWARE]) exports its 32-byte seed. Keystore keys
+     * ([CustodyType.HARDWARE]) are non-extractable, so the method MUST throw `SCP-CRYPTO-4005`
+     * for a Keystore handle. The refusal covers every use of the key bytes, not one caller:
+     * its message states that Keystore keys are non-extractable and that ADR-063's curve
+     * slice, which removes every key-export accessor, has not landed.
      *
      * ADR-063's curve slice requires every core function that takes a raw signing key to
      * take a signer instead, and every key-export accessor, this method included, to leave
