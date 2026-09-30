@@ -651,8 +651,9 @@ class AndroidKeyCustody internal constructor(
             throw ScpException(
                 "Cannot export signing key bytes from Android Keystore custody " +
                     "(handle '${keyHandle.id}'). Keystore keys are non-extractable. " +
-                    "ADR-063's curve slice requires a signer in place of raw-key export " +
-                    "for governance signing; that slice has not landed.",
+                    "ADR-063's curve slice requires every core function that takes a raw " +
+                    "signing key to take a signer instead, and every key-export accessor to " +
+                    "leave the custody adapters and all three bridges; that slice has not landed.",
                 "SCP-CRYPTO-4005",
             )
         }

@@ -1,4 +1,5 @@
-//! Re-exports the key custody trait and its types for the Android Keystore adapter.
+//! Re-exports the key custody trait with its handle, key-type and custody-type
+//! types for the Android Keystore adapter.
 //!
 //! The Kotlin class `AndroidKeyCustody` in
 //! `bindings/kotlin/scp-kt-android/.../AndroidKeyCustody.kt` implements the Kotlin
@@ -18,7 +19,8 @@
 //! "Android Keystore key outside the TEE" in
 //! `.docs/specs/00-open-questions.md`, and keeps criteria 2, 3 and 10 unmet
 //! until it is decided. This module documents the Rust-side contract and
-//! re-exports the trait types for Android builds.
+//! re-exports the trait with its handle, key-type and custody-type types for
+//! Android builds.
 //!
 //! # Key Storage Strategy
 //!

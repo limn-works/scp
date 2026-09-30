@@ -3,8 +3,9 @@
 // These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
 // is not available in JVM unit tests. The Keystore path (API 33+, CustodyType.HARDWARE)
 // requires an Android device or emulator; the module has no instrumented tests, so no test
-// covers it. The one exception is exportSigningKeyBytes's rejection of a hardware handle,
-// which throws before it reads Keystore.
+// covers it. Two checks on a hardware handle throw before they read Keystore, so a JVM test
+// reaches them: exportSigningKeyBytes's SCP-CRYPTO-4005, and dhAgree's SCP-CRYPTO-4002 for a
+// 32-byte peer key, because a Keystore handle never enters softwareKeys.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework.
@@ -93,12 +94,13 @@ private class InMemorySharedPreferences : SharedPreferences {
 }
 
 /**
- * Unit tests for [AndroidKeyCustody]: the software fallback path, plus the one Keystore-handle
- * check a JVM test reaches.
+ * Unit tests for [AndroidKeyCustody]: the software fallback path, plus the two Keystore-handle
+ * checks a JVM test reaches.
  *
  * Android Keystore is not available in JVM unit tests. These tests verify:
  * - Software Ed25519 key generation, signing, and public key extraction
- * - Software X25519 key generation and DH agreement
+ * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4002` from dhAgree for a
+ *   [CustodyType.HARDWARE] handle, which throws before it reads Keystore
  * - Pseudonym derivation determinism
  * - Key destruction, and the error codes a destroyed handle yields
  * - Signing-key export: the seed of a software Ed25519 key and of a derived pseudonym key,
@@ -461,6 +463,22 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
+        fun `dhAgree throws SCP-CRYPTO-4002 for a hardware handle and never reads Keystore`() {
+            // A Keystore handle has no softwareKeyTypes entry, so dhAgree skips the key-type
+            // check and fails the software-key lookup before any Keystore call.
+            val hardwareHandle = KeyHandle(id = "keystore-key", custodyType = CustodyType.HARDWARE)
+            val exception = assertThrows<ScpException> {
+                custody.dhAgree(hardwareHandle, ByteArray(32))
+            }
+            assertEquals("SCP-CRYPTO-4002", exception.code)
+            // The peer length check still runs first for a hardware handle.
+            val lengthException = assertThrows<ScpException> {
+                custody.dhAgree(hardwareHandle, ByteArray(31))
+            }
+            assertEquals("SCP-CRYPTO-4003", lengthException.code)
+        }
+
+        @Test
         fun `dhAgree throws SCP-CRYPTO-4003 for wrong-size peerPublic`() {
             val handle = custody.generateKeypair(KeyType.X25519)
             for (badSize in listOf(0, 16, 31, 33, 64)) {
@@ -628,6 +646,10 @@ class AndroidKeyCustodyTest {
             assertEquals("SCP-CRYPTO-4005", exception.code)
             val message = exception.message.orEmpty()
             assertTrue(message.contains("ADR-063's curve slice"), message)
+            // ADR-063 requires every key-export accessor to leave the adapters, not only for
+            // governance signing, so the message may not narrow the clause.
+            assertTrue(message.contains("every key-export accessor"), message)
+            assertTrue(!message.contains("for governance signing"), message)
             // The curve slice has not landed, so the message may not state its signer path as current.
             assertTrue(message.contains("has not landed"), message)
             assertTrue(!message.contains("replaces raw-key export"), message)
