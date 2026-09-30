@@ -1341,7 +1341,7 @@ else
     grep -qF "and $plat_count platform keys" "$REPO_ROOT/scripts/fix-round-check.sh" \
         || scan_rules_missing+="[header item 8: and $plat_count platform keys] "
 fi
-if [[ $gate_rule_count -ge 8 && -z $scan_rules_missing ]]; then
+if [[ $gate_rule_count -ge 10 && -z $scan_rules_missing ]]; then
     report "case 22b states every source rule the examples gate applies" 0 ""
 else
     report "case 22b states every source rule the examples gate applies" 1 "the gate has $gate_rule_count scan rules; the source-scan line lacks $scan_rules_missing: ${SCAN_LINE:-<absent>}"
