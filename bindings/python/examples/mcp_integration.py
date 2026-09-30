@@ -47,10 +47,14 @@ async def main() -> None:
         # only in this process's in-memory store, so that server cannot expose
         # it: the example invokes a context the server exposes, read from
         # SCP_MCP_SSE_CONTEXT_ID, and that context must offer an outlet named
-        # ``summarize``. An SCP SSE server always runs a bearer check (ADR-015),
-        # so pass the token that server's operator gives you, read here from
-        # SCP_MCP_SSE_TOKEN. The transport has no TLS, so a token is sent only
-        # to a loopback host.
+        # ``summarize``. An SCP server lists each outlet as
+        # ``<context_id>/call.<outlet>`` or ``<context_id>/query.<outlet>`` and
+        # refuses a bare outlet name in ``tools/call``, so the example invokes the
+        # name ``mcp_client_list_tools`` returns; the context ID passed to
+        # ``mcp_client_invoke`` feeds only local provenance. An SCP SSE server
+        # always runs a bearer check (ADR-015), so pass the token that server's
+        # operator gives you, read here from SCP_MCP_SSE_TOKEN. The transport
+        # has no TLS, so a token is sent only to a loopback host.
         sse_token = os.environ.get("SCP_MCP_SSE_TOKEN")
         sse_context_id = os.environ.get("SCP_MCP_SSE_CONTEXT_ID")
         if not sse_token or not sse_context_id:
@@ -61,10 +65,14 @@ async def main() -> None:
         client = await scp.mcp_client_connect_sse("http://127.0.0.1:8080/sse", sse_token)
         outlets = await scp.mcp_client_list_tools(client)
         print(f"The SSE server offers {len(outlets)} outlet(s)")
+        summarize_names = {f"{sse_context_id}/call.summarize", f"{sse_context_id}/query.summarize"}
+        summarize = next((t.name for t in outlets if t.name in summarize_names), None)
+        if summarize is None:
+            raise RuntimeError(f"context {sse_context_id} offers no summarize outlet")
 
         result = await scp.mcp_client_invoke(
             client,
-            "summarize",
+            summarize,
             {"text": "SCP is a protocol for..."},
             sse_context_id,
             identity.did,
