@@ -176,8 +176,9 @@
 #      including a package with no example target, and it fails on a `cfg(` or `cfg!(`
 #      predicate naming anything but `not`, `any`, `all` and nine platform keys, on a
 #      platform predicate false on the Linux runner, on an empty `any()` or `all()`, on any
-#      `cfg_attr`, `include`, `macro_rules` or `#[path]`, and on a block comment or string
-#      literal it cannot close. No run starts that gate, so this script prints up to four
+#      identifier that starts with `cfg_`, on any `include`, `macro_rules` or `#[path]`, on
+#      the identifiers `test`, `bench` and `test_case` wherever they stand, and on a block
+#      comment or string literal it cannot close. No run starts that gate, so this script prints up to four
 #      NOT CHECKED lines for it. A run that compiles at least one crate prints the
 #      assertion 2 line, naming every crate it compiled. That run also prints the
 #      assertion 1 line when at least one crate it compiled is a package some example
@@ -516,7 +517,7 @@ wide_list=""
 # Rust commands they still leave unrun are the same for every run, which is why items 1,
 # 2, 3 and 6 of the DOES-NOT-RUN list state them once rather than per changed file. The
 # lines that name the packages a given run selected are computed below rather than listed
-# here: the sibling-feature line, the reverse-dependency line, the two
+# here: the sibling-feature line, the reverse-dependency line, the three
 # scripts/check-examples-compile.sh lines, the wasm line and the workspace-wide-input line.
 UNRUN_LANES=(
     "bindings/python/|ruff and pytest, which the python-lint and python-test jobs of .github/workflows/ci.yml run"
@@ -847,7 +848,7 @@ print(" ".join(sorted(selected & owners)))
         NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone and without --no-deps, so it lints the example and every workspace library that example compiles, in that one package's dev-target feature set and without the --features list the compile above passed; an example with a clippy warning, an example that names an item behind a feature the compile above turned on, and a library with a clippy warning that only that narrower feature set raises, such as an import left unused when a feature is off, each pass here and fail that gate in the rust-clippy job of .github/workflows/ci.yml")
     fi
     if [[ -n $scan_list ]]; then
-        NOTES+=("scripts/check-examples-compile.sh assertion 1 source scan over $scan_list: that gate reads each example target's source file and every .rs file under the package's examples/ directory, symbolic links followed, in every workspace package whether or not it has an example target, and fails on a cfg( or cfg!( predicate that names anything but not, any, all and the nine platform keys unix, windows, target_os, target_family, target_arch, target_pointer_width, target_endian, target_env and target_vendor, so target_feature and target_has_atomic fail; on a platform predicate that is false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows), cfg(not(unix)) and cfg(target_os = \"macos\") fail there; on an empty any() or all(); on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds; and on a block comment or string literal the scan cannot close; the compile above reads none of those files this way, so such a file passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 source scan over $scan_list: that gate reads each example target's source file and every .rs file under the package's examples/ directory, symbolic links followed, in every workspace package whether or not it has an example target, and fails on a cfg( or cfg!( predicate that names anything but not, any, all and the nine platform keys unix, windows, target_os, target_family, target_arch, target_pointer_width, target_endian, target_env and target_vendor, so target_feature and target_has_atomic fail; on a platform predicate that is false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows), cfg(not(unix)) and cfg(target_os = \"macos\") fail there; on an empty any() or all(); on any identifier outside a comment or string literal that starts with cfg_ (cfg_attr and cfg_select! included), on any include or macro_rules word, and any #[path] attribute, whatever each holds; on the identifier test, bench or test_case wherever it stands outside a comment or string literal, so #[test], #[core::prelude::v1::test], a renamed test attribute and a function named test fail; and on a block comment or string literal the scan cannot close; the compile above reads none of those files this way, so such a file passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
     fi
 
     declare -a SELECTED_WASM=()
@@ -1047,8 +1048,9 @@ fi
 # ── The summary ──────────────────────────────────────────────────────────────────────
 # `crate_list` is set above the compile step, because the summary line below and these
 # NOT CHECKED lines name it: the sibling-feature line, the reverse-dependency line, the
-# scripts/check-examples-compile.sh assertion 2 line, the assertion 1 line when cargo
-# metadata could not list the example targets, and the workspace-wide-input line.
+# scripts/check-examples-compile.sh assertion 2 line, the assertion 1 line and the
+# source-scan line when cargo metadata could not list the example targets, and the
+# workspace-wide-input line.
 #
 # `IFS` joins an array on its FIRST character alone, so "; " would separate on ";" and drop
 # the space. The loop writes the two-character separator the summary line reads with.

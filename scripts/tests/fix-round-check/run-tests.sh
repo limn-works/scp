@@ -127,7 +127,8 @@
 #     names all three packages and both example file forms, `examples/NAME.rs` and
 #     `examples/NAME/main.rs`; that the assertion 1 source-scan line names scp-ffi, whose
 #     `examples/` holds a helper and no target, and scp-transport and not scp-clock, and
-#     states every source rule the gate applies; and that no gate-edit line appears on a
+#     states every source rule the gate applies, as the gate's own `print` lines give
+#     them; and that no gate-edit line appears on a
 #     branch that left the gate alone. A run that drops any of the three lines, the
 #     dependency walk or the reachability filter reports green over a change the
 #     rust-clippy job turns red.
@@ -1274,23 +1275,54 @@ if [[ $SCAN_LINE == *'source scan over scp-ffi, scp-transport:'* ]]; then
 else
     report "case 22b names the source scan over each package with an example target or examples/" 1 "the source-scan line reads: ${SCAN_LINE:-<absent>}"
 fi
-# The line must state the rules the gate applies, as check-examples-compile.sh's header
-# gives them. A line that admits windows or any target_ key, or that leaves out the
-# outright cfg_attr, include, macro_rules and #[path] rejections, tells a fix agent that
-# code the gate rejects will pass.
+# The line must state every rule the gate applies. The rules come from the gate itself:
+# each `print` line in check-examples-compile.sh's scan names one rejection, and
+# scan_rule_phrase maps it to the phrase the line must carry. A scan rule the map does not
+# know maps to nothing, so a rule added to the gate turns this case red until the line and
+# the map state it. A line that admits windows or any target_ key, or that leaves out a
+# word rejection, tells a fix agent that code the gate rejects will pass.
+scan_rule_phrase() {
+    case $1 in
+        *'unbalanced block comment'* | *'unbalanced string literal'*)
+            echo 'on a block comment or string literal the scan cannot close' ;;
+        *'include!'* | *'macro_rules!'*) echo 'on any include or macro_rules word' ;;
+        *'#[path]'*) echo 'any #[path] attribute, whatever each holds' ;;
+        *'(cfg_\w+)'*) echo 'on any identifier outside a comment or string literal that starts with cfg_ (cfg_attr and cfg_select! included)' ;;
+        *'test-attribute name'*) echo 'on the identifier test, bench or test_case wherever it stands' ;;
+        *'cfg($s)'*) echo 'target_feature and target_has_atomic fail' ;;
+        *) echo '' ;;
+    esac
+}
 scan_rules_missing=""
-for want in 'target_feature and target_has_atomic fail' \
-    'false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows)' \
+gate_rule_count=0
+while IFS= read -r rule; do
+    gate_rule_count=$((gate_rule_count + 1))
+    want=$(scan_rule_phrase "$rule")
+    if [[ -z $want ]]; then
+        scan_rules_missing+="[a phrase for the gate rule: $rule] "
+    elif [[ $SCAN_LINE != *"$want"* ]]; then
+        scan_rules_missing+="[$want] "
+    fi
+done < <(grep -E '^[[:space:]]*print "' "$REPO_ROOT/scripts/check-examples-compile.sh")
+for want in 'false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows)' \
     'on an empty any() or all()' \
-    'on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds' \
-    'a block comment or string literal the scan cannot close' \
     'in every workspace package whether or not it has an example target'; do
     [[ $SCAN_LINE == *"$want"* ]] || scan_rules_missing+="[$want] "
 done
-if [[ -z $scan_rules_missing ]]; then
+if [[ $gate_rule_count -ge 8 && -z $scan_rules_missing ]]; then
     report "case 22b states every source rule the examples gate applies" 0 ""
 else
-    report "case 22b states every source rule the examples gate applies" 1 "the source-scan line lacks $scan_rules_missing: ${SCAN_LINE:-<absent>}"
+    report "case 22b states every source rule the examples gate applies" 1 "the gate has $gate_rule_count scan rules; the source-scan line lacks $scan_rules_missing: ${SCAN_LINE:-<absent>}"
+fi
+# The map must reject a rule it does not know, and the retired wording, which named
+# cfg_attr alone and left out test, bench and test_case, must fail the phrase check.
+retired='on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds; and on a block comment or string literal the scan cannot close'
+if [[ -z $(scan_rule_phrase 'print "cfg_select!\n" if /\bcfg_select\b/;') \
+    && $retired != *"$(scan_rule_phrase 'print "test-attribute name $1\n"')"* \
+    && $retired != *"$(scan_rule_phrase 'print "$1\n" while /\b(cfg_\w+)/g;')"* ]]; then
+    report "case 22b rejects an unmapped gate rule and the retired rule wording" 0 ""
+else
+    report "case 22b rejects an unmapped gate rule and the retired rule wording" 1 "scan_rule_phrase accepted an unknown rule, or the retired wording carries a required phrase"
 fi
 # The retired wording admitted any target_ key and a cfg_attr whose predicate names a
 # platform key; neither the scan line nor the assertion 1 line may carry it.
