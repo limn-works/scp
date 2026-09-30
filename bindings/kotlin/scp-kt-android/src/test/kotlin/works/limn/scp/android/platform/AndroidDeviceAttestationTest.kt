@@ -251,8 +251,7 @@ class AndroidDeviceAttestationTest {
         // the binding digest of 09-security-model.md section 9.3.1; story
         // SCP-111 carries that change. OQ-22 of spec 27 keeps two questions
         // open: which of the two device-attestation traits is normative, and
-        // whether that trait's attest takes D or D's two inputs (a challenge
-        // and an identifier).
+        // whether that trait's attest takes a challenge and an identifier.
         val attestation = createAttestationWithMockContext()
         val json = attestation.buildClientDataJSON(
             byteArrayOf(1, 2, 3),
