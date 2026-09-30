@@ -8059,10 +8059,13 @@ mod tests {
 
     /// A context no supervisor actor serves fails every lifecycle gate closed.
     ///
-    /// A handle can outlive its actor — a despawn after migration, a watchdog
-    /// that stopped respawning a crashing actor — and the handle's cached
-    /// string still reads `"active"`. No gate infers "active" from an absent
-    /// answer.
+    /// A handle can name a context no actor serves, such as one the supervisor
+    /// never spawned an actor for (this fixture's case), while the handle's
+    /// cached string still reads `"active"`. `Supervisor::read_context_state_checked`
+    /// answers `None` only for an id with no actor and no crash-window signal;
+    /// a poisoned or mid-respawn actor reads as `SCP-CTX-2134` or
+    /// `SCP-CTX-2135` instead and is not this case. No gate infers "active"
+    /// from an absent answer.
     #[test]
     fn lifecycle_gates_fail_closed_without_a_supervisor_actor() {
         crate::init_runtime().ok();
@@ -8114,17 +8117,44 @@ mod tests {
         }
     }
 
-    /// A gate admits an operation while the supervisor reports `Active`.
+    /// Every lifecycle gate admits its operation while the supervisor reports
+    /// `Active`.
     ///
-    /// Without this case the two above would also pass for a gate that refused
-    /// every call.
+    /// Without this case the refusal cases would also pass for a gate that
+    /// refused every call. Join, leave and send can still fail after their
+    /// gate on work this fixture does not set up, so each of those calls is
+    /// checked for the absence of every refusal its gate can produce rather
+    /// than for success: "context must be 'active'" for a non-`Active` state,
+    /// "has no live supervisor state" for an absent actor, and `SCP-CTX-2134`
+    /// or `SCP-CTX-2135` for a poisoned or crashed one.
     #[test]
     fn lifecycle_gates_admit_an_active_context() {
+        fn assert_admitted<T>(name: &str, result: PyResult<T>) {
+            if let Err(err) = result {
+                let text = err.to_string();
+                assert!(
+                    !text.contains("context must be 'active'")
+                        && !text.contains("has no live supervisor state")
+                        && !text.contains(codes::CTX_2134)
+                        && !text.contains(codes::CTX_2135),
+                    "{name} was refused by its lifecycle gate: {text}"
+                );
+            }
+        }
+
         let creator = "did:dht:z6MkActiveGateCreator";
+        let member = "did:dht:z6MkActiveGateMember";
         let (scp, handle) = lifecycle_fixture("a3", creator);
 
+        assert_admitted("join", scp.context_join(&handle, member, None));
+        let send = Python::with_gil(|py| {
+            let payload = pyo3::types::PyBytes::new(py, b"hello");
+            scp.context_send(&handle, creator, payload.as_any(), None)
+        });
+        assert_admitted("send", send);
         scp.context_receive(&handle)
             .expect("receive must pass the gate for an active context");
+        assert_admitted("leave", scp.context_leave(&handle, member));
     }
 
     /// Every lifecycle gate refuses a context the crash watchdog poisoned with
