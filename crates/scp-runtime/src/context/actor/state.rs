@@ -4311,8 +4311,9 @@ mod crypto_ops_golden {
     }
 
     /// Apply a public MLS Commit (as produced by `advance_epoch` / `remove_member`)
-    /// to an encrypted actor's group, mirroring the real deliver path
-    /// (`scp_mls::ratchet::process_commit`).
+    /// to an encrypted actor's group through `scp_mls::ratchet::process_commit`,
+    /// which runs the same `decrypt_with_sender_did` path as the backend's
+    /// `process_commit`.
     fn process_commit_on_actor(
         state: &mut PerContextState,
         commit_bytes: &[u8],
@@ -4321,7 +4322,7 @@ mod crypto_ops_golden {
         match &mut state.mode {
             ContextModeState::Encrypted(c) => {
                 let group = c.mls_group.as_mut().expect("group present");
-                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace)
+                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace, &SystemClock)
             }
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
         }

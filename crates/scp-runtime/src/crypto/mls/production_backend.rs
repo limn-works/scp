@@ -500,19 +500,10 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
     ) -> Result<(), MlsError> {
-        // Parse the incoming Commit bytes and process via `decrypt_with_sender_did`
-        // path, but only accept Commit outcomes. This reuses the existing
-        // `process_message` + `merge_staged_commit` sequence verbatim.
-        let content = decrypt_with_sender_did(group, commit_bytes, self.clock.as_ref())?;
-        match content {
-            DecryptedContent::Commit { .. } => Ok(()),
-            DecryptedContent::Application { .. } => Err(MlsError::CommitProcessingFailed(
-                "expected Commit, got Application message".to_string(),
-            )),
-            DecryptedContent::Proposal { .. } => Err(MlsError::CommitProcessingFailed(
-                "expected Commit, got Proposal message".to_string(),
-            )),
-        }
+        // `decrypt_commit` refuses a non-Commit before decrypting it, so a
+        // refused application message or Proposal consumes no ratchet
+        // generation, then merges a Commit through `decrypt_with_sender_did`.
+        scp_mls::encrypt::decrypt_commit(group, commit_bytes, self.clock.as_ref())
     }
 
     async fn advance_epoch(
@@ -1774,6 +1765,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bob_grp.epoch().unwrap(), 2);
+    }
+
+    /// An application message handed to the backend's `process_commit` is
+    /// refused before decryption, so Bob's epoch is unchanged and the same bytes
+    /// still decrypt through the backend's `decrypt`: the refusal consumed no
+    /// sender ratchet generation and deleted no key.
+    #[tokio::test]
+    async fn process_commit_refuses_application_message_without_consuming_its_key() {
+        let backend = joinable_backend();
+
+        let alice_cred = test_credential("alice-pcapp");
+        let bob_cred = test_credential("bob-pcapp");
+        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
+        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let added = backend
+            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+        let mut bob_grp = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        let epoch_before = bob_grp.epoch().unwrap();
+
+        let ct = backend.encrypt(&mut alice_grp, b"in flight").await.unwrap();
+        let err = backend.process_commit(&mut bob_grp, &ct).await.unwrap_err();
+        assert!(
+            matches!(err, MlsError::CommitProcessingFailed(_)),
+            "expected CommitProcessingFailed, got {err:?}"
+        );
+        assert_eq!(bob_grp.epoch().unwrap(), epoch_before);
+
+        match backend.decrypt(&mut bob_grp, &ct).await.unwrap() {
+            DecryptedContent::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"in flight");
+            }
+            other => panic!("expected Application, got {other:?}"),
+        }
     }
 
     /// Byte-level equivalence: a backend-produced encryption can be

@@ -260,7 +260,7 @@ async fn mls_forward_secrecy() {
 
         // Bob processes Alice's Commit to advance his epoch too.
         let commit_bytes = serialize_mls_message(&result.commit).unwrap();
-        process_commit(&mut bob_group, &commit_bytes, &mut bob_grace).unwrap();
+        process_commit(&mut bob_group, &commit_bytes, &mut bob_grace, &SystemClock).unwrap();
     }
 
     // Both groups are now at epoch 4. With max_past_epochs=2, epoch 1 material
