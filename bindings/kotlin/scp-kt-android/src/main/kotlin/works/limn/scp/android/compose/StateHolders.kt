@@ -355,7 +355,9 @@ private fun <R> rememberCollectedState(
  * that [Job] normally. [startMounted] then refuses every
  * `start` with [ScpHotStreamCoordinatorClosedException], because no stop could release what that
  * `start` opened. [close] ends this coordinator the same way before [scope] is cancelled, and
- * returns once every running `start` and every launched stop has finished.
+ * returns once every `start` running when it reached that key and every stop launched before it
+ * read that key's last stop has finished; it does not wait for a stop launched after that read,
+ * or under a key first mounted after `close` began.
  *
  * @param scope Scope that runs every `onStop` lambda this coordinator launches. The owner of
  *   the [ScpHotStreams] that constructed this coordinator owns that scope, and cancels it only
@@ -369,9 +371,13 @@ internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
     private val closed = AtomicBoolean(false)
 
     /**
-     * Refuse every later `start`, then wait for each `start` running under a key's mutex and
-     * for the last stop launched under each key, which joins every stop launched before it.
-     * A stop whose scope was already cancelled returns from that wait at once.
+     * Refuse every later `start`, then, key by key over the keys present when this began, wait
+     * for each `start` running under that key's mutex and for the last stop launched under that
+     * key, which joins every stop launched before it. A stop that a departing mount launches
+     * under a key after this read that key's last stop, or under a key first mounted after this
+     * began, is not awaited: this returns without it, and it runs on [scope] afterwards, or is
+     * skipped and logged if the owner cancels [scope] first. A stop whose scope was already
+     * cancelled returns from that wait at once.
      */
     internal suspend fun close() {
         closed.set(true)
@@ -688,10 +694,11 @@ class ScpHotStreams(
      * mount that passed this instance has left composition, and before it cancels `scope`.
      *
      * This refuses every later `start` with [ScpHotStreamCoordinatorClosedException], waits for
-     * each running `start` and each stop already launched, and then calls
-     * [HotStreamFactory.stopAll], so a subscription whose stop a cancelled `scope` skipped is
-     * released too. A mount still composed when this runs loses its subscription and receives
-     * nothing further.
+     * each running `start` and each stop launched before it reached that stream (not a stop a
+     * mount leaving during this call launches later), and then calls
+     * [HotStreamFactory.stopAll], so a subscription whose stop a cancelled `scope` skipped, or
+     * whose stop this call did not wait for, is released too. A mount still composed when this
+     * runs loses its subscription and receives nothing further.
      *
      * The whole body runs under [NonCancellable], so an owner that calls this from a cancelled
      * coroutine (a `finally` block, or a scope already being torn down) still waits for each
@@ -917,7 +924,13 @@ class ScpContextState(
 
 private const val MAX_EVENT_LIST_SIZE = 100
 
-/** Log tag for failures [ScpHotStreamCoordinator] catches from `onStop`. */
+/**
+ * Log tag for every hot-stream warning in this file: an `onStop` that threw, which
+ * [ScpHotStreamCoordinator] catches; a stop that the cancellation of the coordinator's scope
+ * kept from running every `onStop` it held ([SCOPE_CANCELLED_BEFORE_STOP]); and, from
+ * [rememberScpHotStream], a `start` the coordinator refused ("hot stream not started") and a
+ * `start` that threw ("hot stream start threw; its State stays null").
+ */
 private const val COORDINATOR_TAG = "ScpHotStreamCoordinator"
 
 /** Warning [ScpHotStreamCoordinator] logs when its scope's cancellation skipped an `onStop`. */

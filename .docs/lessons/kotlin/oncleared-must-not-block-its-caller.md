@@ -119,14 +119,10 @@ cancels races cancellation against `onStop`, and `onStop` may never run. A secon
 both — disposal hands `onStop` to its coordinator and returns after cancelling its subscription
 scope. When the departing mount is the last live mount under its key, the coordinator launches a stop
 that runs `onStop` on a scope disposal never cancels; while another mount under that key stays live,
-the coordinator holds `onStop` for the stop the last mount's departure launches. The coordinator
-drops `onStop`, which then never runs, in two cases: the departing mount's start never ran, or its
-start returned the object (compared by identity) that the start of another departed mount, whose
-`onStop` the coordinator still holds under that key, returned, in which case the coordinator runs that
-held `onStop` in its place. A stop clears the held list, so an `onStop` an earlier stop already ran is
-not compared, and a later mount whose start returns that object keeps its own `onStop`. `rememberScpContext`'s KDoc example teaches callers
-that same shape, because that example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
-disposal callback.
+the coordinator holds `onStop` for the stop the last mount's departure launches. The coordinator's
+KDoc and `.docs/lessons/kotlin/hot-stream-subscription-ownership.md` state when it drops an `onStop`.
+`rememberScpContext`'s KDoc example teaches callers that same shape, because that example previously
+showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a disposal callback.
 
 ## No exception for `AutoCloseable`
 
@@ -149,31 +145,16 @@ which is also what agent-first API design asks for. A bounded wait was weighed a
 still blocks a calling thread, and blocking an Android main thread up to a timeout risks an ANR,
 so it trades a deadlock for an ANR rather than removing a blocking wait.
 
-That rule is not this lesson's to make. ADR-028 in `.docs/adrs/phase-6.md` originally applied
-`AutoCloseable` / `use { }` to the Kotlin SDK, and `.docs/standards/sdk-common.md` §Resource
-Lifecycle carried it in a per-language table; a lesson file plus a test recording the opposite
-would have left code contradicting the artifacts that govern it. Both artifacts now carry the
-amendment and its reasoning — the ADR under its `AutoCloseable` rationale bullet, the standard
-under §"Kotlin: why no `Closeable`" — and this lesson records the failure that drove it, the
-deadlock `ScpViewModelTest` observed, and the ANR it risks on an Android main thread, which nothing
-here has observed.
+ADR-028 in `.docs/adrs/phase-6.md` (its `AutoCloseable` rationale bullet) and
+`.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" state that rule; this lesson records
+the deadlock `ScpViewModelTest` observed that drove it.
 
 `ServerTest.no lifecycle-owning type implements AutoCloseable` fails if that interface returns to
 `Relay`, `Node`, or `SCP`. `ServerTest.every stop method on a lifecycle-owning type suspends`
-requires a `kotlin.coroutines.Continuation` parameter on every declared method named `shutdown`,
-`close`, `stop`, or `dispose`, so a non-suspending method under one of those four names fails it.
-Before matching, it strips the `$default` and `-<hash>` suffixes Kotlin appends to a stop method's
-compiled overloads, and it skips every method whose name contains `$lambda`. A non-suspend lambda
-written inside `shutdown()`, such as one handed to `CoroutineBridge.ffiCall`, compiles to a
-non-suspending `shutdown$lambda$0` method on the same class, and the check skips it; a suspend
-lambda compiles to a separate class that the check never inspects. The check reads signatures
-only and inspects no method body, so it catches no blocking call anywhere: not one written directly
-in a suspending stop method's body, such as `runBlocking` inside `suspend fun shutdown()`, not one
-inside either kind of lambda, and not a blocking stop method under any other name.
-`ServerBridge.shutdownRelay` and `shutdownNode` set the shutdown flag inside their bridge call for a
-different reason: `withContext` checks for cancellation as it returns, so a flag that `shutdown()`
-set after the bridge call returned would stay false when the caller was cancelled after the
-teardown finished.
+requires a `kotlin.coroutines.Continuation` parameter on every method `Relay`, `Node`, or `SCP`
+declares under a stop name (`shutdown`, `close`, `stop`, or `dispose`, compiled overloads
+included), so a non-suspending method under one of those names fails it. It reads signatures only,
+so it catches no blocking call inside a method body.
 
 ## Affected files
 

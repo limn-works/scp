@@ -126,9 +126,10 @@ subscription that a different caller had just opened.
   mount's `onDispose` launched may not have taken its key's mutex when the owner cancels the
   scope, and nothing outside `ScpHotStreams` could reach its factory's `stopAll`. The owner
   therefore calls `ScpHotStreams.close()` once every mount has left, and cancels the scope after
-  it returns. `close` refuses every later `start`, waits for each running `start` and each
-  launched stop, and then calls `HotStreamFactory.stopAll`, which also releases a subscription
-  whose stop an earlier cancellation skipped.
+  it returns. `close` refuses every later `start`, waits for each running `start` and each stop
+  launched before it reached that stop's key, and then calls `HotStreamFactory.stopAll`, which also
+  releases a subscription whose stop an earlier cancellation skipped, or whose stop a mount leaving
+  during `close` launched after `close` passed that key, which `close` does not wait for.
 - **Decide a skipped stop from the `onStop` calls that returned, not from the stop's `Job`.**
   Cancelling a coroutine while its body runs completes its `Job` as cancelled even when the body
   then returns normally. `HotStreamFactory`'s stop functions run under `NonCancellable`, so a
@@ -189,7 +190,7 @@ second Rust subscription per stream beside any other instance's.
   dispatcher's thread. `closing ScpHotStreams releases a subscription whose stop a cancelled scope
   skipped` asserts that `close` unsubscribes what a skipped stop left open and refuses a later
   start, and `closing ScpHotStreams waits for a launched stop` asserts that `close` returns only
-  after a launched `onStop` returns. `a stop that held no onStop reports no skip on a cancelled
+  after an `onStop` launched before `close` was called returns. `a stop that held no onStop reports no skip on a cancelled
   scope` asserts that such a stop's `Job` completes normally and logs nothing.
 
 ## Anti-patterns

@@ -6,192 +6,125 @@ Build blueprint for the SCP Kotlin SDK: package structure, UniFFI bridge pattern
 
 ## Package Layout
 
-The tree lists every file `git ls-tree` shows under `bindings/kotlin/` except the four `.gitkeep` directory placeholders, plus the generated UniFFI bindings, which the build writes and the repository does not track.
-
 ```
 bindings/kotlin/
-  AGENTS.md                      # Kotlin rules, including §Coroutines and streams
-  README.md
-  build.gradle.kts               # Root build config
+  build.gradle.kts              # Root build config
   settings.gradle.kts
-  gradle.properties
-  detekt.yml
-  gradlew, gradlew.bat
-  gradle/wrapper/gradle-wrapper.jar, gradle/wrapper/gradle-wrapper.properties
-  examples/
-    BasicMessaging.kt
-    McpIntegration.kt
-    MultiAgent.kt
-    OutletInvocation.kt
   scp-kt/
-    build.gradle.kts             # SDK module build; runs the UniFFI generator
-    src/main/kotlin/works/limn/scp/
-      SCP.kt                     # SCP instance class and its suspend shutdown(bridge, timeout)
-      Server.kt                  # ServerBindings, ServerBridge, and Relay and Node with their suspend shutdown()
-      Identity.kt                # IdentityAdvancedBridge, IdentityAdvancedBindings, and the data classes their operations return
-      BridgeConnector.kt
-      ConsequenceRule.kt
-      Discovery.kt
-      Economy.kt
-      Media.kt
-      Metadata.kt
-      Outlets.kt
-      OutletsStreaming.kt        # InvocationHandle and its suspend cancel()
-      Provenance.kt
-      Sync.kt
-      Trust.kt
-      TrustAdmission.kt
-      TrustAggregate.kt
-      Types.kt
-      auth/ScpId.kt
-      bridge/CoroutineBridge.kt  # CoroutineBridge and its injected ioDispatcher
-      stream/Streams.kt          # ColdStreamFactory, HotStreamFactory, ColdMessageFlow
-      internal/
-        uniffi/scp/scp.kt        # UniFFI-generated bindings (generated, not tracked)
-    src/test/kotlin/works/limn/scp/
-      EconomyFormatTest.kt
-      ErrorCodeTest.kt
-      IdentityAgentKeyRealFfiTest.kt
-      IdentityAttestationTest.kt
-      IdentityVerifyLinkAttestationFfiTest.kt
-      JoinFromWelcomeTest.kt
-      McpAllowlistTest.kt
-      NativeLibraryPathTest.kt
-      OutletDefinitionTest.kt
-      OutletSagaTest.kt
-      OutletStreamingSagaTest.kt
-      OutletsStreamingTest.kt
-      PersistenceTest.kt
-      ScpClassTest.kt
-      ScpShutdownTest.kt
-      ServerTest.kt
-      SiteConfigTest.kt
-      SmokeTest.kt
-      TestVectorTest.kt
-      TrustAdmissionFfiTest.kt
-      TrustAdmissionTest.kt
-      TrustAggregateFfiTest.kt
-      TrustAggregateTest.kt
-      TrustTest.kt
-      TypesTest.kt
-      ValidationTest.kt
-      auth/ScpIdTest.kt
-      bridge/
-        CoroutineBridgeTest.kt
-        IdentityAdvancedBridgeTest.kt
-        SyncBridgeTest.kt
-      conformance/
-        ConformanceDispatcher.kt
-        ConformanceFixture.kt
-        ConformanceRunnerTest.kt
-        ConformanceStubBindings.kt
-        ContextConformanceTest.kt
-        EncryptionConformanceTest.kt
-        EventLogConformanceTest.kt
-        GovernanceConformanceTest.kt
-        IdentityConformanceTest.kt
-        MessagingConformanceTest.kt
-        OutletsConformanceTest.kt
-        TransportConformanceTest.kt
-        UcanConformanceTest.kt
-      stream/
-        StreamsTest.kt
-        SubscriptionReleaseProbe.kt
-  scp-kt-android/
-    build.gradle.kts
-    src/main/AndroidManifest.xml
-    src/main/kotlin/works/limn/scp/android/
-      ContextLifecycle.kt
-      ScpViewModel.kt            # ScpViewModel; onCleared() launches its leave calls and returns
-      compose/StateHolders.kt    # ScpHotStreams, its coordinator, and the remember* state holders
-      platform/
-        AndroidDeviceAttestation.kt
-        AndroidKeyCustody.kt
-        AndroidPushProvider.kt
-        AndroidStorage.kt
-        PlatformAdapter.kt
-        Types.kt
-    src/test/kotlin/works/limn/scp/android/
-      ContextLifecycleTest.kt
-      ScpViewModelCleanupLoggingTest.kt
-      ScpViewModelTest.kt
-      compose/StateHoldersTest.kt
-      platform/
-        AndroidDeviceAttestationTest.kt
-        AndroidKeyCustodyTest.kt
-        AndroidPushProviderTest.kt
-        AndroidStorageTest.kt
-        StorageConformanceTest.kt
+    build.gradle.kts             # SDK module build
+    src/
+      main/kotlin/works/limn/scp/
+        Identity.kt              # Identity class
+        Context.kt               # Context class, Membership
+        Tools.kt                 # ToolDefinition, TestVector data classes
+        Trust.kt                 # evaluateTrust(), TrustEvaluation
+        EventLog.kt              # EventLog class, Event, Proof, Checkpoint
+        Errors.kt                # Exception hierarchy (ScpException → subtypes)
+        Transport.kt             # TransportConfig, relay connection
+        Types.kt                 # Shared types: Message, Provenance, Capability
+        Ucan.kt                  # UCAN validate(), mint(), revoke(), delegate()
+        Mcp.kt                   # serveMcp(), McpClient
+        internal/
+          NativeLib.kt           # UniFFI-generated native bindings (auto-generated)
+      main/resources/
+        libscp_ffi.so            # Linux native library (bundled in JAR)
+        libscp_ffi.dylib         # macOS native library
+        scp_ffi.dll              # Windows native library
+      test/kotlin/works/limn/scp/
+        IdentityTest.kt
+        ContextTest.kt
+        ToolsTest.kt
+        UcanTest.kt
+        TransportTest.kt
+        EventLogTest.kt
+        McpTest.kt
+        conformance/
+          ConformanceTest.kt
 ```
 
 ## UniFFI Bridge
 
-UniFFI generates the Kotlin bindings from the metadata that proc-macro exports (`#[uniffi::export]`, `#[derive(uniffi::Object)]`, `#[derive(uniffi::Record)]`, `#[derive(uniffi::Error)]`, `#[uniffi::export(callback_interface)]`) embed in the compiled `scp-ffi-uniffi` library. Those exports live in `bridge.rs`, `lib.rs`, `outlet_stream.rs`, `scp.rs`, and `server.rs` under `crates/scp-ffi/uniffi/src/`. `scripts/generate-uniffi-kotlin.sh` builds that library and runs `uniffi-bindgen generate --library <library> --language kotlin`, and the Gradle task `generateUniffiBindings` runs that script.
+UniFFI generates Kotlin bindings from a single UDL (Universal Definition Language) file shared with Swift.
 
-`crates/scp-ffi/uniffi/src/scp.udl` holds only the empty `namespace scp {};` that `uniffi::include_scaffolding!("scp")` in `lib.rs` requires, and declares no type or function. An operation reaches Kotlin when a proc-macro export declares it in Rust; an edit to the UDL adds nothing to the bindings.
+### UDL definition
+
+Located at `crates/scp-ffi/uniffi/src/scp.udl`:
+
+```
+namespace scp {
+  [Throws=ScpError]
+  Identity identity_create(IdentityConfig config);
+
+  [Throws=ScpError]
+  Identity identity_load(bytes identifier);
+
+  [Throws=ScpError]
+  ResolutionOutcome identity_resolve(bytes identifier);
+};
+
+interface Identity {
+  bytes identifier();
+  CustodyType custody_type();
+
+  [Throws=ScpError]
+  Identity rotate_key();
+};
+
+interface Context {
+  string context_id();
+  string state();
+
+  [Throws=ScpError]
+  void send(bytes payload);
+
+  [Throws=ScpError]
+  ToolResult invoke_tool(string tool_id, string input_json);
+};
+```
 
 UniFFI generates:
-- `scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt` — JNA bindings to the Rust shared library, in package `uniffi.scp`
-- A Kotlin class for each exported object, such as `Scp`, `Identity`, `ContextHandle`, `RelayHandle`, and `NodeHandle`
-- An exception class hierarchy for each error type, such as `uniffi.scp.ScpException` and its subclasses (for example `ScpException.Transport`)
+- `NativeLib.kt` — JNA bindings to the Rust shared library
+- Kotlin classes wrapping each interface
+- Kotlin enums for error types
 
 ### Async bridging
 
-UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`, and this SDK does not depend on that plugin until the plugin stabilizes. `CoroutineBridge`, `ServerBridge`, and the stream factories in `stream/Streams.kt` run each blocking FFI call they dispatch and each subscription release on an injected `ioDispatcher`, which defaults to `Dispatchers.IO`, so a test can inject a `StandardTestDispatcher`. The `SCP` class's `shutdown`, `suspendInstance`, and `resume` take a `CoroutineBridge` and dispatch on its `ioDispatcher`. ADR-028's Dispatcher strategy states the rule that every FFI call runs on an IO dispatcher, and ADR-028 acceptance criterion 6 names the one test that checks the injected dispatcher, for `ScpHotStreams`. The `Context` class below is superseded: ADR-048 removed `Context` from the Kotlin surface, so no `Context.kt` ships and the sketch binds no code. It still shows the injected `ioDispatcher` and the `callbackFlow` subscription release that `bindings/kotlin/AGENTS.md` §Coroutines and streams requires of every shipped stream; a context is a handle that `CoroutineBridge.context` operates on.
+UniFFI supports Kotlin coroutines via `uniffi-kotlin-multiplatform`. This SDK wraps blocking FFI calls in `Dispatchers.IO` to avoid depending on the multiplatform plugin until it stabilizes:
 
 ```kotlin
-class Context internal constructor(
-    private val handle: ContextHandle,
-    // Injected like CoroutineBridge.ioDispatcher, with the same default.
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-) {
+class Context internal constructor(private val handle: ContextHandle) {
     val contextId: String get() = handle.contextId()
     val state: String get() = handle.state()
 
-    suspend fun send(payload: ByteArray) = withContext(ioDispatcher) {
+    suspend fun send(payload: ByteArray) = withContext(Dispatchers.IO) {
         handle.send(payload)
     }
 
     suspend fun invokeTool(toolId: String, input: Map<String, Any>): Map<String, Any> =
-        withContext(ioDispatcher) {
+        withContext(Dispatchers.IO) {
             val json = Json.encodeToString(input)
             val result = handle.invokeTool(toolId, json)
             Json.decodeFromString(result)
         }
 
-    // Subscribe under NonCancellable and record the subscription inside that block: when
-    // ioDispatcher differs from the collector's dispatcher, so that withContext resumes the
-    // collector by dispatch, a collector cancelled mid-call makes withContext throw on that
-    // resumption and drop the block's return value. Release it by suspending in a finally: awaitClose's lambda runs on the
-    // collector's thread, an Android main thread under collectAsState. Log a release that
-    // throws instead of rethrowing it (sdk-common.md §Cleanup error handling): rethrown from
-    // the finally, it would replace the collector's cancellation as the failure and propagate
-    // to the collector's parent scope.
+    // Release the subscription by suspending in a finally, off the collector's thread:
+    // awaitClose's lambda runs on the collector's thread, an Android main thread under
+    // collectAsState. Log a release that throws instead of rethrowing it (sdk-common.md
+    // §Cleanup error handling): rethrown from the finally, it would replace the collector's
+    // cancellation as the failure.
     fun receiveFlow(): Flow<Message> = callbackFlow {
-        var subscription: Subscription? = null
+        handle.subscribe { envelope ->
+            trySend(envelope.toMessage())
+        }
         try {
-            withContext(NonCancellable + ioDispatcher) {
-                subscription = handle.subscribe { envelope ->
-                    val result = trySend(envelope.toMessage())
-                    if (result.isFailure && !result.isClosed) {
-                        close(BridgeException("Message buffer overflow", "SCP-CTX-2001"))
-                    }
-                }
-            }
             awaitClose()
         } finally {
-            val opened = subscription
-            if (opened != null) {
-                withContext(NonCancellable + ioDispatcher) {
-                    // NonCancellable keeps the collector's cancellation out of this catch.
-                    try {
-                        opened.unsubscribe()
-                    } catch (e: Exception) {
-                        // java.util.logging, as stream/Streams.kt uses: scp-kt also runs on
-                        // Android, where java.lang.System.Logger is absent.
-                        java.util.logging.Logger.getLogger("works.limn.scp.Context")
-                            .log(java.util.logging.Level.WARNING, "unsubscribe failed when receiveFlow() closed", e)
-                    }
+            withContext(NonCancellable + Dispatchers.IO) {
+                try {
+                    handle.unsubscribe()
+                } catch (e: Exception) {
+                    java.util.logging.Logger.getLogger("works.limn.scp.Context")
+                        .log(java.util.logging.Level.WARNING, "unsubscribe failed when receiveFlow() closed", e)
                 }
             }
         }
@@ -239,8 +172,6 @@ detekt {
 
 ## Data Classes
 
-Superseded. `scp-kt` ships no `Message` or `ToolDefinition` class, so this sketch binds no code: a message flow such as `ColdMessageFlow` (`stream/Streams.kt`) emits each message as a JSON string, outlet declarations use `OutletDefinition` in `Types.kt`, and the other data types come from the UniFFI-generated `uniffi.scp` package or the hand-written data classes beside each bridge.
-
 ```kotlin
 data class Message(
     val senderIdentifier: ByteArray,
@@ -264,8 +195,6 @@ data class ToolDefinition(
 
 ## Exception Hierarchy
 
-Superseded. `scp-kt` defines none of the classes below, so this sketch binds no code. `SCP` operations throw the UniFFI-generated `uniffi.scp.ScpException` subclasses (for example `ScpException.Transport`, which the `SCP.suspendInstance` KDoc names), `CoroutineBridge`'s FFI wrappers (`ffiCall`, `ffiCallSuspend`, `ffiCallWithCancellation`) catch and convert nothing, so an FFI call that fails reaches the caller as the exception the binding threw. `BridgeException` (`bridge/CoroutineBridge.kt`) carries a structured `code` such as `"SCP-CTX-2001"`, and the SDK raises it itself: `CoroutineBridge` throws it for a missing identity handle (`"SCP-IDENT-1060"`) and for a field missing from a result's JSON, `Types.kt` throws it for a denied capability and for an input that fails validation, `Server.kt` throws it for a handle JSON missing a field, and `ContextBridge.subscribe` and `ColdMessageFlow` close with one on a buffer overflow (`"SCP-CTX-2001"`) and on an `onError` callback, which supplies the code. The one hand-written `ScpException` is `scp-kt-android`'s, in `platform/Types.kt`.
-
 ```kotlin
 open class ScpException(
     message: String,
@@ -283,13 +212,8 @@ class ValidationException(message: String, code: String) : ScpException(message,
 
 ## Identity Class
 
-Superseded. `scp-kt` ships no hand-written `Identity` wrapper, so this sketch binds no code: `SCP` operations take the UniFFI-generated `uniffi.scp.Identity`, which `scp-kt` compiles from the bindings under `src/main/kotlin/works/limn/scp/internal`, and the shipped `Identity.kt` holds `IdentityAdvancedBridge` and the data classes its operations return.
-
 ```kotlin
-class Identity private constructor(
-    private val handle: IdentityHandle,
-    private val ioDispatcher: CoroutineDispatcher,
-) {
+class Identity private constructor(private val handle: IdentityHandle) {
     val identifier: ByteArray get() = handle.identifier()
     val custodyType: CustodyType get() = handle.custodyType()
 
@@ -297,65 +221,34 @@ class Identity private constructor(
         // IdentityConfig is the three-slot config object
         // `.docs/standards/construction.md` states. Its `custody` slot carries
         // the bridge's KeyCustodyConfig and carries no default, because that
-        // slot decides where an identity's private key lives. The ioDispatcher
-        // parameter is injected like CoroutineBridge.ioDispatcher, with the same default.
-        suspend fun create(
-            config: IdentityConfig,
-            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-        ): Identity =
-            withContext(ioDispatcher) {
-                Identity(NativeLib.identityCreate(config), ioDispatcher)
+        // slot decides where an identity's private key lives.
+        suspend fun create(config: IdentityConfig): Identity =
+            withContext(Dispatchers.IO) {
+                Identity(NativeLib.identityCreate(config))
             }
 
-        suspend fun load(
-            identifier: ByteArray,
-            ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-        ): Identity =
-            withContext(ioDispatcher) {
-                Identity(NativeLib.identityLoad(identifier), ioDispatcher)
+        suspend fun load(identifier: ByteArray): Identity =
+            withContext(Dispatchers.IO) {
+                Identity(NativeLib.identityLoad(identifier))
             }
     }
 
-    suspend fun rotateKey(): Identity = withContext(ioDispatcher) {
-        Identity(handle.rotateKey(), ioDispatcher)
+    suspend fun rotateKey(): Identity = withContext(Dispatchers.IO) {
+        Identity(handle.rotateKey())
     }
 }
 ```
 
 ## Resource Management
 
-A type with a teardown function of its own that reaches the Rust engine exposes that function as one `suspend` function and implements no `AutoCloseable` or `Closeable`, so no `use { }` block applies to it. `AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` that reaches the engine could keep that promise only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. A lifecycle callback that cannot suspend, `ScpViewModel.onCleared()` or the `onDispose` callback a composable passes to `rememberScpContext`, promises no finished teardown, so it launches the `suspend` teardown on a scope that outlives it and returns. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
-
-`SCP.shutdown(bridge, timeout)` and `InvocationHandle.cancel()` are the teardowns of a type's own resources that reach the Rust engine today, and this rule covers only those; `SCP.contextClose(handle, identity)` also reaches the engine, through the UniFFI-generated `contextClose`, but it closes a context handle, not the `SCP` instance, so this rule does not govern it; `cancel()` suspends on the UniFFI-generated async `Scp.outletStreamCancel`. `Relay` and `Node` follow the same rule, but no production class implements the `ServerBindings` interface they call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`), so their `shutdown()` reaches only the test source set's `StubServerBindings`. `ScpHotStreams.close()` (`scp-kt-android`) follows it too, and no production class implements the `EventContextBindings` interface it releases through, so it reaches only test stubs.
+`SCP`, `Relay`, `Node` (`scp-kt`), and `ScpHotStreams` (`scp-kt-android`) each expose their teardown as one `suspend` function, `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()`, and `ScpHotStreams.close()`, and implement no `AutoCloseable` or `Closeable`, so no `use { }` block applies to them. The classes UniFFI generates, such as `Scp`, keep the synchronous `close()` UniFFI gives them. `AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` whose teardown suspends on an injected dispatcher could keep that promise only by blocking its calling thread, which never returns under an injected `StandardTestDispatcher` and risks an ANR on an Android main thread. `ScpViewModel.onCleared()` cannot suspend and promises no finished teardown, so it launches its `leave` calls on a scope that outlives it and returns. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and ADR-028 (as amended, `.docs/adrs/phase-6.md`) state the rule; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk.
 
 ```kotlin
-class SCP internal constructor(
-    private val inner: NativeScp,
-) {
-    private val shutdownRecorded = AtomicBoolean(false)
-
-    // The only stop path. It suspends on the bridge's injected ioDispatcher. A failed
-    // teardown propagates and leaves the flag false, so the instance still reads as live.
-    // shutdown sets the flag inside the bridge block, because withContext checks for cancellation
-    // as it returns: a flag set after ffiCallSuspend returned would stay false for a caller
-    // cancelled after a finished teardown.
-    suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration = 5.seconds) {
-        val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
-        bridge.ffiCallSuspend {
-            inner.shutdown(timeoutMillis = millis)
-            // Reached only when the FFI call returns; an engine failure throws first.
-            shutdownRecorded.set(true)
-        }
-    }
-}
-
-// Usage: call shutdown() from a coroutine the caller owns, never through runBlocking.
-// Run it under NonCancellable: a finally block usually runs because the coroutine was
-// cancelled, and in a cancelled coroutine the bridge's withContext(ioDispatcher) throws
-// CancellationException before the FFI call starts, so a bare shutdown() tears nothing down.
-// SCP.withStorage blocks its calling thread on JNA, so this sample runs it on an injected
-// ioDispatcher (ADR-028, Dispatcher strategy), which a test can replace with a
-// StandardTestDispatcher.
+// Call shutdown() from a coroutine the caller owns, never through runBlocking. Run it under
+// NonCancellable: a finally block usually runs because the coroutine was cancelled, and in a
+// cancelled coroutine the bridge's withContext(ioDispatcher) throws CancellationException
+// before the FFI call starts, so a bare shutdown() tears nothing down. SCP.withStorage is not a
+// suspend function and blocks its calling thread on JNA, so this runs it on ioDispatcher.
 val scp = withContext(ioDispatcher) { SCP.withStorage(config) }
 try {
     scp.contextCreate(identity, params)
