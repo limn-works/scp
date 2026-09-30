@@ -1962,10 +1962,16 @@ impl ActiveFlagGuard {
     }
 }
 
-/// Admits one subscription on `handle`: refuses a second concurrent
-/// subscription (`CTX_2022`) and a context the supervisor does not report
-/// `Active` (`CTX_2021`), and returns the guard that resets the handle's
-/// subscription flag when it drops.
+/// Admits one subscription on `handle` and returns the guard that resets the
+/// handle's subscription flag when it drops.
+///
+/// Refuses a second concurrent subscription with `CTX_2022`. Refuses through
+/// [`require_active_context`](crate::runtime::require_active_context) a context
+/// the supervisor does not report `Active`: `CTX_2021` for a state other than
+/// `Active` or `Poisoned` and for a context no actor serves, `CTX_2134` for a
+/// poisoned context, and the supervisor query's own error when the state read
+/// fails: `CTX_2130` for a busy actor, `CTX_2135` for a crashed or
+/// mid-respawn actor, and `CTX_2000` when this bridge holds no supervisor.
 async fn subscribe_admission(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,

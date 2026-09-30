@@ -561,14 +561,18 @@ pub const CTX_2096: &str = "SCP-CTX-2096";
 ///
 /// Maps from `ContextError::ActorBusy` in each bridge's error translator. A
 /// bridge call site that reports every failure under one fixed code reports
-/// that code instead.
+/// that code instead, and one that formats the error into a message with no
+/// code reports no code; the same holds for `CTX_2134` and `CTX_2135`.
 pub const CTX_2130: &str = "SCP-CTX-2130";
 /// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
 ///
 /// No longer respawned; the context is dormant until an operator clears the
 /// poison (triggering a fresh respawn) or the process restarts.
 ///
-/// Maps from `ContextError::ContextPoisoned`.
+/// Maps from `ContextError::ContextPoisoned` in each bridge's error translator.
+/// A bridge call site that reports every failure under one fixed code reports
+/// that code instead, and one that formats the error into a message with no
+/// code reports no code.
 pub const CTX_2134: &str = "SCP-CTX-2134";
 /// Context actor crashed and has not been respawned (ADR-049 §10).
 ///
@@ -579,7 +583,10 @@ pub const CTX_2134: &str = "SCP-CTX-2134";
 /// operator recovery or a restart. Distinct from `CTX_2134`: the crash budget
 /// was not necessarily exhausted.
 ///
-/// Maps from `ContextError::ActorCrashed`.
+/// Maps from `ContextError::ActorCrashed` in each bridge's error translator.
+/// A bridge call site that reports every failure under one fixed code reports
+/// that code instead, and one that formats the error into a message with no
+/// code reports no code.
 pub const CTX_2135: &str = "SCP-CTX-2135";
 /// Key package single-use replay rejected by the crypto-layer consumed-init-key
 /// backstop (ADR-049 §9 two-anchor single-use model).
