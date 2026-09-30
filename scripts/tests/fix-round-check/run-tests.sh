@@ -1286,6 +1286,7 @@ scan_rule_phrase() {
         *'unbalanced block comment'* | *'unbalanced string literal'*)
             echo 'on a block comment or string literal the scan cannot close' ;;
         *'include!'* | *'macro_rules!'* | *'stringify!'*) echo 'on any include, macro_rules or stringify word' ;;
+        *'U+200E or U+200F'*) echo 'on a U+200E or U+200F mark outside a literal or comment' ;;
         *'#[path]'*) echo 'any #[path] or #[r#path] attribute, whatever each holds' ;;
         *'(cfg_\w+)'*) echo 'on any identifier outside a comment or string literal that starts with cfg_ (cfg_attr and cfg_select! included)' ;;
         *'test-attribute name'*) echo 'on the identifier test, bench or test_case wherever it stands' ;;
@@ -1347,11 +1348,12 @@ else
 fi
 # The map must reject a rule it does not know. Two retired wordings must fail the phrase
 # check: the one that named cfg_attr alone and left out test, bench and test_case, and the
-# one written before the gate rejected stringify and #[r#path].
-pre_stringify='on any include or macro_rules word, and any #[path] attribute, whatever each holds'
+# one written before the gate rejected stringify, #[r#path], U+200E and U+200F.
+earlier_wording='on any include or macro_rules word, and any #[path] attribute, whatever each holds'
 retired='on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds; and on a block comment or string literal the scan cannot close'
 if [[ -z $(scan_rule_phrase 'print "cfg_select!\n" if /\bcfg_select\b/;') \
-    && $pre_stringify != *"$(scan_rule_phrase 'print "stringify!\n" if /\bstringify\b/;')"* \
+    && $earlier_wording != *"$(scan_rule_phrase 'print "stringify!\n" if /\bstringify\b/;')"* \
+    && $earlier_wording != *"$(scan_rule_phrase 'print "U+200E or U+200F outside a literal or comment\n"')"* \
     && $retired != *"$(scan_rule_phrase 'print "test-attribute name $1\n"')"* \
     && $retired != *"$(scan_rule_phrase 'print "$1\n" while /\b(cfg_\w+)/g;')"* ]]; then
     report "case 22b rejects an unmapped gate rule and the retired rule wording" 0 ""
