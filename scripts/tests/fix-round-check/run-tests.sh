@@ -1285,8 +1285,8 @@ scan_rule_phrase() {
     case $1 in
         *'unbalanced block comment'* | *'unbalanced string literal'*)
             echo 'on a block comment or string literal the scan cannot close' ;;
-        *'include!'* | *'macro_rules!'*) echo 'on any include or macro_rules word' ;;
-        *'#[path]'*) echo 'any #[path] attribute, whatever each holds' ;;
+        *'include!'* | *'macro_rules!'* | *'stringify!'*) echo 'on any include, macro_rules or stringify word' ;;
+        *'#[path]'*) echo 'any #[path] or #[r#path] attribute, whatever each holds' ;;
         *'(cfg_\w+)'*) echo 'on any identifier outside a comment or string literal that starts with cfg_ (cfg_attr and cfg_select! included)' ;;
         *'test-attribute name'*) echo 'on the identifier test, bench or test_case wherever it stands' ;;
         *'cfg($s)'*) echo 'target_feature and target_has_atomic fail' ;;
@@ -1309,20 +1309,72 @@ for want in 'false on the host the gate runs on, and the rust-clippy job runs on
     'in every workspace package whether or not it has an example target'; do
     [[ $SCAN_LINE == *"$want"* ]] || scan_rules_missing+="[$want] "
 done
+# The cfg rule admits the keys in the gate's %plat list and no others, so the line must
+# name exactly that list and its count, read from the gate, and header item 8 must give
+# the same count. plat_keys_phrase prints the phrase a gate file's list requires, or
+# nothing when the file holds no %plat list.
+plat_keys_phrase() {
+    local keys n words
+    keys=$(perl -0ne 'print join(" ", split(" ", $1)) if /%plat\s*=\s*map\s*\{[^}]*\}\s*qw\(([^)]*)\)/' "$1")
+    [[ -n $keys ]] || return 0
+    read -r -a keys <<<"$keys"
+    n=${#keys[@]}
+    words=(zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty)
+    local count=$n
+    [[ $n -le 20 ]] && count=${words[$n]}
+    if [[ $n -eq 1 ]]; then
+        echo "the $count platform key ${keys[0]},"
+    else
+        local head
+        head=$(printf '%s, ' "${keys[@]:0:n-1}")
+        echo "the $count platform keys ${head%, } and ${keys[n-1]},"
+    fi
+}
+plat_want=$(plat_keys_phrase "$REPO_ROOT/scripts/check-examples-compile.sh")
+if [[ -z $plat_want ]]; then
+    scan_rules_missing+="[the gate's %plat key list, which the case could not read] "
+else
+    [[ $SCAN_LINE == *"$plat_want"* ]] || scan_rules_missing+="[$plat_want] "
+    plat_count=${plat_want#the }
+    plat_count=${plat_count%% *}
+    grep -qF "and $plat_count platform keys" "$REPO_ROOT/scripts/fix-round-check.sh" \
+        || scan_rules_missing+="[header item 8: and $plat_count platform keys] "
+fi
 if [[ $gate_rule_count -ge 8 && -z $scan_rules_missing ]]; then
     report "case 22b states every source rule the examples gate applies" 0 ""
 else
     report "case 22b states every source rule the examples gate applies" 1 "the gate has $gate_rule_count scan rules; the source-scan line lacks $scan_rules_missing: ${SCAN_LINE:-<absent>}"
 fi
-# The map must reject a rule it does not know, and the retired wording, which named
-# cfg_attr alone and left out test, bench and test_case, must fail the phrase check.
+# The map must reject a rule it does not know. Two retired wordings must fail the phrase
+# check: the one that named cfg_attr alone and left out test, bench and test_case, and the
+# one written before the gate rejected stringify and #[r#path].
+pre_stringify='on any include or macro_rules word, and any #[path] attribute, whatever each holds'
 retired='on any cfg_attr, include or macro_rules word outside a comment or string literal, and any #[path] attribute, whatever each holds; and on a block comment or string literal the scan cannot close'
 if [[ -z $(scan_rule_phrase 'print "cfg_select!\n" if /\bcfg_select\b/;') \
+    && $pre_stringify != *"$(scan_rule_phrase 'print "stringify!\n" if /\bstringify\b/;')"* \
     && $retired != *"$(scan_rule_phrase 'print "test-attribute name $1\n"')"* \
     && $retired != *"$(scan_rule_phrase 'print "$1\n" while /\b(cfg_\w+)/g;')"* ]]; then
     report "case 22b rejects an unmapped gate rule and the retired rule wording" 0 ""
 else
     report "case 22b rejects an unmapped gate rule and the retired rule wording" 1 "scan_rule_phrase accepted an unknown rule, or the retired wording carries a required phrase"
+fi
+# The key-list check must go red when the gate's %plat list gains or loses a key, and
+# when the gate holds no list at all. Each mutation edits a copy of the gate.
+plat_gate=$(mktemp "${TMPDIR:-/tmp}/plat-gate.XXXXXX")
+plat_bad=""
+perl -pe 's/qw\(unix /qw(unix target_has_atomic /' "$REPO_ROOT/scripts/check-examples-compile.sh" >"$plat_gate"
+m=$(plat_keys_phrase "$plat_gate")
+[[ -n $m && $SCAN_LINE != *"$m"* && $m == *'the ten platform keys'* ]] || plat_bad+="[an added key left the phrase in the line: $m] "
+perl -pe 's/ target_vendor\)/)/' "$REPO_ROOT/scripts/check-examples-compile.sh" >"$plat_gate"
+m=$(plat_keys_phrase "$plat_gate")
+[[ -n $m && $SCAN_LINE != *"$m"* && $m == *'the eight platform keys'* ]] || plat_bad+="[a removed key left the phrase in the line: $m] "
+perl -pe 's/%plat\b/%other/' "$REPO_ROOT/scripts/check-examples-compile.sh" >"$plat_gate"
+[[ -z $(plat_keys_phrase "$plat_gate") ]] || plat_bad+="[a gate without %plat still gave a phrase] "
+rm -f "$plat_gate"
+if [[ -z $plat_bad ]]; then
+    report "case 22b rejects a line whose platform keys differ from the gate's list" 0 ""
+else
+    report "case 22b rejects a line whose platform keys differ from the gate's list" 1 "$plat_bad"
 fi
 # The retired wording admitted any target_ key and a cfg_attr whose predicate names a
 # platform key; neither the scan line nor the assertion 1 line may carry it.
