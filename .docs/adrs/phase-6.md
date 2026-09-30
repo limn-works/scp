@@ -442,7 +442,7 @@ dependencies {
    - For a P-256 agreement key on API 31+: generates the key in `AndroidKeyStore` with `KeyProperties.PURPOSE_AGREE_KEY`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
    - For a P-256 agreement key on API 26-30: generates a Bouncy Castle software key and stores it in `EncryptedSharedPreferences`. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
    - For the root member: generates nothing. `09-security-model.md` §9.7.4.1 item 4 places the root in the platform credential provider as a passkey.
-   - Called twice during identity creation: for the Active Signing Key and for the Pre-Rotation Key.
+   - For the pre-rotation key: generates nothing. `09-security-model.md` §9.7.4.1 item 3 forbids the pre-rotation key to be reachable through the custody provider that daily operations use, and item 4 places it in a passkey through the platform credential provider. Identity creation calls `generateKeypair` for the Active Signing Key and never for the pre-rotation key.
 
 2. **`AndroidKeyCustody.sign(keyHandle, data)`:**
    - Retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("SHA256withECDSA")`, converts the DER output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and normalizes `s` into the low half of the group order.

@@ -6267,7 +6267,7 @@
         "KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025",
         "`generateKeypair` generates every P-256 signing key in `AndroidKeyStore` with `ECGenParameterSpec(\"secp256r1\")` at every supported API level (API 26+) and returns `CustodyType.HARDWARE` (ADR-027 acceptance criterion 1). The criterion is unmet until the open question \"Android Keystore key outside the TEE\" in `.docs/specs/00-open-questions.md` is decided, because a Keystore on a device without a hardware TEE holds the key in software, and the answer sets whether the adapter then reads `KeyInfo.securityLevel` and reports `CustodyType.SOFTWARE` or refuses the key",
         "`generateKeypair` generates a P-256 agreement key in `AndroidKeyStore` with `KeyProperties.PURPOSE_AGREE_KEY` on API 31+ and returns `CustodyType.HARDWARE`, subject to the open question \"Android Keystore key outside the TEE\" in `.docs/specs/00-open-questions.md` as for a signing key; on API 26-30 it generates a Bouncy Castle software key, stores it in `EncryptedSharedPreferences`, and returns `CustodyType.SOFTWARE` (ADR-027 acceptance criterion 1)",
-        "`generateKeypair` generates no key for the root member or for the pre-rotation key. §9.7.4.1 item 4 and the Android row of §17.8 place both in a passkey through the platform credential provider, and §9.7.4.1 item 3 forbids the pre-rotation key to be reachable through the custody provider that daily operations use. ADR-027 acceptance criterion 1 also says `generateKeypair` is \"Called twice during identity creation: for the Active Signing Key and for the Pre-Rotation Key\", which conflicts with §9.7.4.1 item 3; this story follows §9.7.4.1 item 3, and ADR-027 acceptance criterion 1 must drop that bullet",
+        "`generateKeypair` generates no key for the root member or for the pre-rotation key. §9.7.4.1 item 4 and the Android row of §17.8 place both in a passkey through the platform credential provider, and §9.7.4.1 item 3 forbids the pre-rotation key to be reachable through the custody provider that daily operations use (ADR-027 acceptance criterion 1)",
         "`sign` signs with `SHA256withECDSA` under the handle's P-256 key, returns the 64-byte raw `r || s` form of §9.5 with `s` normalized into the low half of the group order, rejects an agreement-only handle with `PlatformError.wrongKeyType`, and throws `ScpException` with code `SCP-CRYPTO-4001` for a handle it does not hold (ADR-027 acceptance criterion 2)",
         "`publicKey` returns the 33-byte SEC1 compressed encoding of the P-256 public point (§9.5, ADR-027 acceptance criterion 3)",
         "`dhAgree` performs P-256 ECDH in `AndroidKeyStore` on API 31+ and through Bouncy Castle below API 31, returns the 32-byte x-coordinate of the agreed point, and rejects a signing-only handle with `PlatformError.wrongKeyType` (ADR-027 acceptance criterion 5)",
@@ -6303,7 +6303,6 @@
         }
       ],
       "details": {
-        "stubADR": true,
         "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "minimumApiLevel": "Decided by ADR-027 as amended on 2026-09-10: API 26 SDK minimum, P-256 signing in Keystore at every supported API level, Keystore P-256 key agreement from API 31",
@@ -6318,7 +6317,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidKeyCustody.kt and Types.kt implemented. Ed25519 keys are held by Android Keystore on API 33+ and reported as `CustodyType.HARDWARE` without a `KeyInfo.securityLevel` check, so the adapter does not know whether a key sits in the TEE or in software; API 26-32 falls back to Bouncy Castle software keys, and X25519 keys are software keys. ADR-027 requires P-256. `AndroidKeyCustodyTest.kt` holds 59 JVM unit tests."
+      "result": "AndroidKeyCustody.kt and Types.kt implemented. Ed25519 keys are held by Android Keystore on API 33+ and reported as `CustodyType.HARDWARE` without a `KeyInfo.securityLevel` check, so the adapter does not know whether a key sits in the TEE or in software; API 26-32 falls back to Bouncy Castle software keys, and X25519 keys are software keys. ADR-027 requires P-256."
     },
     {
       "id": "SCP-111",
@@ -6365,7 +6364,6 @@
         }
       ],
       "details": {
-        "stubADR": true,
         "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "playIntegrityLevel": "Decided by ADR-027: Standard integrity requests; Classic attestation is not used"
@@ -6374,7 +6372,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidDeviceAttestation.kt implemented. The adapter requests a Classic Play Integrity token through `IntegrityTokenRequest.builder().setNonce(nonce)` with a SHA-256 nonce and returns the token bytes; ADR-027 requires a Standard request, which this story still has to deliver. `AndroidDeviceAttestationTest.kt` holds 16 JVM unit tests."
+      "result": "AndroidDeviceAttestation.kt implemented. The adapter requests a Classic Play Integrity token through `IntegrityTokenRequest.builder().setNonce(nonce)` with a SHA-256 nonce and returns the token bytes; ADR-027 requires a Standard request, which this story still has to deliver."
     },
     {
       "id": "SCP-112",
@@ -6414,7 +6412,6 @@
         }
       ],
       "details": {
-        "stubADR": true,
         "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "fcmPayloadFormat": "Parallel to APNs opacity decision in ADR-025"
@@ -6423,7 +6420,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidPushProvider.kt implemented. `register` returns the FCM token, and `handleNotification` checks only the `scp` field of a data-only payload, throwing `SCP-TRANS-5001` when the field is missing and `SCP-TRANS-5002` when it is not `\"1\"`. It accepts extra fields. No sender in the repository emits the §10.7.1 step 5 payload, so no code meets §10.7 opacity, which binds the sender. `AndroidPushProviderTest.kt` holds 14 JVM unit tests."
+      "result": "AndroidPushProvider.kt implemented. `register` returns the FCM token, and `handleNotification` checks only the `scp` field of a data-only payload, throwing `SCP-TRANS-5001` when the field is missing and `SCP-TRANS-5002` when it is not `\"1\"`. It accepts extra fields. No sender in the repository emits the §10.7.1 step 5 payload, so no code meets §10.7 opacity, which binds the sender."
     },
     {
       "id": "SCP-113",
@@ -6435,7 +6432,7 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
-      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.\n\nStatus reopened 2026-09-28: the shipped adapter derives the SQLCipher passphrase from a Keystore AES-256 key but never reads `KeyInfo.securityLevel`, so it does not show that the key is TEE-backed, and no unit test opens a SQLCipher database. Of the 46 tests in `AndroidStorageTest.kt`, 31 run against the test-only `InMemoryStorageProvider` and 15 check `AndroidStorage` constants, type and error codes. `StorageConformanceTest.kt` runs 15 conformance tests against `InMemoryStorageProvider` and against an unencrypted JVM SQLite provider that runs hand-copied versions of `AndroidStorage`'s schema and SQL statements, which no test compares with `AndroidStorage`, plus 5 SQL-specific tests against that SQLite provider; none of them opens SQLCipher. The criteria \"SQLCipher database encryption key derived via TEE-backed key derivation\" and \"Unit tests verify encrypted storage round-trip\" are unmet. `AndroidStorage` implements the Kotlin `StorageProvider` interface of `Types.kt`, which declares the method names of the UniFFI `StorageProvider` callback interface but is not that interface, and no code injects it into the Rust engine as ADR-027 requires, so the criterion \"Storage trait implemented for Android matching ADR-025 trait signatures\" is unmet as well.",
+      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.\n\nStatus reopened 2026-09-28: the shipped adapter derives the SQLCipher passphrase from a Keystore AES-256 key but never reads `KeyInfo.securityLevel`, so it does not show that the key is TEE-backed, and no unit test opens a SQLCipher database. Each test in `AndroidStorageTest.kt` runs against the test-only `InMemoryStorageProvider` or checks `AndroidStorage` constants, type or error codes. `StorageConformanceTest.kt` runs its conformance tests against `InMemoryStorageProvider` and against an unencrypted JVM SQLite provider that runs hand-copied versions of `AndroidStorage`'s schema and SQL statements, which no test compares with `AndroidStorage`, plus SQL-specific tests against that SQLite provider; none of them opens SQLCipher. The criteria \"SQLCipher database encryption key derived via TEE-backed key derivation\" and \"Unit tests verify encrypted storage round-trip\" are unmet. `AndroidStorage` implements the Kotlin `StorageProvider` interface of `Types.kt`, which declares the method names of the UniFFI `StorageProvider` callback interface but is not that interface, and no code injects it into the Rust engine as ADR-027 requires, so the criterion \"Storage trait implemented for Android matching ADR-025 trait signatures\" is unmet as well.",
       "acceptanceCriteria": [
         "Storage trait implemented for Android matching ADR-025 trait signatures",
         "SQLCipher database encryption key derived via TEE-backed key derivation, with the adapter reading the Keystore AES key's `KeyInfo` security level to show the key sits in the TEE. What the adapter does when Keystore holds the key outside the TEE waits on the open question \"Android Keystore key outside the TEE\" in `.docs/specs/00-open-questions.md`, and this criterion is unmet until it is decided",
@@ -6464,7 +6461,6 @@
         }
       ],
       "details": {
-        "stubADR": true,
         "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "sqlCipherKeyDerivation": "TEE-backed key derivation for database encryption key"
@@ -6474,7 +6470,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidStorage.kt implemented. The SQLCipher passphrase is derived from an AES-256 key held by Android Keystore, and SQLCipher derives the database key from that passphrase; the adapter does not read `KeyInfo.securityLevel`, so it does not know whether the AES key sits in the TEE or in software. `AndroidStorageTest.kt` holds 46 JVM unit tests: 31 run against the test-only `InMemoryStorageProvider`, 10 assert `AndroidStorage` constants, and 5 check `AndroidStorage`'s type and constructor by reflection or build an `ScpException` from its error-code constants. None opens a SQLCipher database."
+      "result": "AndroidStorage.kt implemented. The SQLCipher passphrase is derived from an AES-256 key held by Android Keystore, and SQLCipher derives the database key from that passphrase; the adapter does not read `KeyInfo.securityLevel`, so it does not know whether the AES key sits in the TEE or in software. Each JVM unit test in `AndroidStorageTest.kt` runs against the test-only `InMemoryStorageProvider`, asserts an `AndroidStorage` constant, or checks `AndroidStorage`'s type and constructor by reflection or builds an `ScpException` from its error-code constants. None opens a SQLCipher database."
     },
     {
       "id": "SCP-114",
