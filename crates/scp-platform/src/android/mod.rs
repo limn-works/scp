@@ -21,9 +21,11 @@
 //! the Rust trait in [`crate::traits`] and the `UniFFI` callback interface in
 //! `crates/scp-ffi/uniffi/src/lib.rs` for its capability:
 //!
-//! - `DeviceAttestationProvider` restates the `UniFFI` callback interface of
-//!   the same name: `attest(challenge, deviceId)` and
-//!   `assertRequest(requestHash)` take and return bytes. The
+//! - `DeviceAttestationProvider` restates the methods of the `UniFFI`
+//!   callback interface of the same name: `attest(challenge, deviceId)` and
+//!   `assertRequest(requestHash)` take and return bytes and suspend. It
+//!   differs from the callback in its error type (see the paragraph
+//!   after this list). The
 //!   [`crate::traits::DeviceAttestation`] trait's `attest` takes no argument,
 //!   the trait declares a `verify` method the Kotlin interface lacks, and it
 //!   declares no `assert_request`, while the Kotlin interface declares
@@ -36,11 +38,18 @@
 //!   `custody_type`,
 //!   `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
 //!   `generate_ephemeral_ed25519_seed`, which the Kotlin interface lacks. The
-//!   Kotlin methods take a `KeyHandle` and a `KeyType`, as the Rust trait's
-//!   do, while the `UniFFI` callback's methods take a `String` key ID and a
-//!   `String` key type. The Kotlin `generateKeypair` returns a `KeyHandle`, as
-//!   the trait's does, while the callback's `generate_keypair` returns a
-//!   `String` key ID. The Kotlin `destroyKey` returns a
+//!   Kotlin methods name a key by a Kotlin `KeyHandle`, a data class of a
+//!   `String` id and a `CustodyType`, while the trait's [`KeyHandle`] is a
+//!   different type, an opaque `u64`, and the `UniFFI` callback's methods take
+//!   a `String` key ID. The Kotlin `generateKeypair` takes a `KeyType` enum,
+//!   as the trait's takes a [`KeyType`] enum of the same two variants, while
+//!   the callback's takes a `String` key type. The Kotlin
+//!   `deriveRotatablePseudonym` takes its epoch as a signed `Long`, while both
+//!   Rust declarations take a `u64`, which `UniFFI` generates in Kotlin as
+//!   `ULong`. The Kotlin `generateKeypair` returns a Kotlin `KeyHandle`, while
+//!   the trait's returns its `u64` [`KeyHandle`] and the callback's
+//!   `generate_keypair` returns a `String` key ID. The Kotlin `destroyKey`
+//!   returns a
 //!   `DestructionAttestation`, while both Rust declarations return nothing.
 //!   The Kotlin pseudonym methods return a `PseudonymKeyHandle`, while the
 //!   trait returns a `PseudonymKeypair` and the callback returns bytes. The
@@ -63,7 +72,18 @@
 //!   `listKeys`, `deletePrefix`, `exists`). The [`crate::traits::Storage`]
 //!   trait declares the same six operations but names `set` and `get` as
 //!   `store` and `retrieve`. The Kotlin methods are synchronous, while every
-//!   method of both Rust declarations is `async`.
+//!   method of both Rust declarations is `async`. The Kotlin `deletePrefix`
+//!   returns a signed `Long`, while both Rust declarations return a `u64`,
+//!   which `UniFFI` generates in Kotlin as `ULong`.
+//!
+//! No Kotlin interface throws the exception class the `UniFFI` callbacks
+//! declare. The Kotlin interfaces throw the `scp-kt-android` class
+//! `works.limn.scp.android.platform.ScpException`, and the adapters also let
+//! other throwables escape. Each `UniFFI` callback declares `ScpError`, which
+//! `UniFFI` generates in Kotlin as a different class,
+//! `uniffi.scp.ScpException`, and each Rust trait returns a
+//! [`crate::PlatformError`]. ADR-027 states that a `UniFFI` callback that
+//! throws any exception other than the generated one panics the Rust caller.
 //!
 //! # Adapter Modules
 //!

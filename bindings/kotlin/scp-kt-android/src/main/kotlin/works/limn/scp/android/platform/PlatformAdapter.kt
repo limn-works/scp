@@ -24,9 +24,12 @@ import android.content.Context
  * accepts only the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody]
  * does not implement.
  *
- * @property keyCustody Android Keystore key management (Keystore-held Ed25519 on API 33+ today,
- *   reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel` check, and in-memory
- *   software X25519 key agreement at every API level; ADR-027 requires a P-256 signing key in
+ * @property keyCustody Android Keystore and Bouncy Castle key management (Keystore-held Ed25519
+ *   on API 33+ today, reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel`
+ *   check; on API 26-32 a Bouncy Castle software Ed25519 key in process memory, whose seed
+ *   [AndroidKeyCustody] writes to EncryptedSharedPreferences and
+ *   [KeyCustodyProvider.exportSigningKeyBytes] returns; and in-memory software X25519 key
+ *   agreement at every API level; ADR-027 requires a P-256 signing key in
  *   Keystore at every supported API level and P-256 key agreement in Keystore from API 31;
  *   story SCP-110 tracks both moves).
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic

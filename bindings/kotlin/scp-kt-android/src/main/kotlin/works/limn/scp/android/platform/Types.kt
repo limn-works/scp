@@ -198,11 +198,16 @@ enum class WakeSignal {
  * The Android implementation requests a Classic Play Integrity token; ADR-027
  * requires a Standard request, and story SCP-111 tracks that change.
  *
- * This interface mirrors the UniFFI `DeviceAttestationProvider` callback interface in
- * `crates/scp-ffi/uniffi/src/lib.rs`. It does not mirror the Rust `DeviceAttestation` trait in
- * `crates/scp-platform/src/traits.rs`, whose `attest` takes no argument, which declares a
- * `verify` method that this interface lacks, and which declares no `assert_request`, while this
- * interface declares [assertRequest].
+ * This interface declares the two methods of the UniFFI `DeviceAttestationProvider` callback
+ * interface in `crates/scp-ffi/uniffi/src/lib.rs` under the Kotlin names UniFFI generates for
+ * them, and like the callback's they take and return bytes and suspend. It differs from the
+ * callback in its error type: its methods throw this file's [ScpException], while the callback
+ * declares `ScpError`, which UniFFI generates in Kotlin as `uniffi.scp.ScpException`, a
+ * different class. ADR-027 states that a UniFFI callback that throws any exception other than
+ * the generated one panics the Rust caller. It does not mirror the Rust `DeviceAttestation`
+ * trait in `crates/scp-platform/src/traits.rs`. The trait's `attest` takes no argument, the
+ * trait declares a `verify` method that this interface lacks and no `assert_request`, while
+ * this interface declares [assertRequest], and the trait returns a `PlatformError`.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -253,7 +258,11 @@ interface DeviceAttestationProvider {
  * `handle_notification` takes the payload as `&[u8]`, and both methods are `async`. The UniFFI
  * `PushProvider` callback interface in `crates/scp-ffi/uniffi/src/lib.rs` names them
  * `register_push` and `handle_notification`. Both are `async`: `register_push` returns bytes,
- * and `handle_notification` takes and returns bytes.
+ * and `handle_notification` takes and returns bytes. [handleNotification] throws this file's
+ * [ScpException], while the callback declares `ScpError`, which UniFFI generates in Kotlin as
+ * `uniffi.scp.ScpException`, a different class, and the Rust trait returns a `PlatformError`.
+ * ADR-027 states that a UniFFI callback that throws any exception other than the generated one
+ * panics the Rust caller.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
@@ -305,17 +314,26 @@ interface PushProvider {
  *   `export_signing_key_bytes`, and it also declares `custody_type`, `ed25519_to_x25519_agree`,
  *   `import_ed25519_signing_key` and `generate_ephemeral_ed25519_seed`, which this interface
  *   lacks.
- * - Parameters: its methods take a [KeyHandle] and a [KeyType], as the Rust trait's do, while
- *   the UniFFI callback's methods take a `String` key ID and a `String` key type.
- * - Return types: [generateKeypair] returns a [KeyHandle], as the Rust trait's does, while the
- *   UniFFI callback's `generate_keypair` returns a `String` key ID. [destroyKey] returns a
- *   [DestructionAttestation], while both Rust declarations return nothing. The pseudonym methods
- *   return a [PseudonymKeyHandle], while the Rust trait returns a `PseudonymKeypair` and the
- *   UniFFI callback returns bytes. [sign], [publicKey] and [dhAgree] return a [ByteArray], as the
- *   UniFFI callback's methods return bytes, while the Rust trait returns a `Signature`, a
- *   `PublicKey` and a `SharedSecret`.
+ * - Parameters: its methods name a key by a [KeyHandle], a data class of a `String` id and a
+ *   [CustodyType]. The Rust trait's `KeyHandle` is a different type, an opaque `u64`, and the
+ *   UniFFI callback's methods take a `String` key ID. [generateKeypair] takes a [KeyType] enum,
+ *   as the Rust trait's takes a `KeyType` enum of the same two variants, while the UniFFI
+ *   callback's takes a `String` key type. [deriveRotatablePseudonym] takes `pseudonymEpoch` as
+ *   a signed `Long`, while both Rust declarations take a `u64`, which UniFFI generates in Kotlin
+ *   as `ULong`.
+ * - Return types: [generateKeypair] returns a [KeyHandle], while the Rust trait's returns its
+ *   `u64` `KeyHandle` and the UniFFI callback's `generate_keypair` returns a `String` key ID.
+ *   [destroyKey] returns a [DestructionAttestation], while both Rust declarations return
+ *   nothing. The pseudonym methods return a [PseudonymKeyHandle], while the Rust trait returns
+ *   a `PseudonymKeypair` and the UniFFI callback returns bytes. [sign], [publicKey] and
+ *   [dhAgree] return a [ByteArray], as the UniFFI callback's methods return bytes, while the
+ *   Rust trait returns a `Signature`, a `PublicKey` and a `SharedSecret`.
  * - Synchrony: its methods are synchronous. Every method of both Rust declarations is `async`
  *   except `custody_type`, which is synchronous in both.
+ * - Errors: its methods throw this file's [ScpException]. The UniFFI callback declares
+ *   `ScpError`, which UniFFI generates in Kotlin as `uniffi.scp.ScpException`, a different
+ *   class, and the Rust trait returns a `PlatformError`. ADR-027 states that a UniFFI callback
+ *   that throws any exception other than the generated one panics the Rust caller.
  *
  * [AndroidKeyCustody] converts no exception to [ScpException]. Each method throws [ScpException]
  * only for the codes its `@throws` lines name, and every other failure escapes as the original
@@ -545,7 +563,12 @@ interface KeyCustodyProvider {
  * `crates/scp-ffi/uniffi/src/lib.rs` under the same names. The Rust `Storage` trait in
  * `crates/scp-platform/src/traits.rs` declares the same six operations but names `set` and
  * `get` as `store` and `retrieve`. The methods of this interface are synchronous, while every
- * method of both Rust declarations is `async`.
+ * method of both Rust declarations is `async`. [deletePrefix] returns a signed `Long`, while
+ * both Rust declarations return a `u64`, which UniFFI generates in Kotlin as `ULong`. The
+ * methods throw this file's [ScpException], while the callback declares `ScpError`, which
+ * UniFFI generates in Kotlin as `uniffi.scp.ScpException`, a different class, and the Rust
+ * trait returns a `PlatformError`. ADR-027 states that a UniFFI callback that throws any
+ * exception other than the generated one panics the Rust caller.
  *
  * [AndroidStorage] opens its database on the first method call and retries the open on every
  * call until one succeeds, so each method can also throw an open failure, in one of three forms:
