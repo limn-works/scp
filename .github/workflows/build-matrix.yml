@@ -130,7 +130,38 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Python wheels — maturin-built manylinux2014 / macOS / Windows wheels
+  # Python wheels — maturin-built manylinux_2_28 / macOS / Windows wheels
+  #
+  # The 0.1.0b3 publish was the first run that reached this job. The settings
+  # below, and the reason for each:
+  #   - maturin in CI finds no python by itself, so every leg names its
+  #     interpreters (`-i`). Without abi3 a wheel serves one CPython minor, so
+  #     each leg builds one wheel per CPython minor that the classifiers in
+  #     bindings/python/pyproject.toml name, 3.10-3.13; a platform with no
+  #     wheel falls back to the sdist. The sdist builds with the same
+  #     `vendored-openssl` feature, so installing it on Linux or Windows
+  #     compiles OpenSSL; bindings/python/README.md §Requirements lists what
+  #     that build needs.
+  #   - `vendored-openssl` compiles OpenSSL into SQLCipher on the Linux and
+  #     Windows legs only. On the universal2 leg it activates nothing, and
+  #     SQLCipher keeps CommonCrypto: crates/scp-platform/Cargo.toml declares
+  #     the edge the feature sets for non-Apple targets only. Job
+  #     rust-build-pyo3-production in ci.yml checks that split with `cargo tree`.
+  #   - manylinux 2_28, not 2014: CentOS 7 (EOL) can build neither
+  #     ring (glibc >= 2.18, newer gcc) nor vendored OpenSSL.
+  #   - x86_64 2_28 container ships a minimal perl that openssl-src's
+  #     Configure rejects -> install the full perl distribution. The aarch64
+  #     leg is an Ubuntu-based rust-cross image (complete perl, NO dnf) — a
+  #     dnf attempt there exits 127, so it must get no container prep.
+  #   - Windows installs NASM so the vendored OpenSSL keeps its assembly
+  #     routines; without NASM openssl-src builds OpenSSL with `no-asm`.
+  #   - No --manifest-path arg: bindings/python/pyproject.toml already carries
+  #     [tool.maturin] manifest-path.
+  #   - Job rust-build-pyo3-production in ci.yml builds the `scp-ffi` library
+  #     with the same [tool.maturin] features on every PR that ci.yml's `rust` or
+  #     `python` path filter selects, on the Linux x86_64 runner only. The
+  #     manylinux_2_28 containers, the universal2 build, and the Windows NASM
+  #     build run nowhere but here.
   # ---------------------------------------------------------------------------
   python-wheels:
     name: Python wheel (${{ matrix.target }})
@@ -142,14 +173,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            manylinux: manylinux2014
+            manylinux: 2_28
+            before-script: dnf install -y perl
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            manylinux: manylinux2014
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            manylinux: auto
-          - target: aarch64-apple-darwin
+            manylinux: 2_28
+            before-script: "true"
+          # One universal2 wheel, as ADR phase-3 and `.docs/standards/python.md`
+          # name it: maturin compiles x86_64-apple-darwin and
+          # aarch64-apple-darwin and joins the two into one fat binary.
+          - target: universal2-apple-darwin
             runner: macos-latest
             manylinux: auto
           - target: x86_64-pc-windows-msvc
@@ -159,15 +192,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # The macOS and Windows legs build on the runner, so each interpreter `-i`
+      # names below must exist there; the Linux legs build inside the manylinux
+      # container, which carries its own python3.10-python3.13.
+      - name: Setup Python 3.10-3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+
+      - name: Setup NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      # MACOSX_DEPLOYMENT_TARGET sets the macOS floor the universal2 wheel's tag
+      # names, `macosx_11_0_universal2` in `.docs/standards/python.md`; 11.0 is the
+      # first release that runs on arm64. rustc and the cc crate read it only when
+      # they compile for an Apple target, so the Linux and Windows legs ignore it.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          before-script-linux: ${{ matrix.before-script }}
           args: >-
             --release
             --out dist
-            --manifest-path crates/scp-ffi/Cargo.toml
+            -i python3.10 python3.11 python3.12 python3.13
           working-directory: bindings/python
 
       - name: Upload Python wheel
@@ -185,13 +241,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # No --manifest-path: pyproject.toml carries [tool.maturin] manifest-path.
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: >-
             --out dist
-            --manifest-path crates/scp-ffi/Cargo.toml
           working-directory: bindings/python
 
       - name: Upload sdist

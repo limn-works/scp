@@ -288,19 +288,64 @@ impl PushToken {
 /// A wake signal produced by [`Push::handle_notification`].
 ///
 /// Indicates that the application should wake up and process pending messages.
-/// The payload carries transport-specific context (e.g., which context has new
-/// messages). See ADR-006.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// §10.7 of the infrastructure spec states: "Push payloads MUST contain a wake
+/// signal and nothing else. No context ID, no sender identifier, no message
+/// preview, no metadata of any kind." A wake signal must therefore not vary
+/// with the payload it was produced from. `WakeSignal` holds `&'static` bytes,
+/// so returning the borrowed payload or a temporary copy of it does not
+/// compile (the two examples below). The type does not stop a signal that
+/// varies with the payload: an implementation can leak payload bytes with
+/// `Vec::leak`, pick one of several `'static` constants by payload content, or
+/// slice a `static` table at an index read from the payload. The conformance
+/// check `scp_testing::conformance::push::check_fixed_wake_signal` is what
+/// rejects an adapter whose signal differs across the payloads it sends,
+/// however the signal was built. `InMemoryPush`, the durability-only adapter behind the
+/// `in-memory-push` feature (ADR-062 §0), returns the fixed bytes
+/// `{"aps":{"content-available":1}}` for every payload. See ADR-006.
+///
+/// ```
+/// use scp_platform::WakeSignal;
+///
+/// const WAKE: &[u8] = br#"{"aps":{"content-available":1}}"#;
+/// assert_eq!(WakeSignal::new(WAKE).payload(), WAKE);
+/// ```
+///
+/// Bytes borrowed from a notification payload do not compile:
+///
+/// ```compile_fail,E0521
+/// use scp_platform::WakeSignal;
+///
+/// fn from_payload(payload: &[u8]) -> WakeSignal {
+///     WakeSignal::new(payload)
+/// }
+/// ```
+///
+/// Nor does a copy of them:
+///
+/// ```compile_fail,E0716
+/// use scp_platform::WakeSignal;
+///
+/// fn from_payload(payload: &[u8]) -> WakeSignal {
+///     WakeSignal::new(&payload.to_vec())
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WakeSignal {
-    /// The raw notification payload that triggered this wake signal.
-    pub payload: Vec<u8>,
+    payload: &'static [u8],
 }
 
 impl WakeSignal {
-    /// Creates a new wake signal from a notification payload.
+    /// Creates a wake signal holding `payload`, a constant the [`Push`]
+    /// implementation returns for every notification it accepts (§10.7).
     #[must_use]
-    pub const fn new(payload: Vec<u8>) -> Self {
+    pub const fn new(payload: &'static [u8]) -> Self {
         Self { payload }
+    }
+
+    /// Returns the wake signal bytes.
+    #[must_use]
+    pub const fn payload(&self) -> &'static [u8] {
+        self.payload
     }
 }
 
@@ -858,8 +903,8 @@ pub trait DeviceAttestation: Send + Sync {
 /// Push notification trait.
 ///
 /// Abstracts platform-specific push notification registration and handling
-/// (APNs, FCM). The testing implementation returns synthetic tokens and passes
-/// payloads through as wake signals. See ADR-006.
+/// (APNs, FCM). The in-memory implementation returns synthetic tokens and one
+/// fixed wake signal for every payload. See ADR-006.
 pub trait Push: Send + Sync {
     /// Register for push notifications and return a platform-specific token.
     ///
@@ -869,6 +914,14 @@ pub trait Push: Send + Sync {
     fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send;
 
     /// Handle an incoming push notification payload and produce a wake signal.
+    ///
+    /// Returns one fixed [`WakeSignal`] for every payload the implementation
+    /// accepts, and may reject a payload instead. §10.7 of the infrastructure
+    /// spec states: "Push payloads MUST contain a wake signal and nothing else.
+    /// No context ID, no sender identifier, no message preview, no metadata of
+    /// any kind." The signal must therefore not vary with `payload`: a signal
+    /// that did would hand the caller whatever a relay put there. Spec
+    /// §16.12.5 and ADR-006 state this contract for every implementation.
     ///
     /// # Errors
     ///
