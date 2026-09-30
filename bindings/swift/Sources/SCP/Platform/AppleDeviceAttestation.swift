@@ -167,8 +167,11 @@
     /// next queued call, and a completion handler Apple runs after the call
     /// ended stores no key ID, starts no further App Attest call, and reaches
     /// no caller. An end that arrives while the adapter stores a key ID or
-    /// hands App Attest a method takes effect when that step returns, so a
-    /// call never starts an App Attest method after it ended. A caller
+    /// hands App Attest a method takes effect when that step returns. An end
+    /// that arrives while the adapter reads the stored key ID takes effect at
+    /// once, and the adapter checks whether the call ended immediately before
+    /// it stores a key ID or hands App Attest a method, so a call never
+    /// starts an App Attest method after it ended. A caller
     /// cancelled while queued leaves the queue and never
     /// reaches Apple. After a timeout or a cancellation, Apple can still be
     /// working on the abandoned call while the next call runs, and the
@@ -394,24 +397,28 @@
             // preceding call ended with Apple's answer.
             let outcome = await callSerializer.run(timeLimit: callTimeLimit) { [self] call in
                 if let keyId = loadKeyId() {
-                    requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                    call.issue {
+                        requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                    }
                     return
                 }
-                service.generateKey { [self] keyId, error in
-                    if let error {
-                        call.end(with: .failure(.fromAppAttest(error, call: "generateKey")))
-                    } else if let keyId {
-                        // A key ID that arrives after the call ended is
-                        // discarded: it is neither stored nor attested. The
-                        // store and the `attestKey` call run inside one
-                        // `issue`, so an end that arrives between them takes
-                        // effect after `attestKey` started.
-                        call.issue {
-                            storeKeyId(keyId)
-                            requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                call.issue {
+                    service.generateKey { [self] keyId, error in
+                        if let error {
+                            call.end(with: .failure(.fromAppAttest(error, call: "generateKey")))
+                        } else if let keyId {
+                            // A key ID that arrives after the call ended is
+                            // discarded: it is neither stored nor attested. The
+                            // store and the `attestKey` call run inside one
+                            // `issue`, so an end that arrives between them takes
+                            // effect after `attestKey` started.
+                            call.issue {
+                                storeKeyId(keyId)
+                                requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                            }
+                        } else {
+                            call.end(with: .failure(.internalError("generateKey returned neither keyId nor error")))
                         }
-                    } else {
-                        call.end(with: .failure(.internalError("generateKey returned neither keyId nor error")))
                     }
                 }
             }
@@ -474,13 +481,15 @@
                     call.end(with: .failure(.keyNotFound))
                     return
                 }
-                service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
-                    if let error {
-                        call.end(with: .failure(.fromAppAttest(error, call: "generateAssertion")))
-                    } else if let assertion {
-                        call.end(with: .success(assertion))
-                    } else {
-                        call.end(with: .failure(.internalError("generateAssertion returned neither assertion nor error")))
+                call.issue {
+                    service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
+                        if let error {
+                            call.end(with: .failure(.fromAppAttest(error, call: "generateAssertion")))
+                        } else if let assertion {
+                            call.end(with: .success(assertion))
+                        } else {
+                            call.end(with: .failure(.internalError("generateAssertion returned neither assertion nor error")))
+                        }
                     }
                 }
             }
@@ -646,11 +655,11 @@
         }
 
         /// Return `true` once `ticket`'s call holds the serializer, or `false`
-        /// when its caller is cancelled first.
+        /// when its caller is cancelled while it waits. A caller cancelled
+        /// before it reaches the serializer is admitted like any other, and
+        /// `AppAttestCall.run` ends its call before the call reads a key ID
+        /// or reaches Apple, so the serializer keeps one cancellation check.
         private func admit(_ ticket: UInt64) async -> Bool {
-            if Task.isCancelled {
-                return false
-            }
             if !running {
                 running = true
                 return true
@@ -684,11 +693,14 @@
     ///
     /// A key-ID read that finds no stored key ID in `assertRequest`, Apple's
     /// answer, the time limit and the caller's cancellation each try to end
-    /// the call; the first one ends it, and each later one does nothing. The adapter stores a key ID and hands App Attest a method only
-    /// inside `issue(_:)`, which runs nothing once the call ended. An end that
+    /// the call; the first one ends it, and each later one does nothing. The
+    /// adapter stores a key ID and hands App Attest a method only inside
+    /// `issue(_:)`, which runs nothing once the call ended. An end that
     /// arrives while an `issue(_:)` body runs takes effect, and resumes the
     /// caller, when that body returns, so every key ID a call stores and every
-    /// App Attest method it starts comes before the call ends.
+    /// App Attest method it starts comes before the call ends. The key-ID
+    /// read runs outside `issue(_:)`: an end that arrives during it takes
+    /// effect at once, and the `issue(_:)` after the read then starts nothing.
     private final class AppAttestCall: Sendable {
         /// What ending the call hands its caller.
         private struct Delivery: Sendable {
@@ -768,10 +780,14 @@
                         }
                         return true
                     }
-                    // A call that ended before the lock above, or between
-                    // that lock and `issue`, starts nothing; its caller
-                    // receives the outcome here or from `end(with:)`.
-                    if !open || !issue({ start(self) }) {
+                    // A call that ended before the lock above reads no key
+                    // ID and starts nothing; its caller receives the outcome
+                    // here. After the lock, `start` hands App Attest each
+                    // method through `issue(_:)`, which starts nothing once
+                    // the call ended, and `end(with:)` resumes the caller.
+                    if open {
+                        start(self)
+                    } else {
                         deliverIfEnded()
                     }
                 }
@@ -794,13 +810,12 @@
         }
 
         /// Run `body`, which stores a key ID or hands App Attest a method,
-        /// while the call is open, and report whether it ran. Once the call
-        /// ended, `body` does not run. An `end(with:)` that arrives while
-        /// `body` runs takes effect when `body` returns. `body` runs outside
-        /// the lock, so a completion handler that answers inside `body` ends
-        /// the call without taking the lock twice.
-        @discardableResult
-        func issue(_ body: () -> Void) -> Bool {
+        /// while the call is open. Once the call ended, `body` does not run.
+        /// An `end(with:)` that arrives while `body` runs takes effect when
+        /// `body` returns. `body` runs outside the lock, so a completion
+        /// handler that answers inside `body` ends the call without taking the
+        /// lock twice.
+        func issue(_ body: () -> Void) {
             let open: Bool = state.withLock { state in
                 guard state.outcome == nil else {
                     return false
@@ -809,7 +824,7 @@
                 return true
             }
             guard open else {
-                return false
+                return
             }
             body()
             let delivery: Delivery? = state.withLock { state in
@@ -817,7 +832,6 @@
                 return state.takeDelivery()
             }
             delivery?.perform()
-            return true
         }
 
         /// Resume the caller when the call ended and the caller has not
