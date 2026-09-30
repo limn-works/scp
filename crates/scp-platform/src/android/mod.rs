@@ -1,8 +1,13 @@
 //! Android platform adapter modules for SCP.
 //!
 //! This module declares four modules, one per Android adapter capability. Each
-//! re-exports from [`crate::traits`] the platform trait for its capability
-//! and, except [`storage`], that trait's types, and holds no adapter code.
+//! re-exports from [`crate::traits`] the platform trait for its capability and
+//! holds no adapter code. Three also re-export some of their trait's types:
+//! [`key_custody`] re-exports [`KeyHandle`], [`KeyType`] and [`CustodyType`]
+//! but not `Signature`, `PublicKey`, `SharedSecret` or `PseudonymKeypair`,
+//! which [`KeyCustody`] methods return; [`device_attestation`] re-exports
+//! [`DeviceAttestationToken`]; and [`push_provider`] re-exports [`PushToken`]
+//! and [`WakeSignal`].
 //! The adapters themselves are Kotlin classes in `bindings/kotlin/scp-kt-android/`.
 //! ADR-021 (the `UniFFI` bridge) and ADR-027 (the Android platform adapter)
 //! require each Kotlin class to implement the `UniFFI` callback interface for
@@ -87,8 +92,8 @@
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 
-/// Re-exports the key custody trait and its types; the Kotlin
-/// `AndroidKeyCustody` class is the Android Keystore adapter.
+/// Re-exports the key custody trait and its handle, key type and custody type
+/// types; the Kotlin `AndroidKeyCustody` class is the Android Keystore adapter.
 pub mod key_custody;
 
 /// Re-exports the device attestation trait and its token type; the Kotlin
