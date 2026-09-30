@@ -3,14 +3,19 @@
 // Kotlin JUnit 5 port of the Rust `storage_conformance!()` macro (SCP-PERSIST-030).
 // Exercises all 13 conformance cases against two StorageProvider test doubles:
 //
-// 1. InMemoryStorageProvider  — lock-guarded TreeMap, validates interface contract
-// 2. SqliteStorageProvider    — org.xerial:sqlite-jdbc on JVM, validates the SQL paths
-//                               (schema, LIKE escaping, ORDER BY, WITHOUT ROWID)
+// 1. InMemoryStorageProvider  — lock-guarded TreeMap
+// 2. SqliteStorageProvider    — org.xerial:sqlite-jdbc on JVM, running hand-copied
+//                               versions of AndroidStorage's schema and SQL statements
 //
 // The production AndroidStorage uses SQLCipher (net.zetetic:sqlcipher-android) with
-// Keystore-derived encryption, which requires an Android runtime. These tests exercise the
-// same SQL statements against unencrypted JVM SQLite to verify correctness of the
-// query logic without Android runtime dependencies.
+// Keystore-derived encryption, which requires an Android runtime. No test in this file
+// constructs an AndroidStorage, so none shows that AndroidStorage's SQL matches the copies
+// here. On JVM SQLite, the SQLite cases check that the copied statements escape the `%`
+// and `_` LIKE wildcards in a prefix, store a key holding `\`, order keys, and replace a
+// key on overwrite. They do not show the prefix query is correct: SQLite's `LIKE` ignores
+// ASCII letter case, so listKeys("ctx.a") and deletePrefix("ctx.a") also match "ctx.Abc"
+// in both the copy and AndroidStorage, and no case here stores two keys that differ only
+// in letter case, so the suite passes on that defect.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // section 17 (Persistence Architecture), SCP-PERSIST-030 (storage_conformance!() macro).
@@ -40,10 +45,11 @@ import java.util.concurrent.TimeUnit
 /**
  * [StorageProvider] backed by JVM SQLite (org.xerial:sqlite-jdbc).
  *
- * Uses the same SQL statements and schema as the production [AndroidStorage] class,
- * but runs on a plain JVM without encryption. This validates the SQL query logic
- * (LIKE escaping, ORDER BY, WITHOUT ROWID, INSERT OR REPLACE, changes()) without
- * requiring Android platform APIs.
+ * Holds hand-copied versions of the production [AndroidStorage] schema and SQL
+ * statements (LIKE with escaping, ORDER BY, WITHOUT ROWID, INSERT OR REPLACE) and runs
+ * them on a plain JVM without encryption. [deletePrefix] counts rows with
+ * `executeUpdate()`, where AndroidStorage queries `changes()`. It inherits
+ * AndroidStorage's case-insensitive `LIKE` prefix match.
  *
  * Each instance creates an in-memory SQLite database (`jdbc:sqlite::memory:`) so
  * tests are isolated and fast. The [close] method releases the JDBC connection.
@@ -379,10 +385,10 @@ class InMemoryStorageConformanceTest : StorageConformanceBase() {
 /**
  * Conformance tests against [SqliteStorageProvider].
  *
- * Validates the SQL query paths (INSERT OR REPLACE, LIKE with escaping, ORDER BY,
- * WITHOUT ROWID schema, changes() count) using JVM SQLite (org.xerial:sqlite-jdbc).
- * This exercises the same SQL statements that the production [AndroidStorage] uses
- * via SQLCipher, without requiring Android runtime.
+ * Runs the conformance cases and wildcard-escaping cases against the copied SQL
+ * statements on JVM SQLite (org.xerial:sqlite-jdbc). It constructs no [AndroidStorage]
+ * and has no mixed-case prefix case, so it passes on the case-insensitive `LIKE`
+ * prefix match that AndroidStorage and the copy share.
  */
 class SqliteStorageConformanceTest : StorageConformanceBase() {
 
