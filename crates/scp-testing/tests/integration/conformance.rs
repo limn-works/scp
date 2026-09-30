@@ -1461,7 +1461,8 @@ async fn conf_032_push_notification() {
         .expect("handle notification");
     println!("    Wake signal: {wake:?}");
     assert_eq!(
-        wake.payload, br#"{"aps":{"content-available":1}}"#,
+        wake.payload(),
+        br#"{"aps":{"content-available":1}}"#,
         "InMemoryPush must return the fixed ADR-006 wake signal"
     );
     scp_testing::conformance::push::check_fixed_wake_signal(&push).await;

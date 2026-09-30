@@ -56,7 +56,7 @@ impl Push for InMemoryPush {
         &self,
         _payload: &[u8],
     ) -> impl Future<Output = Result<WakeSignal, PlatformError>> + Send {
-        async move { Ok(WakeSignal::new(WAKE_SIGNAL.to_vec())) }
+        async move { Ok(WakeSignal::new(WAKE_SIGNAL)) }
     }
 }
 
@@ -95,7 +95,7 @@ mod tests {
         for payload in payloads {
             assert_ne!(payload, WAKE_SIGNAL);
             let signal = push.handle_notification(payload).await.unwrap();
-            assert_eq!(signal.payload, WAKE_SIGNAL);
+            assert_eq!(signal.payload(), WAKE_SIGNAL);
         }
     }
 
@@ -106,9 +106,9 @@ mod tests {
         let push = InMemoryPush::new();
         let payload = br#"{"aps":{"content-available":1},"contextId":"ctx-42"}"#;
         let signal = push.handle_notification(payload).await.unwrap();
-        assert_eq!(signal.payload, WAKE_SIGNAL);
+        assert_eq!(signal.payload(), WAKE_SIGNAL);
         assert!(
-            !signal.payload.windows(6).any(|w| w == b"ctx-42"),
+            !signal.payload().windows(6).any(|w| w == b"ctx-42"),
             "wake signal carries the payload's context ID"
         );
     }
@@ -117,7 +117,7 @@ mod tests {
     async fn handle_notification_empty_payload() {
         let push = InMemoryPush::new();
         let signal = push.handle_notification(b"").await.unwrap();
-        assert_eq!(signal.payload, WAKE_SIGNAL);
+        assert_eq!(signal.payload(), WAKE_SIGNAL);
     }
 
     #[tokio::test]
@@ -125,6 +125,6 @@ mod tests {
         let push = InMemoryPush::new();
         let payload = vec![0xAB; 4096];
         let signal = push.handle_notification(&payload).await.unwrap();
-        assert_eq!(signal.payload, WAKE_SIGNAL);
+        assert_eq!(signal.payload(), WAKE_SIGNAL);
     }
 }

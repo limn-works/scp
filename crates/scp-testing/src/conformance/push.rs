@@ -88,7 +88,7 @@ fn record_signal(fixed: &mut Option<WakeSignal>, signal: WakeSignal) {
         );
     } else {
         assert!(
-            !signal.payload.is_empty(),
+            !signal.payload().is_empty(),
             "wake signal payload should not be empty"
         );
         *fixed = Some(signal);
@@ -111,7 +111,7 @@ fn record_signal(fixed: &mut Option<WakeSignal>, signal: WakeSignal) {
 /// push_conformance!(InMemoryPush::new());
 /// ```
 ///
-/// See ADR-006 and spec section 17.11.
+/// See ADR-006 and spec §16.12.5 (`.docs/specs/16-test-infrastructure.md`).
 #[macro_export]
 macro_rules! push_conformance {
     ($factory:expr) => {
@@ -165,14 +165,16 @@ mod tests {
 
         async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError> {
             if payload == self.0 {
-                Ok(WakeSignal::new(b"wake".to_vec()))
+                Ok(WakeSignal::new(b"wake"))
             } else {
                 Err(PlatformError::PushError("opaque payload violation".into()))
             }
         }
     }
 
-    /// An adapter that derives its signal from the payload with `transform`.
+    /// An adapter that derives its signal from the payload with its function.
+    /// It leaks the derived bytes to get the `&'static` slice `WakeSignal`
+    /// holds, the one way an adapter can put payload bytes in a signal.
     struct DerivingPush(fn(&[u8]) -> Vec<u8>);
 
     impl Push for DerivingPush {
@@ -181,13 +183,13 @@ mod tests {
         }
 
         async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError> {
-            Ok(WakeSignal::new((self.0)(payload)))
+            Ok(WakeSignal::new((self.0)(payload).leak()))
         }
     }
 
     /// A strict adapter that echoes an accepted payload: it rejects every
     /// payload but the permitted one with trailing whitespace allowed, and
-    /// returns the received bytes.
+    /// returns a leaked copy of the received bytes.
     struct EchoingStrictPush;
 
     impl Push for EchoingStrictPush {
@@ -197,7 +199,7 @@ mod tests {
 
         async fn handle_notification(&self, payload: &[u8]) -> Result<WakeSignal, PlatformError> {
             if payload.trim_ascii_end() == PERMITTED_PAYLOADS[0] {
-                Ok(WakeSignal::new(payload.to_vec()))
+                Ok(WakeSignal::new(payload.to_vec().leak()))
             } else {
                 Err(PlatformError::PushError("opaque payload violation".into()))
             }

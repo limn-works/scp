@@ -683,7 +683,7 @@ async fn platform_push_notifications() {
         .handle_notification(payload)
         .await
         .expect("notification handling");
-    assert_eq!(wake.payload, br#"{"aps":{"content-available":1}}"#);
+    assert_eq!(wake.payload(), br#"{"aps":{"content-available":1}}"#);
 }
 
 #[tokio::test]

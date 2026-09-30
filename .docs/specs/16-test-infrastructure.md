@@ -1241,7 +1241,9 @@ macro_rules! push_conformance {
             }
 
             #[tokio::test]
-            async fn handle_notification_returns_wake() {
+            async fn handle_notification_produces_event() {
+                // Calls check_fixed_wake_signal, a public function of
+                // this module, which asserts the contract below.
                 // The adapter accepts at least one permitted wake payload:
                 // the APNs payload {"aps":{"content-available":1}}
                 // (ADR-025 criterion 4), the FCM payload

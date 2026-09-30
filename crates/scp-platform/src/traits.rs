@@ -289,28 +289,60 @@ impl PushToken {
 ///
 /// Indicates that the application should wake up and process pending messages.
 /// §10.7 of the infrastructure spec forbids a context ID, a sender identifier,
-/// and any other metadata in a push payload. `WakeSignal` does not enforce that
-/// rule: it carries whatever bytes it is constructed from, so each [`Push`]
-/// implementation decides which bytes reach the caller. `InMemoryPush`, the
-/// durability-only adapter behind the `in-memory-push` feature (ADR-062 §0),
-/// returns the fixed bytes `{"aps":{"content-available":1}}` for every
-/// payload and copies no byte of the received payload. See ADR-006.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// and any other metadata in a push payload, so a wake signal must not vary
+/// with the payload it was produced from. `WakeSignal` holds `&'static` bytes,
+/// so a [`Push`] implementation builds it from a constant: the borrowed
+/// payload and a temporary copy of it do not compile (the two examples below),
+/// and only a deliberate leak such as `Vec::leak` gets payload bytes in. The
+/// conformance check `scp_testing::conformance::push::check_fixed_wake_signal`
+/// rejects an adapter whose signal varies with the payload, however it was
+/// built. `InMemoryPush`, the durability-only adapter behind the
+/// `in-memory-push` feature (ADR-062 §0), returns the fixed bytes
+/// `{"aps":{"content-available":1}}` for every payload. See ADR-006.
+///
+/// ```
+/// use scp_platform::WakeSignal;
+///
+/// const WAKE: &[u8] = br#"{"aps":{"content-available":1}}"#;
+/// assert_eq!(WakeSignal::new(WAKE).payload(), WAKE);
+/// ```
+///
+/// Bytes borrowed from a notification payload do not compile:
+///
+/// ```compile_fail,E0521
+/// use scp_platform::WakeSignal;
+///
+/// fn from_payload(payload: &[u8]) -> WakeSignal {
+///     WakeSignal::new(payload)
+/// }
+/// ```
+///
+/// Nor does a copy of them:
+///
+/// ```compile_fail,E0716
+/// use scp_platform::WakeSignal;
+///
+/// fn from_payload(payload: &[u8]) -> WakeSignal {
+///     WakeSignal::new(&payload.to_vec())
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WakeSignal {
-    /// The bytes the [`Push`] implementation chose as the wake signal. They
-    /// must not depend on the notification payload, and the implementation
-    /// copies no byte of the payload into them (§10.7).
-    pub payload: Vec<u8>,
+    payload: &'static [u8],
 }
 
 impl WakeSignal {
-    /// Creates a wake signal holding `payload`, the bytes the [`Push`]
-    /// implementation chose to return. The caller passes bytes that do not
-    /// depend on the received notification and copies no byte of it into
-    /// them (§10.7).
+    /// Creates a wake signal holding `payload`, a constant the [`Push`]
+    /// implementation returns for every notification it accepts (§10.7).
     #[must_use]
-    pub const fn new(payload: Vec<u8>) -> Self {
+    pub const fn new(payload: &'static [u8]) -> Self {
         Self { payload }
+    }
+
+    /// Returns the wake signal bytes.
+    #[must_use]
+    pub const fn payload(&self) -> &'static [u8] {
+        self.payload
     }
 }
 
@@ -857,6 +889,13 @@ pub trait Push: Send + Sync {
     fn register(&self) -> impl Future<Output = Result<PushToken, PlatformError>> + Send;
 
     /// Handle an incoming push notification payload and produce a wake signal.
+    ///
+    /// Returns one fixed [`WakeSignal`] for every payload the implementation
+    /// accepts, and may reject a payload instead. §10.7 of the infrastructure
+    /// spec forbids a context ID, a sender identifier, and any other metadata
+    /// in a push payload, so the signal must not vary with `payload`: a signal
+    /// that did would hand the caller whatever a relay put there. Spec
+    /// §16.12.5 and ADR-006 state this contract for every implementation.
     ///
     /// # Errors
     ///
