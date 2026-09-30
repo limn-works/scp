@@ -23,9 +23,10 @@
 # strips path-only DEV-dependencies from a published manifest, and with them the
 # feature activations they carried, so an example relying on one compiles here and
 # not for a consumer. `crates/scp-runtime/examples/identity.rs` is the measured case.
-# It names `InMemoryDhtClient`, which `scp-dht` compiles only under `scp-dht/testing`,
-# and for one round `scp-runtime` reached that feature through the stripped
-# dev-dependency edge alone, so the file compiled here and failed for a consumer.
+# It names `InMemoryDhtClient`, which `scp-dht` compiles only under `scp-dht/testing`.
+# From the day that file first imported `InMemoryDhtClient` until this check landed,
+# `scp-runtime` reached that feature through the stripped dev-dependency edge alone,
+# so the file compiled here and failed for a consumer of the published crate.
 # `scp-runtime/testing` now carries `scp-dht/testing` alongside `scp-platform/testing`,
 # and `scp-dht` and `scp-platform` are normal dependencies that survive publication, so
 # all four of that crate's examples compile for a consumer under `--features testing`.
@@ -255,7 +256,7 @@ while IFS=$'\t' read -r pkg pkgdir; do
     # Unconditional. Gating this on the package having targets inverts it: an
     # `autoexamples = false` crate has none, which is exactly the state where a
     # published example file cannot be seen, so silence there is the failure mode
-    # this branch exists to remove.
+    # this check exists to remove.
     echo "FAIL: 'cargo package --list -p $pkg' failed, so its published file set is unknown." >&2
     printf '%s\n' "$RAW" >&2
     status=1

@@ -174,8 +174,9 @@ compiles each of them.
 ## An example a consumer cannot compile names a missing feature edge, not a file to stop publishing
 
 `crates/scp-runtime/examples/identity.rs` constructs `InMemoryDhtClient`, which `scp-dht`
-compiles only under `scp-dht/testing`. Before this branch, one edge alone reached that
-feature from `scp-runtime`: the `[dev-dependencies]` entry
+compiles only under `scp-dht/testing`. From the day that file first imported
+`InMemoryDhtClient` until this pull request, one edge alone reached that feature from
+`scp-runtime`: the `[dev-dependencies]` entry
 `scp-dht = { path = "../scp-dht", features = ["testing"] }`. Cargo strips a path-only
 dev-dependency from a published manifest, so a consumer of the published crate reached an
 unresolved import that no feature flag resolved.
