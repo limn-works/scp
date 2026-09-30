@@ -300,13 +300,17 @@ pub enum ContextError {
     ///
     /// An undeclared ceiling leaves the context's security boundary to a
     /// default nobody chose, and an empty ceiling describes a context no
-    /// member can use, so neither is created. Two kinds of site raise this
+    /// member can use, so neither is created. Three kinds of site raise this
     /// variant, each before any context state exists. The runtime's
     /// context-creation step raises [`CeilingDeclaration::Empty`] (wrapped in
     /// [`builder::ContextCreationError::StateTransition`]) for every create
-    /// whose [`ContextParams`] ceiling is empty; `Supervisor::create`,
-    /// `Supervisor::create_context`, and the `CreateContext` lifecycle
-    /// command all reach that step. The NAPI and `PyO3` context-parameter
+    /// whose [`ContextParams`] ceiling is empty; every create path reaches
+    /// that step: `Supervisor::create`, `Supervisor::create_context`, the
+    /// `CreateContext` lifecycle command, the standing-pair recreate, and the
+    /// governance migration. The runtime's governance proposal step raises
+    /// [`CeilingDeclaration::Empty`], unwrapped, for a
+    /// `ProposeContextMigration` whose destination ceiling is empty, so the
+    /// proposal never reaches a vote. The NAPI and `PyO3` context-parameter
     /// parsers raise all three declarations, because their parameters can
     /// omit the ceiling or set it to null. Each bridge's error translator maps
     /// [`CeilingDeclaration::Absent`] and [`CeilingDeclaration::Null`] to

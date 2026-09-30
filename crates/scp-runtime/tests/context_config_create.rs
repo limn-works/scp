@@ -311,9 +311,11 @@ fn params_with_ceiling(ceiling: Vec<Capability>) -> ContextParams {
     }
 }
 
-/// Every production create reaches `Supervisor::create_context`, directly or
-/// through the `CreateContext` lifecycle command it dispatches, and the
-/// empty-ceiling rejection runs on that path: an empty ceiling fails with
+/// The empty-ceiling rejection sits in `lifecycle_helpers::create_context`,
+/// which every create path reaches: `Supervisor::create_context` and the
+/// `CreateContext` lifecycle command it dispatches, the standing-pair
+/// recreate, and the governance migration. This test covers the
+/// `Supervisor::create_context` path: an empty ceiling fails with
 /// `ContextError::CeilingRequired(CeilingDeclaration::Empty)` and creates no
 /// context.
 #[tokio::test]

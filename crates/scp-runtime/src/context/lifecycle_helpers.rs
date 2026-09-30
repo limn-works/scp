@@ -1559,7 +1559,8 @@ fn rollback_join_economy_ticket(
 /// # Errors
 ///
 /// - [`ContextCreationError::StateTransition`] wrapping
-///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)`(`[`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)`)`
+///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+///   with [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
 ///   when `params.ceiling` is empty, before any context state exists.
 /// - [`ContextCreationError::CreationFailed`] for version
 ///   incompatibility, governance / consequence-rule / economic-policy
@@ -1583,8 +1584,10 @@ pub async fn create_context(
     // 2026-09-30): an empty ceiling describes a context no member can use.
     // Every create path (`Supervisor::create`, `Supervisor::create_context`,
     // the `CreateContext` lifecycle command, the standing-pair recreate, and
-    // the governance migration) reaches this function, so the rejection runs
-    // here, before any context state exists.
+    // the governance migration) reaches this function, and
+    // `builder::create_context`, which builds the MLS group, is crate-private
+    // with this function as its only caller. The rejection runs here, before
+    // any context state exists.
     if params.ceiling.is_empty() {
         return Err(ContextCreationError::StateTransition(
             scp_protocol::context::ContextError::CeilingRequired(

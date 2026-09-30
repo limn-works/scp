@@ -431,7 +431,7 @@ mod live {
 
         let ctx = {
             let params = PyDict::new(py);
-            // Every built-in capability, so the fixture's mint, delegation and
+            // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
             // outlet calls all sit inside the ceiling.
             params
                 .set_item(

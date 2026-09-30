@@ -74,8 +74,9 @@ pub enum ContextCreation {
     /// [`Supervisor::create`](crate::context::supervisor::Supervisor::create)
     /// rejects an empty one with
     /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired),
-    /// as does every other create path, because each reaches the same
-    /// creation step.
+    /// as does every other create path. The check sits in the crate-private
+    /// `lifecycle_helpers::create_context`, which every create path reaches
+    /// and which alone calls the crate-private step that builds the MLS group.
     Explicit {
         /// Capability ceiling — the maximum set of capabilities any participant
         /// can hold. Required and non-empty (M2): no over-broad default.

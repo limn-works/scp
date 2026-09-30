@@ -819,9 +819,9 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // type system, since GovernanceModel has no Option wrapper).
     let _ = &params.governance; // field presence guaranteed by the type
 
-    // Validate ceiling policy / ceiling consistency: if ceiling is empty and
-    // policy is Governed, that is technically valid (no capabilities to
-    // narrow). No structural constraint to enforce here.
+    // The ceiling is not checked here: the only caller of
+    // `builder::create_context`, `lifecycle_helpers::create_context`, rejects
+    // an empty ceiling before it calls in (construction.md M2).
 
     // §5.1/§5.12: outlets are declared at creation and the creator installs them
     // into the live registry (GitHub #2020). The creator therefore writes
@@ -881,6 +881,11 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 
 /// Executes the two-phase context creation flow.
 ///
+/// Crate-private: its only caller is `lifecycle_helpers::create_context`,
+/// which rejects an empty ceiling (construction.md M2) before calling it. No
+/// other crate can create a context through this function and skip that
+/// check.
+///
 /// **Phase 1 (validate):** Checks params and identity with zero side effects.
 /// Returns early on any validation failure. Transport connectivity is NOT
 /// checked — context creation is a local operation.
@@ -924,7 +929,7 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 // splitting the sequential phases across helpers would reduce, not improve,
 // readability.
 #[allow(clippy::too_many_lines)]
-pub async fn create_context(
+pub(crate) async fn create_context(
     context_id: String,
     params: ContextParams,
     crypto: &NodeMlsFactory,

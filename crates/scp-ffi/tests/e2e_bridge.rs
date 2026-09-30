@@ -2860,7 +2860,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // created on a different runtime is unreachable → transport.rate-limited).
         let ctx = {
             let params = PyDict::new(py);
-            // Every built-in capability, so the fixture's mint, delegation and
+            // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
             // outlet calls all sit inside the ceiling.
             params
                 .set_item(
@@ -3058,7 +3058,7 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         runtime::init_context_manager_for_test(bi);
         let ctx = {
             let params = PyDict::new(py);
-            // Every built-in capability, so the fixture's mint, delegation and
+            // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
             // outlet calls all sit inside the ceiling.
             params
                 .set_item(

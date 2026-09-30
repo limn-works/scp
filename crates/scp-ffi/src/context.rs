@@ -1604,8 +1604,8 @@ fn build_core_context_params(
 }
 
 /// `default_ceiling()` rendered as the capability strings a Python caller
-/// writes in `ceiling`. Test fixtures use it to declare every built-in
-/// capability; `context_create` substitutes no default ceiling.
+/// writes in `ceiling`. Test fixtures use it to declare every capability in
+/// `default_ceiling()`; `context_create` substitutes no default ceiling.
 #[cfg(test)]
 pub(crate) fn default_ceiling_strings() -> Vec<String> {
     scp_core::context::roles::default_ceiling()
@@ -8034,8 +8034,8 @@ mod tests {
         let bi = __bi();
         let context_id = format!("{prefix}{}", "0".repeat(56));
         crate::runtime::init_context_manager_for_test(&bi);
-        // Both copies carry every built-in capability; the close fixture needs
-        // the creator's `context:close`.
+        // Both copies carry every capability in `default_ceiling()`; the close
+        // fixture needs the creator's `context:close`.
         let ceiling = super::default_ceiling_strings();
         crate::runtime::register_context(&bi, &context_id, creator_did, &ceiling)
             .expect("fixture registration");
@@ -8446,8 +8446,9 @@ mod tests {
     }
 
     /// `default_ceiling_strings` renders capabilities in the vocabulary the
-    /// shared parser accepts, so a fixture that declares every built-in
-    /// capability through it gets exactly those capabilities in `ContextParams`.
+    /// shared parser accepts, so a fixture that declares every capability in
+    /// `default_ceiling()` through it gets exactly those capabilities in
+    /// `ContextParams`.
     #[test]
     fn default_ceiling_strings_round_trip_through_the_parser() {
         let strings = super::default_ceiling_strings();

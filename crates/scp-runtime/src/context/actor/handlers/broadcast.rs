@@ -2503,12 +2503,81 @@ mod tests {
 
     /// Destination params whose `min_protocol_version` names a major this SDK
     /// does not speak, so `lifecycle_helpers::create_context` fails at its
-    /// version check, before it touches any provider or spawns an actor.
+    /// version check, before it touches any provider or spawns an actor. The
+    /// ceiling is non-empty so the create passes the empty-ceiling check that
+    /// runs before the version check.
     fn undeliverable_destination_params() -> scp_protocol::context::params::ContextParams {
         scp_protocol::context::params::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
             min_protocol_version: Some((9, 0)),
             ..scp_protocol::context::params::ContextParams::default()
         }
+    }
+
+    /// A `ProposeContextMigration` whose destination ceiling is empty would
+    /// fail its destination create after the vote, so the proposal step
+    /// refuses it with the typed `CeilingRequired(Empty)` and records no
+    /// proposal. The same proposal with a non-empty ceiling passes that check.
+    #[tokio::test]
+    async fn migration_proposal_with_an_empty_destination_ceiling_is_refused() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::roles::Capability;
+
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new(state);
+        let proposer = DID(CREATOR_DID.to_owned());
+        let migrate = |ceiling: Vec<Capability>| GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+                ceiling,
+                ..undeliverable_destination_params()
+            }),
+            reason: "fixture".to_owned(),
+            grace_period_secs: 60,
+            auto_invite: false,
+        };
+
+        let refused = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposer,
+            migrate(Vec::new()),
+            &creator_key(),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ContextError::CeilingRequired(
+                    scp_protocol::context::CeilingDeclaration::Empty
+                ))
+            ),
+            "an empty destination ceiling must be refused at proposal time; got {refused:?}"
+        );
+        assert!(
+            crate::context::governance_helpers::list_proposals(&cell).is_empty(),
+            "a refused migration proposal must record no proposal"
+        );
+
+        let admitted = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposer,
+            migrate(vec![Capability::MessagesRead]),
+            &creator_key(),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            !matches!(admitted, Err(ContextError::CeilingRequired(_))),
+            "a non-empty destination ceiling must pass the proposal-time check; got {admitted:?}"
+        );
     }
 
     /// `execute_propose_context_migration` applies nothing to the source
@@ -2552,9 +2621,10 @@ mod tests {
                 &result,
                 Err(ContextError::PermissionDenied(msg))
                     if msg.starts_with("failed to create destination context")
+                        && msg.contains("protocol version incompatible")
             ),
-            "the helper must reach and report the destination-creation failure, \
-             not an earlier pre-check; got {result:?}"
+            "the helper must reach and report the destination's version-check \
+             failure, not an earlier pre-check; got {result:?}"
         );
         assert_eq!(
             cell.mutation_epoch(),
@@ -2611,8 +2681,9 @@ mod tests {
                     &result,
                     Err(ContextError::PermissionDenied(msg))
                         if msg.starts_with("failed to create destination context")
+                            && msg.contains("protocol version incompatible")
                 ),
-                "attempt {attempt}: the destination-creation failure must surface, \
+                "attempt {attempt}: the destination's version-check failure must surface, \
                  not an already-executed refusal; got {result:?}"
             );
             assert!(
