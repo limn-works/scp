@@ -866,10 +866,10 @@ class SCP internal constructor(
      *
      * The invite routes through the actor's capability-checked governance gate,
      * which requires the inviter to hold the `governance:propose` capability
-     * (that is the ONLY capability the invite gate enforces). A normally-created
-     * `SingleAdmin` context grants its admin `governance:propose` at genesis, so
-     * it works out of the box; a context with a custom ceiling must grant
-     * `governance:propose` to the inviter. The inviter's `#active` signing key
+     * (that is the ONLY capability the invite gate enforces). The creator of a
+     * `SingleAdmin` context holds the admin role, which grants every capability
+     * in the context's ceiling, so the creator can invite only when that
+     * ceiling includes `governance:propose`. The inviter's `#active` signing key
      * is resolved from its retained local custody (never crossing the FFI as raw
      * bytes) and wiped immediately after the invite is produced.
      *

@@ -271,9 +271,12 @@ impl PyContextHandle {
 pub struct PyContextParams {
     /// Capability ceiling -- maximum capabilities any participant can hold.
     ///
-    /// This field holds the ceiling the context runs under: `from_py_dict`
-    /// rejects an absent, `None`, or empty declaration, so it is never empty.
-    /// No later stage substitutes a default into it.
+    /// This field holds the ceiling the context runs under, and no later
+    /// stage substitutes a default into it. `from_py_dict` rejects an absent,
+    /// `None`, or empty declaration. `from_core_params`, which builds a Welcome
+    /// joiner's params, copies the joined context's signed ceiling as it is,
+    /// and a context created through a path that does not check the ceiling
+    /// (see `ContextError::CeilingRequired`) can carry an empty one.
     ceiling: Vec<String>,
     /// Role definitions mapping role names to capability lists.
     roles: HashMap<String, Vec<String>>,
@@ -3148,9 +3151,10 @@ impl crate::scp::PyScp {
     /// invitations are not yet implemented).
     ///
     /// The invite routes through the actor governance gate, which requires the
-    /// inviter to hold the `governance:propose` capability (a normally-created
-    /// `SingleAdmin` context grants its admin that capability at genesis, so it
-    /// works out of the box; a custom ceiling must grant it).
+    /// inviter to hold the `governance:propose` capability. The creator of a
+    /// `SingleAdmin` context holds the admin role, which grants every
+    /// capability in the context's declared ceiling, so the creator can invite
+    /// only when that ceiling includes `governance:propose`.
     ///
     /// # Arguments
     ///
