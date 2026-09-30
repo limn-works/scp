@@ -8,7 +8,7 @@
 //! The in-browser SCP client (ADR-057) decrypts ciphertext delivered by an
 //! **untrusted relay**. The untrusted-relay guarantee is that a tampered or
 //! malformed ciphertext must surface a **typed** `MlsError::DecryptionFailed`
-//! (→ browser `[SCP-CRYPTO-4010]`), never abort the tab.
+//! (→ browser `[SCP-CRYPTO-4041]`), never abort the tab.
 //!
 //! No panic has been *found* on the openmls 0.9.0 decrypt path (this target is
 //! that standing evidence; a version bump could introduce one, caught by the

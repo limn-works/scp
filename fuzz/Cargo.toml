@@ -206,8 +206,8 @@ test = false
 doc = false
 
 # Tier 4 — MLS decrypt-path panic safety (ADR-057 §Prereq-4).
-# CI runs it with `-O` — see the `[profile.release]` note above and
-# `.github/workflows/fuzz.yml`.
+# CI runs it without `-O`, like every target; see the `[profile.release]` note
+# above and `.github/workflows/fuzz.yml`.
 [[bin]]
 name = "fuzz_mls_decrypt"
 path = "fuzz_targets/fuzz_mls_decrypt.rs"
