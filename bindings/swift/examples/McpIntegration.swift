@@ -54,15 +54,35 @@ struct McpIntegration {
         //   )
         //   _ = try await scp.mcpServerCreate(config: serverConfig)
         //
-        //   // Connect as an MCP client to an MCP server on this machine via
-        //   // SSE. This server runs no bearer check; an SCP SSE server needs
-        //   // its token here instead of nil. The transport has no TLS, so a
-        //   // token is sent only to a loopback host.
+        //   // Or connect as an MCP client to an SCP SSE server started
+        //   // separately on this machine at 127.0.0.1:8080. The server streams
+        //   // events at `/sse` and takes requests at the `/message` path it
+        //   // names in its first event, so the client dials `/sse`. The
+        //   // context created above lives only in this process's in-memory
+        //   // store, so that server cannot expose it: the example invokes a
+        //   // context the server exposes, read from SCP_MCP_SSE_CONTEXT_ID,
+        //   // and that context must offer an outlet named `summarize`. An SCP
+        //   // SSE server always runs a bearer check (ADR-015), so pass the
+        //   // token that server's operator gives you, read here from
+        //   // SCP_MCP_SSE_TOKEN. The transport has no TLS, so a token is sent
+        //   // only to a loopback host.
+        //   let env = ProcessInfo.processInfo.environment
+        //   guard let sseToken = env["SCP_MCP_SSE_TOKEN"],
+        //         let sseContextId = env["SCP_MCP_SSE_CONTEXT_ID"] else {
+        //       fatalError("set SCP_MCP_SSE_TOKEN to the bearer token of the SCP SSE server on 127.0.0.1:8080 and SCP_MCP_SSE_CONTEXT_ID to a context it exposes")
+        //   }
         //   let client = try await McpClient.connect(
         //       scp: scp,
-        //       config: .sse(url: "http://localhost:8080/mcp", authToken: nil)
+        //       config: .sse(url: "http://127.0.0.1:8080/sse", authToken: sseToken)
         //   )
         //   let outlets = try await client.listTools()
+        //   let result = try await client.invoke(
+        //       tool: "summarize",
+        //       input: Data(#"{"text":"SCP is a protocol for..."}"#.utf8),
+        //       contextId: sseContextId,
+        //       invokerDid: identity.did()
+        //   )
+        //   try await client.disconnect()
         //
         print("(MCP server/client available via scp.mcpServerCreate / McpClient.connect)")
 
