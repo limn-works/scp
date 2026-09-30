@@ -6,7 +6,9 @@ import Foundation
 ///
 /// Represents a tool available through the Model Context Protocol. When
 /// consumed via SCP, tool results are wrapped with provenance metadata
-/// recording the MCP server the tool came from, the invoking agent, and the context.
+/// recording the tool name as `mcp:{tool_name}`, the invoking agent, the
+/// context, and the time. The provenance does not name the MCP server the
+/// tool came from.
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md`.
 public nonisolated struct McpToolDefinition: Sendable {
@@ -31,8 +33,11 @@ public nonisolated struct McpToolDefinition: Sendable {
 
 /// The result of invoking an MCP tool, wrapped with SCP provenance.
 ///
-/// Maintains the protocol's provenance-everywhere principle: a tool call to
-/// any MCP server, an SCP SSE server or another, carries verifiable origin metadata.
+/// Follows the protocol's provenance-everywhere principle: a tool call to
+/// any MCP server, an SCP SSE server or another, carries origin metadata that
+/// the client records locally and does not sign. That metadata names the tool
+/// but not the server, so two servers exposing the same tool name produce the
+/// same `source`.
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md`.
 public nonisolated struct McpToolResult: Sendable {
