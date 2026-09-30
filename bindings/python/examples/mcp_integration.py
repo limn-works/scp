@@ -7,6 +7,7 @@ Use :meth:`SCP.mcp_serve`, :meth:`SCP.mcp_client_connect_sse`,
 """
 
 import asyncio
+import os
 
 from scp_sdk import SCP
 from scp_sdk.types import Capability, CustodyType, MemoryScope
@@ -35,11 +36,15 @@ async def main() -> None:
         server = await scp.mcp_serve(identity.did, [ctx.context_id], "stdio")
         print("MCP server running")
 
-        # Or connect as an MCP client to an MCP server on this machine via SSE.
-        # This server runs no bearer check; an SCP SSE server needs its token
-        # here instead of None. The transport has no TLS, so a token is sent
-        # only to a loopback host.
-        client = await scp.mcp_client_connect_sse("http://localhost:8080/mcp", None)
+        # Or connect as an MCP client to an SCP SSE server on this machine that
+        # exposes this context. An SCP SSE server always runs a bearer check
+        # (ADR-015), so pass the token that server's operator gives you; this
+        # example reads it from SCP_MCP_SSE_TOKEN. The transport has no TLS, so
+        # a token is sent only to a loopback host.
+        sse_token = os.environ.get("SCP_MCP_SSE_TOKEN")
+        if not sse_token:
+            raise RuntimeError("set SCP_MCP_SSE_TOKEN to the bearer token of the SCP SSE server")
+        client = await scp.mcp_client_connect_sse("http://localhost:8080/mcp", sse_token)
         outlets = await scp.mcp_client_list_tools(client)
         print(f"The SSE server offers {len(outlets)} outlet(s)")
 
