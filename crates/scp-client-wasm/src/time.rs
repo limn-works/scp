@@ -41,19 +41,25 @@
 //!   (add-member / key-package-DID) and pre-merge on staged-commit Add proposals
 //!   — and the RFC 9420 maximum-range bound openmls never enforces is added
 //!   there too.
-//! - **Welcome tree leaves are bracketed (V3).** openmls 0.9.0 makes
-//!   `MlsGroup::public_group()` public, so `public_group().leaf(idx)
-//!   .leaf_node_source()` reaches every joined-tree leaf's
+//! - **Welcome tree leaves are bracketed (V3).** openmls 0.9.0 exposes
+//!   `MlsGroup::treesync()`, so `treesync().full_leaves()` with
+//!   `leaf_node_source()` reaches every joined-tree leaf's
 //!   `LeafNodeSource::KeyPackage(Lifetime)`. `scp_mls::group::join_group_from_bytes`
 //!   re-validates every KeyPackage-sourced leaf against the injected hardened
 //!   clock, with the maximum-range bound, after `into_group` and before the
 //!   group is adopted.
-//! - **openmls's internal check still runs.** openmls 0.9.0's internal checks
-//!   call `Lifetime::validate`, never `validate_with_time` with a caller's time,
-//!   so its own check on `KeyPackageIn` and on Welcome tree leaves still reads
-//!   `web_time`'s `Date.now()`, in addition to
-//!   SCP's checks. Page same-origin integrity (CSP/SRI/COOP/COEP) stays
-//!   load-bearing only for that internal check, not for Welcome-leaf freshness.
+//! - **Residual: openmls's internal check still runs.** openmls 0.9.0's
+//!   internal checks call `Lifetime::validate`, never `validate_with_time` with
+//!   a caller's time, so its own check inside `KeyPackageIn::validate`,
+//!   `process_message`, and Welcome processing still reads `web_time`'s
+//!   `Date.now()`, in addition to SCP's checks. Prerequisite 1's one-clock
+//!   criterion is therefore not yet met. Every accept decision also needs
+//!   SCP's check against this module's clock, so openmls's clock can only add
+//!   rejections: a page script that overrides `Date.now()` can make an honest
+//!   `KeyPackage`, commit, or Welcome fail, but cannot get a forged `Lifetime`
+//!   accepted. Page same-origin integrity (CSP/SRI/COOP/COEP) stays
+//!   load-bearing only against that denial of service, not for `Lifetime`
+//!   acceptance.
 
 use scp_clock::Clock;
 

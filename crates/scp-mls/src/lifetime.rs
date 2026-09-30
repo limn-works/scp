@@ -35,28 +35,38 @@
 //!   staged-commit Add proposals, and on Welcome tree leaves post-`into_group`
 //!   and pre-adoption), and additionally enforces the RFC 9420
 //!   maximum-total-range bound that openmls's own `validate` path never checks.
+//!   One exception: [`crate::ratchet::process_commit`]
+//!   (`crates/scp-mls/src/ratchet.rs`), a path only tests call, merges a
+//!   Commit's staged Add proposals without the pre-merge check.
 //!
 //! # openmls's internal check still runs, and SCP brackets it
 //!
-//! openmls's own `Lifetime::validate` still runs inside `KeyPackageIn::validate`
-//! and inside Welcome tree-leaf validation, against openmls's internal clock
+//! openmls's own `Lifetime::validate` still runs inside `KeyPackageIn::validate`,
+//! `process_message`, and Welcome processing, against openmls's internal clock
 //! (the real wall clock natively; the attacker-overridable `Date.now()` through
 //! `web_time` on wasm), because those checks call `validate`, never
-//! `validate_with_time` with a caller's time. SCP
-//! brackets both paths against the injected clock, in addition to that internal
-//! check and never in place of it:
+//! `validate_with_time` with a caller's time. This is the residual ADR-057
+//! Prerequisite 1 records: there are still two clocks. SCP brackets every
+//! production accept path against the injected clock, in addition to that
+//! internal check and never in place of it, so an accept decision needs both
+//! checks to pass and openmls's clock can only add rejections. A page script that overrides
+//! `Date.now()` can make an honest `KeyPackage`, commit, or Welcome fail, but
+//! cannot get a forged `Lifetime` accepted. The bracketed paths:
 //!
 //! - `KeyPackageIn::validate`: [`crate::group::add_member`],
-//!   [`crate::group::key_package_in_did`], and the staged-commit Add
-//!   proposals in [`crate::encrypt::decrypt_with_sender_did`] and
-//!   [`crate::encrypt::decrypt_with_membership_changes`], and the runtime
-//!   backend's `validate_key_package` in `scp-runtime`
-//!   (`crypto/mls/production_backend.rs` and `crypto/mls/provider.rs`).
+//!   [`crate::group::key_package_in_did`], and the runtime backend's
+//!   `validate_key_package` in `scp-runtime` (`crypto/mls/production_backend.rs`
+//!   and `crypto/mls/provider.rs`).
+//! - `process_message`: the staged-commit Add proposals in
+//!   [`crate::encrypt::decrypt_with_sender_did`] and
+//!   [`crate::encrypt::decrypt_with_membership_changes`], checked before the
+//!   merge.
 //! - Welcome tree leaves: `validate_tree_leaf_lifetimes`, called by
 //!   [`crate::group::join_group_from_bytes`] after `StagedWelcome::into_group`
-//!   and before it builds the `ScpMlsGroup`. openmls 0.9.0 makes
-//!   `MlsGroup::public_group()` public, so every leaf of the joined tree and its
-//!   `LeafNodeSource::KeyPackage(Lifetime)` is reachable.
+//!   and before it builds the `ScpMlsGroup`. openmls 0.9.0 exposes
+//!   `MlsGroup::treesync()`, and `TreeSync::full_leaves()` yields every
+//!   non-blank leaf of the joined tree with its
+//!   `LeafNodeSource::KeyPackage(Lifetime)`.
 //!
 //! # Test-clock realism constraint (IMPORTANT)
 //!
@@ -188,24 +198,21 @@ pub fn validate_key_package_lifetime(
 /// group's tree against the injected [`Clock`](scp_clock::Clock), through
 /// [`validate_key_package_lifetime`] (ADR-057 §Prereq-1).
 ///
-/// `MlsGroup::members()` yields every non-blank leaf, the joiner's own included.
-/// A leaf whose source is `LeafNodeSource::Update` or `LeafNodeSource::Commit`
-/// carries no `Lifetime` (RFC 9420 §7.2) and is skipped.
+/// `MlsGroup::treesync().full_leaves()` (openmls 0.9.0
+/// `group/mls_group/mod.rs:417`, `treesync/mod.rs:685`) yields every non-blank
+/// leaf, the joiner's own included. A leaf whose source is
+/// `LeafNodeSource::Update` or `LeafNodeSource::Commit` carries no `Lifetime`
+/// (RFC 9420 §7.2) and is skipped.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::KeyPackageLifetimeInvalid`] for the first leaf whose
-/// `Lifetime` fails the temporal or maximum-range check, and
-/// [`MlsError::MemberNotFound`] if a member index has no leaf in the tree.
+/// `Lifetime` fails the temporal or maximum-range check.
 pub(crate) fn validate_tree_leaf_lifetimes(
     group: &MlsGroup,
     clock: &dyn Clock,
 ) -> Result<(), MlsError> {
-    let public = group.public_group();
-    for member in group.members() {
-        let leaf = public
-            .leaf(member.index)
-            .ok_or_else(|| MlsError::MemberNotFound(member.index.u32()))?;
+    for (_index, leaf) in group.treesync().full_leaves() {
         if let LeafNodeSource::KeyPackage(lifetime) = leaf.leaf_node_source() {
             validate_key_package_lifetime(lifetime, clock)?;
         }
