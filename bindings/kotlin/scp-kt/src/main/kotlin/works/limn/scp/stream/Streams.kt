@@ -594,9 +594,13 @@ private class SubscriptionSlot(
  *
  * 1. It takes the bindings and [ioDispatcher] as parameters instead of reading them from a
  *    [works.limn.scp.bridge.CoroutineBridge].
- * 2. It sets an [AtomicBoolean] when the flow begins closing and skips [trySend] for a
- *    message the engine delivers after that. [works.limn.scp.bridge.ContextBridge.subscribe]
- *    calls [trySend] for such a message and ignores the failure on the closed channel.
+ * 2. It sets an [AtomicBoolean] as the first statement of the producer's `finally`, which
+ *    runs after the channel has closed, and skips [trySend] for a message the engine delivers
+ *    from then on. A message the engine delivers between the channel closing and that
+ *    `finally` still reaches [trySend], which fails on the closed channel, and the callback
+ *    ignores that failure.
+ *    [works.limn.scp.bridge.ContextBridge.subscribe] has no such flag, so it calls [trySend]
+ *    for every late message and ignores the failure the same way.
  * 3. It logs a failed release to the [COLD_MESSAGE_FLOW_LOGGER] logger.
  *
  * @param contextBindings The context FFI bindings.
@@ -643,12 +647,12 @@ fun ColdMessageFlow(
         // nothing releases.
         var subscriptionHandle: Long? = null
 
-        // Release the subscription by suspending on ioDispatcher, never by blocking:
-        // awaitClose's lambda runs on the collector's thread, which is an Android main
-        // thread under collectAsState (ADR-028's AutoCloseable amendment). NonCancellable
+        // Release the subscription by suspending on ioDispatcher, never by blocking: the
+        // finally below runs on the collector's thread, which is an Android main thread under
+        // collectAsState (ADR-028's AutoCloseable amendment). NonCancellable
         // lets the release run although the collector was cancelled. A release that throws
         // is logged, never rethrown (sdk-common.md §Cleanup error handling): rethrown from
-        // this finally, it would replace the collector's cancellation as the failure and
+        // the finally, it would replace the collector's cancellation as the failure and
         // propagate to the collector's parent scope.
         try {
             withContext(NonCancellable + ioDispatcher) {

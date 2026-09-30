@@ -752,7 +752,7 @@ class StreamsTest {
     @Nested
     inner class ColdMessageFlowTests {
         @Test
-        fun `ColdMessageFlow emits messages from callback`() =
+        fun `ColdMessageFlow emits messages and releases its subscription when take ends collection`() =
             runTest(testDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -775,10 +775,12 @@ class StreamsTest {
                 assertEquals(2, messages.size)
                 assertEquals("""{"seq":1}""", messages[0])
                 assertEquals("""{"seq":2}""", messages[1])
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
-        fun `ColdMessageFlow completes on onComplete callback`() =
+        fun `ColdMessageFlow completes on onComplete callback and releases its subscription`() =
             runTest(testDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -799,10 +801,12 @@ class StreamsTest {
                 job.join()
 
                 assertEquals(1, messages.size)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
-        fun `ColdMessageFlow closes with BridgeException on error`() =
+        fun `ColdMessageFlow closes with BridgeException on error and releases its subscription`() =
             runTest(testDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -829,6 +833,8 @@ class StreamsTest {
 
                 assertTrue(caughtException is BridgeException)
                 assertEquals("SCP-CTX-2001", (caughtException as BridgeException).code)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test

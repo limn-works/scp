@@ -534,23 +534,29 @@ class CoroutineBridgeTest {
             }
 
         @Test
-        fun `contextSubscribe flow cancellation calls awaitClose`() =
+        fun `contextSubscribe releases its subscription when take ends collection after one message`() =
             runTest(ioDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
                 val flow = bridge.context.subscribe(42L)
+                val messages = mutableListOf<String>()
 
                 val job =
                     launch {
-                        flow.take(1).toList()
+                        flow.take(1).toList().also { messages.addAll(it) }
                     }
 
                 advanceUntilIdle()
+                assertFalse(stubBindings.contextUnsubscribeCalled)
 
                 stubBindings.lastMessageCallback?.onMessage("""{"text":"hello"}""")
 
                 advanceUntilIdle()
                 job.join()
+
+                assertEquals(listOf("""{"text":"hello"}"""), messages)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
@@ -656,7 +662,7 @@ class CoroutineBridgeTest {
             }
 
         @Test
-        fun `contextSubscribe flow closes on error`() =
+        fun `contextSubscribe flow closes on error and releases its subscription`() =
             runTest(ioDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -678,10 +684,12 @@ class CoroutineBridgeTest {
                 val exception = result.exceptionOrNull()
                 assertTrue(exception is BridgeException)
                 assertEquals("SCP-CTX-2001", (exception as BridgeException).code)
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
 
         @Test
-        fun `contextSubscribe flow completes on onComplete`() =
+        fun `contextSubscribe flow completes on onComplete and releases its subscription`() =
             runTest(ioDispatcher) {
                 stubBindings.contextSubscribeResult = 100L
 
@@ -701,6 +709,8 @@ class CoroutineBridgeTest {
 
                 assertEquals(1, messages.size)
                 assertEquals("""{"seq":1}""", messages[0])
+                assertTrue(stubBindings.contextUnsubscribeCalled)
+                assertEquals(100L, stubBindings.lastUnsubscribeHandle)
             }
     }
 

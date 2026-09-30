@@ -1697,7 +1697,9 @@ class ContextBridge internal constructor(
      *
      * Per ADR-028: `callbackFlow` is the streaming primitive for message
      * reception. Cold stream semantics: the subscription starts when the
-     * flow is collected and stops when the collector cancels.
+     * flow is collected and is released when the flow closes, whether the
+     * collector cancels, the collector stops early (for example through
+     * `take`), or the engine calls `onComplete` or `onError`.
      *
      * @param contextHandle Handle from context create or join.
      * @return Cold [Flow] of JSON-encoded messages.
@@ -1735,12 +1737,12 @@ class ContextBridge internal constructor(
             var subscriptionHandle: Long? = null
 
             // Release the subscription by suspending on bridge.ioDispatcher, never by
-            // blocking: awaitClose's lambda runs on the collector's thread, which is an
-            // Android main thread under collectAsState, so a runBlocking there parks that
+            // blocking: the finally below runs on the collector's thread, which is an Android
+            // main thread under collectAsState, so a runBlocking here would park that
             // thread until the FFI call returns (ADR-028's AutoCloseable amendment).
             // NonCancellable lets the release run although the collector was cancelled. A
             // release that throws is logged, never rethrown (sdk-common.md §Cleanup error
-            // handling): rethrown from this finally, it would replace the collector's
+            // handling): rethrown from the finally, it would replace the collector's
             // cancellation as the failure and propagate to the collector's parent scope.
             try {
                 withContext(NonCancellable + bridge.ioDispatcher) {
