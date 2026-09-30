@@ -295,8 +295,8 @@ impl PushToken {
 /// payload and a temporary copy of it do not compile (the two examples below),
 /// and only a deliberate leak such as `Vec::leak` gets payload bytes in. The
 /// conformance check `scp_testing::conformance::push::check_fixed_wake_signal`
-/// rejects an adapter whose signal varies with the payload, however it was
-/// built. `InMemoryPush`, the durability-only adapter behind the
+/// rejects an adapter whose signal differs across the payloads it sends,
+/// however the signal was built. `InMemoryPush`, the durability-only adapter behind the
 /// `in-memory-push` feature (ADR-062 §0), returns the fixed bytes
 /// `{"aps":{"content-available":1}}` for every payload. See ADR-006.
 ///
