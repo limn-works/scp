@@ -4625,7 +4625,9 @@ pub(crate) struct McpClientEntry {
     /// instance shutdown, the instance's drop) ends a call in flight on the
     /// handle: that call's clone of `client` would otherwise keep the
     /// transport open, and a blocking thread parked on it, for as long as the
-    /// server stays silent.
+    /// server stays silent. A connect still waiting for its server to answer
+    /// `initialize` (stdio or SSE) has no entry yet, so neither a disconnect
+    /// nor instance shutdown ends it.
     closer: McpClientCloser,
     /// Set by the entry's `Drop`. A call reads it after it takes the client's
     /// lock, so a call queued behind an in-flight one fails once the handle
@@ -5056,19 +5058,24 @@ impl Drop for McpStdioTransport {
 const UNIFFI_OUTLET_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_MS as u64;
 
 /// FFI bridge provider for the MCP server. Implements `ContextProvider` by
-/// reading outlet registrations, role state, and event log data from the
-/// context handle registry and `ContextManager`.
+/// reading outlet registrations from this bridge's context handle registry,
+/// and role state and the event log from the context's actor through the
+/// instance's supervisor.
 ///
-/// This mirrors the `PyO3` bridge's `FfiBridgeProvider` architecture:
-/// - `context_tools()` reads from the per-context `OutletRegistry`
-/// - `agent_role()` reads from `ContextManager::get_role_state()`
-/// - `validate_capability()` runs UCAN validation + role-state capability check
-/// - `invoke_outlet()` dispatches to registered handlers with schema validation
-/// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
-/// - `context_events()` reads from the per-context event log (UCAN state)
+/// - `context_tools()` reads the `OutletRegistry` of the context's handle; a
+///   context the actor holds with no handle has no outlet registered here.
+/// - `active_context_ids()`, `agent_role()`, `context_members()` and the
+///   access gates read the context's role state through
+///   [`Self::role_state_of`], which asks the actor with
+///   `Supervisor::get_role_state_checked`.
+/// - `validate_capability()` runs the role-state capability check, then UCAN
+///   validation (`outlet_grant` says why in that order).
+/// - `invoke_outlet()` dispatches to registered handlers with schema validation.
+/// - `context_events()` reads the actor's event log summary
+///   (`Supervisor::event_log_summary`) and the bridge's UCAN-state event log.
 struct McpUniFfiBridgeProvider {
     /// Weak reference to the owning `UniffiBridgeInstance` — source for the
-    /// context handle registry, `ContextManager`, and UCAN state lookups.
+    /// context handle registry, the supervisor, and UCAN state lookups.
     ///
     /// # Why `Weak` and not `Arc` (#1549 round-2 bug-catcher)
     ///
@@ -5115,11 +5122,14 @@ impl McpUniFfiBridgeProvider {
         })
     }
 
-    /// Reads a context's role state through the ADR-049 query shim.
+    /// Reads a context's role state by asking the actor that holds it, with
+    /// `Supervisor::get_role_state_checked`.
     ///
     /// Shared by `active_context_ids`, `agent_role`, `context_members`,
-    /// `validate_capability` and `validate_resource_access` so all five answer
-    /// from one source rather than near-identical `block_in_place` blocks.
+    /// `context_tools` and [`Self::gate_role_state`] (which
+    /// `validate_capability` and `validate_resource_access` call) so all of
+    /// them answer from one source rather than near-identical
+    /// `block_in_place` blocks.
     ///
     /// # Errors
     ///
@@ -5401,9 +5411,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn agent_role(&self, context_id: &str) -> Result<Option<String>, String> {
-        // Read the agent's role assignment from this instance's Supervisor
-        // role state via the ADR-049 query shim
-        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
+        // Read the agent's role assignment from the context's role state
+        // through `role_state_of`, which asks the actor with
+        // `Supervisor::get_role_state_checked`.
         // A dropped bridge or a failed read is an error, never `None`.
         let bi = self.upgrade_bi()?;
         Ok(
@@ -5498,7 +5508,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         context_id: &str,
     ) -> Result<Vec<scp_mcp::server::MemberInfo>, String> {
         // Read the roster and role assignments from the context's role state
-        // through the ADR-049 query shim, as the PyO3 and NAPI bridges read
+        // through `role_state_of`, as the PyO3 and NAPI bridges read
         // `role_state.members`. A dropped bridge, an unreachable actor or an
         // unknown context is an error, never an empty roster.
         let bi = self.upgrade_bi()?;
@@ -5754,10 +5764,12 @@ impl McpUniFfiBridgeProvider {
 /// `crate::runtime::build_supervisor`). The bundle is unwired in three cases:
 /// no supervisor is attached, the supervisor has no channel, or the instance
 /// is suspended when the server is created, because
-/// `context_manager_or_error` refuses a suspended instance. The last case
-/// lasts the server's life: a `resume()` does not rewire a server built while
-/// suspended, so the host creates the server again after `resume()` to get
-/// subscriptions. An unwired server advertises every capability the event pump
+/// `context_manager_or_error` refuses a suspended instance. Each case lasts
+/// the server's life, because this function runs once per
+/// `mcp_server_create`: neither a supervisor attached later nor a `resume()`
+/// rewires the server, so the host creates the server again once the
+/// instance has a supervisor and is not suspended to get subscriptions. An
+/// unwired server advertises every capability the event pump
 /// backs as false (`resources.subscribe`, `resources.listChanged`,
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
@@ -5767,7 +5779,9 @@ impl McpUniFfiBridgeProvider {
 /// no role state to read, because it asks the actor on every read, so the
 /// server serves no context: `tools/list` and `resources/list` return empty
 /// lists and `resources/read` answers "not a participant". Serving still
-/// starts, so a supervisor attached later is read on the next request.
+/// starts, and the provider reads role state on every request, so a
+/// supervisor attached later serves `tools/*` and `resources/list|read` from
+/// the next request on; subscriptions stay absent for the server's life.
 ///
 /// One call decides both halves: the server that advertises
 /// `resources.subscribe` and the pump that honours it, folded into one
@@ -5793,6 +5807,60 @@ fn mcp_server_bundle(
         );
     }
     scp_mcp::server::McpServer::with_optional_event_source(provider, context_events)
+}
+
+/// Makes a write to this process's stdout fail with `EPIPE` instead of
+/// raising SIGPIPE. A stdio MCP server writes its responses and its event
+/// pump's notifications to stdout, the pump on its own schedule, after the
+/// client reading stdout may have exited; SIGPIPE's default action, which a
+/// Swift app loading this library keeps, terminates the whole host.
+///
+/// - Apple targets: `fcntl(STDOUT_FILENO, F_SETNOSIGPIPE, 1)` marks stdout's
+///   open file description alone and leaves the signal's disposition as the
+///   host set it.
+/// - Other Unix targets: a pipe has no per-descriptor switch, so when SIGPIPE
+///   still has its default action the whole process ignores it from here on.
+///   A host that installed its own disposition (a handler, or `SIG_IGN` as
+///   the JVM and Python set) keeps it.
+/// - Other targets have no SIGPIPE.
+///
+/// # Errors
+///
+/// Returns the OS error when the call fails, for example `EBADF` on Apple
+/// targets when stdout is closed.
+fn stdout_raises_no_sigpipe() -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        /// `F_SETNOSIGPIPE` from `<sys/fcntl.h>`; `libc` does not export it
+        /// for Apple targets.
+        const F_SETNOSIGPIPE: libc::c_int = 73;
+        // SAFETY: `F_SETNOSIGPIPE` takes an `int` argument and reads or
+        // writes no memory of this process.
+        let set = unsafe { libc::fcntl(libc::STDOUT_FILENO, F_SETNOSIGPIPE, 1) };
+        if set == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    {
+        // SAFETY: an all-zero `sigaction` is a valid value of the C struct,
+        // used here only as the out-parameter below.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action makes `sigaction` only write the current
+        // action into `current`, which outlives the call.
+        let read = unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &raw mut current) };
+        if read == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if current.sa_sigaction == libc::SIG_DFL {
+            // SAFETY: `SIG_IGN` installs no handler.
+            let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            if previous == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Runs the MCP stdio transport for this bridge instance until shutdown.
@@ -16643,6 +16711,27 @@ impl Scp {
     /// Routes through `&*self.inner`. The MCP server registry is
     /// module-level (not per-instance) so the returned opaque handle
     /// string is globally unique; this method preserves that behaviour.
+    ///
+    /// A server created while the instance has no supervisor or is
+    /// suspended serves no resource subscriptions for its whole life: it
+    /// advertises `resources.subscribe: false` and rejects
+    /// `resources/subscribe`, and neither attaching a supervisor nor
+    /// `resume()` changes that. Create the server again once the instance
+    /// has a supervisor and is not suspended to get subscriptions.
+    ///
+    /// A `stdio` server writes to this process's stdout, and its event pump
+    /// writes there after the reading client may have exited. Before serving,
+    /// this call makes such a write fail with `EPIPE` instead of raising
+    /// SIGPIPE, whose default action terminates the host: on Apple targets it
+    /// sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+    /// pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+    /// has its default action, for the whole process.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+    /// server's stdout cannot be made to fail without SIGPIPE, for example
+    /// because stdout is closed.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_server_create(&self, config: McpServerConfig) -> Result<String, ScpError> {
         validate_did(&config.identity_did)?;
@@ -16656,6 +16745,15 @@ impl Scp {
                 msg: "context_ids must not be empty".to_owned(),
                 code: codes::TRANS_5011.to_owned(),
             });
+        }
+
+        if config.transport == "stdio" {
+            stdout_raises_no_sigpipe().map_err(|e| ScpError::Transport {
+                msg: format!(
+                    "cannot serve MCP over stdio: a write to a closed stdout would raise SIGPIPE: {e}"
+                ),
+                code: codes::TRANS_5050.to_owned(),
+            })?;
         }
 
         // #1549 round-2: hold the bridge instance as a `Weak`, not an
@@ -16857,7 +16955,10 @@ impl Scp {
     /// call fails on the closed stdout. An SSE client's POST and `GET`
     /// sockets are shut down, and the call fails as closed. A call queued
     /// behind the in-flight one, on a stdio or an SSE client, fails as
-    /// disconnected once it takes the client's lock and sends nothing.
+    /// disconnected once it takes the client's lock and sends nothing. A
+    /// connect still waiting for its server to answer `initialize` (stdio or
+    /// SSE) has no handle yet, so no disconnect, and no instance shutdown,
+    /// ends it.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
@@ -23315,7 +23416,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
-            let (conn, _) = listener.accept().expect("accept GET");
+            let conn = accept_within(&listener).expect("the client never sent its GET");
             let mut reader = std::io::BufReader::new(conn);
             let mut head = String::new();
             loop {
@@ -23489,6 +23590,57 @@ mod tests {
         in_flight_sse_call_ends_on(Teardown::Shutdown).await;
     }
 
+    /// Accepts one connection on `listener`, or `None` once five seconds pass
+    /// with none, so a stub server whose client never connects ends its
+    /// thread and the test fails on the join instead of hanging in `accept`.
+    /// The stream it returns blocks, with a five-second read timeout.
+    fn accept_within(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    conn.set_nonblocking(false).expect("blocking stream");
+                    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .expect("read timeout");
+                    return Some(conn);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// A stub server whose client never dials gives up after five seconds,
+    /// and one whose client dials returns the connection, so the SSE tests
+    /// fail instead of hanging when a client refuses before it dials.
+    #[test]
+    fn accept_within_gives_up_without_a_client_and_accepts_one() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let started = std::time::Instant::now();
+        assert!(
+            accept_within(&listener).is_none(),
+            "no client dialed, so there is nothing to accept"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the accept must give up at its five-second deadline"
+        );
+        let addr = listener.local_addr().expect("addr");
+        let _client = std::net::TcpStream::connect(addr).expect("dial the stub");
+        assert!(
+            accept_within(&listener).is_some(),
+            "a client dialed, so the accept must return its connection"
+        );
+    }
+
     /// Reads one HTTP request from `conn` and returns its body.
     fn read_http_body(conn: &std::net::TcpStream) -> Vec<u8> {
         use std::io::{BufRead, Read};
@@ -23524,14 +23676,14 @@ mod tests {
         let (posted_tx, posted_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
-            let (mut sse, _) = listener.accept().expect("accept GET");
+            let mut sse = accept_within(&listener).expect("the client never sent its GET");
             read_http_body(&sse);
             sse.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
                   event: endpoint\r\ndata: /message?sessionId=s1\r\n\r\n",
             )
             .expect("write endpoint event");
-            let (mut init, _) = listener.accept().expect("accept initialize POST");
+            let mut init = accept_within(&listener).expect("the client never POSTed initialize");
             let request: serde_json::Value =
                 serde_json::from_slice(&read_http_body(&init)).expect("initialize body");
             init.write_all(ACCEPTED).expect("answer initialize POST");
@@ -23546,12 +23698,13 @@ mod tests {
             });
             sse.write_all(format!("event: message\r\ndata: {response}\r\n\r\n").as_bytes())
                 .expect("write initialize response");
-            let (mut notified, _) = listener.accept().expect("accept notification POST");
+            let mut notified =
+                accept_within(&listener).expect("the client never POSTed its notification");
             read_http_body(&notified);
             notified
                 .write_all(ACCEPTED)
                 .expect("answer notification POST");
-            let (list, _) = listener.accept().expect("accept tools/list POST");
+            let list = accept_within(&listener).expect("the client never POSTed tools/list");
             read_http_body(&list);
             let _ = posted_tx.send(());
             let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
@@ -23903,6 +24056,154 @@ mod tests {
             exited.send_request(&request).is_err(),
             "a request to an exited server must fail"
         );
+    }
+
+    /// A stdio MCP server whose stdout has lost its reader fails its next
+    /// write with an error and raises no SIGPIPE, which would kill a Swift
+    /// host. Responses and the event pump's notifications go through one
+    /// stdout writer on one descriptor, so the response to an `initialize`
+    /// stands in for both. Each run is a child test process that restores
+    /// SIGPIPE's default action, as a Swift app has it (the harness ignores
+    /// SIGPIPE). Served through `mcp_server_create`, the child survives the
+    /// failed write. Served without the guard `mcp_server_create` installs,
+    /// the same write kills the child by SIGPIPE, which shows the scenario
+    /// raises the signal the guard stops.
+    #[cfg(unix)]
+    #[test]
+    fn a_stdio_server_write_to_a_closed_stdout_raises_no_sigpipe() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "SCP_UNIFFI_SERVER_SIGPIPE_TEST_CHILD";
+        const NAME: &str =
+            "bridge::tests::a_stdio_server_write_to_a_closed_stdout_raises_no_sigpipe";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            // SAFETY: `signal` with `SIG_DFL` installs no handler; this child
+            // process runs only this test.
+            let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            assert_ne!(previous, libc::SIG_ERR, "restore SIGPIPE's default action");
+            serve_stdio_into_a_closed_stdout(mode == "guarded");
+            return;
+        }
+        let run = |mode: &str| {
+            std::process::Command::new(std::env::current_exe().expect("test binary path"))
+                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, mode)
+                .output()
+                .expect("run the child test process")
+        };
+        let guarded = run("guarded");
+        let stdout = String::from_utf8_lossy(&guarded.stdout);
+        let stderr = String::from_utf8_lossy(&guarded.stderr);
+        assert_eq!(
+            guarded.status.signal(),
+            None,
+            "a served stdio server's write to a closed stdout killed the host by signal:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            guarded.status.success() && stdout.contains("1 passed"),
+            "the guarded child must run and pass the scenario: {:?}\n{stdout}\n{stderr}",
+            guarded.status
+        );
+        let unguarded = run("unguarded");
+        assert_eq!(
+            unguarded.status.signal(),
+            Some(libc::SIGPIPE),
+            "without the guard the write must raise SIGPIPE, or the guarded run proves nothing: {:?}\n{}",
+            unguarded.status,
+            String::from_utf8_lossy(&unguarded.stderr)
+        );
+    }
+
+    /// The child half of
+    /// `a_stdio_server_write_to_a_closed_stdout_raises_no_sigpipe`: points
+    /// descriptor 0 at a pipe holding one request, and descriptor 1 at a pipe
+    /// with no reader, serves stdio until the server loop ends, and restores
+    /// both descriptors. The request pipe's write end stays open, so the loop
+    /// ends only by failing its response write.
+    #[cfg(unix)]
+    fn serve_stdio_into_a_closed_stdout(guarded: bool) {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        let (stdin_reader, mut stdin_writer) = std::io::pipe().expect("stdin pipe");
+        let (stdout_reader, stdout_writer) = std::io::pipe().expect("stdout pipe");
+        // SAFETY: `dup` touches no memory; this child process runs only this
+        // test, so no other thread swaps descriptors 0 and 1.
+        let saved = unsafe { [libc::dup(0), libc::dup(1)] };
+        assert!(saved.iter().all(|fd| *fd >= 0), "save stdin and stdout");
+        // SAFETY: as above; both sources are open pipe ends this test owns.
+        let redirected = unsafe {
+            libc::dup2(stdin_reader.as_raw_fd(), 0) >= 0
+                && libc::dup2(stdout_writer.as_raw_fd(), 1) >= 0
+        };
+        assert!(redirected, "point stdin and stdout at the test's pipes");
+        drop((stdin_reader, stdout_reader, stdout_writer));
+        stdin_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\
+                  \"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\
+                  \"clientInfo\":{\"name\":\"sigpipe-test\",\"version\":\"0\"}}}\n",
+            )
+            .expect("queue the request");
+        let ended = runtime().block_on(async {
+            let bound = std::time::Duration::from_secs(10);
+            if guarded {
+                let scp = scp_test();
+                let handle = scp
+                    .mcp_server_create(McpServerConfig {
+                        identity_did: "did:dht:z6MkTestUser".to_owned(),
+                        context_ids: vec!["ctx-1".to_owned()],
+                        transport: "stdio".to_owned(),
+                        ucan_token: None,
+                        proof_tokens: None,
+                    })
+                    .await
+                    .expect("serve MCP over stdio");
+                // Keep the shutdown sender alive: dropping it would stop the
+                // server without a write.
+                let (
+                    _,
+                    McpServerEntry {
+                        shutdown_tx: _keep_serving,
+                        _task_handle: task,
+                        ..
+                    },
+                ) = mcp_server_registry(&scp.inner)
+                    .remove(&handle)
+                    .expect("the server is registered");
+                tokio::time::timeout(bound, task)
+                    .await
+                    .map(|joined| joined.expect("the server task ran to its end"))
+            } else {
+                let provider = McpUniFfiBridgeProvider {
+                    bi: std::sync::Weak::new(),
+                    agent_did: "did:dht:z6MkTestUser".to_owned(),
+                    context_ids: vec!["ctx-1".to_owned()],
+                    outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+                    agent_ucan_token: None,
+                    agent_proof_tokens: None,
+                };
+                let server = scp_mcp::server::McpServer::with_optional_event_source(provider, None);
+                let (_stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+                tokio::time::timeout(
+                    bound,
+                    run_mcp_stdio_server_uniffi(
+                        server,
+                        stop_rx,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
+                )
+                .await
+            }
+        });
+        // SAFETY: as above; `saved` holds the descriptors `dup` returned.
+        let restored = unsafe {
+            let restored = libc::dup2(saved[0], 0) >= 0 && libc::dup2(saved[1], 1) >= 0;
+            libc::close(saved[0]);
+            libc::close(saved[1]);
+            restored
+        };
+        assert!(restored, "restore stdin and stdout");
+        drop(stdin_writer);
+        ended.expect("the server loop must end on its failed response write");
     }
 
     /// `mcp_client_disconnect` must reject unknown handle.
