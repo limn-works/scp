@@ -6,8 +6,10 @@
 //! docs list where the two differ. ADR-021 and ADR-027 require the class to
 //! implement the `UniFFI` `PushProvider` callback interface and to be injected
 //! into the Rust engine. The class does neither, and no code injects it into
-//! the Rust engine. Story SCP-112 stays in progress while the class fails its
-//! trait criterion. This module documents the Rust-side contract and
+//! the Rust engine. Story SCP-112 stays in progress while any acceptance
+//! criterion its description in `.docs/prds/main.json` records as unmet
+//! stands; the trait criterion is one of five. This module documents the
+//! Rust-side contract and
 //! re-exports the trait types for Android builds.
 //!
 //! # FCM Payload Opacity (ADR-027, section 10.7)
@@ -20,6 +22,11 @@
 //! repository sends an FCM message, and no SDK code wakes the app, connects to
 //! a relay, or pulls envelopes: the caller does all three when the Kotlin
 //! adapter returns `WakeSignal.PULL`.
+//!
+//! Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send
+//! exactly `{ "scp": 1 }`. FCM has carried every field of a payload before
+//! the Kotlin adapter sees it, so no receive-side check can keep a field from
+//! FCM, and no code in this repository sends a push.
 //!
 //! See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
 

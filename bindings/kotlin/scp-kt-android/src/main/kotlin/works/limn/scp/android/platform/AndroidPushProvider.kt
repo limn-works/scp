@@ -20,7 +20,13 @@
  * [handleNotification] checks only the `scp` field. It rejects a payload that lacks the
  * field with [ScpException] code `SCP-TRANS-5001`, and a payload whose field is not
  * `"1"` with code `SCP-TRANS-5002`. It accepts a payload that carries other fields
- * beside `"scp": "1"`, so it does not enforce the opacity requirement.
+ * beside `"scp": "1"` and returns the same [WakeSignal.PULL] for it, reading nothing
+ * else from the payload.
+ *
+ * Opacity is an obligation on the sender: §10.7.1 step 5 has the relay send exactly
+ * `{ "scp": 1 }`. FCM has already carried every field of a payload before
+ * [handleNotification] sees it, so no check in this class can keep a field from FCM. No
+ * code in this repository sends a push, so no code meets the sender obligation.
  *
  * ## Token Registration Lifecycle
  *
@@ -106,8 +112,9 @@ class AndroidPushProvider(
      *
      * Checks only the `scp` field: it must be present with value `"1"`. The method
      * neither checks nor reads any other field, so it accepts a payload that carries
-     * other fields beside `"scp": "1"` and does not enforce the §10.7 opacity
-     * requirement.
+     * other fields beside `"scp": "1"` and returns the same [WakeSignal.PULL] for it.
+     * §10.7 opacity is the sender's obligation (§10.7.1 step 5): FCM has carried every
+     * field before this method runs.
      *
      * @param payload The FCM data payload as a key-value map (from
      *   `RemoteMessage.getData()`). Expected: `{"scp": "1"}`.

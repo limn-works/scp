@@ -164,21 +164,18 @@ class AndroidPushProviderTest {
     }
 
     // -----------------------------------------------------------------------
-    // Payload with extra fields — current behaviour, not the contract
+    // Payload with extra fields — the current accept path
     // -----------------------------------------------------------------------
 
     @Test
-    fun `handleNotification accepts extra fields that the wake-signal-only rule forbids`() {
+    fun `handleNotification returns Pull for a payload with extra fields`() {
         // handleNotification checks only the "scp" field, so a payload with
-        // other fields returns Pull. The wake-signal-only rule is §10.7: a push
-        // payload MUST contain a wake signal and nothing else, so §10.7 forbids
-        // this "extra" field.
-        // ADR-027 acceptance criterion 10 forbids only a context ID, a sender
-        // identifier, or message content in the payload, and this payload
-        // carries none of the three. SCP-112 records the criterion "FCM
-        // payload format is opaque" as unmet. This test pins the current
-        // behaviour only: the SCP-112 fix rejects this payload and inverts
-        // this assertion.
+        // other fields returns Pull. §10.7 requires a push payload to carry a
+        // wake signal and nothing else; §10.7.1 step 5 puts that on the sender
+        // (the relay sends exactly { "scp": 1 }), and FCM has carried every
+        // field before the handler sees it. §16.12.5 push_conformance lets an
+        // adapter accept such a payload with a byte-identical WakeSignal or
+        // reject it. This test pins the current accept path.
         val payload = mapOf("scp" to "1", "extra" to "ignored")
         val signal = provider.handleNotification(payload)
         assertEquals(WakeSignal.PULL, signal)
