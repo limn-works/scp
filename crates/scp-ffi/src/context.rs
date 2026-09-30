@@ -8019,7 +8019,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Lifecycle gates read the supervisor actor, not the handle string (#2372)
+    // Lifecycle gates read the supervisor actor, not the handle string
     // -------------------------------------------------------------------
 
     /// Builds a bridge instance, a supervisor context, and a handle whose
@@ -8343,7 +8343,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Ceiling: an absent declaration and an empty one are different (#2372)
+    // Ceiling: an absent declaration and an empty one are different
     // -------------------------------------------------------------------
 
     /// Build a `PyContextParams` from a Python dict, so a case exercises the

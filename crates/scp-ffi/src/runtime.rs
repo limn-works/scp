@@ -1470,8 +1470,12 @@ pub struct FfiBridgeState {
     /// Also maintained by `ContextManager` for lifecycle operations.
     /// This copy is used by UCAN validation (`ucan.rs`) and outlet capability
     /// checking (`outlets.rs`, `mcp.rs`) which access state via `with_ffi_state`.
-    /// Both copies are kept in sync: `register_ffi_state` initializes from
-    /// the same parameters, and `py_context_join` updates both.
+    /// `register_ffi_state` builds it from the caller's declared ceiling, the
+    /// one the supervisor enforces (a Welcome join registers an empty ceiling
+    /// first), and `install_role_state` replaces it, and `ceiling_strings`
+    /// with it, from the supervisor's role state. While `role_state_fenced` is
+    /// set the two differ on purpose: this copy is deny-all and the
+    /// supervisor's is not.
     pub role_state: ContextRoleState,
     /// UCAN revocation list for this context.
     pub revocation_list: RevocationList,
@@ -1875,9 +1879,11 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
 /// the UCAN/outlet ceiling string set from that role state's ceiling, so the
 /// two copies cannot disagree.
 ///
-/// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
-/// FFI-side copy used by UCAN/outlet capability checks stays current.
+/// A failed re-read leaves both bridge copies as they were. A caller that
+/// re-syncs after the supervisor may have narrowed a ceiling, a role or the
+/// member set (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`)
+/// runs [`sync_role_state_or_fence_async`] instead, which fences both copies
+/// deny-all when the re-read fails.
 ///
 /// The read is `Supervisor::get_role_state_checked`, so a busy or timed-out
 /// actor, a crashed or mid-respawn context and a poisoned context each fail
@@ -1900,9 +1906,9 @@ pub fn sync_role_state_from_manager(
 
 /// Async-native variant of [`sync_role_state_from_manager`].
 ///
-/// Callers that are already executing inside `runtime().block_on(...)` (the
-/// governance propose, approve, reject, withdraw and execute flows in
-/// `context.rs`) MUST use this instead of the sync wrapper: the sync wrapper
+/// Callers that are already executing inside `runtime().block_on(...)` MUST
+/// use this, or [`sync_role_state_or_fence_async`] that wraps it, instead of
+/// the sync wrapper: the sync wrapper
 /// performs its own `block_on`, and a nested `block_on` on the multi-threaded
 /// runtime panics with "Cannot start a runtime from within a runtime". This
 /// helper awaits the supervisor role-state query directly so it composes

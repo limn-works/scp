@@ -27,7 +27,7 @@ This directory holds the PyO3 bridge (`src/`, the Python `_scp_core` module and 
 ## PyO3 (`src/`)
 
 - `cargo test -p scp-ffi` links libpython; the root `AGENTS.md` Toolchain gotchas give the library-path setup. `cargo check -p scp-ffi` compiles without it. Never skip these tests.
-- `FfiBridgeState.role_state` is a local copy that UCAN and outlet capability checks read. After any governance action that changes roles or membership, call `runtime::sync_role_state_from_manager` so the copy matches the Supervisor.
+- `FfiBridgeState.role_state` and `FfiBridgeState.ceiling_strings` are local copies that UCAN mint and validate and outlet and MCP capability checks read. After any action that can narrow a ceiling, a role or the member set, re-sync through `runtime::sync_role_state_or_fence_async`: when the supervisor re-read fails, it sets both copies to deny-all, while `runtime::sync_role_state_from_manager` would keep the older, broader copies.
 - A bridge function that returns a dict is read in Python as `h["key"]`, not `h.key`. Return a `#[pyclass]` for a new structured result.
 - The MCP stdio client accepts only bare binary names on the instance's allowlist; it rejects every path, even in unrestricted mode, to block basename spoofing.
 - An outlet handler that times out keeps its thread running until the handler returns, because Rust cannot cancel a thread; the design rejects cooperative cancellation (see the doc comment on `invoke_outlet` in `src/mcp.rs`).
