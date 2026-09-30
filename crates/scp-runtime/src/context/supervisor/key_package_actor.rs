@@ -845,8 +845,7 @@ impl KeyPackageStoreActor {
     /// KeyPackage-sourced leaf that fails the injected-clock or maximum-range
     /// lifetime check (ADR-057 §Prereq-1): that is the sender's tree, not the
     /// caller's KeyPackage, so it is not [`ContextError::InvalidKeyPackage`].
-    /// Issue #2593, a dedicated error variant for a rejected Welcome, tracks a
-    /// typed variant for it.
+    /// No dedicated error variant for a rejected Welcome exists yet.
     fn map_join_error(e: &MlsError) -> ContextError {
         match e {
             MlsError::KeyPackageReplay => ContextError::KeyPackageReplay(
