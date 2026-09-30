@@ -56,8 +56,8 @@ of them reopens a bypass this repository has already measured:
    `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
    gate (row 9b). It fails on any identifier that starts with `cfg_`, which covers
    `cfg_attr` and std's stable `cfg_select!` (it keeps only the arm whose predicate holds,
-   and its predicates are not `cfg(` calls), and on `#[path]`, `include` and
-   `macro_rules`. It fails on the identifier `test`, `bench` or `test_case` wherever it
+   and its predicates are not `cfg(` calls), and on `#[path]` (also written `#[r#path]`), `include`, `macro_rules` and
+   `stringify` (std's `stringify!` turns its input into a string without type-checking it). It fails on the identifier `test`, `bench` or `test_case` wherever it
    stands: the lint call is not a `--test` build, so rustc deletes a `#[test]` item before
    name resolution and a body in `#[test] fn body()` beside an empty `fn main()` is never
    type-checked, and the attribute also works path-qualified and renamed through `use`, so
@@ -144,7 +144,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
 | 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
 | 9a | example body under `#[cfg(feature = "testing")] fn main()` beside an empty `#[cfg(not(feature = "testing"))] fn main() {}` | the compile saw only the empty `main` and counted the target as checked |
-| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]`, a local `macro_rules!` that builds the `cfg` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
+| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
 | 9c | a lib item under a feature key beside an empty default twin, a lib or dependency macro that drops or feature-gates its input | open, unmeasured: the code sits outside `examples/`, which is all mechanism 7 reads |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both

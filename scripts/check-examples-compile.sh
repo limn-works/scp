@@ -74,14 +74,19 @@
 #     running this gate, as `rustc --print cfg` reports it. A false platform predicate
 #     removes code as a feature key does: `#[cfg(not(unix))]` on the Linux CI runner.
 #     An empty `any()` or `all()` fails too.
-#   - Any identifier that starts with `cfg_`, and `#[path]`, `include` and `macro_rules`.
+#   - Any identifier that starts with `cfg_`, and `#[path]` (also as `#[r#path]`),
+#     `include`, `macro_rules` and `stringify`.
 #     The `cfg_` rule covers `cfg_attr`, which can carry a `path` key, and std's stable
 #     `cfg_select!`, which keeps only the arm whose predicate holds, so a body under
 #     `feature = "testing" => { ... }` beside an empty `_` arm compiles to nothing; it
 #     rejects every other `cfg_` name too, `cfg_if!` included, so a new macro of that
 #     family fails instead of passing. `#[path]` and `include!` bring in a file the scan
 #     never opens, and a local macro can build a `cfg` attribute from an ident or drop its
-#     input tokens.
+#     input tokens. std's `stringify!` drops its input too: it turns the tokens into a
+#     `&str` without resolving or type-checking them, so a body in
+#     `const _: &str = stringify!{ fn body() { ... } };` beside an empty `fn main()` is
+#     never type-checked. The rule matches the name, so `core::stringify!` and a
+#     `use ... stringify as s;` rename fail too.
 #   - The identifier `test`, `bench` or `test_case`, wherever it stands. The lint build
 #     is not a `--test` build, so rustc deletes a `#[test]` item before name resolution,
 #     and a body in `#[test] fn body()` beside an empty `fn main()` is never type-checked.
@@ -135,7 +140,7 @@ status=0
 checked=0
 
 # cfg_scan FILE LABEL: fail when FILE holds a construct the header's source rules reject.
-# Each hit prints on its own line.
+# Each hit prints on its own line, indented, so a case can match a hit that is not the first.
 HOST_CFG="$(rustc --print cfg </dev/null)" || { echo "FAIL: 'rustc --print cfg' failed." >&2; exit 1; }
 IFS= read -r -d '' CFG_SCAN <<'PL' || true
 local $/; $_ = <STDIN>;
@@ -152,7 +157,8 @@ print "unbalanced block comment\n" if m{/\*};
 print "unbalanced string literal\n" if s/"\d+"//gr =~ /"/;
 print "include!\n" if /\binclude\b/;
 print "macro_rules!\n" if /\bmacro_rules\b/;
-print "#[path]\n" if /#\s*!?\s*\[\s*path\b/;
+print "stringify!\n" if /\bstringify\b/;
+print "#[path]\n" if /#\s*!?\s*\[\s*(?:r#)?path\b/;
 print "$1\n" while /\b(cfg_\w+)/g;
 print "test-attribute name $1\n" while /\b(test|bench|test_case)\b/g;
 sub ev {
@@ -196,7 +202,7 @@ cfg_scan() {
   fi
   [ -n "$hits" ] || return 0
   echo "FAIL: $2 holds a construct that can remove code from this compile:" >&2
-  printf '      %s\n' "$hits" >&2
+  printf '%s\n' "$hits" | sed 's/^/      /' >&2
   status=1
 }
 
