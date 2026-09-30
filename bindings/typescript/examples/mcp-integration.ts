@@ -55,11 +55,16 @@ async function main(): Promise<void> {
     console.log("MCP server running, exposing outlets");
 
     try {
-      // Or connect as an MCP client to an MCP server on this machine via SSE.
-      // This server runs no bearer check; an SCP SSE server needs its token
-      // here instead of null. The transport has no TLS, so a token is sent
-      // only to a loopback host.
-      const client = await scp.mcpClientConnectSse("http://localhost:8080/mcp", null);
+      // Or connect as an MCP client to an SCP SSE server on this machine that
+      // exposes this context. An SCP SSE server always runs a bearer check
+      // (ADR-015), so pass the token that server's operator gives you; this
+      // example reads it from SCP_MCP_SSE_TOKEN. The transport has no TLS, so
+      // a token is sent only to a loopback host.
+      const sseToken = process.env.SCP_MCP_SSE_TOKEN;
+      if (sseToken === undefined || sseToken === "") {
+        throw new Error("set SCP_MCP_SSE_TOKEN to the bearer token of the SCP SSE server");
+      }
+      const client = await scp.mcpClientConnectSse("http://localhost:8080/mcp", sseToken);
       try {
         const outlets = await scp.mcpClientListTools(client);
         console.log(`The server offers ${outlets.length} outlet(s)`);
