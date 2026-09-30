@@ -23,9 +23,11 @@
 //! - **Dynamic updates** -- emits `notifications/tools/list_changed` when a
 //!   `tools/call`, or a [`ContextEvent`] that `affected_resources` classes
 //!   as a membership, capability or lifecycle change, changes the
-//!   capability-filtered tool set. Any other event runs no comparison, so it
-//!   sends the notice only when the server cannot read which contexts it
-//!   serves. A `tools/call` queues its notifications,
+//!   capability-filtered tool set. When the server cannot read which
+//!   contexts it serves, it sends the notice only for a context that a list
+//!   or subscribe response or an earlier event found served, and nothing for
+//!   any other context. Any other event runs no comparison, so it sends the
+//!   notice only on such a failed read. A `tools/call` queues its notifications,
 //!   and the transport drains them with
 //!   [`McpServer::take_pending_notifications`]. A change that no compared
 //!   [`ContextEvent`] reports and no `tools/call` causes sends no
