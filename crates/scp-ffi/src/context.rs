@@ -100,30 +100,6 @@ fn require_active_context(
     .into())
 }
 
-/// Prefixes a supervisor error a committed Welcome join met while reading its
-/// role state, keeping the error's code.
-///
-/// `context_join_from_welcome` returns this when the actor is busy, crashed or
-/// poisoned after `spawn_actor_from_welcome` committed. The prefix tells the
-/// caller the join is not undone: the context stays resident and the bridge's
-/// capability copy stays deny-all.
-fn committed_join_sync_error(err: crate::error::ScpPyError) -> crate::error::ScpPyError {
-    match err {
-        crate::error::ScpPyError::ContextError { message, code } => {
-            crate::error::ScpPyError::ContextError {
-                message: format!(
-                    "context_join_from_welcome committed the join, but the supervisor did \
-                     not answer the role-state read; the joined context stays resident and \
-                     this bridge's capability copy stays deny-all until a later role-state \
-                     sync: {message}"
-                ),
-                code,
-            }
-        }
-        other => other,
-    }
-}
-
 /// Installs a committed Welcome join's role state from the supervisor, and
 /// tears the join down when the supervisor no longer serves it.
 ///
@@ -149,16 +125,19 @@ fn committed_join_sync_error(err: crate::error::ScpPyError) -> crate::error::Scp
 ///
 /// The third must NOT discard: the single-use key package is consumed,
 /// so destroying the group would turn a transient miss into a permanent
-/// loss of membership. It surfaces the supervisor's code (a busy actor,
-/// `SCP-CTX-2135` or `SCP-CTX-2134`) and leaves the FFI state holding
-/// the deny-all precheck role state, so no UCAN, outlet or MCP check
-/// grants more than the empty ceiling until a later role-state sync.
+/// loss of membership. It must NOT fail the join either: the caller's
+/// only way to reach the joined context is the handle
+/// `context_join_from_welcome` returns after this step, and a retry fails
+/// on the already-registered FFI state. So it logs the supervisor's error
+/// and returns `Ok`, leaving the FFI state holding the deny-all precheck
+/// role state: no UCAN, outlet or MCP check grants more than the empty
+/// ceiling until a later role-state sync, and join, leave, send and
+/// receive read the supervisor and surface the busy, crashed
+/// (`SCP-CTX-2135`) or poisoned (`SCP-CTX-2134`) actor themselves.
 ///
 /// # Errors
 ///
-/// Returns the supervisor's error, prefixed by [`committed_join_sync_error`],
-/// for a busy, crashed or poisoned actor, and a `RuntimeError` after the
-/// teardown for the other two failures.
+/// Returns a `RuntimeError` after the teardown for the first two failures.
 fn install_joined_role_state(
     bi: &crate::runtime::PyBridgeInstance,
     rt: &tokio::runtime::Runtime,
@@ -173,7 +152,14 @@ fn install_joined_role_state(
             "context '{context_id}' not found in supervisor after the join committed"
         )),
         Err(e) => {
-            return Err(committed_join_sync_error(crate::error::ScpPyError::from(e)).into());
+            tracing::warn!(
+                context_id = %context_id,
+                error = %crate::error::ScpPyError::from(e),
+                "context_join_from_welcome committed the join, but the supervisor did not \
+                 answer the role-state read; this bridge's capability copy stays deny-all \
+                 until a later role-state sync"
+            );
+            None
         }
     };
     if let Some(reason) = discard_reason {
@@ -4009,10 +3995,10 @@ impl crate::scp::PyScp {
 
             // Re-sync the bridge role state AND its UCAN/outlet ceiling copy
             // from the supervisor after any governance action that may have
-            // modified roles, membership or the ceiling. A `ModifyCeiling`
-            // executes here, and writing only `role_state` would leave
-            // `ceiling_strings` granting a capability the ceiling removed.
-            // The async variant runs because this closure is already inside
+            // modified roles or membership. Executing a `ModifyCeiling` only
+            // stages it; the ceiling changes in
+            // `apply_pending_ceiling_modification`, which re-syncs both copies
+            // itself. The async variant runs because this closure is already inside
             // `rt.block_on`, where the sync wrapper's nested `block_on` panics.
             if let Err(e) =
                 crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
@@ -4583,6 +4569,10 @@ impl crate::scp::PyScp {
     /// Returns `true` if the modification was applied, `false` if no pending
     /// modification exists or the notification period has not elapsed.
     ///
+    /// After the supervisor answers, the bridge re-reads the supervisor's role
+    /// state into its role state and UCAN/outlet/MCP ceiling copy, because an
+    /// applied modification narrows the ceiling those checks read.
+    ///
     /// # Arguments
     ///
     /// * `handle` -- The context handle.
@@ -4594,7 +4584,9 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` (SCP-CTX-2060) if the operation fails.
+    /// Returns `RuntimeError` (SCP-CTX-2060) if the operation fails, or if the
+    /// role-state re-read fails; in the second case the bridge's capability
+    /// copy is left deny-all until a later role-state sync.
     #[pyo3(signature = (handle, current_timestamp))]
     pub fn apply_pending_ceiling_modification(
         &self,
@@ -4613,7 +4605,7 @@ impl crate::scp::PyScp {
             use scp_core::context::actor::commands::GovernanceCommand;
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = GovernanceCommand::ApplyPendingCeilingModification {
-                context_id,
+                context_id: context_id.clone(),
                 current_timestamp,
                 reply: tx,
             };
@@ -4622,7 +4614,26 @@ impl crate::scp::PyScp {
                     "SCP-CTX-2060: supervisor dispatch_governance_command failed: {e}"
                 ))
             })?;
-            rx.await
+            let reply = rx.await;
+            // The ceiling changes here, not when `governance_execute` stages a
+            // `ModifyCeiling`, so re-sync the bridge role state and its UCAN,
+            // outlet and MCP ceiling copy now. The re-sync runs whatever the
+            // reply says: the actor keeps a lowered ceiling even when its
+            // persist fails and it replies with an error. When the re-sync
+            // fails, fence both copies deny-all, because the older copy may
+            // grant a capability the supervisor's ceiling removed.
+            if let Err(e) =
+                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
+            {
+                crate::runtime::fence_role_state_deny_all(bi, &context_id)
+                    .map_err(|fence| PyRuntimeError::new_err(fence.to_string()))?;
+                return Err(PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2060: apply_pending_ceiling_modification could not re-read \
+                     the supervisor's role state, so this bridge's capability copy is \
+                     deny-all until a later role-state sync: {e}"
+                )));
+            }
+            reply
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!(
                         "SCP-CTX-2060: apply ceiling shim reply dropped: {e}"
@@ -8192,7 +8203,7 @@ mod tests {
     /// The post-commit step of a Welcome join keeps apart the three answers
     /// `get_role_state_checked` gives: it installs a served role state, tears
     /// down a join the supervisor no longer serves, and keeps a join whose
-    /// actor is poisoned instead of destroying it.
+    /// actor is poisoned instead of destroying it or failing it.
     #[cfg(feature = "testing")]
     #[test]
     fn install_joined_role_state_discards_only_a_join_the_supervisor_does_not_serve() {
@@ -8237,15 +8248,12 @@ mod tests {
             "an absent join's bridge state must be removed"
         );
 
-        // Poisoned: the join stays committed and its bridge copy stays deny-all.
+        // Poisoned: the join stays committed and succeeds, so the caller still
+        // gets its handle, and its bridge copy stays deny-all.
         let (bi, ctx_id, sup) = setup("7a03", true);
         rt.block_on(sup.test_poison_context(&ctx_id));
-        let err = install_joined_role_state(&bi, rt, &sup, &ctx_id).unwrap_err();
-        let text = err.to_string();
-        assert!(
-            text.contains(codes::CTX_2134) && text.contains("committed the join"),
-            "got: {text}"
-        );
+        install_joined_role_state(&bi, rt, &sup, &ctx_id)
+            .expect("a poisoned join keeps the commit and returns Ok");
         assert!(
             ffi_ceiling(&bi, &ctx_id)
                 .expect("a poisoned join keeps its bridge state")
@@ -8253,36 +8261,6 @@ mod tests {
             "the bridge copy stays deny-all"
         );
         crate::runtime::remove_context(&bi, &ctx_id);
-    }
-
-    /// A committed Welcome join that meets a busy, crashed or poisoned actor
-    /// keeps the supervisor's code and says the join is not undone; an error
-    /// of another kind passes through unchanged.
-    #[test]
-    fn committed_join_sync_error_keeps_the_code_and_names_the_commit() {
-        let crashed = committed_join_sync_error(crate::error::ScpPyError::from(
-            scp_core::context::ContextError::ActorCrashed("ctx-1".to_owned()),
-        ));
-        match crashed {
-            crate::error::ScpPyError::ContextError { message, code } => {
-                assert_eq!(code, codes::CTX_2135);
-                assert!(message.contains("committed the join"), "got: {message}");
-            }
-            other => panic!("expected a ContextError, got {other:?}"),
-        }
-        let identity = crate::error::ScpPyError::IdentityError {
-            message: "unrelated".to_owned(),
-            code: "SCP-IDENT-1001".to_owned(),
-        };
-        match committed_join_sync_error(identity) {
-            crate::error::ScpPyError::IdentityError { message, code } => {
-                assert_eq!(
-                    (message.as_str(), code.as_str()),
-                    ("unrelated", "SCP-IDENT-1001")
-                );
-            }
-            other => panic!("expected the IdentityError unchanged, got {other:?}"),
-        }
     }
 
     /// Every lifecycle gate refuses a context the crash watchdog poisoned with
@@ -8521,6 +8499,194 @@ mod tests {
     #[cfg(feature = "testing")]
     fn ucan_mint_is_admitted_under_the_default_ceiling() {
         mint_in_created_context(None).expect("messages:write is in default_ceiling()");
+    }
+
+    /// Builds an outlet registration dict whose operator is `operator` and
+    /// whose schema meets the specificity floor.
+    fn outlet_registration_dict<'py>(
+        py: Python<'py>,
+        name: &str,
+        operator: &str,
+    ) -> Bound<'py, PyDict> {
+        let str_type = PyDict::new(py);
+        str_type.set_item("type", "string").unwrap();
+        let num_type = PyDict::new(py);
+        num_type.set_item("type", "number").unwrap();
+        let props = PyDict::new(py);
+        props.set_item("a", str_type).unwrap();
+        props.set_item("b", num_type).unwrap();
+        let input = PyDict::new(py);
+        input.set_item("type", "object").unwrap();
+        input.set_item("properties", props).unwrap();
+        let output = PyDict::new(py);
+        output.set_item("type", "object").unwrap();
+        let schema = PyDict::new(py);
+        schema.set_item("input_schema", input).unwrap();
+        schema.set_item("output_schema", output).unwrap();
+        let dict = PyDict::new(py);
+        dict.set_item("name", name).unwrap();
+        dict.set_item("description", "probes the bridge role check")
+            .unwrap();
+        dict.set_item("operator_did", operator).unwrap();
+        dict.set_item("schema", schema).unwrap();
+        dict
+    }
+
+    /// Creates a context through `context_create` with `ceiling` set to
+    /// `ceiling` (or no `ceiling` key when `None`), then registers an outlet in
+    /// it through `outlet_register`, whose `OutletRegister` check reads the
+    /// bridge's `role_state`, not its `ceiling_strings`.
+    #[cfg(feature = "testing")]
+    fn register_outlet_in_created_context(ceiling: Option<Vec<String>>) -> PyResult<String> {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            if let Some(ceiling) = ceiling {
+                params.set_item("ceiling", ceiling).unwrap();
+            }
+            let handle = scp
+                .context_create(&creator_did, &params)
+                .expect("context_create succeeds");
+            let dict = outlet_registration_dict(py, "ceiling-probe", &creator_did);
+            scp.outlet_register(&handle.context_id, &dict.as_borrowed())
+        })
+    }
+
+    /// Outlet registration is role-gated at the bridge: the creator's admin
+    /// role grants `outlet:register` only when the ceiling holds it. A `[]`
+    /// context and a context narrowed to `messages:read` both refuse it, and a
+    /// context under `default_ceiling()` admits it. The admitted case is what
+    /// makes the refusals mean something: without it, a registration that
+    /// failed for every context would pass.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn outlet_register_is_refused_unless_the_ceiling_grants_it() {
+        for (label, ceiling) in [
+            ("deny-all", Vec::new()),
+            ("narrowed", vec!["messages:read".to_owned()]),
+        ] {
+            let err = register_outlet_in_created_context(Some(ceiling))
+                .expect_err("a ceiling without outlet:register must refuse registration");
+            assert!(
+                err.to_string().contains("outlet registration failed"),
+                "{label}: the refusal must come from the role check, got: {err}"
+            );
+        }
+        register_outlet_in_created_context(None)
+            .expect("outlet:register is in default_ceiling(), so registration succeeds");
+    }
+
+    /// `apply_pending_ceiling_modification` re-reads the supervisor's role
+    /// state into the bridge, so a bridge copy broader than the supervisor's
+    /// ceiling stops admitting outlet registration after the call.
+    ///
+    /// The context is created with `ceiling=[]`, then its bridge copy is
+    /// widened to `default_ceiling()`, the state the bridge holds after an
+    /// applied narrowing and before it re-syncs. Registration succeeds against
+    /// that copy (the case that must differ), and is refused after the apply.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn apply_pending_ceiling_modification_resyncs_the_bridge_role_state() {
+        use scp_core::context::roles::{ContextRoleState, default_ceiling};
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = &*scp.inner;
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            params.set_item("ceiling", Vec::<String>::new()).unwrap();
+            let handle = scp
+                .context_create(&creator_did, &params)
+                .expect("context_create succeeds");
+            let ctx_id = handle.context_id.clone();
+            crate::runtime::with_ffi_state(bi, &ctx_id, |st| {
+                let wide = default_ceiling();
+                st.ceiling_strings = wide.to_ucan_string_set();
+                st.role_state = ContextRoleState::new(
+                    &ctx_id,
+                    &creator_did,
+                    wide,
+                    vec![],
+                    &scp_clock::SystemClock,
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+            let first = outlet_registration_dict(py, "ceiling-probe-1", &creator_did);
+            scp.outlet_register(&ctx_id, &first.as_borrowed())
+                .expect("the widened bridge copy admits registration");
+
+            let applied = scp
+                .apply_pending_ceiling_modification(&handle, u64::MAX)
+                .expect("apply succeeds with nothing pending");
+            assert!(!applied, "no modification was pending");
+
+            let second = outlet_registration_dict(py, "ceiling-probe-2", &creator_did);
+            let err = scp
+                .outlet_register(&ctx_id, &second.as_borrowed())
+                .expect_err("the re-synced deny-all copy must refuse registration");
+            assert!(
+                err.to_string().contains("outlet registration failed"),
+                "got: {err}"
+            );
+            let strings =
+                crate::runtime::with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone()))
+                    .unwrap();
+            assert!(
+                strings.is_empty(),
+                "the UCAN copy is deny-all, got: {strings:?}"
+            );
+        });
+    }
+
+    /// `fence_role_state_deny_all` leaves both bridge copies granting nothing
+    /// and keeps the member set; a copy that grants `outlet:register` before
+    /// the fence is the case that must differ.
+    #[test]
+    fn fence_role_state_deny_all_revokes_every_bridge_grant() {
+        use scp_core::context::roles::Capability;
+        let bi = __bi();
+        crate::runtime::init_context_manager_for_test(&bi);
+        let ctx_id = format!("7a04{}", "0".repeat(60));
+        let creator = "did:dht:z6MkFenceCreator";
+        crate::runtime::register_ffi_state(&bi, &ctx_id, creator, &default_ceiling_strings())
+            .unwrap();
+        let grants = |bi: &crate::runtime::PyBridgeInstance| {
+            crate::runtime::with_ffi_state(bi, &ctx_id, |st| {
+                Ok((
+                    st.role_state
+                        .member_has_capability(creator, &Capability::OutletRegister),
+                    st.ceiling_strings.is_empty(),
+                    st.role_state.members.contains(creator),
+                ))
+            })
+            .unwrap()
+        };
+        let before = grants(&bi);
+        assert!(
+            before.0 && !before.1,
+            "the default copy grants outlet:register"
+        );
+
+        crate::runtime::fence_role_state_deny_all(&bi, &ctx_id).unwrap();
+
+        assert_eq!(
+            grants(&bi),
+            (false, true, before.2),
+            "the fenced copy grants nothing and keeps membership"
+        );
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]

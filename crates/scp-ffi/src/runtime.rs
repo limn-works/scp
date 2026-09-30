@@ -1948,6 +1948,39 @@ pub(crate) fn install_role_state(
     })
 }
 
+/// Replaces the context's bridge role state and UCAN ceiling copy with a pair
+/// built from an empty ceiling, keeping the member set, so every UCAN, outlet
+/// and MCP check the bridge serves from its own state refuses.
+///
+/// A caller runs it when the supervisor may have narrowed the ceiling but the
+/// re-sync read failed: keeping the older, broader copy would admit a
+/// capability the supervisor's ceiling no longer holds. A later successful
+/// [`sync_role_state_from_manager`] restores the supervisor's role state.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the FFI state registry holds no
+/// entry for `context_id` or the empty-ceiling role state cannot be built.
+pub(crate) fn fence_role_state_deny_all(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    with_ffi_state(bi, context_id, |st| {
+        let mut role_state = ContextRoleState::new(
+            context_id,
+            &st.creator_did,
+            CapabilityCeiling::new(Vec::new()),
+            vec![],
+            &SystemClock,
+        )
+        .map_err(|e| ScpPyError::context(format!("failed to create role state: {e}")))?;
+        role_state.members = std::mem::take(&mut st.role_state.members);
+        st.role_state = role_state;
+        st.ceiling_strings.clear();
+        Ok(())
+    })
+}
+
 /// Test-only: spawns the per-context supervisor actor whose lifecycle state
 /// [`live_context_state`] reads, carrying `ceiling` as the context's capability
 /// ceiling.
@@ -3140,10 +3173,10 @@ mod tests {
     /// The governance flows' async re-sync narrows a stale UCAN/outlet ceiling
     /// copy to the supervisor's ceiling, a `[]` deny-all ceiling included.
     ///
-    /// Each bridge copy starts as the default ceiling, the state
-    /// `governance_execute` left behind a `ModifyCeiling` when it rewrote only
-    /// `role_state`. The precondition assertion is the case that must differ;
-    /// after the sync the two copies must agree.
+    /// Each bridge copy starts as the default ceiling, the state a bridge holds
+    /// after `apply_pending_ceiling_modification` narrowed the supervisor's
+    /// ceiling and before the bridge re-synced. The precondition assertion is
+    /// the case that must differ; after the sync the two copies must agree.
     #[test]
     fn sync_role_state_from_manager_async_narrows_a_stale_ceiling_copy() {
         crate::init_runtime().ok();
