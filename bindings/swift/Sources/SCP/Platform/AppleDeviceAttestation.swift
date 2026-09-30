@@ -155,11 +155,13 @@
     ///
     /// One serialized call is the whole of one `attest` (`generateKey`, when
     /// no key ID is stored, then `attestKey`) or one `assertRequest`
-    /// (`generateAssertion`). It ends at the first of three events: Apple's
+    /// (`generateAssertion`). It ends at the first of four events: an
+    /// `assertRequest` that reads no stored key ID ends its call at that
+    /// read with `SCP-ATTEST-9020` and calls no App Attest method; Apple's
     /// answers end it (an error from any of its App Attest methods, or the
-    /// answer to its last one), `appAttestCallTimeLimit` (25
-    /// seconds from the call's start) passes, or the caller's task is
-    /// cancelled. On the time limit the caller gets `SCP-ATTEST-9027`; on
+    /// answer to its last one); `appAttestCallTimeLimit` (25 seconds from
+    /// the call's start) passes; or the caller's task is cancelled. On the
+    /// time limit the caller gets `SCP-ATTEST-9027`; on
     /// cancellation it gets `SCP-ATTEST-9001`, through
     /// `AttestationError.serviceError`. Either way the serializer runs the
     /// next queued call, and a completion handler Apple runs after the call
@@ -585,12 +587,13 @@
     /// held from the read that finds no stored key ID to the write that stores
     /// the generated one. Two first `attest` calls that each held the lock only
     /// for the read would both find no key ID and generate one key each.
-    /// Running each call, from the key-ID read through Apple's answer, before
+    /// Running each call, from the key-ID read until the call ends, before
     /// the next call starts makes each read follow every preceding call's
     /// write.
     ///
     /// **Bound and cancellation** (ADR-025 acceptance criterion 3): a running
-    /// call ends at the first of Apple's answer, `timeLimit`, or the caller's
+    /// call ends at the first of an `assertRequest`'s read that finds no
+    /// stored key ID, Apple's answer, `timeLimit`, or the caller's
     /// cancellation, and the serializer then starts the next queued call.
     /// `AppAttestCall` discards whatever Apple answers after that. A caller
     /// cancelled while queued leaves the queue without reaching Apple. Time
@@ -613,11 +616,13 @@
 
         /// Wait for every call this serializer accepted earlier to end, then
         /// run one call: `start` hands it to App Attest, and the call ends at
-        /// the first of Apple's answer, `timeLimit`, or the caller's
-        /// cancellation.
+        /// the first of `start` ending it without App Attest (an
+        /// `assertRequest` that reads no stored key ID), Apple's answer,
+        /// `timeLimit`, or the caller's cancellation.
         ///
         /// - Parameter start: Starts the call's App Attest work and ends the
-        ///   `AppAttestCall` it receives from Apple's completion handlers.
+        ///   `AppAttestCall` it receives, from Apple's completion handlers or,
+        ///   when it calls no App Attest method, directly.
         /// - Returns: What ended the call; a cancelled caller receives
         ///   `AppAttestCall.cancelledOutcome`, whether it was queued or
         ///   running.
@@ -677,9 +682,9 @@
 
     /// One App Attest call the serializer runs, which ends exactly once.
     ///
-    /// Apple's answer, the time limit and the caller's cancellation each try
-    /// to end the call; the first one ends it, and each later one does
-    /// nothing. The adapter stores a key ID and hands App Attest a method only
+    /// A key-ID read that finds no stored key ID in `assertRequest`, Apple's
+    /// answer, the time limit and the caller's cancellation each try to end
+    /// the call; the first one ends it, and each later one does nothing. The adapter stores a key ID and hands App Attest a method only
     /// inside `issue(_:)`, which runs nothing once the call ended. An end that
     /// arrives while an `issue(_:)` body runs takes effect, and resumes the
     /// caller, when that body returns, so every key ID a call stores and every

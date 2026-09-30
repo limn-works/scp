@@ -43,10 +43,11 @@
 //    answer stores no key ID and reaches no caller. A caller cancelled while
 //    queued never reaches Apple, and one cancelled while Apple holds its
 //    call frees the queue. A cancellation that arrives while the adapter
-//    stores a generated key ID or reads the stored one ends the call only
-//    after the App Attest method that step leads to started, so a call never
-//    starts a method after it ended; `AppAttestCallEndTests` pins those two
-//    cases, and `AppAttestCallOrderingTests` pins each other case: the
+//    stores a generated key ID ends the call only after the `attestKey` that
+//    step leads to started, so a call never starts a method after it ended;
+//    `AppAttestCallEndTests` pins that case and says why a cancellation
+//    during the key-ID read has none. `AppAttestCallOrderingTests` pins
+//    each other case: the
 //    time-out case injects a limit of one second and the late-answer case
 //    one of 300 milliseconds in place of the adapter's 25 seconds, the
 //    cancellation cases keep the 25-second default and cancel well before it
@@ -1250,10 +1251,18 @@
     }
 
     /// Cases that pin when a serialized App Attest call ends: an end that
-    /// arrives while the adapter stores a key ID or reads the stored one
-    /// takes effect only after the App Attest method that step leads to
-    /// started, so a call never starts a method after its caller received
-    /// its outcome.
+    /// arrives while the adapter stores a generated key ID takes effect only
+    /// after the `attestKey` that step leads to started, so a call never
+    /// starts a method after its caller received its outcome. Removing
+    /// `issuing == 0` from `AppAttestCall.State.takeDelivery()`, or storing
+    /// the key ID and calling `attestKey` outside `call.issue`, turns
+    /// `endBetweenKeyStoreAndAttestKeyComesAfterAttestKey` red. An end that
+    /// arrives while a call reads the stored key ID has no case here:
+    /// `AppAttestCall.run` runs that read, and the `generateKey`,
+    /// `attestKey` or `generateAssertion` call after it, on the caller's own
+    /// task inside the `withCheckedContinuation` body, so the caller cannot
+    /// resume before that body returns whether or not the end waits for it,
+    /// and no test can tell the two apart.
     struct AppAttestCallEndTests {
         @Test("a cancellation between the generated key's store and attestKey ends the call only after attestKey started")
         func endBetweenKeyStoreAndAttestKeyComesAfterAttestKey() async {
@@ -1288,50 +1297,6 @@
                 .init(keyId: RecordingAppAttestService.generatedKeyId(1), clientDataHash: challenge)
             ])
             #expect(defaults.string(forKey: keyIdDefaultsKey) == RecordingAppAttestService.generatedKeyId(1))
-        }
-
-        @Test("a cancellation while a call reads its key ID ends the call only after generateAssertion started")
-        func endDuringKeyReadComesAfterGenerateAssertion() async {
-            let service = RecordingAppAttestService()
-            let defaults = InMemoryUserDefaults()
-            defaults.set(RecordingAppAttestService.generatedKeyId(1), forKey: keyIdDefaultsKey)
-            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
-            let callerReturned = DispatchSemaphore(value: 0)
-            let callerHandle = OSAllocatedUnfairLock<Task<(code: String, assertionCalls: Int), Never>?>(
-                initialState: nil
-            )
-
-            // Cancel the caller when its call reads the stored key ID, the
-            // step before its `generateAssertion` call, and give the caller
-            // 300 milliseconds to return. The caller's task can reach the
-            // read before this case stores its handle, so the hook waits up
-            // to one second for the handle.
-            defaults.onNextAccess {
-                for _ in 0 ..< 1000 {
-                    if let caller = callerHandle.withLock({ $0 }) {
-                        caller.cancel()
-                        break
-                    }
-                    usleep(1000)
-                }
-                _ = callerReturned.wait(timeout: .now() + .milliseconds(300))
-            }
-            let caller = Task { () -> (code: String, assertionCalls: Int) in
-                let outcome = await code(of: { () async throws(ScpError) -> Data in
-                    try await adapter.assertRequest(requestHash: requestHash)
-                })
-                let assertionCalls = service.assertions.count
-                callerReturned.signal()
-                return (outcome, assertionCalls)
-            }
-            callerHandle.withLock { $0 = caller }
-
-            let result = await caller.value
-            // SCP-ATTEST-9001 proves the cancellation reached the call inside
-            // the key-ID read, before Apple's answer ended it.
-            #expect(result.code == "SCP-ATTEST-9001")
-            #expect(result.assertionCalls == 1, "the caller returned before its call's generateAssertion started")
-            #expect(service.assertions.map(\.clientDataHash) == [requestHash])
         }
     }
 
