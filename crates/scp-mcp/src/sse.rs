@@ -109,7 +109,8 @@ const DEFAULT_RETRY_MS: u64 = 3000;
 /// while it computes and broadcasts one event's notifications or a lagged
 /// resync, and computing them runs the provider's re-authorization calls
 /// (`active_context_ids`, `validate_resource_access`), which on the `UniFFI`
-/// bridge are `block_in_place` actor round-trips.
+/// bridge are `block_in_place` actor round-trips. No outlet timeout bounds
+/// the pump's hold.
 const EVICTION_WAIT: Duration = Duration::from_secs(5);
 
 /// Configuration for the SSE transport server.

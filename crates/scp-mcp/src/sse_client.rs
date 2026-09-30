@@ -436,8 +436,9 @@ impl McpTransport for SseClientTransport {
     /// Returns an error when the stream has closed, before any POST, when the
     /// POST fails, when a read fails or times out, when the stream closes
     /// during the wait, on a `data:` line that is not JSON, and on a `data:`
-    /// line carrying this request's `id` that is not a valid response. A closed stream stays closed: the server has ended
-    /// the session, and the caller connects a new transport. Returns
+    /// line carrying this request's `id` that is not a valid response. A
+    /// closed stream stays closed: the server has ended the session, and the
+    /// caller connects a new transport. Returns
     /// [`SSE_CLOSED`] when an [`SseCloser`] closed the transport before or
     /// during the call.
     #[allow(clippy::significant_drop_tightening)] // sse_reader MutexGuard is borrowed by reader across the entire loop.
