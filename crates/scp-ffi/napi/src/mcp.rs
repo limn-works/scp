@@ -1913,32 +1913,40 @@ mod tests {
             .build()
             .expect("runtime");
         let limit = std::time::Duration::from_secs(10);
+        // Each timeout is built inside `block_on`, where its timer finds the
+        // runtime's reactor.
         let handle = runtime
-            .block_on(tokio::time::timeout(
-                limit,
-                mcp_client_connect_stdio_on(
-                    &bi,
-                    vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
-                ),
-            ))
+            .block_on(async {
+                tokio::time::timeout(
+                    limit,
+                    mcp_client_connect_stdio_on(
+                        &bi,
+                        vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                    ),
+                )
+                .await
+            })
             .expect("the connect must end within 10 s")
             .unwrap_or_else(|e| panic!("connect to the erroring stub server: {}", e.reason));
         let list_and_invoke = || {
             let (list, invoke) = runtime
-                .block_on(tokio::time::timeout(limit, async {
-                    (
-                        mcp_client_list_tools_on(&bi, &handle).await,
-                        mcp_client_invoke_on(
-                            &bi,
-                            &handle,
-                            "test-outlet".to_owned(),
-                            "{}".to_owned(),
-                            "ctx-test".to_owned(),
-                            "did:dht:z6MkTestUser".to_owned(),
+                .block_on(async {
+                    tokio::time::timeout(limit, async {
+                        (
+                            mcp_client_list_tools_on(&bi, &handle).await,
+                            mcp_client_invoke_on(
+                                &bi,
+                                &handle,
+                                "test-outlet".to_owned(),
+                                "{}".to_owned(),
+                                "ctx-test".to_owned(),
+                                "did:dht:z6MkTestUser".to_owned(),
+                            )
+                            .await,
                         )
-                        .await,
-                    )
-                }))
+                    })
+                    .await
+                })
                 .expect("tools/list and tools/call must end within 10 s");
             (
                 list.err().expect("tools/list must fail").reason.clone(),
