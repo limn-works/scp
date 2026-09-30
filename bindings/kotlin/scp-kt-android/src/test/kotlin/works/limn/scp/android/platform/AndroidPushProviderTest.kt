@@ -8,8 +8,10 @@
  * `FirebaseMessaging` to inject. ADR-027 criterion 13 requires FCM tests on
  * Firebase Test Lab or against a mock `FirebaseMessaging` injected through
  * dependency injection, and the module has neither. Story SCP-112 stays in
- * progress while its criteria "FCM token registration and refresh handled"
- * and "Integration tests verify push delivery flow" are unmet.
+ * progress while any acceptance criterion its description in
+ * `.docs/prds/main.json` records as unmet stands. That description records all
+ * five as unmet; the two this file bears on are "FCM token registration and
+ * refresh handled" and "Integration tests verify push delivery flow".
  *
  * See ADR-027 (Android Platform Adapter) and §10.7 (push payload opacity).
  */
