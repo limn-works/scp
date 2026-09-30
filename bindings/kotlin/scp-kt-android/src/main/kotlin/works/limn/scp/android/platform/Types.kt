@@ -363,6 +363,20 @@ interface PushProvider {
  * Bouncy Castle throw `IllegalStateException` ("X25519 agreement failed") because the shared
  * secret is all zero.
  *
+ * The software path writes to EncryptedSharedPreferences, whose editor encrypts each entry's
+ * name and value and throws `SecurityException` when that encryption fails. Two methods let it
+ * escape:
+ *
+ * - [generateKeypair] for an Ed25519 key on API 26-32 writes the key's seed after it adds the
+ *   key to this instance's software key map, so the exception escapes with the key in the map
+ *   and no handle returned.
+ * - [destroyKey] for a [CustodyType.SOFTWARE] handle removes the handle's seed entry after it
+ *   removes the key from the software key map and before its `SCP-CRYPTO-4001` and
+ *   `SCP-CRYPTO-4004` checks, so the exception escapes with the key gone from the map and any
+ *   persisted seed still on disk. A retry reaches the same removal before the `SCP-CRYPTO-4001`
+ *   check, and an [AndroidKeyCustody] constructed later restores the key from a seed still on
+ *   disk.
+ *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
 interface KeyCustodyProvider {
@@ -373,8 +387,9 @@ interface KeyCustodyProvider {
      * X25519 wrapping keys are always software-managed (Bouncy Castle) and held in process
      * memory only, which diverges from ADR-027's P-256 agreement key (see the interface KDoc).
      *
-     * [AndroidKeyCustody] throws no [ScpException] from this method. A Keystore failure escapes
-     * as the original exception, listed in the interface KDoc.
+     * [AndroidKeyCustody] throws no [ScpException] from this method. A Keystore or
+     * EncryptedSharedPreferences failure escapes as the original exception, listed in the
+     * interface KDoc.
      *
      * @param keyType The type of key to generate.
      * @return An opaque [KeyHandle] referencing the generated key.
@@ -424,6 +439,8 @@ interface KeyCustodyProvider {
      * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
      * can restore the key when this process dies before the removal reaches disk (see
      * [DestructionAttestation.confirmed]).
+     * A Keystore or EncryptedSharedPreferences failure escapes as the original exception, listed
+     * in the interface KDoc.
      *
      * @param keyHandle Handle to destroy.
      * @return A [DestructionAttestation] naming the destruction method, with
