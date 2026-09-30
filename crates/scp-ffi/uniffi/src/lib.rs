@@ -432,16 +432,17 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
     /// governance vote signing among them, build that key from the returned
     /// bytes. A key held in hardware or in Android Keystore does not export its
-    /// bytes: the Android adapter refuses a Keystore handle with
-    /// `SCP-CRYPTO-4005`, and ADR-063 requires every key-export accessor to leave
-    /// the custody adapters, because hardware custody on the governance path is
-    /// impossible until then.
+    /// bytes, and ADR-063 requires every key-export accessor, this callback
+    /// included, to leave the custody adapters and all three bridges, because
+    /// hardware custody on the governance path is impossible until then.
     ///
     /// # Default
     ///
     /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. Platform SDKs (Swift `AppleKeyCustody`, Kotlin
-    /// `AndroidKeyCustody`) override this with real implementations. Third-party
+    /// implemented. The Swift `AppleKeyCustody` overrides this with a real
+    /// implementation. No Kotlin class implements this callback: the Kotlin
+    /// `AndroidKeyCustody` implements the Kotlin SDK's own `KeyCustodyProvider`
+    /// interface, and no code passes it to the Rust engine. Third-party
     /// `KeyCustodyProvider` implementations that do not need governance vote
     /// signing may rely on the default until they add support.
     ///
