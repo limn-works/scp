@@ -3576,10 +3576,12 @@ const HELD_READ: &str = "fn gate_role_state(bi: &Bi, context_id: &str) -> R {\n 
                   block_on(async move { supervisor.get_role_state_checked(&id).await })\n}\n\
                   fn outlet_grant() {}\n";
 
-/// The source gate must go red when the role-state read returns a stand-in on
-/// either branch, asks a receiver other than the supervisor it bound from
-/// `bi`, asks about an id other than its `context_id` parameter, or reports a
-/// held context as absent.
+/// The source gate must go red when the role-state read replaces its pinned
+/// no-supervisor branch, drops the `get_role_state_checked` call, calls it on a
+/// receiver other than the supervisor it bound from `bi` or with an id other
+/// than its `context_id` parameter, rebinds either with a `let`, or spells
+/// `Some(`, `Ok(None)` or `default(` outside that branch. Each case below uses
+/// one of those spellings; a stand-in spelled some other way stays green.
 #[test]
 fn mcp_role_state_gate_rejects_a_stand_in_below_gate_role_state() {
     assert!(reads_role_state_from_its_own_source(&production_code(
@@ -4150,11 +4152,13 @@ fn after_open_parens<const OPEN: usize>(text: &str) -> Option<&str> {
 }
 
 /// Whether the function that `gate_role_state` in `code` (from
-/// [`production_code`]) matches on reads role state only from its own bridge
-/// instance: with no supervisor attached, it returns either the bridge's own
-/// copy (`rt.role_state` through `crate::runtime::with_context`, on `PyO3` and
-/// NAPI, which keep one) or `Ok(None)` (on `UniFFI`, which keeps no copy);
-/// otherwise it asks the supervisor it bound with `get_role_state_checked`.
+/// [`production_code`]) matches on has the source shape below. It contains one
+/// of three pinned no-supervisor branches, which returns either the bridge's
+/// own copy (`rt.role_state` through `crate::runtime::with_context`, on `PyO3`
+/// and NAPI, which keep one) or `Ok(None)` (on `UniFFI`, which keeps no copy);
+/// after that branch it calls `get_role_state_checked` on the supervisor it
+/// bound. The gate does not check whether that call's answer is what the
+/// function returns.
 ///
 /// The two statements right after that branch must be `let <name> =
 /// Arc::clone(<name>);` and `let id = context_id.to_owned();`, where `<name>`
@@ -4435,10 +4439,14 @@ fn production_source(src: &str) -> &str {
 /// test pins the three parts the types cannot see. First, each bridge's
 /// `validate_resource_access` passes the predicate the role state its
 /// `gate_role_state` read from the provider's own bridge instance, and the
-/// function `gate_role_state` reads through returns, with no supervisor
-/// attached, the bridge's own copy (`PyO3`, NAPI) or no context (`UniFFI`,
-/// which keeps no copy), and otherwise the bound supervisor's
-/// `get_role_state_checked` answer. Second, each bridge's `gate_role_state`
+/// function `gate_role_state` reads through has the shape
+/// [`reads_role_state_from_its_own_source`] checks: a pinned no-supervisor
+/// branch that returns the bridge's own copy (`PyO3`, NAPI) or `Ok(None)`
+/// (`UniFFI`, which keeps no copy), then a `get_role_state_checked(&id)` call
+/// on the supervisor bound from `bi` over `context_id`, with neither rebound by
+/// a `let`, and no `Some(`, `Ok(None)` or `default(` outside that branch. It
+/// does not check whether that call's answer is what the function returns.
+/// Second, each bridge's `gate_role_state`
 /// answers a context the actor does not hold with `AccessRefusal::Denied` and
 /// a failed read with `AccessRefusal::Unreadable`, and each bridge's
 /// `validate_capability` returns `outlet_grant`'s verdict on role state read
@@ -4493,9 +4501,11 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
         );
         assert!(
             reads_role_state_from_its_own_source(&code),
-            "{bridge}'s production role-state read behind `gate_role_state` must return, with no \
-             supervisor attached, the bridge's own copy or `Ok(None)`, and otherwise the bound \
-             supervisor's `get_role_state_checked` answer; a stand-in role state does not count"
+            "{bridge}'s production role-state read behind `gate_role_state` must keep a pinned \
+             no-supervisor branch returning the bridge's own copy or `Ok(None)`, then call \
+             `get_role_state_checked(&id)` on the supervisor bound from `bi` over `context_id` \
+             with neither rebound by a `let`, and spell no `Some(`, `Ok(None)` or `default(` \
+             outside that branch"
         );
         assert!(
             answers_capability_as_invoke_outlet_allows(&code),
