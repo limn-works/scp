@@ -394,8 +394,9 @@ interface KeyCustodyProvider {
     /**
      * Perform X25519 Diffie-Hellman key agreement.
      *
-     * Returns the 32-byte shared secret. The private key never leaves the
-     * custody boundary.
+     * Returns the 32-byte shared secret. No method of this interface returns the X25519 private
+     * key: [exportSigningKeyBytes] throws `SCP-CRYPTO-4003` for an X25519 handle. See
+     * [AndroidKeyCustody.dhAgree] for where the software implementation holds the key.
      *
      * @param keyHandle Handle to an X25519 key.
      * @param peerPublic 32-byte X25519 public key of the peer.
