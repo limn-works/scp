@@ -749,10 +749,11 @@ pub const TRANS_5020: &str = "SCP-TRANS-5020";
 /// waited for the client's lock, so the call sent no request.
 pub const TRANS_5021: &str = "SCP-TRANS-5021";
 /// MCP client `tools/list`: the request failed on the transport, the server
-/// answered with an error, or the call itself failed. On NAPI and UniFFI
-/// the task running the call failed; on PyO3 an earlier call panicked
-/// while holding the client's lock, which fails every later call on the
-/// handle this way until the host disconnects it.
+/// answered with an error, or the call itself failed.
+///
+/// On NAPI and `UniFFI` the task running the call failed; on `PyO3` an
+/// earlier call panicked while holding the client's lock, which fails every
+/// later call on the handle this way until the host disconnects it.
 pub const TRANS_5022: &str = "SCP-TRANS-5022";
 /// MCP client `tools/call`: no client is registered under the handle.
 pub const TRANS_5023: &str = "SCP-TRANS-5023";
@@ -760,10 +761,11 @@ pub const TRANS_5023: &str = "SCP-TRANS-5023";
 /// waited for the client's lock, so the call sent no request.
 pub const TRANS_5024: &str = "SCP-TRANS-5024";
 /// MCP client `tools/call`: the request failed on the transport, the server
-/// answered with an error, or the call itself failed. On NAPI and UniFFI
-/// the task running the call failed; on PyO3 an earlier call panicked
-/// while holding the client's lock, which fails every later call on the
-/// handle this way until the host disconnects it.
+/// answered with an error, or the call itself failed.
+///
+/// On NAPI and `UniFFI` the task running the call failed; on `PyO3` an
+/// earlier call panicked while holding the client's lock, which fails every
+/// later call on the handle this way until the host disconnects it.
 pub const TRANS_5025: &str = "SCP-TRANS-5025";
 /// Transport relay configured error.
 pub const TRANS_5030: &str = "SCP-TRANS-5030";
