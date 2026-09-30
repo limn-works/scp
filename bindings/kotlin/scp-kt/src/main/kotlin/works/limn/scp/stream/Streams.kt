@@ -382,26 +382,39 @@ class HotStreamFactory(
      * Waits for [eventMutex] under [NonCancellable]: a cancelled caller that found the mutex
      * held would otherwise throw from `withLock` and leave this handle's subscription live.
      *
-     * An unsubscribe call that throws propagates to this caller; the handle's registry entry is
-     * already gone by then, as [removeEventSubscription] states.
+     * Never throws a release's failure (`.docs/standards/sdk-common.md` §Cleanup error
+     * handling): an unsubscribe call that throws is logged at warning level, and the handle's
+     * registry entry is gone by then, as [removeEventSubscription] states.
      *
      * @param contextHandle The context to stop receiving events for.
      */
     suspend fun stopContextEvents(contextHandle: Long) {
-        withContext(NonCancellable) { eventMutex.withLock { removeEventSubscription(contextHandle) } }
+        withContext(NonCancellable) {
+            eventMutex.withLock {
+                releaseLogged("stopContextEvents", "context events", contextHandle) {
+                    removeEventSubscription(contextHandle)
+                }
+            }
+        }
     }
 
     /**
      * Stop receiving messages for the given context handle.
      *
      * Takes [messageMutex], and waits for it under [NonCancellable], for the reasons
-     * [stopContextEvents] states about [eventMutex]. An unsubscribe call that throws propagates
-     * to this caller, as [stopContextEvents] states.
+     * [stopContextEvents] states about [eventMutex]. An unsubscribe call that throws is logged,
+     * never thrown, as [stopContextEvents] states.
      *
      * @param contextHandle The context to stop receiving messages for.
      */
     suspend fun stopMessageStream(contextHandle: Long) {
-        withContext(NonCancellable) { messageMutex.withLock { removeMessageSubscription(contextHandle) } }
+        withContext(NonCancellable) {
+            messageMutex.withLock {
+                releaseLogged("stopMessageStream", "incoming messages", contextHandle) {
+                    removeMessageSubscription(contextHandle)
+                }
+            }
+        }
     }
 
     /**
@@ -411,10 +424,11 @@ class HotStreamFactory(
      * [stopContextEvents] and [stopMessageStream], because taking one non-reentrant [Mutex]
      * twice on one coroutine deadlocks that coroutine.
      *
-     * The whole body runs under [NonCancellable], so a caller that is already cancelled still
-     * releases every handle: each removal's own `withContext` throws on resumption into a
-     * cancelled caller, which would otherwise end the loop after its first removal and leave
-     * every later Rust subscription live.
+     * The whole body runs under [NonCancellable]. Each removal's own `withContext` still runs
+     * its block for a cancelled caller, but then throws [kotlinx.coroutines.CancellationException]
+     * on resumption into that caller; [releaseLogged] would catch that throw after a release that
+     * succeeded and log it as a failed release. The wrapper keeps that false warning out of the
+     * log.
      *
      * Attempts every release it holds and never throws a release's failure
      * (`.docs/standards/sdk-common.md` §Cleanup error handling): an unsubscribe call that
@@ -426,26 +440,27 @@ class HotStreamFactory(
         withContext(NonCancellable) {
             eventMutex.withLock {
                 activeEventSubscriptions.keys.toList().forEach { handle ->
-                    releaseLogged("context events", handle) { removeEventSubscription(handle) }
+                    releaseLogged("stopAll", "context events", handle) { removeEventSubscription(handle) }
                 }
             }
             messageMutex.withLock {
                 activeMessageSubscriptions.keys.toList().forEach { handle ->
-                    releaseLogged("incoming messages", handle) { removeMessageSubscription(handle) }
+                    releaseLogged("stopAll", "incoming messages", handle) { removeMessageSubscription(handle) }
                 }
             }
         }
     }
 
     /**
-     * Run one [stopAll] release and log its failure instead of throwing it.
+     * Run one release for [operation] and log its failure instead of throwing it.
      *
      * Catches [Exception], not [Throwable], so an [Error] such as an out-of-memory condition
-     * still propagates. The caller runs under [NonCancellable], so no cancellation of that
+     * still propagates. Every caller runs under [NonCancellable], so no cancellation of that
      * caller reaches this catch.
      */
     @Suppress("TooGenericExceptionCaught")
     private suspend fun releaseLogged(
+        operation: String,
         stream: String,
         contextHandle: Long,
         release: suspend () -> Unit,
@@ -455,7 +470,7 @@ class HotStreamFactory(
         } catch (e: Exception) {
             logger.log(
                 Level.WARNING,
-                "HotStreamFactory.stopAll: releasing $stream for context handle $contextHandle " +
+                "HotStreamFactory.$operation: releasing $stream for context handle $contextHandle " +
                     "failed; its registry entry is removed and the Rust subscription may stay live",
                 e,
             )
@@ -469,7 +484,8 @@ class HotStreamFactory(
      * with an unsubscribe call for a reason [contextEvents] states about its own subscribe
      * call: a cancellation landing between those two statements drops a caller's only route to
      * a live Rust subscription. The entry is removed before the unsubscribe call, so an
-     * unsubscribe that throws still leaves no local state behind, and its throw propagates.
+     * unsubscribe that throws still leaves no local state behind, and its throw propagates to
+     * [releaseLogged], which logs it.
      */
     private suspend fun removeEventSubscription(contextHandle: Long) {
         withContext(NonCancellable + ioDispatcher) {

@@ -33,7 +33,6 @@ import java.util.logging.Level
 import java.util.logging.LogRecord
 import java.util.logging.Logger
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -329,15 +328,27 @@ class StreamsTest {
             }
 
         @Test
-        fun `a single stop whose unsubscribe throws propagates and releases its registry entry`() =
+        fun `a single stop whose unsubscribe throws logs it and releases its registry entry`() =
             runTest {
                 val events = factory.contextEvents(42L)
                 val messages = factory.incomingMessages(42L)
                 stubBindings.onUnsubscribeEvents = { throw IllegalStateException("event unsubscribe failed") }
                 stubBindings.onUnsubscribeMessages = { throw IllegalStateException("message unsubscribe failed") }
 
-                assertFailsWith<IllegalStateException> { factory.stopContextEvents(42L) }
-                assertFailsWith<IllegalStateException> { factory.stopMessageStream(42L) }
+                // Neither stop throws: sdk-common §Cleanup error handling logs a cleanup failure.
+                val records =
+                    captureLogs(HotStreamFactory::class.java.name) {
+                        factory.stopContextEvents(42L)
+                        factory.stopMessageStream(42L)
+                    }
+
+                assertEquals(
+                    listOf("event unsubscribe failed", "message unsubscribe failed"),
+                    records.map { it.thrown?.message },
+                )
+                assertTrue(records.all { it.level == Level.WARNING })
+                assertTrue(records[0].message.startsWith("HotStreamFactory.stopContextEvents: "))
+                assertTrue(records[1].message.startsWith("HotStreamFactory.stopMessageStream: "))
 
                 // The entries are gone, so asking again opens a new subscription.
                 stubBindings.onUnsubscribeEvents = null
@@ -346,10 +357,20 @@ class StreamsTest {
                 assertTrue(messages !== factory.incomingMessages(42L))
                 assertEquals(2, stubBindings.eventSubscribeCount)
                 assertEquals(2, stubBindings.messageSubscribeCount)
+
+                // A stop whose unsubscribe succeeds logs nothing.
+                val cleanRecords =
+                    captureLogs(HotStreamFactory::class.java.name) {
+                        factory.stopContextEvents(42L)
+                        factory.stopMessageStream(42L)
+                    }
+                assertTrue(cleanRecords.isEmpty())
+                assertEquals(1, stubBindings.eventUnsubscribeCount)
+                assertEquals(1, stubBindings.messageUnsubscribeCount)
             }
 
         @Test
-        fun `stopAll from a cancelled caller releases every subscription`() =
+        fun `stopAll from a cancelled caller releases every subscription and logs no failure`() =
             runTest {
                 // A dispatcher distinct from runTest's makes each removal's withContext resume
                 // its caller by dispatch, which is where a cancelled caller throws.
@@ -358,16 +379,23 @@ class StreamsTest {
                 factory.contextEvents(43L)
                 factory.incomingMessages(42L)
 
-                val stopping =
-                    launch {
-                        cancel()
-                        factory.stopAll()
+                val records =
+                    captureLogs(HotStreamFactory::class.java.name) {
+                        val stopping =
+                            launch {
+                                cancel()
+                                factory.stopAll()
+                            }
+                        advanceUntilIdle()
+                        stopping.join()
                     }
-                advanceUntilIdle()
-                stopping.join()
 
                 assertEquals(2, stubBindings.eventUnsubscribeCount)
                 assertEquals(1, stubBindings.messageUnsubscribeCount)
+                // Every release succeeded. Without stopAll's NonCancellable wrapper each removal's
+                // withContext throws CancellationException on resuming this cancelled caller,
+                // and releaseLogged logs that throw as a failed release.
+                assertTrue(records.isEmpty(), "stopAll logged a successful release as failed: $records")
             }
 
         @Test
