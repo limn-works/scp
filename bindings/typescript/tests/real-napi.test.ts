@@ -697,16 +697,20 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanValidate(ctx, token.encoded, fullUri as string, member.did);
     });
 
-    // `contextCreate` rejects params whose ceiling is absent, null, or empty
-    // with SCP-VALID-7005 (construction.md M2), and creates a context whose
+    // `contextCreate` rejects params whose ceiling is absent or null with
+    // SCP-VALID-7004 and one whose ceiling is empty with SCP-VALID-7005
+    // (construction.md M2), and creates a context whose
     // handle carries a non-empty declared ceiling as written. The accepted
     // case proves the check does not reject every create.
-    test("an omitted, null or empty ceiling rejects with SCP-VALID-7005", async () => {
+    test("an omitted or null ceiling rejects with SCP-VALID-7004, an empty one with SCP-VALID-7005", async () => {
       const admin = await napi.identityCreate("in_memory");
-      for (const params of [{ memoryScope: "ephemeral" }, { ceiling: null }, { ceiling: [] }]) {
-        await expect(napi.contextCreate(admin, JSON.stringify(params))).rejects.toThrow(
-          /SCP-VALID-7005/,
-        );
+      const cases: [object, RegExp][] = [
+        [{ memoryScope: "ephemeral" }, /SCP-VALID-7004/],
+        [{ ceiling: null }, /SCP-VALID-7004/],
+        [{ ceiling: [] }, /SCP-VALID-7005/],
+      ];
+      for (const [params, code] of cases) {
+        await expect(napi.contextCreate(admin, JSON.stringify(params))).rejects.toThrow(code);
       }
 
       // `BridgeContextHandle` does not declare the addon handle's `ceiling`

@@ -569,8 +569,9 @@ struct ParsedContextParams {
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation`:
-/// - `SCP-VALID-7005` ([`ContextError::CeilingRequired`](scp_core::context::ContextError::CeilingRequired))
-///   if `ceiling` is absent, `null`, or an empty array;
+/// - `SCP-VALID-7004` ([`ContextError::CeilingRequired`](scp_core::context::ContextError::CeilingRequired))
+///   if `ceiling` is absent or `null`;
+/// - `SCP-VALID-7005` (the same variant) if `ceiling` is an empty array;
 /// - `SCP-VALID-7000` if the JSON is malformed or is not an object, if
 ///   `ceiling` is neither `null` nor an array, if a `ceiling` entry is not a
 ///   string, or if the parameters fail the common builder's validation.
@@ -610,19 +611,19 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
     // and hide the mistake behind a context that refuses the capability.
     let ceiling: Vec<String> = match &params["ceiling"] {
         serde_json::Value::Null => {
-            let detail = if params.get("ceiling").is_some() {
-                "`ceiling` is null"
+            let declared = if params.get("ceiling").is_some() {
+                scp_core::context::CeilingDeclaration::Null
             } else {
-                "no `ceiling` was declared"
+                scp_core::context::CeilingDeclaration::Absent
             };
             return Err(NapiError::from(ScpNapiError::from(
-                scp_core::context::ContextError::CeilingRequired(detail.to_owned()),
+                scp_core::context::ContextError::CeilingRequired(declared),
             )));
         }
         serde_json::Value::Array(entries) if entries.is_empty() => {
             return Err(NapiError::from(ScpNapiError::from(
                 scp_core::context::ContextError::CeilingRequired(
-                    "`ceiling` is an empty array".to_owned(),
+                    scp_core::context::CeilingDeclaration::Empty,
                 ),
             )));
         }
@@ -6853,8 +6854,9 @@ mod tests {
         }
     }
 
-    /// `context_create` rejects a params object whose ceiling is absent,
-    /// `null`, or an empty array with `SCP-VALID-7005`, and creates a context
+    /// `context_create` rejects a params object whose ceiling is absent or
+    /// `null` with `SCP-VALID-7004` and one whose ceiling is an empty array
+    /// with `SCP-VALID-7005`, and creates a context
     /// whose supervisor-held ceiling and role state carry a non-empty declared
     /// ceiling as written. The accepted case proves the check does not reject
     /// every create.
@@ -6869,19 +6871,24 @@ mod tests {
             .await
             .expect("identity_create should succeed");
 
-        for params_json in [
-            r#"{"memoryScope":"ephemeral"}"#,
-            r#"{"memoryScope":"ephemeral","ceiling":null}"#,
-            r#"{"memoryScope":"ephemeral","ceiling":[]}"#,
+        for (params_json, code) in [
+            (r#"{"memoryScope":"ephemeral"}"#, codes::VALID_7004),
+            (
+                r#"{"memoryScope":"ephemeral","ceiling":null}"#,
+                codes::VALID_7004,
+            ),
+            (
+                r#"{"memoryScope":"ephemeral","ceiling":[]}"#,
+                codes::VALID_7005,
+            ),
         ] {
             let err = super::context_create_on(&bi, &owner, params_json.to_owned())
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{params_json}: context_create must reject"));
             assert!(
-                err.reason.starts_with(&format!("[{}] ", codes::VALID_7005)),
-                "{params_json}: expected {}, got: {}",
-                codes::VALID_7005,
+                err.reason.starts_with(&format!("[{code}] ")),
+                "{params_json}: expected {code}, got: {}",
                 err.reason
             );
         }
@@ -6927,16 +6934,15 @@ mod tests {
             .collect()
     }
 
-    /// Asserts `params_json` fails to parse with `SCP-VALID-7005` and a
-    /// message naming `detail`.
-    fn assert_ceiling_required(params_json: &str, detail: &str) {
+    /// Asserts `params_json` fails to parse with `code` and a message naming
+    /// `detail`.
+    fn assert_ceiling_required(params_json: &str, code: &str, detail: &str) {
         let err = super::parse_context_params(params_json)
             .err()
             .unwrap_or_else(|| panic!("{params_json} must not parse"));
         assert!(
-            err.reason.starts_with(&format!("[{}] ", codes::VALID_7005)),
-            "{params_json}: expected {}, got: {}",
-            codes::VALID_7005,
+            err.reason.starts_with(&format!("[{code}] ")),
+            "{params_json}: expected {code}, got: {}",
             err.reason
         );
         assert!(
@@ -6946,29 +6952,37 @@ mod tests {
         );
     }
 
-    /// An absent `ceiling` key rejects: no default ceiling is substituted.
+    /// An absent `ceiling` key rejects as a missing required field
+    /// (`SCP-VALID-7004`): no default ceiling is substituted.
     #[test]
     fn parse_context_params_rejects_an_absent_ceiling() {
-        assert_ceiling_required(r#"{"mode":"Encrypted"}"#, "no `ceiling` was declared");
-        assert_ceiling_required("{}", "no `ceiling` was declared");
+        assert_ceiling_required(
+            r#"{"mode":"Encrypted"}"#,
+            codes::VALID_7004,
+            "no `ceiling` was declared",
+        );
+        assert_ceiling_required("{}", codes::VALID_7004, "no `ceiling` was declared");
     }
 
-    /// A `ceiling` key holding `null` rejects, the same as an absent key.
+    /// A `ceiling` key holding `null` rejects as a missing required field
+    /// (`SCP-VALID-7004`), the same as an absent key.
     #[test]
     fn parse_context_params_rejects_a_null_ceiling() {
         assert_ceiling_required(
             r#"{"mode":"Encrypted","ceiling":null}"#,
+            codes::VALID_7004,
             "`ceiling` is null",
         );
     }
 
-    /// An empty `ceiling` array rejects: it describes a context no member can
-    /// use.
+    /// An empty `ceiling` array rejects as an invalid field value
+    /// (`SCP-VALID-7005`): it describes a context no member can use.
     #[test]
     fn parse_context_params_rejects_an_empty_ceiling() {
         assert_ceiling_required(
             r#"{"mode":"Encrypted","ceiling":[]}"#,
-            "`ceiling` is an empty array",
+            codes::VALID_7005,
+            "`ceiling` is an empty list",
         );
     }
 

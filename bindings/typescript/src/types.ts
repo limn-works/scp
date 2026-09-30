@@ -80,8 +80,9 @@ export interface ContextParams {
    * Capability ceiling — maximum capabilities available in this context.
    *
    * Required and non-empty. `contextCreate` rejects params JSON whose
-   * `ceiling` is absent, `null`, or an empty array with `SCP-VALID-7005`;
-   * no default ceiling is substituted.
+   * `ceiling` is absent or `null` with `SCP-VALID-7004` and one whose
+   * `ceiling` is an empty array with `SCP-VALID-7005`; no default ceiling is
+   * substituted.
    */
   readonly ceiling: readonly string[];
   /** Outlet definitions to register at context creation. */

@@ -250,9 +250,9 @@ impl PyContextHandle {
 ///
 /// The dict carries a required `ceiling` and any of the optional keys below:
 /// - `ceiling` -- required non-empty list of capability strings
-///   (construction.md M2). Omitting this key, passing `None`, or passing `[]`
-///   raises `ValidationError` with `SCP-VALID-7005`; no default ceiling is
-///   substituted.
+///   (construction.md M2). Omitting this key or passing `None` raises
+///   `ValidationError` with `SCP-VALID-7004`, and passing `[]` raises it with
+///   `SCP-VALID-7005`; no default ceiling is substituted.
 /// - `roles` -- dict mapping role names to lists of capability strings
 /// - `outlets` -- list of outlet name strings
 /// - `ttl` -- float (seconds) or `None`
@@ -329,8 +329,9 @@ impl PyContextParams {
     ///
     /// # Errors
     ///
-    /// Returns `ValidationError` (`SCP-VALID-7005`) if `ceiling` is absent,
-    /// `None`, or empty, `TypeError` if a value has an unexpected type, or
+    /// Returns `ValidationError` (`SCP-VALID-7004` if `ceiling` is absent or
+    /// `None`, `SCP-VALID-7005` if it is empty), `TypeError` if a value has an
+    /// unexpected type, or
     /// `ValueError` if a value is out of the valid set.
     #[new]
     fn new(params: &Bound<'_, PyDict>) -> PyResult<Self> {
@@ -475,6 +476,33 @@ impl PyContextParams {
     }
 }
 
+/// The Python exception for a failed supervisor call named `op`.
+///
+/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130`, as the
+/// NAPI and `UniFFI` bridges report it (its doc states producers and retry
+/// behaviour); every other variant raises the uncoded `RuntimeError` this
+/// call site raised before.
+fn busy_or(op: &str, e: &scp_core::context::ContextError) -> PyErr {
+    actor_busy_error(op, e).map_or_else(
+        || PyRuntimeError::new_err(format!("{op} failed: {e}")),
+        PyErr::from,
+    )
+}
+
+/// The `SCP-CTX-2130` error [`busy_or`] raises for `ContextError::ActorBusy`,
+/// or `None` for every other variant.
+fn actor_busy_error(
+    op: &str,
+    e: &scp_core::context::ContextError,
+) -> Option<crate::error::ScpPyError> {
+    matches!(e, scp_core::context::ContextError::ActorBusy(_)).then(|| {
+        crate::error::ScpPyError::ContextError {
+            message: format!("{op} failed: {e}"),
+            code: codes::CTX_2130.to_owned(),
+        }
+    })
+}
+
 /// Valid template ID strings accepted from the Python bridge layer.
 ///
 /// These correspond to the `TemplateId` variants in scp-core, using the
@@ -509,34 +537,32 @@ impl PyContextParams {
         // An absent key or a `None` value declares no ceiling, which would
         // leave the context's security boundary to a default nobody chose; an
         // empty list declares a context no member can use. All three raise
-        // `ContextError::CeilingRequired` (`ValidationError`, SCP-VALID-7005)
+        // `ContextError::CeilingRequired` (`ValidationError`; SCP-VALID-7004
+        // for an absent key or `None`, SCP-VALID-7005 for an empty list)
         // before any context state exists. A non-empty list stands as written.
+        let ceiling_required = |declared| -> PyErr {
+            crate::error::ScpPyError::from(scp_core::context::ContextError::CeilingRequired(
+                declared,
+            ))
+            .into()
+        };
         let ceiling: Vec<String> = match dict.get_item("ceiling")? {
             Some(val) if !val.is_none() => val.extract()?,
             Some(_) => {
-                return Err(crate::error::ScpPyError::from(
-                    scp_core::context::ContextError::CeilingRequired(
-                        "`ceiling` is None".to_owned(),
-                    ),
-                )
-                .into());
+                return Err(ceiling_required(
+                    scp_core::context::CeilingDeclaration::Null,
+                ));
             }
             None => {
-                return Err(crate::error::ScpPyError::from(
-                    scp_core::context::ContextError::CeilingRequired(
-                        "no `ceiling` was declared".to_owned(),
-                    ),
-                )
-                .into());
+                return Err(ceiling_required(
+                    scp_core::context::CeilingDeclaration::Absent,
+                ));
             }
         };
         if ceiling.is_empty() {
-            return Err(crate::error::ScpPyError::from(
-                scp_core::context::ContextError::CeilingRequired(
-                    "`ceiling` is an empty list".to_owned(),
-                ),
-            )
-            .into());
+            return Err(ceiling_required(
+                scp_core::context::CeilingDeclaration::Empty,
+            ));
         }
 
         // roles: dict[str, list[str]] (default: empty)
@@ -2839,7 +2865,7 @@ impl crate::scp::PyScp {
         let owning = scp_did::DID(owning_did.to_owned());
         let (reservation_id, kp_public) = rt
             .block_on(async move { sup.reserve_key_package(owning).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("reserve_key_package failed: {e}")))?;
+            .map_err(|e| busy_or("reserve_key_package", &e))?;
         Ok((reservation_id.to_string(), kp_public))
     }
 
@@ -3030,9 +3056,7 @@ impl crate::scp::PyScp {
                 Ok(handle) => handle,
                 Err(e) => {
                     crate::runtime::remove_context(bi, &sealed.context_id);
-                    return Err(PyRuntimeError::new_err(format!(
-                        "context_join_from_welcome failed: {e}"
-                    )));
+                    return Err(busy_or("context_join_from_welcome", &e));
                 }
             };
 
@@ -3182,8 +3206,7 @@ impl crate::scp::PyScp {
         // `.zeroize()` call — is what triggers the wipe here.
         drop(signing_key);
 
-        let outcome =
-            outcome.map_err(|e| PyRuntimeError::new_err(format!("invite_member failed: {e}")))?;
+        let outcome = outcome.map_err(|e| busy_or("invite_member", &e))?;
         Ok(PyInviteMemberOutcome::from_outcome(outcome))
     }
 
@@ -8278,11 +8301,58 @@ mod tests {
         })
     }
 
-    /// Asserts `result` is the `ValidationError` carrying `SCP-VALID-7005`
-    /// and naming `detail`.
-    fn assert_ceiling_required<T>(result: PyResult<T>, detail: &str) {
+    /// `busy_or` raises `SCP-CTX-2130` for `ContextError::ActorBusy` and keeps
+    /// the uncoded `RuntimeError` for every other variant, on the
+    /// `reserve_key_package`, `context_join_from_welcome` and `invite_member`
+    /// failure paths.
+    #[test]
+    fn busy_or_raises_ctx_2130_only_for_actor_busy() {
+        use scp_core::context::ContextError;
+        match super::actor_busy_error(
+            "reserve_key_package",
+            &ContextError::ActorBusy("key-package actor".to_owned()),
+        ) {
+            Some(crate::error::ScpPyError::ContextError { message, code }) => {
+                assert_eq!(code, codes::CTX_2130);
+                assert!(
+                    message.starts_with("reserve_key_package failed: "),
+                    "{message}"
+                );
+            }
+            other => panic!("expected an SCP-CTX-2130 ContextError, got {other:?}"),
+        }
+        assert!(
+            super::actor_busy_error(
+                "context_join_from_welcome",
+                &ContextError::MembershipFailed("bad welcome".to_owned()),
+            )
+            .is_none(),
+            "a non-busy failure keeps the uncoded RuntimeError"
+        );
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let busy = super::busy_or("invite_member", &ContextError::ActorBusy("c".to_owned()));
+            assert!(
+                busy.is_instance_of::<crate::error::ContextError>(py),
+                "ActorBusy raises ContextError, got {busy}"
+            );
+            assert!(busy.to_string().contains(codes::CTX_2130), "{busy}");
+            let other = super::busy_or(
+                "invite_member",
+                &ContextError::MembershipFailed("x".to_owned()),
+            );
+            assert!(
+                other.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "a non-busy failure raises RuntimeError, got {other}"
+            );
+        });
+    }
+
+    /// Asserts `result` is the `ValidationError` carrying `code` and naming
+    /// `detail`.
+    fn assert_ceiling_required<T>(result: PyResult<T>, code: &str, detail: &str) {
         let Err(err) = result else {
-            panic!("expected SCP-VALID-7005 naming {detail:?}, got Ok");
+            panic!("expected {code} naming {detail:?}, got Ok");
         };
         Python::with_gil(|py| {
             assert!(
@@ -8292,30 +8362,35 @@ mod tests {
         });
         let text = err.to_string();
         assert!(
-            text.contains(codes::VALID_7005) && text.contains(detail),
-            "expected {} naming {detail:?}, got: {text}",
-            codes::VALID_7005
+            text.contains(code) && text.contains(detail),
+            "expected {code} naming {detail:?}, got: {text}"
         );
     }
 
-    /// A dict carrying no `ceiling` key rejects: no default is substituted.
+    /// A dict carrying no `ceiling` key rejects as a missing required field
+    /// (`SCP-VALID-7004`): no default is substituted.
     #[test]
     fn absent_ceiling_rejects() {
         pyo3::prepare_freethreaded_python();
-        assert_ceiling_required(params_from_dict(&[]), "no `ceiling` was declared");
+        assert_ceiling_required(
+            params_from_dict(&[]),
+            codes::VALID_7004,
+            "no `ceiling` was declared",
+        );
     }
 
-    /// A `ceiling` key holding Python `None` rejects, exactly as an absent key
-    /// does.
+    /// A `ceiling` key holding Python `None` rejects as a missing required
+    /// field (`SCP-VALID-7004`), exactly as an absent key does.
     #[test]
     fn none_ceiling_rejects() {
         pyo3::prepare_freethreaded_python();
         let result =
             Python::with_gil(|py| params_from_dict(&[("ceiling", py.None().into_bound(py))]));
-        assert_ceiling_required(result, "`ceiling` is None");
+        assert_ceiling_required(result, codes::VALID_7004, "`ceiling` is null or None");
     }
 
-    /// An empty list rejects: it describes a context no member can use.
+    /// An empty list rejects as an invalid field value (`SCP-VALID-7005`): it
+    /// describes a context no member can use.
     #[test]
     fn empty_ceiling_list_rejects() {
         pyo3::prepare_freethreaded_python();
@@ -8323,7 +8398,7 @@ mod tests {
             let empty: Vec<String> = Vec::new();
             params_from_dict(&[("ceiling", empty.into_pyobject(py).unwrap().into_any())])
         });
-        assert_ceiling_required(result, "`ceiling` is an empty list");
+        assert_ceiling_required(result, codes::VALID_7005, "`ceiling` is an empty list");
     }
 
     /// A supplied ceiling stands as written: no default is unioned into it.
@@ -8378,8 +8453,9 @@ mod tests {
         );
     }
 
-    /// `context_create` rejects a dict whose ceiling is absent, `None`, or an
-    /// empty list with `SCP-VALID-7005`, and creates a context whose
+    /// `context_create` rejects a dict whose ceiling is absent or `None` with
+    /// `SCP-VALID-7004` and one whose ceiling is an empty list with
+    /// `SCP-VALID-7005`, and creates a context whose
     /// supervisor-held role state carries a non-empty declared ceiling as
     /// written. The accepted case proves the check does not reject every
     /// create. No bridge copy is read.
@@ -8402,16 +8478,22 @@ mod tests {
                 params
             };
             let empty: Vec<String> = Vec::new();
-            for (ceiling, detail) in [
-                (None, "no `ceiling` was declared"),
-                (Some(py.None().into_bound(py)), "`ceiling` is None"),
+            for (ceiling, code, detail) in [
+                (None, codes::VALID_7004, "no `ceiling` was declared"),
+                (
+                    Some(py.None().into_bound(py)),
+                    codes::VALID_7004,
+                    "`ceiling` is null or None",
+                ),
                 (
                     Some(empty.into_pyobject(py).unwrap().into_any()),
+                    codes::VALID_7005,
                     "`ceiling` is an empty list",
                 ),
             ] {
                 assert_ceiling_required(
                     scp.context_create(&creator_did, &params_with(ceiling)),
+                    code,
                     detail,
                 );
             }

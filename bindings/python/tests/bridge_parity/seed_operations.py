@@ -328,7 +328,8 @@ OP_IDENTITY_CREATE = OpSpec(
 
 
 # Every create declares a non-empty ceiling: the PyO3 and NAPI bridges reject
-# an absent, null, or empty one with SCP-VALID-7005 (construction.md M2).
+# an absent or null one with SCP-VALID-7004 and an empty one with SCP-VALID-7005
+# (construction.md M2).
 _PARITY_CEILING = ["messages:read", "messages:write"]
 
 

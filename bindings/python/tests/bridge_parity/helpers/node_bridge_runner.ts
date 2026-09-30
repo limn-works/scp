@@ -411,7 +411,8 @@ async function opIdentityCreate(
 }
 
 // Every create declares a non-empty ceiling: the NAPI bridge rejects an
-// absent, null, or empty one with SCP-VALID-7005 (construction.md M2).
+// absent or null one with SCP-VALID-7004 and an empty one with SCP-VALID-7005
+// (construction.md M2).
 const PARITY_CEILING = ["messages:read", "messages:write"];
 
 async function opContextCreate(

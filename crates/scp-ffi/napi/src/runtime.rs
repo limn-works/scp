@@ -856,26 +856,35 @@ fn document_vm_key_resolver(
 pub fn supervisor(
     bi: &NapiBridgeInstance,
 ) -> napi::Result<&Arc<scp_core::context::supervisor::Supervisor>> {
+    typed_supervisor(bi).map_err(napi::Error::from)
+}
+
+/// [`supervisor`] with the refusal kept as the typed [`ScpNapiError`], so a
+/// caller that returns `ScpNapiError` passes the `SCP-CTX-2000` refusal on
+/// as built instead of re-wrapping the rendered `napi::Error` text.
+fn typed_supervisor(
+    bi: &NapiBridgeInstance,
+) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, ScpNapiError> {
     // Suspended: return error (recoverable — caller should resume()).
     // AlreadyShutDown: warn only — shutdown already destroyed state,
     // operations will fail naturally at MLS/transport layer.
     if bi.core.is_suspended() {
-        return Err(napi::Error::from(ScpNapiError::Context {
+        return Err(ScpNapiError::Context {
             message: "bridge is suspended — call resume() before performing operations".to_owned(),
             code: codes::CTX_2000.to_owned(),
-        }));
+        });
     }
     if bi.core.is_shutdown() {
         tracing::warn!("supervisor() called after shutdown — operations may fail");
     }
-    bi.core.try_supervisor().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Context {
+    bi.core
+        .try_supervisor()
+        .ok_or_else(|| ScpNapiError::Context {
             message: "Supervisor not yet attached — call context_create, \
-                      context_join_from_welcome, context_import, or init_supervisor first"
+                  context_join_from_welcome, context_import, or init_supervisor first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
         })
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,11 +1848,7 @@ pub async fn sync_role_state_from_manager(
     context_id: &str,
 ) -> Result<(), ScpNapiError> {
     use scp_core::context::actor::commands::QueriesCommand;
-    let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
-        message: e.to_string(),
-        code: codes::CTX_2000.to_owned(),
-    })?;
-    let sup = Arc::clone(sup);
+    let sup = Arc::clone(typed_supervisor(bi)?);
     // Route through the ADR-049 query shim. The handler returns
     // `Ok(None)` when the context is unknown, matching the legacy
     // `ContextManager::get_role_state` `Option` contract.
@@ -1959,11 +1964,7 @@ pub async fn read_live_context_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
 ) -> Result<Option<scp_core::context::ContextState>, ScpNapiError> {
-    let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
-        message: e.to_string(),
-        code: codes::CTX_2000.to_owned(),
-    })?;
-    let sup = Arc::clone(sup);
+    let sup = Arc::clone(typed_supervisor(bi)?);
     sup.read_context_state_checked(context_id)
         .await
         .map_err(ScpNapiError::from)
@@ -2342,6 +2343,49 @@ mod tests {
             Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
             "supervisor(&bi) must match bi.core.try_supervisor()"
         );
+    }
+
+    /// `read_live_context_state` passes the `SCP-CTX-2000` refusal on as
+    /// `supervisor` built it: one code, and no rendered `napi::Error` status
+    /// inside the message. Covers a bridge with no supervisor, a suspended
+    /// one, and an attached one that answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_live_context_state_keeps_the_ctx_2000_refusal_as_built() {
+        let assert_refusal = |err: ScpNapiError, expected: &str| {
+            let rendered = err.to_string();
+            assert!(
+                matches!(&err, ScpNapiError::Context { code, .. } if code == codes::CTX_2000),
+                "expected an SCP-CTX-2000 context error, got {err:?}"
+            );
+            assert!(
+                rendered.starts_with(&format!("[{}] context error: {expected}", codes::CTX_2000)),
+                "rendered: {rendered}"
+            );
+            assert_eq!(
+                rendered.matches(codes::CTX_2000).count(),
+                1,
+                "the code appears once: {rendered}"
+            );
+            assert!(
+                !rendered.contains("GenericFailure"),
+                "the message re-wraps a rendered napi::Error: {rendered}"
+            );
+        };
+
+        let bi = NapiBridgeInstance::new_napi();
+        let err = read_live_context_state(&bi, "ctx-none").await.unwrap_err();
+        assert_refusal(err, "Supervisor not yet attached");
+
+        init_supervisor_for_test_on(&bi);
+        assert_eq!(
+            read_live_context_state(&bi, "ctx-none").await.unwrap(),
+            None,
+            "an attached supervisor answers for a context it does not serve"
+        );
+
+        bi.core.suspend().expect("suspend");
+        let err = read_live_context_state(&bi, "ctx-none").await.unwrap_err();
+        assert_refusal(err, "bridge is suspended");
     }
 
     #[test]

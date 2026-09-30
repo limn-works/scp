@@ -248,6 +248,28 @@ impl ContextState {
 // ContextError
 // ---------------------------------------------------------------------------
 
+/// What a context create declared in place of a non-empty capability ceiling
+/// ([`ContextError::CeilingRequired`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingDeclaration {
+    /// The parameters carried no `ceiling` key.
+    Absent,
+    /// The `ceiling` key held `null` (`None` in Python).
+    Null,
+    /// The `ceiling` key held an empty list.
+    Empty,
+}
+
+impl std::fmt::Display for CeilingDeclaration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Absent => "no `ceiling` was declared",
+            Self::Null => "`ceiling` is null or None",
+            Self::Empty => "`ceiling` is an empty list",
+        })
+    }
+}
+
 /// Errors produced by context lifecycle operations.
 ///
 /// Error codes follow the `SCP-CTX-` prefix (range 2000-2999) as defined in
@@ -280,11 +302,15 @@ pub enum ContextError {
     /// default nobody chose, and an empty ceiling describes a context no
     /// member can use, so neither is created. The NAPI and `PyO3` bridges
     /// raise this variant from their context-parameter parsers, before any
-    /// context state exists. Each bridge's error translator maps it to
-    /// `SCP-VALID-7005` (invalid field value). The string names which of the
-    /// three inputs the caller sent.
+    /// context state exists; the core create path does not raise it, so a
+    /// Rust or `UniFFI` caller that passes an empty ceiling still creates a
+    /// context. Each bridge's error translator maps
+    /// [`CeilingDeclaration::Absent`] and [`CeilingDeclaration::Null`] to
+    /// `SCP-VALID-7004` (missing required field) and
+    /// [`CeilingDeclaration::Empty`] to `SCP-VALID-7005` (invalid field
+    /// value).
     #[error("context creation requires a non-empty capability ceiling: {0}")]
-    CeilingRequired(String),
+    CeilingRequired(CeilingDeclaration),
 
     /// An operation was attempted that requires the context to be in the
     /// `Active` state, but the context is in a different state.

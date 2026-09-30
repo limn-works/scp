@@ -1381,11 +1381,18 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
-            // construction.md M2: a create with no ceiling, a null one, or an
-            // empty one is an invalid field value, not a context failure.
-            CE::CeilingRequired(_) => Self::Validation {
+            // construction.md M2: a create with no ceiling or a null one omits
+            // a required field; an empty one is an invalid field value. The
+            // UniFFI create path does not raise this variant yet; the arm keeps
+            // the translation identical across the three bridges.
+            CE::CeilingRequired(declared) => Self::Validation {
                 msg: format!("{e}"),
-                code: codes::VALID_7005.to_owned(),
+                code: match declared {
+                    scp_core::context::CeilingDeclaration::Absent
+                    | scp_core::context::CeilingDeclaration::Null => codes::VALID_7004,
+                    scp_core::context::CeilingDeclaration::Empty => codes::VALID_7005,
+                }
+                .to_owned(),
             },
             // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
             // `ContextError::ActorBusy` doc states producers and retry behaviour.
@@ -23484,14 +23491,21 @@ mod tests {
     }
 
     /// construction.md M2: a create that declared no usable ceiling surfaces
-    /// as a validation error with `SCP-VALID-7005`, not a context error.
+    /// as a validation error, not a context error: an absent or null ceiling
+    /// with `SCP-VALID-7004`, an empty one with `SCP-VALID-7005`.
     #[test]
-    fn ceiling_required_surfaces_valid_7005() {
-        let err: ScpError =
-            scp_core::context::ContextError::CeilingRequired("empty".to_owned()).into();
-        match err {
-            ScpError::Validation { code, .. } => assert_eq!(code, codes::VALID_7005),
-            other => panic!("expected ScpError::Validation, got {other:?}"),
+    fn ceiling_required_surfaces_valid_7004_or_7005() {
+        use scp_core::context::CeilingDeclaration as D;
+        for (declared, expected) in [
+            (D::Absent, codes::VALID_7004),
+            (D::Null, codes::VALID_7004),
+            (D::Empty, codes::VALID_7005),
+        ] {
+            let err: ScpError = scp_core::context::ContextError::CeilingRequired(declared).into();
+            match err {
+                ScpError::Validation { code, .. } => assert_eq!(code, expected, "{declared:?}"),
+                other => panic!("expected ScpError::Validation, got {other:?}"),
+            }
         }
     }
 
