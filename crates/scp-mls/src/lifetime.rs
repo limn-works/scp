@@ -46,7 +46,9 @@
 //! - `KeyPackageIn::validate`: [`crate::group::add_member`],
 //!   [`crate::group::key_package_in_did`], and the staged-commit Add
 //!   proposals in [`crate::encrypt::decrypt_with_sender_did`] and
-//!   [`crate::encrypt::decrypt_with_membership_changes`].
+//!   [`crate::encrypt::decrypt_with_membership_changes`], and the runtime
+//!   backend's `validate_key_package` in `scp-runtime`
+//!   (`crypto/mls/production_backend.rs` and `crypto/mls/provider.rs`).
 //! - Welcome tree leaves: `validate_tree_leaf_lifetimes`, called by
 //!   [`crate::group::join_group_from_bytes`] after `StagedWelcome::into_group`
 //!   and before it builds the `ScpMlsGroup`. openmls 0.9.0 makes

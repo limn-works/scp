@@ -112,4 +112,4 @@ pub use wrapping_extension::{
 // `ScpMlsProvider<S>` snapshots out to durable storage; an in-browser client
 // snapshots it to `IndexedDB` out-of-band. It lives in `scp-mls` so the sync MLS
 // machine is self-contained (ADR-057).
-pub use provider::{InMemoryMlsProvider, wipe_memory_storage};
+pub use provider::InMemoryMlsProvider;

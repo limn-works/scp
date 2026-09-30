@@ -69,7 +69,7 @@ impl Drop for InMemoryMlsProvider {
 /// A poisoned lock does not stop the wipe: the map is taken from the poison
 /// error and wiped anyway, because a panic elsewhere does not make the key
 /// material less sensitive.
-pub fn wipe_memory_storage(storage: &MemoryStorage) {
+pub(crate) fn wipe_memory_storage(storage: &MemoryStorage) {
     let mut values = storage
         .values
         .write()

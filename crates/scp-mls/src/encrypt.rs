@@ -79,9 +79,12 @@ fn process_inbound(
 /// `ProcessedMessageContent::OwnPrivateMessage`, an undecrypted body, and an
 /// unverified signature; the typed error lets the receive loop drop it benignly
 /// instead of reading an unauthenticated sender or AAD.
-/// `ProcessedMessageContent::OwnPendingCommit` gets the same error. openmls
-/// produces it only for a `PublicMessage` Commit, which SCP's
-/// `PURE_CIPHERTEXT` wire-format policy never accepts.
+/// `ProcessedMessageContent::OwnPendingCommit` gets the same error, but a
+/// `PrivateMessage` never reaches it: openmls 0.9.0's `from_inbound_ciphertext`
+/// (`framing/validation.rs`) returns `OwnPrivateMessage` for every
+/// `PrivateMessage` whose sender is the local member, before decryption, so a
+/// member's own Commit sent as a `PrivateMessage` also arrives as
+/// `OwnPrivateMessage`.
 fn reject_own_echo(processed: &ProcessedMessage) -> Result<(), MlsError> {
     match processed.content() {
         ProcessedMessageContent::OwnPrivateMessage | ProcessedMessageContent::OwnPendingCommit => {
