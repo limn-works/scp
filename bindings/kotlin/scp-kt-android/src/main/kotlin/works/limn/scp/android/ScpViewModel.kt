@@ -53,9 +53,7 @@ data class TrackedContext(
  * Per ADR-028, the recommended pattern is:
  * 1. Create [CoroutineBridge] and context handles in the ViewModel
  * 2. Track contexts via [trackContext]
- * 3. Expose message flows as a [kotlinx.coroutines.flow.StateFlow] of the messages received so
- *    far: accumulate them with `runningFold`, then `stateIn(viewModelScope,
- *    SharingStarted.WhileSubscribed(5000), emptyList())`
+ * 3. Expose message flows via `stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())`
  * 4. Let [onCleared], which this class already overrides, call
  *    [works.limn.scp.bridge.ContextBridge.leave] on every tracked context
  *
@@ -69,11 +67,9 @@ data class TrackedContext(
  *         trackContext(TrackedContext(contextHandle, identityHandle, bridge))
  *     }
  *
- *     // No asLifecycleFlow here: it needs a LifecycleOwner, which a ViewModel must not hold.
- *     // WhileSubscribed stops the upstream once the UI stops collecting.
  *     val messages: StateFlow<List<String>> = bridge.context
  *         .subscribe(contextHandle)
- *         .runningFold(emptyList<String>()) { received, message -> received + message }
+ *         .asLifecycleFlow(...)
  *         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
  * }
  * ```

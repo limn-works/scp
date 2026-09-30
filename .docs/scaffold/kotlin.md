@@ -243,20 +243,6 @@ class Identity private constructor(private val handle: IdentityHandle) {
 
 `SCP`, `Relay`, `Node` (`scp-kt`), and `ScpHotStreams` (`scp-kt-android`) each expose their teardown as one `suspend` function, `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()`, and `ScpHotStreams.close()`, and implement no `AutoCloseable` or `Closeable`, so no `use { }` block applies to them. `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" states why.
 
-```kotlin
-// Call shutdown() from a coroutine the caller owns, never through runBlocking. Run it under
-// NonCancellable: a finally block usually runs because the coroutine was cancelled, and in a
-// cancelled coroutine the bridge's withContext(ioDispatcher) throws CancellationException
-// before the FFI call starts, so a bare shutdown() tears nothing down. SCP.withStorage is not a
-// suspend function and blocks its calling thread on JNA, so this runs it on ioDispatcher.
-val scp = withContext(ioDispatcher) { SCP.withStorage(config) }
-try {
-    scp.contextCreate(identity, params)
-} finally {
-    withContext(NonCancellable) { scp.shutdown(bridge) }
-}
-```
-
 ## Maven Central Publishing
 
 Published as `works.limn:scp-kt` on Maven Central.
