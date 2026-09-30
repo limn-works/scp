@@ -16,7 +16,10 @@
     /// Errors produced by `AppleDeviceAttestation`.
     public nonisolated enum AttestationError: Error, Sendable {
         /// The platform App Attest service returned an error other than
-        /// `DCError.featureUnsupported`.
+        /// `DCError.featureUnsupported`, or the caller's task was cancelled
+        /// while its App Attest call waited in the queue or for Apple's
+        /// answer. The adapter maps that Swift `CancellationError` to this
+        /// case, as it maps every error that is not an `AttestationError`.
         case serviceError(String)
         /// App Attest is unsupported: `DCAppAttestService` reports
         /// `isSupported == false`, or an App Attest call answers with
@@ -39,6 +42,12 @@
         /// `A` of `09-security-model.md` §9.3.1 that App Attest takes as
         /// `clientDataHash`.
         case invalidClientDataHash(String)
+        /// App Attest did not answer one serialized call within
+        /// `AppleDeviceAttestation.appAttestCallTimeLimit`, 25 seconds. The
+        /// adapter runs the next queued call and discards any answer Apple
+        /// gives the timed-out call later: that answer stores no key ID and
+        /// reaches no caller.
+        case timedOut(String)
     }
 
     extension AttestationError {
@@ -54,6 +63,7 @@
                 .Identity(msg: "no App Attest key ID is stored; call attest first", code: "SCP-ATTEST-9020")
             case let .internalError(msg): .Identity(msg: msg, code: "SCP-ATTEST-9025")
             case let .invalidClientDataHash(msg): .Identity(msg: msg, code: "SCP-ATTEST-9026")
+            case let .timedOut(msg): .Identity(msg: msg, code: "SCP-ATTEST-9027")
             }
         }
 
@@ -134,15 +144,24 @@
     /// `callSerializer`, an actor, runs the App Attest calls of every `attest`
     /// and `assertRequest`, key generation included, one call at a time, in
     /// the order the serializer accepts them. Each call therefore reads the
-    /// stored key ID after every preceding call finished writing it, and
-    /// concurrent `attest` calls on a device with no stored key generate one
-    /// key. `attest` and
-    /// `assertRequest` check `isSupported` and the 32-byte length before they
-    /// queue a call, so a call either check rejects waits for no other call.
-    /// `attestKey` and `generateAssertion` bridge to structured concurrency
-    /// through `withCheckedContinuation` and return Apple's answer as a
-    /// `Result`; `generateKey` bridges through
-    /// `withCheckedThrowingContinuation`.
+    /// stored key ID after every preceding call ended, and concurrent
+    /// `attest` calls on a device with no stored key generate one key.
+    /// `attest` and `assertRequest` check `isSupported` and the 32-byte
+    /// length before they queue a call, so a call either check rejects waits
+    /// for no other call.
+    ///
+    /// One serialized call ends at the first of three events: Apple answers
+    /// it, `appAttestCallTimeLimit` (25 seconds) passes, or the caller's task
+    /// is cancelled. On the time limit the caller gets `SCP-ATTEST-9027`; on
+    /// cancellation it gets `SCP-ATTEST-9001`, the case every error that is
+    /// not an `AttestationError` maps to. Either way the serializer runs the
+    /// next queued call, and a completion handler Apple runs after the call
+    /// ended stores no key ID, starts no further App Attest call, and reaches
+    /// no caller. A caller cancelled while queued leaves the queue and never
+    /// reaches Apple. After a timeout or a cancellation, Apple can still be
+    /// working on the abandoned call while the next call runs, and a
+    /// `generateKey` that ended that way leaves a key no stored ID names, so
+    /// the next `attest` generates another.
     ///
     /// The lock and the serializer belong to the `UserDefaults` object that
     /// holds the key ID, not to one instance: `AppAttestKeyStateGuard`
@@ -168,9 +187,20 @@
         private let lock: NSLock
 
         /// Runs one App Attest call at a time, so each call reads the stored
-        /// key ID after every preceding call finished writing it, and
-        /// concurrent `attest` calls generate one key.
+        /// key ID after every preceding call ended, and concurrent `attest`
+        /// calls generate one key.
         private let callSerializer: AppAttestCallSerializer
+
+        /// How long one serialized App Attest call may run before its caller
+        /// gets `SCP-ATTEST-9027`.
+        private let callTimeLimit: Duration
+
+        /// The time limit on one serialized App Attest call: 25 seconds,
+        /// below the 30-second `HANDLER_TIMEOUT` a runtime actor handler
+        /// waits, so a Rust caller receives `SCP-ATTEST-9027` rather than
+        /// its own timeout (ADR-025 acceptance criterion 3, the call-ordering
+        /// item).
+        static let appAttestCallTimeLimit: Duration = .seconds(25)
 
         /// The value of `DCAppAttestService.isSupported`, and nothing more.
         ///
@@ -194,6 +224,7 @@
         public init() {
             service = DCAppAttestService.shared
             defaults = UserDefaults.standard
+            callTimeLimit = Self.appAttestCallTimeLimit
             let keyStateGuard = AppAttestKeyStateGuard.guarding(defaults)
             lock = keyStateGuard.lock
             callSerializer = keyStateGuard.callSerializer
@@ -201,16 +232,27 @@
 
         /// Testing initializer that accepts injected dependencies.
         ///
-        /// Used in unit tests to supply a mock `DCAppAttestService` subclass and
-        /// an in-memory `UserDefaults` suite. Every adapter built over one
-        /// `defaults` object shares one lock and one serializer, as every
-        /// adapter `init()` builds does.
-        init(service: DCAppAttestService, defaults: UserDefaults) {
+        /// Used in unit tests to supply a mock `DCAppAttestService` subclass, an
+        /// in-memory `UserDefaults` suite, and a time limit shorter than 25
+        /// seconds. Every adapter built over one `defaults` object shares one
+        /// lock and one serializer, as every adapter `init()` builds does.
+        init(
+            service: DCAppAttestService,
+            defaults: UserDefaults,
+            callTimeLimit: Duration = AppleDeviceAttestation.appAttestCallTimeLimit
+        ) {
             self.service = service
             self.defaults = defaults
+            self.callTimeLimit = callTimeLimit
             let keyStateGuard = AppAttestKeyStateGuard.guarding(defaults)
             lock = keyStateGuard.lock
             callSerializer = keyStateGuard.callSerializer
+        }
+
+        /// The number of callers waiting in this adapter's serializer queue,
+        /// not counting the call it is running.
+        func waitingAppAttestCallCount() async -> Int {
+            await callSerializer.waitingCallCount
         }
 
         /// Report whether this adapter and `other` share one lock and one
@@ -238,8 +280,9 @@
         /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
         ///   `AttestationError.unsupported`, `SCP-ATTEST-9026` for
         ///   `AttestationError.invalidClientDataHash`, `SCP-ATTEST-9001` for
-        ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
-        ///   `AttestationError.internalError`, in the cases
+        ///   `AttestationError.serviceError`, `SCP-ATTEST-9025` for
+        ///   `AttestationError.internalError`, or `SCP-ATTEST-9027` for
+        ///   `AttestationError.timedOut`, in the cases
         ///   `attestReportingAttestationError(challenge:deviceId:)` lists.
         public func attest(challenge: Data, deviceId: Data) async throws(ScpError) -> Data {
             do throws(AttestationError) {
@@ -257,8 +300,9 @@
         ///   `AttestationError.unsupported`, `SCP-ATTEST-9026` for
         ///   `AttestationError.invalidClientDataHash`, `SCP-ATTEST-9020` for
         ///   `AttestationError.keyNotFound`, `SCP-ATTEST-9001` for
-        ///   `AttestationError.serviceError`, or `SCP-ATTEST-9025` for
-        ///   `AttestationError.internalError`, in the cases
+        ///   `AttestationError.serviceError`, `SCP-ATTEST-9025` for
+        ///   `AttestationError.internalError`, or `SCP-ATTEST-9027` for
+        ///   `AttestationError.timedOut`, in the cases
         ///   `assertRequestReportingAttestationError(requestHash:)` lists.
         public func assertRequest(requestHash: Data) async throws(ScpError) -> Data {
             do throws(AttestationError) {
@@ -299,9 +343,12 @@
         ///   and `challenge` is not 32 bytes; this method then generates no
         ///   key and calls no App Attest method.
         ///   `AttestationError.serviceError` when `generateKey` or `attestKey`
-        ///   answers with any other error.
+        ///   answers with any other error, or when the caller's task is
+        ///   cancelled while the call is queued or outstanding.
         ///   `AttestationError.internalError` when `generateKey` or `attestKey`
         ///   answers with neither a value nor an error.
+        ///   `AttestationError.timedOut` when `generateKey` and `attestKey`
+        ///   together take longer than `appAttestCallTimeLimit`.
         func attestReportingAttestationError(
             challenge: Data,
             deviceId _: Data
@@ -321,29 +368,23 @@
 
             // The two checks above run before the call is queued, so a call
             // they reject waits for no other call. The key ID is read inside
-            // the serialized body, so it follows every write a preceding call
-            // made, and concurrent first calls generate one key.
-            let outcome = await callSerializer.run { [self] () -> Result<Data, AttestationError> in
-                let keyId: String
-                do {
-                    keyId = try await resolveKeyId()
-                } catch let error as AttestationError {
-                    return .failure(error)
-                } catch {
-                    return .failure(.serviceError(error.localizedDescription))
+            // the serialized call, so it follows every preceding call's write,
+            // and concurrent first calls generate one key.
+            let outcome = await callSerializer.run(timeLimit: callTimeLimit) { [self] call in
+                if let keyId = loadKeyId() {
+                    requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                    return
                 }
-
-                return await withCheckedContinuation { continuation in
-                    service.attestKey(keyId, clientDataHash: challenge) { attestation, error in
-                        if let error {
-                            continuation.resume(returning: .failure(.fromAppAttest(error, call: "attestKey")))
-                        } else if let attestation {
-                            continuation.resume(returning: .success(attestation))
-                        } else {
-                            continuation.resume(returning: .failure(.internalError(
-                                "attestKey returned neither attestation nor error"
-                            )))
-                        }
+                service.generateKey { [self] keyId, error in
+                    if let error {
+                        call.end(with: .failure(.fromAppAttest(error, call: "generateKey")))
+                    } else if let keyId {
+                        // A key ID that arrives after the call ended is
+                        // discarded: it is neither stored nor attested.
+                        guard call.whileOpen({ storeKeyId(keyId) }) else { return }
+                        requestAttestation(keyId: keyId, challenge: challenge, call: call)
+                    } else {
+                        call.end(with: .failure(.internalError("generateKey returned neither keyId nor error")))
                     }
                 }
             }
@@ -377,9 +418,12 @@
         ///   `AttestationError.keyNotFound` when no key ID is stored, because
         ///   no `attest` call has generated a key.
         ///   `AttestationError.serviceError` when `generateAssertion` answers
-        ///   with any other error.
+        ///   with any other error, or when the caller's task is cancelled while
+        ///   the call is queued or outstanding.
         ///   `AttestationError.internalError` when `generateAssertion` answers
         ///   with neither an assertion nor an error.
+        ///   `AttestationError.timedOut` when `generateAssertion` does not
+        ///   answer within `appAttestCallTimeLimit`.
         func assertRequestReportingAttestationError(
             requestHash: Data
         ) async throws(AttestationError) -> Data {
@@ -396,24 +440,20 @@
                 )
             }
 
-            // The key ID is read inside the serialized body for the reason
+            // The key ID is read inside the serialized call for the reason
             // `attestReportingAttestationError(challenge:deviceId:)` states.
-            let outcome = await callSerializer.run { [self] () -> Result<Data, AttestationError> in
+            let outcome = await callSerializer.run(timeLimit: callTimeLimit) { [self] call in
                 guard let keyId = loadKeyId() else {
-                    return .failure(.keyNotFound)
+                    call.end(with: .failure(.keyNotFound))
+                    return
                 }
-
-                return await withCheckedContinuation { continuation in
-                    service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
-                        if let error {
-                            continuation.resume(returning: .failure(.fromAppAttest(error, call: "generateAssertion")))
-                        } else if let assertion {
-                            continuation.resume(returning: .success(assertion))
-                        } else {
-                            continuation.resume(returning: .failure(.internalError(
-                                "generateAssertion returned neither assertion nor error"
-                            )))
-                        }
+                service.generateAssertion(keyId, clientDataHash: requestHash) { assertion, error in
+                    if let error {
+                        call.end(with: .failure(.fromAppAttest(error, call: "generateAssertion")))
+                    } else if let assertion {
+                        call.end(with: .success(assertion))
+                    } else {
+                        call.end(with: .failure(.internalError("generateAssertion returned neither assertion nor error")))
                     }
                 }
             }
@@ -422,53 +462,21 @@
 
         // MARK: - Private helpers
 
-        /// Retrieve the stored App Attest key ID, or generate and store a new one.
+        /// Ask App Attest to attest `keyId` over `challenge`, and end `call`
+        /// with its answer.
         ///
-        /// A caller reaches this method through `callSerializer`, which is what
-        /// makes concurrent callers that find no stored key ID generate one key
-        /// rather than one each: the second caller reads the key ID only after
-        /// the first caller stored it. `loadKeyId()` reads `UserDefaults` under
-        /// `lock` on every call, and this adapter caches no key ID.
-        ///
-        /// - Returns: An App Attest key ID string suitable for use in
-        ///   `attestKey(_:clientDataHash:)` and `generateAssertion(_:clientDataHash:)`.
-        /// - Throws: `AttestationError.unsupported` if `generateKey` answers
-        ///   `DCError.featureUnsupported`, `AttestationError.serviceError` if it
-        ///   answers any other error, `AttestationError.internalError` if it
-        ///   answers neither a key ID nor an error.
-        private func resolveKeyId() async throws -> String {
-            if let stored = loadKeyId() {
-                return stored
-            }
-            return try await generateAndStoreKey()
-        }
-
-        /// Generate a new App Attest key and persist its ID.
-        ///
-        /// Wraps `DCAppAttestService.generateKey(completionHandler:)` via
-        /// `withCheckedThrowingContinuation` to produce an `async` function.
-        ///
-        /// - Returns: The newly generated App Attest key ID.
-        /// - Throws: `AttestationError.unsupported` if the service call answers
-        ///   `DCError.featureUnsupported`, `AttestationError.serviceError` if it
-        ///   answers any other error, `AttestationError.internalError` if it
-        ///   answers neither a key ID nor an error.
-        private func generateAndStoreKey() async throws -> String {
-            let keyId: String = try await withCheckedThrowingContinuation { continuation in
-                service.generateKey { keyId, error in
-                    if let error {
-                        continuation.resume(throwing: AttestationError.fromAppAttest(error, call: "generateKey"))
-                    } else if let keyId {
-                        continuation.resume(returning: keyId)
-                    } else {
-                        continuation.resume(throwing: AttestationError.internalError(
-                            "generateKey returned neither keyId nor error"
-                        ))
-                    }
+        /// `call` ends at most once, so an answer that arrives after the time
+        /// limit or the caller's cancellation ended `call` reaches no caller.
+        private func requestAttestation(keyId: String, challenge: Data, call: AppAttestCall) {
+            service.attestKey(keyId, clientDataHash: challenge) { attestation, error in
+                if let error {
+                    call.end(with: .failure(.fromAppAttest(error, call: "attestKey")))
+                } else if let attestation {
+                    call.end(with: .success(attestation))
+                } else {
+                    call.end(with: .failure(.internalError("attestKey returned neither attestation nor error")))
                 }
             }
-            storeKeyId(keyId)
-            return keyId
         }
 
         // MARK: Persistence (UserDefaults)
@@ -539,55 +547,199 @@
     /// Runs App Attest calls one at a time, in the order it accepts them.
     ///
     /// The serializer accepts a call when the actor runs that caller's
-    /// `run(_:)` job. Swift's default actor executor does not promise to run
-    /// jobs in the order callers made them: it may run a later,
-    /// higher-priority caller's job before an earlier, lower-priority one. So
-    /// the order App Attest sees is the acceptance order, not the order in
-    /// which callers called `attest` or `assertRequest`. Mutual exclusion and
-    /// the one-key guarantee do not depend on that order.
+    /// `run(timeLimit:_:)` job. Swift's default actor executor does not
+    /// promise to run jobs in the order callers made them: it may run a
+    /// later, higher-priority caller's job before an earlier, lower-priority
+    /// one. So the order App Attest sees is the acceptance order, not the
+    /// order in which callers called `attest` or `assertRequest`. Mutual
+    /// exclusion and the one-key guarantee do not depend on that order.
     ///
     /// **Why serialization, rather than a lock around the key-ID read:**
     /// `generateKey` answers through a completion handler, so a lock cannot be
     /// held from the read that finds no stored key ID to the write that stores
     /// the generated one. Two first `attest` calls that each held the lock only
     /// for the read would both find no key ID and generate one key each.
-    /// Running each call's whole body, from the key-ID read through Apple's
-    /// answer, before the next body starts makes each read follow every
-    /// preceding call's write.
+    /// Running each call, from the key-ID read through Apple's answer, before
+    /// the next call starts makes each read follow every preceding call's
+    /// write.
     ///
-    /// `run(_:)` chains each caller's work onto whatever work this serializer
-    /// last accepted, and it publishes that chaining inside actor isolation, so
-    /// two callers that arrive together take distinct positions in one order
-    /// rather than both reading an empty tail.
-    ///
-    /// **Cost:** each call waits until every call this serializer accepted
-    /// before it finishes, so an `assertRequest` accepted after an `attest`
-    /// waits while that `attest`'s `attestKey` call waits for Apple's server.
-    /// `run(_:)` puts no time bound on that wait. Cancelling a caller's task
-    /// neither removes its body from the chain nor ends the caller's wait,
-    /// because the body runs in an unstructured `Task` and `Task.value` does
-    /// not return early when the awaiting task is cancelled. When one App
-    /// Attest completion handler never runs, every later call over the same
-    /// `UserDefaults` object therefore waits forever. ADR-025, the Apple
-    /// platform adapter, records this cost in the call-ordering item of
-    /// acceptance criterion 3.
+    /// **Bound and cancellation** (ADR-025 acceptance criterion 3): a running
+    /// call ends at the first of Apple's answer, `timeLimit`, or the caller's
+    /// cancellation, and the serializer then starts the next queued call.
+    /// `AppAttestCall` discards whatever Apple answers after that. A caller
+    /// cancelled while queued leaves the queue without reaching Apple. Time
+    /// spent queued counts against no limit: each call ahead of a caller runs
+    /// for at most `timeLimit`.
     private actor AppAttestCallSerializer {
-        /// Work this serializer last accepted, which the next caller waits for.
-        private var tail: Task<Void, Never>?
+        /// Whether a call holds the serializer.
+        private var running = false
+        /// Callers waiting for the serializer, first in line first. Each
+        /// continuation resumes with `true` when its caller's call starts,
+        /// or `false` when that caller was cancelled first.
+        private var waiting: [(ticket: UInt64, turn: CheckedContinuation<Bool, Never>)] = []
+        private var nextTicket: UInt64 = 0
 
-        /// Run `body` after every call this serializer already accepted, and
-        /// return what `body` returned.
+        /// The number of callers waiting, not counting the running call.
+        var waitingCallCount: Int {
+            waiting.count
+        }
+
+        /// Wait for every call this serializer accepted earlier to end, then
+        /// run one call: `start` hands it to App Attest, and the call ends at
+        /// the first of Apple's answer, `timeLimit`, or the caller's
+        /// cancellation.
         ///
-        /// - Parameter body: One App Attest call, together with the key-ID
-        ///   read and write it makes.
-        func run<Outcome: Sendable>(_ body: @Sendable @escaping () async -> Outcome) async -> Outcome {
-            let predecessor = tail
-            let work = Task<Outcome, Never> {
-                await predecessor?.value
-                return await body()
+        /// - Parameter start: Starts the call's App Attest work and ends the
+        ///   `AppAttestCall` it receives from Apple's completion handlers.
+        /// - Returns: What ended the call; a cancelled caller receives
+        ///   `AppAttestCall.cancelledOutcome`, whether it was queued or
+        ///   running.
+        func run(
+            timeLimit: Duration,
+            _ start: @Sendable @escaping (AppAttestCall) -> Void
+        ) async -> Result<Data, AttestationError> {
+            let ticket = nextTicket
+            nextTicket &+= 1
+            let admitted = await withTaskCancellationHandler {
+                await admit(ticket)
+            } onCancel: {
+                Task { await self.withdraw(ticket) }
             }
-            tail = Task { _ = await work.value }
-            return await work.value
+            guard admitted else {
+                return AppAttestCall.cancelledOutcome
+            }
+            let outcome = await AppAttestCall().run(timeLimit: timeLimit, start)
+            startNextCall()
+            return outcome
+        }
+
+        /// Return `true` once `ticket`'s call holds the serializer, or `false`
+        /// when its caller is cancelled first.
+        private func admit(_ ticket: UInt64) async -> Bool {
+            if Task.isCancelled {
+                return false
+            }
+            if !running {
+                running = true
+                return true
+            }
+            return await withCheckedContinuation { turn in
+                waiting.append((ticket, turn))
+            }
+        }
+
+        /// Remove `ticket` from the queue and end its wait. A ticket already
+        /// running or already gone is left alone: the running call ends
+        /// through its own cancellation handler.
+        private func withdraw(_ ticket: UInt64) {
+            guard let index = waiting.firstIndex(where: { $0.ticket == ticket }) else {
+                return
+            }
+            waiting.remove(at: index).turn.resume(returning: false)
+        }
+
+        /// Hand the serializer to the first waiting caller, or free it.
+        private func startNextCall() {
+            if waiting.isEmpty {
+                running = false
+            } else {
+                waiting.removeFirst().turn.resume(returning: true)
+            }
+        }
+    }
+
+    /// One App Attest call the serializer runs, which ends exactly once.
+    ///
+    /// Apple's answer, the time limit and the caller's cancellation each try
+    /// to end the call; the first one ends it and resumes its caller, and each
+    /// later one does nothing. A completion handler therefore stores a key ID
+    /// only through `whileOpen(_:)`, which stores nothing once the call ended.
+    private final class AppAttestCall: @unchecked Sendable {
+        // `@unchecked Sendable`: every mutable property below is read and
+        // written only while `lock` is held.
+        private let lock = NSLock()
+        private var ended = false
+        /// The outcome of a call that ended before `run` installed `waiter`.
+        private var endedEarly: Result<Data, AttestationError>?
+        private var waiter: CheckedContinuation<Result<Data, AttestationError>, Never>?
+        private var timer: Task<Void, Never>?
+
+        /// What a caller cancelled while queued or running receives. The
+        /// adapter maps the Swift `CancellationError` to
+        /// `AttestationError.serviceError`, as it maps every error that is not
+        /// an `AttestationError`.
+        static let cancelledOutcome: Result<Data, AttestationError> = .failure(.serviceError(
+            "CancellationError: the caller's task was cancelled before App Attest answered; "
+                + "the adapter discards any later answer"
+        ))
+
+        /// Start the call through `start` and wait until it ends. A caller
+        /// cancelled before the call starts never reaches `start`.
+        func run(
+            timeLimit: Duration,
+            _ start: @Sendable (AppAttestCall) -> Void
+        ) async -> Result<Data, AttestationError> {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    let starts: Bool = lock.withLock {
+                        if let endedEarly {
+                            continuation.resume(returning: endedEarly)
+                            return false
+                        }
+                        waiter = continuation
+                        timer = Task { [self] in
+                            do {
+                                try await Task.sleep(for: timeLimit)
+                            } catch {
+                                return
+                            }
+                            end(with: .failure(.timedOut(
+                                "App Attest did not answer within \(timeLimit); the adapter runs the next "
+                                    + "queued call and discards any later answer"
+                            )))
+                        }
+                        return true
+                    }
+                    if starts {
+                        start(self)
+                    }
+                }
+            } onCancel: {
+                end(with: Self.cancelledOutcome)
+            }
+        }
+
+        /// End the call with `outcome` and resume its caller, unless the call
+        /// already ended.
+        func end(with outcome: Result<Data, AttestationError>) {
+            let (waiter, timer): (CheckedContinuation<Result<Data, AttestationError>, Never>?, Task<Void, Never>?) =
+                lock.withLock {
+                    guard !ended else {
+                        return (nil, nil)
+                    }
+                    ended = true
+                    let taken = (self.waiter, self.timer)
+                    if self.waiter == nil {
+                        endedEarly = outcome
+                    }
+                    self.waiter = nil
+                    self.timer = nil
+                    return taken
+                }
+            timer?.cancel()
+            waiter?.resume(returning: outcome)
+        }
+
+        /// Run `effect` while holding the call open, and report whether the
+        /// call was still open. Once the call ended, `effect` does not run.
+        func whileOpen(_ effect: () -> Void) -> Bool {
+            lock.withLock {
+                guard !ended else {
+                    return false
+                }
+                effect()
+                return true
+            }
         }
     }
 

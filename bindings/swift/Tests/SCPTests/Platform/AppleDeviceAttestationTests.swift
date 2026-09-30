@@ -37,7 +37,13 @@
 //    every adapter over one `UserDefaults` object shares one lock and one
 //    call serializer. A call that the `isSupported` check or the 32-byte
 //    check rejects returns while another call holds the serializer, so it
-//    never waits in the queue. `AppAttestCallOrderingTests` pins each case.
+//    never waits in the queue. A call Apple does not answer within the
+//    adapter's time limit throws `SCP-ATTEST-9027` and the next queued call
+//    runs; Apple's later answer stores no key ID and reaches no caller. A
+//    caller cancelled while queued never reaches Apple, and one cancelled
+//    while Apple holds its call frees the queue. `AppAttestCallOrderingTests`
+//    pins each case, with a time limit of a fraction of a second in place of
+//    the adapter's 25 seconds.
 //
 // See ADR-025 (Apple Platform Adapter) in `.docs/adrs/phase-5.md` and the
 // UniFFI `DeviceAttestationProvider` callback interface in
@@ -159,19 +165,26 @@
     }
 
     /// A `DCAppAttestService` that reports App Attest as available, counts how
-    /// many times a caller asked it to generate a key, and answers every
-    /// `attestKey` with an error, so a case reads the key count and nothing
-    /// else.
+    /// many times a caller asked it to generate a key, records the key ID and
+    /// `clientDataHash` of every `attestKey` call, and answers every
+    /// `attestKey` with an error.
     private final class CountingAppAttestService: DCAppAttestService {
         /// A key ID this double hands back to every caller.
         static let keyId = Data(repeating: 0x01, count: 32).base64EncodedString()
 
         private let lock = NSLock()
         private var callCount = 0
+        private var attestKeyArguments: [(keyId: String, clientDataHash: Data)] = []
 
         /// How many times `generateKey` ran.
         var keyGenerationCount: Int {
             lock.withLock { callCount }
+        }
+
+        /// The key ID and `clientDataHash` of every `attestKey` call, in
+        /// arrival order.
+        var attestKeyCalls: [(keyId: String, clientDataHash: Data)] {
+            lock.withLock { attestKeyArguments }
         }
 
         override var isSupported: Bool {
@@ -190,10 +203,11 @@
         }
 
         override func attestKey(
-            _: String,
-            clientDataHash _: Data,
+            _ keyId: String,
+            clientDataHash: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
+            lock.withLock { attestKeyArguments.append((keyId, clientDataHash)) }
             completionHandler(nil, NSError(domain: DCErrorDomain, code: DCError.serverUnavailable.rawValue))
         }
     }
@@ -227,6 +241,19 @@
         private var keyGenerationCallCount = 0
         private var attestKeyCalls = 0
         private var generateAssertionCalls = 0
+        private var arrivals: [Arrival] = []
+
+        /// One call that reached this double: which method, and the
+        /// `clientDataHash` it carried.
+        struct Arrival: Hashable {
+            let method: String
+            let clientDataHash: Data
+        }
+
+        /// Every `attestKey` and `generateAssertion` call, in arrival order.
+        var arrivalOrder: [Arrival] {
+            lock.withLock { arrivals }
+        }
 
         /// Most calls this double had outstanding at one moment.
         var peakConcurrency: Int {
@@ -263,19 +290,25 @@
 
         override func attestKey(
             _: String,
-            clientDataHash _: Data,
+            clientDataHash: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
-            lock.withLock { attestKeyCalls += 1 }
+            lock.withLock {
+                attestKeyCalls += 1
+                arrivals.append(Arrival(method: "attestKey", clientDataHash: clientDataHash))
+            }
             answer(from: \.attestScript, to: completionHandler)
         }
 
         override func generateAssertion(
             _: String,
-            clientDataHash _: Data,
+            clientDataHash: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
-            lock.withLock { generateAssertionCalls += 1 }
+            lock.withLock {
+                generateAssertionCalls += 1
+                arrivals.append(Arrival(method: "generateAssertion", clientDataHash: clientDataHash))
+            }
             answer(from: \.assertScript, to: completionHandler)
         }
 
@@ -313,8 +346,10 @@
     /// `clientDataHash` of every `attestKey` and `generateAssertion` call in
     /// arrival order, so a test checks the exact bytes the adapter hands
     /// Apple. With `holdsFirstAssertion`, it answers its first
-    /// `generateAssertion` only when a case calls `releaseHeldAssertion()`, so
-    /// a case keeps one App Attest call outstanding for as long as it needs.
+    /// `generateAssertion` only when a case calls `releaseHeldAssertion()`, and
+    /// with `holdsFirstKeyGeneration` its first `generateKey` only when a case
+    /// calls `releaseHeldKeyGeneration()`, so a case keeps one App Attest call
+    /// outstanding for as long as it needs.
     private final class RecordingAppAttestService: DCAppAttestService {
         /// The key ID the `ordinal`th `generateKey` call hands back, counting
         /// from 1. Apple returns a new key ID for every generated key, so each
@@ -334,13 +369,35 @@
         private var assertCalls: [Call] = []
         private var keysGenerated = 0
         private var heldAssertion: ((Data?, Error?) -> Void)?
+        private var heldKeyGeneration: ((String?, Error?) -> Void)?
         private let holdsFirstAssertion: Bool
+        private let holdsFirstKeyGeneration: Bool
         private let assertionResult: Result<Data, Error>
 
-        init(holdsFirstAssertion: Bool = false, assertionResult: Result<Data, Error> = .success(scriptedAssertion)) {
+        init(
+            holdsFirstAssertion: Bool = false,
+            holdsFirstKeyGeneration: Bool = false,
+            assertionResult: Result<Data, Error> = .success(scriptedAssertion)
+        ) {
             self.holdsFirstAssertion = holdsFirstAssertion
+            self.holdsFirstKeyGeneration = holdsFirstKeyGeneration
             self.assertionResult = assertionResult
             super.init()
+        }
+
+        /// Whether the first `generateKey` is waiting for
+        /// `releaseHeldKeyGeneration()`.
+        var isHoldingKeyGeneration: Bool {
+            lock.withLock { heldKeyGeneration != nil }
+        }
+
+        /// Answer the held first `generateKey` with `generatedKeyId(1)`.
+        func releaseHeldKeyGeneration() {
+            let handler: ((String?, Error?) -> Void)? = lock.withLock {
+                defer { heldKeyGeneration = nil }
+                return heldKeyGeneration
+            }
+            handler?(Self.generatedKeyId(1), nil)
         }
 
         /// Every `attestKey` call, in arrival order.
@@ -370,7 +427,13 @@
         override func generateKey(completionHandler: @escaping (String?, Error?) -> Void) {
             let ordinal: Int = lock.withLock {
                 keysGenerated += 1
+                if holdsFirstKeyGeneration, keysGenerated == 1 {
+                    heldKeyGeneration = completionHandler
+                }
                 return keysGenerated
+            }
+            if holdsFirstKeyGeneration, ordinal == 1 {
+                return
             }
             completionHandler(Self.generatedKeyId(ordinal), nil)
         }
@@ -538,6 +601,18 @@
         return condition()
     }
 
+    /// Poll `adapter`'s serializer until `count` callers wait in its queue, for
+    /// at most ten seconds, and report whether they did.
+    private func waitForWaitingCalls(_ count: Int, in adapter: AppleDeviceAttestation) async -> Bool {
+        for _ in 0 ..< 10000 {
+            if await adapter.waitingAppAttestCallCount() == count {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return await adapter.waitingAppAttestCallCount() == count
+    }
+
     // MARK: - Fail-closed tests
 
     struct AppleDeviceAttestationFailClosedTests {
@@ -588,13 +663,14 @@
         @Test("every AttestationError case maps to its own SCP-ATTEST code")
         func everyCaseHasItsOwnCode() {
             let cases: [AttestationError] = [
-                .serviceError("m"), .unsupported("m"), .keyNotFound, .internalError("m"), .invalidClientDataHash("m")
+                .serviceError("m"), .unsupported("m"), .keyNotFound, .internalError("m"), .invalidClientDataHash("m"),
+                .timedOut("m")
             ]
             let codes = cases.compactMap { error -> String? in
                 guard case let .Identity(_, code) = error.scpError else { return nil }
                 return code
             }
-            let expected = ["9001", "9019", "9020", "9025", "9026"]
+            let expected = ["9001", "9019", "9020", "9025", "9026", "9027"]
             #expect(codes == expected.map { "SCP-ATTEST-\($0)" })
         }
 
@@ -780,9 +856,13 @@
             // `peakConcurrency` counts calls this double had outstanding at
             // once. Six callers starting together drive it above one for an
             // adapter that hands every caller straight to App Attest. The call
-            // counts prove the first attestation and all six callers reached
-            // Apple, so a peak of one cannot come from callers that failed
-            // before calling out.
+            // counts and the arrival record prove the first attestation and
+            // each of the six callers reached Apple exactly once, so a peak of
+            // one cannot come from callers that failed before calling out or
+            // from a serializer that dropped one call and repeated another.
+            // The six callers start together, so the serializer's acceptance
+            // order among them is not fixed; the first attestation, awaited
+            // before they start, reaches Apple first.
             let service = OverlapDetectingAppAttestService(
                 attestScript: [.init(result: .success(Data([0xA1])), delay: 0.05)],
                 assertScript: [.init(result: .success(Data([0xB1])), delay: 0.05)]
@@ -793,18 +873,15 @@
             // key ID rather than throwing `keyNotFound` before it calls out.
             _ = try? await adapter.attestReportingAttestationError(challenge: challenge, deviceId: deviceId)
 
+            // 0x10 upward, so no caller's hash equals `challenge`.
+            let callerHashes = (0 ..< 3).map { Data(repeating: UInt8(0x10 + $0), count: 32) }
             await withTaskGroup(of: Void.self) { group in
-                for caller in 0 ..< 3 {
+                for hash in callerHashes {
                     group.addTask {
-                        _ = try? await adapter.attestReportingAttestationError(
-                            challenge: Data(repeating: UInt8(caller), count: 32),
-                            deviceId: deviceId
-                        )
+                        _ = try? await adapter.attestReportingAttestationError(challenge: hash, deviceId: deviceId)
                     }
                     group.addTask {
-                        _ = try? await adapter.assertRequestReportingAttestationError(
-                            requestHash: Data(repeating: UInt8(caller), count: 32)
-                        )
+                        _ = try? await adapter.assertRequestReportingAttestationError(requestHash: hash)
                     }
                 }
             }
@@ -821,6 +898,14 @@
                 service.generateAssertionCallCount == 3,
                 "generateAssertion reached Apple \(service.generateAssertionCallCount) times, expected 3"
             )
+            typealias Arrival = OverlapDetectingAppAttestService.Arrival
+            let arrivals = service.arrivalOrder
+            #expect(arrivals.first == Arrival(method: "attestKey", clientDataHash: challenge))
+            let callerArrivals = callerHashes.flatMap { hash in
+                [Arrival(method: "attestKey", clientDataHash: hash), Arrival(method: "generateAssertion", clientDataHash: hash)]
+            }
+            #expect(arrivals.count == 7)
+            #expect(Set(arrivals.dropFirst()) == Set(callerArrivals))
         }
 
         @Test("a call queued behind an outstanding call reaches Apple only after that call answers, even with an error")
@@ -921,22 +1006,36 @@
             // This case fails when `attest` stops routing key generation
             // through `AppAttestCallSerializer`. 50 rounds guard against a
             // scheduler that happens to order one round's callers one after
-            // another.
+            // another. Each caller must reach `attestKey` once with the one
+            // generated key ID and get Apple's `serverUnavailable` back as
+            // `serviceError`, so one generated key cannot come from seven
+            // callers that failed before they called Apple.
+            let challenges = (0 ..< 8).map { Data(repeating: UInt8($0), count: 32) }
             for round in 0 ..< 50 {
                 let defaults = InMemoryUserDefaults()
                 let service = CountingAppAttestService()
                 let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
 
-                await withTaskGroup(of: Void.self) { group in
-                    for caller in 0 ..< 8 {
+                let serviceErrors = await withTaskGroup(of: Bool.self) { group in
+                    for challenge in challenges {
                         group.addTask {
-                            _ = try? await adapter.attestReportingAttestationError(
-                                challenge: Data(repeating: UInt8(caller), count: 32),
-                                deviceId: deviceId
-                            )
+                            do throws(AttestationError) {
+                                _ = try await adapter.attestReportingAttestationError(challenge: challenge, deviceId: deviceId)
+                                return false
+                            } catch {
+                                guard case .serviceError = error else { return false }
+                                return true
+                            }
                         }
                     }
+                    return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
                 }
+
+                let calls = service.attestKeyCalls
+                #expect(serviceErrors == 8, "round \(round): \(serviceErrors) of 8 callers got Apple's error")
+                #expect(calls.count == 8, "round \(round): attestKey reached Apple \(calls.count) times")
+                #expect(calls.allSatisfy { $0.keyId == CountingAppAttestService.keyId })
+                #expect(Set(calls.map(\.clientDataHash)) == Set(challenges))
 
                 #expect(
                     service.keyGenerationCount == 1,
@@ -944,6 +1043,118 @@
                 )
                 #expect(defaults.string(forKey: keyIdDefaultsKey) == CountingAppAttestService.keyId)
             }
+        }
+
+        @Test("a call Apple does not answer within the time limit throws SCP-ATTEST-9027, and the next queued call runs")
+        func hungCallTimesOutAndNextCallRuns() async {
+            let service = RecordingAppAttestService(holdsFirstAssertion: true)
+            let defaults = InMemoryUserDefaults()
+            defaults.set(RecordingAppAttestService.generatedKeyId(1), forKey: keyIdDefaultsKey)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .milliseconds(300))
+            let secondHash = Data(repeating: 0xCD, count: 32)
+
+            let first = Task { await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.assertRequest(requestHash: requestHash)
+            }) }
+            #expect(await waitUntil { service.isHoldingAssertion }, "the first assertRequest never reached Apple")
+            let second = Task { await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.assertRequest(requestHash: secondHash)
+            }) }
+
+            #expect(await first.value == "SCP-ATTEST-9027")
+            #expect(await second.value == "returned bytes")
+            #expect(service.isHoldingAssertion, "the queued call waited for Apple to answer the timed-out call")
+            #expect(service.assertions.map(\.clientDataHash) == [requestHash, secondHash])
+
+            // Apple answers the timed-out call now. The answer reaches no
+            // caller: a second resume of the first caller's continuation
+            // would crash the suite.
+            service.releaseHeldAssertion()
+            // A call Apple answers within the time limit returns its bytes.
+            #expect(await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.assertRequest(requestHash: requestHash)
+            }) == "returned bytes")
+            #expect(service.assertions.map(\.clientDataHash) == [requestHash, secondHash, requestHash])
+        }
+
+        @Test("a generateKey answer that arrives after the time limit stores no key ID and reaches no attestKey")
+        func lateAnswerWritesNothing() async {
+            let service = RecordingAppAttestService(holdsFirstKeyGeneration: true)
+            let defaults = InMemoryUserDefaults()
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .milliseconds(300))
+
+            #expect(await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.attest(challenge: challenge, deviceId: deviceId)
+            }) == "SCP-ATTEST-9027")
+            #expect(service.isHoldingKeyGeneration)
+
+            // The held completion handler runs on this thread, so every write
+            // it makes has happened when this call returns.
+            service.releaseHeldKeyGeneration()
+            #expect(defaults.string(forKey: keyIdDefaultsKey) == nil, "a late generateKey answer stored its key ID")
+            #expect(service.attestations.isEmpty, "a late generateKey answer reached attestKey")
+
+            // The next attest generates its own key, stores it and attests it.
+            #expect(await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.attest(challenge: challenge, deviceId: deviceId)
+            }) == "returned bytes")
+            #expect(defaults.string(forKey: keyIdDefaultsKey) == RecordingAppAttestService.generatedKeyId(2))
+            #expect(service.attestations == [
+                .init(keyId: RecordingAppAttestService.generatedKeyId(2), clientDataHash: challenge)
+            ])
+        }
+
+        @Test("a caller cancelled while queued leaves the queue and never reaches Apple")
+        func cancelledQueuedCallerNeverReachesApple() async {
+            let service = RecordingAppAttestService(holdsFirstAssertion: true)
+            let defaults = InMemoryUserDefaults()
+            defaults.set(RecordingAppAttestService.generatedKeyId(1), forKey: keyIdDefaultsKey)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+
+            let held = Task { await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.assertRequest(requestHash: requestHash)
+            }) }
+            #expect(await waitUntil { service.isHoldingAssertion }, "the held assertRequest never reached Apple")
+            let queued = Task { await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.assertRequest(requestHash: Data(repeating: 0xCD, count: 32))
+            }) }
+            #expect(await waitForWaitingCalls(1, in: adapter), "the second assertRequest never joined the queue")
+
+            queued.cancel()
+            #expect(await queued.value == "SCP-ATTEST-9001")
+            #expect(await adapter.waitingAppAttestCallCount() == 0)
+            #expect(service.isHoldingAssertion, "the cancelled caller waited for the held assertion")
+
+            service.releaseHeldAssertion()
+            #expect(await held.value == "returned bytes")
+            #expect(service.assertions.map(\.clientDataHash) == [requestHash])
+        }
+
+        @Test("a caller cancelled while Apple holds its call frees the queue for the next call")
+        func cancelledWaitingCallerFreesQueue() async {
+            let service = RecordingAppAttestService(holdsFirstAssertion: true)
+            let defaults = InMemoryUserDefaults()
+            defaults.set(RecordingAppAttestService.generatedKeyId(1), forKey: keyIdDefaultsKey)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults)
+            let secondHash = Data(repeating: 0xCD, count: 32)
+
+            let first = Task { await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.assertRequest(requestHash: requestHash)
+            }) }
+            #expect(await waitUntil { service.isHoldingAssertion }, "the first assertRequest never reached Apple")
+            let second = Task { await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.assertRequest(requestHash: secondHash)
+            }) }
+            #expect(await waitForWaitingCalls(1, in: adapter), "the second assertRequest never joined the queue")
+
+            first.cancel()
+            #expect(await first.value == "SCP-ATTEST-9001")
+            #expect(await second.value == "returned bytes")
+            #expect(service.isHoldingAssertion, "the second call waited for Apple to answer the cancelled call")
+            #expect(service.assertions.map(\.clientDataHash) == [requestHash, secondHash])
+
+            // Apple's answer to the cancelled call reaches no caller.
+            service.releaseHeldAssertion()
         }
 
         @Test("adapters over one defaults object share one lock and one serializer, and adapters over two do not")

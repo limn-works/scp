@@ -338,6 +338,7 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9020` | No App Attest key ID is stored, so no assertion is possible |
 | `SCP-ATTEST-9025` | The App Attest adapter reached a state no caller input produces: Apple's service answered a completion handler with neither a value nor an error |
 | `SCP-ATTEST-9026` | The attestation challenge or the assertion request hash is not 32 bytes |
+| `SCP-ATTEST-9027` | Apple App Attest did not answer one serialized call within 25 seconds; the adapter runs the next queued call and discards any later answer |
 
 ### SCP-IDENT-1017 and its cross-bridge contract
 
