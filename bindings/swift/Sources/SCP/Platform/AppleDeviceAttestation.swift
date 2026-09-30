@@ -559,6 +559,18 @@
     /// last accepted, and it publishes that chaining inside actor isolation, so
     /// two callers that arrive together take distinct positions in one order
     /// rather than both reading an empty tail.
+    ///
+    /// **Cost:** each call waits until every call this serializer accepted
+    /// before it finishes, so an `assertRequest` accepted after an `attest`
+    /// waits while that `attest`'s `attestKey` call waits for Apple's server.
+    /// `run(_:)` puts no time bound on that wait. Cancelling a caller's task
+    /// neither removes its body from the chain nor ends the caller's wait,
+    /// because the body runs in an unstructured `Task` and `Task.value` does
+    /// not return early when the awaiting task is cancelled. When one App
+    /// Attest completion handler never runs, every later call over the same
+    /// `UserDefaults` object therefore waits forever. ADR-025, the Apple
+    /// platform adapter, records this cost in the call-ordering item of
+    /// acceptance criterion 3.
     private actor AppAttestCallSerializer {
         /// Work this serializer last accepted, which the next caller waits for.
         private var tail: Task<Void, Never>?
