@@ -557,8 +557,8 @@ pub enum ContextError {
     ///   `REPLY_TIMEOUT`, or the key-package actor did the same or missed
     ///   `KP_REPLY_TIMEOUT`. The actor had already received the command and
     ///   may have run it, so a retry can apply a non-idempotent operation (a
-    ///   send, a governance action, a key-package reservation) twice. Read
-    ///   the context's state before retrying one.
+    ///   send, a governance action, a key-package reservation) twice. Check
+    ///   whether the first call took effect before retrying one.
     /// - `start_saga`, when the saga's participant context set overlaps an
     ///   in-flight saga, and the checked role read, when an actor registers
     ///   while it classifies a miss. Neither reaches an actor with the
