@@ -1108,6 +1108,36 @@ mod tests {
         assert!(err.contains("byte limit"), "got: {err}");
     }
 
+    /// A malformed answer under the call's own id fails the call: the server
+    /// answers each id once, so skipping it would wait for a response that
+    /// never comes. A malformed message under another id is not this call's,
+    /// and the call reads past it to its own response.
+    #[test]
+    fn read_response_fails_a_malformed_answer_under_its_own_id() {
+        let valid = "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"late\":true}}\n";
+        for (line, what) in [
+            ("{\"id\":7,\"result\":{}}\n", "no jsonrpc field"),
+            (
+                "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":\"boom\"}\n",
+                "a malformed error object",
+            ),
+        ] {
+            let mut reader = std::io::Cursor::new(format!("{line}{valid}").into_bytes());
+            let err = read_response(&mut reader, &RequestId::Number(7)).expect_err(what);
+            assert!(
+                err.contains("failed to parse response JSON"),
+                "{what}: {err}"
+            );
+        }
+
+        let mut reader =
+            std::io::Cursor::new(format!("{{\"id\":8,\"result\":{{}}}}\n{valid}").into_bytes());
+        let response = read_response(&mut reader, &RequestId::Number(7))
+            .expect("a malformed message under another id is not this call's answer");
+        assert_eq!(response.id, RequestId::Number(7));
+        assert_eq!(response.result, Some(serde_json::json!({"late": true})));
+    }
+
     /// Drives the REAL `read_loop_from` and returns its result with everything
     /// it wrote, for tests that assert on how the loop ended.
     async fn run_loop<P: ContextProvider>(

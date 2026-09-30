@@ -841,22 +841,24 @@ mod tests {
             SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok-1"))
                 .expect("connect"),
         );
+        // Both calls must be spawned before either is joined: each waits on
+        // the barrier of two, so joining the first before the second exists
+        // would hang the test instead of failing it.
         let start = Arc::new(std::sync::Barrier::new(2));
-        let calls: Vec<_> = [5, 6]
-            .into_iter()
-            .map(|id| {
-                let transport = Arc::clone(&transport);
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    start.wait();
-                    (id, transport.send_request(&request(id)))
-                })
+        let spawn_call = |id: i64| {
+            let transport = Arc::clone(&transport);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                (id, transport.send_request(&request(id)))
             })
-            .collect();
-        let results: Vec<_> = calls
-            .into_iter()
-            .map(|call| call.join().expect("call thread"))
-            .collect();
+        };
+        let first = spawn_call(5);
+        let second = spawn_call(6);
+        let results = [
+            first.join().expect("call thread"),
+            second.join().expect("call thread"),
+        ];
         let overlapped = server.join().expect("server thread");
         assert!(
             !overlapped,
