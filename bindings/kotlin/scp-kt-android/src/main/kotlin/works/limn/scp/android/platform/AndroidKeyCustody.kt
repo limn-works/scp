@@ -298,12 +298,15 @@ class AndroidKeyCustody internal constructor(
      * [encryptedPrefs] with `apply()`, which returns before the removal reaches disk. The
      * post-deletion check reads only [softwareKeys].
      *
-     * After this call, operations with the same handle in the same process throw [ScpException]
+     * After this call, operations with the same handle on the same instance throw [ScpException]
      * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, or
      * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
      * length before any key lookup; and [exportSigningKeyBytes] on a Keystore handle
      * ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
      * [KeyHandle.custodyType] before any key lookup.
+     * Each instance holds its own [softwareKeys] map and restores every persisted software Ed25519
+     * seed into it when constructed, so another instance in the same process that already holds a
+     * software key keeps signing with it after this call.
      * When the process dies before `apply()` writes the removal to disk, the next instance's
      * `restorePersistedEd25519Keys` reloads the seed and the key signs again, although this
      * call returned `confirmed = true`.

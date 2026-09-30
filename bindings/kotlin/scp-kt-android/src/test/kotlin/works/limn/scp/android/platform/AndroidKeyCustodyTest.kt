@@ -849,6 +849,27 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
+        fun `destroyKey on one instance leaves the key signing on another instance that restored it`() {
+            val handle = custody.generateKeypair(KeyType.ED25519)
+            val originalPubKey = custody.publicKey(handle)
+            val other = AndroidKeyCustody(prefs)
+
+            custody.destroyKey(handle)
+
+            val exception = assertThrows<ScpException> {
+                custody.sign(handle, "data".toByteArray())
+            }
+            assertEquals("SCP-CRYPTO-4001", exception.code)
+
+            val data = "signed after another instance destroyed the key".toByteArray(Charsets.UTF_8)
+            val signature = other.sign(handle, data)
+            val verifier = Ed25519Signer()
+            verifier.init(false, Ed25519PublicKeyParameters(originalPubKey, 0))
+            verifier.update(data, 0, data.size)
+            assertTrue(verifier.verifySignature(signature))
+        }
+
+        @Test
         fun `multiple Ed25519 keys are all persisted and restored`() {
             val handles = (1..5).map { custody.generateKeypair(KeyType.ED25519) }
             val pubKeys = handles.map { custody.publicKey(it) }
