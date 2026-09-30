@@ -3015,14 +3015,15 @@
       ],
       "details": {
         "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}",
-        "audit_note": "Downgraded from done (audit): the NAPI MCP provider in crates/scp-ffi/napi/src/mcp.rs does not implement ContextProvider::invoke_outlet, so its validate_capability refuses every tool, tools/list is empty and tools/call is refused. The tool-invocation criterion is unmet on NAPI. The PyO3 and UniFFI providers run an outlet from tools/call at most once per server: the server holds the one agent UCAN it was created with, the first tools/call whose Invoke check reaches ADR-016 Step 9 records that token's nonce, whether or not the check then passes and the outlet runs, and every later check of the token fails as a replay, so tools/list then omits every outlet and tools/call refuses it; the token's nonce also fails the freshness check five minutes after it was minted. The tool-invocation criterion is unmet on those two bridges until a server can present a fresh token per call. The dynamic-update criterion is unmet on every bridge: registering, updating or removing an outlet sends no `notifications/tools/list_changed`, because the event pump runs only on a ContextEvent, no ContextEvent variant reports an outlet change, and every bridge discards the registry event that register_outlet returns. The built-in-tools criterion is unmet on every bridge: `{context}/send_message`, `{context}/read_messages` and `{context}/list_members` are listed only when the provider grants the built-in's name, the PyO3 and UniFFI providers grant a name only for an outlet registered under it in the context's outlet registry, and no code registers an outlet under any of the three names, so tools/list omits them and tools/call refuses them from the first request; the NAPI provider refuses them as it refuses every tool."
+        "audit_note": "Downgraded from done (audit): the NAPI MCP provider in crates/scp-ffi/napi/src/mcp.rs does not implement ContextProvider::invoke_outlet, so its validate_capability refuses every tool, tools/list is empty and tools/call is refused. The tool-invocation criterion is unmet on NAPI. The PyO3 provider runs an outlet from tools/call at most once per server: the server holds the one agent UCAN it was created with, the first tools/call whose Invoke check reaches ADR-016 Step 9 records that token's nonce, whether or not the check then passes and the outlet runs, and every later check of the token fails as a replay, so tools/list then omits every outlet and tools/call refuses it; the token's nonce also fails the freshness check five minutes after it was minted. The UniFFI provider runs no outlet from tools/call: no production code in the UniFFI crate registers an outlet handler, so the provider refuses every tools/call with 'has no registered handler' before its Invoke check runs, while tools/list still lists every outlet in the context's outlet registry. The one-token replay above applies to UniFFI as well once a caller can register a handler. The tool-invocation criterion is unmet on PyO3 until a server can present a fresh token per call, and on UniFFI until a caller can register an outlet handler and a server can present a fresh token per call. The dynamic-update criterion is unmet on every bridge: registering, updating or removing an outlet sends no `notifications/tools/list_changed`, because the event pump runs only on a ContextEvent, no ContextEvent variant reports an outlet change, and every bridge discards the registry event that register_outlet returns. The built-in-tools criterion is unmet on every bridge: `{context}/send_message`, `{context}/read_messages` and `{context}/list_members` are listed only when the provider grants the built-in's name, the PyO3 and UniFFI providers grant a name only for an outlet registered under it in the context's outlet registry, and no code registers an outlet under any of the three names, so tools/list omits them and tools/call refuses them from the first request; the NAPI provider refuses them as it refuses every tool."
       },
       "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests.",
       "blockedByIssues": [
         2506,
         2512,
         2513,
-        2561
+        2561,
+        2582
       ]
     },
     {
@@ -3077,7 +3078,8 @@
       "blockedByIssues": [
         2311,
         2551,
-        2557
+        2557,
+        2583
       ]
     },
     {
@@ -3125,7 +3127,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/python/scp_sdk/mcp.py"
       ],
@@ -3161,9 +3163,15 @@
       ],
       "details": {
         "python_usage": "from scp_sdk.mcp import serve_mcp\n\nserver = await serve_mcp(\n    identity=my_identity,\n    contexts=[context_a, context_b],\n    transport=\"stdio\",\n)",
-        "cli_usage": "scp-mcp serve --identity <did> --relay <relay_url> --transport stdio"
+        "cli_usage": "scp-mcp serve --identity <did> --relay <relay_url> --transport stdio",
+        "audit_note": "Downgraded from done (audit): two criteria are unmet. The criterion '`serve_mcp(identity, contexts, transport)` starts an MCP server that dynamically exposes outlets from the agent's active SCP contexts' is unmet. The Python SDK starts a server through `SCP.mcp_serve(did, context_ids, transport)`, and the PyO3 server it starts holds the one agent UCAN it was created with, so tools/list omits every outlet after the first tools/call whose Invoke check reaches ADR-016 Step 9, and five minutes after that token was minted (SCP-048 audit note). That server also sends no `notifications/tools/list_changed` when an outlet is registered, updated or removed, so a connected client sees a new outlet only when it calls tools/list again (SCP-048 audit note). The criterion 'Transport parameter accepts `\"stdio\"` or `\"sse\"`' is unmet for `\"sse\"`: the PyO3 bridge binds the SSE server to 127.0.0.1 port 0 and returns neither the port nor the bearer token, so no client can connect to a server started with `\"sse\"` (SCP-049 audit note)."
       },
-      "result": "Created bindings/python/scp_sdk/mcp.py with serve_mcp(), McpClient, and CLI entry point. All Python SDK patterns followed."
+      "result": "Created bindings/python/scp_sdk/mcp.py with serve_mcp(), McpClient, and CLI entry point. All Python SDK patterns followed.",
+      "blockedByIssues": [
+        2311,
+        2512,
+        2513
+      ]
     },
     {
       "id": "SCP-052",
@@ -3452,7 +3460,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "tests/integration/phase3_integration_test.py"
       ],
@@ -3518,8 +3526,14 @@
           "section": "## Phase 3 Integration Test"
         }
       ],
-      "details": {},
-      "result": "Phase 3 end-to-end Python SDK integration test created at tests/integration/phase3_integration_test.py. Exercises Identity, Context, Outlets, UCAN, MCP, and EventLog across PyO3 bridge."
+      "details": {
+        "audit_note": "Downgraded from done (audit): the two MCP criteria are unmet, and the story's test proves no criterion. In the MCP server criterion, tools/list lists no built-in tool (`send_message`, `read_messages`, `list_members`), because the PyO3 provider grants a tool name only for an outlet registered under that name (SCP-048 audit note). In the MCP tool-invocation criterion, a PyO3 server runs an outlet from tools/call at most once, and none five minutes after its agent UCAN was minted, because it presents that one token for every call (SCP-048 audit note). `tests/integration/phase3_integration_test.py` imports `serve_mcp` from `scp_sdk.mcp`, which the Python SDK no longer defines, so the module fails at import. The test also replaces the PyO3 bridge with a `MagicMock` fixture, so even a passing run would show no call crossing the bridge, and no CI workflow or script runs the test."
+      },
+      "result": "Phase 3 end-to-end Python SDK integration test created at tests/integration/phase3_integration_test.py. Exercises Identity, Context, Outlets, UCAN, MCP, and EventLog across PyO3 bridge.",
+      "blockedByIssues": [
+        2512,
+        2561
+      ]
     },
     {
       "id": "SCP-059",
