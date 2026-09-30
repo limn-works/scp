@@ -23,7 +23,7 @@
 # makes the gate exit 1 on `spaced`, which expects exit 0. Ending the package loop after its
 # first package makes the gate exit 0 on `secondbroken` and `secondorphan`, which expect exit 1.
 # Dropping the source scan makes the gate exit 0 on every case from `cfgbody` to
-# `testalias`, which expect exit 1: each fixture compiles on default features. Accepting a
+# `charunicode`, which expect exit 1: each fixture compiles on default features. Accepting a
 # platform predicate false on the host makes the gate exit 0 on `falsecfg`, accepting an
 # empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
 # the same on `nestedcomment`, dropping the `include`, `#[path]` or `macro_rules` rule
@@ -32,9 +32,15 @@
 # `cfg_attr` in place of every `cfg_` name does the same on `cfgselect`, dropping the
 # test-name rule does the same on `testattr`, `testpath` and `testalias`, and matching only
 # the attribute form `#[...test]` in place of the name does the same on `testalias`.
+# Reading `r"` as a raw string after a literal, a lifetime or a closing quote makes the gate
+# exit 0 on `suffixnum`, `suffixlifetime` and `suffixstring` respectively, and a char literal
+# pattern that accepts only one-character escapes does the same on `charhex` and
+# `charunicode`.
 # Scanning string literals or comments, rejecting a platform predicate true on the host,
-# rejecting `include_str!`, or rejecting an identifier that merely starts with `test` or
-# `bench` makes the gate exit 1 on `platformcfg`, which expects exit 0.
+# rejecting `include_str!`, rejecting an identifier that merely starts with `test` or
+# `bench`, refusing a raw string whose prefix follows `(` or a space, or matching a char
+# literal byte by byte in place of decoding the source as UTF-8 makes the gate exit 1 on
+# `platformcfg`, which expects exit 0.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -250,6 +256,25 @@ printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo
 printf 'use core::prelude::v1::test as check;\nfn main() {}\n#[check]\nfn body() { demo::t(); }\n' > "$ws/demo/examples/good.rs"
 expect "example body in a test function under a renamed attribute" "$ws" 1 "      test-attribute name test"
 
+# rustc lexes the `r` below as a literal suffix or a lifetime and `"\" "` as an ordinary
+# string, so the feature cfg is real code. A scan that reads `r"\"` as a raw string ends it
+# at the second quote and blanks the cfg inside the string that the stray quote opens.
+for pre in suffixnum:1r suffixlifetime:\'r suffixstring:\"x\"r; do
+    ws="$(new_ws "${pre%%:*}" $'[features]\ntesting = []')"
+    printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+    printf 'const _: &str = stringify!(%s"\\" ");\n#[cfg(feature = "testing")]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n// "\n' "${pre#*:}" > "$ws/demo/examples/good.rs"
+    expect "feature cfg after the literal ${pre#*:}\"\\\" \"" "$ws" 1 '      cfg(feature = "testing")'
+done
+
+# A char literal with a multi-character escape. A scan that stops at `'\x` reads `','` as
+# the char literal, and the `"` after it opens a string that swallows the feature cfg.
+for lit in charhex:'\x41' charunicode:'\u{41}'; do
+    ws="$(new_ws "${lit%%:*}" $'[features]\ntesting = []')"
+    printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+    printf 'fn main() { let _ = (%s,%s); body(); }\n#[cfg(feature = "testing")]\nfn body() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn body() {}\n// "\n' "'${lit#*:}'" "'\"'" > "$ws/demo/examples/good.rs"
+    expect "feature cfg after the char literal '${lit#*:}'" "$ws" 1 '      cfg(feature = "testing")'
+done
+
 ws="$(new_ws platformcfg)"
 cat > "$ws/demo/examples/good.rs" <<'RS'
 // #[cfg(feature = "testing")] in a comment is not a predicate.
@@ -268,6 +293,8 @@ fn main() {
     let _ = cfg!(all(target_family = "unix", not(windows)));
     let _ = (include_str!("good.rs"), r#"cfg(windows) "include" macro_rules"#);
     let _ = ("cfg_select! { _ => {} } #[test]", tested(), testing(), benches());
+    let _ = (r"cfg(windows) \", br#"cfg(windows)"#, cr"cfg(windows) \", c"cfg(windows)");
+    let _ = ('\x41','"', '\u{41}','"', b'\x7f','"', 'é','"', "cfg(windows)");
 }
 // cfg_if! and #[bench] in a comment are not constructs either.
 #[inline]

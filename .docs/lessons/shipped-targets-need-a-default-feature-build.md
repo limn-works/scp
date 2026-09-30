@@ -44,7 +44,11 @@ of them reopens a bypass this repository has already measured:
    the lint call builds, and the target still counts as checked (row 9a). The script reads
    each target's source and every `.rs` file under the package's `examples/`, following
    symbolic links as rustc follows them when it resolves `mod`, after blanking string
-   literals and comments, with block comments nested as rustc nests them. It fails on a
+   literals, char literals and comments, with block comments nested as rustc nests them.
+   The blanking must lex a literal where rustc does: a scan that reads the `r` of a literal
+   suffix or a lifetime (`1r"\" "`, `'r"\" "`) as a raw-string prefix, or stops a char
+   literal at a one-character escape (`'\x41'`), ends the literal at the wrong quote and
+   blanks the real code after it, feature cfg included, as a string. It fails on a
    `cfg(` or `cfg!(` predicate that names anything but `not`, `any`, `all`, `unix`,
    `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
    `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
