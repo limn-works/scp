@@ -1323,10 +1323,54 @@ header_rules_missing() {
             out+="[header item 8: $want] "
         fi
     done < <(grep -E '^[[:space:]]*print "' "$REPO_ROOT/scripts/check-examples-compile.sh")
-    for want in 'on a platform predicate false on the Linux runner' 'on an empty `any()` or `all()`' \
+    for want in 'on a platform predicate false on the Linux runner' \
         'including a package with no example target'; do
         [[ $text == *"$want"* ]] || out+="[header item 8: $want] "
     done
+    printf '%s' "$out"
+}
+# Every other cfg rejection comes out of the gate's `ev` predicate evaluator through the
+# one `print "cfg($s)` line, so the print map above cannot tell those rules apart. Each
+# `return undef` line in `ev` is one rejection; ev_rule_phrase maps it to the phrase the
+# source-scan line (first argument `scan`) or header item 8 (`header`) must carry, `-` for
+# the line that only passes a nested rejection up. A `return undef` line the map does not
+# know maps to nothing, so a rule added to `ev` turns this case red until both texts and
+# the map state it.
+ev_rule_phrase() {
+    local scan header
+    case $2 in
+        *'ev($t); return undef unless defined $x'*) echo -; return 0 ;;
+        *'$k =~ /^[A-Za-z_]/'* | *"shift(@\$t) eq ')'"*)
+            scan='on a predicate the scan cannot parse, such as cfg() or any(unix windows)'
+            header='on a predicate it cannot parse' ;;
+        *'(?:not|any|all)'* | *'$plat{$k}'*)
+            scan='fails on a cfg( or cfg!( predicate that names anything but not, any, all and '
+            header='predicate naming anything but `not`, `any`, `all` and' ;;
+        *"\$k eq 'not' ? @v != 1 : !@v"*)
+            scan='on an empty any() or all(), and on a not() that holds other than one predicate'
+            header='on an empty `any()` or `all()`, on a `not()` that holds other than one predicate' ;;
+        *'$s =~ /^"(\d+)"$/ && $str[$1] !~ /\\/'*)
+            scan='on a platform value that is not a string literal, as in target_os = linux, or that holds a backslash'
+            header='on a platform value that is not a string literal or that holds a backslash' ;;
+        *) return 0 ;;
+    esac
+    [[ $1 == scan ]] && echo "$scan" || echo "$header"
+}
+# ev_rules_missing KIND TEXT GATE prints each phrase TEXT lacks for a `return undef` line of
+# GATE's `ev` sub, and a note when GATE's `ev` holds fewer than the seven such lines the
+# gate has, so a gate whose `ev` the case cannot find fails instead of passing.
+ev_rules_missing() {
+    local line want n=0 out=""
+    while IFS= read -r line; do
+        n=$((n + 1))
+        want=$(ev_rule_phrase "$1" "$line")
+        if [[ -z $want ]]; then
+            out+="[a phrase for the ev rule: $line] "
+        elif [[ $want != - && $2 != *"$want"* ]]; then
+            out+="[$1: $want] "
+        fi
+    done < <(awk '/^sub ev \{/ { on = 1 } on && /return undef/ { print } on && /^\}/ { on = 0 }' "$3")
+    [[ $n -ge 7 ]] || out+="[the seven return undef lines of the gate's ev sub; found $n] "
     printf '%s' "$out"
 }
 # Item 8's text, comment markers stripped and its lines joined with single spaces.
@@ -1344,7 +1388,6 @@ while IFS= read -r rule; do
     fi
 done < <(grep -E '^[[:space:]]*print "' "$REPO_ROOT/scripts/check-examples-compile.sh")
 for want in 'false on the host the gate runs on, and the rust-clippy job runs on Linux, so cfg(windows)' \
-    'on an empty any() or all()' \
     'in every workspace package whether or not it has an example target'; do
     [[ $SCAN_LINE == *"$want"* ]] || scan_rules_missing+="[$want] "
 done
@@ -1395,6 +1438,8 @@ else
     plat_count=${plat_count%% *}
     scan_rules_missing+=$(header_rules_missing "$HEADER8" "$plat_count")
 fi
+scan_rules_missing+=$(ev_rules_missing scan "$SCAN_LINE" "$REPO_ROOT/scripts/check-examples-compile.sh")
+scan_rules_missing+=$(ev_rules_missing header "$HEADER8" "$REPO_ROOT/scripts/check-examples-compile.sh")
 if [[ $gate_rule_count -ge 11 && -z $scan_rules_missing ]]; then
     report "case 22b states every source rule the examples gate applies" 0 ""
 else
@@ -1439,6 +1484,22 @@ perl -pe 's/%plat\b/%other/' "$REPO_ROOT/scripts/check-examples-compile.sh" >"$p
 [[ -n $(header_rules_missing "${HEADER8/as a shebang/as a comment}" nine) ]] \
     || plat_bad+="[header item 8 without the shebang rule passed] "
 [[ -z $(header_rules_missing "$HEADER8" nine) ]] || plat_bad+="[the head's header item 8 failed] "
+# The ev map must pass the head's texts, reject a text that drops an ev rule, and reject a
+# gate whose ev gains a rejection the map does not know or whose ev it cannot find.
+GATE=$REPO_ROOT/scripts/check-examples-compile.sh
+[[ -z $(ev_rules_missing scan "$SCAN_LINE" "$GATE") && -z $(ev_rules_missing header "$HEADER8" "$GATE") ]] \
+    || plat_bad+="[the head's texts failed the ev rules] "
+[[ -n $(ev_rules_missing scan "${SCAN_LINE/, or that holds a backslash/}" "$GATE") ]] \
+    || plat_bad+="[a source-scan line without the backslash rule passed] "
+[[ -n $(ev_rules_missing header "${HEADER8/or that holds a backslash/}" "$GATE") ]] \
+    || plat_bad+="[header item 8 without the backslash rule passed] "
+[[ -n $(ev_rules_missing scan "${SCAN_LINE/and on a not() that holds/and on a not() with}" "$GATE") ]] \
+    || plat_bad+="[a source-scan line without the not() arity rule passed] "
+perl -pe "s/^(\s*return undef unless \\\$plat\{\\\$k\};)/\$1\n  return undef if \\\$k eq 'target_env';/" "$GATE" >"$plat_gate"
+[[ $(ev_rules_missing scan "$SCAN_LINE" "$plat_gate") == *"[a phrase for the ev rule:"*"target_env"* ]] \
+    || plat_bad+="[a gate whose ev gained an unmapped rejection passed] "
+perl -pe 's/^sub ev \{/sub evaluate {/' "$GATE" >"$plat_gate"
+[[ -n $(ev_rules_missing scan "$SCAN_LINE" "$plat_gate") ]] || plat_bad+="[a gate with no ev sub passed] "
 rm -f "$plat_gate"
 if [[ -z $plat_bad ]]; then
     report "case 22b rejects a line or header item 8 that differs from the gate's rules and key list" 0 ""
