@@ -16,7 +16,11 @@
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
 //!    (no DNS name required) — opens an inbound public port, publishes the host's
 //!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
-//!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP).
+//!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP). A shipped build
+//!    starts only from a storage directory that already holds an identity;
+//!    given any other directory it logs `self-host mode failed` with
+//!    `no production pre-rotation custody backend available`
+//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
 //!
 //! Configuration is read from CLI flags and environment variables.
 
@@ -67,8 +71,11 @@ struct CliConfig {
 ///   `--health`           — TCP health probe
 ///   `--ephemeral`        — all in-memory subsystems (`testing` builds only;
 ///                          a shipped build exits 1)
-///   `--storage-path <p>` — `SQLite` database directory
-///   `--help`             — print usage and exit
+///   `--self-host`        — host a static site on SCP (also `SCP_NODE_SELF_HOST`)
+///   `--site-dir <p>`     — static site directory for `--self-host` (also
+///                          `SCP_NODE_SITE_DIR`)
+///   `--storage-path <p>` — `SQLite` database directory (also `SCP_STORAGE_PATH`)
+///   `--help`, `-h`       — print usage and exit
 fn parse_args() -> CliConfig {
     let args: Vec<String> = env::args().collect();
 
@@ -177,6 +184,10 @@ OPTIONS:
                             (`SCP_NODE_DHT_MODE=disabled` skips publication).
                             Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1
                             for plain HTTP). See the loud startup banner for the full warning.
+                            A shipped binary starts only from a storage directory that
+                            already holds an identity; otherwise it logs 'self-host mode
+                            failed' ('no production pre-rotation custody backend
+                            available') and exits 1
     --site-dir <PATH>       Directory of static files to host in --self-host mode
                             (must contain index.html). Default: embedded site.
                             Also configurable via SCP_NODE_SITE_DIR env var

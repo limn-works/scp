@@ -157,7 +157,9 @@ OPTIONS:
                             a shipped binary exits 1)
     --self-host             Host a static site entirely on SCP (no DNS name required);
                             opens an inbound port to the public internet. Also set
-                            by SCP_NODE_SELF_HOST=1. See
+                            by SCP_NODE_SELF_HOST=1. A shipped binary starts only
+                            from a storage directory that already holds an
+                            identity; otherwise it exits 1. See
                             .docs/guides/self-hosting-a-website-on-scp.md
     --site-dir <PATH>       Directory of static files to host in --self-host mode
                             (must contain index.html; default: embedded site).

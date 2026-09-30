@@ -5,30 +5,70 @@ across 37 files. Nineteen review rounds later the branch was still producing fin
 in the nineteenth round a reviewer falsified three claims that the two newest commits had
 added. Deleting most of the sentences about subsystems the branch never modified ended the
 loop that fixing individual sentences could not. Outside the example the branch fixed
-(`crates/scp-node/examples/website.rs` and its `README.md`), the passages that stayed
-explain a fail-closed backend the branch never modified: `NoPreRotationBackend` on identity
-creation, or the unconfigured custody-migration backend. Each stayed because it replaced a
-false sentence: either a claim that a backend succeeds, or a documented command that exits 1
-with no reason given, which reads as a promise that the command works. By file:
+(`crates/scp-node/examples/website.rs` and its `README.md`) and the run-mode check it added
+to `crates/scp-node/src/main.rs` (`conflicting_modes`), each passage that stayed either
+documents a surface the branch changed or replaced a false sentence: a claim that a backend
+succeeds, a claim about a value or behavior the code does not have, or a documented command
+that exits 1 with no reason given, which reads as a promise that the command works. Most of
+them explain a fail-closed backend the branch never modified: `NoPreRotationBackend` on
+identity creation, or the unconfigured custody-migration backend. By file, each with the
+sentence it replaced:
 
 - `crates/scp-ffi/src/identity.rs`: the rustdoc of `identity_execute_custody_migration`,
   which had said its backend succeeds.
-- `crates/scp-node/src/main.rs`: item 1 of the module doc, the rustdoc of
-  `run_full_node_persistent`, the reason in the `--ephemeral` refusal message, and the
-  `--ephemeral` and `SCP_NODE_DOMAIN` lines of the help text.
-- `docs/guides/relay-operations.md`: the Identity and Use case cells of the full-node row
-  in the modes table, the comment on the full-node command below it, the identity bullet
-  in §6, the Production deployment paragraph that marks a `testing` build as
-  development-only, the Production deployment paragraph on why a shipped full node exits
-  1, and the comment on the §7 self-signed recipe. The §8 logging recipe moved from the
-  full node to `--relay-only`, and its comment says why.
+- `crates/scp-node/src/main.rs`:
+  - item 1 of the module doc, the rustdoc of `run_full_node_persistent`, and the
+    `SCP_NODE_DOMAIN` line of the help text, which presented the full node as the
+    production default with no word of its exit 1;
+  - item 3 of the module doc, the `--ephemeral` lines of the `parse_args` rustdoc and the
+    help text, and the warning `run_full_node_ephemeral` prints, which documented
+    `--ephemeral` with no word of a shipped build's exit 1, and whose warning pointed an
+    operator at the persistent mode for production;
+  - item 4 of the module doc and the `--self-host` line of the help text, which documented
+    `--self-host` with no word of a shipped build's exit 1 on a storage directory that holds
+    no identity;
+  - the `--self-host`, `--site-dir` and `-h` lines of the `parse_args` rustdoc, a list of
+    accepted flags that left out three flags `parse_cli_from` parses;
+  - the reason in the `--ephemeral` refusal message, which told the operator to run the
+    persistent full node, a command that exits 1;
+  - the comments on the `DhtMode::Disabled` arm of `run_full_node_persistent` and in
+    `parse_dht_mode_or_exit`, the rustdoc of `run_self_host` and its DHT-mode comment, and
+    the self-host banner test, which named `memory` as the self-host no-publish value that a
+    shipped binary rejects, and called the `Disabled` arm unreachable;
+  - the comment in `run_node_with`, which called `DhtMode::Production` advisory with no
+    runtime effect.
+- `docs/guides/relay-operations.md`:
+  - the modes sentence, which counted three modes; the Identity and Use case cells of the
+    full-node row and the Flag cell of the ephemeral row in the modes table; and the
+    comments on the full-node and ephemeral commands below it, which presented both as
+    commands that run;
+  - the `SCP_NODE_DHT_MODE` row, which offered `memory`, a value a shipped binary rejects,
+    and did not name `disabled`;
+  - the OPTIONS block: the `--ephemeral` line, which had no word of its exit 1, and the
+    `--self-host` and `--site-dir` lines, which the block left out; the `--self-host` line
+    also states its exit 1;
+  - the identity bullet in §6, which called the identity persistent across restarts;
+  - in Production deployment, the paragraph that marks a `testing` build as
+    development-only, storage-key step 1, and the paragraph on why a shipped full node
+    exits 1, which replaced the claims that the node generates its key on first run and
+    reloads its identity on later runs;
+  - in Development deployment, the rewritten recipe, which had run `--ephemeral` on a
+    shipped binary with `SCP_NODE_DHT_MODE=memory`, and the three paragraphs after it: that
+    ephemeral mode ignores `SCP_NODE_DHT_MODE`, that a shipped binary exits 1 on
+    `--ephemeral` and on two mode flags, and that a `testing` full node publishes the host's
+    address to the Mainline DHT, which warns about the recipe the branch rewrote;
+  - the comment on the §7 self-signed recipe and the "Do not drop `--ephemeral`" paragraph
+    after it, because the recipe had run the full node, which exits 1;
+  - the §8 logging recipe, which moved from the full node to `--relay-only`, and its
+    comment, which says why;
+  - the health-probe paragraph in §8, which documents the run-mode check the branch added.
 - `.docs/guides/deploying-an-scp-website.md`: the opening paragraph on why each recipe
   fails on a shipped build.
 - `.docs/guides/self-hosting-a-website-on-scp.md`: the parenthetical in the `host_site`
   running-log entry on why the example command exits 1.
 
-The rule below admits them, because each one corrects a false sentence rather than
-explaining a subsystem the branch only reads.
+The rule below admits them, because each one corrects a false sentence or documents a
+surface the branch changed, rather than explaining a subsystem the branch only reads.
 
 ## The Rule
 

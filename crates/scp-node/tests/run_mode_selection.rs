@@ -86,12 +86,14 @@ fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool) {
     );
 }
 
-/// The error text `docs/guides/relay-operations.md` and `main.rs` tell an
-/// operator to search a shipped full node's log for is the text the binary
-/// logs: `main` logs the `NodeError` with `%e`, so its `Display` is what the
-/// log holds, and the variant name `NoPreRotationBackend` is not in it.
+/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` displays the
+/// text `docs/guides/relay-operations.md` and `main.rs` tell an operator to
+/// search a shipped full node's log for, and its `Display` does not name the
+/// variant. This pins the `Display` string only. It does not run a node, so it
+/// does not prove that a shipped full node reaches this error or that `main`
+/// logs it with `%e`.
 #[test]
-fn shipped_full_node_logs_the_documented_pre_rotation_error_text() {
+fn no_pre_rotation_backend_display_matches_documented_log_text() {
     let logged = scp_node::NodeError::Identity(scp_identity::IdentityError::NoPreRotationBackend)
         .to_string();
     assert!(
