@@ -417,9 +417,9 @@ interface KeyCustodyProvider {
      * process that already holds a software key keeps signing with it after this call. The
      * other direction also holds: an instance constructed before another instance generated a
      * software Ed25519 key does not hold that key, yet its destroyKey queues removal of the key's
-     * persisted seed and then throws `SCP-CRYPTO-4001` because its own map lacks the key. The instance that holds
-     * the key keeps signing with it until its process ends, and no process started after the
-     * removal reaches disk restores it.
+     * persisted seed and then throws `SCP-CRYPTO-4001` because its own map lacks the key. The
+     * instance that holds the key keeps signing with it until its process ends, and no process
+     * started after the removal reaches disk restores it.
      * [AndroidKeyCustody] removes the persisted seed of a software Ed25519 key that
      * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
      * can restore the key when this process dies before the removal reaches disk (see

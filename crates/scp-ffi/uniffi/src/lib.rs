@@ -429,9 +429,13 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
     ///
-    /// Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
-    /// directly. Platform implementations using software-backed Ed25519 storage
-    /// (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+    /// The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
+    /// governance vote signing among them, build that key from the returned
+    /// bytes. A key held in hardware or in Android Keystore does not export its
+    /// bytes: the Android adapter refuses a Keystore handle with
+    /// `SCP-CRYPTO-4005`, and ADR-063 requires every key-export accessor to leave
+    /// the custody adapters, because hardware custody on the governance path is
+    /// impossible until then.
     ///
     /// # Default
     ///
