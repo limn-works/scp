@@ -1724,9 +1724,11 @@ class ContextBridge internal constructor(
 
             // Subscribe on IO dispatcher since it crosses the FFI boundary. The handle is
             // recorded inside the NonCancellable block, never taken from withContext's return
-            // value: a collector cancelled while contextSubscribe runs makes withContext throw
-            // on resumption and drop whatever the block returned, which would leave a live
-            // Rust subscription that nothing releases.
+            // value: when bridge.ioDispatcher differs from the collector's dispatcher, so that
+            // withContext resumes the collector by dispatch, a collector cancelled while
+            // contextSubscribe runs makes withContext throw on that resumption and drop
+            // whatever the block returned, which would leave a live Rust subscription that
+            // nothing releases.
             var subscriptionHandle: Long? = null
 
             // Release the subscription by suspending on bridge.ioDispatcher, never by

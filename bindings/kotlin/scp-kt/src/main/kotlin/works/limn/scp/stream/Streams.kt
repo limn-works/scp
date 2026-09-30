@@ -212,9 +212,11 @@ internal fun buildPaginatedFilter(
  *
  * Call [stopAll] in teardown, or [stopContextEvents] or [stopMessageStream] for
  * one handle, to unsubscribe from the Rust engine and remove the registry
- * entry. Nothing else releases a subscription: cancelling a collector's scope
- * does not, and the factory has no finalizer or cleaner, so dropping it
- * without a stop leaves every Rust subscription it opened live, still
+ * entry. A Rust engine that reports a subscription complete ends it and drops
+ * its registry entry, so no stop unsubscribes that one. Nothing else releases
+ * a subscription: cancelling a collector's scope does not, and the factory has
+ * no finalizer or cleaner, so dropping it without a stop leaves every
+ * subscription it opened that the engine has not completed live, still
  * emitting into its [SharedFlow].
  */
 class HotStreamFactory(
@@ -433,10 +435,11 @@ class HotStreamFactory(
      * twice on one coroutine deadlocks that coroutine.
      *
      * The whole body runs under [NonCancellable]. Each removal's own `withContext` still runs
-     * its block for a cancelled caller, but then throws [kotlinx.coroutines.CancellationException]
-     * on resumption into that caller; [releaseLogged] would catch that throw after a release that
-     * succeeded and log it as a failed release. The wrapper keeps that false warning out of the
-     * log.
+     * its block for a cancelled caller, and when [ioDispatcher] differs from that caller's
+     * dispatcher, so that `withContext` resumes the caller by dispatch, it then throws
+     * [kotlinx.coroutines.CancellationException] on that resumption; [releaseLogged] would catch
+     * that throw after a release that succeeded and log it as a failed release. The wrapper keeps
+     * that false warning out of the log.
      *
      * Attempts every release it holds and never throws a release's failure
      * (`.docs/standards/sdk-common.md` §Cleanup error handling): an unsubscribe call that
@@ -626,9 +629,11 @@ fun ColdMessageFlow(
             }
 
         // The handle is recorded inside the NonCancellable block, never taken from
-        // withContext's return value: a collector cancelled while contextSubscribe runs makes
-        // withContext throw on resumption and drop whatever the block returned, which would
-        // leave a live Rust subscription that nothing releases.
+        // withContext's return value: when ioDispatcher differs from the collector's
+        // dispatcher, so that withContext resumes the collector by dispatch, a collector
+        // cancelled while contextSubscribe runs makes withContext throw on that resumption and
+        // drop whatever the block returned, which would leave a live Rust subscription that
+        // nothing releases.
         var subscriptionHandle: Long? = null
 
         // Release the subscription by suspending on ioDispatcher, never by blocking:
