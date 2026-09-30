@@ -48,8 +48,9 @@
 //!   switches openmls's own tree-leaf `Lifetime` check off
 //!   (`skip_lifetime_validation`) and validates every KeyPackage-sourced leaf
 //!   against the injected hardened clock, with the maximum-range bound, after
-//!   `into_group` and before the group is adopted. `Date.now()` plays no part
-//!   in a Welcome's `Lifetime` decision.
+//!   `into_group` and before the group is adopted. A `Date.now()` override
+//!   made after this module initializes plays no part in a Welcome's
+//!   `Lifetime` decision; one made before it shifts the captured clock too.
 //! - **Residual: openmls's internal check still runs on two paths.** openmls
 //!   0.9.0's internal checks call `Lifetime::validate`, never
 //!   `validate_with_time` with a caller's time, so its own check inside
@@ -57,11 +58,12 @@
 //!   `Date.now()`, in addition to SCP's checks. Prerequisite 1's one-clock
 //!   criterion is therefore not yet met. Every accept decision on those paths
 //!   also needs SCP's check against this module's clock, so openmls's clock can
-//!   only add rejections: a page script that overrides `Date.now()` can make an
-//!   honest `KeyPackage` or commit fail, but cannot get a forged `Lifetime`
-//!   accepted. Page same-origin integrity (CSP/SRI/COOP/COEP) stays
-//!   load-bearing only against that denial of service, not for `Lifetime`
-//!   acceptance. The residual closes when openmls lets the caller supply the
+//!   only add rejections: a page script that overrides `Date.now()` after this
+//!   module initializes can make an honest `KeyPackage` or commit fail, but
+//!   cannot get a forged `Lifetime` accepted. Page same-origin integrity
+//!   (CSP/SRI/COOP/COEP) stays load-bearing for every `Lifetime` decision,
+//!   because a script that runs before this module initializes shifts the
+//!   captured clock too. The residual closes when openmls lets the caller supply the
 //!   clock that `KeyPackageIn::validate` and `process_message` read.
 
 use scp_clock::Clock;

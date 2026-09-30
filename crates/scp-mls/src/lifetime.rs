@@ -19,8 +19,9 @@
 //!
 //! `openmls` 0.9.0 reads its own clock in `Lifetime::new`, `Lifetime::default`,
 //! and the `Lifetime::validate` its internal checks run, and offers no way to
-//! route those reads through a caller's clock. Only its Welcome tree-leaf check
-//! can be switched off, and SCP switches it off (see below). It exposes two
+//! route those reads through a caller's clock. Of the checks SCP reaches, only
+//! the Welcome tree-leaf check can be switched off, and SCP switches it off
+//! (see below). It exposes two
 //! caller-side entry points that take the time from the caller, and this module
 //! uses both:
 //! [`Lifetime::init`](openmls::prelude::Lifetime), a pure constructor that takes
@@ -51,9 +52,10 @@
 //! Prerequisite 1 records: there are still two clocks. SCP brackets both paths
 //! against the injected clock, in addition to that internal check and never in
 //! place of it, so an accept decision needs both checks to pass and openmls's
-//! clock can only add rejections. A page script that overrides `Date.now()` can
-//! make an honest `KeyPackage` or commit fail, but cannot get a forged
-//! `Lifetime` accepted. On the Welcome path openmls's tree-leaf check is
+//! clock can only add rejections. A page script that overrides `Date.now()`
+//! after the browser client's clock module initializes can make an honest
+//! `KeyPackage` or commit fail, but cannot get a forged `Lifetime` accepted.
+//! In [`crate::group::join_group_from_bytes`] openmls's tree-leaf check is
 //! switched off and SCP's check is the only one, so there openmls's clock is
 //! never read for a `Lifetime`. The residual closes when openmls lets the
 //! caller supply the clock that `KeyPackageIn::validate` and
@@ -63,7 +65,10 @@
 //!   [`crate::group::key_package_in_did`],
 //!   [`crate::group::key_package_in_wrapping_key`], and the runtime backend's
 //!   `validate_key_package` in `scp-runtime` (`crypto/mls/production_backend.rs`
-//!   and `crypto/mls/provider.rs`).
+//!   and `crypto/mls/provider.rs`). Also `ProductionMlsBackend::join_from_welcome`
+//!   → `consumed_init_key_key` in `scp-runtime`, which validates the joiner's own
+//!   `KeyPackage`, on native only, with no SCP bracket, so openmls's clock there
+//!   can reject a join before `join_group_from_bytes` runs.
 //! - `process_message`: the staged-commit Add proposals in
 //!   [`crate::encrypt::decrypt_with_sender_did`] and
 //!   [`crate::encrypt::decrypt_with_membership_changes`], checked before the
@@ -83,7 +88,7 @@
 //!
 //! Because openmls's un-injectable internal `validate`/`Lifetime::new` still
 //! runs against the **real** system clock at every openmls validation/generation
-//! site (every one except a Welcome's tree leaves) — an injected [`Clock`](scp_clock::Clock) used in a test must sit within
+//! site (every one except a Welcome's tree leaves), an injected [`Clock`](scp_clock::Clock) used in a test must sit within
 //! `(real_now - KEY_PACKAGE_LIFETIME_SECS, real_now + KEY_PACKAGE_LIFETIME_MARGIN_SECS)`
 //! of the real clock — otherwise a `KeyPackage` minted from the injected clock is
 //! rejected by openmls's *own* internal validation before this module's check
@@ -156,8 +161,12 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 ///
 /// 1. **Temporal validity** — openmls 0.9.0 `Lifetime::validate_with_time`,
 ///    which accepts `not_before <= now && now < not_after`, called with `now`
-///    read from the injected clock. `now` is a `web_time::SystemTime`, the type
-///    `validate_with_time` takes on every target: `web_time` re-exports
+///    read from the injected clock. SCP calls openmls's comparison instead of
+///    keeping its own, so SCP's temporal rule cannot drift from openmls's (a
+///    hand-written copy went stale when openmls 0.9.0 moved the `not_before`
+///    bound from strict `<` to `<=`). The call compiles on both targets because
+///    `now` is a `web_time::SystemTime`, the type `validate_with_time` takes on
+///    every target: `web_time` re-exports
 ///    `std::time::SystemTime` natively and supplies its own type on
 ///    `wasm32-unknown-unknown`, where openmls uses it. One call therefore
 ///    compiles on both without a cfg branch.
@@ -166,8 +175,10 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 ///    KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`. A legitimately-signed `Lifetime`
 ///    with an over-long range (which openmls would accept) is rejected here.
 ///
-/// Both checks must pass. This runs *in addition to* openmls's own internal
-/// validation, never in place of it.
+/// Both checks must pass. On the `KeyPackageIn::validate` and staged-commit Add
+/// paths this runs in addition to openmls's own internal validation. On the
+/// Welcome tree-leaf path (`validate_tree_leaf_lifetimes`) openmls's check is
+/// switched off and this is the only one.
 ///
 /// # Errors
 ///

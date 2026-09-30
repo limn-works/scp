@@ -41,6 +41,7 @@ openmls_basic_credential = { workspace = true }
 openmls_rust_crypto = { workspace = true }
 openmls_memory_storage = { workspace = true }
 tls_codec = "0.5"
+# SCP calls openmls's own `Lifetime::validate_with_time` so its temporal rule cannot drift from openmls's.
 # `lifetime.rs` builds the `now` it passes to openmls's `Lifetime::validate_with_time`
 # as a `web_time::SystemTime`. That is the type the method takes on every target:
 # web-time re-exports `std::time::SystemTime` natively and supplies its own type on
