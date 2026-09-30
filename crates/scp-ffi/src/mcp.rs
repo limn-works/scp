@@ -919,7 +919,10 @@ impl FfiBridgeProvider {
         //
         // This trait method is sync but its callers vary:
         //   (a) `py_mcp_serve` stdio loop → `rt.spawn(async move …)`
-        //       on either a multi-thread or current-thread runtime.
+        //       on the multi-thread bridge runtime: `py_mcp_serve` refuses
+        //       a current-thread runtime while a supervisor is attached
+        //       (`check_serve_runtime`), and without one this call fails at
+        //       `supervisor` below.
         //   (b) SSE async handler → multi-thread runtime.
         //   (c) Sync `#[test]` tests → no runtime.
         //
@@ -1430,6 +1433,31 @@ fn mcp_server_bundle(
     McpServer::with_optional_event_source(provider, context_events)
 }
 
+/// Refuses to serve from a current-thread bridge runtime while a supervisor is
+/// attached.
+///
+/// With a supervisor attached, every provider gate reads the actor's role
+/// state (`FfiBridgeProvider::held_role_state`), which blocks the transport
+/// task's thread until the actor answers. On a current-thread runtime that
+/// thread is the only one that could run the actor, so every gated request
+/// would fail; `py_mcp_serve` fails instead of returning a handle to a server
+/// that answers none of them. The bridge runtime falls back to current-thread
+/// only when the multi-thread build fails (`crate::init_runtime`).
+fn check_serve_runtime(
+    flavor: tokio::runtime::RuntimeFlavor,
+    has_supervisor: bool,
+) -> Result<(), ScpPyError> {
+    if has_supervisor && flavor != tokio::runtime::RuntimeFlavor::MultiThread {
+        return Err(ScpPyError::transport(
+            "cannot serve MCP from a current-thread bridge runtime while a supervisor \
+             is attached: every gate reads the actor's role state, which that runtime \
+             cannot run while the gate blocks its only thread"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Returns a reference to the given bridge instance's MCP server registry.
 fn server_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpServerState> {
     bi.mcp_server_registry().as_ref()
@@ -1475,8 +1503,10 @@ fn generate_handle_id(prefix: &str) -> String {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the server fails to start or the instance
-/// shuts down before the server is registered.
+/// Raises `TransportError` if the server fails to start, if the bridge
+/// runtime is current-thread while a supervisor is attached (see
+/// `check_serve_runtime`), or if the instance shuts down before the server
+/// is registered.
 ///
 /// See ADR-015: MCP server with context namespace mapping.
 #[pymethods]
@@ -1533,6 +1563,10 @@ impl crate::scp::PyScp {
 
         // Start the transport task on the tokio runtime.
         let rt = crate::runtime()?;
+        check_serve_runtime(
+            rt.handle().runtime_flavor(),
+            bi.core.try_supervisor().is_some(),
+        )?;
         let transport_mode = transport.to_owned();
         // Capture the cancel token so the server task exits when the
         // instance is dropped, even if the caller never calls
@@ -3491,26 +3525,31 @@ mod tests {
     /// `py_mcp_client_connect_sse` sends the caller's token on its `GET`, so a
     /// Python client passes the bearer check an SCP SSE server always runs.
     /// The listener reads the request head and then closes the connection, so
-    /// the connect fails after the header has gone out.
+    /// the connect fails after the header has gone out. The test waits for
+    /// the head for at most 10 seconds, so a connect that refuses before it
+    /// dials fails the test with the connect's own result, not a hang.
     #[test]
     fn py_mcp_client_connect_sse_sends_the_bearer_token() {
         use std::io::BufRead;
         let scp = crate::scp::PyScp { inner: __bi() };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let server = std::thread::spawn(move || {
-            let (conn, _) = listener.accept().expect("accept GET");
+        let (head_tx, head_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((conn, _)) = listener.accept() else {
+                return;
+            };
             let mut reader = std::io::BufReader::new(conn);
             let mut head = String::new();
             loop {
                 let mut line = String::new();
-                let n = reader.read_line(&mut line).expect("read head");
-                if n == 0 || line == "\r\n" {
-                    break;
+                match reader.read_line(&mut line) {
+                    Ok(n) if n > 0 && line != "\r\n" => head.push_str(&line),
+                    _ => break,
                 }
-                head.push_str(&line);
             }
-            head
+            drop(reader);
+            let _ = head_tx.send(head);
         });
         pyo3::prepare_freethreaded_python();
         let result = Python::with_gil(|py| {
@@ -3520,7 +3559,14 @@ mod tests {
                 Some("tok-1"),
             )
         });
-        let head = server.join().expect("server thread");
+        let head = head_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the connect never sent its GET; it returned: {:?}",
+                    result.as_ref().map(|_| ()).map_err(ToString::to_string)
+                )
+            });
         assert!(
             head.contains("\r\nAuthorization: Bearer tok-1\r\n"),
             "the GET must carry the caller's bearer token, got: {head:?}"
@@ -5617,11 +5663,69 @@ mod tests {
                 .is_some()
         );
 
+        // The served shape: `py_mcp_serve` runs the gates inside a task it
+        // spawns on the multi-thread bridge runtime, where each read blocks
+        // one worker (`block_in_place`) while the actor answers on another.
+        let served = pyo3_mcp_provider(&bi, &granted, agent);
+        let served_ctx = granted.clone();
+        let rt = crate::runtime().unwrap();
+        let (ids, role, access, members) = rt
+            .block_on(rt.spawn(async move {
+                (
+                    served.active_context_ids(),
+                    served.agent_role(&served_ctx),
+                    served.validate_resource_access(&served_ctx, ResourceKind::Members),
+                    served.context_members(&served_ctx),
+                )
+            }))
+            .expect("the transport task must not panic");
+        assert_eq!(
+            ids.expect("participation reads in the task"),
+            vec![granted.clone()]
+        );
+        assert!(role.expect("the role state reads in the task").is_some());
+        access.unwrap_or_else(|e| panic!("the actor grants Members in the task: {e}"));
+        assert!(
+            members
+                .expect("members read in the task")
+                .iter()
+                .any(|m| m.did == agent)
+        );
+        let served = pyo3_mcp_provider(&bi, &revoked, agent);
+        let served_ctx = revoked.clone();
+        let denial = rt
+            .block_on(rt.spawn(async move {
+                served.validate_resource_access(&served_ctx, ResourceKind::Members)
+            }))
+            .expect("the transport task must not panic")
+            .expect_err("the actor's revocation holds in the task");
+        assert!(
+            matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("lacks messages:read")),
+            "{denial}"
+        );
+
         // No write-back: each copy still holds what the bridge wrote into it.
         assert!(copy_has_agent(&revoked) && !copy_has_agent(&granted));
 
         crate::runtime::remove_context(&bi, &revoked);
         crate::runtime::remove_context(&bi, &granted);
+    }
+
+    /// `py_mcp_serve` refuses a current-thread bridge runtime only while a
+    /// supervisor is attached, the one case where every gate would fail.
+    #[test]
+    fn serve_refuses_a_current_thread_runtime_only_with_a_supervisor() {
+        use tokio::runtime::RuntimeFlavor;
+        let error = check_serve_runtime(RuntimeFlavor::CurrentThread, true)
+            .expect_err("a current-thread runtime cannot run the actor a gate waits on")
+            .to_string();
+        assert!(error.contains("current-thread"), "{error}");
+        check_serve_runtime(RuntimeFlavor::MultiThread, true)
+            .expect("a multi-thread runtime serves with a supervisor");
+        check_serve_runtime(RuntimeFlavor::CurrentThread, false)
+            .expect("without a supervisor the gates read the bridge copy");
+        check_serve_runtime(RuntimeFlavor::MultiThread, false)
+            .expect("a multi-thread runtime serves without a supervisor");
     }
 
     /// A context the actor holds while the bridge holds no copy of it has no
