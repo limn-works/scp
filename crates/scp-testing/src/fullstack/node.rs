@@ -587,12 +587,13 @@ impl FullStackNode {
         //    nor the Welcome carries the joiner's sender key to the incumbents, so
         //    without this a B→A send fails at the receiver with `sender key lookup
         //    failed`. The joiner does not proactively PUSH its key: a push seals
-        //    to each incumbent's STABLE `0xFF01` wrapping key, and although the
-        //    signed leaf extension is readable through
-        //    `scp_mls::extract_member_wrapping_key`, binding a DID to a leaf is
-        //    open until the leaf-signing / custody slice (ADR-057's T4 residual
-        //    (3), the self-certifying directory; §23.13, Event Verification During
-        //    Reconciliation) — a joiner's `member_wrapping_keys` is empty.
+        //    to each incumbent's STABLE `0xFF01` wrapping key, and although
+        //    openmls 0.9.0 exposes every remote leaf, reading a member's wrapping
+        //    key from the tree waits on an attestation-verified binding of
+        //    identifier to leaf, owned by the leaf-signing / custody slice
+        //    (ADR-057's T4 residual (3), the self-certifying directory; §23.13,
+        //    Event Verification During Reconciliation) — a joiner's
+        //    `member_wrapping_keys` is empty.
         //    Instead each incumbent PULLS the joiner's key (see the helper).
         self.incumbents_pull_joiner_sender_key(context_id, &handle)
             .await?;
