@@ -289,9 +289,12 @@ interface PushProvider {
  * Abstracts key generation, signing, key agreement, and pseudonym derivation
  * behind a uniform interface. The Android implementation ([AndroidKeyCustody])
  * uses Android Keystore for Ed25519 on API 33+ and Bouncy Castle
- * for software fallback on API 26-32. ADR-027, as amended on 2026-09-10, requires a P-256
- * signing key in Keystore at every supported API level instead; story SCP-110 tracks that
- * move.
+ * for software fallback on API 26-32, and it performs key agreement with a software X25519 key
+ * that Bouncy Castle holds in process memory at every API level. ADR-027, as amended on
+ * 2026-09-10, requires a different scheme: an EC P-256 signing key in Keystore at every
+ * supported API level, and P-256 key agreement in Keystore from API 31 with a Bouncy Castle
+ * software P-256 agreement key, stored in EncryptedSharedPreferences, below it. Story SCP-110
+ * tracks both moves.
  *
  * This interface matches neither Rust declaration.
  *
@@ -349,7 +352,8 @@ interface KeyCustodyProvider {
      * Generate a new keypair of the specified type.
      *
      * Ed25519 keys may be Keystore keys ([CustodyType.HARDWARE], API 33+).
-     * X25519 wrapping keys are always software-managed (Bouncy Castle).
+     * X25519 wrapping keys are always software-managed (Bouncy Castle) and held in process
+     * memory only, which diverges from ADR-027's P-256 agreement key (see the interface KDoc).
      *
      * [AndroidKeyCustody] throws no [ScpException] from this method. A Keystore failure escapes
      * as the original exception, listed in the interface KDoc.
@@ -392,7 +396,12 @@ interface KeyCustodyProvider {
      * [KeyHandle.custodyType] before any key lookup.
      * Each [AndroidKeyCustody] instance holds its own map of software keys and restores every
      * persisted software Ed25519 seed into it when constructed, so another instance in the same
-     * process that already holds a software key keeps signing with it after this call.
+     * process that already holds a software key keeps signing with it after this call. The
+     * other direction also holds: an instance constructed before another instance generated a
+     * software Ed25519 key does not hold that key, yet its destroyKey queues removal of the key's
+     * persisted seed and then throws `SCP-CRYPTO-4001` because its own map lacks the key. The instance that holds
+     * the key keeps signing with it until its process ends, and no process started after the
+     * removal reaches disk restores it.
      * [AndroidKeyCustody] removes the persisted seed of a software Ed25519 key that
      * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
      * can restore the key when this process dies before the removal reaches disk (see
@@ -402,7 +411,10 @@ interface KeyCustodyProvider {
      * @return A [DestructionAttestation] naming the destruction method, with
      *   [DestructionAttestation.confirmed] always `true`: a failed post-deletion check throws
      *   `SCP-CRYPTO-4004` instead.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
+     * @throws ScpException with code `SCP-CRYPTO-4001` if no key sits under the handle: for a
+     *   Keystore handle, Keystore holds no alias `scp.key.<id>`; for a software handle, this
+     *   instance's software key map holds no entry, and the persisted seed under the handle's ID
+     *   is already queued for removal when this is thrown.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
     fun destroyKey(keyHandle: KeyHandle): DestructionAttestation

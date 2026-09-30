@@ -25,8 +25,10 @@ import android.content.Context
  * does not implement.
  *
  * @property keyCustody Android Keystore key management (Keystore-held Ed25519 on API 33+ today,
- *   reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel` check; ADR-027
- *   requires P-256 at every supported API level; story SCP-110 tracks that move).
+ *   reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel` check, and in-memory
+ *   software X25519 key agreement at every API level; ADR-027 requires a P-256 signing key in
+ *   Keystore at every supported API level and P-256 key agreement in Keystore from API 31;
+ *   story SCP-110 tracks both moves).
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging; checks only the `scp` wake field of a data-only

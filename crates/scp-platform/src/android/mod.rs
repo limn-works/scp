@@ -72,8 +72,11 @@
 //!
 //! - [`key_custody`] — Android Keystore key management (Keystore-held Ed25519
 //!   on API 33+, reported as hardware custody without a `KeyInfo.securityLevel`
-//!   check, Bouncy Castle software fallback on API 26-32, today; ADR-027
-//!   requires P-256; story SCP-110 tracks that move).
+//!   check, Bouncy Castle software fallback on API 26-32, and in-memory
+//!   software X25519 key agreement at every API level, today; ADR-027
+//!   requires a P-256 signing key in Keystore at every supported API level and
+//!   P-256 key agreement in Keystore from API 31; story SCP-110 tracks both
+//!   moves).
 //! - [`device_attestation`] — Play Integrity device attestation (a Classic
 //!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
 //! - [`push_provider`] — Firebase Cloud Messaging; checks only the `scp` wake
