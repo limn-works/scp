@@ -1924,7 +1924,8 @@ pub struct ContextParams {
     /// See spec §5.14.
     pub mode: ContextMode,
     /// Capability ceiling — maximum capabilities any participant can hold.
-    /// Empty list means no ceiling restriction.
+    /// Required and non-empty (construction.md M2): an empty list fails the
+    /// create with `SCP-VALID-7005`.
     pub ceiling: Vec<String>,
     /// Ceiling mutability policy — `Immutable` (default) or `Governed`.
     /// See spec §5.3.

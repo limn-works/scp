@@ -807,6 +807,11 @@ impl CreationReceipt {
 ///
 /// # Errors
 ///
+/// Returns [`ContextCreationError::StateTransition`] wrapping
+/// [`ContextError::CeilingRequired`] with
+/// [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
+/// if the ceiling is empty (construction.md M2).
+///
 /// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
 /// is specified and the params do not match the template definition.
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
@@ -819,9 +824,18 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // type system, since GovernanceModel has no Option wrapper).
     let _ = &params.governance; // field presence guaranteed by the type
 
-    // The ceiling is not checked here: the only caller of
-    // `builder::create_context`, `lifecycle_helpers::create_context`, rejects
-    // an empty ceiling before it calls in (construction.md M2).
+    // The ceiling must be non-empty (construction.md M2, Alec's ruling of
+    // 2026-09-30): an empty ceiling describes a context no member can use.
+    // `lifecycle_helpers::create_context` rejects it too, before it builds any
+    // governance state; this check makes the rule hold for every in-crate
+    // caller of `builder::create_context`, test code included.
+    if params.ceiling.is_empty() {
+        return Err(ContextCreationError::StateTransition(
+            scp_protocol::context::ContextError::CeilingRequired(
+                scp_protocol::context::CeilingDeclaration::Empty,
+            ),
+        ));
+    }
 
     // §5.1/§5.12: outlets are declared at creation and the creator installs them
     // into the live registry (GitHub #2020). The creator therefore writes
@@ -881,10 +895,8 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 
 /// Executes the two-phase context creation flow.
 ///
-/// Crate-private: its only caller is `lifecycle_helpers::create_context`,
-/// which rejects an empty ceiling (construction.md M2) before calling it. No
-/// other crate can create a context through this function and skip that
-/// check.
+/// Crate-private: no other crate can create a context through this function.
+/// Phase 1 rejects an empty ceiling (construction.md M2) for every caller.
 ///
 /// **Phase 1 (validate):** Checks params and identity with zero side effects.
 /// Returns early on any validation failure. Transport connectivity is NOT
@@ -1235,6 +1247,41 @@ mod tests {
     /// `#[ignore]`d pending `MlsBackend` injection.
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
+    /// Default params with a non-empty ceiling, which every create requires
+    /// (construction.md M2).
+    fn ceilinged_params() -> ContextParams {
+        ContextParams {
+            ceiling: vec![
+                scp_protocol::context::roles::Capability::MessagesRead,
+                scp_protocol::context::roles::Capability::MessagesWrite,
+            ],
+            ..ContextParams::default()
+        }
+    }
+
+    #[test]
+    fn validate_params_rejects_an_empty_ceiling() {
+        let params = ContextParams::default();
+        assert!(
+            params.ceiling.is_empty(),
+            "test precondition: default ceiling is empty"
+        );
+        let err = validate_params(&params).expect_err("an empty ceiling must be rejected");
+        assert!(
+            matches!(
+                err,
+                ContextCreationError::StateTransition(ContextError::CeilingRequired(
+                    scp_protocol::context::CeilingDeclaration::Empty
+                ))
+            ),
+            "expected CeilingRequired(Empty), got {err:?}"
+        );
+        assert!(
+            validate_params(&ceilinged_params()).is_ok(),
+            "a non-empty ceiling must be accepted"
+        );
+    }
+
     struct TestTransport;
     #[async_trait::async_trait]
     impl ContextTransportProvider for TestTransport {
@@ -1282,7 +1329,7 @@ mod tests {
         // Pure data test — no crypto provider needed.
         let params = ContextParams {
             memory_scope: MemoryScope::Full,
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(validate_params(&params).is_ok());
     }
@@ -1362,7 +1409,7 @@ mod tests {
         );
         let (handle, owned_crypto) = create_context(
             id.clone(),
-            ContextParams::default(),
+            ceilinged_params(),
             &crypto,
             &TestTransport,
             &TestEventLog,
@@ -1415,7 +1462,7 @@ mod tests {
 
         create_context(
             id.clone(),
-            ContextParams::default(),
+            ceilinged_params(),
             &crypto,
             &TestTransport,
             &provider,
@@ -1538,7 +1585,7 @@ mod tests {
 
         let params = ContextParams {
             outlets: vec![outlet_fixture("alpha"), outlet_fixture("beta")],
-            ..Default::default()
+            ..ceilinged_params()
         };
 
         create_context(
@@ -1634,7 +1681,7 @@ mod tests {
         };
         let params = ContextParams {
             outlets: vec![degenerate],
-            ..Default::default()
+            ..ceilinged_params()
         };
         let err = validate_params(&params)
             .expect_err("property-free schemas fail the §6.2/§9.2.1 specificity floor");
@@ -1651,7 +1698,7 @@ mod tests {
         under_floor.schema.output_schema = serde_json::json!({"type": "object"});
         let params = ContextParams {
             outlets: vec![under_floor],
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             validate_params(&params).is_err(),
@@ -1663,7 +1710,7 @@ mod tests {
         bad_operator.operator_did = "not-a-did".into();
         let params = ContextParams {
             outlets: vec![bad_operator],
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             validate_params(&params).is_err(),
@@ -1680,7 +1727,7 @@ mod tests {
     fn validate_params_rejects_duplicate_genesis_outlet_ids() {
         let params = ContextParams {
             outlets: vec![outlet_fixture("alpha"), outlet_fixture("alpha")],
-            ..Default::default()
+            ..ceilinged_params()
         };
         let err = validate_params(&params).expect_err("a duplicate outlet id must be refused");
         assert!(
@@ -1699,7 +1746,7 @@ mod tests {
             outlets: (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
                 .map(|i| outlet_fixture(&format!("outlet-{i}")))
                 .collect(),
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             params.outlets.len() > crate::context::state::MAX_REGISTERED_OUTLETS,
@@ -1718,7 +1765,7 @@ mod tests {
             outlets: (0..crate::context::state::MAX_REGISTERED_OUTLETS)
                 .map(|i| outlet_fixture(&format!("outlet-{i}")))
                 .collect(),
-            ..Default::default()
+            ..ceilinged_params()
         };
         assert!(
             validate_params(&params).is_ok(),

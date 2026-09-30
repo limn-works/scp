@@ -816,9 +816,13 @@ impl CapabilityCeiling {
     }
 }
 
-/// Returns the set of every standard SCP capability: messaging, outlet
-/// management, role assignment, membership control, governance, and context
-/// close.
+/// Returns a fixed set of eleven capabilities.
+///
+/// The set is messages read and write, outlet register, query-all and
+/// call-all, role assign, member invite and remove, governance propose and
+/// vote, and context close. It is not every [`Capability`]: it leaves out child-context creation, outlet interfaces,
+/// bridging, voice, video and screen-share media, member ban, metadata edit,
+/// and custom capabilities.
 ///
 /// No create substitutes it for an undeclared ceiling: the runtime rejects a
 /// create whose ceiling is empty, and the NAPI and `PyO3` `context_create`
