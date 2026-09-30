@@ -23,10 +23,11 @@ import { resolve } from "node:path";
 export const WASM_PACK_PROFILE_FLAG = "--release" as const;
 
 /**
- * Debug/dev profile flags that MUST NEVER appear in a shipped-artifact build
- * (they turn debug assertions on, a configuration the decrypt fuzzing does not
- * cover). The guard rejects any of these; the whitelist above is the only
- * allowed profile.
+ * Profile flags that MUST NEVER appear in a shipped-artifact build. A `--dev`
+ * (or `--debug`) build turns on every `debug_assert!` and overflow check, each
+ * a panic site the release build does not carry, and in the browser a panic
+ * aborts the tab (see the header above). The guard rejects any of these; the
+ * `--release` flag above is the only allowed profile.
  */
 export const FORBIDDEN_PROFILE_FLAGS: readonly string[] = ["--dev", "--debug", "--profiling"];
 
