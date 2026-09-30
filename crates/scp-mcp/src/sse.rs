@@ -1682,17 +1682,6 @@ mod tests {
         conn
     }
 
-    // -- Auth middleware -------------------------------------------------------
-
-    #[tokio::test]
-    async fn router_with_auth_builds_successfully() {
-        let server = McpServer::new(MockProvider::default());
-        let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        config.auth_token = "secret-token".to_owned();
-        let (_router, pump) = router_with_pump(server, &config, None, CancellationToken::new());
-        assert!(pump.is_none(), "no event source means no pump");
-    }
-
     // -- Auth middleware integration tests ------------------------------------
 
     /// Helper: build an authenticated router (`auth_token` = "test-secret").
