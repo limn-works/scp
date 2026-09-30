@@ -998,13 +998,15 @@ fun Context.asLifecycleFlow(
 
 /**
  * Base ViewModel that leaves every tracked context and shuts down the SCP instance it holds
- * when the ViewModel is cleared.
+ * in scpInstance when the ViewModel is cleared.
  */
-abstract class ScpViewModel(
-    // The SCP instance this ViewModel holds and the bridge its shutdown runs on.
-    private val scp: SCP,
-    private val scpBridge: CoroutineBridge,
-) : ViewModel() {
+abstract class ScpViewModel : ViewModel() {
+
+    // Set by the subclass, so the constructor keeps zero arguments: a Java subclass calls
+    // super(). scpInstance is the SCP instance onCleared() shuts down; scpBridge is the
+    // bridge its shutdown runs on.
+    protected var scpInstance: SCP? = null
+    protected var scpBridge: CoroutineBridge? = null
 
     private val contextsLock = Any()
     private val activeContexts = mutableListOf<TrackedContext>()
@@ -1057,8 +1059,10 @@ abstract class ScpViewModel(
                     .onFailure { Log.w("ScpViewModel", "onCleanupFailure threw", it) }
             }
             // After every leave: a leave needs the engine that shutdown stops.
-            if (shutdownAfter) {
-                runCatching { scp.shutdown(scpBridge) }
+            val scp = scpInstance
+            val bridge = scpBridge
+            if (shutdownAfter && scp != null && bridge != null) {
+                runCatching { scp.shutdown(bridge) }
                     .onFailure { Log.w("ScpViewModel", "SCP shutdown failed during ViewModel cleanup", it) }
             }
         }
@@ -1306,7 +1310,7 @@ dependencies {
 11. **Android lifecycle integration (scp-kt-android):**
     - `context.asLifecycleFlow(lifecycleOwner)` returns a `Flow<Message>` that cancels when the `LifecycleOwner` reaches `DESTROYED`.
     - Verified by creating a `TestLifecycleOwner`, collecting the flow in a test coroutine, moving the owner to `DESTROYED`, and asserting the flow completes.
-    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). A `leave()` that throws, whatever it throws, does not stop the remaining calls: each throwable goes to `ScpViewModel.onCleanupFailure(context, cause)`, a `protected open` hook whose default body logs at warning level, and a throw from an override is logged and does not stop them either. `onCleanupFailure` calls never overlap: a `Mutex` serializes them across `onCleared()`'s cleanup coroutine and each coroutine that a `trackContext` call after clear launches. An override may therefore update unsynchronized state, although successive calls can run on different threads. ScpViewModelTest verifies the serialization in `onCleanupFailure calls from parallel cleanup coroutines never overlap`. A waiting coroutine suspends rather than blocking its thread: `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread` fails under a blocking lock, because `trackContext` would block the test thread before the running call is released. Each cleanup coroutine starts undispatched on the thread that calls `onCleared()` or `trackContext`, so over a bridge whose I/O dispatcher runs inline, such as `Dispatchers.Unconfined`, every `leave` and every `onCleanupFailure` call runs on the calling thread before `onCleared()` or `trackContext` returns, unless another cleanup coroutine holds the lock; the waiting call then runs later, on the thread that releases it. `an inline leave retried from onCleanupFailure runs before trackContext returns` fails under a default start, which queues a retry launched from inside an unconfined cleanup coroutine until the retrying override returns. `onCleared()` also shuts down the `SCP` instance the ViewModel holds.
+    - `ScpViewModel.onCleared()` launches `leave()` for every tracked context on a scope it never cancels and returns without waiting for those calls (amended; see Rationale). A `leave()` that throws, whatever it throws, does not stop the remaining calls: each throwable goes to `ScpViewModel.onCleanupFailure(context, cause)`, a `protected open` hook whose default body logs at warning level, and a throw from an override is logged and does not stop them either. `onCleanupFailure` calls never overlap: a `Mutex` serializes them across `onCleared()`'s cleanup coroutine and each coroutine that a `trackContext` call after clear launches. An override may therefore update unsynchronized state, although successive calls can run on different threads. ScpViewModelTest verifies the serialization in `onCleanupFailure calls from parallel cleanup coroutines never overlap`. A waiting coroutine suspends rather than blocking its thread: `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread` fails under a blocking lock, because `trackContext` would block the test thread before the running call is released. Each cleanup coroutine starts undispatched on the thread that calls `onCleared()` or `trackContext`, so over a bridge whose I/O dispatcher runs inline, such as `Dispatchers.Unconfined`, every `leave` and every `onCleanupFailure` call runs on the calling thread before `onCleared()` or `trackContext` returns, unless another cleanup coroutine holds the lock; the waiting call then runs later, on the thread that releases it. `an inline leave retried from onCleanupFailure runs before trackContext returns` fails under a default start, which queues a retry launched from inside an unconfined cleanup coroutine until the retrying override returns. `onCleared()` also shuts down the `SCP` instance the ViewModel holds in `scpInstance`, when the subclass has set `scpInstance` and `scpBridge`, on the same cleanup coroutine after every `leave()`.
 
 12. **Jetpack Compose integration (`works.limn:scp-kt-android` state holders; `works.limn:scp-kt` takes no Compose dependency):**
     - The module-internal `rememberScpHotStream`, which `rememberContextEvents` and `rememberIncomingMessages` call, recomposes with the flow its `start` returned — verified in `StateHoldersTest`.
