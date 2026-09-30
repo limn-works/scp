@@ -622,7 +622,9 @@ fn held_role_state(
 /// Why the NAPI MCP server lists no tools and refuses every `tools/call`: this
 /// bridge's `ContextProvider::invoke_outlet` is not implemented, so it reports
 /// the capability as absent rather than advertising tools it cannot run. The
-/// `PyO3` and `UniFFI` providers do run outlets from `tools/call`.
+/// `PyO3` provider runs outlets from `tools/call`. The `UniFFI` provider runs
+/// an outlet only when a handler is registered for it, and no production
+/// `UniFFI` path registers one, so a `UniFFI` `tools/call` is refused too.
 // Stub — see SCP-048
 const OUTLET_INVOCATION_UNAVAILABLE: &str = "outlet invocation through the NAPI MCP server is not implemented: no \
      tools/call can run on this bridge, whatever grant the agent holds";
@@ -776,10 +778,11 @@ impl ContextProvider for McpNapiBridgeProvider {
         // the PyO3 and UniFFI bridges return. A dropped bridge or an
         // unreadable log is an error, never an empty log.
         let bi = self.upgrade_bi()?;
-        // `bridge_event_log` summarizes the bridge's local tree. The PyO3 and
-        // UniFFI bridges append each MCP `tools/call` record to their local
-        // tree; this bridge's `invoke_outlet` refuses every call, so it
-        // appends none.
+        // `bridge_event_log` summarizes the bridge's local tree. The PyO3
+        // bridge appends each MCP `tools/call` record to its local tree. The
+        // UniFFI bridge appends one only for an outlet with a registered
+        // handler, which no production UniFFI path registers. This bridge's
+        // `invoke_outlet` refuses every call, so it appends none.
         let bridge_log = crate::runtime::with_context(&bi, context_id, |rt| {
             Ok((
                 rt.core.event_log.leaves().len(),
@@ -1484,20 +1487,30 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        // Bounded: the stub never closes stdout before `sleep 600` ends, so a
-        // connect that stops finishing the handshake fails here in 10 s.
-        let result = runtime
-            .block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    mcp_client_connect_stdio_on(
-                        &bi,
-                        vec!["sh".to_owned(), "-c".to_owned(), script],
-                    ),
-                )
-                .await
-            })
-            .expect("the connect must end within 10 s");
+        // Bounded: the stub keeps stdout open until `sleep 600` ends, so a
+        // connect that stops finishing the handshake would hang this test ten
+        // minutes; it fails here in 10 s instead. The handshake runs on a
+        // blocking thread that outlives the timeout until the stub and its
+        // `sleep` die, and dropping the runtime waits on that thread, so a
+        // timeout kills both and shuts the runtime down in the background
+        // before it panics.
+        let Ok(result) = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                mcp_client_connect_stdio_on(&bi, vec!["sh".to_owned(), "-c".to_owned(), script]),
+            )
+            .await
+        }) else {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                let _ = Command::new("pkill")
+                    .args(["-KILL", "-P", pid.trim()])
+                    .status();
+                let _ = Command::new("kill").args(["-KILL", pid.trim()]).status();
+            }
+            let _ = std::fs::remove_file(&pid_file);
+            runtime.shutdown_background();
+            panic!("the connect must end within 10 s");
+        };
         let pid = std::fs::read_to_string(&pid_file).expect("the stub server wrote its pid");
         let _ = std::fs::remove_file(&pid_file);
 
@@ -1941,21 +1954,26 @@ mod tests {
             .expect("runtime");
         let limit = std::time::Duration::from_secs(10);
         // Each timeout is built inside `block_on`, where its timer finds the
-        // runtime's reactor.
-        let handle = runtime
-            .block_on(async {
-                tokio::time::timeout(
-                    limit,
-                    mcp_client_connect_stdio_on(
-                        &bi,
-                        vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
-                    ),
-                )
-                .await
-            })
-            .expect("the connect must end within 10 s")
+        // runtime's reactor. A call that times out leaves its blocking thread
+        // reading the stub's stdout, and dropping the runtime waits on that
+        // thread, so a timeout shuts the runtime down in the background before
+        // it panics.
+        let Ok(connected) = runtime.block_on(async {
+            tokio::time::timeout(
+                limit,
+                mcp_client_connect_stdio_on(
+                    &bi,
+                    vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                ),
+            )
+            .await
+        }) else {
+            runtime.shutdown_background();
+            panic!("the connect must end within 10 s");
+        };
+        let handle = connected
             .unwrap_or_else(|e| panic!("connect to the erroring stub server: {}", e.reason));
-        let list_and_invoke = || {
+        let list_and_invoke = |runtime: &tokio::runtime::Runtime| {
             let (list, invoke) = runtime
                 .block_on(async {
                     tokio::time::timeout(limit, async {
@@ -1974,14 +1992,17 @@ mod tests {
                     })
                     .await
                 })
-                .expect("tools/list and tools/call must end within 10 s");
-            (
+                .ok()?;
+            Some((
                 list.err().expect("tools/list must fail").reason.clone(),
                 invoke.err().expect("tools/call must fail").reason.clone(),
-            )
+            ))
         };
 
-        let (list, invoke) = list_and_invoke();
+        let Some((list, invoke)) = list_and_invoke(&runtime) else {
+            runtime.shutdown_background();
+            panic!("tools/list and tools/call must end within 10 s");
+        };
         assert!(list.contains("tools/list failed"), "got: {list}");
         assert_mcp_client_code(&list, codes::TRANS_5022);
         assert!(invoke.contains("tools/call failed"), "got: {invoke}");
@@ -1990,7 +2011,10 @@ mod tests {
         runtime
             .block_on(mcp_client_disconnect_on(&bi, &handle))
             .expect("disconnect a known handle");
-        let (list, invoke) = list_and_invoke();
+        let Some((list, invoke)) = list_and_invoke(&runtime) else {
+            runtime.shutdown_background();
+            panic!("tools/list and tools/call on a disconnected handle must end within 10 s");
+        };
         assert!(list.contains("not found"), "got: {list}");
         assert_mcp_client_code(&list, codes::TRANS_5020);
         assert!(invoke.contains("not found"), "got: {invoke}");
