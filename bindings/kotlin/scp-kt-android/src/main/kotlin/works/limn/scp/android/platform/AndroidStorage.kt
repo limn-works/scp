@@ -136,7 +136,11 @@ class AndroidStorage(private val context: Context) : StorageProvider {
      * key (fixed IV, fixed plaintext label).
      *
      * @return 32-byte SQLCipher passphrase derived from the Keystore key.
-     * @throws ScpException with code `SCP-STORAGE-8003` if key derivation fails.
+     * @throws ScpException with code `SCP-STORAGE-8003` if a Keystore, key-generation or
+     *   cipher call throws a `GeneralSecurityException`. Every other failure propagates
+     *   unconverted, for example the `IOException` from `KeyStore.load`, a
+     *   `ProviderException` from Keystore key generation, or the `NullPointerException`
+     *   the `as SecretKey` cast throws when `KeyStore.getKey` returns `null`.
      */
     internal fun getOrCreateStorageKey(): ByteArray {
         try {
@@ -371,7 +375,11 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         /** Error code: storage operation failed. */
         internal const val ERROR_STORAGE_OPERATION_FAILED = "SCP-STORAGE-8002"
 
-        /** Error code: the Keystore key or the SQLCipher passphrase derivation failed. */
+        /**
+         * Error code: the Keystore key or the SQLCipher passphrase derivation threw a
+         * `GeneralSecurityException`. [AndroidStorage.getOrCreateStorageKey] lists the
+         * failures it does not convert.
+         */
         internal const val ERROR_KEY_DERIVATION_FAILED = "SCP-STORAGE-8003"
     }
 }
