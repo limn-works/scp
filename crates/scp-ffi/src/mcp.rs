@@ -4121,6 +4121,30 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Runs `connect` against `scp` on a Python thread of its own and
+    /// returns the handle it yields. A stub server that answers `initialize`
+    /// lets the connect return at once, so the wait is bounded at 10 s: a
+    /// handshake regression fails the test there instead of hanging for as
+    /// long as the stub stays alive.
+    #[cfg(unix)]
+    fn connect_within_10s(
+        scp: &crate::scp::PyScp,
+        connect: impl FnOnce(&crate::scp::PyScp, Python<'_>) -> PyResult<String> + Send + 'static,
+    ) -> String {
+        let connector = crate::scp::PyScp {
+            inner: Arc::clone(&scp.inner),
+        };
+        let (connect_tx, connect_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = Python::with_gil(|py| connect(&connector, py).map_err(|e| e.to_string()));
+            let _ = connect_tx.send(result);
+        });
+        connect_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the stub server answers initialize, so connect must return within 10 s")
+            .expect("connect to the stub server")
+    }
+
     /// Yields an in-flight call's error message once it ends, or `None` if
     /// it succeeded.
     #[cfg(unix)]
@@ -4157,13 +4181,12 @@ mod tests {
             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
             \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
             wait";
-        let handle = Python::with_gil(|py| {
+        let handle = connect_within_10s(scp, move |scp, py| {
             scp.py_mcp_client_connect_stdio(
                 py,
                 vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
             )
-        })
-        .expect("connect to the stub server");
+        });
         let (server, probe) = {
             let entry = client_registry_of(&scp.inner)
                 .get(&handle)
@@ -4376,13 +4399,12 @@ mod tests {
             if [ -n \"$id\" ]; then \
             echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"error\\\":{\\\"code\\\":-32601,\\\"message\\\":\\\"refused\\\"}}\"; \
             fi; done";
-        Python::with_gil(|py| {
+        connect_within_10s(scp, move |scp, py| {
             scp.py_mcp_client_connect_stdio(
                 py,
                 vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
             )
         })
-        .expect("connect to the stub server")
     }
 
     /// Calls `tools/list` and `tools/call` on `handle` and returns both
@@ -4717,10 +4739,9 @@ mod tests {
             drop((sse, initialize, initialized, answered, silent));
             Some(())
         });
-        let handle = Python::with_gil(|py| {
+        let handle = connect_within_10s(scp, move |scp, py| {
             scp.py_mcp_client_connect_sse(py, &format!("http://127.0.0.1:{port}/sse"), None)
-        })
-        .expect("connect to the stub server");
+        });
         let listed = Python::with_gil(|py| {
             scp.py_mcp_client_list_tools(py, &handle)
                 .map(|tools| tools.bind(py).to_string())
