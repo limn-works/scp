@@ -4,6 +4,10 @@ Phase 4 PR 5 (#1549) moved MCP operations onto :class:`scp_sdk.SCP`.
 Use :meth:`SCP.mcp_serve`, :meth:`SCP.mcp_client_connect_sse`,
 :meth:`SCP.mcp_client_list_tools`, :meth:`SCP.mcp_client_invoke`,
 :meth:`SCP.mcp_client_disconnect`, and :meth:`SCP.mcp_server_stop`.
+
+Run: python3.12 examples/mcp_integration.py, with a separate SCP SSE server
+listening on 127.0.0.1:8080 and SCP_MCP_SSE_TOKEN and SCP_MCP_SSE_CONTEXT_ID
+set as the client section below describes.
 """
 
 import asyncio
