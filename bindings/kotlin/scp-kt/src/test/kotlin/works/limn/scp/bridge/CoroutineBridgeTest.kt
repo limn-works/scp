@@ -608,7 +608,7 @@ class CoroutineBridgeTest {
 
                 val cause = completionCause
                 assertTrue(cause is CancellationException, "collector completed with $cause")
-                assertFalse(generateSequence(cause) { it.cause }.any { it === failure })
+                assertFalse(generateSequence<Throwable>(cause) { it.cause }.any { it === failure })
                 assertEquals(1, records.size)
                 assertEquals(Level.WARNING, records[0].level)
                 assertEquals(failure.message, records[0].thrown?.message)

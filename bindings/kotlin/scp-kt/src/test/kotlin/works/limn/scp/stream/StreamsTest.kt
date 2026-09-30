@@ -403,8 +403,8 @@ class StreamsTest {
                 val subscribing =
                     launch {
                         cancel()
-                        runCatching { factory.contextEvents(EVENT_CONTEXT_HANDLE) }
-                        runCatching { factory.incomingMessages(EVENT_CONTEXT_HANDLE) }
+                        runCatching { factory.contextEvents(CONTEXT_HANDLE) }
+                        runCatching { factory.incomingMessages(CONTEXT_HANDLE) }
                     }
                 advanceUntilIdle()
                 subscribing.join()
@@ -413,8 +413,8 @@ class StreamsTest {
                 assertEquals(0, stubBindings.messageSubscribeCount)
 
                 // Nothing was registered, so a live caller subscribes afresh.
-                factory.contextEvents(EVENT_CONTEXT_HANDLE)
-                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                factory.contextEvents(CONTEXT_HANDLE)
+                factory.incomingMessages(CONTEXT_HANDLE)
                 assertEquals(1, stubBindings.eventSubscribeCount)
                 assertEquals(1, stubBindings.messageSubscribeCount)
             }
@@ -430,7 +430,7 @@ class StreamsTest {
                     releaseSubscribe.await()
                 }
 
-                val subscribing = launch(Dispatchers.Default) { factory.contextEvents(EVENT_CONTEXT_HANDLE) }
+                val subscribing = launch(Dispatchers.Default) { factory.contextEvents(CONTEXT_HANDLE) }
                 try {
                     assertTrue(
                         subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
@@ -442,7 +442,7 @@ class StreamsTest {
                     // waiting for the mutex, however slowly the runner schedules threads.
                     val stopping =
                         launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
-                            factory.stopContextEvents(EVENT_CONTEXT_HANDLE)
+                            factory.stopContextEvents(CONTEXT_HANDLE)
                         }
                     assertTrue(stopping.isActive, "stopContextEvents returned while the subscribe held its mutex")
                     stopping.cancel()
@@ -470,7 +470,7 @@ class StreamsTest {
                     releaseSubscribe.await()
                 }
 
-                val subscribing = launch(Dispatchers.Default) { factory.incomingMessages(EVENT_CONTEXT_HANDLE) }
+                val subscribing = launch(Dispatchers.Default) { factory.incomingMessages(CONTEXT_HANDLE) }
                 try {
                     assertTrue(
                         subscribeEntered.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
@@ -480,7 +480,7 @@ class StreamsTest {
                     // the reason the event-side test above states.
                     val stopping =
                         launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
-                            factory.stopMessageStream(EVENT_CONTEXT_HANDLE)
+                            factory.stopMessageStream(CONTEXT_HANDLE)
                         }
                     assertTrue(stopping.isActive, "stopMessageStream returned while the subscribe held its mutex")
                     stopping.cancel()
@@ -561,7 +561,7 @@ class StreamsTest {
                 // cancellation exactly where a registry write follows a subscribe call.
                 stubBindings.onSubscribeEvents = { subscribing.cancel() }
 
-                subscribing = launch { factory.contextEvents(EVENT_CONTEXT_HANDLE) }
+                subscribing = launch { factory.contextEvents(CONTEXT_HANDLE) }
                 advanceUntilIdle()
 
                 assertEquals(1, stubBindings.eventSubscribeCount)
@@ -579,7 +579,7 @@ class StreamsTest {
                 lateinit var subscribing: Job
                 stubBindings.onSubscribe = { subscribing.cancel() }
 
-                subscribing = launch { factory.incomingMessages(EVENT_CONTEXT_HANDLE) }
+                subscribing = launch { factory.incomingMessages(CONTEXT_HANDLE) }
                 advanceUntilIdle()
 
                 assertEquals(1, stubBindings.messageSubscribeCount)
@@ -601,7 +601,7 @@ class StreamsTest {
                     releaseSubscribe.await()
                 }
 
-                val subscribing = launch(Dispatchers.Default) { factory.contextEvents(EVENT_CONTEXT_HANDLE) }
+                val subscribing = launch(Dispatchers.Default) { factory.contextEvents(CONTEXT_HANDLE) }
                 // A failing assertion below leaves `subscribing` parked on releaseSubscribe,
                 // which a Rust callback thread cannot interrupt, so this latch opens in a
                 // finally block: a test that fails an assertion reports that failure instead
@@ -620,7 +620,7 @@ class StreamsTest {
                     // threads.
                     val stopping =
                         launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
-                            factory.stopContextEvents(EVENT_CONTEXT_HANDLE)
+                            factory.stopContextEvents(CONTEXT_HANDLE)
                         }
                     assertTrue(
                         stopping.isActive,
@@ -651,7 +651,7 @@ class StreamsTest {
                     releaseSubscribe.await()
                 }
 
-                val subscribing = launch(Dispatchers.Default) { factory.incomingMessages(EVENT_CONTEXT_HANDLE) }
+                val subscribing = launch(Dispatchers.Default) { factory.incomingMessages(CONTEXT_HANDLE) }
                 // This finally block opens releaseSubscribe for a reason an event-side test
                 // above states.
                 try {
@@ -665,7 +665,7 @@ class StreamsTest {
                     // states.
                     val stopping =
                         launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
-                            factory.stopMessageStream(EVENT_CONTEXT_HANDLE)
+                            factory.stopMessageStream(CONTEXT_HANDLE)
                         }
                     assertTrue(
                         stopping.isActive,
@@ -689,11 +689,11 @@ class StreamsTest {
         fun `a completion callback removes only its own subscription`() =
             runTest {
                 val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
-                factory.contextEvents(EVENT_CONTEXT_HANDLE)
+                factory.contextEvents(CONTEXT_HANDLE)
                 val staleCallback = assertNotNull(stubBindings.lastEventCallback)
 
-                factory.stopContextEvents(EVENT_CONTEXT_HANDLE)
-                factory.contextEvents(EVENT_CONTEXT_HANDLE)
+                factory.stopContextEvents(CONTEXT_HANDLE)
+                factory.contextEvents(CONTEXT_HANDLE)
                 staleCallback.onComplete()
 
                 factory.stopAll()
@@ -705,11 +705,11 @@ class StreamsTest {
         fun `a message completion callback removes only its own subscription`() =
             runTest {
                 val factory = HotStreamFactory(stubBindings, StandardTestDispatcher(testScheduler))
-                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                factory.incomingMessages(CONTEXT_HANDLE)
                 val staleCallback = assertNotNull(stubBindings.lastMessageCallback)
 
-                factory.stopMessageStream(EVENT_CONTEXT_HANDLE)
-                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                factory.stopMessageStream(CONTEXT_HANDLE)
+                factory.incomingMessages(CONTEXT_HANDLE)
                 staleCallback.onComplete()
 
                 factory.stopAll()
@@ -724,11 +724,11 @@ class StreamsTest {
                 // A Rust engine ends this subscription before contextSubscribeEvents returns,
                 // so its completion reaches the slot before the slot's registry write.
                 stubBindings.onSubscribeEvents = { assertNotNull(stubBindings.lastEventCallback).onComplete() }
-                factory.contextEvents(EVENT_CONTEXT_HANDLE)
+                factory.contextEvents(CONTEXT_HANDLE)
                 stubBindings.onSubscribeEvents = null
 
                 // A registry that still named the ended subscription would hand it back here.
-                factory.contextEvents(EVENT_CONTEXT_HANDLE)
+                factory.contextEvents(CONTEXT_HANDLE)
 
                 assertEquals(2, stubBindings.eventSubscribeCount)
             }
@@ -740,11 +740,11 @@ class StreamsTest {
                 // A Rust engine ends this subscription before contextSubscribe returns, so its
                 // completion reaches the slot before the slot's registry write.
                 stubBindings.onSubscribe = { assertNotNull(stubBindings.lastMessageCallback).onComplete() }
-                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                factory.incomingMessages(CONTEXT_HANDLE)
                 stubBindings.onSubscribe = null
 
                 // A registry that still named the ended subscription would hand it back here.
-                factory.incomingMessages(EVENT_CONTEXT_HANDLE)
+                factory.incomingMessages(CONTEXT_HANDLE)
 
                 assertEquals(2, stubBindings.messageSubscribeCount)
             }
@@ -901,7 +901,7 @@ class StreamsTest {
 
                 val cause = completionCause
                 assertTrue(cause is CancellationException, "collector completed with $cause")
-                assertFalse(generateSequence(cause) { it.cause }.any { it === failure })
+                assertFalse(generateSequence<Throwable>(cause) { it.cause }.any { it === failure })
                 assertEquals(1, records.size)
                 assertEquals(Level.WARNING, records[0].level)
                 assertEquals(failure.message, records[0].thrown?.message)
@@ -1142,8 +1142,11 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
     override fun transportDisconnect(transportHandle: Long) { /* no-op */ }
 }
 
-/** Context handle that every subscription-ownership test subscribes against. */
-private const val EVENT_CONTEXT_HANDLE = 42L
+/**
+ * Context handle that HotStreamFactoryTests and SubscriptionOwnershipTests subscribe
+ * their event and message streams against.
+ */
+private const val CONTEXT_HANDLE = 42L
 
 /** Upper bound on how long a test waits for a latch that a stub's own thread opens. */
 private const val LATCH_TIMEOUT_SECONDS = 10L
