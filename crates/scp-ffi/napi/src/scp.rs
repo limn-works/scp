@@ -4090,7 +4090,9 @@ impl Scp {
     /// sockets are shut down, before this returns, and a call in flight on
     /// the handle then fails. A call still waiting behind an in-flight call
     /// on the handle fails once it reaches the client, on either transport,
-    /// and sends no request.
+    /// and sends no request. A connect still waiting for its server to answer
+    /// `initialize` (stdio or SSE) has no handle yet, so no disconnect, and no
+    /// instance shutdown, ends it.
     #[napi(js_name = "mcpClientDisconnect")]
     pub async fn mcp_client_disconnect(&self, handle: &NapiMcpClientHandle) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);

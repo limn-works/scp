@@ -868,10 +868,11 @@ async fn run_mcp_stdio_server(
 /// `crate::runtime::build_supervisor_arc`). The bundle is unwired in three
 /// cases: no supervisor is attached, the supervisor has no channel, or the
 /// instance is suspended when the server is created, because
-/// `crate::runtime::supervisor` refuses a suspended instance. The last case
-/// lasts the server's life: a `resume()` does not rewire a server built
-/// while suspended, so the host creates the server again after `resume()`
-/// to get subscriptions. An unwired server advertises every capability the event
+/// `crate::runtime::supervisor` refuses a suspended instance. Each case lasts
+/// the server's life, because this function runs once per serve call: neither
+/// a supervisor attached later nor a `resume()` rewires the server, so the host
+/// creates the server again once the instance has a supervisor and is not
+/// suspended to get subscriptions. An unwired server advertises every capability the event
 /// pump backs as false (`resources.subscribe`, `resources.listChanged`,
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
@@ -1862,6 +1863,105 @@ mod tests {
         }
     }
 
+    /// Asserts that `reason` carries `code` and none of the other MCP client
+    /// codes, nor the generic transport code.
+    fn assert_mcp_client_code(reason: &str, code: &str) {
+        for other in [
+            codes::TRANS_5001,
+            codes::TRANS_5020,
+            codes::TRANS_5021,
+            codes::TRANS_5022,
+            codes::TRANS_5023,
+            codes::TRANS_5024,
+            codes::TRANS_5025,
+        ] {
+            assert_eq!(
+                reason.contains(other),
+                other == code,
+                "expected {code} alone, got: {reason}"
+            );
+        }
+    }
+
+    /// The NAPI MCP client returns the documented code for each condition: a
+    /// server error on `tools/list` and `tools/call` is TRANS-5022 and
+    /// TRANS-5025, and a handle no longer registered is TRANS-5020 and
+    /// TRANS-5023. `a_call_queued_at_disconnect_sends_no_request_napi` checks
+    /// the queued-at-disconnect codes TRANS-5021 and TRANS-5024.
+    #[test]
+    fn mcp_client_calls_return_the_documented_codes_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+        bi.core
+            .mcp_allowlist()
+            .lock()
+            .expect("allowlist lock")
+            .configure(&["sh"])
+            .expect("allow sh");
+        // Answers `initialize`, then answers every later request that carries
+        // an id with a JSON-RPC error.
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            while read l; do \
+            id=$(printf '%s' \"$l\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p'); \
+            if [ -n \"$id\" ]; then \
+            echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"error\\\":{\\\"code\\\":-32601,\\\"message\\\":\\\"refused\\\"}}\"; \
+            fi; done";
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let limit = std::time::Duration::from_secs(10);
+        let handle = runtime
+            .block_on(tokio::time::timeout(
+                limit,
+                mcp_client_connect_stdio_on(
+                    &bi,
+                    vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                ),
+            ))
+            .expect("the connect must end within 10 s")
+            .unwrap_or_else(|e| panic!("connect to the erroring stub server: {}", e.reason));
+        let list_and_invoke = || {
+            let (list, invoke) = runtime
+                .block_on(tokio::time::timeout(limit, async {
+                    (
+                        mcp_client_list_tools_on(&bi, &handle).await,
+                        mcp_client_invoke_on(
+                            &bi,
+                            &handle,
+                            "test-outlet".to_owned(),
+                            "{}".to_owned(),
+                            "ctx-test".to_owned(),
+                            "did:dht:z6MkTestUser".to_owned(),
+                        )
+                        .await,
+                    )
+                }))
+                .expect("tools/list and tools/call must end within 10 s");
+            (
+                list.err().expect("tools/list must fail").reason,
+                invoke.err().expect("tools/call must fail").reason,
+            )
+        };
+
+        let (list, invoke) = list_and_invoke();
+        assert!(list.contains("tools/list failed"), "got: {list}");
+        assert_mcp_client_code(&list, codes::TRANS_5022);
+        assert!(invoke.contains("tools/call failed"), "got: {invoke}");
+        assert_mcp_client_code(&invoke, codes::TRANS_5025);
+
+        runtime
+            .block_on(mcp_client_disconnect_on(&bi, &handle))
+            .expect("disconnect a known handle");
+        let (list, invoke) = list_and_invoke();
+        assert!(list.contains("not found"), "got: {list}");
+        assert_mcp_client_code(&list, codes::TRANS_5020);
+        assert!(invoke.contains("not found"), "got: {invoke}");
+        assert_mcp_client_code(&invoke, codes::TRANS_5023);
+    }
+
     /// A disconnect ends an SSE call in flight against a server that
     /// accepted its POST and never answers, and the handle then fails as
     /// not found. The client is connected through `mcp_client_connect_sse_on`,
@@ -2713,6 +2813,46 @@ mod tests {
                 .agent_role(granted)
                 .expect("the role state reads")
                 .is_some()
+        );
+
+        // The served shape: `mcp_server_create_on` runs the gates inside a
+        // task it spawns on the multi-thread bridge runtime, where each read
+        // blocks one worker (`block_in_place`) while the actor answers on
+        // another.
+        let rt = crate::runtime();
+        let served = provider(granted);
+        let (ids, role, access, members) = rt
+            .block_on(rt.spawn(async move {
+                (
+                    served.active_context_ids(),
+                    served.agent_role(granted),
+                    served.validate_resource_access(granted, ResourceKind::Members),
+                    served.context_members(granted),
+                )
+            }))
+            .expect("the transport task must not panic");
+        assert_eq!(
+            ids.expect("participation reads in the task"),
+            vec![granted.to_owned()]
+        );
+        assert!(role.expect("the role state reads in the task").is_some());
+        access.unwrap_or_else(|e| panic!("the actor grants Members in the task: {e}"));
+        assert!(
+            members
+                .expect("members read in the task")
+                .iter()
+                .any(|m| m.did == agent)
+        );
+        let served = provider(revoked);
+        let denial = rt
+            .block_on(rt.spawn(async move {
+                served.validate_resource_access(revoked, ResourceKind::Members)
+            }))
+            .expect("the transport task must not panic")
+            .expect_err("the actor's revocation holds in the task");
+        assert!(
+            matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("lacks messages:read")),
+            "{denial}"
         );
 
         // No write-back: each copy still holds what the bridge wrote into it.
