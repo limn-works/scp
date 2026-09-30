@@ -840,20 +840,18 @@ impl KeyPackageStoreActor {
     /// A replay rejection (the crypto-layer consumed-init-key backstop) maps to
     /// the dedicated [`ContextError::KeyPackageReplay`] — distinct from
     /// [`ContextError::InvalidState`] (which also means "unknown reservation")
-    /// so a caller can detect a security-relevant single-use replay. A Welcome
-    /// whose tree holds a KeyPackage-sourced leaf that fails the injected-clock
-    /// or maximum-range lifetime check maps to
-    /// [`ContextError::InvalidKeyPackage`], the variant `NodeMlsFactory` and
-    /// the lifecycle join path use for lifetime failures (ADR-057 §Prereq-1).
-    /// Everything else is a crypto failure.
+    /// so a caller can detect a security-relevant single-use replay. Everything
+    /// else is a crypto failure, including a Welcome whose tree holds a
+    /// KeyPackage-sourced leaf that fails the injected-clock or maximum-range
+    /// lifetime check (ADR-057 §Prereq-1): that is the sender's tree, not the
+    /// caller's KeyPackage, so it is not [`ContextError::InvalidKeyPackage`].
+    /// Issue #2593, a dedicated error variant for a rejected Welcome, tracks a
+    /// typed variant for it.
     fn map_join_error(e: &MlsError) -> ContextError {
         match e {
             MlsError::KeyPackageReplay => ContextError::KeyPackageReplay(
                 "key package already consumed (init-key replay rejected)".to_owned(),
             ),
-            MlsError::KeyPackageLifetimeInvalid { .. } => {
-                ContextError::InvalidKeyPackage(e.to_string())
-            }
             other => ContextError::CryptoFailed(format!("join from welcome: {other}")),
         }
     }

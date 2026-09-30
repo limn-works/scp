@@ -2880,11 +2880,12 @@ async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
 }
 
 /// A Welcome whose tree holds a KeyPackage-sourced leaf that expired under the
-/// actor backend's injected clock fails the fused join with the typed
-/// `InvalidKeyPackage`, not the `CryptoFailed` a corrupt Welcome gets, and the
-/// reserved KeyPackage is not burned.
+/// actor backend's injected clock fails the fused join with `CryptoFailed`
+/// carrying the lifetime error, not `InvalidKeyPackage`, because the rejected
+/// leaf is in the sender's tree, not the caller's KeyPackage. The reserved
+/// KeyPackage is not burned.
 #[tokio::test]
-async fn fused_confirm_rejects_expired_tree_leaf_as_invalid_key_package() {
+async fn fused_confirm_rejects_expired_tree_leaf_as_crypto_failed() {
     use scp_clock::TestClock;
     use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
 
@@ -2952,9 +2953,16 @@ async fn fused_confirm_rejects_expired_tree_leaf_as_invalid_key_package() {
         .await
         .err()
         .expect("a Welcome holding an expired leaf makes the fused join fail");
+    let expected_not_after = format!("not_after={}", real_now + 600);
     assert!(
-        matches!(err, ContextError::InvalidKeyPackage(_)),
-        "expected InvalidKeyPackage, got {err:?}"
+        matches!(
+            &err,
+            ContextError::CryptoFailed(msg)
+                if msg.starts_with("join from welcome: ")
+                    && msg.contains("key package lifetime invalid")
+                    && msg.contains(&expected_not_after)
+        ),
+        "expected CryptoFailed carrying Carol's lifetime error, got {err:?}"
     );
     assert!(
         kp_record_present(&storage, &alice(), &kp_ref).await,
