@@ -32,7 +32,7 @@ public nonisolated struct McpToolDefinition: Sendable {
 /// The result of invoking an MCP tool, wrapped with SCP provenance.
 ///
 /// Maintains the protocol's provenance-everywhere principle: a tool call to
-/// any MCP server, an SCP node's or another, carries verifiable origin metadata.
+/// any MCP server, an SCP SSE server or another, carries verifiable origin metadata.
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md`.
 public nonisolated struct McpToolResult: Sendable {
@@ -76,8 +76,8 @@ public nonisolated struct McpToolResult: Sendable {
 
 /// Configuration for connecting to an MCP server.
 ///
-/// Specifies how to connect to an MCP server, an SCP node's SSE server
-/// included. Tool results are wrapped with SCP provenance metadata.
+/// Specifies how to connect to an MCP server, an SCP SSE server or
+/// another. Tool results are wrapped with SCP provenance metadata.
 public nonisolated enum McpClientConfig: Sendable {
     /// Connect via stdio: spawn a subprocess and communicate over stdin/stdout.
     ///
@@ -101,7 +101,7 @@ public nonisolated enum McpClientConfig: Sendable {
 
 /// An MCP client that calls an MCP server's tools and records SCP provenance.
 ///
-/// Connects to an MCP server, an SCP node's SSE server included, via an
+/// Connects to an MCP server, an SCP SSE server or another, via an
 /// ``SCP`` instance and wraps tool results with SCP provenance metadata. This
 /// maintains SCP's provenance-everywhere principle for every tool call.
 ///
@@ -143,7 +143,7 @@ public actor McpClient {
 
     // MARK: - Factory
 
-    /// Connects to an MCP server, an SCP node's SSE server included, and completes the MCP handshake.
+    /// Connects to an MCP server, an SCP SSE server or another, and completes the MCP handshake.
     ///
     /// - Parameters:
     ///   - scp: The owning ``SCP`` instance whose MCP client registry
