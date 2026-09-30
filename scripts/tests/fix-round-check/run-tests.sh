@@ -1278,9 +1278,12 @@ fi
 # The source-scan line and header item 8 do not restate the scan's rules: each names
 # scripts/check-examples-compile.sh as the one statement of them, so a rule the gate
 # gains or drops leaves both texts true. scan_points_to_gate passes a text that carries
-# that pointer and fails one that drops it.
+# that pointer with the gate path as its subject, bare or in backticks, and fails one
+# that drops the pointer or names another file as its subject, even when the gate path
+# stands elsewhere in the text.
 scan_points_to_gate() {
-    [[ $1 == *'scripts/check-examples-compile.sh'*' is the one statement of the rules that scan applies'* ]]
+    [[ $1 == *'scripts/check-examples-compile.sh is the one statement of the rules that scan applies'* \
+        || $1 == *'`scripts/check-examples-compile.sh` is the one statement of the rules that scan applies'* ]]
 }
 # Item 8's text, comment markers stripped and its lines joined with single spaces.
 HEADER8=$(awk '/^#   8\./ { on = 1 } /^# USAGE/ { on = 0 } on' "$REPO_ROOT/scripts/fix-round-check.sh" \
@@ -1288,7 +1291,9 @@ HEADER8=$(awk '/^#   8\./ { on = 1 } /^# USAGE/ { on = 0 } on' "$REPO_ROOT/scrip
 if scan_points_to_gate "$SCAN_LINE" && scan_points_to_gate "$HEADER8" \
     && ! scan_points_to_gate "${SCAN_LINE/is the one statement/is one statement}" \
     && ! scan_points_to_gate "${HEADER8/is the one statement/is one statement}" \
-    && ! scan_points_to_gate "${SCAN_LINE//scripts\/check-examples-compile.sh/the gate}"; then
+    && ! scan_points_to_gate "${SCAN_LINE//scripts\/check-examples-compile.sh/the gate}" \
+    && ! scan_points_to_gate "${SCAN_LINE/scripts\/check-examples-compile.sh is the one/LESSON.md is the one}" \
+    && ! scan_points_to_gate "${HEADER8/scripts\/check-examples-compile.sh\` is the one/LESSON.md\` is the one}"; then
     report "case 22b points the source-scan line and header item 8 to the examples gate for its rules" 0 ""
 else
     report "case 22b points the source-scan line and header item 8 to the examples gate for its rules" 1 "the source-scan line reads: ${SCAN_LINE:-<absent>}; header item 8 reads: ${HEADER8:-<absent>}"
