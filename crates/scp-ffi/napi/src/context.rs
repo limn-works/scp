@@ -339,10 +339,6 @@ impl NapiContextHandle {
     /// Creates a minimal active handle stamped with the given bridge
     /// instance's id. Suitable for testing bridge functions that only need
     /// UCAN state (set up via `ensure_registered`).
-    ///
-    /// The handle carries `default_ceiling()`, the ceiling `context_create`
-    /// resolves an omitted declaration to, because `ensure_registered` keeps
-    /// an empty ceiling empty (deny-all).
     pub(crate) fn test_active_on(
         bi: &Arc<NapiBridgeInstance>,
         context_id: String,
@@ -355,10 +351,7 @@ impl NapiContextHandle {
             state: std::sync::Mutex::new(ContextState::Active),
             creator_did,
             mode: "Encrypted".to_owned(),
-            ceiling: scp_core::context::roles::default_ceiling()
-                .iter()
-                .map(scp_core::context::roles::Capability::ucan_capability_name)
-                .collect(),
+            ceiling: vec![],
             ceiling_policy: "immutable".to_owned(),
             ttl_seconds: None,
             promotion_policy: None,
@@ -572,9 +565,7 @@ struct ParsedContextParams {
 ///
 /// `parse_context_params` carries a caller's vocabulary to the shared
 /// `build_context_params` parser, so a default this bridge substitutes has to
-/// arrive in the same form a caller would have written. The Welcome-join
-/// precheck registers the joiner's FFI state with the same strings until the
-/// authenticated ceiling replaces them.
+/// arrive in the same form a caller would have written.
 fn default_ceiling_strings() -> Vec<String> {
     scp_core::context::roles::default_ceiling()
         .iter()
@@ -1305,15 +1296,10 @@ pub(crate) async fn reserve_key_package_on(
 
     let sup = crate::runtime::supervisor(bi)?;
     let sup = Arc::clone(sup);
-    let (reservation_id, kp_public) =
-        sup.reserve_key_package(DID(owning_did))
-            .await
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("reserve_key_package failed: {e}"),
-                    code: codes::CTX_2000.to_owned(),
-                })
-            })?;
+    let (reservation_id, kp_public) = sup
+        .reserve_key_package(DID(owning_did))
+        .await
+        .map_err(|e| NapiError::from(busy_or("reserve_key_package", codes::CTX_2000, &e)))?;
 
     Ok(NapiKeyPackageReservation {
         reservation_id: reservation_id.to_string(),
@@ -1426,19 +1412,13 @@ pub(crate) async fn context_join_from_welcome_on(
     // any pre-existing entry untouched (never roll back state we did not create).
     //
     // FLAG-1: the caller no longer supplies a ceiling, so register with the
-    // DEFAULT ceiling, passed explicitly because `register_ffi_state` keeps an
-    // empty ceiling empty (deny-all). The Occupied dedup is keyed on
-    // `context_id`, so the "detect a duplicate BEFORE consuming the single-use
-    // KeyPackage" crash-safety is preserved regardless of the ceiling. The
-    // AUTHENTICATED ceiling is re-synced from the joined handle's signed params
-    // AFTER a successful spawn (see `sync_ceiling_from_params` below).
-    crate::runtime::register_ffi_state(
-        bi,
-        &sealed.context_id,
-        &sealed.creator_did,
-        &default_ceiling_strings(),
-    )
-    .map_err(NapiError::from)?;
+    // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`, so
+    // the "detect a duplicate BEFORE consuming the single-use KeyPackage"
+    // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
+    // ceiling is re-synced from the joined handle's signed params AFTER a
+    // successful spawn (see `sync_ceiling_from_params` below).
+    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
+        .map_err(NapiError::from)?;
     // Insert the joiner as a member of the freshly-registered role state. On the
     // (practically unreachable) failure of this insert into state we just
     // created, roll it back so a failed join leaves nothing behind.
@@ -1471,7 +1451,11 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(NapiError::from(welcome_join_error(&e)));
+            return Err(NapiError::from(busy_or(
+                "context_join_from_welcome",
+                codes::CTX_2013,
+                &e,
+            )));
         }
     };
 
@@ -1482,13 +1466,11 @@ pub(crate) async fn context_join_from_welcome_on(
     // just registered (and not removed on this success path), so the sync targets
     // a live entry.
     //
-    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails in
-    // two cases: a concurrent close/leave removed the just-registered FFI state
-    // in the window since the spawn returned, or an entry of the authenticated
-    // ceiling fails the §5.3.1.1 grammar (VALID_7000). In both cases the runtime
-    // actor is live (a close/leave does NOT despawn it), so returning `Err` here
-    // without tearing the actor down would strand a live, orphaned actor for a
-    // join that never fully materialized at the bridge.
+    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails ONLY
+    // if a concurrent close/leave removed the just-registered FFI state in the
+    // window since the spawn returned. A close/leave does NOT despawn the runtime
+    // actor, so returning `Err` here without tearing the actor down would strand a
+    // live, orphaned actor for a join that never fully materialized at the bridge.
     // Compensate with the COMPLETE teardown (`discard_joined_context`): it removes
     // the actor handle AND destroys the resident MLS group AND deletes the durable
     // Class-S snapshot the join persisted — a bare `despawn_actor` would leave the
@@ -1634,12 +1616,8 @@ pub(crate) async fn invite_member_on(
     // is what triggers the wipe here (matching the PyO3 reference bridge).
     drop(signing_key);
 
-    let outcome = outcome.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("invite_member failed: {e}"),
-            code: codes::CTX_2013.to_owned(),
-        })
-    })?;
+    let outcome =
+        outcome.map_err(|e| NapiError::from(busy_or("invite_member", codes::CTX_2013, &e)))?;
     Ok(NapiInviteMemberOutcome::from_outcome(outcome))
 }
 
@@ -5575,20 +5553,22 @@ fn parse_template_id_napi(
     }
 }
 
-/// Maps a failed `spawn_actor_from_welcome` to the bridge error.
+/// Maps a failed supervisor call that otherwise reports every failure under
+/// one fixed `code` to the bridge error, keeping `ActorBusy` retryable.
 ///
 /// `ActorBusy` keeps its retryable `SCP-CTX-2130` code (ADR-049 §10): an
-/// actor the join needed, such as the joiner's key-package actor, gave no
-/// answer, and a fresh call can complete the join. Every other failure is
-/// `SCP-CTX-2013`.
-fn welcome_join_error(e: &scp_core::context::ContextError) -> ScpNapiError {
+/// actor the call needed, such as the joiner's key-package actor, gave no
+/// answer, and a fresh call can succeed. Every other failure reports `code`.
+/// The Welcome join, the key-package reservation and the invite map their
+/// errors through it.
+fn busy_or(op: &str, code: &str, e: &scp_core::context::ContextError) -> ScpNapiError {
     let code = if matches!(e, scp_core::context::ContextError::ActorBusy(_)) {
         codes::CTX_2130
     } else {
-        codes::CTX_2013
+        code
     };
     ScpNapiError::Context {
-        message: format!("context_join_from_welcome failed: {e}"),
+        message: format!("{op} failed: {e}"),
         code: code.to_owned(),
     }
 }
@@ -6835,27 +6815,80 @@ mod tests {
         }
     }
 
-    /// A Welcome join that meets a busy actor keeps the retryable
-    /// `SCP-CTX-2130` code, and any other failure reads `SCP-CTX-2013`.
+    /// A Welcome join, a key-package reservation or an invite that meets a
+    /// busy actor keeps the retryable `SCP-CTX-2130` code, and any other
+    /// failure reads the operation's own code.
     #[test]
-    fn welcome_join_error_keeps_actor_busy_retryable() {
+    fn busy_or_keeps_actor_busy_retryable() {
         use scp_core::context::ContextError;
         let code_of = |e: crate::error::ScpNapiError| match e {
             crate::error::ScpNapiError::Context { code, .. } => code,
             other => panic!("expected ScpNapiError::Context, got {other:?}"),
         };
-        assert_eq!(
-            code_of(super::welcome_join_error(&ContextError::ActorBusy(
-                "key-package actor".to_owned()
-            ))),
-            codes::CTX_2130
-        );
-        assert_eq!(
-            code_of(super::welcome_join_error(&ContextError::MembershipFailed(
-                "bad welcome".to_owned()
-            ))),
-            codes::CTX_2013
-        );
+        for fallback in [codes::CTX_2013, codes::CTX_2000] {
+            assert_eq!(
+                code_of(super::busy_or(
+                    "reserve_key_package",
+                    fallback,
+                    &ContextError::ActorBusy("key-package actor".to_owned())
+                )),
+                codes::CTX_2130
+            );
+            assert_eq!(
+                code_of(super::busy_or(
+                    "context_join_from_welcome",
+                    fallback,
+                    &ContextError::MembershipFailed("bad welcome".to_owned())
+                )),
+                fallback
+            );
+        }
+    }
+
+    /// The supervisor installs an explicit `ceiling: []` as the actor's
+    /// ceiling and grants the creator nothing, while an omitted ceiling
+    /// installs `default_ceiling()` and grants the creator `messages:write`.
+    /// The check reads the actor's params and role state, not the bridge's
+    /// copy.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_supervisor_enforces_an_empty_ceiling_as_deny_all() {
+        use scp_core::context::roles::Capability;
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        for (params_json, admits) in [
+            (r#"{"memoryScope":"ephemeral"}"#, true),
+            (r#"{"memoryScope":"ephemeral","ceiling":[]}"#, false),
+        ] {
+            let handle = super::context_create_on(&bi, &owner, params_json.to_owned())
+                .await
+                .expect("context_create should succeed");
+            let stored = test_dispatch_context_params(&bi, &handle.context_id).await;
+            assert_eq!(
+                stored.ceiling.is_empty(),
+                !admits,
+                "{params_json}: the actor's ceiling is {:?}",
+                stored.ceiling
+            );
+            let sup = std::sync::Arc::clone(
+                crate::runtime::supervisor(&bi).expect("context_create attaches a supervisor"),
+            );
+            let role_state = sup
+                .get_role_state(&handle.context_id)
+                .await
+                .expect("the created context's actor must answer");
+            assert_eq!(
+                role_state.member_has_capability(&handle.creator_did, &Capability::MessagesWrite),
+                admits,
+                "{params_json}: the actor must {} the creator messages:write",
+                if admits { "grant" } else { "deny" }
+            );
+        }
     }
 
     // -------------------------------------------------------------------

@@ -559,7 +559,9 @@ pub const CTX_2096: &str = "SCP-CTX-2096";
 /// `CTX_2134` is not retryable until an operator clears the poison or the
 /// process restarts.
 ///
-/// Maps from `ContextError::ActorBusy`.
+/// Maps from `ContextError::ActorBusy` in each bridge's error translator. A
+/// bridge call site that reports every failure under one fixed code reports
+/// that code instead.
 pub const CTX_2130: &str = "SCP-CTX-2130";
 /// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
 ///

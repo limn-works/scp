@@ -482,16 +482,14 @@ pub(crate) async fn ucan_mint_on(
     let context_id = handle.context_id();
 
     // Get ceiling from the context handle for mint-time enforcement (#339).
-    // Always `Some`, because `None` makes the runtime apply `default_ceiling()`.
-    // The handle's ceiling equals the ceiling the context actor holds, so an
-    // empty one is the actor's deny-all ceiling and stays empty; widening it
-    // would let this mint admit what the actor refuses.
-    let ceiling = Some(
-        handle
-            .ceiling()
-            .into_iter()
-            .collect::<std::collections::HashSet<String>>(),
-    );
+    // Empty ceiling means the user passed `[]` — apply the default ceiling
+    // instead of `None` (which would mean unlimited). See #1419.
+    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
+    let ceiling = Some(if ceiling_strings.is_empty() {
+        scp_core::context::roles::default_ceiling().to_ucan_string_set()
+    } else {
+        ceiling_strings
+    });
 
     let params = MintParams {
         issuer_did: &creator_did,
@@ -610,16 +608,14 @@ pub(crate) async fn ucan_delegate_on(
         .map_err(napi::Error::from)?;
 
     // Get ceiling from the context handle for delegation-time enforcement (#339).
-    // Always `Some`, because `None` makes the runtime apply `default_ceiling()`.
-    // The handle's ceiling equals the ceiling the context actor holds, so an
-    // empty one is the actor's deny-all ceiling and stays empty; widening it
-    // would let this mint admit what the actor refuses.
-    let ceiling = Some(
-        handle
-            .ceiling()
-            .into_iter()
-            .collect::<std::collections::HashSet<String>>(),
-    );
+    // Empty ceiling means the user passed `[]` — apply the default ceiling
+    // instead of `None` (which would mean unlimited). See #1419.
+    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
+    let ceiling = Some(if ceiling_strings.is_empty() {
+        scp_core::context::roles::default_ceiling().to_ucan_string_set()
+    } else {
+        ceiling_strings
+    });
 
     // Look up the DELEGATOR's identity from the global identity registry.
     // This is critical: the delegation must be signed with the delegator's
@@ -1204,79 +1200,6 @@ mod tests {
             (bi, handle, token, owner_did)
         }
 
-        /// A context created with an explicit `ceiling: []` grants nothing at
-        /// the bridge, the same as at the actor: `ucan_mint_on` refuses a
-        /// capability the default ceiling carries, and the registered UCAN and
-        /// role-state ceilings stay empty. A context whose ceiling names that
-        /// capability mints it, so the refusal comes from the ceiling.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn an_empty_ceiling_refuses_mint_and_registers_no_capability() {
-            let scp = crate::scp::Scp::new_in_memory_for_test();
-            let bi = std::sync::Arc::clone(&scp.inner);
-            let owner = scp
-                .identity_create("in_memory".to_owned(), None)
-                .await
-                .expect("identity_create should succeed");
-
-            for (ceiling, admits) in [
-                (serde_json::json!([]), false),
-                (serde_json::json!(["messages:write"]), true),
-            ] {
-                let params = serde_json::json!({
-                    "ceiling": ceiling,
-                    "governance": "single_admin",
-                    "memoryScope": "ephemeral",
-                })
-                .to_string();
-                let handle = crate::context::context_create_on(&bi, &owner, params)
-                    .await
-                    .expect("context_create should succeed");
-
-                let minted = ucan_mint_on(
-                    &bi,
-                    &handle,
-                    AUDIENCE_DID.to_owned(),
-                    vec!["messages:write".to_owned()],
-                    None,
-                )
-                .await;
-                assert_eq!(
-                    minted.is_ok(),
-                    admits,
-                    "ceiling {ceiling} must {} a messages:write mint",
-                    if admits { "admit" } else { "refuse" }
-                );
-
-                runtime::ensure_registered(&bi, &handle)
-                    .expect("ensure_registered should register a freshly created context");
-                let (ucan_ceiling, role_ceiling_admits) =
-                    runtime::with_context(&bi, &handle.context_id(), |rt| {
-                        Ok((
-                            rt.core.ceiling_strings.clone(),
-                            rt.role_state
-                                .ceiling()
-                                .contains(&scp_core::context::roles::Capability::MessagesWrite),
-                        ))
-                    })
-                    .expect("the context must be registered in the UCAN state registry");
-                assert_eq!(
-                    ucan_ceiling.contains("messages:write"),
-                    admits,
-                    "ceiling {ceiling} registered UCAN ceiling {ucan_ceiling:?}"
-                );
-                assert_eq!(
-                    role_ceiling_admits, admits,
-                    "ceiling {ceiling} must seed the role-state ceiling the same way"
-                );
-                if !admits {
-                    assert!(
-                        ucan_ceiling.is_empty(),
-                        "an explicit [] must register no capability, got {ucan_ceiling:?}"
-                    );
-                }
-            }
-        }
-
         /// `ucan_revoke_on` marks the token revoked in the context's revocation
         /// list and appends a `TokenRevoked` event, when the context creator
         /// revokes a token that creator issued.
@@ -1438,107 +1361,6 @@ mod tests {
                  issuer's DID; a false result here means ucan_delegate_on signed with a \
                  key other than its delegator's"
             );
-        }
-
-        /// A context created with an explicit `ceiling: []` refuses every
-        /// delegation at the bridge, the same as at the actor, while a context
-        /// whose ceiling names the capability admits the same delegation.
-        ///
-        /// In each row the parent token is scoped to the delegating handle's
-        /// own context and is signed by that context's creator through
-        /// `mint_ucan` with no ceiling, the way a token from an issuer outside
-        /// this bridge arrives, so the parent grants `messages:write` in both
-        /// rows and only the handle's ceiling differs. Restoring an
-        /// empty-to-default widening, or passing `None` so the runtime applies
-        /// `default_ceiling()`, turns the `[]` row green and fails this test.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn an_empty_ceiling_refuses_delegation() {
-            let scp = crate::scp::Scp::new_in_memory_for_test();
-            let bi = std::sync::Arc::clone(&scp.inner);
-
-            let creator = scp
-                .identity_create("in_memory".to_owned(), None)
-                .await
-                .expect("identity_create should succeed for a context creator");
-            let delegator = scp
-                .identity_create("in_memory".to_owned(), None)
-                .await
-                .expect("identity_create should succeed for a delegator");
-            let delegator_did = delegator.did();
-            let granted = vec!["messages:write".to_owned()];
-
-            for (ceiling, admits) in [
-                (serde_json::json!([]), false),
-                (serde_json::json!(["messages:write"]), true),
-            ] {
-                let params = serde_json::json!({
-                    "ceiling": ceiling,
-                    "governance": "single_admin",
-                    "memoryScope": "ephemeral",
-                })
-                .to_string();
-                let handle = crate::context::context_create_on(&bi, &creator, params)
-                    .await
-                    .expect("context_create should succeed");
-                let custody = handle
-                    .in_memory_custody
-                    .as_ref()
-                    .expect("an in-memory creator retains custody");
-                let signing_key = handle
-                    .signing_key
-                    .expect("an in-memory creator retains a signing key");
-                let creator_did = handle.creator_did();
-                let context_id = handle.context_id();
-                let parent = mint_ucan(
-                    &MintParams {
-                        issuer_did: &creator_did,
-                        issuer_key: &signing_key,
-                        audience_did: &delegator_did,
-                        context_id: &context_id,
-                        capabilities: &granted,
-                        lifetime_secs: 3600,
-                        not_before: None,
-                        proofs: Vec::new(),
-                        facts: None,
-                        key_scope: None,
-                        signing_key_id: None,
-                        ceiling: None,
-                    },
-                    custody.as_ref(),
-                    &scp_clock::SystemClock,
-                )
-                .await
-                .expect("mint_ucan should sign a parent scoped to this context");
-                let delegated = ucan_delegate_on(
-                    &bi,
-                    &handle,
-                    delegator_did.clone(),
-                    DELEGATEE_DID.to_owned(),
-                    parent.encoded,
-                    granted.clone(),
-                )
-                .await;
-                match delegated {
-                    Ok(token) => {
-                        assert!(admits, "ceiling {ceiling} must refuse the delegation");
-                        assert_eq!(
-                            token.data.capabilities,
-                            vec![format!("scp:ctx:{context_id}/messages:write")],
-                            "the delegation must stay scoped to the handle's own context"
-                        );
-                    }
-                    Err(err) => {
-                        assert!(
-                            !admits,
-                            "ceiling {ceiling} must admit the delegation, got: {err}"
-                        );
-                        assert!(
-                            err.reason.contains("capability outside ceiling"),
-                            "ceiling {ceiling} must refuse at the ceiling check, got: {err}"
-                        );
-                    }
-                }
-            }
         }
     }
 

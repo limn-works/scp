@@ -63,8 +63,8 @@ describe("type definitions", () => {
   });
 
   it("ContextParams may omit the ceiling", () => {
-    // Type-level only: the bridge's reading of an absent and an empty ceiling
-    // is tested against the real addon in real-napi.test.ts.
+    // Type-level only: the bridge's reading of an absent ceiling is tested
+    // against the real addon in real-napi.test.ts.
     const params: ContextParams = { mode: "Encrypted" };
     expect(params.ceiling).toBeUndefined();
   });

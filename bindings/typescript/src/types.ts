@@ -80,9 +80,10 @@ export interface ContextParams {
    * Capability ceiling — maximum capabilities available in this context.
    *
    * Omit it (or pass `null` in hand-written JSON) to get the protocol's
-   * default ceiling. An empty array declares a ceiling that grants nothing:
-   * every UCAN mint, delegation and outlet registration in the context is
-   * refused. An empty array is never widened to the default.
+   * default ceiling. An empty array declares a ceiling that grants nothing,
+   * and the context's actor installs it as written. This bridge's UCAN mint,
+   * delegation and outlet checks still read an empty array as the default
+   * ceiling.
    */
   readonly ceiling?: readonly string[];
   /** Outlet definitions to register at context creation. */

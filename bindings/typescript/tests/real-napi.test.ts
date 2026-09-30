@@ -706,17 +706,6 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(token.capabilities.some((c: string) => c.endsWith("/messages:write"))).toBe(true);
     });
 
-    test("an empty ceiling refuses a capability the default ceiling carries", async () => {
-      const admin = await napi.identityCreate("in_memory");
-      const member = await napi.identityCreate("in_memory");
-      const ctx = await napi.contextCreate(
-        admin,
-        JSON.stringify({ ceiling: [], memoryScope: "ephemeral" }),
-      );
-
-      await expect(napi.ucanMint(ctx, member.did, ["messages:write"])).rejects.toThrow();
-    });
-
     test("rejects validation for an ungranted capability", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
