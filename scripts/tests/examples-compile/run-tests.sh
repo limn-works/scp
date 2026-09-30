@@ -26,7 +26,10 @@
 # `nbspshebang`, which expect exit 1: each fixture compiles on default features. Accepting a
 # platform predicate false on the host makes the gate exit 0 on `falsecfg`, accepting an
 # empty `any()` does the same on `emptyany`, ending a block comment at its first `*/` does
-# the same on `nestedcomment`, dropping the `include`, `#[path]`, `macro_rules` or
+# the same on `nestedcomment`, comparing a platform value's source bytes in place of
+# rejecting a value that holds a backslash does the same on `escapedcfg` and `continuedcfg`,
+# dropping the unclosed block comment rule or the unclosed string literal rule does the same
+# on `unclosedcomment` or `unclosedstring`, dropping the `include`, `#[path]`, `macro_rules` or
 # `stringify` rule does the same on `include`, `pathmod`, `macrorules` or `stringify`,
 # dropping the U+200E and U+200F rule does the same on `lrmcfg`, `lrmcfgmacro` and `rlmpath`,
 # matching `path` only directly after `[` does the same on `rawpath`, and listing `examples/` without
@@ -224,6 +227,26 @@ ws="$(new_ws nestedcomment $'[features]\ntesting = []')"
 printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
 printf '/* /* */ " */\n#[cfg(feature = "testing")]\nfn main() { demo::t(); }\n#[cfg(not(feature = "testing"))]\nfn main() {}\n// "\n' > "$ws/demo/examples/good.rs"
 expect "feature cfg after a nested block comment" "$ws" 1 '      cfg(feature = "testing")'
+
+# rustc compares a cfg value after unescaping it, so it reads each value below as `unix`,
+# finds `not(...)` false, and drops the body that names a testing-only item. A scan that
+# compares the value's source bytes finds no host key of that spelling and passes the file.
+for esc in escapedcfg:'un\\x69x' continuedcfg:'un\\\n    ix'; do
+    ws="$(new_ws "${esc%%:*}" $'[features]\ntesting = []')"
+    printf 'pub fn f() {}\n#[cfg(feature = "testing")]\npub fn t() {}\n' > "$ws/demo/src/lib.rs"
+    printf '#[cfg(not(target_family = "'"${esc#*:}"'"))]\nfn main() { demo::t(); }\n#[cfg(target_family = "unix")]\nfn main() {}\n' > "$ws/demo/examples/good.rs"
+    expect "example body behind an escaped platform value in case ${esc%%:*}" "$ws" 1 "      cfg(not(target_family = \"un\\"
+done
+
+# A block comment or string literal the scan cannot close fails the scan. Each helper file
+# is no target's source, so the compile alone passes both workspaces.
+for un in unclosedcomment:'/* unclosed':'unbalanced block comment' unclosedstring:'"unmatched':'unbalanced string literal'; do
+    ws="$(new_ws "${un%%:*}")"
+    mkdir -p "$ws/demo/examples/support"
+    un="${un#*:}"
+    printf '%s\n' "${un%%:*}" > "$ws/demo/examples/support/mod.rs"
+    expect "helper file with an ${un#*:}" "$ws" 1 "      ${un#*:}"
+done
 
 # The next three hide the gated body in a file the scan does not open, or build the cfg
 # attribute from an ident the scan does not read.

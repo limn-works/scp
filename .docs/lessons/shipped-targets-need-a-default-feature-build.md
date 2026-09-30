@@ -58,7 +58,11 @@ of them reopens a bypass this repository has already measured:
    alone, and blanks it. It fails on a `cfg(` or `cfg!(` predicate that names anything but `not`,
    `any`, `all`, `unix`, `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
    `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
-   gate (row 9b). It fails on any identifier that starts with `cfg_`, which covers
+   gate (row 9b), and on a predicate value that holds a backslash: rustc compares the value
+   after unescaping it, so it reads `target_family = "un\x69x"`, and a value continued
+   across a line break by a trailing backslash, as `target_family = "unix"`, while a scan
+   comparing source bytes finds no host key of that spelling and evaluates `not(...)` of it
+   as true. It fails on any identifier that starts with `cfg_`, which covers
    `cfg_attr` and std's stable `cfg_select!` (it keeps only the arm whose predicate holds,
    and its predicates are not `cfg(` calls), and on `#[path]` (also written `#[r#path]`), `include`, `macro_rules` and
    `stringify` (std's `stringify!` turns its input into a string without type-checking it). It fails on the identifier `test`, `bench` or `test_case` wherever it
@@ -103,7 +107,7 @@ word-splitting. Row 9a was measured with mechanism 7 removed: the gate compiled 
 feature-gated fixture of case `cfgbody` and exited 0.
 
 Row 9b is closed by mechanism 7 for every route in its row, and the case suite's
-`falsecfg`, `emptyany`, `nestedcomment`, `include`, `pathmod`, `rawpath`, `macrorules`,
+`falsecfg`, `escapedcfg`, `continuedcfg`, `emptyany`, `nestedcomment`, `include`, `pathmod`, `rawpath`, `macrorules`,
 `stringify`, `lrmcfg`, `lrmcfgmacro`, `rlmpath`, `cfgselect`, `testattr`, `testpath`,
 `testalias`, `shebang`, `bomshebang` and `nbspshebang` cases each fail on one of those routes. The row lists the routes
 reviewers have found, not a proof that no other exists.
@@ -152,7 +156,7 @@ above name their rows: a bare total drifts from the table, and an enumeration do
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
 | 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | hypothesis, unmeasured: cargo auto-discovers `build.rs` with no manifest key, so the cfg might reach every target of the package; two reproduction attempts made the gate exit 1 instead |
 | 9a | example body under `#[cfg(feature = "testing")] fn main()` beside an empty `#[cfg(not(feature = "testing"))] fn main() {}` | the compile saw only the empty `main` and counted the target as checked |
-| 9b | platform predicate false on the CI host, empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, a first line rustc strips as a shebang (`#!/x "`, with or without a byte-order mark, and `#!<U+00A0>[`) whose quote opened a string for the scan, a U+200E or U+200F that rustc lexes as whitespace inside a `cfg(`, `cfg!(` or `#[path]` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
+| 9b | platform predicate false on the CI host, a platform value rustc unescapes into a host value (`"un\x69x"`, or a string continued across a line break), empty `any()`, a nested block comment that desynchronized the scan, `include!`, `#[path]` and its raw-identifier form `#[r#path]`, a local `macro_rules!` that builds the `cfg` attribute, std's `stringify!` holding the body, a first line rustc strips as a shebang (`#!/x "`, with or without a byte-order mark, and `#!<U+00A0>[`) whose quote opened a string for the scan, a U+200E or U+200F that rustc lexes as whitespace inside a `cfg(`, `cfg!(` or `#[path]` attribute, `cfg_select!`, a `#[test]` item, bare, path-qualified or renamed | found by reading the scan, which read cfg predicates only and ended a block comment at its first `*/`; closed by mechanism 7 |
 | 9c | a lib item under a feature key beside an empty default twin, a lib or dependency macro that drops or feature-gates its input | open, unmeasured: the code sits outside `examples/`, which is all mechanism 7 reads |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both

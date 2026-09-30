@@ -73,7 +73,11 @@
 #     `any` or `all`, or that is false on the host
 #     running this gate, as `rustc --print cfg` reports it. A false platform predicate
 #     removes code as a feature key does: `#[cfg(not(unix))]` on the Linux CI runner.
-#     An empty `any()` or `all()` fails too.
+#     An empty `any()` or `all()` fails too, and so does a predicate value holding a
+#     backslash. rustc compares a value after unescaping it, so it reads
+#     `target_os = "lin\x75x"`, or a string continued across a line break by a trailing
+#     backslash, as `target_os = "linux"`, while a scan comparing source bytes finds no
+#     host key of that spelling and evaluates `not(...)` of it as true.
 #   - Any identifier that starts with `cfg_`, and `#[path]` (also as `#[r#path]`),
 #     `include`, `macro_rules` and `stringify`.
 #     The `cfg_` rule covers `cfg_attr`, which can carry a `path` key, and std's stable
@@ -195,7 +199,7 @@ sub ev {
   return undef unless $plat{$k};
   return $host{$k} ? 1 : 0 unless @$t && $t->[0] eq '=';
   shift @$t; my $s = shift @$t;
-  return undef unless defined $s && $s =~ /^"(\d+)"$/;
+  return undef unless defined $s && $s =~ /^"(\d+)"$/ && $str[$1] !~ /\\/;
   return $host{qq{$k="$str[$1]"}} ? 1 : 0;
 }
 while (/\bcfg\s*!?\s*\(/g) {
