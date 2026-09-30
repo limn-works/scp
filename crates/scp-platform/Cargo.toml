@@ -63,7 +63,7 @@ sync = []
 
 [dependencies]
 # P-256 point validation and the pseudonym routing id (§9.10.4) back the
-# `PseudonymKeypair` constructor, which every build (not only
+# `Pseudonym` constructors, which every build (not only
 # `software_platform`) exposes; the software backends also derive pseudonyms
 # through it (ADR-057 Option A). `scp-crypto` is a pure, wasm-safe leaf.
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }

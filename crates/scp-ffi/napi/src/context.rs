@@ -435,8 +435,8 @@ pub(crate) fn pseudonym_derivation_failed(e: &scp_platform::PlatformError) -> Sc
 /// Core pseudonym-derivation sequence shared by every NAPI entry point.
 ///
 /// Holds the single authoritative definition of the derivation-failure code
-/// contract ([`pseudonym_derivation_failed`]; a host-returned pseudonym key that
-/// is not a valid 33-byte P-256 point → SCP-IDENT-1055). The missing-key-material code (SCP-IDENT-1054) is surfaced
+/// contract ([`pseudonym_derivation_failed`]; host-returned pseudonym bytes that are
+/// not a valid 33-byte compressed P-256 point → SCP-IDENT-1055). The missing-key-material code (SCP-IDENT-1054) is surfaced
 /// by the callers that resolve custody (which know whether the lookup came from
 /// a handle or the registry). Centralizing here mirrors the `PyO3` reference
 /// bridge so the 1054/1055 contract cannot drift across create / join /
@@ -451,7 +451,7 @@ pub(crate) async fn derive_pseudonym_bytes(
         .await
         .map_err(|e| pseudonym_derivation_failed(&e))?;
     // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
-    // P-256 pseudonym. `PseudonymKeypair::new` already rejected a malformed
+    // P-256 pseudonym. `Pseudonym::from_point` already rejected a malformed
     // host-returned point, which surfaced above as SCP-IDENT-1055.
     Ok(*pseudonym.routing_id())
 }

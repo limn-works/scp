@@ -26,10 +26,8 @@ from typing import Literal
 import pytest
 
 from scp_sdk import (
-    PseudonymResult,
     p256_pseudonym_scalar,
     p256_public_key,
-    p256_sign_prehash_rfc6979,
 )
 
 from .pseudonym_recipe import (
@@ -138,20 +136,19 @@ class _FakeKeychain:
     def __init__(
         self,
         *,
-        dict_result: bool = False,
-        fault: Literal["legacy32", "wrong_public_key"] | None = None,
+        tuple_result: bool = False,
+        fault: Literal["legacy32"] | None = None,
     ) -> None:
-        # ``dict_result`` makes both derive methods return a dict in place of
-        # a :class:`PseudonymResult`, the shape mistake the bridge must name.
-        self._dict_result = dict_result
-        # ``fault`` makes the host return a pseudonym the bridge must reject
-        # (§9.10.4): ``legacy32`` the retired 32-byte Ed25519 shape,
-        # ``wrong_public_key`` a ``get_public_key`` answer that disagrees with
-        # the point the derivation returned.
+        # ``tuple_result`` makes both derive methods return the retired
+        # ``(point, key_id)`` pair in place of the point bytes, the shape
+        # mistake the bridge must name.
+        self._tuple_result = tuple_result
+        # ``fault="legacy32"`` makes the host return the retired 32-byte
+        # Ed25519 pseudonym shape, which the bridge must reject (§9.10.4).
         self._fault = fault
         self._seeds: dict[str, bytes] = {}
-        # Pseudonym key id -> 32-byte P-256 private scalar (§9.10.4).
-        self._pseudonyms: dict[str, bytes] = {}
+        # Every (identity key id, context) a derivation received.
+        self.derive_calls: list[tuple[str, bytes]] = []
         self._next = 1
 
     def generate_keypair(self, key_type: str) -> str:
@@ -163,71 +160,43 @@ class _FakeKeychain:
         return kid
 
     def sign(self, key_id: str, message: bytes) -> bytes:
-        if key_id in self._pseudonyms:
-            # A pseudonym key signs a 32-byte digest: 64-byte low-s r || s.
-            return p256_sign_prehash_rfc6979(self._pseudonyms[key_id], bytes(message))
         return ed25519_sign(self._seeds[key_id], bytes(message))
 
     def get_public_key(self, key_id: str) -> bytes:
-        if key_id in self._pseudonyms:
-            point = bytearray(p256_public_key(self._pseudonyms[key_id]))
-            if self._fault == "wrong_public_key":
-                point[0] = 0x03 if point[0] == 0x02 else 0x02
-            return bytes(point)
         return ed25519_publickey(self._seeds[key_id])
 
     def destroy_key(self, key_id: str) -> None:
         self._seeds.pop(key_id, None)
-        self._pseudonyms.pop(key_id, None)
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
         # Not exercised by identity_create_with_custody; a deterministic
         # stand-in keeps the protocol surface complete.
         return hashlib.sha256(self._seeds[key_id] + bytes(peer_public)).digest()
 
-    @staticmethod
-    def _pseudonym_key_id(identity: str, context_id: bytes, epoch: int | None) -> str:
-        # The provider contract requires the same (identity, context, epoch) to
-        # name the same key. The top bit keeps the id clear of the small
-        # sequential identity ids.
-        ident = identity.encode()
-        h = hashlib.sha256(b"fake-keychain-pseudonym-id")
-        h.update(len(ident).to_bytes(4, "big") + len(context_id).to_bytes(4, "big"))
-        h.update(ident + bytes(context_id))
-        if epoch is not None:
-            h.update(epoch.to_bytes(8, "big"))
-        return str(int.from_bytes(h.digest()[:8], "big") | (1 << 63))
-
-    def _register_pseudonym(self, seed: bytes, kid: str) -> PseudonymResult:
-        # The host computes the context seed; the SDK helper maps it to the
-        # scalar and the point.
-        d = p256_pseudonym_scalar(seed)
-        self._pseudonyms[kid] = d
-        point = p256_public_key(d)
+    def _point(self, seed: bytes) -> bytes:
+        # The host computes the context seed; the SDK helpers map it to the
+        # point. Nothing is stored.
+        point = p256_public_key(p256_pseudonym_scalar(seed))
         if self._fault == "legacy32":
             point = point[1:]
-        result = PseudonymResult(public_key=point, key_id=kid)
-        if self._dict_result:
-            return result._asdict()  # type: ignore[return-value]
-        return result
+        if self._tuple_result:
+            return (point, "1")  # type: ignore[return-value]
+        return point
 
-    def derive_pseudonym(self, key_id: str, context_id: bytes) -> PseudonymResult:
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
         # Canonical v1 recipe (§9.10.4.A) over the Ed25519 identity seed (the
-        # native interim ikm until S12). Registers the P-256 pseudonym key under
-        # its deterministic id and returns ``(public_key (33), key_id)``.
-        return self._register_pseudonym(
-            canonical_pseudonym_seed(self._seeds[key_id], context_id),
-            self._pseudonym_key_id(key_id, context_id, None),
-        )
+        # native interim ikm until S12).
+        self.derive_calls.append((key_id, bytes(context_id)))
+        return self._point(canonical_pseudonym_seed(self._seeds[key_id], context_id))
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
-    ) -> PseudonymResult:
+    ) -> bytes:
         # Canonical v2 recipe (§9.10.4.A): HMAC(context_id || epoch_BE ||
         # "scp-pseudonym-v2"). Same return shape as the v1 path.
-        seed = canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
-        return self._register_pseudonym(
-            seed, self._pseudonym_key_id(key_id, context_id, pseudonym_epoch)
+        self.derive_calls.append((key_id, bytes(context_id)))
+        return self._point(
+            canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
         )
 
     def export_signing_key_bytes(self, key_id: str) -> bytes:
@@ -289,47 +258,42 @@ _ENCRYPTED_PARAMS = {"ceiling": ["messages:read"], "memory_scope": "ephemeral"}
 
 
 @pytest.mark.asyncio
-async def test_pseudonym_result_provider_derives_in_context_create(scp) -> None:
-    """An encrypted ``context_create`` succeeds with a provider returning
-    :class:`PseudonymResult`, and it drives that provider to derive a new
-    pseudonym key."""
+async def test_point_provider_derives_in_context_create(scp) -> None:
+    """An encrypted ``context_create`` succeeds with a provider returning the
+    pseudonym point, and it drives that provider to derive one."""
     provider = _FakeKeychain()
     identity = await scp.identity_create_with_custody(provider)
-    before = set(provider._pseudonyms)
+    before = len(provider.derive_calls)
     ctx = await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
 
     assert ctx.context_id
-    assert set(provider._pseudonyms) - before, "context_create never derived a pseudonym"
+    assert len(provider.derive_calls) > before, "context_create never derived a pseudonym"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["legacy32", "wrong_public_key"])
-async def test_untrusted_host_pseudonym_fails_context_create_with_ident_1055(
-    scp, fault: Literal["legacy32", "wrong_public_key"]
-) -> None:
-    """§9.10.4: the bridge fails closed with ``SCP-IDENT-1055`` on a host
-    pseudonym it cannot trust: a retired 32-byte key (``legacy32``), or a key
-    id whose ``get_public_key`` disagrees with the point the derivation
-    returned (``wrong_public_key``)."""
+async def test_32_byte_host_pseudonym_fails_context_create_with_ident_1055(scp) -> None:
+    """§9.10.4: the bridge fails closed with ``SCP-IDENT-1055`` on host
+    pseudonym bytes that are not a compressed P-256 point, such as the retired
+    32-byte Ed25519 key."""
     from scp_sdk import _scp_core
 
-    provider = _FakeKeychain(fault=fault)
+    provider = _FakeKeychain(fault="legacy32")
     identity = await scp.identity_create_with_custody(provider)
-    with pytest.raises(_scp_core.ScpError) as excinfo:
+    with pytest.raises(_scp_core.ScpError, match="got 32 bytes") as excinfo:
         await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
     assert str(excinfo.value).startswith("[SCP-IDENT-1055]"), excinfo.value
 
 
 @pytest.mark.asyncio
-async def test_dict_pseudonym_result_fails_naming_the_expected_shape(scp) -> None:
-    """A provider whose derive returns a dict fails, and the error text names
-    ``PseudonymResult(public_key: bytes, key_id: str)``."""
+async def test_tuple_pseudonym_result_fails_naming_the_expected_shape(scp) -> None:
+    """A provider whose derive returns the retired ``(point, key_id)`` pair
+    fails, and the error text names the expected bytes."""
     from scp_sdk import _scp_core
 
-    provider = _FakeKeychain(dict_result=True)
+    provider = _FakeKeychain(tuple_result=True)
     identity = await scp.identity_create_with_custody(provider)
 
-    expected = r"PseudonymResult\(public_key: bytes, key_id: str\)"
+    expected = r"expected bytes: the 33-byte compressed P-256 pseudonym point"
     with pytest.raises(_scp_core.ScpError, match=expected) as excinfo:
         await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
     assert str(excinfo.value).startswith("[SCP-CRYPTO-4060]"), excinfo.value
@@ -345,7 +309,7 @@ async def test_coroutine_derive_fails_with_custody_error(scp) -> None:
     class _AsyncDerive(_FakeKeychain):
         async def derive_pseudonym(  # type: ignore[override]
             self, key_id: str, context_id: bytes
-        ) -> PseudonymResult:
+        ) -> bytes:
             return super().derive_pseudonym(key_id, context_id)
 
     provider = _AsyncDerive()

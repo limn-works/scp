@@ -49,7 +49,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
-    NamedTuple,
     Protocol,
     TypeAlias,
     TypedDict,
@@ -86,7 +85,6 @@ __all__ = [
     "InviteMemberOutcome",
     "KeyCustodyProvider",
     "McpAllowlistState",
-    "PseudonymResult",
     "Sealed",
     "SealedInvitation",
     "SqliteStorage",
@@ -95,22 +93,6 @@ __all__ = [
     "p256_public_key",
     "p256_sign_prehash_rfc6979",
 ]
-
-
-class PseudonymResult(NamedTuple):
-    """A pseudonym a :class:`KeyCustodyProvider` derived (``09-security-model.md`` §9.10.4).
-
-    Returned by :meth:`KeyCustodyProvider.derive_pseudonym` and
-    :meth:`KeyCustodyProvider.derive_rotatable_pseudonym`.
-    """
-
-    public_key: bytes
-    """The 33-byte SEC1 compressed P-256 public key."""
-    key_id: str
-    """The id of the pseudonym key, usable with ``sign`` and ``get_public_key``.
-
-    A canonical decimal ``u64`` string (see :class:`KeyCustodyProvider`).
-    """
 
 
 @runtime_checkable
@@ -128,23 +110,23 @@ class KeyCustodyProvider(Protocol):
     the GIL while orchestrating, then re-acquires it per call), so a method
     body may block on a keystore without stalling the asyncio event loop.
 
-    Key identifiers are handles your implementation assigns in
-    :meth:`generate_keypair` and :meth:`derive_pseudonym` and maps internally
-    to real key material. Each is the canonical decimal form of an unsigned
-    64-bit integer, as ``str(n)`` writes it for an ``int`` ``n`` in
-    ``[0, 2**64 - 1]``: ASCII digits only, with no sign, no leading zero
-    (``"0"`` itself is allowed) and no whitespace. The bridge rejects any other
-    id (``"007"``, ``"+7"``, ``" 7"``, a UUID): from :meth:`generate_keypair`
-    with the custody error ``SCP-CRYPTO-4060``, and from
-    :meth:`derive_pseudonym` or :meth:`derive_rotatable_pseudonym` with
-    ``SCP-IDENT-1055``. Byte values are passed and returned as ``bytes``.
+    Key identifiers are handles your implementation assigns in :meth:`generate_keypair` and maps
+    internally to real key material. Each is the canonical decimal form of an unsigned 64-bit
+    integer, as ``str(n)`` writes it for an ``int`` ``n`` in ``[0, 2**64 - 1]``: ASCII digits only,
+    with no sign, no leading zero (``"0"`` itself is allowed) and no whitespace. The bridge rejects
+    any other id (``"007"``, ``"+7"``, ``" 7"``, a UUID) with the custody error ``SCP-CRYPTO-4060``.
+    Byte values are passed and returned as ``bytes``.
+
+    A pseudonym has no private key (``09-security-model.md`` §9.10.4): your
+    implementation stores no pseudonym key and signs with none, so
+    :meth:`sign`, :meth:`get_public_key` and :meth:`destroy_key` never receive
+    a pseudonym.
 
     Every method is a plain ``def``. A method that returns a coroutine (an
     ``async def``), or a value of the wrong type (for :meth:`derive_pseudonym`,
-    a ``dict``, bare ``bytes`` or a tuple whose items have the wrong types),
-    fails the operation with the custody error ``SCP-CRYPTO-4060``;
-    ``SCP-IDENT-1055`` covers only a well-typed :class:`PseudonymResult` the
-    bridge cannot bind.
+    anything but ``bytes``), fails the operation with the custody error
+    ``SCP-CRYPTO-4060``; ``SCP-IDENT-1055`` covers only ``bytes`` that are not
+    a compressed P-256 point.
 
     A method reports failure by raising. Raise an exception whose ``code`` is
     ``"SCP-CRYPTO-4006"`` (key not found), such as
@@ -155,10 +137,9 @@ class KeyCustodyProvider(Protocol):
     operation that calls the provider reports these two codes, including the
     pseudonym derivation inside ``context_create`` and the identity key reads
     and signatures of identity operations. There are two exceptions:
-    ``SCP-IDENT-1055``, reported when the bridge rejects the pseudonym a
-    :meth:`derive_pseudonym` call returned (including when
-    :meth:`get_public_key` on its key id raises, whatever the ``code``), and
-    ``SCP-IDENT-1037``, which ``scpid_sign`` reports for any custody failure
+    ``SCP-IDENT-1055``, reported when the bytes a :meth:`derive_pseudonym` or
+    :meth:`derive_rotatable_pseudonym` call returned are not a compressed
+    P-256 point, and ``SCP-IDENT-1037``, which ``scpid_sign`` reports for any custody failure
     (spec §3.11.4).
     """
 
@@ -171,34 +152,19 @@ class KeyCustodyProvider(Protocol):
         ...
 
     def sign(self, key_id: str, message: bytes) -> bytes:
-        """Return the 64-byte signature of ``message`` under ``key_id``.
-
-        An Ed25519 key signs ``message`` itself. A pseudonym key id from
-        :meth:`derive_pseudonym` receives a 32-byte digest and returns the
-        64-byte low-s P-256 ``r || s`` over it with no second hash (§9.5);
-        the bridge verifies it strictly under the pseudonym point and rejects
-        anything else, for a pseudonym key this adapter derived and still holds
-        bound; for a handle the adapter did not bind, the bridge returns the
-        host's bytes unchecked. A software host signs with
-        :func:`scp_sdk.p256_sign_prehash_rfc6979` rather than its own ECDSA.
-        """
+        """Return the 64-byte Ed25519 signature of ``message`` under ``key_id``."""
         ...
 
     def get_public_key(self, key_id: str) -> bytes:
-        """Return the public key for ``key_id``.
-
-        32 bytes for an Ed25519 or X25519 key; the 33-byte compressed P-256
-        point for a pseudonym key id, byte-identical to the ``public_key``
-        :meth:`derive_pseudonym` returned for it.
-        """
+        """Return the 32 public-key bytes of the Ed25519 or X25519 key ``key_id``."""
         ...
 
     def destroy_key(self, key_id: str) -> None:
         """Destroy key material for ``key_id``; subsequent ops must fail.
 
-        Destroying an identity key also destroys its ``pseudonym_secret`` and
-        every v1 and v2 pseudonym key derived from it, so each such pseudonym
-        key id then fails too (``09-security-model.md`` §9.10.4.A).
+        That includes pseudonym derivation under a destroyed identity key,
+        which raises key-not-found ``SCP-CRYPTO-4006``
+        (``09-security-model.md`` §9.10.4.A).
         """
         ...
 
@@ -206,22 +172,13 @@ class KeyCustodyProvider(Protocol):
         """Return the 32-byte X25519 shared secret with ``peer_public``."""
         ...
 
-    def derive_pseudonym(self, key_id: str, context_id: bytes) -> PseudonymResult:
-        """Derive a context-scoped P-256 pseudonym keypair (v1, static; §9.10.4).
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
+        """Derive the context-scoped P-256 pseudonym point (v1, static; §9.10.4).
 
-        Returns a :class:`PseudonymResult` ``(public_key, key_id)``: the
-        33-byte SEC1 compressed P-256 pseudonym point and the id of its
-        signing key. The bridge rejects (``SCP-IDENT-1055``) a point that is
-        not a valid compressed P-256 point, a key id that is not a canonical
-        decimal ``u64`` string, and a key id whose :meth:`get_public_key`
-        raises or differs from it.
-        The same ``(key_id, context_id)`` MUST return the same pseudonym key
-        id on every call, so re-deriving names one key rather than minting
-        another.
-        The pseudonym dies with its identity (``09-security-model.md``
-        §9.10.4.A): :meth:`destroy_key` on ``key_id`` destroys it, and a
-        derivation still in flight when ``key_id`` is destroyed raises
-        key-not-found (``SCP-CRYPTO-4006``) and stores nothing.
+        Returns the 33-byte SEC1 compressed P-256 pseudonym point and nothing
+        else. The bridge fails the operation with ``SCP-IDENT-1055`` when the
+        bytes are not a valid compressed P-256 point. Raise key-not-found
+        (``SCP-CRYPTO-4006``) when ``key_id`` was destroyed or never existed.
 
         Canonical recipe (all software custody backends MUST produce identical
         bytes; ``ikm`` is the identity private key material, the 32-byte
@@ -233,24 +190,19 @@ class KeyCustodyProvider(Protocol):
             d = int.from_bytes(HKDF-Expand-SHA256(
                 prk=seed, info=b"SCP-PSEUDONYM-P256-V1", length=48),
                 "big") % (n - 1) + 1
-            public_key = SEC1_compressed(d * G)
+            point = SEC1_compressed(d * G)
 
-        A host maps ``seed`` to ``d`` with :func:`scp_sdk.p256_pseudonym_scalar`
-        (``d.to_bytes(32, "big")``) and computes ``public_key`` with
-        :func:`scp_sdk.p256_public_key` rather than reducing and multiplying
-        itself.
+        ``d`` is discarded, never stored.
         """
         ...
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
-    ) -> PseudonymResult:
-        """Derive a rotatable, epoch-scoped P-256 pseudonym keypair (v2).
+    ) -> bytes:
+        """Derive a rotatable, epoch-scoped P-256 pseudonym point (v2).
 
-        Returns a :class:`PseudonymResult` ``(public_key, key_id)``, checked as for
-        :meth:`derive_pseudonym`; the same ``(key_id, context_id,
-        pseudonym_epoch)`` MUST return the same pseudonym key id, and it dies
-        with its identity as for :meth:`derive_pseudonym` (§9.10.4.A). Including
+        Returns the 33-byte compressed point, checked as for
+        :meth:`derive_pseudonym`. Including
         the rotation epoch in the HMAC derivation produces a different
         pseudonym per epoch within the same context, mitigating relay-side
         pseudonym correlation.

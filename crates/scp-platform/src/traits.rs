@@ -147,8 +147,7 @@ impl PublicKey {
 
 /// A signature produced by [`KeyCustody::sign`].
 ///
-/// Contains the raw 64-byte signature: Ed25519 `R ‖ S` for an Ed25519 key, or
-/// the low-`s` P-256 `r ‖ s` for a pseudonym key.
+/// Contains the raw 64-byte Ed25519 signature `R ‖ S`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature(Vec<u8>);
 
@@ -200,48 +199,50 @@ impl SharedSecret {
 /// A per-context pseudonym derived via [`KeyCustody::derive_pseudonym`] or
 /// [`KeyCustody::derive_rotatable_pseudonym`] (§9.10.4).
 ///
-/// The pseudonym is a P-256 key: `public_key` is its 33-byte SEC1 compressed
-/// point, and `routing_id` is
-/// `SHA-256("scp-pseudonym-routing-v1:" || public_key)`, the 32-byte value
-/// every routing field carries. The only constructor,
-/// [`PseudonymKeypair::new`], validates the point (§9.5) and computes the
-/// routing id, so a held value is always well-formed, whichever custody
-/// backend or host adapter produced it.
-#[derive(Debug, Clone)]
-pub struct PseudonymKeypair {
-    public_key: PublicKey,
+/// A pseudonym is a P-256 point with no private key: no protocol message is
+/// signed under it, so no custody stores one. `routing_id` is
+/// `SHA-256("scp-pseudonym-routing-v1:" || compressed point)`, the 32-byte
+/// value every routing field carries. Both constructors take a validated point
+/// (§9.5) and compute the routing id, so a held value is always well-formed,
+/// whichever custody backend or host adapter produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pseudonym {
+    public_key: scp_crypto::p256::P256PublicKey,
     routing_id: [u8; 32],
-    key_handle: KeyHandle,
 }
 
-impl PseudonymKeypair {
-    /// Validates a pseudonym public key and binds it to its custody handle.
+impl Pseudonym {
+    /// The pseudonym whose point is `public_key`.
+    #[must_use]
+    pub fn new(public_key: scp_crypto::p256::P256PublicKey) -> Self {
+        Self {
+            routing_id: scp_crypto::pseudonym::pseudonym_routing_id(&public_key),
+            public_key,
+        }
+    }
+
+    /// Validates a pseudonym point a custody returned.
     ///
     /// # Errors
     ///
-    /// [`PlatformError::CustodyError`] when `public_key` is not a 33-byte SEC1
-    /// compressed P-256 point on the curve.
-    pub fn new(public_key: &[u8], key_handle: KeyHandle) -> Result<Self, PlatformError> {
+    /// [`PlatformError::PseudonymRejected`] when `point` is not a 33-byte SEC1
+    /// compressed P-256 point on the curve; the message names which.
+    pub fn from_point(point: &[u8]) -> Result<Self, PlatformError> {
         use scp_crypto::p256::{COMPRESSED_POINT_LEN, P256PublicKey};
-        let compressed: [u8; COMPRESSED_POINT_LEN] = public_key.try_into().map_err(|_| {
-            PlatformError::CustodyError(format!(
-                "pseudonym public key must be a {COMPRESSED_POINT_LEN}-byte compressed P-256 point, got {} bytes",
-                public_key.len()
-            ))
-        })?;
-        let point = P256PublicKey::from_sec1(&compressed).map_err(|e| {
-            PlatformError::CustodyError(format!("invalid pseudonym public key: {e}"))
-        })?;
-        Ok(Self {
-            public_key: PublicKey::new(compressed.to_vec()),
-            routing_id: scp_crypto::pseudonym::pseudonym_routing_id(&point),
-            key_handle,
-        })
+        if point.len() != COMPRESSED_POINT_LEN {
+            return Err(PlatformError::PseudonymRejected(format!(
+                "pseudonym point must be a {COMPRESSED_POINT_LEN}-byte compressed P-256 point, got {} bytes",
+                point.len()
+            )));
+        }
+        P256PublicKey::from_sec1(point)
+            .map(Self::new)
+            .map_err(|e| PlatformError::PseudonymRejected(format!("invalid pseudonym point: {e}")))
     }
 
-    /// The 33-byte SEC1 compressed P-256 pseudonym public key.
+    /// The P-256 pseudonym point.
     #[must_use]
-    pub const fn public_key(&self) -> &PublicKey {
+    pub const fn public_key(&self) -> &scp_crypto::p256::P256PublicKey {
         &self.public_key
     }
 
@@ -249,12 +250,6 @@ impl PseudonymKeypair {
     #[must_use]
     pub const fn routing_id(&self) -> &[u8; 32] {
         &self.routing_id
-    }
-
-    /// The custody handle of the pseudonym's private key.
-    #[must_use]
-    pub const fn key_handle(&self) -> &KeyHandle {
-        &self.key_handle
     }
 }
 
@@ -378,19 +373,13 @@ pub trait KeyCustody: Send + Sync {
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send;
 
-    /// Sign data with an Ed25519 key, or a 32-byte digest with a P-256
-    /// pseudonym key ([`PseudonymKeypair::key_handle`]).
-    ///
-    /// For a pseudonym key, `data` is the digest itself (prehash, §9.5.1) and
-    /// the result is the 64-byte low-`s` `r ‖ s`.
+    /// Sign data with an Ed25519 key.
     ///
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
     /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an
     /// X25519 key.
-    /// Returns [`PlatformError::CustodyError`] if a pseudonym key is given
-    /// `data` that is not 32 bytes.
     fn sign(
         &self,
         key: &KeyHandle,
@@ -399,8 +388,7 @@ pub trait KeyCustody: Send + Sync {
 
     /// Return the public key for a handle.
     ///
-    /// Works for Ed25519 and X25519 key handles (32 bytes) and P-256 pseudonym
-    /// handles (33-byte compressed point).
+    /// Works for Ed25519 and X25519 key handles (32 bytes).
     ///
     /// # Errors
     ///
@@ -415,10 +403,9 @@ pub trait KeyCustody: Send + Sync {
     /// After this call, all subsequent operations with the same handle will
     /// return [`PlatformError::KeyNotFound`].
     ///
-    /// Destroying an identity destroys every v1 and v2 pseudonym key derived
-    /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing
-    /// (`09-security-model.md` §9.10.4.A).
+    /// No pseudonym key exists to destroy: a pseudonym has no private key, and
+    /// a derivation from a destroyed identity fails with key-not-found
+    /// (`SCP-CRYPTO-4006`, `09-security-model.md` §9.10.4.A).
     ///
     /// # Errors
     ///
@@ -444,12 +431,12 @@ pub trait KeyCustody: Send + Sync {
         peer_public: &[u8; 32],
     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send;
 
-    /// Derive a deterministic, context-scoped pseudonym keypair (v1, non-rotatable).
+    /// Derive a deterministic, context-scoped pseudonym (v1, non-rotatable).
     ///
     /// Algorithm:
     ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
     ///   2. `d = (int(HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48)) mod (n − 1)) + 1`
-    ///      (FIPS 186-5 A.2.1), and the pseudonym is the P-256 key `d`
+    ///      (FIPS 186-5 A.2.1), and the pseudonym is the point `d·G`; `d` is discarded
     ///
     /// The HMAC key is the 32-byte `pseudonym_secret`, NEVER the public key (public
     /// key bytes would be a membership-enumeration oracle, §9.10.4.A). For SOFTWARE
@@ -459,20 +446,17 @@ pub trait KeyCustody: Send + Sync {
     /// `pseudonym_secret` is a device-local value computed inside the boundary;
     /// hardware pseudonyms are therefore device-local BY DESIGN, not cross-platform
     /// identical. The Rust software backends share this derivation via
-    /// [`scp_crypto::pseudonym::derive_pseudonym_keypair`].
+    /// [`scp_crypto::pseudonym::derive_pseudonym`].
     ///
-    /// The returned [`PseudonymKeypair`] is always software-managed (derived
-    /// output). Its handle signs only a 32-byte digest, returning a 64-byte
-    /// low-`s` P-256 `r ‖ s` signature ([`KeyCustody::sign`]); every other
-    /// operation on it fails with a typed [`PlatformError`].
+    /// The returned [`Pseudonym`] is the point and its routing id; the custody
+    /// stores nothing for it.
     ///
     /// For contexts that support pseudonym rotation (BLACK-001 mitigation),
     /// use [`derive_rotatable_pseudonym`](KeyCustody::derive_rotatable_pseudonym) instead.
     ///
     /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
-    /// destroying the identity destroys every v1 and v2 pseudonym key derived
-    /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+    /// once the identity is destroyed, deriving from it fails with
+    /// key-not-found (`SCP-CRYPTO-4006`).
     ///
     /// # Errors
     ///
@@ -483,9 +467,9 @@ pub trait KeyCustody: Send + Sync {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send;
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send;
 
-    /// Derive a rotatable, epoch-scoped pseudonym keypair (v2).
+    /// Derive a rotatable, epoch-scoped pseudonym (v2).
     ///
     /// Mitigates relay-side pseudonym correlation (BLACK-001) by including a
     /// rotation epoch in the HMAC derivation, producing a different pseudonym
@@ -493,7 +477,7 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// Algorithm:
     ///   1. `seed = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")`
-    ///   2. the P-256 key `d` from `seed` exactly as in v1
+    ///   2. the point `d·G` from `seed` exactly as in v1
     ///
     /// where `epoch_BE` is the `pseudonym_epoch` as an 8-byte big-endian u64. As in
     /// v1, the HMAC key is the `pseudonym_secret` (NEVER the public key, §9.10.4.A):
@@ -506,9 +490,8 @@ pub trait KeyCustody: Send + Sync {
     /// domain confusion.
     ///
     /// The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A):
-    /// destroying the identity destroys every v1 and v2 pseudonym key derived
-    /// from it, and a derivation still in flight when its identity is destroyed
-    /// fails with key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+    /// once the identity is destroyed, deriving from it fails with
+    /// key-not-found (`SCP-CRYPTO-4006`).
     ///
     /// # Errors
     ///
@@ -520,7 +503,7 @@ pub trait KeyCustody: Send + Sync {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send;
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send;
 
     /// Performs X25519 key agreement using an Ed25519 key via birational conversion.
     ///
@@ -1059,35 +1042,6 @@ impl<T: Storage> Storage for std::sync::Arc<T> {
 // ---------------------------------------------------------------------------
 // X25519 key agreement helper (software_platform only)
 // ---------------------------------------------------------------------------
-
-/// Signs a 32-byte digest with a software P-256 pseudonym key: the shared
-/// [`KeyCustody::sign`] path of every software backend for pseudonym handles.
-///
-/// # Errors
-///
-/// [`PlatformError::CustodyError`] when `data` is not 32 bytes, or when
-/// signing fails.
-// Compiled exactly when a caller is: `file.rs`, `testing/key_custody.rs`, and
-// `sqlite/key_custody.rs` (which needs `software_platform` too).
-#[cfg(any(
-    feature = "file",
-    feature = "testing",
-    all(feature = "sqlite", feature = "software_platform")
-))]
-pub(crate) fn sign_pseudonym_digest(
-    key: &scp_crypto::p256::P256SecretKey,
-    data: &[u8],
-) -> Result<Signature, PlatformError> {
-    let digest: &[u8; 32] = data.try_into().map_err(|_| {
-        PlatformError::CustodyError(format!(
-            "a P-256 pseudonym key signs a 32-byte digest, got {} bytes",
-            data.len()
-        ))
-    })?;
-    scp_crypto::p256::sign_prehash_rfc6979(key, digest)
-        .map(|sig| Signature::new(sig.to_vec()))
-        .map_err(|e| PlatformError::CustodyError(format!("pseudonym signing: {e}")))
-}
 
 /// Performs X25519 key agreement using an Ed25519 signing key via birational conversion.
 ///

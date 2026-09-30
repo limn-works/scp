@@ -3,13 +3,7 @@
 // it to the bridge; the bridge-check tests drive the same record through the
 // napi `TestingCallbackCustody` hook.
 
-import type { KeyCustodyProvider, PseudonymResult } from "../scp";
-
-/** The shape napi-rs marshals for a {@link PseudonymResult}: bytes as a number array. */
-export interface NativePseudonymResult {
-  publicKey: number[];
-  keyId: string;
-}
+import type { KeyCustodyProvider } from "../scp";
 
 /**
  * The one outcome shape every custody callback hands the bridge. A host
@@ -108,21 +102,6 @@ function asBytes(method: string): (raw: unknown) => number[] {
   };
 }
 
-function asPseudonym(method: string): (raw: unknown) => NativePseudonymResult {
-  return (raw) => {
-    const result = raw as Partial<PseudonymResult> | null;
-    if (
-      typeof raw !== "object" ||
-      result === null ||
-      !(result.publicKey instanceof Uint8Array) ||
-      typeof result.keyId !== "string"
-    ) {
-      throw wrongType(method, "a { publicKey: Uint8Array, keyId: string } result");
-    }
-    return { publicKey: Array.from(result.publicKey), keyId: result.keyId };
-  };
-}
-
 /**
  * Wraps `provider` in the record the napi `NapiKeyCustodyProvider` object
  * reads.
@@ -165,14 +144,12 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
         () => provider.dhAgree(keyId, Uint8Array.from(peerPublic)),
         asBytes("dhAgree"),
       ),
-    derivePseudonym: ([keyId, contextId]: [
-      string,
-      number[],
-    ]): NativeHostResult<NativePseudonymResult> =>
+    derivePseudonym: ([keyId, contextId]: [string, number[]]): NativeHostResult<number[]> =>
       hostCall(
         "derivePseudonym",
         () => provider.derivePseudonym(keyId, Uint8Array.from(contextId)),
-        asPseudonym("derivePseudonym"),
+        // The bridge checks the bytes are a compressed P-256 point.
+        asBytes("derivePseudonym"),
       ),
     // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
     // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
@@ -181,11 +158,11 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
       string,
       number[],
       bigint,
-    ]): NativeHostResult<NativePseudonymResult> =>
+    ]): NativeHostResult<number[]> =>
       hostCall(
         "deriveRotatablePseudonym",
         () => provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
-        asPseudonym("deriveRotatablePseudonym"),
+        asBytes("deriveRotatablePseudonym"),
       ),
     // A sign-only / hardware / secure-enclave custody throws here to signal it
     // cannot export raw private-key bytes (ADR-006). The failure reaches Rust

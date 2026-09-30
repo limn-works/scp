@@ -38,8 +38,7 @@ use scp_did::SigningKeyId;
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 use scp_testing::builder::ScenarioBuilder;
 use scp_testing::clock::Clock;
@@ -102,7 +101,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         &self,
         _: &KeyHandle,
         _: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
     fn derive_rotatable_pseudonym(
@@ -110,7 +109,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         _: &KeyHandle,
         _: &[u8],
         _: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
     fn ed25519_to_x25519_agree(

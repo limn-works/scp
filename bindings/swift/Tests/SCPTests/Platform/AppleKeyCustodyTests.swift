@@ -6,7 +6,7 @@
 //
 // The pseudonym derivation known-answer test verifies cross-platform
 // determinism with the canonical Rust reference implementation
-// (`derive_pseudonym_keypair` in `scp-crypto/src/pseudonym.rs`), asserting
+// (`derive_pseudonym` in `scp-crypto/src/pseudonym.rs`), asserting
 // the literal spec §25.19 vectors for both the static (v1) and rotatable (v2)
 // derivations.
 //
@@ -25,7 +25,9 @@
 // v2 (rotatable): seed = HMAC-SHA256(pseudonym_secret,
 //                          contextId || BE64(epoch) || "scp-pseudonym-v2")
 // d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1;
-// the pseudonym public key is the 33-byte compressed P-256 point d * G.
+// the pseudonym is the 33-byte compressed P-256 point d * G. The custody
+// stores no pseudonym key: it returns the point, computed by the shared Rust
+// helper, and nothing else.
 //
 // See spec §9.10.4.A, §9.10.4.1, §25.19, ADR-025 (Apple Platform Adapter), and
 // ADR-006 (KeyCustody trait).
@@ -280,10 +282,8 @@
             let first = try await custody.derivePseudonym(handle, contextId: contextId)
             let second = try await custody.derivePseudonym(handle, contextId: contextId)
 
-            #expect(
-                first.publicKey == second.publicKey,
-                "same identity key + same context_id = same pseudonym public key"
-            )
+            #expect(first.count == 33)
+            #expect(first == second, "same identity key + same context_id = same pseudonym")
 
             // Cleanup
             try await custody.destroyKey(handle)
@@ -296,10 +296,7 @@
             let pseudoA = try await custody.derivePseudonym(handle, contextId: Data("context-a".utf8))
             let pseudoB = try await custody.derivePseudonym(handle, contextId: Data("context-b".utf8))
 
-            #expect(
-                pseudoA.publicKey != pseudoB.publicKey,
-                "different contexts must produce different pseudonyms"
-            )
+            #expect(pseudoA != pseudoB, "different contexts must produce different pseudonyms")
 
             // Cleanup
             try await custody.destroyKey(handle)
@@ -315,130 +312,42 @@
             try await custody.destroyKey(handle)
         }
 
-        @Test("derived pseudonym handle signs a digest with low-s P-256 ECDSA")
-        func derivedPseudonymCanSign() async throws {
-            let identityHandle = try await custody.generateKeypair(keyType: "ed25519")
-            let pseudonym = try await custody.derivePseudonym(
-                identityHandle, contextId: Data("context-1".utf8)
-            )
-            #expect(pseudonym.publicKey.count == 33)
-            #expect(try await custody.publicKey(pseudonym.keyId) == pseudonym.publicKey)
-
-            let publicKey = try P256.Signing.PublicKey(compressedRepresentation: pseudonym.publicKey)
-            let halfOrder = try hexToData(Self.halfOrderHex)
-            for index in 0 ..< 16 {
-                let digest = SHA256.hash(data: Data("pseudonym message \(index)".utf8))
-                let signature = try await custody.sign(pseudonym.keyId, data: Data(digest))
-                #expect(signature.count == 64)
-                let ecdsa = try P256.Signing.ECDSASignature(rawRepresentation: signature)
-                #expect(publicKey.isValidSignature(ecdsa, for: digest), "signature must verify")
-                #expect(
-                    signature.suffix(32).lexicographicallyPrecedes(halfOrder)
-                        || signature.suffix(32) == halfOrder,
-                    "s must be in the low half"
-                )
-            }
-
-            // RFC 6979: the same digest signs to the same bytes (§9.5).
-            let digest = Data(SHA256.hash(data: Data("deterministic".utf8)))
-            let first = try await custody.sign(pseudonym.keyId, data: digest)
-            let second = try await custody.sign(pseudonym.keyId, data: digest)
-            #expect(first == second, "software pseudonym signatures must be deterministic")
-
-            // A pseudonym key signs only a 32-byte digest; the shared helper's
-            // `SCP-VALID-7005` reaches the caller unchanged, as in Kotlin.
-            do {
-                _ = try await custody.sign(pseudonym.keyId, data: Data("12 bytes....".utf8))
-                Issue.record("a 12-byte digest signed")
-            } catch let ScpError.Validation(_, code) {
-                #expect(code == "SCP-VALID-7005")
-            } catch {
-                Issue.record("expected ScpError.Validation, got \(error)")
-            }
-
-            // Cleanup
-            try await custody.destroyKey(identityHandle)
-        }
-
-        @Test("destroying an identity destroys every pseudonym derived from it")
-        func destroyIdentityDestroysPseudonyms() async throws {
+        @Test("destroying an identity makes its pseudonyms underivable while a bystander still derives")
+        func destroyIdentityMakesPseudonymsUnderivable() async throws {
             let identity = try await custody.generateKeypair(keyType: "ed25519")
-            let first = try await custody.derivePseudonym(identity, contextId: Data("context-a".utf8))
-            let second = try await custody.deriveRotatablePseudonym(
-                identity, contextId: Data("context-b".utf8), pseudonymEpoch: 3
+            let bystander = try await custody.generateKeypair(keyType: "ed25519")
+            let contextId = Data("context-a".utf8)
+            let bystanderV1 = try await custody.derivePseudonym(bystander, contextId: contextId)
+            let bystanderV2 = try await custody.deriveRotatablePseudonym(
+                bystander, contextId: contextId, pseudonymEpoch: 3
             )
-            let digest = Data(SHA256.hash(data: Data("before destroy".utf8)))
-            _ = try await custody.sign(first.keyId, data: digest)
-            _ = try await custody.sign(second.keyId, data: digest)
+            _ = try await custody.derivePseudonym(identity, contextId: contextId)
 
             let attestation = try await custody.destroyKey(identity)
             #expect(attestation.confirmed)
-            for pseudonym in [first, second] {
-                let signError = await #expect(throws: PlatformError.self) {
-                    _ = try await custody.sign(pseudonym.keyId, data: digest)
-                }
-                let keyError = await #expect(throws: PlatformError.self) {
-                    _ = try await custody.publicKey(pseudonym.keyId)
-                }
-                for error in [signError, keyError] {
-                    guard case .keyNotFound = error else {
-                        Issue.record("expected keyNotFound, got \(String(describing: error))")
-                        continue
-                    }
+
+            let v1Error = await #expect(throws: PlatformError.self) {
+                _ = try await custody.derivePseudonym(identity, contextId: contextId)
+            }
+            let v2Error = await #expect(throws: PlatformError.self) {
+                _ = try await custody.deriveRotatablePseudonym(
+                    identity, contextId: contextId, pseudonymEpoch: 3
+                )
+            }
+            for error in [v1Error, v2Error] {
+                guard case .keyNotFound = error else {
+                    Issue.record("expected keyNotFound, got \(String(describing: error))")
+                    continue
                 }
             }
-        }
-
-        /// (n - 1) / 2 for P-256, the largest low-s value (§9.5.1).
-        static let halfOrderHex = "7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8"
-
-        /// RFC 6979 A.2.5 (P-256, SHA-256, message "sample"): the pseudonym
-        /// signer reproduces the RFC's r, so its nonce is the RFC 6979 k, and
-        /// returns the low-s form of the RFC's (high) s. No Swift code
-        /// normalizes s; the Rust export does.
-        @Test("pseudonym signer reproduces RFC 6979 A.2.5 with low s")
-        func pseudonymSignerMatchesRfc6979() throws {
-            let scalar = try hexToData("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
-            let digest = Data(SHA256.hash(data: Data("sample".utf8)))
-            let signature = try P256Pseudonym.signPrehash(scalar: scalar, digest: digest)
+            #expect(try await custody.derivePseudonym(bystander, contextId: contextId) == bystanderV1)
             #expect(
-                try signature.prefix(32)
-                    == hexToData("efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716")
+                try await custody.deriveRotatablePseudonym(
+                    bystander, contextId: contextId, pseudonymEpoch: 3
+                ) == bystanderV2
             )
-            #expect(try P256Pseudonym.signPrehash(scalar: scalar, digest: digest) == signature)
-            let halfOrder = try hexToData(Self.halfOrderHex)
-            #expect(
-                signature.suffix(32).lexicographicallyPrecedes(halfOrder)
-                    || signature.suffix(32) == halfOrder
-            )
-            let publicKey = try P256.Signing.PrivateKey(rawRepresentation: scalar).publicKey
-            let ecdsa = try P256.Signing.ECDSASignature(rawRepresentation: signature)
-            #expect(publicKey.isValidSignature(ecdsa, for: SHA256.hash(data: Data("sample".utf8))))
-        }
 
-        /// A wrong-length digest is `SCP-VALID-7005` and an out-of-range
-        /// scalar `SCP-CRYPTO-4001`: the codes of the shared Rust helper.
-        @Test("signPrehash reports the shared helper codes")
-        func pseudonymSignerReportsSharedCodes() throws {
-            let scalar = Data(repeating: 1, count: 32)
-            for size in [0, 12, 31, 33] {
-                do {
-                    _ = try P256Pseudonym.signPrehash(scalar: scalar, digest: Data(count: size))
-                    Issue.record("a \(size)-byte digest signed")
-                } catch let ScpError.Validation(_, code) {
-                    #expect(code == "SCP-VALID-7005", "digest of \(size) bytes")
-                } catch {
-                    Issue.record("expected ScpError.Validation, got \(error)")
-                }
-            }
-            do {
-                _ = try P256Pseudonym.signPrehash(scalar: Data(count: 32), digest: Data(count: 32))
-                Issue.record("a zero scalar signed")
-            } catch let ScpError.Crypto(_, code) {
-                #expect(code == "SCP-CRYPTO-4001")
-            } catch {
-                Issue.record("expected ScpError.Crypto, got \(error)")
-            }
+            try await custody.destroyKey(bystander)
         }
 
         // MARK: - custodyType
@@ -473,12 +382,10 @@
         }
     }
 
-    // MARK: - Pseudonym Store Tests
+    // MARK: - Store Tests
 
-    /// How a pseudonym's Keychain item is stored: a re-derive keeps the
-    /// existing item, and a derive whose identity is destroyed mid-way stores
-    /// nothing.
-    struct AppleKeyCustodyPseudonymStoreTests {
+    /// How a key's Keychain item is stored over an existing one.
+    struct AppleKeyCustodyStoreTests {
         private let custody = AppleKeyCustody(accessGroup: nil)
 
         /// The `kSecAttrComment` of the generic-password item for `account`.
@@ -505,34 +412,8 @@
             return SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         }
 
-        @Test("re-deriving a pseudonym keeps its Keychain item when the policy is unchanged")
-        func reDeriveKeepsTheExistingItem() async throws {
-            let identity = try await custody.generateKeypair(keyType: "ed25519")
-            let contextId = Data("keep-existing".utf8)
-            let first = try await custody.derivePseudonym(identity, contextId: contextId)
-            let account = "scp.key.\(first.keyId)"
-            // A delete and re-add would drop this mark.
-            #expect(updateKeychainItem(account, [kSecAttrComment as String: "kept"]) == errSecSuccess)
-
-            let again = try await custody.derivePseudonym(identity, contextId: contextId)
-            #expect(again.keyId == first.keyId)
-            #expect(again.publicKey == first.publicKey)
-            #expect(keychainComment(account) == "kept")
-
-            // An item stored under another policy is replaced under the current one.
-            let retag = updateKeychainItem(account, [kSecAttrDescription as String: "scp.policy.other"])
-            #expect(retag == errSecSuccess)
-            let replaced = try await custody.derivePseudonym(identity, contextId: contextId)
-            #expect(replaced.keyId == first.keyId)
-            #expect(keychainComment(account) == nil)
-            let digest = Data(SHA256.hash(data: Data("after replace".utf8)))
-            #expect(try await custody.sign(replaced.keyId, data: digest).count == 64)
-
-            try await custody.destroyKey(identity)
-        }
-
-        @Test("storing a non-pseudonym key over an existing item replaces it")
-        func nonPseudonymStoreReplacesTheExistingItem() async throws {
+        @Test("storing a key over an existing item replaces it")
+        func storeReplacesTheExistingItem() async throws {
             let handle = UUID().uuidString
             let account = "scp.key.\(handle)"
             let first = Data(repeating: 0x11, count: 32)
@@ -554,56 +435,6 @@
             #expect(result as? Data == second)
 
             try await custody.destroyKey(handle)
-        }
-
-        @Test("publicKey passes the P-256 helper's ScpError through for a truncated pseudonym scalar")
-        func publicKeyPassesHelperErrorThrough() async throws {
-            // A 31-byte pseudonym scalar with no cached point: publicKey must
-            // derive the point, and the shared helper rejects the length.
-            let handle = UUID().uuidString
-            try custody.storePrivateKeyBytes(
-                Data(repeating: 0x07, count: 31), for: handle, keyType: .p256Pseudonym, publicKeyBytes: Data()
-            )
-            do {
-                _ = try await custody.publicKey(handle)
-                Issue.record("a 31-byte pseudonym scalar produced a public key")
-            } catch let ScpError.Validation(_, code) {
-                #expect(code == "SCP-VALID-7005")
-            } catch {
-                Issue.record("expected ScpError.Validation, got \(error)")
-            }
-            try await custody.destroyKey(handle)
-        }
-
-        @Test("a derive whose identity is destroyed after the store fails and leaves no pseudonym")
-        func deriveRacingIdentityDestroyLeavesNoPseudonym() async throws {
-            // Destroys the identity item in the window between the pseudonym
-            // store and the identity re-check.
-            let racing = AppleKeyCustody(
-                accessGroup: nil,
-                biometricPolicy: .none,
-                afterPseudonymStore: { identityHandle in
-                    let query: [String: Any] = [
-                        kSecClass as String: kSecClassGenericPassword,
-                        kSecAttrAccount as String: "scp.key.\(identityHandle)"
-                    ]
-                    _ = SecItemDelete(query as CFDictionary)
-                }
-            )
-            let identity = try await racing.generateKeypair(keyType: "ed25519")
-            let error = await #expect(throws: PlatformError.self) {
-                _ = try await racing.derivePseudonym(identity, contextId: Data("raced".utf8))
-            }
-            guard case .keyNotFound = error else {
-                Issue.record("expected keyNotFound, got \(String(describing: error))")
-                return
-            }
-            let leftover: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: "scp.pseudonym-of.\(identity)",
-                kSecMatchLimit as String: kSecMatchLimitOne
-            ]
-            #expect(SecItemCopyMatching(leftover as CFDictionary, nil) == errSecItemNotFound)
         }
     }
 
@@ -627,10 +458,7 @@
                 handle, contextId: contextId, pseudonymEpoch: 1
             )
 
-            #expect(
-                first.publicKey == second.publicKey,
-                "same identity key + same context_id + same epoch = same pseudonym public key"
-            )
+            #expect(first == second, "same identity key + same context_id + same epoch = same pseudonym")
 
             // Cleanup
             try await custody.destroyKey(handle)
@@ -648,14 +476,7 @@
                 handle, contextId: contextId, pseudonymEpoch: 2
             )
 
-            #expect(
-                epoch1.publicKey != epoch2.publicKey,
-                "different epochs must produce different pseudonyms"
-            )
-            #expect(
-                epoch1.keyId != epoch2.keyId,
-                "different epochs must occupy distinct Keychain handle slots"
-            )
+            #expect(epoch1 != epoch2, "different epochs must produce different pseudonyms")
 
             // Cleanup
             try await custody.destroyKey(handle)
@@ -703,7 +524,7 @@
         ///
         /// Asserts the Swift `AppleKeyCustody` pseudonym derivations reproduce
         /// the canonical spec §25.19 vectors byte-for-byte, proving the Swift
-        /// adapter is wire-compatible with the Rust `derive_pseudonym_keypair`
+        /// adapter is wire-compatible with the Rust `derive_pseudonym`
         /// reference (`scp-crypto/src/pseudonym.rs`) across all SDKs.
         ///
         /// Both vectors use `context_id = "context-alpha"` (ASCII). For each
@@ -733,8 +554,8 @@
                 // v1 (static) pseudonym.
                 let staticPseudonym = try await custody.derivePseudonym(handle, contextId: contextId)
                 #expect(
-                    staticPseudonym.publicKey == v1Expected,
-                    "v1 pseudonym public key must match the §25.19 KAT vector"
+                    staticPseudonym == v1Expected,
+                    "v1 pseudonym must match the §25.19 KAT vector"
                 )
 
                 // v2 (rotatable) pseudonym at epoch 1.
@@ -742,13 +563,13 @@
                     handle, contextId: contextId, pseudonymEpoch: 1
                 )
                 #expect(
-                    rotatablePseudonym.publicKey == v2Expected,
-                    "v2 (epoch=1) pseudonym public key must match the §25.19 KAT vector"
+                    rotatablePseudonym == v2Expected,
+                    "v2 (epoch=1) pseudonym must match the §25.19 KAT vector"
                 )
 
                 // Domain separation: v1 and v2 must differ.
                 #expect(
-                    staticPseudonym.publicKey != rotatablePseudonym.publicKey,
+                    staticPseudonym != rotatablePseudonym,
                     "v1 and v2 derivations must differ (domain separation)"
                 )
 

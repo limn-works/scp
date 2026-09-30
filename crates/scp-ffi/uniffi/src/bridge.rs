@@ -65,8 +65,7 @@ use scp_platform::error::PlatformError;
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 use uuid::Uuid;
 
@@ -196,7 +195,7 @@ impl KeyCustody for OpaqueInMemoryKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         self.0.derive_pseudonym(key, context_id).await
     }
 
@@ -205,7 +204,7 @@ impl KeyCustody for OpaqueInMemoryKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         self.0
             .derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
             .await
@@ -480,9 +479,8 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// `IDENT_1054`, custody unavailable in this build → `IDENT_1056`, and a
 /// custody derivation failure → its custody code ([`ScpError::custody`]):
 /// key-not-found → `CRYPTO_4006` (§9.10.4.A), any other custody failure →
-/// `CRYPTO_4060`. A host pseudonym whose point is not a valid 33-byte P-256
-/// point, or whose `get_public_key(key_id)` fails or differs from it, fails in
-/// `CallbackKeyCustody::bind_pseudonym` → `IDENT_1055`.
+/// `CRYPTO_4060`. A host pseudonym that is not a valid 33-byte compressed P-256
+/// point → `IDENT_1055`.
 ///
 /// Callers gate this themselves: `context_create`/`context_join` skip it for
 /// broadcast contexts (soft `None`, spec §5.14), while `context_import` calls
@@ -686,48 +684,12 @@ fn resolve_context_custody(handle: &ContextHandle) -> Option<Arc<UniffiKeyCustod
 /// is `dyn`-dispatched via `Box<dyn KeyCustodyProvider>`).
 pub(crate) struct CallbackKeyCustody {
     provider: Box<dyn crate::KeyCustodyProvider>,
-    /// Pseudonym handles this adapter derived, each bound to its host point.
-    pseudonyms: scp_ffi_common::custody_parse::PseudonymBindings,
 }
 
 impl CallbackKeyCustody {
     /// Creates a new adapter wrapping the given callback provider.
     pub(crate) fn new(provider: Box<dyn crate::KeyCustodyProvider>) -> Self {
-        Self {
-            provider,
-            pseudonyms: scp_ffi_common::custody_parse::PseudonymBindings::default(),
-        }
-    }
-
-    /// Validates a host pseudonym return and binds its key id to the point
-    /// after the host's `get_public_key(key_id)` reports the same 33 bytes.
-    ///
-    /// A failed `get_public_key(key_id)` call, with any code (`SCP-CRYPTO-4006`
-    /// too), is [`PlatformError::PseudonymRejected`] (`SCP-IDENT-1055`) with the
-    /// host's code and message kept (ADR-021 2026-09-27 amendment).
-    async fn bind_pseudonym(
-        &self,
-        method: &str,
-        result: crate::PseudonymResult,
-    ) -> Result<PseudonymKeypair, PlatformError> {
-        let pseudonym = scp_ffi_common::custody_parse::parse_pseudonym(
-            method,
-            &result.public_key,
-            &result.key_id,
-        )?;
-        let host_public_key = self
-            .provider
-            .get_public_key(pseudonym.key_handle().id().to_string())
-            .await
-            .map_err(|e| {
-                scp_ffi_common::custody_parse::pseudonym_lookup_failure(
-                    method,
-                    Some(e.code()),
-                    &e.to_string(),
-                )
-            })?;
-        self.pseudonyms.bind(method, &pseudonym, &host_public_key)?;
-        Ok(pseudonym)
+        Self { provider }
     }
 }
 
@@ -766,17 +728,11 @@ impl KeyCustody for CallbackKeyCustody {
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
-        let pseudonym = self.pseudonyms.check_sign_input(key, data)?;
         let sig_bytes = self
             .provider
             .sign(key.id().to_string(), data.to_vec())
             .await
             .map_err(|e| host_err("sign", &e))?;
-        if let Some((point, digest)) = pseudonym {
-            scp_ffi_common::custody_parse::PseudonymBindings::check_signature(
-                &point, &digest, &sig_bytes,
-            )?;
-        }
         Ok(Signature::new(sig_bytes))
     }
 
@@ -790,14 +746,10 @@ impl KeyCustody for CallbackKeyCustody {
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
-        self.pseudonyms
-            .destroy_unbound(key, async {
-                self.provider
-                    .destroy_key(key.id().to_string())
-                    .await
-                    .map_err(|e| host_err("destroy_key", &e))
-            })
+        self.provider
+            .destroy_key(key.id().to_string())
             .await
+            .map_err(|e| host_err("destroy_key", &e))
     }
 
     async fn dh_agree(
@@ -819,13 +771,13 @@ impl KeyCustody for CallbackKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
-        let result = self
+    ) -> Result<Pseudonym, PlatformError> {
+        let point = self
             .provider
             .derive_pseudonym(key.id().to_string(), context_id.to_vec())
             .await
             .map_err(|e| host_err("derive_pseudonym", &e))?;
-        self.bind_pseudonym("derive_pseudonym", result).await
+        scp_ffi_common::custody_parse::parse_pseudonym("derive_pseudonym", &point)
     }
 
     async fn derive_rotatable_pseudonym(
@@ -833,7 +785,7 @@ impl KeyCustody for CallbackKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the provider performs
         // the rotatable derivation itself — seed = HMAC-SHA256(pseudonym_secret,
         // context_id || BE64(pseudonym_epoch) || "scp-pseudonym-v2"); d =
@@ -842,13 +794,12 @@ impl KeyCustody for CallbackKeyCustody {
         // provider rather than synthesized into the context_id bridge-side, so
         // the v1 platform adapter does not re-append its own "scp-pseudonym"
         // domain separator (which would corrupt the v2 domain).
-        let result = self
+        let point = self
             .provider
             .derive_rotatable_pseudonym(key.id().to_string(), context_id.to_vec(), pseudonym_epoch)
             .await
             .map_err(|e| host_err("derive_rotatable_pseudonym", &e))?;
-        self.bind_pseudonym("derive_rotatable_pseudonym", result)
-            .await
+        scp_ffi_common::custody_parse::parse_pseudonym("derive_rotatable_pseudonym", &point)
     }
 
     async fn ed25519_to_x25519_agree(
@@ -1105,7 +1056,7 @@ impl KeyCustody for UniffiKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
@@ -1118,7 +1069,7 @@ impl KeyCustody for UniffiKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
@@ -19537,7 +19488,7 @@ mod tests {
             &self,
             _key_id: String,
             _context_id: Vec<u8>,
-        ) -> Result<crate::PseudonymResult, ScpError> {
+        ) -> Result<Vec<u8>, ScpError> {
             Err(Self::refuse("derive_pseudonym"))
         }
 
@@ -21690,7 +21641,7 @@ mod tests {
             &self,
             _key_id: String,
             _context_id: Vec<u8>,
-        ) -> Result<crate::PseudonymResult, ScpError> {
+        ) -> Result<Vec<u8>, ScpError> {
             Err(ScpError::Context {
                 msg: "derive_pseudonym not supported by SignOnlyCustody".to_owned(),
                 code: codes::CTX_2050.to_owned(),
@@ -24316,93 +24267,54 @@ mod tests {
     /// (which runs `DidDht::create`) and `scpid_sign` (which signs + exposes the
     /// public key) both work. Signatures are real, so a signed SCPID response
     /// verifies against the exposed public key. Pseudonyms follow the §9.10.4
-    /// P-256 recipe over the identity seed; `fault` makes the pseudonym path
-    /// misbehave in one specific way so a test can reach each bridge rejection.
-    ///
-    /// Pseudonym key ids are deterministic per (identity key id, context,
-    /// epoch), as the `KeyCustodyProvider` contract requires, so deriving the
-    /// same pseudonym twice returns the same id.
+    /// P-256 recipe over the identity seed and are stored nowhere; `fault`
+    /// makes the host misbehave in one specific way so a test can reach each
+    /// bridge rejection.
     struct ProdLikeCustody {
         keys: Arc<std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::SigningKey>>>,
-        pseudonyms:
-            std::sync::Mutex<std::collections::HashMap<String, scp_crypto::p256::P256SecretKey>>,
         next: std::sync::atomic::AtomicU64,
-        fault: PseudonymFault,
-        /// Called with the key id at the start of `destroy_key`, before the
-        /// host forgets the key.
-        destroy_probe: Option<DestroyProbe>,
-        /// Counts every host `sign` call, so a test can show an input never
-        /// reached the host.
-        sign_calls: Arc<std::sync::atomic::AtomicU64>,
+        fault: HostFault,
+        /// Every (identity key id, context, epoch) a derivation call received;
+        /// the epoch is `None` for the v1 `derive_pseudonym`.
+        received: Arc<std::sync::Mutex<Vec<Received>>>,
     }
 
-    /// A callback run inside the host's `destroy_key`.
-    type DestroyProbe = Box<dyn Fn(&str) + Send + Sync>;
+    /// One derivation call a host received: identity key id, context, epoch.
+    type Received = (String, Vec<u8>, Option<u64>);
 
-    /// One way a host's pseudonym path can misbehave.
+    /// One way a host can misbehave.
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum PseudonymFault {
+    enum HostFault {
         None,
         /// `derive_pseudonym` returns the 32-byte Ed25519 key of a legacy host.
         Legacy32,
-        /// `get_public_key(key_id)` reports a point other than the derived one.
-        WrongPublicKey,
-        /// `sign` returns the high-`s` form of a valid signature.
-        HighS,
-        /// Every pseudonym gets key id 777, whatever its context: a host that
-        /// reuses one id for two different points.
-        FixedId,
+        /// `derive_pseudonym` returns the §25.19 Vector 30 v1 point, whatever
+        /// the identity, as a host holding the Vector 30 identity would.
+        Vector30,
         /// `sign` fails with the generic `SCP-CRYPTO-4001`, which is not the
         /// key-not-found code.
         SignFails4001,
-        /// `get_public_key(key_id)` of a pseudonym key id fails with the
-        /// key-not-found code `SCP-CRYPTO-4006`.
-        LookupFails4006,
-        /// `get_public_key(key_id)` of a pseudonym key id fails with the generic
-        /// `SCP-CRYPTO-4060`.
-        LookupFails4060,
         /// `generate_keypair` returns the non-canonical key id `"007"`.
         NonCanonicalKeypairId,
-        /// `derive_pseudonym` returns the non-canonical key id `"007"`.
-        NonCanonicalPseudonymId,
     }
+
+    /// The §25.19 Vector 30 v1 point (`context_id` = "context-alpha"), copied
+    /// verbatim from the spec.
+    const VECTOR_30_V1_POINT: &str =
+        "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72";
 
     impl ProdLikeCustody {
         fn new() -> Self {
-            Self::with_fault(PseudonymFault::None)
+            Self::with_fault(HostFault::None)
         }
 
-        fn with_fault(fault: PseudonymFault) -> Self {
+        fn with_fault(fault: HostFault) -> Self {
             Self {
                 keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                pseudonyms: std::sync::Mutex::new(std::collections::HashMap::new()),
                 next: std::sync::atomic::AtomicU64::new(1),
                 fault,
-                destroy_probe: None,
-                sign_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                received: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
-        }
-
-        /// The deterministic u64 key id of the pseudonym for (identity key id,
-        /// context, epoch): the first 8 bytes of a domain-separated SHA-256.
-        fn pseudonym_key_id(key_id: &str, context_id: &[u8], epoch: Option<u64>) -> String {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(b"prod-like-pseudonym-key-id");
-            hasher.update((key_id.len() as u64).to_be_bytes());
-            hasher.update(key_id.as_bytes());
-            hasher.update((context_id.len() as u64).to_be_bytes());
-            hasher.update(context_id);
-            match epoch {
-                None => hasher.update([0u8]),
-                Some(e) => {
-                    hasher.update([1u8]);
-                    hasher.update(e.to_be_bytes());
-                }
-            }
-            let digest = hasher.finalize();
-            let mut id = [0u8; 8];
-            id.copy_from_slice(&digest[..8]);
-            u64::from_be_bytes(id).to_string()
         }
 
         fn key_for(&self, key_id: &str) -> Result<ed25519_dalek::SigningKey, ScpError> {
@@ -24418,82 +24330,45 @@ mod tests {
                 })
         }
 
-        fn pseudonym_for(&self, key_id: &str) -> Option<scp_crypto::p256::P256SecretKey> {
-            self.pseudonyms
-                .lock()
-                .expect("pseudonym mutex")
-                .get(key_id)
-                .cloned()
-        }
-
-        fn mint_pseudonym(
+        fn derive_point(
             &self,
             key_id: &str,
             context_id: &[u8],
             epoch: Option<u64>,
-        ) -> Result<crate::PseudonymResult, ScpError> {
+        ) -> Result<Vec<u8>, ScpError> {
+            self.received.lock().expect("received mutex").push((
+                key_id.to_owned(),
+                context_id.to_vec(),
+                epoch,
+            ));
             let sk = self.key_for(key_id)?;
-            if self.fault == PseudonymFault::Legacy32 {
-                return Ok(crate::PseudonymResult {
-                    public_key: sk.verifying_key().to_bytes().to_vec(),
-                    key_id: key_id.to_owned(),
-                });
+            match self.fault {
+                HostFault::Legacy32 => return Ok(sk.verifying_key().to_bytes().to_vec()),
+                HostFault::Vector30 => {
+                    return Ok(hex::decode(VECTOR_30_V1_POINT).expect("Vector 30 hex"));
+                }
+                _ => {}
             }
             let ikm = zeroize::Zeroizing::new(sk.to_bytes());
-            let pseudonym =
-                scp_crypto::pseudonym::derive_pseudonym_keypair(&ikm, context_id, epoch);
-            let public_key = pseudonym.public_key().to_compressed().to_vec();
-            let id = if self.fault == PseudonymFault::FixedId {
-                "777".to_owned()
-            } else if self.fault == PseudonymFault::NonCanonicalPseudonymId {
-                "007".to_owned()
-            } else {
-                Self::pseudonym_key_id(key_id, context_id, epoch)
-            };
-            self.pseudonyms
-                .lock()
-                .expect("pseudonym mutex")
-                .insert(id.clone(), pseudonym);
-            Ok(crate::PseudonymResult {
-                public_key,
-                key_id: id,
-            })
+            let version = epoch.map_or(scp_crypto::pseudonym::PseudonymVersion::Static, |epoch| {
+                scp_crypto::pseudonym::PseudonymVersion::Rotatable { epoch }
+            });
+            Ok(
+                scp_crypto::pseudonym::derive_pseudonym(&ikm, context_id, version)
+                    .to_compressed()
+                    .to_vec(),
+            )
         }
-    }
-
-    /// The §9.10.4 routing id the recipe yields for `seed` in `context_id`.
-    #[cfg(feature = "testing")]
-    fn recipe_routing_id(seed: [u8; 32], context_id: &[u8], epoch: Option<u64>) -> [u8; 32] {
-        let ikm = zeroize::Zeroizing::new(seed);
-        let version = epoch.map_or(scp_crypto::pseudonym::PseudonymVersion::Static, |epoch| {
-            scp_crypto::pseudonym::PseudonymVersion::Rotatable { epoch }
-        });
-        let point = scp_crypto::pseudonym::derive_pseudonym(&ikm, context_id, version);
-        scp_crypto::pseudonym::pseudonym_routing_id(&point)
     }
 
     #[async_trait::async_trait]
     impl crate::KeyCustodyProvider for ProdLikeCustody {
         async fn sign(&self, key_id: String, message: Vec<u8>) -> Result<Vec<u8>, ScpError> {
-            self.sign_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if self.fault == PseudonymFault::SignFails4001 {
+            if self.fault == HostFault::SignFails4001 {
                 return Err(ScpError::Crypto {
                     msg: "hsm offline".to_owned(),
                     code: codes::CRYPTO_4001.to_owned(),
                 });
-            }
-            if let Some(pseudonym) = self.pseudonym_for(&key_id) {
-                // Signs input of any length (a non-digest is hashed first), so
-                // only the bridge's own check can reject a non-digest input.
-                let digest: [u8; 32] = <[u8; 32]>::try_from(message.as_slice())
-                    .unwrap_or_else(|_| sha2::Sha256::digest(&message).into());
-                let mut sig = scp_crypto::p256::sign_prehash_rfc6979(&pseudonym, &digest)
-                    .expect("RFC 6979 signing");
-                if self.fault == PseudonymFault::HighS {
-                    high_s(&mut sig);
-                }
-                return Ok(sig.to_vec());
             }
             use ed25519_dalek::Signer;
             let sk = self.key_for(&key_id)?;
@@ -24501,37 +24376,11 @@ mod tests {
         }
 
         async fn get_public_key(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
-            if let Some(pseudonym) = self.pseudonym_for(&key_id) {
-                let code = match self.fault {
-                    PseudonymFault::LookupFails4006 => Some(codes::CRYPTO_4006),
-                    PseudonymFault::LookupFails4060 => Some(codes::CRYPTO_4060),
-                    _ => None,
-                };
-                if let Some(code) = code {
-                    return Err(ScpError::Crypto {
-                        msg: format!("host lookup of {key_id} failed"),
-                        code: code.to_owned(),
-                    });
-                }
-                let mut point = pseudonym.public_key().to_compressed();
-                if self.fault == PseudonymFault::WrongPublicKey {
-                    // The other point with the same x: still valid, not the one derived.
-                    point[0] ^= 0x01;
-                }
-                return Ok(point.to_vec());
-            }
             let sk = self.key_for(&key_id)?;
             Ok(sk.verifying_key().to_bytes().to_vec())
         }
 
         async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
-            if let Some(probe) = &self.destroy_probe {
-                probe(&key_id);
-            }
-            self.pseudonyms
-                .lock()
-                .expect("pseudonym mutex")
-                .remove(&key_id);
             self.keys.lock().expect("keystore mutex").remove(&key_id);
             Ok(())
         }
@@ -24543,7 +24392,7 @@ mod tests {
             let mut seed = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut seed);
             let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-            let id = if self.fault == PseudonymFault::NonCanonicalKeypairId {
+            let id = if self.fault == HostFault::NonCanonicalKeypairId {
                 "007".to_owned()
             } else {
                 self.next
@@ -24571,8 +24420,8 @@ mod tests {
             &self,
             key_id: String,
             context_id: Vec<u8>,
-        ) -> Result<crate::PseudonymResult, ScpError> {
-            self.mint_pseudonym(&key_id, &context_id, None)
+        ) -> Result<Vec<u8>, ScpError> {
+            self.derive_point(&key_id, &context_id, None)
         }
 
         async fn derive_rotatable_pseudonym(
@@ -24580,8 +24429,8 @@ mod tests {
             key_id: String,
             context_id: Vec<u8>,
             pseudonym_epoch: u64,
-        ) -> Result<crate::PseudonymResult, ScpError> {
-            self.mint_pseudonym(&key_id, &context_id, Some(pseudonym_epoch))
+        ) -> Result<Vec<u8>, ScpError> {
+            self.derive_point(&key_id, &context_id, Some(pseudonym_epoch))
         }
 
         fn custody_type(&self, _key_id: String) -> String {
@@ -24589,63 +24438,29 @@ mod tests {
         }
     }
 
-    /// Replaces the `s` of a raw P-256 signature with `n − s`: the same
-    /// signature in high-`s` form.
-    fn high_s(sig: &mut [u8; 64]) {
-        const N: [u8; 32] = [
-            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
-            0xfc, 0x63, 0x25, 0x51,
-        ];
-        let mut borrow = 0i16;
-        for i in (0..32).rev() {
-            let mut d = i16::from(N[i]) - i16::from(sig[32 + i]) - borrow;
-            borrow = i16::from(d < 0);
-            if d < 0 {
-                d += 256;
-            }
-            sig[32 + i] = u8::try_from(d).expect("byte");
-        }
-    }
-
-    /// Mints a callback-custody identity and returns it with its identity seed.
+    /// Mints a callback-custody identity over a host with `fault`.
     #[cfg(feature = "testing")]
-    async fn prod_like_identity(fault: PseudonymFault) -> (Arc<Identity>, [u8; 32]) {
-        let provider = ProdLikeCustody::with_fault(fault);
-        let keys = Arc::clone(&provider.keys);
-        let identity = scp_test()
-            .identity_create_with_custody(Box::new(provider))
+    async fn prod_like_identity(fault: HostFault) -> Arc<Identity> {
+        scp_test()
+            .identity_create_with_custody(Box::new(ProdLikeCustody::with_fault(fault)))
             .await
-            .expect("identity_create_with_custody");
-        let handle = identity
-            .core_id
-            .as_ref()
-            .expect("callback identity retains its core id")
-            .identity_key;
-        let seed = keys
-            .lock()
-            .expect("keystore mutex")
-            .get(&handle.id().to_string())
-            .expect("identity key is in the store")
-            .to_bytes();
-        (identity, seed)
+            .expect("identity_create_with_custody")
     }
 
-    /// The bridge helper returns the §9.10.4 routing id of the host's P-256
-    /// pseudonym: `SHA-256("scp-pseudonym-routing-v1:" || point)` of the point
-    /// the recipe yields for the identity seed, not the point itself.
+    /// §25.19 Vector 30: the bridge helper that production `context_create`,
+    /// join and import call returns the v1 routing id
+    /// `SHA-256("scp-pseudonym-routing-v1:" || point)` of the host's point,
+    /// the spec's literal, not the point itself.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn member_pseudonym_is_the_recipe_routing_id() {
-        let (identity, seed) = prod_like_identity(PseudonymFault::None).await;
-        let routing_id = derive_member_pseudonym_required(&identity, "ctx-routing")
+    async fn callback_pseudonym_routing_id_is_spec_25_19_vector_30() {
+        let identity = prod_like_identity(HostFault::Vector30).await;
+        let routing_id = derive_member_pseudonym_required(&identity, "context-alpha")
             .await
             .expect("pseudonym derives");
-        assert_eq!(routing_id, recipe_routing_id(seed, b"ctx-routing", None));
-        assert_ne!(
-            routing_id,
-            recipe_routing_id(seed, b"ctx-other", None),
-            "the routing id is context-scoped"
+        assert_eq!(
+            hex::encode(routing_id),
+            "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307"
         );
     }
 
@@ -24657,7 +24472,7 @@ mod tests {
     fn context_create_surfaces_host_key_not_found_as_crypto_4006() {
         let rt = runtime();
         let scp = scp_test();
-        let provider = ProdLikeCustody::with_fault(PseudonymFault::None);
+        let provider = ProdLikeCustody::with_fault(HostFault::None);
         let keys = Arc::clone(&provider.keys);
         let identity = rt
             .block_on(scp.identity_create_with_custody(Box::new(provider)))
@@ -24676,43 +24491,13 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn legacy_32_byte_host_pseudonym_is_ident_1055() {
-        let (identity, _) = prod_like_identity(PseudonymFault::Legacy32).await;
+        let identity = prod_like_identity(HostFault::Legacy32).await;
         match derive_member_pseudonym_required(&identity, "ctx").await {
-            Err(ScpError::Identity { code, .. }) => assert_eq!(code, codes::IDENT_1055),
-            other => panic!("expected IDENT_1055, got {other:?}"),
-        }
-    }
-
-    /// A host whose `get_public_key(key_id)` disagrees with the returned point
-    /// fails closed with SCP-IDENT-1055.
-    #[cfg(feature = "testing")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn host_public_key_mismatch_is_ident_1055() {
-        let (identity, _) = prod_like_identity(PseudonymFault::WrongPublicKey).await;
-        match derive_member_pseudonym_required(&identity, "ctx").await {
-            Err(ScpError::Identity { code, .. }) => assert_eq!(code, codes::IDENT_1055),
-            other => panic!("expected IDENT_1055, got {other:?}"),
-        }
-    }
-
-    /// ADR-021 2026-09-27: a failed `get_public_key(key_id)` confirmation call
-    /// rejects the pseudonym with SCP-IDENT-1055, whether the host's code is
-    /// key-not-found (`SCP-CRYPTO-4006`) or generic, and keeps the host's text.
-    #[cfg(feature = "testing")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn host_public_key_lookup_failure_is_ident_1055() {
-        for fault in [
-            PseudonymFault::LookupFails4006,
-            PseudonymFault::LookupFails4060,
-        ] {
-            let (identity, _) = prod_like_identity(fault).await;
-            match derive_member_pseudonym_required(&identity, "ctx").await {
-                Err(ScpError::Identity { code, msg }) => {
-                    assert_eq!(code, codes::IDENT_1055);
-                    assert!(msg.contains("host lookup of"), "{msg}");
-                }
-                other => panic!("expected IDENT_1055, got {other:?}"),
+            Err(ScpError::Identity { code, msg }) => {
+                assert_eq!(code, codes::IDENT_1055);
+                assert!(msg.contains("got 32 bytes"), "{msg}");
             }
+            other => panic!("expected IDENT_1055, got {other:?}"),
         }
     }
 
@@ -24722,7 +24507,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_canonical_generated_key_id_is_crypto_4060() {
-        let provider = ProdLikeCustody::with_fault(PseudonymFault::NonCanonicalKeypairId);
+        let provider = ProdLikeCustody::with_fault(HostFault::NonCanonicalKeypairId);
         match scp_test()
             .identity_create_with_custody(Box::new(provider))
             .await
@@ -24736,80 +24521,6 @@ mod tests {
         }
     }
 
-    /// A pseudonym key id must be the canonical decimal form of a `u64`:
-    /// `"007"` from `derive_pseudonym` is rejected with `SCP-IDENT-1055`.
-    #[cfg(feature = "testing")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn non_canonical_pseudonym_key_id_is_ident_1055() {
-        let (identity, _) = prod_like_identity(PseudonymFault::NonCanonicalPseudonymId).await;
-        match derive_member_pseudonym_required(&identity, "ctx").await {
-            Err(ScpError::Identity { code, msg }) => {
-                assert_eq!(code, codes::IDENT_1055);
-                assert!(msg.contains("non-canonical key_id"), "{msg}");
-            }
-            other => panic!("expected IDENT_1055, got {other:?}"),
-        }
-    }
-
-    /// Callback `sign` on a pseudonym handle takes a 32-byte digest and returns
-    /// a strict signature under the bound point; a 12-byte input and a host
-    /// high-`s` signature both fail closed.
-    #[tokio::test]
-    async fn callback_pseudonym_sign_is_strict() {
-        let host = ProdLikeCustody::new();
-        let sign_calls = Arc::clone(&host.sign_calls);
-        let custody = CallbackKeyCustody::new(Box::new(host));
-        let identity = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("identity key");
-        let pseudonym = custody
-            .derive_pseudonym(&identity, b"ctx")
-            .await
-            .expect("derive");
-        let point = scp_crypto::p256::P256PublicKey::from_sec1(pseudonym.public_key().as_bytes())
-            .expect("point");
-        let digest = [0x42u8; 32];
-        let sig = custody
-            .sign(pseudonym.key_handle(), &digest)
-            .await
-            .expect("sign digest");
-        scp_crypto::p256::verify_prehash_strict(&point, &digest, sig.as_bytes())
-            .expect("strict signature under the bound point");
-        let before = sign_calls.load(std::sync::atomic::Ordering::SeqCst);
-        let err = custody
-            .sign(pseudonym.key_handle(), b"twelve bytes")
-            .await
-            .expect_err("12-byte input");
-        assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
-        assert_eq!(
-            sign_calls.load(std::sync::atomic::Ordering::SeqCst),
-            before,
-            "a 12-byte input reached the host"
-        );
-        // Identity (non-pseudonym) handles still sign arbitrary messages.
-        custody
-            .sign(&identity, b"twelve bytes")
-            .await
-            .expect("identity sign");
-
-        let custody =
-            CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(PseudonymFault::HighS)));
-        let identity = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("identity key");
-        let pseudonym = custody
-            .derive_pseudonym(&identity, b"ctx")
-            .await
-            .expect("derive");
-        let err = custody
-            .sign(pseudonym.key_handle(), &digest)
-            .await
-            .expect_err("high-s host signature");
-        assert!(matches!(err, PlatformError::CustodyError(_)), "{err:?}");
-    }
-
     /// A host failure carrying `SCP-CRYPTO-4006` is key-not-found, and one
     /// carrying the generic `SCP-CRYPTO-4001` is a custody error; the bridge
     /// reports them as `SCP-CRYPTO-4006` and `SCP-CRYPTO-4060`.
@@ -24820,18 +24531,14 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("identity key");
-        let pseudonym = custody
+        custody
+            .destroy_key(&identity)
+            .await
+            .expect("destroy identity");
+        let err = custody
             .derive_pseudonym(&identity, b"ctx")
             .await
-            .expect("derive");
-        custody
-            .destroy_key(pseudonym.key_handle())
-            .await
-            .expect("destroy pseudonym");
-        let err = custody
-            .sign(pseudonym.key_handle(), &[0x42u8; 32])
-            .await
-            .expect_err("destroyed key");
+            .expect_err("destroyed identity");
         assert!(matches!(err, PlatformError::KeyNotFound), "{err:?}");
         match ScpError::from(err) {
             ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
@@ -24839,7 +24546,7 @@ mod tests {
         }
 
         let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(
-            PseudonymFault::SignFails4001,
+            HostFault::SignFails4001,
         )));
         let identity = custody
             .generate_keypair(KeyType::Ed25519)
@@ -24864,153 +24571,25 @@ mod tests {
         }
     }
 
-    /// B1: a host that returns the same key id for the same (identity,
-    /// context) re-binds cleanly; both derives yield the same routing id.
-    #[tokio::test]
-    async fn rederiving_a_pseudonym_reuses_its_key_id() {
-        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::new()));
-        let identity = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("identity key");
-        let first = custody
-            .derive_pseudonym(&identity, b"ctx")
-            .await
-            .expect("first derive");
-        let second = custody
-            .derive_pseudonym(&identity, b"ctx")
-            .await
-            .expect("second derive re-binds");
-        assert_eq!(first.key_handle(), second.key_handle());
-        assert_eq!(first.routing_id(), second.routing_id());
-        let rotated = custody
-            .derive_rotatable_pseudonym(&identity, b"ctx", 3)
-            .await
-            .expect("rotatable derive");
-        assert_ne!(rotated.key_handle(), first.key_handle());
-    }
-
-    /// The callback adapter hands the host the caller's context bytes and
-    /// epoch unchanged (§9.10.4, §9.10.4.1): the v1 and v2 routing ids are the
-    /// recipe's for exactly `(seed, "ctx-routing", None)` and
-    /// `(seed, "ctx-routing", Some(3))`.
-    #[cfg(feature = "testing")]
+    /// The callback adapter hands the host's v2 callback the caller's context
+    /// bytes and epoch unchanged (§9.10.4.1): no synthesized preimage, and no
+    /// call to the v1 callback.
     #[tokio::test]
     async fn callback_custody_forwards_context_and_epoch_unchanged() {
         let provider = ProdLikeCustody::new();
-        let keys = Arc::clone(&provider.keys);
+        let received = Arc::clone(&provider.received);
         let custody = CallbackKeyCustody::new(Box::new(provider));
         let identity = custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("identity key");
-        let seed = keys
-            .lock()
-            .expect("keystore mutex")
-            .get(&identity.id().to_string())
-            .expect("identity key is in the store")
-            .to_bytes();
-        let static_pseudonym = custody
-            .derive_pseudonym(&identity, b"ctx-routing")
-            .await
-            .expect("v1 derive");
-        assert_eq!(
-            *static_pseudonym.routing_id(),
-            recipe_routing_id(seed, b"ctx-routing", None)
-        );
-        let rotated = custody
+        custody
             .derive_rotatable_pseudonym(&identity, b"ctx-routing", 3)
             .await
             .expect("rotatable derive");
         assert_eq!(
-            *rotated.routing_id(),
-            recipe_routing_id(seed, b"ctx-routing", Some(3))
-        );
-        assert_ne!(
-            *rotated.routing_id(),
-            recipe_routing_id(seed, b"ctx-routing", Some(4)),
-            "the routing id is epoch-scoped"
-        );
-    }
-
-    /// B3: `destroy_key` unbinds the handle. A host that reuses key id 777
-    /// for a second point is refused while the first is bound, and accepted
-    /// once the first is destroyed.
-    #[tokio::test]
-    async fn destroy_unbinds_a_pseudonym_handle() {
-        let custody = CallbackKeyCustody::new(Box::new(ProdLikeCustody::with_fault(
-            PseudonymFault::FixedId,
-        )));
-        let identity = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("identity key");
-        let first = custody
-            .derive_pseudonym(&identity, b"ctx-a")
-            .await
-            .expect("first derive");
-        assert_eq!(first.key_handle().id(), 777);
-        let err = custody
-            .derive_pseudonym(&identity, b"ctx-b")
-            .await
-            .expect_err("id 777 is bound to ctx-a's point");
-        assert!(
-            matches!(err, PlatformError::PseudonymRejected(_)),
-            "{err:?}"
-        );
-        custody
-            .destroy_key(first.key_handle())
-            .await
-            .expect("destroy");
-        let second = custody
-            .derive_pseudonym(&identity, b"ctx-b")
-            .await
-            .expect("re-derive under the freed id");
-        assert_eq!(second.key_handle().id(), 777);
-        assert_ne!(second.public_key(), first.public_key());
-    }
-
-    /// The adapter unbinds a pseudonym handle before it calls the host's
-    /// `destroy_key`: a probe inside the host's `destroy_key` reads the
-    /// adapter's bindings and finds the handle already unbound. Calling the
-    /// host first leaves the handle bound during that call, and this fails.
-    #[tokio::test]
-    async fn destroy_unbinds_before_the_host_call() {
-        type Cell = std::sync::OnceLock<std::sync::Weak<CallbackKeyCustody>>;
-        let adapter = Arc::new(Cell::new());
-        let bound_during_host_destroy = Arc::new(std::sync::Mutex::new(None::<bool>));
-        let mut host = ProdLikeCustody::new();
-        let (probe_adapter, probe_seen) = (adapter.clone(), bound_during_host_destroy.clone());
-        host.destroy_probe = Some(Box::new(move |key_id: &str| {
-            let custody = probe_adapter
-                .get()
-                .and_then(std::sync::Weak::upgrade)
-                .expect("adapter is alive during destroy");
-            let handle = KeyHandle::new(key_id.parse().expect("numeric key id"));
-            *probe_seen.lock().expect("probe mutex") = Some(custody.pseudonyms.is_bound(&handle));
-        }));
-        let custody = Arc::new(CallbackKeyCustody::new(Box::new(host)));
-        adapter
-            .set(Arc::downgrade(&custody))
-            .expect("cell set once");
-
-        let identity = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("identity key");
-        let pseudonym = custody
-            .derive_pseudonym(&identity, b"ctx")
-            .await
-            .expect("derive");
-        assert!(custody.pseudonyms.is_bound(pseudonym.key_handle()));
-        custody
-            .destroy_key(pseudonym.key_handle())
-            .await
-            .expect("destroy");
-        assert_eq!(
-            *bound_during_host_destroy.lock().expect("probe mutex"),
-            Some(false),
-            "the host's destroy_key ran while the handle was still bound"
+            *received.lock().expect("received mutex"),
+            vec![(identity.id().to_string(), b"ctx-routing".to_vec(), Some(3))]
         );
     }
 

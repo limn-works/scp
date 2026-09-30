@@ -1705,7 +1705,7 @@ fn derive_member_pseudonym(
 /// Derives the §9.10.4 routing id of `identity_key`'s pseudonym in
 /// `context_id` over `custody`: the derivation step every member-pseudonym
 /// path shares. A failure carries its custody code: key-not-found →
-/// SCP-CRYPTO-4006 (§9.10.4.A), a host pseudonym the bridge cannot bind →
+/// SCP-CRYPTO-4006 (§9.10.4.A), a host pseudonym point the bridge rejects →
 /// SCP-IDENT-1055, any other custody failure → SCP-CRYPTO-4060.
 pub(crate) fn pseudonym_routing_id_on(
     rt: &tokio::runtime::Runtime,
@@ -1719,7 +1719,7 @@ pub(crate) fn pseudonym_routing_id_on(
             .await
     });
     // §9.10.4: the routing axis carries the 32-byte routing id of the
-    // 33-byte P-256 pseudonym. `PseudonymKeypair::new` already rejected a
+    // 33-byte P-256 pseudonym. `Pseudonym::from_point` already rejected a
     // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
     let pseudonym = pseudonym.map_err(|e| {
         crate::error::ScpPyError::custody(format!("pseudonym derivation failed: {e}"), &e)
@@ -6341,21 +6341,13 @@ mod tests {
         let bi = __bi();
         let did = "did:dht:z6MkPseudonymLegacyHost";
         register_fake_callback_identity(&bi, did, Some("legacy32"));
-        let err = derive_member_pseudonym(&bi, did, "ctx").expect_err("legacy host key rejected");
-        assert_identity_code(err, codes::IDENT_1055);
-    }
-
-    /// A host whose `get_public_key(key_id)` disagrees with the point it
-    /// returned fails with SCP-IDENT-1055.
-    #[cfg(feature = "testing")]
-    #[test]
-    fn host_public_key_mismatch_is_ident_1055() {
-        let bi = __bi();
-        let did = "did:dht:z6MkPseudonymWrongPublicKey";
-        register_fake_callback_identity(&bi, did, Some("wrong_public_key"));
-        let err =
-            derive_member_pseudonym(&bi, did, "ctx").expect_err("mismatched host key rejected");
-        assert_identity_code(err, codes::IDENT_1055);
+        match derive_member_pseudonym(&bi, did, "ctx").expect_err("legacy host key rejected") {
+            crate::error::ScpPyError::IdentityError { code, message } => {
+                assert_eq!(code, codes::IDENT_1055);
+                assert!(message.contains("got 32 bytes"), "{message}");
+            }
+            other => panic!("expected identity error IDENT_1055, got {other:?}"),
+        }
     }
 
     /// §9.10.4.A: a host that reports key-not-found (`SCP-CRYPTO-4006`) while

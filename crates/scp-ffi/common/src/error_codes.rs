@@ -269,7 +269,7 @@ pub const IDENT_1056: &str = "SCP-IDENT-1056";
 /// Pseudonym derivation: derived public key had the wrong length (reserved).
 ///
 /// Since the §9.10.4 P-256 move, bridges emit the 32-byte routing id and
-/// `PseudonymKeypair::new` rejects a malformed point as `IDENT_1055`, so no
+/// `Pseudonym::from_point` rejects a malformed point as `IDENT_1055`, so no
 /// bridge emits this code.
 pub const IDENT_1057: &str = "SCP-IDENT-1057";
 

@@ -107,28 +107,6 @@ pub fn derive_pseudonym(
     pseudonym_from_context_seed(&context_seed(&secret, context_id, version))
 }
 
-/// Derives the per-context P-256 pseudonym key, private scalar included, for
-/// `epoch = None` (v1, static) or `Some(e)` (v2, rotatable).
-///
-/// A pseudonym signs nothing (§9.10.4); this remains only for the custody
-/// backends that still store a pseudonym key. Everything else calls
-/// [`derive_pseudonym`].
-#[must_use]
-pub fn derive_pseudonym_keypair(
-    ikm: &[u8; 32],
-    context_id: &[u8],
-    epoch: Option<u64>,
-) -> P256SecretKey {
-    let version = epoch.map_or(PseudonymVersion::Static, |epoch| {
-        PseudonymVersion::Rotatable { epoch }
-    });
-    let secret = derive_pseudonym_secret(ikm);
-    P256SecretKey::from_seed(
-        SeedLabel::Pseudonym,
-        &context_seed(&secret, context_id, version),
-    )
-}
-
 /// The 32-byte routing id every routing field carries for a pseudonym
 /// (§9.10.4): `SHA-256("scp-pseudonym-routing-v1:" || context_pseudonym)`,
 /// over the 33-byte compressed point.

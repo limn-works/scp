@@ -236,7 +236,6 @@ export type {
   ContextReconnectResult,
   KeyCustodyProvider,
   KeyPackageReservation,
-  PseudonymResult,
   ReconnectReport,
   ScpOptions,
   StorageConfig,

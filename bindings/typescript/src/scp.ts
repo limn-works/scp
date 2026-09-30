@@ -490,17 +490,6 @@ export interface KeyPackageReservation {
   readonly keyPackagePublic: Uint8Array;
 }
 
-/** A pseudonym a {@link KeyCustodyProvider} derived (spec §9.10.4). */
-export interface PseudonymResult {
-  /** The 33-byte SEC1 compressed P-256 public key. */
-  publicKey: Uint8Array;
-  /**
-   * The id of the pseudonym key, usable with `sign` and `getPublicKey`: a
-   * canonical decimal `u64` string (see {@link KeyCustodyProvider}).
-   */
-  keyId: string;
-}
-
 /**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
@@ -515,13 +504,16 @@ export interface PseudonymResult {
  * the Node.js event loop). Byte values are passed and returned as `Uint8Array`.
  *
  * Key identifiers are handles your implementation assigns in
- * {@link generateKeypair} and {@link derivePseudonym}. Each is the canonical
+ * {@link generateKeypair}. Each is the canonical
  * decimal form of an unsigned 64-bit integer, as `String(n)` writes it for a
  * `bigint` `n` in `[0, 2^64 - 1]`: ASCII digits only, with no sign, no leading
  * zero (`"0"` itself is allowed) and no whitespace. The bridge rejects any
- * other id (`"007"`, `"+7"`, `" 7"`, a UUID): from `generateKeypair` with the
- * custody error `SCP-CRYPTO-4060`, and from `derivePseudonym` or
- * `deriveRotatablePseudonym` with `SCP-IDENT-1055`.
+ * other id (`"007"`, `"+7"`, `" 7"`, a UUID) with the custody error
+ * `SCP-CRYPTO-4060`.
+ *
+ * A pseudonym has no private key (spec §9.10.4): your implementation stores no
+ * pseudonym key and signs with none, so `sign`, `getPublicKey` and
+ * `destroyKey` never receive a pseudonym.
  *
  * A callback reports failure by throwing. Throw an error whose `code` is
  * `"SCP-CRYPTO-4006"` (key not found), such as
@@ -532,9 +524,9 @@ export interface PseudonymResult {
  * Every SDK operation that calls the provider reports these two codes,
  * including the pseudonym derivation inside `createContext` and the identity
  * key reads and signatures of identity operations. There are two exceptions:
- * `SCP-IDENT-1055`, reported when the bridge rejects the pseudonym a
- * {@link derivePseudonym} call returned (including when `getPublicKey` on its
- * key id throws, whatever the code), and `SCP-IDENT-1037`, which
+ * `SCP-IDENT-1055`, reported when the bytes a {@link derivePseudonym} or
+ * {@link deriveRotatablePseudonym} call returned are not a compressed P-256
+ * point, and `SCP-IDENT-1037`, which
  * `scpidSign` reports for any custody failure (spec §3.11.4).
  *
  * Every callback must be synchronous and return the type its signature names.
@@ -554,65 +546,40 @@ export interface KeyCustodyProvider {
    * canonical decimal `u64` string (`SCP-CRYPTO-4060` otherwise).
    */
   generateKeypair(keyType: string): string;
-  /**
-   * Return the 64-byte signature of `message` under `keyId`. For an identity
-   * key this is Ed25519. For a pseudonym key returned by
-   * {@link derivePseudonym} `message` is a 32-byte digest and the result is
-   * the P-256 prehash ECDSA `r || s` with low s (§9.5); the bridge rejects
-   * any other length and any signature that fails strict verification, for a
-   * pseudonym key this adapter derived and still holds bound; for a handle the
-   * adapter did not bind, the bridge returns the host's bytes unchecked. A
-   * software host signs with {@link p256SignPrehashRfc6979} rather than its
-   * own ECDSA.
-   */
+  /** Return the 64-byte Ed25519 signature of `message` under `keyId`. */
   sign(keyId: string, message: Uint8Array): Uint8Array;
-  /**
-   * Return the public key for `keyId`: 32 Ed25519 bytes for an identity key,
-   * the 33-byte compressed P-256 point for a pseudonym key.
-   */
+  /** Return the 32 public-key bytes of the Ed25519 or X25519 key `keyId`. */
   getPublicKey(keyId: string): Uint8Array;
   /**
-   * Destroy key material for `keyId`; subsequent operations must fail.
-   * Destroying an identity key also destroys its `pseudonym_secret` and every
-   * v1 and v2 pseudonym key derived from it, so each such pseudonym `keyId`
-   * then fails too (spec §9.10.4.A).
+   * Destroy key material for `keyId`; subsequent operations must fail,
+   * including pseudonym derivation under a destroyed identity key, which
+   * throws key-not-found `SCP-CRYPTO-4006` (spec §9.10.4.A).
    */
   destroyKey(keyId: string): void;
   /** Return the 32-byte X25519 shared secret with `peerPublic`. */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
   /**
-   * Derive the context-scoped P-256 pseudonym of identity key `keyId`
-   * (spec §9.10.4, §9.10.4.A). `publicKey` is the 33-byte compressed point
-   * and `keyId` the id of the new pseudonym key, a canonical decimal `u64`
-   * string (`SCP-IDENT-1055` otherwise). The bridge requires
-   * `getPublicKey(keyId)` to return the same 33 bytes, and fails the
-   * operation with `SCP-IDENT-1055` otherwise, including when that
-   * `getPublicKey` call fails with any code. The same (`keyId`,
-   * `contextId`) MUST return the same pseudonym `keyId` on every call, so
-   * re-deriving names one key rather than minting another. The pseudonym
-   * dies with its identity (spec §9.10.4.A): `destroyKey(keyId)` destroys it,
-   * and a derivation still in flight when `keyId` is destroyed fails with
-   * key-not-found (`SCP-CRYPTO-4006`) and stores nothing.
+   * Derive the context-scoped P-256 pseudonym point of identity key `keyId`
+   * (spec §9.10.4, §9.10.4.A) and return its 33 compressed bytes and nothing
+   * else. The bridge fails the operation with `SCP-IDENT-1055` when the bytes
+   * are not a valid compressed P-256 point. Throw key-not-found
+   * (`SCP-CRYPTO-4006`) when `keyId` was destroyed or never existed.
    *
    * Canonical recipe (spec §9.10.4, §9.10.4.A; every software host MUST
    * produce identical bytes; `ikm` is the identity private key material, the
    * 32-byte Ed25519 seed until slice S12):
    *   1. `pseudonym_secret = HKDF-SHA256(ikm, salt="scp-pseudonym-secret-v1", info="", L=32)`
    *   2. `seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")`
-   *   3. `d = p256PseudonymScalar(seed)` and `publicKey = p256PublicKey(d)`.
+   *   3. `d = seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed)`; return the
+   *      compressed point `d·G`. `d` is discarded, never stored.
    *
    * The HMAC key is the 32-byte `pseudonym_secret`, never the public key:
    * public key bytes would be a membership-enumeration oracle (§9.10.4.A).
-   * A host maps `seed` to `d` with {@link p256PseudonymScalar} and computes
-   * `publicKey` with {@link p256PublicKey} rather than reducing and
-   * multiplying itself.
    */
-  derivePseudonym(keyId: string, contextId: Uint8Array): PseudonymResult;
+  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array;
   /**
-   * Derive a rotatable (epoch-versioned) context-scoped pseudonym (spec
-   * §9.10.4.1). Same contract and checks as {@link derivePseudonym}; the same
-   * (`keyId`, `contextId`, `pseudonymEpoch`) MUST return the same pseudonym
-   * `keyId` on every call, and it dies with its identity as for
+   * Derive a rotatable (epoch-versioned) context-scoped pseudonym point
+   * (spec §9.10.4.1). Same return shape and checks as
    * {@link derivePseudonym}.
    *
    * Canonical recipe: steps 1 and 3 of {@link derivePseudonym}, with step 2
@@ -621,14 +588,14 @@ export interface KeyCustodyProvider {
    * where `BE64` is the 8-byte big-endian epoch. The `"scp-pseudonym-v2"`
    * separator differs from the v1 `"scp-pseudonym"`, so epoch 0 yields a
    * pseudonym distinct from the static v1 one, and rotating the epoch yields
-   * an unlinkable new keypair. The HMAC key is the `pseudonym_secret`, never
+   * an unlinkable new point. The HMAC key is the `pseudonym_secret`, never
    * the public key.
    */
   deriveRotatablePseudonym(
     keyId: string,
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
-  ): PseudonymResult;
+  ): Uint8Array;
   /**
    * Return the 32 raw Ed25519 private-seed bytes for `keyId`.
    *

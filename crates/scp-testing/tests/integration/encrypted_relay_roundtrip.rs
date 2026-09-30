@@ -50,8 +50,7 @@ use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
@@ -122,7 +121,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         &self,
         _key: &KeyHandle,
         _context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
@@ -131,7 +130,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         _key: &KeyHandle,
         _context_id: &[u8],
         _pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
