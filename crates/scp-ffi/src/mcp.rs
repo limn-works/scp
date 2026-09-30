@@ -1237,34 +1237,56 @@ struct LiveMcpClient {
 
 impl LiveMcpClient {
     /// Clones the handle's client out of the registry, so the shard guard
-    /// drops before the call blocks.
-    fn checkout(bi: &crate::runtime::PyBridgeInstance, handle: &str) -> Result<Self, ScpPyError> {
+    /// drops before the call blocks. A missing handle fails with `code`, the
+    /// operation's not-registered code (`TRANS_5020` or `TRANS_5023`).
+    fn checkout(
+        bi: &crate::runtime::PyBridgeInstance,
+        handle: &str,
+        code: &str,
+    ) -> Result<Self, ScpPyError> {
         client_registry_of(bi)
             .get(handle)
             .map(|entry| Self {
                 client: Arc::clone(&entry.client),
                 closed: Arc::clone(&entry.closed),
             })
-            .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))
+            .ok_or_else(|| {
+                mcp_client_error(code, format!("MCP client handle '{handle}' not found"))
+            })
     }
 
     /// Takes the client's lock, and refuses the call when the handle was
-    /// disconnected while it waited.
+    /// disconnected while it waited. The refusal carries `disconnected_code`
+    /// (`TRANS_5021` or `TRANS_5024`); a poisoned lock, left by a call that
+    /// panicked, carries `failed_code` (`TRANS_5022` or `TRANS_5025`). The
+    /// connect's `initialize` handshake passes `TRANS_5001` for both.
     fn lock(
         &self,
         handle: &str,
+        disconnected_code: &str,
+        failed_code: &str,
     ) -> Result<std::sync::MutexGuard<'_, McpClient<ClientTransport, SystemTimestamp>>, ScpPyError>
     {
         let guard = self
             .client
             .lock()
-            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
+            .map_err(|e| mcp_client_error(failed_code, format!("client lock poisoned: {e}")))?;
         if self.closed.load(Ordering::Acquire) {
-            return Err(ScpPyError::transport(format!(
-                "MCP client handle '{handle}' was disconnected"
-            )));
+            return Err(mcp_client_error(
+                disconnected_code,
+                format!("MCP client handle '{handle}' was disconnected"),
+            ));
         }
         Ok(guard)
+    }
+}
+
+/// A `TransportError` carrying one of the MCP client codes
+/// `TRANS_5020`..`TRANS_5025`.
+fn mcp_client_error(code: &str, message: String) -> ScpPyError {
+    ScpPyError::TransportError {
+        message,
+        code: code.to_owned(),
     }
 }
 
@@ -1318,8 +1340,10 @@ fn initialize_registered(
         generate_handle_id("mcp-client"),
         state,
     )?;
+    // A connect is neither `tools/list` nor `tools/call`, so it keeps the
+    // generic transport code.
     let result = py.allow_threads(|| {
-        live.lock(&handle)?
+        live.lock(&handle, codes::TRANS_5001, codes::TRANS_5001)?
             .initialize()
             .map(|_| ())
             .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))
@@ -1926,8 +1950,11 @@ impl crate::scp::PyScp {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the client is not connected or the request
-/// fails.
+/// Raises `TransportError` with `SCP-TRANS-5020` when no client is
+/// registered under `handle`, `SCP-TRANS-5021` when the handle was
+/// disconnected while the call waited for the client's lock, and
+/// `SCP-TRANS-5022` when the request fails on the transport, the server
+/// answers with an error, or an earlier call panicked holding the lock.
 #[pymethods]
 impl crate::scp::PyScp {
     #[pyo3(name = "py_mcp_client_list_tools")]
@@ -1935,16 +1962,16 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         validate::validate_mcp_handle(handle)?;
         // Send the real tools/list request via the MCP client.
-        let client = LiveMcpClient::checkout(bi, handle)?;
+        let client = LiveMcpClient::checkout(bi, handle, codes::TRANS_5020)?;
 
         // The GIL is released for the blocking request, so another Python
         // thread can run, including a `py_mcp_client_disconnect` that ends
         // this call against a silent stdio or SSE server.
         let outlets = py.allow_threads(|| {
-            let client_guard = client.lock(handle)?;
+            let client_guard = client.lock(handle, codes::TRANS_5021, codes::TRANS_5022)?;
             client_guard
                 .list_tools()
-                .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))
+                .map_err(|e| mcp_client_error(codes::TRANS_5022, format!("tools/list failed: {e}")))
         })?;
 
         // Convert outlet definitions to JSON array for Python.
@@ -1983,8 +2010,11 @@ impl crate::scp::PyScp {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the client is not connected or the
-/// invocation fails.
+/// Raises `TransportError` with `SCP-TRANS-5023` when no client is
+/// registered under `handle`, `SCP-TRANS-5024` when the handle was
+/// disconnected while the call waited for the client's lock, and
+/// `SCP-TRANS-5025` when the request fails on the transport, the server
+/// answers with an error, or an earlier call panicked holding the lock.
 #[pymethods]
 impl crate::scp::PyScp {
     #[pyo3(name = "py_mcp_client_invoke")]
@@ -2002,7 +2032,7 @@ impl crate::scp::PyScp {
         validate::validate_outlet_name(outlet_name)?;
         validate::validate_context_id(context_id)?;
         validate::validate_did(identity_did)?;
-        let client = LiveMcpClient::checkout(bi, handle)?;
+        let client = LiveMcpClient::checkout(bi, handle, codes::TRANS_5023)?;
 
         // Convert input to JSON.
         let input_json = py_dict_to_json(input)?;
@@ -2011,10 +2041,10 @@ impl crate::scp::PyScp {
         // The GIL is released for the blocking request, as in
         // `py_mcp_client_list_tools`.
         let result = py.allow_threads(|| {
-            let client_guard = client.lock(handle)?;
+            let client_guard = client.lock(handle, codes::TRANS_5024, codes::TRANS_5025)?;
             client_guard
                 .invoke(outlet_name, input_json, context_id, identity_did)
-                .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))
+                .map_err(|e| mcp_client_error(codes::TRANS_5025, format!("tools/call failed: {e}")))
         })?;
 
         // Convert the McpToolResult to a Python dict.
@@ -4118,8 +4148,8 @@ mod tests {
     fn assert_failed_in_tools_list(error: Option<String>) {
         let error = error.expect("the killed stub server sent no tools/list response");
         assert!(
-            error.contains("tools/list failed"),
-            "the call must fail on its in-flight request, not on the handle lookup: {error}"
+            error.contains("tools/list failed") && error.contains(codes::TRANS_5022),
+            "the call must fail on its in-flight request with TRANS-5022, not on the handle lookup: {error}"
         );
     }
 
@@ -4232,13 +4262,13 @@ mod tests {
     fn a_call_queued_at_disconnect_sends_no_request() {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let (handle, server, done_rx) = start_call_on_a_silent_stdio_server(&scp);
-        let queued =
-            LiveMcpClient::checkout(&scp.inner, &handle).expect("check out the live handle");
+        let queued = LiveMcpClient::checkout(&scp.inner, &handle, codes::TRANS_5020)
+            .expect("check out the live handle");
         let queued_handle = handle.clone();
         let (queued_tx, queued_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = queued
-                .lock(&queued_handle)
+                .lock(&queued_handle, codes::TRANS_5021, codes::TRANS_5022)
                 .map(drop)
                 .map_err(|e| e.to_string());
             let _ = queued_tx.send(outcome);
@@ -4259,9 +4289,127 @@ mod tests {
         stop_stdio_server(&server);
         let error = queued.expect_err("the queued call took the client after the disconnect");
         assert!(
-            error.contains("was disconnected"),
-            "the queued call must fail as disconnected, got: {error}"
+            error.contains("was disconnected") && error.contains(codes::TRANS_5021),
+            "the queued call must fail as disconnected with TRANS-5021, got: {error}"
         );
+    }
+
+    /// Connects a stdio client to a stub server that answers `initialize`
+    /// and then answers every request with a JSON-RPC error carrying the
+    /// request's id.
+    #[cfg(unix)]
+    fn connect_to_an_erroring_stdio_server(scp: &crate::scp::PyScp) -> String {
+        pyo3::prepare_freethreaded_python();
+        scp.inner
+            .core
+            .mcp_allowlist()
+            .lock()
+            .expect("allowlist lock")
+            .configure(&["sh"])
+            .expect("allow sh");
+        let script = "read l; \
+            echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\
+            \"capabilities\":{},\"serverInfo\":{\"name\":\"stub\"}}}'; \
+            while read l; do \
+            id=$(printf '%s' \"$l\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p'); \
+            if [ -n \"$id\" ]; then \
+            echo \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$id,\\\"error\\\":{\\\"code\\\":-32601,\\\"message\\\":\\\"refused\\\"}}\"; \
+            fi; done";
+        Python::with_gil(|py| {
+            scp.py_mcp_client_connect_stdio(
+                py,
+                vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            )
+        })
+        .expect("connect to the stub server")
+    }
+
+    /// Calls `tools/list` and `tools/call` on `handle` and returns both
+    /// error strings.
+    #[cfg(unix)]
+    fn list_and_invoke_errors(scp: &crate::scp::PyScp, handle: &str) -> (String, String) {
+        Python::with_gil(|py| {
+            let list = scp
+                .py_mcp_client_list_tools(py, handle)
+                .expect_err("tools/list must fail")
+                .to_string();
+            let invoke = scp
+                .py_mcp_client_invoke(
+                    py,
+                    handle,
+                    "test-outlet",
+                    &PyDict::new(py),
+                    "ctx-test",
+                    "did:dht:z6MkTestUser",
+                )
+                .expect_err("tools/call must fail")
+                .to_string();
+            (list, invoke)
+        })
+    }
+
+    /// Asserts that `error` carries `code` and none of the other MCP client
+    /// codes, nor the generic transport code.
+    #[cfg(unix)]
+    fn assert_mcp_client_code(error: &str, code: &str) {
+        for other in [
+            codes::TRANS_5001,
+            codes::TRANS_5020,
+            codes::TRANS_5021,
+            codes::TRANS_5022,
+            codes::TRANS_5023,
+            codes::TRANS_5024,
+            codes::TRANS_5025,
+        ] {
+            assert_eq!(
+                error.contains(other),
+                other == code,
+                "expected {code} alone, got: {error}"
+            );
+        }
+    }
+
+    /// The `PyO3` MCP client returns the documented code for each condition:
+    /// a server error on `tools/list` and `tools/call` is TRANS-5022 and
+    /// TRANS-5025, a poisoned client lock is the same failure codes, and an
+    /// unregistered handle is TRANS-5020 and TRANS-5023. A disconnect cannot
+    /// be raced into a call deterministically, so
+    /// `a_call_queued_at_disconnect_sends_no_request` checks the
+    /// disconnected-while-waiting refusal through `LiveMcpClient::lock`.
+    #[cfg(unix)]
+    #[test]
+    fn mcp_client_calls_return_the_documented_codes() {
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let handle = connect_to_an_erroring_stdio_server(&scp);
+
+        let (list, invoke) = list_and_invoke_errors(&scp, &handle);
+        assert!(list.contains("tools/list failed"), "got: {list}");
+        assert_mcp_client_code(&list, codes::TRANS_5022);
+        assert!(invoke.contains("tools/call failed"), "got: {invoke}");
+        assert_mcp_client_code(&invoke, codes::TRANS_5025);
+
+        let client = LiveMcpClient::checkout(&scp.inner, &handle, codes::TRANS_5020)
+            .expect("check out the live handle");
+        let poisoner = Arc::clone(&client.client);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("client lock");
+            panic!("poison the client lock");
+        })
+        .join();
+        let (list, invoke) = list_and_invoke_errors(&scp, &handle);
+        assert!(list.contains("client lock poisoned"), "got: {list}");
+        assert_mcp_client_code(&list, codes::TRANS_5022);
+        assert!(invoke.contains("client lock poisoned"), "got: {invoke}");
+        assert_mcp_client_code(&invoke, codes::TRANS_5025);
+        drop(client);
+
+        scp.py_mcp_client_disconnect(&handle)
+            .expect("disconnect a known handle");
+        let (list, invoke) = list_and_invoke_errors(&scp, &handle);
+        assert!(list.contains("not found"), "got: {list}");
+        assert_mcp_client_code(&list, codes::TRANS_5020);
+        assert!(invoke.contains("not found"), "got: {invoke}");
+        assert_mcp_client_code(&invoke, codes::TRANS_5023);
     }
 
     /// Polls `condition` every 5 ms for up to 10 seconds.
@@ -4583,7 +4731,10 @@ mod tests {
         let after = Python::with_gil(|py| scp.py_mcp_client_list_tools(py, &handle))
             .expect_err("a disconnected handle must refuse a call")
             .to_string();
-        assert!(after.contains("not found"), "got: {after}");
+        assert!(
+            after.contains("not found") && after.contains(codes::TRANS_5020),
+            "got: {after}"
+        );
     }
 
     /// Instance shutdown clears the client registry while a `tools/list` is
