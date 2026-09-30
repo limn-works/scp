@@ -2,7 +2,8 @@
 //! starts anything. `conflicting_modes` holds the rule; this test proves that
 //! `main` calls it ahead of the `--health` probe and the mode dispatch
 //! (`.docs/prds/self-host-binary.json` SHB-001, the exactly-one-run-mode
-//! acceptance criterion).
+//! acceptance criterion). A shipped build likewise refuses `--ephemeral`
+//! ahead of the `--health` probe (`unavailable_mode`, ADR-062 §Decision 1).
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -32,14 +33,34 @@ fn two_run_modes_exit_1_before_the_health_probe_and_the_mode_dispatch() {
     ];
     for health in [true, false] {
         for (args, self_host_env) in cases {
-            assert_refused(args, self_host_env, health);
+            assert_refused(args, self_host_env, health, CONFLICT);
         }
     }
 }
 
+/// The text of the two-mode refusal.
+const CONFLICT: &str = "each select a run mode; select exactly one.";
+
+/// A shipped build exits 1 on `--ephemeral`, alone and beside `--health`, with
+/// the refusal. With `--health`, a binary that checked the mode only at the
+/// dispatch probes a closed loopback port and exits without the refusal. A
+/// `testing` build compiles `--ephemeral`, so this test runs only without it.
+#[cfg(not(feature = "testing"))]
+#[test]
+fn shipped_build_refuses_ephemeral_before_the_health_probe() {
+    for health in [true, false] {
+        assert_refused(
+            &["--ephemeral"],
+            None,
+            health,
+            "ERROR: --ephemeral is a test-harness mode",
+        );
+    }
+}
+
 /// Spawns `scp-node` with `args` (plus `--health` when `health`) and asserts it
-/// exits 1 with the refusal and leaves `SCP_STORAGE_PATH` uncreated.
-fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool) {
+/// exits 1 with `refusal` on stderr and leaves `SCP_STORAGE_PATH` uncreated.
+fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool, refusal: &str) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let storage = tmp.path().join("node-storage");
     let mut command = Command::new(env!("CARGO_BIN_EXE_scp-node"));
@@ -48,6 +69,7 @@ fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool) {
         .current_dir(tmp.path())
         .env("SCP_STORAGE_PATH", &storage)
         .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+        .env("SCP_NODE_BIND_ADDR", "127.0.0.1:0")
         .env("SCP_NODE_SELF_HOST_PORT", "0")
         .env("SCP_NODE_SELF_HOST_NO_NAT", "1")
         .env("SCP_NODE_SELF_HOST_PLAINTEXT", "1")
@@ -76,10 +98,7 @@ fn assert_refused(args: &[&str], self_host_env: Option<&str>, health: bool) {
     let output = child.wait_with_output().expect("collect scp-node output");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{case}: {stderr}");
-    assert!(
-        stderr.contains("each select a run mode; select exactly one."),
-        "{case}: {stderr}"
-    );
+    assert!(stderr.contains(refusal), "{case}: {stderr}");
     assert!(
         !storage.exists(),
         "{case} created its storage directory before refusing"

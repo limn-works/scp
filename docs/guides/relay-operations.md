@@ -464,7 +464,9 @@ The health probe attempts a TCP connection to the bind address and exits immedia
 (or `SCP_NODE_SELF_HOST`) and `--ephemeral` selected, `--health` prints `ERROR: ... each
 select a run mode; select exactly one.` and exits 1 whatever the listener's state. So
 `scp-node --relay-only --health` exits 1 in an environment that sets `SCP_NODE_SELF_HOST`
-to `1` or `true`; leave that variable out of the relay container's environment.
+to `1` or `true`; leave that variable out of the relay container's environment. A shipped
+binary also refuses `--ephemeral` before it probes, so `scp-node --ephemeral --health`
+exits 1 whatever the listener's state.
 
 ### Container health check
 

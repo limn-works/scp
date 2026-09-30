@@ -9,7 +9,7 @@ loop that fixing individual sentences could not. Outside the example the branch 
 to `crates/scp-node/src/main.rs` (`conflicting_modes`), each passage that stayed either
 documents a surface the branch changed or replaced a false sentence: a claim that a backend
 succeeds, a claim about a value or behavior the code does not have, or a documented command
-that exits 1 with no reason given, which reads as a promise that the command works. Most of
+that exits 1 with no reason given, which reads as a promise that the command works. Many of
 them explain a fail-closed backend the branch never modified: `NoPreRotationBackend` on
 identity creation, or the unconfigured custody-migration backend. By file, each with the
 sentence it replaced:
@@ -32,9 +32,13 @@ sentence it replaced:
   - the reason in the `--ephemeral` refusal message, which told the operator to run the
     persistent full node, a command that exits 1;
   - the comments on the `DhtMode::Disabled` arm of `run_full_node_persistent` and in
-    `parse_dht_mode_or_exit`, the rustdoc of `run_self_host` and its DHT-mode comment, and
-    the self-host banner test, which named `memory` as the self-host no-publish value that a
-    shipped binary rejects, and called the `Disabled` arm unreachable;
+    `parse_dht_mode_or_exit`, the rustdoc of `run_self_host` and its DHT-mode comment, the
+    rustdoc of `self_host_banner`, and the self-host banner test, which named `memory` as
+    the self-host no-publish value that a shipped binary rejects, and called the `Disabled`
+    arm unreachable;
+  - `unavailable_mode` and its test, which refuse `--ephemeral` on a shipped build before
+    the `--health` probe, because `scp-node --ephemeral --health` had probed
+    `SCP_NODE_BIND_ADDR` and exited 0 where five sentences promised exit 1;
   - the comment in `run_node_with`, which called `DhtMode::Production` advisory with no
     runtime effect.
 - `docs/guides/relay-operations.md`:
@@ -61,7 +65,30 @@ sentence it replaced:
     after it, because the recipe had run the full node, which exits 1;
   - the §8 logging recipe, which moved from the full node to `--relay-only`, and its
     comment, which says why;
-  - the health-probe paragraph in §8, which documents the run-mode check the branch added.
+  - the health-probe paragraph in §8, which documents the run-mode check the branch added
+    and the shipped build's `--ephemeral` refusal ahead of the probe.
+- `crates/scp-node/src/self_host.rs`: the rustdoc of the module, `host_site`,
+  `host_site_until` and `HostSiteError::NodeBuild`, which called the example runnable and
+  had no word of the `NoPreRotationBackend` failure on a directory that holds no identity;
+  `NodeBuild` now carries the typed `NodeError`, a surface the branch changed. Also the
+  `DhtMode::Disabled` rustdoc and log line, which said DID resolution runs where the relay
+  layer `host_site` wires is a `NoOpRelayQuerier` that answers from the cache alone.
+- The DHT-mode comments in `crates/scp-node/src/config.rs`, `crates/scp-node/src/lib.rs`,
+  `crates/scp-ffi/common/src/server.rs`, `crates/scp-testing/src/helpers.rs`,
+  `crates/scp-testing/tests/integration/node.rs`, and the scp-node tests `self_host.rs`,
+  `host_site.rs`, `integration.rs`, `quic_cross_transport.rs` and `quic_listener.rs`, which
+  called `DhtMode::Production` advisory in P1, said a publishing reach requires it, or
+  named `DhtMode::Memory` as the default and as equally valid. Production makes the start
+  publish and fail if that publish fails, and `NodeConfig::defaults` sets `Disabled`. The
+  three `config.rs` tests named `*_dht_memory_*` became `*_dht_disabled_*` for the same
+  reason.
+- The citations of spec §9.7.4.1 in `crates/scp-identity/src/config.rs`,
+  `crates/scp-identity/src/lib.rs`, `crates/scp-node/src/lib.rs`,
+  `crates/scp-ffi/common/src/error_codes.rs`, `crates/scp-ffi/napi/src/identity.rs`,
+  `crates/scp-ffi/napi/src/scp.rs` and `crates/scp-ffi/uniffi/src/bridge.rs`, which cited
+  the section as "§3" for mandatory pre-rotation and credited the whole section with
+  recovery from `#0` compromise; they now cite item 5(a) for the mandatory commitment and
+  item 4 for the reveal that recovers a root compromise.
 - `.docs/guides/deploying-an-scp-website.md`: the opening paragraph on why each recipe
   fails on a shipped build.
 - `.docs/guides/self-hosting-a-website-on-scp.md`: the parenthetical in the `host_site`

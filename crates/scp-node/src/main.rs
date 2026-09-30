@@ -165,6 +165,25 @@ fn conflicting_modes(config: &CliConfig) -> Option<String> {
     })
 }
 
+/// The refusal a shipped build prints for `--ephemeral`.
+const EPHEMERAL_UNAVAILABLE: &str = "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
+     available in this build. A shipped build creates no identity in any mode \
+     (no production pre-rotation custody backend available): the persistent full \
+     node exits 1 on every run, and \
+     --self-host starts only from a storage directory that already holds an \
+     identity. Build with --features testing to run --ephemeral.";
+
+/// Returns the refusal to print when the configuration selects a run mode this
+/// build does not compile, or `None` otherwise. `ephemeral_compiled` is
+/// `cfg!(feature = "testing")` in [`main`].
+///
+/// [`main`] calls this before the `--health` probe, so a shipped build exits 1
+/// on `--ephemeral --health` instead of probing `SCP_NODE_BIND_ADDR` for a mode
+/// it cannot run (ADR-062 §Decision 1).
+fn unavailable_mode(config: &CliConfig, ephemeral_compiled: bool) -> Option<&'static str> {
+    (config.ephemeral && !ephemeral_compiled).then_some(EPHEMERAL_UNAVAILABLE)
+}
+
 /// Prints usage information and exits with code 0.
 fn print_help() -> ! {
     eprintln!(
@@ -1198,6 +1217,11 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if let Some(error) = unavailable_mode(&config, cfg!(feature = "testing")) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     // --health: probe the appropriate bind address and exit.
     if config.health {
         let addr: SocketAddr = if config.relay_only {
@@ -1231,19 +1255,13 @@ async fn main() {
         // Ephemeral mode wires in-memory subsystems (incl. the §17.17.3 in-memory
         // DHT nullifier), so it is compiled only under the `testing` feature
         // (ADR-062 §Decision 1). A shipped binary reached with `--ephemeral`
-        // fails closed rather than silently running a nullifier-backed node.
+        // fails closed at `unavailable_mode` above, before the `--health`
+        // probe; this arm refuses again rather than fall through to exit 0.
         #[cfg(feature = "testing")]
         run_full_node_ephemeral().await;
         #[cfg(not(feature = "testing"))]
         {
-            eprintln!(
-                "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. A shipped build creates no identity in any mode \
-                 (no production pre-rotation custody backend available): the persistent full \
-                 node exits 1 on every run, and \
-                 --self-host starts only from a storage directory that already holds an \
-                 identity. Build with --features testing to run --ephemeral."
-            );
+            eprintln!("{EPHEMERAL_UNAVAILABLE}");
             std::process::exit(1);
         }
     } else {
@@ -1555,6 +1573,35 @@ mod tests {
                 None,
                 "{args:?} (env {env_self_host})"
             );
+        }
+    }
+
+    /// `--ephemeral` is refused, alone or beside `--health`, exactly when the
+    /// build does not compile it; every other mode passes in either build.
+    #[test]
+    fn ephemeral_is_refused_only_where_it_is_not_compiled() {
+        for args in [&["--ephemeral"][..], &["--ephemeral", "--health"][..]] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), false, None, None);
+            assert_eq!(
+                unavailable_mode(&cfg, false),
+                Some(EPHEMERAL_UNAVAILABLE),
+                "{args:?}"
+            );
+            assert_eq!(unavailable_mode(&cfg, true), None, "{args:?}");
+        }
+        for args in [
+            &[][..],
+            &["--health"][..],
+            &["--relay-only"][..],
+            &["--self-host"][..],
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), false, None, None);
+            assert_eq!(unavailable_mode(&cfg, false), None, "{args:?}");
+            assert_eq!(unavailable_mode(&cfg, true), None, "{args:?}");
         }
     }
 
