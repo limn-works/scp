@@ -5126,7 +5126,8 @@ impl McpUniFfiBridgeProvider {
     /// `Supervisor::get_role_state_checked`.
     ///
     /// Shared by `active_context_ids`, `agent_role`, `context_members`,
-    /// `context_tools` and [`Self::gate_role_state`] (which
+    /// `context_tools` (only for a context with no handle) and
+    /// [`Self::gate_role_state`] (which
     /// `validate_capability` and `validate_resource_access` call) so all of
     /// them answer from one source rather than near-identical
     /// `block_in_place` blocks.
@@ -5438,8 +5439,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // and read its outlet_registry. Outlets register only on a handle, and
         // only this bridge's create and join paths register one, so a context
         // the actor holds with no handle has no outlet registered through this
-        // bridge: its registry is empty. A dropped bridge, a failed role-state
-        // read, or a context the actor does not hold is an error.
+        // bridge: its registry is empty. A dropped bridge is an error. A context
+        // with no handle is an error when its role-state read fails or no actor
+        // holds it. A context with a handle answers from the handle's registry
+        // without a role-state read; `McpServer` lists or invokes an outlet
+        // only after `validate_capability` reads the actor's role state.
         let bi = self.upgrade_bi()?;
         let registry = context_handle_registry(&bi);
         let Some(handle) = registry.get(context_id) else {
