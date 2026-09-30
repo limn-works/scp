@@ -509,6 +509,8 @@ pub struct McpServer<P: ContextProvider> {
     /// The [`ContextView`] of each served context as the client last saw
     /// it: `tools/list` writes the tools half, `resources/list` the readable
     /// half, and a pump evaluation both halves (see [`Self::record_view`]).
+    /// A list response that omits a recorded context, and a broadcast lag,
+    /// set both halves to `None` ([`ContextView::UNKNOWN`]).
     ///
     /// [`Self::notifications_for_event`] sends the `tools/list_changed` +
     /// `resources/list_changed` pair and the `scp://{ctx}/tools` update only
@@ -1770,11 +1772,31 @@ impl<P: ContextProvider> McpServer<P> {
     ///
     /// Returns the provider's message when it cannot read participation; no
     /// context is recorded then.
+    ///
+    /// A context recorded as served that `active` omits left the served set
+    /// without the pump evaluating its removal event (a broadcast lag dropped
+    /// it, or `active_context_ids()` failed when it arrived). This response
+    /// omits it, so the view recorded for it no longer describes the client's
+    /// cache, and both halves are set to `None`: on the agent's return, no
+    /// current view equals that record, so the list-changed pair goes out. The
+    /// context stays in `served_contexts`, because a list of the other kind
+    /// cached earlier may still carry it, and a removal event that arrives
+    /// after this response must still announce it.
     fn record_served_contexts(&self) -> Result<(Vec<ContextId>, bool), String> {
         let active = self.provider.active_context_ids()?;
         let listed_before = self
             .client_listed
             .swap(true, std::sync::atomic::Ordering::SeqCst);
+        for (context_id, view) in self
+            .client_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter_mut()
+        {
+            if !active.contains(context_id) {
+                *view = ContextView::UNKNOWN;
+            }
+        }
         self.served_contexts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1822,10 +1844,7 @@ impl<P: ContextProvider> McpServer<P> {
         let fresh = if recorded {
             None
         } else if listed_before {
-            Some(ContextView {
-                tools: None,
-                readable: None,
-            })
+            Some(ContextView::UNKNOWN)
         } else {
             match self.context_view(served, context_id) {
                 Some(view) => Some(view),
@@ -1941,6 +1960,21 @@ impl<P: ContextProvider> McpServer<P> {
             Self::resources_list_changed_notification(),
             Self::tools_list_changed_notification(),
         ];
+
+        // The dropped events may have changed or removed a context's view
+        // without the pump recording it, so no recorded view still describes
+        // the client's cache. Each is set to `None` in both halves, which no
+        // current view equals: the next membership or lifecycle event on the
+        // context sends the list-changed pair, and a later list or pump
+        // evaluation records the halves the client reads again.
+        for view in self
+            .client_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+        {
+            *view = ContextView::UNKNOWN;
+        }
 
         // Without the served set no subscription can be re-authorized, so a
         // failed participation read sends only the list-changed pair above.
@@ -2112,6 +2146,15 @@ struct ContextView {
     /// The kinds [`McpServer::resource_access`] admits, in [`RESOURCE_KINDS`]
     /// order.
     readable: Option<Vec<ResourceKind>>,
+}
+
+impl ContextView {
+    /// A record no current view equals: the client's cache of this context
+    /// is unknown, so the next membership or lifecycle event notifies.
+    const UNKNOWN: Self = Self {
+        tools: None,
+        readable: None,
+    };
 }
 
 /// Creates an internal error response.
@@ -4486,6 +4529,93 @@ mod tests {
                     .iter()
                     .any(|n| n.method == protocol::METHOD_RESOURCES_LIST_CHANGED),
             "got: {notifs:?}"
+        );
+    }
+
+    /// Whether `notifs` holds the `tools/list_changed` +
+    /// `resources/list_changed` pair.
+    fn has_list_changed_pair(notifs: &[JsonRpcNotification]) -> bool {
+        notifs
+            .iter()
+            .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED)
+            && notifs
+                .iter()
+                .any(|n| n.method == protocol::METHOD_RESOURCES_LIST_CHANGED)
+    }
+
+    /// The agent's removal event for `ctx_b` never reaches the pump, and the
+    /// client re-lists without `ctx_b`. When the agent returns with the same
+    /// role, the client must be told, because its cached lists lack `ctx_b`.
+    /// The next event, with the view unchanged since that announcement, stays
+    /// silent.
+    #[test]
+    fn return_after_unevaluated_departure_and_relist_emits_list_changed_pair() {
+        let mut server = subscribing_server(MockProvider::default());
+        for method in [protocol::METHOD_TOOLS_LIST, protocol::METHOD_RESOURCES_LIST] {
+            let list = make_request(method, None);
+            assert!(server.handle_request(&list).unwrap().error.is_none());
+        }
+        server.provider.contexts.retain(|c| c != "ctx_b");
+        for method in [protocol::METHOD_TOOLS_LIST, protocol::METHOD_RESOURCES_LIST] {
+            let list = make_request(method, None);
+            assert!(server.handle_request(&list).unwrap().error.is_none());
+        }
+        server.provider.contexts.push("ctx_b".to_owned());
+
+        let notifs = server.notifications_for_event("ctx_b", &members_and_tools_event());
+        assert!(
+            has_list_changed_pair(&notifs),
+            "the client re-listed without ctx_b, so its return must be announced; got: {notifs:?}"
+        );
+        let again = server.notifications_for_event("ctx_b", &members_and_tools_event());
+        assert!(
+            !has_list_changed_pair(&again),
+            "the view is unchanged since the announcement; got: {again:?}"
+        );
+    }
+
+    /// A re-list that still carries a context keeps its recorded view, so an
+    /// event that leaves the view unchanged stays silent.
+    #[test]
+    fn relist_that_keeps_context_leaves_view_and_stays_silent() {
+        let mut server = subscribing_server(MockProvider::default());
+        for _ in 0..2 {
+            for method in [protocol::METHOD_TOOLS_LIST, protocol::METHOD_RESOURCES_LIST] {
+                let list = make_request(method, None);
+                assert!(server.handle_request(&list).unwrap().error.is_none());
+            }
+        }
+
+        let notifs = server.notifications_for_event("ctx_b", &members_and_tools_event());
+        assert!(
+            !has_list_changed_pair(&notifs),
+            "ctx_b's view is what the client listed; got: {notifs:?}"
+        );
+    }
+
+    /// A broadcast lag may have dropped the event that changed or removed a
+    /// context's view, so after the resync the next membership or lifecycle
+    /// event on a listed context sends the list-changed pair even when the
+    /// view equals the one recorded before the lag.
+    #[test]
+    fn lagged_resync_invalidates_recorded_views() {
+        let mut server = subscribing_server(MockProvider::default());
+        for method in [protocol::METHOD_TOOLS_LIST, protocol::METHOD_RESOURCES_LIST] {
+            let list = make_request(method, None);
+            assert!(server.handle_request(&list).unwrap().error.is_none());
+        }
+        assert!(
+            !has_list_changed_pair(
+                &server.notifications_for_event("ctx_b", &members_and_tools_event())
+            ),
+            "before the lag, an unchanged view stays silent"
+        );
+
+        let _ = server.lagged_resync_notifications();
+        let notifs = server.notifications_for_event("ctx_b", &members_and_tools_event());
+        assert!(
+            has_list_changed_pair(&notifs),
+            "after a lag no recorded view describes the client's cache; got: {notifs:?}"
         );
     }
 
