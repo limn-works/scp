@@ -181,9 +181,10 @@
 #      a literal or comment, on a first line that rustc strips as a shebang (`#!`, after
 #      an optional byte-order mark, not followed by `[` after spaces, tabs and line
 #      breaks alone), on the identifiers `test`, `bench` and `test_case` wherever they
-#      stand, and on a block comment or string literal it cannot close. No run starts that gate, so this script prints up to four
-#      NOT CHECKED lines for it. A run that compiles at least one crate prints the
-#      assertion 2 line, naming every crate it compiled. That run also prints the
+#      stand, and on a block comment or string literal it cannot close. No run starts that
+#      gate, so this script prints up to four NOT CHECKED lines for it. A run that
+#      compiles at least one crate prints the assertion 2 line, naming every crate it
+#      compiled. That run also prints the
 #      assertion 1 line when at least one crate it compiled is a package some example
 #      target compiles, and names only those packages, and prints the source-scan line
 #      when at least one crate it compiled owns an example target or holds an `examples/`
