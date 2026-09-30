@@ -99,6 +99,11 @@ import java.security.SecureRandom
  *   which returns before the write reaches disk. The key survives process death once the
  *   write lands, and is lost when the process dies first. [CustodyType.SOFTWARE] is reported.
  *
+ * - **Derived pseudonym keys (all API levels):** [derivePseudonym] and
+ *   [deriveRotatablePseudonym] hold every derived Ed25519 pseudonym key in Bouncy Castle
+ *   software, in [softwareKeys], in memory only, including a pseudonym of a Keystore identity
+ *   key on API 33+. [CustodyType.SOFTWARE] is reported.
+ *
  * - **X25519 (all API levels):** This class keeps every X25519 wrapping key in Bouncy Castle
  *   software, stored in [softwareKeys], at every API level. It does not use the X25519 key
  *   agreement Android Keystore offers from API 33. [CustodyType.SOFTWARE] is reported.
@@ -813,8 +818,11 @@ class AndroidKeyCustody internal constructor(
 /**
  * Bouncy Castle software key operations for [AndroidKeyCustody].
  *
- * Manages Ed25519 keys in software on API 26-32, where Android Keystore has no EdDSA, and
- * X25519 keys in software on all API levels, because this class does not use Keystore X25519.
+ * Manages three kinds of software key: Ed25519 keys that [AndroidKeyCustody.generateKeypair]
+ * creates on API 26-32, where Android Keystore has no EdDSA; Ed25519 pseudonym keys that
+ * [AndroidKeyCustody.derivePseudonym] and [AndroidKeyCustody.deriveRotatablePseudonym] store,
+ * at every API level and for a Keystore identity key too; and X25519 keys on all API levels,
+ * because [AndroidKeyCustody] does not use Keystore X25519.
  *
  * Extracted from [AndroidKeyCustody] to keep the parent class focused on routing
  * between hardware and software custody while respecting function count limits.
