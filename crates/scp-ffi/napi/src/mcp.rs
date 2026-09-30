@@ -1941,8 +1941,8 @@ mod tests {
                 }))
                 .expect("tools/list and tools/call must end within 10 s");
             (
-                list.err().expect("tools/list must fail").reason,
-                invoke.err().expect("tools/call must fail").reason,
+                list.err().expect("tools/list must fail").reason.clone(),
+                invoke.err().expect("tools/call must fail").reason.clone(),
             )
         };
 
