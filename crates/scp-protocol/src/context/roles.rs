@@ -816,11 +816,14 @@ impl CapabilityCeiling {
     }
 }
 
-/// Returns the default capability ceiling for new contexts.
+/// Returns the set of every standard SCP capability: messaging, outlet
+/// management, role assignment, membership control, governance, and context
+/// close.
 ///
-/// Includes all standard SCP capabilities: messaging, outlet management, role
-/// assignment, membership control, governance, and context close. Used by
-/// all FFI bridges when no explicit ceiling is provided.
+/// The NAPI and `PyO3` `context_create` paths never substitute it for an
+/// undeclared ceiling: a create whose ceiling is absent, null, or empty fails
+/// with [`ContextError::CeilingRequired`](crate::context::ContextError::CeilingRequired)
+/// (`.docs/standards/construction.md` M2).
 #[must_use]
 pub fn default_ceiling() -> CapabilityCeiling {
     CapabilityCeiling::new([

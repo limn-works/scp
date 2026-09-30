@@ -272,6 +272,20 @@ pub enum ContextError {
     #[error("capability ceiling is immutable and cannot be modified")]
     CeilingImmutable,
 
+    /// A context create declared no capability ceiling, a null one, or an
+    /// empty one (`.docs/standards/construction.md` M2: the `Explicit`
+    /// ceiling is required and non-empty).
+    ///
+    /// An undeclared ceiling leaves the context's security boundary to a
+    /// default nobody chose, and an empty ceiling describes a context no
+    /// member can use, so neither is created. The NAPI and `PyO3` bridges
+    /// raise this variant from their context-parameter parsers, before any
+    /// context state exists. Each bridge's error translator maps it to
+    /// `SCP-VALID-7005` (invalid field value). The string names which of the
+    /// three inputs the caller sent.
+    #[error("context creation requires a non-empty capability ceiling: {0}")]
+    CeilingRequired(String),
+
     /// An operation was attempted that requires the context to be in the
     /// `Active` state, but the context is in a different state.
     #[error("context is not in Active state")]

@@ -79,13 +79,11 @@ export interface ContextParams {
   /**
    * Capability ceiling — maximum capabilities available in this context.
    *
-   * Omit it (or pass `null` in hand-written JSON) to get the protocol's
-   * default ceiling. An empty array declares a ceiling that grants nothing,
-   * and the context's actor installs it as written. This bridge's UCAN mint,
-   * delegation and outlet checks still read an empty array as the default
-   * ceiling.
+   * Required and non-empty. `contextCreate` rejects params JSON whose
+   * `ceiling` is absent, `null`, or an empty array with `SCP-VALID-7005`;
+   * no default ceiling is substituted.
    */
-  readonly ceiling?: readonly string[];
+  readonly ceiling: readonly string[];
   /** Outlet definitions to register at context creation. */
   readonly outlets?: readonly OutletDefinition[];
   /** Role definitions: role name to capability list mapping. */

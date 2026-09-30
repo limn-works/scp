@@ -367,7 +367,10 @@ class TestInviteMemberRealFfi:
         from scp_sdk.types import CustodyType
 
         creator = await scp.identity_create(CustodyType.IN_MEMORY)
-        await scp.context_create(creator.did, {"mode": "encrypted", "governance": "single_admin"})
+        await scp.context_create(
+            creator.did,
+            {"mode": "encrypted", "governance": "single_admin", "ceiling": ["member:invite"]},
+        )
 
         unknown_ctx = "d" * 64
         with pytest.raises(Exception, match="no live context"):

@@ -525,6 +525,12 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // construction.md M2: a create with no ceiling, a null one, or an
+            // empty one is an invalid field value, not a context failure.
+            CE::CeilingRequired(_) => Self::ValidationError {
+                message: format!("{e}"),
+                code: codes::VALID_7005.to_owned(),
+            },
             // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
             // `ContextError::ActorBusy` doc states producers and retry behaviour.
             CE::ActorBusy(_) => Self::ContextError {
@@ -1064,6 +1070,18 @@ mod tests {
     fn actor_busy_surfaces_ctx_2130() {
         let err: ScpPyError = scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2130);
+    }
+
+    /// construction.md M2: a create that declared no usable ceiling surfaces
+    /// as a validation error with `SCP-VALID-7005`, not a context error.
+    #[test]
+    fn ceiling_required_surfaces_valid_7005() {
+        let err: ScpPyError =
+            scp_core::context::ContextError::CeilingRequired("empty".to_owned()).into();
+        match err {
+            ScpPyError::ValidationError { code, .. } => assert_eq!(code, codes::VALID_7005),
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
     }
 
     /// ADR-049 §10: a poisoned context must surface the dedicated

@@ -560,21 +560,6 @@ struct ParsedContextParams {
     economic_policy: Option<String>,
 }
 
-/// `default_ceiling()` rendered as `Capability::name()` strings (the colon
-/// form, such as `outlet:call:*`), a ceiling-entry form a `context_create`
-/// caller may write. These are not the UCAN `{resource}:{action}` names
-/// (`outlet_call:*`) that `Capability::ucan_capability_name()` returns.
-///
-/// `parse_context_params` carries a caller's vocabulary to the shared
-/// `build_context_params` parser, so a default this bridge substitutes has to
-/// arrive in the same form a caller would have written.
-fn default_ceiling_strings() -> Vec<String> {
-    scp_core::context::roles::default_ceiling()
-        .iter()
-        .map(|cap| cap.name().into_owned())
-        .collect()
-}
-
 /// Parses the JSON context-parameters surface into a [`ParsedContextParams`].
 ///
 /// Delegates all validation and `ContextParams` construction to the shared
@@ -583,10 +568,12 @@ fn default_ceiling_strings() -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Validation` (`SCP-VALID-7000`) if the JSON is
-/// malformed or is not an object, if `ceiling` is present and not `null` but
-/// is not an array, if a `ceiling` entry is not a string, or if the
-/// parameters fail the common builder's validation.
+/// Returns `ScpNapiError::Validation`:
+/// - `SCP-VALID-7005` ([`ContextError::CeilingRequired`](scp_core::context::ContextError::CeilingRequired))
+///   if `ceiling` is absent, `null`, or an empty array;
+/// - `SCP-VALID-7000` if the JSON is malformed or is not an object, if
+///   `ceiling` is neither `null` nor an array, if a `ceiling` entry is not a
+///   string, or if the parameters fail the common builder's validation.
 fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> {
     let params: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
@@ -599,8 +586,7 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
     // Every field below indexes `params` by key, and serde_json's index reads
     // `Null` for any key of a non-object value, so an array, string, number,
     // bool, or `null` would otherwise build a context from the defaults of
-    // every field, including the full default ceiling, that the caller never
-    // declared.
+    // every field that the caller never declared.
     if !params.is_object() {
         return Err(NapiError::from(ScpNapiError::Validation {
             message: format!(
@@ -611,22 +597,35 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
     }
 
     let mode_str = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
-    // ceiling: string[] (default: `default_ceiling()`).
+    // ceiling: string[], required and non-empty (construction.md M2).
     //
-    // An absent key and a `null` value both mean "this caller declared no
-    // ceiling", and `default_ceiling`'s own doc comment states that every FFI
-    // bridge applies it "when no explicit ceiling is provided". A supplied
-    // array stands as written, so an empty array declares a ceiling that
-    // grants nothing rather than reading as an absent key, and the supervisor
-    // installs that empty ceiling as the actor's ceiling. The supervisor
-    // installs this vector verbatim, so this substitution is the only place an
-    // omitted declaration receives its default. Any other JSON type, and any
-    // non-string entry inside the array, is a malformed declaration and
-    // rejects, because dropping the entry would hand the caller a narrower
-    // ceiling than the one they wrote and hide the mistake behind a context
-    // that refuses the capability.
+    // An absent key or a `null` value declares no ceiling, which would leave
+    // the context's security boundary to a default nobody chose; an empty
+    // array declares a context no member can use. All three reject with
+    // `ContextError::CeilingRequired` before any context state exists. A
+    // non-empty array stands as written, and the supervisor installs it
+    // verbatim. Any other JSON type, and any non-string entry inside the
+    // array, is a malformed declaration and rejects, because dropping the
+    // entry would hand the caller a narrower ceiling than the one they wrote
+    // and hide the mistake behind a context that refuses the capability.
     let ceiling: Vec<String> = match &params["ceiling"] {
-        serde_json::Value::Null => default_ceiling_strings(),
+        serde_json::Value::Null => {
+            let detail = if params.get("ceiling").is_some() {
+                "`ceiling` is null"
+            } else {
+                "no `ceiling` was declared"
+            };
+            return Err(NapiError::from(ScpNapiError::from(
+                scp_core::context::ContextError::CeilingRequired(detail.to_owned()),
+            )));
+        }
+        serde_json::Value::Array(entries) if entries.is_empty() => {
+            return Err(NapiError::from(ScpNapiError::from(
+                scp_core::context::ContextError::CeilingRequired(
+                    "`ceiling` is an empty array".to_owned(),
+                ),
+            )));
+        }
         serde_json::Value::Array(entries) => entries
             .iter()
             .map(|entry| {
@@ -641,7 +640,7 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         other => {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: format!(
-                    "ceiling must be an array of capability strings or omitted, got {other}"
+                    "ceiling must be a non-empty array of capability strings, got {other}"
                 ),
                 code: codes::VALID_7000.to_owned(),
             }));
@@ -971,8 +970,8 @@ pub(crate) async fn context_join_on(
         .transpose()?;
 
     // No `init_supervisor` call here: the lifecycle gate above already refused
-    // with SCP-CTX-2000 unless this instance holds a supervisor, so join is
-    // never the operation that attaches one.
+    // with SCP-CTX-2000 unless this instance holds a supervisor and is not
+    // suspended, so join is never the operation that attaches one.
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
     // Generate a real MLS key package for the joining member (#1294).
@@ -1973,7 +1972,8 @@ impl ActiveFlagGuard {
 /// `Active` or `Poisoned` and for a context no actor serves, `CTX_2134` for a
 /// poisoned context, and the supervisor query's own error when the state read
 /// fails: `CTX_2130` for a busy actor, `CTX_2135` for a crashed or
-/// mid-respawn actor, and `CTX_2000` when this bridge holds no supervisor.
+/// mid-respawn actor, and `CTX_2000` when this bridge holds no supervisor or is
+/// suspended (call `resume()` and retry).
 async fn subscribe_admission(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -6853,14 +6853,14 @@ mod tests {
         }
     }
 
-    /// The supervisor installs an explicit `ceiling: []` as the actor's
-    /// ceiling and grants the creator nothing, while an omitted ceiling
-    /// installs `default_ceiling()` and grants the creator `messages:write`.
-    /// The check reads the actor's params and role state, not the bridge's
-    /// copy.
+    /// `context_create` rejects a params object whose ceiling is absent,
+    /// `null`, or an empty array with `SCP-VALID-7005`, and creates a context
+    /// whose supervisor-held ceiling and role state carry a non-empty declared
+    /// ceiling as written. The accepted case proves the check does not reject
+    /// every create.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_supervisor_enforces_an_empty_ceiling_as_deny_all() {
+    async fn context_create_rejects_an_absent_null_or_empty_ceiling() {
         use scp_core::context::roles::Capability;
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
@@ -6869,48 +6869,52 @@ mod tests {
             .await
             .expect("identity_create should succeed");
 
-        for (params_json, admits) in [
-            (r#"{"memoryScope":"ephemeral"}"#, true),
-            (r#"{"memoryScope":"ephemeral","ceiling":[]}"#, false),
+        for params_json in [
+            r#"{"memoryScope":"ephemeral"}"#,
+            r#"{"memoryScope":"ephemeral","ceiling":null}"#,
+            r#"{"memoryScope":"ephemeral","ceiling":[]}"#,
         ] {
-            let handle = super::context_create_on(&bi, &owner, params_json.to_owned())
+            let err = super::context_create_on(&bi, &owner, params_json.to_owned())
                 .await
-                .expect("context_create should succeed");
-            let stored = test_dispatch_context_params(&bi, &handle.context_id).await;
-            assert_eq!(
-                stored.ceiling.is_empty(),
-                !admits,
-                "{params_json}: the actor's ceiling is {:?}",
-                stored.ceiling
-            );
-            let sup = std::sync::Arc::clone(
-                crate::runtime::supervisor(&bi).expect("context_create attaches a supervisor"),
-            );
-            let role_state = sup
-                .get_role_state(&handle.context_id)
-                .await
-                .expect("the created context's actor must answer");
-            assert_eq!(
-                role_state.member_has_capability(&handle.creator_did, &Capability::MessagesWrite),
-                admits,
-                "{params_json}: the actor must {} the creator messages:write",
-                if admits { "grant" } else { "deny" }
+                .err()
+                .unwrap_or_else(|| panic!("{params_json}: context_create must reject"));
+            assert!(
+                err.reason.starts_with(&format!("[{}] ", codes::VALID_7005)),
+                "{params_json}: expected {}, got: {}",
+                codes::VALID_7005,
+                err.reason
             );
         }
+
+        let handle = super::context_create_on(
+            &bi,
+            &owner,
+            r#"{"memoryScope":"ephemeral","ceiling":["messages:write"]}"#.to_owned(),
+        )
+        .await
+        .expect("a non-empty ceiling creates the context");
+        let stored = test_dispatch_context_params(&bi, &handle.context_id).await;
+        assert_eq!(
+            stored.ceiling,
+            vec![Capability::MessagesWrite],
+            "the actor holds the declared ceiling as written"
+        );
+        let sup = std::sync::Arc::clone(
+            crate::runtime::supervisor(&bi).expect("context_create attaches a supervisor"),
+        );
+        let role_state = sup
+            .get_role_state(&handle.context_id)
+            .await
+            .expect("the created context's actor must answer");
+        assert!(
+            role_state.member_has_capability(&handle.creator_did, &Capability::MessagesWrite),
+            "the actor grants the creator the declared messages:write"
+        );
     }
 
     // -------------------------------------------------------------------
-    // Ceiling: an absent declaration and an empty one are different
+    // Ceiling: required and non-empty (construction.md M2)
     // -------------------------------------------------------------------
-
-    /// The capability names `default_ceiling()` carries, in the form a
-    /// `context_create` caller writes them.
-    fn default_ceiling_names() -> std::collections::HashSet<String> {
-        scp_core::context::roles::default_ceiling()
-            .iter()
-            .map(|cap| cap.name().into_owned())
-            .collect()
-    }
 
     /// The capability names a parsed ceiling carries.
     fn parsed_ceiling_names(params_json: &str) -> std::collections::HashSet<String> {
@@ -6923,37 +6927,49 @@ mod tests {
             .collect()
     }
 
-    /// An absent `ceiling` key resolves to `default_ceiling()`.
-    ///
-    /// `default_ceiling`'s doc comment says every FFI bridge applies it "when
-    /// no explicit ceiling is provided". Before this test existed the parser
-    /// read an absent key as an empty vector, and the supervisor installed
-    /// that empty vector verbatim as the actor's ceiling.
-    #[test]
-    fn parse_context_params_resolves_an_absent_ceiling_to_default_ceiling() {
-        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted"}"#);
-        assert_eq!(actual.len(), 11, "default_ceiling() carries 11 entries");
-        assert_eq!(actual, default_ceiling_names());
-    }
-
-    /// A `ceiling` key holding `null` declares no ceiling, the same as an
-    /// absent key.
-    #[test]
-    fn parse_context_params_resolves_a_null_ceiling_to_default_ceiling() {
-        let actual = parsed_ceiling_names(r#"{"mode":"Encrypted","ceiling":null}"#);
-        assert_eq!(actual, default_ceiling_names());
-    }
-
-    /// An empty `ceiling` array stands as written: a deny-all context.
-    #[test]
-    fn parse_context_params_keeps_an_empty_ceiling_empty() {
-        let parsed = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":[]}"#)
-            .expect("params must parse");
+    /// Asserts `params_json` fails to parse with `SCP-VALID-7005` and a
+    /// message naming `detail`.
+    fn assert_ceiling_required(params_json: &str, detail: &str) {
+        let err = super::parse_context_params(params_json)
+            .err()
+            .unwrap_or_else(|| panic!("{params_json} must not parse"));
         assert!(
-            parsed.core.ceiling.is_empty(),
-            "an explicit [] grants nothing"
+            err.reason.starts_with(&format!("[{}] ", codes::VALID_7005)),
+            "{params_json}: expected {}, got: {}",
+            codes::VALID_7005,
+            err.reason
         );
-        assert!(parsed.ceiling.is_empty());
+        assert!(
+            err.reason.contains(detail),
+            "{params_json}: expected the message to name {detail:?}, got: {}",
+            err.reason
+        );
+    }
+
+    /// An absent `ceiling` key rejects: no default ceiling is substituted.
+    #[test]
+    fn parse_context_params_rejects_an_absent_ceiling() {
+        assert_ceiling_required(r#"{"mode":"Encrypted"}"#, "no `ceiling` was declared");
+        assert_ceiling_required("{}", "no `ceiling` was declared");
+    }
+
+    /// A `ceiling` key holding `null` rejects, the same as an absent key.
+    #[test]
+    fn parse_context_params_rejects_a_null_ceiling() {
+        assert_ceiling_required(
+            r#"{"mode":"Encrypted","ceiling":null}"#,
+            "`ceiling` is null",
+        );
+    }
+
+    /// An empty `ceiling` array rejects: it describes a context no member can
+    /// use.
+    #[test]
+    fn parse_context_params_rejects_an_empty_ceiling() {
+        assert_ceiling_required(
+            r#"{"mode":"Encrypted","ceiling":[]}"#,
+            "`ceiling` is an empty array",
+        );
     }
 
     /// A supplied `ceiling` array stands as written, with no default merged in.
@@ -6967,8 +6983,8 @@ mod tests {
     }
 
     /// A `ceiling` value that is neither `null` nor an array is a malformed
-    /// declaration, so the parser rejects it instead of reading it as
-    /// deny-all or as absent.
+    /// declaration, so the parser rejects it with a type error instead of
+    /// reading it as absent.
     #[test]
     fn parse_context_params_rejects_a_non_array_ceiling() {
         let err = super::parse_context_params(r#"{"mode":"Encrypted","ceiling":"messages:write"}"#)
@@ -7002,12 +7018,12 @@ mod tests {
 
     /// A top-level `params_json` that is not a JSON object rejects with
     /// `SCP-VALID-7000` instead of building a context from every field's
-    /// default, while an empty object parses to those defaults.
+    /// default, while an object that declares a ceiling parses.
     ///
     /// `serde_json`'s index reads `Null` for every key of a non-object value, so
     /// without the object check an array, a double-encoded string, a number, a
-    /// bool, or `null` would create an Encrypted context with the full default
-    /// ceiling.
+    /// bool, or `null` would reach the field parsers as if every field were
+    /// undeclared.
     #[test]
     fn parse_context_params_rejects_a_non_object_params_json() {
         for params_json in [
@@ -7032,7 +7048,10 @@ mod tests {
                 err.reason
             );
         }
-        assert_eq!(parsed_ceiling_names("{}"), default_ceiling_names());
+        assert_eq!(
+            parsed_ceiling_names(r#"{"ceiling":["messages:write"]}"#),
+            std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
+        );
     }
 
     /// A rejected direct-execute leaves context membership/role state unchanged

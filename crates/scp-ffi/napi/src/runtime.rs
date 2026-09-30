@@ -871,7 +871,7 @@ pub fn supervisor(
     bi.core.try_supervisor().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Context {
             message: "Supervisor not yet attached — call context_create, \
-                      context_join, context_import, or init_supervisor first"
+                      context_join_from_welcome, context_import, or init_supervisor first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
         })
@@ -1914,11 +1914,13 @@ pub fn sync_ceiling_from_params(
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
 ///
-/// A context the supervisor holds no actor, no poison flag, and no
-/// crash-window record for reads as `None` instead of as an error. An absent
-/// actor the crash watchdog poisoned reads as `Some(Poisoned)`, because the
-/// supervisor keeps that flag outside the actor (ADR-049 §10). An absent actor
-/// the supervisor is still recovering reads as an error (see `# Errors`).
+/// A context with no registered actor reads as `None` instead of as an error,
+/// unless the supervisor holds a poison flag or a recovery in progress for it:
+/// an absent actor the crash watchdog poisoned reads as `Some(Poisoned)`,
+/// because the supervisor keeps that flag outside the actor (ADR-049 §10), and
+/// an absent actor the supervisor is still recovering reads as an error (see
+/// `# Errors`). A crash-window record that is neither poisoned, respawning, nor
+/// marked failed does not change the answer: that context reads as `None`.
 ///
 /// [`require_active_context`] is the gate form: it turns `None` into an error so
 /// a gate never admits an operation on an absent answer.
@@ -1936,7 +1938,8 @@ pub fn sync_ceiling_from_params(
 ///
 /// Returns [`ScpNapiError::Context`] with:
 ///
-/// - `SCP-CTX-2000` when this instance holds no supervisor;
+/// - `SCP-CTX-2000` when this instance holds no supervisor, or when the bridge
+///   is suspended (the supervisor stays attached; call `resume()` and retry);
 /// - `SCP-CTX-2130` when an actor serves `context_id` but the mailbox send
 ///   failed or timed out, or the actor dropped its reply to the state read or
 ///   missed the reply timeout;
@@ -1991,7 +1994,7 @@ pub async fn read_live_context_state(
 /// than `Active` and when no actor serves `context_id`; and the supervisor's
 /// own error (`SCP-CTX-2130` busy, `SCP-CTX-2135` crashed or mid-respawn) when
 /// the supervisor query itself fails, or `SCP-CTX-2000` when this bridge has no
-/// supervisor.
+/// supervisor or is suspended (call `resume()` and retry).
 pub async fn require_active_context<F>(
     bi: &NapiBridgeInstance,
     context_id: &str,

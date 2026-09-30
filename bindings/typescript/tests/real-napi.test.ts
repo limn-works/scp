@@ -697,41 +697,26 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanValidate(ctx, token.encoded, fullUri as string, member.did);
     });
 
-    // The handle's `ceiling` getter renders the ceiling `parse_context_params`
-    // produced, the same value the bridge hands the supervisor. It is the
-    // TypeScript-visible surface that tells "absent means default_ceiling()"
-    // from "absent means []": a mint cannot, because `ucanMint` widens an
-    // empty handle ceiling to the default. The Rust test
-    // `the_supervisor_enforces_an_empty_ceiling_as_deny_all` covers the
-    // actor's enforcement of each reading.
-    test("an omitted or null ceiling resolves to the default ceiling; [] stays empty", async () => {
+    // `contextCreate` rejects params whose ceiling is absent, null, or empty
+    // with SCP-VALID-7005 (construction.md M2), and creates a context whose
+    // handle carries a non-empty declared ceiling as written. The accepted
+    // case proves the check does not reject every create.
+    test("an omitted, null or empty ceiling rejects with SCP-VALID-7005", async () => {
       const admin = await napi.identityCreate("in_memory");
-      // default_ceiling() in UCAN `{resource}:{action}` form.
-      const defaultCeiling = [
-        "context:close",
-        "governance:propose",
-        "governance:vote",
-        "member:invite",
-        "member:remove",
-        "messages:read",
-        "messages:write",
-        "outlet:register",
-        "outlet_call:*",
-        "outlet_query:*",
-        "role:assign",
-      ];
+      for (const params of [{ memoryScope: "ephemeral" }, { ceiling: null }, { ceiling: [] }]) {
+        await expect(napi.contextCreate(admin, JSON.stringify(params))).rejects.toThrow(
+          /SCP-VALID-7005/,
+        );
+      }
+
       // `BridgeContextHandle` does not declare the addon handle's `ceiling`
       // getter, so the test reads it through a narrowed view.
       const ceilingOf = (handle: unknown): string[] => (handle as { ceiling: string[] }).ceiling;
-
-      const omitted = await napi.contextCreate(admin, JSON.stringify({ memoryScope: "ephemeral" }));
-      expect([...ceilingOf(omitted)].sort()).toEqual(defaultCeiling);
-
-      const nulled = await napi.contextCreate(admin, JSON.stringify({ ceiling: null }));
-      expect([...ceilingOf(nulled)].sort()).toEqual(defaultCeiling);
-
-      const empty = await napi.contextCreate(admin, JSON.stringify({ ceiling: [] }));
-      expect(ceilingOf(empty)).toEqual([]);
+      const declared = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:write"] }),
+      );
+      expect(ceilingOf(declared)).toEqual(["messages:write"]);
     });
 
     test("rejects validation for an ungranted capability", async () => {

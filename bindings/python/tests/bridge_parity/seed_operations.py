@@ -327,9 +327,14 @@ OP_IDENTITY_CREATE = OpSpec(
 # ---------------------------------------------------------------------------
 
 
+# Every create declares a non-empty ceiling: the PyO3 and NAPI bridges reject
+# an absent, null, or empty one with SCP-VALID-7005 (construction.md M2).
+_PARITY_CEILING = ["messages:read", "messages:write"]
+
+
 def _py_context_create(ctx: OpContext) -> dict[str, Any]:
     scp, identity = ctx.attached_scp()
-    params = {"name": "parity-test", "mode": "encrypted"}
+    params = {"name": "parity-test", "mode": "encrypted", "ceiling": _PARITY_CEILING}
     handle = scp.context_create(identity.did, params)
     return {
         "context_id": handle.context_id,
@@ -343,7 +348,9 @@ OP_CONTEXT_CREATE = OpSpec(
     py_call=_py_context_create,
     node_call={
         "op": "context_create",
-        "args": {"params": {"name": "parity-test", "mode": "encrypted"}},
+        "args": {
+            "params": {"name": "parity-test", "mode": "encrypted", "ceiling": _PARITY_CEILING}
+        },
     },
     schema=OpSchema(
         fields=(
@@ -430,7 +437,9 @@ OP_INVALID_CAPABILITY = OpSpec(
 
 def _py_event_log_append(ctx: OpContext) -> dict[str, Any]:
     scp, identity = ctx.attached_scp()
-    handle = scp.context_create(identity.did, {"name": "parity-elog", "mode": "encrypted"})
+    handle = scp.context_create(
+        identity.did, {"name": "parity-elog", "mode": "encrypted", "ceiling": _PARITY_CEILING}
+    )
     events = scp.event_log_query(handle.context_id, None)
     first = events[0] if events else None
     if first is None:
@@ -1000,7 +1009,9 @@ _EVENT_LOG_FILTER = {"event_type": "ContextCreated"}
 
 def _py_event_log_query_filtered(ctx: OpContext) -> dict[str, Any]:
     scp, identity = ctx.attached_scp()
-    handle = scp.context_create(identity.did, {"name": "parity-elog-f", "mode": "encrypted"})
+    handle = scp.context_create(
+        identity.did, {"name": "parity-elog-f", "mode": "encrypted", "ceiling": _PARITY_CEILING}
+    )
     events = scp.event_log_query(handle.context_id, _EVENT_LOG_FILTER)
     first = events[0] if events else None
     return {

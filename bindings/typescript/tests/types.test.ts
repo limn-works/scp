@@ -55,17 +55,18 @@ describe("Capability strings", () => {
 });
 
 describe("type definitions", () => {
-  it("ContextParams accepts an explicit ceiling", () => {
+  it("ContextParams has required ceiling field", () => {
     const params: ContextParams = {
       ceiling: ["messages:read", "messages:write"],
     };
     expect(params.ceiling).toHaveLength(2);
   });
 
-  it("ContextParams may omit the ceiling", () => {
-    // Type-level only. The real-addon test in real-napi.test.ts checks that an
-    // omitted ceiling reaches the handle as default_ceiling(); the Rust tests
-    // in crates/scp-ffi/napi/src/context.rs check the supervisor's reading.
+  it("ContextParams rejects an omitted ceiling at compile time", () => {
+    // Type-level: the typecheck fails if `ceiling` becomes optional again,
+    // because the directive below would then be unused. The real-addon test
+    // in real-napi.test.ts checks the runtime rejection.
+    // @ts-expect-error `ceiling` is required (construction.md M2).
     const params: ContextParams = { mode: "Encrypted" };
     expect(params.ceiling).toBeUndefined();
   });
