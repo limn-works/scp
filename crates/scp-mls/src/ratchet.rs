@@ -15,6 +15,7 @@
 //! See ADR-001 acceptance criteria 6 and 7.
 
 use openmls::prelude::*;
+use scp_clock::Clock;
 use tls_codec::Serialize as TlsSerializeTrait;
 
 use crate::epoch_grace::EpochGraceStore;
@@ -32,19 +33,35 @@ use crate::group::ScpMlsGroup;
 /// * `commit_bytes` - The serialized Commit message bytes (TLS-serialized
 ///   `MlsMessageOut` from the committer).
 /// * `grace_store` - The epoch grace store where the old epoch will be tracked.
+/// * `clock` - The injected hardened [`Clock`] each added leaf's `Lifetime` is
+///   re-validated against during admission (ADR-057 §Prereq-1).
+///
+/// # Returns
+///
+/// `(did, key)` for each replaced leaf whose `0xFF01` wrapping key changed
+/// (see [`crate::encrypt::DecryptedContent::Commit`]).
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
 /// Returns [`MlsError::CommitProcessingFailed`] if the Commit message cannot
-/// be deserialized, processed, or merged.
+/// be deserialized, processed, or merged. Returns any
+/// [`crate::admission`] error, before merging, if an added or replaced leaf
+/// fails SCP admission; the group stays on its current epoch.
 ///
 /// See ADR-001 acceptance criterion 6.
 pub fn process_commit(
     group: &mut ScpMlsGroup,
     commit_bytes: &[u8],
     grace_store: &mut EpochGraceStore,
-) -> Result<(), MlsError> {
+    clock: &dyn Clock,
+) -> Result<
+    Vec<(
+        String,
+        [u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
+    )>,
+    MlsError,
+> {
     // Record the current epoch before processing the Commit. This epoch will
     // enter the grace window after the Commit is merged.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
@@ -65,6 +82,12 @@ pub fn process_commit(
         .process_message(&group.provider, protocol_message)
         .map_err(|e| MlsError::CommitProcessingFailed(e.to_string()))?;
 
+    let Sender::Member(committer) = *processed.sender() else {
+        return Err(MlsError::CommitProcessingFailed(
+            "commit sender is not a group member".to_string(),
+        ));
+    };
+
     // Extract the staged commit from the processed message.
     let staged_commit = match processed.into_content() {
         ProcessedMessageContent::StagedCommitMessage(staged) => *staged,
@@ -73,6 +96,13 @@ pub fn process_commit(
                 "message is not a Commit".to_string(),
             ));
         }
+    };
+
+    // SCP admission of every added and replaced leaf before the merge
+    // (spec 09 §9.16.1); on failure the staged commit is dropped unmerged.
+    let admission = {
+        let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        crate::admission::admit_staged_commit(g, &staged_commit, committer, clock)?
     };
 
     // Merge the staged commit to advance the group to the new epoch.
@@ -91,7 +121,7 @@ pub fn process_commit(
     // epochs list is available for logging/diagnostics if needed.
     let _expired_epochs = grace_store.add_epoch(old_epoch);
 
-    Ok(())
+    Ok(admission.wrapping_key_updates)
 }
 
 /// Issues an MLS Update proposal and immediately commits it.
@@ -228,11 +258,20 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn setup_alice_bob() -> (ScpMlsGroup, ScpMlsGroup) {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
@@ -282,7 +321,13 @@ mod tests {
         let commit_bytes = serialize_mls_message(&commit).unwrap();
 
         // Bob processes the Commit.
-        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_epoch_after = bob_group.epoch().unwrap();
         assert_eq!(
@@ -303,7 +348,13 @@ mod tests {
         let commit = propose_update(&mut alice_group).unwrap();
         let commit_bytes = serialize_mls_message(&commit).unwrap();
 
-        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        )
+        .unwrap();
 
         assert!(
             grace_store.is_in_grace(bob_old_epoch),
@@ -322,7 +373,12 @@ mod tests {
 
         crate::group::destroy_group(&mut bob_group).unwrap();
 
-        let result = process_commit(&mut bob_group, &commit_bytes, &mut grace_store);
+        let result = process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        );
         assert!(
             result.is_err(),
             "process_commit must fail on destroyed group"
@@ -348,7 +404,7 @@ mod tests {
         let mut grace_store = EpochGraceStore::new();
 
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let result = process_commit(&mut bob_group, &garbage, &mut grace_store);
+        let result = process_commit(&mut bob_group, &garbage, &mut grace_store, &SystemClock);
         assert!(
             result.is_err(),
             "process_commit must reject malformed bytes"
@@ -366,7 +422,13 @@ mod tests {
         for i in 0u64..3 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+            process_commit(
+                &mut bob_group,
+                &commit_bytes,
+                &mut grace_store,
+                &SystemClock,
+            )
+            .unwrap();
 
             assert_eq!(
                 bob_group.epoch().unwrap(),
@@ -431,7 +493,13 @@ mod tests {
         );
 
         // Also verify Bob can process the commit and advance.
-        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        )
+        .unwrap();
         assert_eq!(bob_group.epoch().unwrap(), old_epoch + 1);
     }
 
@@ -495,7 +563,13 @@ mod tests {
         for _ in 0..3 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+            process_commit(
+                &mut bob_group,
+                &commit_bytes,
+                &mut grace_store,
+                &SystemClock,
+            )
+            .unwrap();
         }
 
         assert_eq!(bob_group.epoch().unwrap(), 4);
@@ -531,7 +605,13 @@ mod tests {
         for _ in 0..2 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+            process_commit(
+                &mut bob_group,
+                &commit_bytes,
+                &mut grace_store,
+                &SystemClock,
+            )
+            .unwrap();
         }
 
         assert_eq!(alice_group.epoch().unwrap(), 3);
@@ -571,7 +651,13 @@ mod tests {
         for _ in 0..3 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+            process_commit(
+                &mut bob_group,
+                &commit_bytes,
+                &mut grace_store,
+                &SystemClock,
+            )
+            .unwrap();
         }
 
         // The grace store has capacity 2, so the first epoch should have been

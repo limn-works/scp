@@ -191,7 +191,12 @@ fn mls_group_derive_pseudonym_serde_path_is_stable_cross_target() {
         SigningKeyId::Active,
     )
     .expect("credential");
-    let group = create_group(&cred, &clock).expect("create group");
+    let group = create_group(
+        &cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+        &clock,
+    )
+    .expect("create group");
     let ctx = b"scp-mls-derive-serde-path-kat";
 
     // Determinism: the serde scalar extraction recovers the same scalar each call.

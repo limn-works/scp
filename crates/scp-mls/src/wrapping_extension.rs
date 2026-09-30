@@ -284,42 +284,27 @@ mod tests {
         );
     }
 
-    /// T4: a real cs2 `KeyPackage` carries the 65-byte key through
-    /// `key_package_in_wrapping_key`, and the joiner reads the same key back
-    /// through `extract_member_wrapping_key` on its own leaf.
+    /// T4: a real cs2 `KeyPackage` carries the 65-byte key: the adder's
+    /// admission reports it, and the joiner reads the same key back through
+    /// `extract_member_wrapping_key` on its own leaf.
     #[test]
     fn cs2_key_package_carries_65_byte_wrapping_key() {
         let bob_cred = test_credential("bob");
         let bob_wrapping = point(0xBB);
         let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+            crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
         assert_eq!(
             bob_kp.key_package().ciphersuite(),
             crate::group::SCP_CIPHERSUITE
         );
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        assert_eq!(
-            crate::group::key_package_in_wrapping_key(
-                &bob_kp_in,
-                ProtocolVersion::Mls10,
-                &SystemClock
-            )
-            .unwrap(),
-            bob_wrapping
-        );
 
-        let mut alice_group = crate::group::create_group_with_wrapping_key(
-            &test_credential("alice"),
-            Some(&point(0xAA)),
-            &SystemClock,
-        )
-        .unwrap();
+        let mut alice_group =
+            crate::group::create_group(&test_credential("alice"), &point(0xAA), &SystemClock)
+                .unwrap();
         let add = crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
+        assert_eq!(add.admitted_did, bob_cred.did);
+        assert_eq!(add.admitted_wrapping_key, bob_wrapping);
         let bob_group = crate::group::join_group(&add.welcome, bob_provider, bob_signer).unwrap();
         assert_eq!(
             extract_member_wrapping_key(&bob_group, &bob_cred.did).unwrap(),
@@ -366,9 +351,7 @@ mod tests {
         let cred = test_credential("alice");
         let wrapping_key = point(0xAA);
 
-        let group =
-            crate::group::create_group_with_wrapping_key(&cred, Some(&wrapping_key), &SystemClock)
-                .unwrap();
+        let group = crate::group::create_group(&cred, &wrapping_key, &SystemClock).unwrap();
 
         // Extract the own wrapping key from the LeafNode.
         let extracted = extract_own_wrapping_key(&group).unwrap();
@@ -385,22 +368,13 @@ mod tests {
     fn key_package_with_wrapping_key_carries_extension_through_join() {
         let alice_cred = test_credential("alice");
         let alice_wrapping = point(0xAA);
-        let mut alice_group = crate::group::create_group_with_wrapping_key(
-            &alice_cred,
-            Some(&alice_wrapping),
-            &SystemClock,
-        )
-        .unwrap();
+        let mut alice_group =
+            crate::group::create_group(&alice_cred, &alice_wrapping, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
         let bob_wrapping = point(0xBB);
         let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+            crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
 
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let add_result =
@@ -424,23 +398,14 @@ mod tests {
     fn wrapping_key_stable_across_epoch_advance() {
         let alice_cred = test_credential("alice");
         let wrapping_key = point(0xCC);
-        let mut alice_group = crate::group::create_group_with_wrapping_key(
-            &alice_cred,
-            Some(&wrapping_key),
-            &SystemClock,
-        )
-        .unwrap();
+        let mut alice_group =
+            crate::group::create_group(&alice_cred, &wrapping_key, &SystemClock).unwrap();
 
         // Add Bob to enable epoch advance.
         let bob_cred = test_credential("bob");
         let bob_wrapping = point(0xDD);
         let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+            crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let add_result =
             crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
@@ -456,7 +421,13 @@ mod tests {
 
         // Bob processes Alice's commit.
         let mut grace_store = crate::epoch_grace::EpochGraceStore::new();
-        crate::ratchet::process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        crate::ratchet::process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        )
+        .unwrap();
 
         // Alice's wrapping key should be unchanged after the update.
         let alice_extracted = extract_own_wrapping_key(&alice_group).unwrap();
@@ -473,14 +444,16 @@ mod tests {
     fn wrapping_key_rotates_on_identity_key_rotation() {
         let cred = test_credential("alice");
         let original_key = point(0xAA);
-        let mut group =
-            crate::group::create_group_with_wrapping_key(&cred, Some(&original_key), &SystemClock)
-                .unwrap();
+        let mut group = crate::group::create_group(&cred, &original_key, &SystemClock).unwrap();
 
         // Add Bob so we can do updates.
         let bob_cred = test_credential("bob");
-        let (bob_kp, _bob_signer, _bob_provider) =
-            crate::group::generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp, _bob_signer, _bob_provider) = crate::group::generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
         let _add_result = crate::group::add_member(&mut group, bob_kp_in, &SystemClock).unwrap();
 

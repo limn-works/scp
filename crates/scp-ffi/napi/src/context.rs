@@ -42,8 +42,8 @@ use crate::{decrement_handle_count, increment_handle_count};
 ///
 /// Uses `generate_key_package_with_context_params` so the leaf **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
 /// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` declares no SCP capabilities and real MLS rejects it
-/// from a context group. The leaf carries `wrapping_public` as its `0xFF01`
+/// `generate_key_package` declares no `0xFF02` capability and real MLS rejects
+/// it from a context group. The leaf carries `wrapping_public` as its `0xFF01`
 /// extension: the identity's wrapping public key, whose secret the supervisor
 /// holds (spec 09 §9.16.1).
 ///
@@ -68,15 +68,12 @@ fn generate_mls_key_package_bytes(
             }
         })?;
 
-    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(
-        &cred,
-        Some(wrapping_public),
-        &scp_clock::SystemClock,
-    )
-    .map_err(|e| ScpNapiError::Crypto {
-        message: format!("MLS key package generation failed: {e}"),
-        code: codes::CRYPTO_4011.to_owned(),
-    })?;
+    let (kp_bundle, _signer, _provider) =
+        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
+            .map_err(|e| ScpNapiError::Crypto {
+            message: format!("MLS key package generation failed: {e}"),
+            code: codes::CRYPTO_4011.to_owned(),
+        })?;
 
     kp_bundle
         .key_package()

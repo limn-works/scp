@@ -4518,9 +4518,12 @@ mod restore_reconcile_tests {
             scp_did::SigningKeyId::Active,
         )
         .expect("joiner credential");
-        let (kp_bundle, _signer, _provider) =
-            scp_mls::group::generate_key_package(&joiner_cred, &scp_clock::SystemClock)
-                .expect("generate joiner key package");
+        let (kp_bundle, _signer, _provider) = scp_mls::group::generate_key_package(
+            &joiner_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&joiner_cred.did),
+            &scp_clock::SystemClock,
+        )
+        .expect("generate joiner key package");
         let kp_bytes =
             openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
                 .expect("serialize key package");

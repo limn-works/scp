@@ -380,11 +380,20 @@ mod seal_open_tests {
     fn setup_group(names: &[&str]) -> Vec<Member> {
         let mut members = vec![Member {
             did: did_of(names[0]),
-            group: create_group(&credential(names[0]), &SystemClock).unwrap(),
+            group: create_group(
+                &credential(names[0]),
+                &scp_crypto::p256::testing::uncompressed_point_for(&(credential(names[0])).did),
+                &SystemClock,
+            )
+            .unwrap(),
         }];
         for name in &names[1..] {
-            let (bundle, signer, provider) =
-                generate_key_package(&credential(name), &SystemClock).unwrap();
+            let (bundle, signer, provider) = generate_key_package(
+                &credential(name),
+                &scp_crypto::p256::testing::uncompressed_point_for(&(credential(name)).did),
+                &SystemClock,
+            )
+            .unwrap();
             let key_package: KeyPackageIn = bundle.key_package().clone().into();
             let added = add_member(&mut members[0].group, key_package, &SystemClock).unwrap();
             let commit = serialize_ciphertext(&added.commit).unwrap();
@@ -953,8 +962,12 @@ mod seal_open_tests {
     #[tokio::test]
     async fn open_envelope_rejects_commit_input() {
         let (mut alice, mut bob) = alice_and_bob();
-        let (bundle, _signer, _provider) =
-            generate_key_package(&credential("carol"), &SystemClock).unwrap();
+        let (bundle, _signer, _provider) = generate_key_package(
+            &credential("carol"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&(credential("carol")).did),
+            &SystemClock,
+        )
+        .unwrap();
         let added = add_member(
             &mut alice.group,
             bundle.key_package().clone().into(),

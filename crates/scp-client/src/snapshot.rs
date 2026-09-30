@@ -694,8 +694,15 @@ mod tests {
     fn fresh_state() -> PerContextState {
         let credential =
             ScpCredential::new(CREATOR.to_owned(), None, SigningKeyId::Active).unwrap();
-        let crypto =
-            ContextCryptoState::from_group(CTX, create_group(&credential, &SystemClock).unwrap());
+        let crypto = ContextCryptoState::from_group(
+            CTX,
+            create_group(
+                &credential,
+                &scp_crypto::p256::testing::uncompressed_point_for(&credential.did),
+                &SystemClock,
+            )
+            .unwrap(),
+        );
         let mut state = PerContextState::new(CTX, CREATOR, crypto);
         state
             .append_log_event(EventType::ContextCreated, CREATOR, Vec::new(), 1_000)

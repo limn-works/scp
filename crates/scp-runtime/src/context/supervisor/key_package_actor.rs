@@ -1759,7 +1759,7 @@ impl KeyPackageStoreActor {
             let wrapping_public_key = *self.wrapping_key.load().public();
             match self
                 .mls
-                .generate_key_package(&credential, Some(&wrapping_public_key))
+                .generate_key_package(&credential, &wrapping_public_key)
                 .await
             {
                 Ok(generated_kp) => {

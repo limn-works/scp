@@ -435,7 +435,12 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_group_identity_and_epoch() {
-        let group = create_group(&credential(ALICE), &SystemClock).unwrap();
+        let group = create_group(
+            &credential(ALICE),
+            &scp_crypto::p256::testing::uncompressed_point_for(&credential(ALICE).did),
+            &SystemClock,
+        )
+        .unwrap();
         let original_epoch = group.epoch().unwrap();
         let original_group_id = group.group_id().unwrap().to_vec();
 
@@ -460,9 +465,18 @@ mod tests {
 
         // Alice creates a two-member group so the restored group can decrypt a
         // message a peer sent — proving the epoch secrets survived the snapshot.
-        let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
-        let (bundle, bob_signer, bob_provider) =
-            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let mut alice = create_group(
+            &credential(ALICE),
+            &scp_crypto::p256::testing::uncompressed_point_for(&credential(ALICE).did),
+            &SystemClock,
+        )
+        .unwrap();
+        let (bundle, bob_signer, bob_provider) = generate_key_package(
+            &credential(BOB),
+            &scp_crypto::p256::testing::uncompressed_point_for(&credential(BOB).did),
+            &SystemClock,
+        )
+        .unwrap();
         let kp_in = crate::wire::parse_key_package_in(
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -500,8 +514,12 @@ mod tests {
         // snapshots that pending material, then RESTORES it and uses the restored
         // pair to join a group Alice adds him to — proving the persisted pending
         // material carries the HPKE private keys the Welcome needs.
-        let (bundle, bob_signer, bob_provider) =
-            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let (bundle, bob_signer, bob_provider) = generate_key_package(
+            &credential(BOB),
+            &scp_crypto::p256::testing::uncompressed_point_for(&credential(BOB).did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Persist and restore Bob's pending-join material (bound to his DID + ctx).
         let blob =
@@ -515,7 +533,12 @@ mod tests {
         );
 
         // Alice creates a group and adds Bob from his published key package.
-        let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
+        let mut alice = create_group(
+            &credential(ALICE),
+            &scp_crypto::p256::testing::uncompressed_point_for(&credential(ALICE).did),
+            &SystemClock,
+        )
+        .unwrap();
         let kp_in = crate::wire::parse_key_package_in(
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -640,10 +663,14 @@ mod tests {
     /// mismatched P-256 pair fails `check_keypair` in `deserialize_state`.
     #[test]
     fn deserialize_state_rejects_mismatched_signer() {
-        let blob = create_group(&credential(ALICE), &SystemClock)
-            .unwrap()
-            .serialize_state()
-            .unwrap();
+        let blob = create_group(
+            &credential(ALICE),
+            &scp_crypto::p256::testing::uncompressed_point_for(&credential(ALICE).did),
+            &SystemClock,
+        )
+        .unwrap()
+        .serialize_state()
+        .unwrap();
         let mut snapshot: MlsGroupSnapshot = rmp_serde::from_slice(&blob).unwrap();
         snapshot.provider_signer.signer_bytes =
             rmp_serde::to_vec_named(&tampered_p256_signer()).unwrap();

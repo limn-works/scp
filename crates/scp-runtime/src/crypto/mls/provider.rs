@@ -711,12 +711,8 @@ impl NodeMlsFactory {
         wrapping_public_key: &[u8; 65],
     ) -> Result<OwnedMlsCryptoState, ContextCreationError> {
         let credential = self.make_credential()?;
-        let mls_group = group::create_group_with_wrapping_key(
-            &credential,
-            Some(wrapping_public_key),
-            self.clock.as_ref(),
-        )
-        .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
+        let mls_group = group::create_group(&credential, wrapping_public_key, self.clock.as_ref())
+            .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
         // Bare (non-`0xFF02`) group as owned material; `fresh_birth` mints the
         // local sender key inline, exactly like the context birth seam.
         Ok(OwnedMlsCryptoState::fresh_birth(mls_group))
@@ -1328,8 +1324,12 @@ mod tests {
             SigningKeyId::Active,
         )
         .unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Serialize the key package to bytes.
         let kp_bytes = bob_kp_bundle
@@ -1364,8 +1364,12 @@ mod tests {
             SigningKeyId::Active,
         )
         .unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -1429,8 +1433,12 @@ mod tests {
         // Add Bob on the actor-owned group.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()

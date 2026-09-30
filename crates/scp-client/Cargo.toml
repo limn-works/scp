@@ -68,6 +68,8 @@ uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]
 scp-did = { path = "../scp-did", features = ["testing"] }
+# Deterministic valid P-256 wrapping keys for test groups and KeyPackages.
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
 # Decodes a snapshot blob to a generic MessagePack value so a test can rewrite

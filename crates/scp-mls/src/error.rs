@@ -100,6 +100,16 @@ pub enum MlsError {
     #[error("extension error: {0}")]
     ExtensionError(String),
 
+    /// A leaf openmls accepted failed SCP admission (spec 09 §9.16.1, spec 10
+    /// §10.8.1(7)); the Commit carrying it is not merged.
+    #[error("leaf admission rejected for {did}: {reason}")]
+    LeafAdmissionRejected {
+        /// The DID the rejected leaf's credential names.
+        did: String,
+        /// Which admission rule the leaf broke.
+        reason: crate::admission::LeafAdmissionRejection,
+    },
+
     /// A member with the given leaf index was not found in the group.
     #[error("member not found at leaf index {0}")]
     MemberNotFound(u32),

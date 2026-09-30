@@ -1159,7 +1159,7 @@ fn resolve_future(
 /// Uses [`generate_key_package_with_context_params`](scp_core::crypto::mls::group::generate_key_package_with_context_params) with `None` so the leaf
 /// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
 /// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` (which declares no SCP capabilities) produces a KP
+/// `generate_key_package` (which declares no `0xFF02` capability) produces a KP
 /// that real MLS rejects from a context group ("the capabilities of the add
 /// proposal are insufficient for this group"). The leaf carries `wrapping_public`
 /// as its `0xFF01` extension: the identity's wrapping public key, whose secret
@@ -1179,14 +1179,11 @@ fn generate_mls_key_package_bytes(
             ))
         })?;
 
-    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(
-        &cred,
-        Some(wrapping_public),
-        &scp_clock::SystemClock,
-    )
-    .map_err(|e| {
-        crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
-    })?;
+    let (kp_bundle, _signer, _provider) =
+        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
+            .map_err(|e| {
+            crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
+        })?;
 
     kp_bundle
         .key_package()

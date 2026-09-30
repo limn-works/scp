@@ -591,8 +591,8 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     use openmls::prelude::BasicCredential;
     use scp_did::SigningKeyId;
     use scp_mls::group::{
-        add_member, add_member_with_convergent_timestamp, create_group,
-        generate_key_package_with_wrapping_key, remove_member,
+        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
+        remove_member,
     };
     use scp_mls::{ScpCredential, SignatureKeyPair};
     use tls_codec::Serialize as TlsSerialize;
@@ -605,7 +605,12 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     let base = SystemClock.now_secs();
     let alice_cred = ScpCredential::new(ALICE_DID.to_owned(), None, SigningKeyId::Active)
         .expect("alice credential");
-    let mut alice_group = create_group(&alice_cred, &SystemClock).expect("Alice's raw MLS group");
+    let mut alice_group = create_group(
+        &alice_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+        &SystemClock,
+    )
+    .expect("Alice's raw MLS group");
 
     let relay = Relay::new();
     let mut bob = relay.new_party(BOB_DID, BOB_OFFSET);
@@ -642,12 +647,8 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     let (carol_wrapping_public, _carol_wrapping_secret) =
         scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
     let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
-        generate_key_package_with_wrapping_key(
-            &carol_cred,
-            Some(&carol_wrapping_public),
-            &SystemClock,
-        )
-        .expect("carol key package");
+        generate_key_package(&carol_cred, &carol_wrapping_public, &SystemClock)
+            .expect("carol key package");
     let carol_kp_in = scp_mls::wire::parse_key_package_in(
         &carol_bundle
             .key_package()

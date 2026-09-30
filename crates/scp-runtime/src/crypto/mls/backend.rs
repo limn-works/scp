@@ -187,7 +187,8 @@ impl std::fmt::Debug for SignerState {
 pub trait MlsBackend: Send + Sync {
     /// Creates a new MLS group with the caller as the sole member.
     ///
-    /// Wraps [`scp_mls::group::create_group_with_wrapping_key`] exactly.
+    /// Wraps [`scp_mls::group::create_group`] exactly: the creator's leaf
+    /// publishes `wrapping_pubkey` as its `0xFF01` (spec 09 §9.16.1).
     ///
     /// # Errors
     ///
@@ -196,7 +197,7 @@ pub trait MlsBackend: Send + Sync {
     async fn create_group(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 65]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<ScpMlsGroup, MlsError>;
 
     /// Adds a member to `group` by their TLS-serialized `KeyPackage` bytes
@@ -260,15 +261,20 @@ pub trait MlsBackend: Send + Sync {
     /// the lower-level alternative to `decrypt` when the caller has already
     /// decomposed the incoming wire bytes (e.g. federation / restore).
     ///
+    /// Returns `(did, key)` for each leaf the Commit replaced with a new
+    /// `scp_wrapping_key`, for the caller's member-key cache; `scp-mls`
+    /// admission checked every added and replaced leaf before the merge.
+    ///
     /// # Errors
     ///
     /// Returns [`MlsError::DecryptionFailed`] for parse / verification
-    /// failures; [`MlsError::CommitProcessingFailed`] if merging fails.
+    /// failures, an admission error for a refused leaf, and
+    /// [`MlsError::CommitProcessingFailed`] if merging fails.
     async fn process_commit(
         &self,
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
-    ) -> Result<(), MlsError>;
+    ) -> Result<Vec<(String, [u8; 65])>, MlsError>;
 
     /// Advances the group epoch via a self-update Commit that republishes
     /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1), the 65-byte
@@ -307,8 +313,8 @@ pub trait MlsBackend: Send + Sync {
         clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
-    /// Generates a fresh `KeyPackage` for `credential`, optionally with an
-    /// `scp_wrapping_key` `LeafNode` extension. Returns the TLS-serialized KP
+    /// Generates a fresh `KeyPackage` for `credential` whose leaf carries
+    /// `wrapping_pubkey` as its `scp_wrapping_key` extension. Returns the TLS-serialized KP
     /// bytes plus an opaque signer-state handle the caller retains to later
     /// join a group from a Welcome addressed to this KP.
     ///
@@ -318,7 +324,7 @@ pub trait MlsBackend: Send + Sync {
     async fn generate_key_package(
         &self,
         credential: &ScpCredential,
-        wrapping_pubkey: Option<&[u8; 65]>,
+        wrapping_pubkey: &[u8; 65],
     ) -> Result<GeneratedKeyPackage, MlsError>;
 
     /// Joins a group from a TLS-serialized MLS Welcome message using the

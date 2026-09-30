@@ -98,6 +98,9 @@ scp-testing = { path = ".", features = ["testing"] }
 # entry above, because no module in this library names the item it gates.
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
 scp-core = { path = "../scp-core", features = ["testing"] }
+# `p256::testing::uncompressed_point_for`, the wrapping public key every MLS
+# group and KeyPackage fixture publishes in its leaf (spec 09 §9.16.1).
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 # The SDK-usability integration test builds relay wire messages directly; the
 # types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
 scp-relay-client = { path = "../scp-relay-client" }

@@ -465,11 +465,16 @@ impl ScpMlsGroup {
 /// The group uses [`SCP_CIPHERSUITE`]
 /// (`MLS_128_DHKEMP256_AES128GCM_SHA256_P256`) and starts at epoch 0.
 /// The creator's identity is embedded in the group via an [`ScpCredential`]
-/// containing their DID and optional UCAN token.
+/// containing their DID and optional UCAN token, and the creator's `LeafNode`
+/// carries the `scp_wrapping_key` extension (`0xFF01`) with `wrapping_pubkey`,
+/// which every leaf of an SCP group must publish (spec 09 §9.16.1,
+/// [`crate::admission`]). No `group_context` extension beyond the required
+/// capabilities is set; a context group uses [`create_group_with_context`].
 ///
 /// # Arguments
 ///
 /// * `credential` - The creator's SCP credential (DID + optional UCAN).
+/// * `wrapping_pubkey` - The creator's 65-byte P-256 wrapping public key.
 /// * `clock` - The injected hardened [`Clock`] used to stamp the creator's own
 ///   `LeafNode` `Lifetime`, so the group leaf's freshness bounds come from the
 ///   SCP-layer clock rather than openmls's internal (wasm: unhardened) one
@@ -486,58 +491,22 @@ impl ScpMlsGroup {
 /// cannot be serialized. Returns [`MlsError::GroupCreationFailed`] if
 /// `OpenMLS` group creation fails.
 ///
-/// See ADR-001 acceptance criterion 1.
+/// See ADR-001 acceptance criterion 1, spec §9.16.1.
 pub fn create_group(
     credential: &ScpCredential,
+    wrapping_pubkey: &[u8; 65],
     clock: &dyn Clock,
 ) -> Result<ScpMlsGroup, MlsError> {
-    create_group_with_wrapping_key(credential, None, clock)
-}
-
-/// Creates a new MLS group with the creator as the sole member, optionally
-/// including an `scp_wrapping_key` `LeafNode` extension.
-///
-/// When `wrapping_pubkey` is `Some`, the creator's `LeafNode` includes the
-/// `scp_wrapping_key` extension with the given 65-byte P-256 public key.
-/// This allows other members to read the wrapping key from the MLS tree
-/// for sender key distribution (§9.16.1).
-///
-/// # Arguments
-///
-/// * `credential` - The creator's SCP credential (DID + optional UCAN).
-/// * `wrapping_pubkey` - Optional 65-byte P-256 public key for the
-///   `scp_wrapping_key` `LeafNode` extension.
-/// * `clock` - The injected hardened [`Clock`] used to stamp the creator's own
-///   `LeafNode` `Lifetime` (ADR-057 §Prereq-1).
-///
-/// # Errors
-///
-/// Returns [`MlsError::CredentialSerializationFailed`] if the credential
-/// cannot be serialized. Returns [`MlsError::GroupCreationFailed`] if
-/// `OpenMLS` group creation fails.
-///
-/// See ADR-001 acceptance criterion 1, spec §9.16.1.
-pub fn create_group_with_wrapping_key(
-    credential: &ScpCredential,
-    wrapping_pubkey: Option<&[u8; 65]>,
-    clock: &dyn Clock,
-) -> Result<ScpMlsGroup, MlsError> {
-    // If a wrapping key is provided, declare the extension type in capabilities
-    // and include the wrapping key in the LeafNode extensions. No group_context
-    // extension for the wrapping-key-only path.
-    let (capabilities, leaf_extensions) = match wrapping_pubkey {
-        Some(pubkey) => {
-            let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
-            let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
-            let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
-                MlsError::GroupCreationFailed(format!("wrapping key extension: {e}"))
-            })?;
-            (Some(caps), Some(leaf_extensions))
-        }
-        None => (None, None),
-    };
-
-    create_group_inner(credential, capabilities, None, leaf_extensions, clock)
+    let ext = crate::wrapping_extension::make_wrapping_key_extension(wrapping_pubkey);
+    let leaf_extensions = Extensions::<LeafNode>::single(ext)
+        .map_err(|e| MlsError::GroupCreationFailed(format!("wrapping key extension: {e}")))?;
+    create_group_inner(
+        credential,
+        crate::wrapping_extension::scp_capabilities_with_wrapping_key(),
+        None,
+        leaf_extensions,
+        clock,
+    )
 }
 
 /// Creates a new MLS group whose `group_context` binds the SCP context
@@ -559,10 +528,6 @@ pub fn create_group_with_wrapping_key(
 /// `OpenMLS` rejects an Add whose leaf does not support every `group_context`
 /// extension (`valn0502`). See the module docs on
 /// [`context_extension`](crate::context_extension).
-///
-/// A context group always has a wrapping key, so `wrapping_pubkey` is required
-/// (unlike [`create_group_with_wrapping_key`], which accepts `None` for the
-/// wrapping-key-only path).
 ///
 /// # Arguments
 ///
@@ -596,28 +561,33 @@ pub fn create_group_with_context(
 
     create_group_inner(
         credential,
-        Some(capabilities),
+        capabilities,
         Some(group_context_extensions),
-        Some(leaf_extensions),
+        leaf_extensions,
         clock,
     )
 }
 
-/// Shared single-member group-creation core for
-/// [`create_group_with_wrapping_key`] and [`create_group_with_context`].
+/// Shared single-member group-creation core for [`create_group`] and
+/// [`create_group_with_context`].
 ///
 /// Builds a fresh in-memory provider and signer, embeds `credential` in the MLS
 /// `BasicCredential`, and creates a one-member group under [`SCP_CIPHERSUITE`].
-/// The optional `capabilities`, `group_context_extensions`, and
+/// `capabilities` and the optional `group_context_extensions` and
 /// `leaf_node_extensions` are attached to the create config. Capabilities are
 /// applied **before** the leaf-node extensions because
 /// `with_leaf_node_extensions` validates each leaf extension type against the
 /// configured capabilities (`OpenMLS` `valn0107`).
+///
+/// Every group's `group_context` carries a `RequiredCapabilities` extension
+/// listing `0xFF01`, so openmls itself refuses a leaf that cannot carry a
+/// wrapping key (`valn0103`, RFC 9420 §11.1). This is defence in depth behind
+/// [`crate::admission`], which requires the key to be present.
 fn create_group_inner(
     credential: &ScpCredential,
-    capabilities: Option<Capabilities>,
+    capabilities: Capabilities,
     group_context_extensions: Option<Extensions<GroupContext>>,
-    leaf_node_extensions: Option<Extensions<LeafNode>>,
+    leaf_node_extensions: Extensions<LeafNode>,
     clock: &dyn Clock,
 ) -> Result<ScpMlsGroup, MlsError> {
     let provider = InMemoryMlsProvider::default();
@@ -671,17 +641,24 @@ fn create_group_inner(
     // Capabilities must be set before the leaf-node extensions: OpenMLS's
     // with_leaf_node_extensions validates each leaf extension type against the
     // configured capabilities (valn0107).
-    if let Some(caps) = capabilities {
-        builder = builder.capabilities(caps);
-    }
-    if let Some(gc_extensions) = group_context_extensions {
-        builder = builder.with_group_context_extensions(gc_extensions);
-    }
-    if let Some(leaf_extensions) = leaf_node_extensions {
-        builder = builder
-            .with_leaf_node_extensions(leaf_extensions)
-            .map_err(|e| MlsError::GroupCreationFailed(format!("leaf node extensions: {e}")))?;
-    }
+    let mut gc_extensions = group_context_extensions.unwrap_or_default();
+    gc_extensions
+        .add(Extension::RequiredCapabilities(
+            RequiredCapabilitiesExtension::new(
+                &[ExtensionType::Unknown(
+                    crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE,
+                )],
+                &[],
+                &[],
+            ),
+        ))
+        .map_err(|e| MlsError::GroupCreationFailed(format!("required capabilities: {e}")))?;
+    builder = builder
+        .capabilities(capabilities)
+        .with_group_context_extensions(gc_extensions);
+    builder = builder
+        .with_leaf_node_extensions(leaf_node_extensions)
+        .map_err(|e| MlsError::GroupCreationFailed(format!("leaf node extensions: {e}")))?;
 
     let group_create_config = builder.build();
 
@@ -722,6 +699,10 @@ pub struct AddMemberResult {
     pub welcome: MlsMessageOut,
     /// Optional group info that may be needed by external parties.
     pub group_info: Option<GroupInfo>,
+    /// The DID the added leaf's credential names.
+    pub admitted_did: String,
+    /// The `0xFF01` wrapping public key the added leaf publishes.
+    pub admitted_wrapping_key: [u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
 }
 
 /// Adds a member to the group using their pre-published `KeyPackage`.
@@ -754,6 +735,10 @@ pub struct AddMemberResult {
 /// Returns [`MlsError::KeyPackageLifetimeInvalid`] if the accepted key package's
 /// `Lifetime` fails validation against the injected clock (expired, not yet
 /// valid, or over-long range).
+/// Returns [`MlsError::InvalidCredential`], [`MlsError::ExtensionError`] or
+/// [`MlsError::LeafAdmissionRejected`] if the leaf fails SCP admission
+/// ([`crate::admission`]): no SCP credential, no or a malformed `0xFF01`, a
+/// `0xFF01` other than the one the DID already publishes, or an 11th leaf.
 /// Returns [`MlsError::MergePendingCommitFailed`] if committing fails.
 ///
 /// See ADR-001 acceptance criterion 2.
@@ -767,12 +752,16 @@ pub fn add_member(
         .validate(group.provider.crypto(), ProtocolVersion::Mls10)
         .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
 
-    // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
-    // internal `Lifetime::is_valid` against openmls's (wasm: unhardened) clock.
-    // Re-validate the accepted `Lifetime` against the injected hardened clock,
-    // and enforce the RFC 9420 maximum-range bound openmls's `validate` never
-    // applies. This is additive hardening — it never replaces openmls's check.
-    validate_key_package_lifetime(verified_key_package.life_time(), clock)?;
+    // SCP admission before openmls sees the add (spec 09 §9.16.1): the
+    // hardened-clock `Lifetime` re-check (ADR-057 §Prereq-1; openmls's
+    // `validate` above used its own clock), the SCP credential, a present and
+    // valid 0xFF01, and the per-DID key-equality and leaf-count rules against
+    // the current tree. The same function runs for bystanders before they merge.
+    let admitted = {
+        let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        let tree = crate::admission::tree_leaves(g)?;
+        crate::admission::admit_added_leaf(&verified_key_package, &tree, &[], clock)?
+    };
 
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
@@ -796,6 +785,8 @@ pub fn add_member(
         commit,
         welcome,
         group_info,
+        admitted_did: admitted.did,
+        admitted_wrapping_key: admitted.wrapping_key,
     })
 }
 
@@ -928,65 +919,6 @@ pub fn key_package_in_did(
     Ok(scp_cred.did)
 }
 
-/// Extracts the `scp_wrapping_key` P-256 public key published in a
-/// fully-validated `KeyPackage`'s leaf extension (§9.16.1).
-///
-/// This is the adder-side counterpart of the recovery
-/// [`decrypt_with_membership_changes`](crate::encrypt::decrypt_with_membership_changes)
-/// performs for bystanders: it lets the member creating an add read the joiner's
-/// stable wrapping public key straight off the wire-delivered `KeyPackage`, so it
-/// can HPKE-seal its own sender key to the new member (ADR-057 sender-key
-/// distribution). Validation is identical to [`key_package_in_did`] — the leaf
-/// signature, key-package signature, protocol version, and (hardened) `Lifetime`
-/// are all checked — so a key package this function reads a wrapping key from is
-/// one [`add_member`] will also accept.
-///
-/// FAIL-CLOSED (ADR-057 INVARIANT 3): a `KeyPackage` whose leaf carries no
-/// `scp_wrapping_key` extension is rejected with [`MlsError::ExtensionError`],
-/// mirroring the pre-merge fail-closed in `decrypt_with_membership_changes`. A
-/// member no peer can HPKE-seal a sender key to must not be admitted.
-///
-/// # Arguments
-///
-/// * `key_package` - The wire-delivered key package to authenticate and read.
-/// * `protocol_version` - The MLS protocol version to validate against.
-/// * `clock` - The injected hardened [`Clock`] the accepted `Lifetime` is
-///   re-validated against (ADR-057 §Prereq-1).
-///
-/// # Errors
-///
-/// Returns [`MlsError::AddMemberFailed`] if the key package fails validation,
-/// [`MlsError::KeyPackageLifetimeInvalid`] if the accepted `Lifetime` fails the
-/// hardened-clock re-validation, or [`MlsError::ExtensionError`] if the leaf
-/// carries no (or a malformed) `scp_wrapping_key` extension.
-pub fn key_package_in_wrapping_key(
-    key_package: &KeyPackageIn,
-    protocol_version: ProtocolVersion,
-    clock: &dyn Clock,
-) -> Result<[u8; 65], MlsError> {
-    let provider = InMemoryMlsProvider::default();
-    let verified = key_package
-        .clone()
-        .validate(provider.crypto(), protocol_version)
-        .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
-
-    // SECURITY (ADR-057 §Prereq-1): mirror the hardened-clock re-validation
-    // `add_member` / `key_package_in_did` perform, so this accepts exactly the
-    // key packages the add path accepts.
-    validate_key_package_lifetime(verified.life_time(), clock)?;
-
-    crate::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())?.ok_or_else(
-        || {
-            MlsError::ExtensionError(
-                "KeyPackage leaf carries no scp_wrapping_key extension; a member no peer \
-                 can HPKE-seal a sender key to must not be admitted (§9.16.1, ADR-057 \
-                 sender-key distribution INVARIANT 3)"
-                    .to_owned(),
-            )
-        },
-    )
-}
-
 /// The result of removing a member from an MLS group.
 ///
 /// Contains the Commit message that must be distributed to remaining members
@@ -1092,14 +1024,20 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 }
 
 /// Generates a `KeyPackage` for a participant, suitable for offline member
-/// addition.
+/// addition to a group created by [`create_group`].
 ///
-/// The `KeyPackage` is signed by the participant's P-256 key and contains
-/// their SCP credential. It uses [`SCP_CIPHERSUITE`].
+/// The `KeyPackage` is signed by the participant's P-256 key, contains their
+/// SCP credential, and uses [`SCP_CIPHERSUITE`]. Its `LeafNode` declares the
+/// `0xFF01` capability and carries the `scp_wrapping_key` extension with
+/// `wrapping_pubkey`, which SCP admission requires of every added leaf
+/// (spec 09 §9.16.1, [`crate::admission`]). A `KeyPackage` for a context group
+/// (one carrying `0xFF02`) comes from
+/// [`generate_key_package_with_context_params`].
 ///
 /// # Arguments
 ///
 /// * `credential` - The participant's SCP credential (DID + optional UCAN).
+/// * `wrapping_pubkey` - The participant's 65-byte P-256 wrapping public key.
 /// * `clock` - The injected hardened [`Clock`] used to stamp the key package's
 ///   `Lifetime` (ADR-057 §Prereq-1), so the published freshness bounds come
 ///   from the SCP-layer clock rather than openmls's internal one.
@@ -1120,53 +1058,41 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 /// generation fails.
 pub fn generate_key_package(
     credential: &ScpCredential,
+    wrapping_pubkey: &[u8; 65],
     clock: &dyn Clock,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
-    generate_key_package_with_wrapping_key(credential, None, clock)
+    generate_key_package_inner(
+        credential,
+        crate::wrapping_extension::scp_capabilities_with_wrapping_key(),
+        Some(wrapping_leaf_extensions(wrapping_pubkey)?),
+        clock,
+    )
 }
 
-/// Generates a `KeyPackage` with an optional `scp_wrapping_key` `LeafNode`
-/// extension.
-///
-/// When `wrapping_pubkey` is `Some`, the generated `KeyPackage`'s `LeafNode`
-/// includes the `scp_wrapping_key` extension with the given 65-byte P-256
-/// public key. This publishes the wrapping key so that other members can
-/// read it from the MLS tree for sender key distribution (§9.16.1).
-///
-/// # Arguments
-///
-/// * `credential` - The participant's SCP credential (DID + optional UCAN).
-/// * `wrapping_pubkey` - Optional 65-byte P-256 public key for the
-///   `scp_wrapping_key` `LeafNode` extension.
-/// * `clock` - The injected hardened [`Clock`] used to stamp the key package's
-///   `Lifetime` (ADR-057 §Prereq-1).
+/// A `KeyPackage` whose leaf declares `0xFF01` but carries no wrapping key:
+/// the shape SCP admission must refuse, for tests of that refusal here and in
+/// the drivers that call admission.
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::CredentialSerializationFailed`] if the credential
-/// cannot be serialized.
-/// Returns [`MlsError::KeyPackageGenerationFailed`] if key package
-/// generation fails.
-pub fn generate_key_package_with_wrapping_key(
+/// [`MlsError`] on any openmls key-package failure.
+#[cfg(any(test, feature = "testing"))]
+pub fn generate_key_package_without_wrapping_key(
     credential: &ScpCredential,
-    wrapping_pubkey: Option<&[u8; 65]>,
     clock: &dyn Clock,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
-    // Wrapping-key-only path: declare only the 0xFF01 extension type and carry
-    // the wrapping key in the LeafNode when a key is provided.
-    let (capabilities, leaf_extensions) = match wrapping_pubkey {
-        Some(pubkey) => {
-            let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
-            let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
-            let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
-                MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
-            })?;
-            (Some(caps), Some(leaf_extensions))
-        }
-        None => (None, None),
-    };
+    generate_key_package_inner(
+        credential,
+        crate::context_extension::scp_capabilities_with_context_params(),
+        None,
+        clock,
+    )
+}
 
-    generate_key_package_inner(credential, capabilities, leaf_extensions, clock)
+fn wrapping_leaf_extensions(wrapping_pubkey: &[u8; 65]) -> Result<Extensions<LeafNode>, MlsError> {
+    let ext = crate::wrapping_extension::make_wrapping_key_extension(wrapping_pubkey);
+    Extensions::<LeafNode>::single(ext)
+        .map_err(|e| MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}")))
 }
 
 /// Generates a `KeyPackage` for joining an SCP **context** group (one whose
@@ -1176,14 +1102,14 @@ pub fn generate_key_package_with_wrapping_key(
 /// for **both** SCP extension types (`0xFF01` + `0xFF02`) via
 /// [`scp_capabilities_with_context_params`](crate::context_extension::scp_capabilities_with_context_params).
 /// It carries the `scp_wrapping_key` (`0xFF01`) `LeafNode` extension with the
-/// participant's wrapping public key **only when `wrapping_pubkey` is `Some`**.
+/// participant's wrapping public key.
 ///
 /// The `0xFF02` capability declaration is **required** to join a context group:
 /// `OpenMLS` rejects an Add proposal (RFC 9420 §12.1.8.2, `valn0502`) unless the
 /// joiner's leaf supports every extension present in the group's `group_context`
 /// — including the `scp_context_params` extension. A `KeyPackage` produced by
-/// [`generate_key_package_with_wrapping_key`] (which declares only `0xFF01`, or
-/// nothing at all when no key is given) therefore cannot be added to a context
+/// [`generate_key_package`] (which declares only `0xFF01`)
+/// therefore cannot be added to a context
 /// group; use this function instead for **any** `KeyPackage` destined for an
 /// encrypted (`0xFF02`) context.
 ///
@@ -1191,23 +1117,14 @@ pub fn generate_key_package_with_wrapping_key(
 ///
 /// The `0xFF02` *capability* — a support declaration in the leaf's
 /// [`Capabilities`] — is what `valn0502` checks, and it requires **no** key
-/// material. The `0xFF01` *leaf extension* — the actual 32-byte wrapping public
-/// key — is a separate, optional §9.16.1 enhancement that lets other members
-/// HPKE-seal sender keys to this member (`add_member` reads it from the leaf via
-/// `extract_wrapping_key`; distribution to a member with no published wrapping
-/// key is simply skipped). A member with `wrapping_pubkey == None` is therefore
-/// still fully **context-joinable** — it just receives no sender keys until it
-/// publishes a wrapping key. Declaring the `0xFF01` capability while omitting the
-/// `0xFF01` leaf extension is valid: `valn0107` only constrains the reverse
-/// (a present leaf extension must be declared in capabilities).
+/// material. The `0xFF01` *leaf extension* — the 65-byte wrapping public key —
+/// is what lets other members HPKE-seal sender keys to this member (§9.16.1),
+/// and SCP admission ([`crate::admission`]) refuses any added leaf without it.
 ///
 /// # Arguments
 ///
 /// * `credential` - The participant's SCP credential (DID + optional UCAN).
-/// * `wrapping_pubkey` - The participant's 65-byte P-256 wrapping public key,
-///   or `None` when the identity has not published one. In both cases the KP is
-///   context-joinable (declares `0xFF02`); the leaf wrapping-key extension is
-///   attached only in the `Some` case.
+/// * `wrapping_pubkey` - The participant's 65-byte P-256 wrapping public key.
 /// * `clock` - The injected hardened [`Clock`] used to stamp the `KeyPackage`
 ///   `Lifetime` (ADR-057 §Prereq-1).
 ///
@@ -1220,29 +1137,20 @@ pub fn generate_key_package_with_wrapping_key(
 /// See spec §5.13.3, §9.16.1.
 pub fn generate_key_package_with_context_params(
     credential: &ScpCredential,
-    wrapping_pubkey: Option<&[u8; 65]>,
+    wrapping_pubkey: &[u8; 65],
     clock: &dyn Clock,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
-    // Always declare BOTH 0xFF01 + 0xFF02 capabilities: this KP is
-    // context-joinable by construction, satisfying valn0502 regardless of
-    // whether a wrapping key is available.
-    let capabilities = crate::context_extension::scp_capabilities_with_context_params();
-    // Carry the 0xFF01 wrapping-key LEAF extension only when a key is present.
-    let leaf_extensions = match wrapping_pubkey {
-        Some(pubkey) => {
-            let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
-            Some(Extensions::<LeafNode>::single(ext).map_err(|e| {
-                MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
-            })?)
-        }
-        None => None,
-    };
-
-    generate_key_package_inner(credential, Some(capabilities), leaf_extensions, clock)
+    // Declare BOTH 0xFF01 + 0xFF02 capabilities so the KP satisfies valn0502
+    // for a context group, and carry the 0xFF01 leaf extension.
+    generate_key_package_inner(
+        credential,
+        crate::context_extension::scp_capabilities_with_context_params(),
+        Some(wrapping_leaf_extensions(wrapping_pubkey)?),
+        clock,
+    )
 }
 
-/// Shared `KeyPackage` generation core for
-/// [`generate_key_package_with_wrapping_key`] and
+/// Shared `KeyPackage` generation core for [`generate_key_package`] and
 /// [`generate_key_package_with_context_params`].
 ///
 /// Builds a fresh in-memory provider and signer, embeds `credential`, and
@@ -1250,7 +1158,7 @@ pub fn generate_key_package_with_context_params(
 /// optional leaf capabilities and leaf-node extensions.
 fn generate_key_package_inner(
     credential: &ScpCredential,
-    capabilities: Option<Capabilities>,
+    capabilities: Capabilities,
     leaf_node_extensions: Option<Extensions<LeafNode>>,
     clock: &dyn Clock,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
@@ -1270,11 +1178,8 @@ fn generate_key_package_inner(
         signature_key: signer.to_public_vec().into(),
     };
 
-    let mut builder = KeyPackage::builder();
+    let mut builder = KeyPackage::builder().leaf_node_capabilities(capabilities);
 
-    if let Some(caps) = capabilities {
-        builder = builder.leaf_node_capabilities(caps);
-    }
     if let Some(leaf_extensions) = leaf_node_extensions {
         builder = builder.leaf_node_extensions(leaf_extensions);
     }
@@ -1437,7 +1342,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn derive_pseudonym_matches_direct_private_seed_derivation() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let context_id = b"ctx-derive-pseudonym-crosscheck";
         let via_method = group.derive_pseudonym(context_id).unwrap();
@@ -1476,7 +1386,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn derive_pseudonym_is_stable_across_serialize_restore() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let context_id = b"ctx-derive-pseudonym-restore";
         let before = group.derive_pseudonym(context_id).unwrap();
 
@@ -1497,14 +1412,22 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn derive_pseudonym_distinct_per_group() {
         let context_id = b"ctx-derive-pseudonym-distinct";
-        let a = create_group(&test_credential("alice"), &SystemClock)
-            .unwrap()
-            .derive_pseudonym(context_id)
-            .unwrap();
-        let b = create_group(&test_credential("bob"), &SystemClock)
-            .unwrap()
-            .derive_pseudonym(context_id)
-            .unwrap();
+        let a = create_group(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("alice").did),
+            &SystemClock,
+        )
+        .unwrap()
+        .derive_pseudonym(context_id)
+        .unwrap();
+        let b = create_group(
+            &test_credential("bob"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("bob").did),
+            &SystemClock,
+        )
+        .unwrap()
+        .derive_pseudonym(context_id)
+        .unwrap();
         assert_ne!(a, b, "distinct MLS keys derive distinct pseudonyms");
     }
 
@@ -1513,7 +1436,12 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn derive_pseudonym_on_destroyed_group_fails_closed() {
-        let mut group = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        let mut group = create_group(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("alice").did),
+            &SystemClock,
+        )
+        .unwrap();
         destroy_group(&mut group).unwrap();
         assert!(matches!(
             group.derive_pseudonym(b"ctx"),
@@ -1656,7 +1584,11 @@ mod tests {
     /// Takes a freshly created group apart into the parts `from_parts` takes.
     fn created_parts()
     -> Result<(MlsGroup, InMemoryMlsProvider, SignatureKeyPair), Box<dyn std::error::Error>> {
-        let mut created = create_group(&test_credential("alice"), &SystemClock)?;
+        let mut created = create_group(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("alice").did),
+            &SystemClock,
+        )?;
         let signer = created.signer.take().ok_or("created group has no signer")?;
         let group = created
             .group
@@ -1732,8 +1664,11 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     fn join_turns_an_openmls_panic_into_an_error() -> Result<(), Box<dyn std::error::Error>> {
-        let (bundle, signer, provider) =
-            generate_key_package(&test_credential("bob"), &SystemClock)?;
+        let (bundle, signer, provider) = generate_key_package(
+            &test_credential("bob"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("bob").did),
+            &SystemClock,
+        )?;
         let welcome = hostile_welcome(bundle.key_package(), &provider)?;
         let result = join_group_from_bytes(&welcome, provider, signer);
         assert!(
@@ -1764,7 +1699,11 @@ mod tests {
     /// signature key is a 65-byte uncompressed P-256 point.
     #[test]
     fn create_group_signs_with_p256_leaf_key() -> Result<(), Box<dyn std::error::Error>> {
-        let group = create_group(&test_credential("alice"), &SystemClock)?;
+        let group = create_group(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("alice").did),
+            &SystemClock,
+        )?;
         let signer = group.signer_key_pair()?;
         assert_eq!(
             signer.signature_scheme(),
@@ -1781,7 +1720,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn create_group_returns_group_with_one_member() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let members = group.members().unwrap();
         assert_eq!(members.len(), 1, "group should have exactly one member");
@@ -1794,7 +1738,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn create_group_uses_scp_ciphersuite() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let inner = group.inner().unwrap();
         assert_eq!(
@@ -1808,7 +1757,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn create_group_embeds_scp_credential() {
         let cred = test_credential("alice");
-        let group = create_group(&cred, &SystemClock).unwrap();
+        let group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let members = group.members().unwrap();
         assert_eq!(members.len(), 1);
@@ -1824,11 +1778,20 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn add_member_returns_welcome_and_commit() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
         let result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
@@ -1856,11 +1819,20 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn add_member_welcome_allows_joining() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
         let result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
@@ -1883,12 +1855,21 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn remove_member_advances_epoch() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Add Bob.
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
         let _add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
@@ -1925,7 +1906,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn destroy_group_prevents_further_operations() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred, &SystemClock).unwrap();
+        let mut group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         destroy_group(&mut group).unwrap();
 
@@ -1944,7 +1930,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn destroy_group_releases_crypto_state() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred, &SystemClock).unwrap();
+        let mut group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // Before destroy: group and signer are Some.
         assert!(group.group.is_some());
@@ -1967,12 +1958,21 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn destroy_group_then_add_member_fails() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred, &SystemClock).unwrap();
+        let mut group = create_group(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         destroy_group(&mut group).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _signer, _provider) =
-            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let (bob_kp_bundle, _signer, _provider) = generate_key_package(
+            &bob_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let result = add_member(&mut group, bob_kp, &SystemClock);
@@ -1983,7 +1983,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn generate_key_package_produces_valid_package() {
         let cred = test_credential("bob");
-        let (kp_bundle, _signer, _provider) = generate_key_package(&cred, &SystemClock).unwrap();
+        let (kp_bundle, _signer, _provider) = generate_key_package(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
 
         // The key package should use the SCP ciphersuite.
         assert_eq!(
@@ -2005,7 +2010,12 @@ mod tests {
             scp_did::SigningKeyId::Active,
         )
         .unwrap();
-        let (kp_bundle, _signer, _provider) = generate_key_package(&cred, &SystemClock).unwrap();
+        let (kp_bundle, _signer, _provider) = generate_key_package(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &SystemClock,
+        )
+        .unwrap();
         let kp_in: KeyPackageIn = kp_bundle.key_package().clone().into();
 
         let did = key_package_in_did(&kp_in, ProtocolVersion::Mls10, &SystemClock).unwrap();
@@ -2030,7 +2040,12 @@ mod tests {
         let now = SystemClock.now_secs();
         let clock = scp_clock::TestClock::new(now);
         let cred = test_credential("alice");
-        let (bundle, _s, _p) = generate_key_package(&cred, &clock).unwrap();
+        let (bundle, _s, _p) = generate_key_package(
+            &cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
+            &clock,
+        )
+        .unwrap();
         let lt = bundle.key_package().life_time();
         assert_eq!(
             lt.not_before(),
@@ -2055,7 +2070,12 @@ mod tests {
         let real_now = SystemClock.now_secs();
         let injected = real_now + 900;
         let clock = scp_clock::TestClock::new(injected);
-        let (bundle, _s, _p) = generate_key_package(&test_credential("bob"), &clock).unwrap();
+        let (bundle, _s, _p) = generate_key_package(
+            &test_credential("bob"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("bob").did),
+            &clock,
+        )
+        .unwrap();
         let lt = bundle.key_package().life_time();
         assert_eq!(lt.not_before(), injected - KEY_PACKAGE_LIFETIME_MARGIN_SECS);
         assert_eq!(lt.not_after(), injected + KEY_PACKAGE_LIFETIME_SECS);
@@ -2077,7 +2097,12 @@ mod tests {
         // like the own leaf — a joined `MlsGroup` exposes no public way to reach.)
         let now = SystemClock.now_secs();
         let clock = scp_clock::TestClock::new(now);
-        let group = create_group(&test_credential("carol"), &clock).unwrap();
+        let group = create_group(
+            &test_credential("carol"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("carol").did),
+            &clock,
+        )
+        .unwrap();
         assert_eq!(group.members().unwrap().len(), 1);
         assert_eq!(group.epoch().unwrap(), 0);
     }
@@ -2090,11 +2115,20 @@ mod tests {
         // even though openmls's own internal validate (real clock) accepts it.
         // The SCP-layer check is authoritative and the group epoch is unchanged.
         let real_now = SystemClock.now_secs();
-        let mut alice = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        let mut alice = create_group(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("alice").did),
+            &SystemClock,
+        )
+        .unwrap();
         let epoch_before = alice.epoch().unwrap();
 
-        let (bob_bundle, _s, _p) =
-            generate_key_package(&test_credential("bob"), &SystemClock).unwrap();
+        let (bob_bundle, _s, _p) = generate_key_package(
+            &test_credential("bob"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("bob").did),
+            &SystemClock,
+        )
+        .unwrap();
         let bob_kp: KeyPackageIn = bob_bundle.key_package().clone().into();
 
         let hundred_days = 100 * 24 * 60 * 60;
@@ -2114,8 +2148,12 @@ mod tests {
         );
 
         // With the clock at real-now, an equivalent fresh KP is accepted.
-        let (carol_bundle, _cs, _cp) =
-            generate_key_package(&test_credential("carol"), &SystemClock).unwrap();
+        let (carol_bundle, _cs, _cp) = generate_key_package(
+            &test_credential("carol"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("carol").did),
+            &SystemClock,
+        )
+        .unwrap();
         let carol_kp: KeyPackageIn = carol_bundle.key_package().clone().into();
         add_member(&mut alice, carol_kp, &SystemClock).unwrap();
         assert_eq!(
@@ -2129,8 +2167,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn key_package_in_did_rejects_expired_against_injected_clock() {
         let real_now = SystemClock.now_secs();
-        let (bundle, _s, _p) =
-            generate_key_package(&test_credential("carol"), &SystemClock).unwrap();
+        let (bundle, _s, _p) = generate_key_package(
+            &test_credential("carol"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("carol").did),
+            &SystemClock,
+        )
+        .unwrap();
         let kp_in: KeyPackageIn = bundle.key_package().clone().into();
 
         let hundred_days = 100 * 24 * 60 * 60;
@@ -2182,7 +2224,12 @@ mod tests {
             "openmls validate should accept the over-long-but-temporally-valid KP"
         );
 
-        let mut alice = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        let mut alice = create_group(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::uncompressed_point_for(&test_credential("alice").did),
+            &SystemClock,
+        )
+        .unwrap();
         let err = add_member(&mut alice, kp_in, &SystemClock)
             .err()
             .expect("add_member must reject an over-long-range KP");

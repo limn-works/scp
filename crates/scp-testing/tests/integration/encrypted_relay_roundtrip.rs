@@ -135,7 +135,12 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let alice_cred =
         ScpCredential::new(alice_id.did.clone(), None, scp_did::SigningKeyId::Active).unwrap();
-    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
+    let mut alice_group = create_group(
+        &alice_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     // ---------------------------------------------------------------
     // Step 4: Alice generates a sender key and publishes epoch advance (ADR-007)
@@ -166,8 +171,12 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let bob_cred =
         ScpCredential::new(bob_id.did.clone(), None, scp_did::SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(
+        &bob_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
 
     // ---------------------------------------------------------------
     // Step 6: Alice adds Bob to the group using his key package (ADR-001)

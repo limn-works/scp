@@ -47,7 +47,7 @@ inject test doubles:
   failure-driven mocks via `NodeMlsFactory::with_backends`.
 - **`ProductionMlsBackend`** (`production_backend.rs`) — a stateless struct
   that delegates each primitive to the `scp_mls` crate's `group` / `encrypt` /
-  `ratchet` free functions (e.g. `scp_mls::group::create_group_with_wrapping_key`).
+  `ratchet` free functions (e.g. `scp_mls::group::create_group`).
   It wraps those calls exactly, so the async bridge does not perturb the wire
   bytes the sync state machine produces.
 - **`MlsBackend`** (`backend.rs`) / **`HpkeBackend`** (`../hpke_backend.rs`)

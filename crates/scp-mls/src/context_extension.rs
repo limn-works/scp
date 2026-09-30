@@ -322,9 +322,7 @@ mod tests {
     fn wrapping_only_group_has_no_context_extension() {
         let cred = test_credential("alice");
         let wrapping_key = scp_crypto::p256::testing::valid_uncompressed_point(0xAA);
-        let group =
-            crate::group::create_group_with_wrapping_key(&cred, Some(&wrapping_key), &SystemClock)
-                .unwrap();
+        let group = crate::group::create_group(&cred, &wrapping_key, &SystemClock).unwrap();
 
         let read_back = group.group_context_extension().unwrap();
         assert_eq!(
@@ -355,12 +353,7 @@ mod tests {
         let bob_cred = test_credential("bob");
         let bob_wrapping = scp_crypto::p256::testing::valid_uncompressed_point(0xBB);
         let (bob_kp, _bob_signer, _bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_wrapping),
-                &SystemClock,
-            )
-            .unwrap();
+            crate::group::generate_key_package(&bob_cred, &bob_wrapping, &SystemClock).unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
         match crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock) {
@@ -372,67 +365,35 @@ mod tests {
         }
     }
 
-    /// The leaf-level invariant behind the reserve / plain-join fix: a
-    /// `KeyPackage` from
+    /// A `KeyPackage` from
     /// [`generate_key_package_with_context_params`](crate::group::generate_key_package_with_context_params)
-    /// declares the `0xFF02` (`scp_context_params`) capability in BOTH the
-    /// `Some` and `None` wrapping-key cases — that capability is what `valn0502`
-    /// checks and what makes the KP addable to an encrypted context group. The
-    /// `0xFF01` wrapping-key LEAF extension is present only in the `Some` case;
-    /// declaring the `0xFF01` capability without carrying the leaf extension is
-    /// valid (`valn0107` constrains only the reverse).
+    /// declares both the `0xFF02` (`scp_context_params`) capability, which
+    /// `valn0502` checks when the KP is added to a context group, and the
+    /// `0xFF01` capability, and carries the `0xFF01` wrapping-key leaf
+    /// extension that admission requires (spec 09 §9.16.1).
     #[test]
-    fn context_params_key_package_declares_0xff02_capability_with_and_without_wrapping_key() {
-        // None: context-capable, but no wrapping-key leaf extension.
-        let cred_none = test_credential("kp-caps-none");
-        let (kp_none, _s, _p) =
-            crate::group::generate_key_package_with_context_params(&cred_none, None, &SystemClock)
-                .unwrap();
-        let caps_none = kp_none.key_package().leaf_node().capabilities();
-        assert!(
-            caps_none
-                .extensions()
-                .contains(&ExtensionType::Unknown(SCP_CONTEXT_EXTENSION_TYPE_ID)),
-            "a wrapping-key-less context KP MUST declare the 0xFF02 capability (valn0502)"
-        );
-        assert!(
-            caps_none
-                .extensions()
-                .contains(&ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE)),
-            "the context KP declares the 0xFF01 capability unconditionally"
-        );
-        assert_eq!(
-            crate::wrapping_extension::extract_wrapping_key(
-                kp_none.key_package().leaf_node().extensions()
-            )
-            .unwrap(),
-            None,
-            "the None case carries NO 0xFF01 wrapping-key leaf extension"
-        );
-
-        // Some: context-capable AND carries the wrapping-key leaf extension.
-        let cred_some = test_credential("kp-caps-some");
+    fn context_params_key_package_declares_both_capabilities_and_carries_wrapping_key() {
+        let cred = test_credential("kp-caps");
         let wrapping = scp_crypto::p256::testing::valid_uncompressed_point(0x5A);
-        let (kp_some, _s2, _p2) = crate::group::generate_key_package_with_context_params(
-            &cred_some,
-            Some(&wrapping),
-            &SystemClock,
-        )
-        .unwrap();
-        let caps_some = kp_some.key_package().leaf_node().capabilities();
-        assert!(
-            caps_some
-                .extensions()
-                .contains(&ExtensionType::Unknown(SCP_CONTEXT_EXTENSION_TYPE_ID)),
-            "the wrapping-key context KP also declares the 0xFF02 capability"
-        );
+        let (kp, _s, _p) =
+            crate::group::generate_key_package_with_context_params(&cred, &wrapping, &SystemClock)
+                .unwrap();
+        let caps = kp.key_package().leaf_node().capabilities();
+        for ext in [
+            SCP_CONTEXT_EXTENSION_TYPE_ID,
+            SCP_WRAPPING_KEY_EXTENSION_TYPE,
+        ] {
+            assert!(
+                caps.extensions().contains(&ExtensionType::Unknown(ext)),
+                "the context KP must declare the {ext:#06x} capability"
+            );
+        }
         assert_eq!(
             crate::wrapping_extension::extract_wrapping_key(
-                kp_some.key_package().leaf_node().extensions()
+                kp.key_package().leaf_node().extensions()
             )
             .unwrap(),
             Some(wrapping),
-            "the Some case carries the 0xFF01 wrapping-key leaf extension"
         );
     }
 
@@ -462,7 +423,7 @@ mod tests {
         let (bob_kp, bob_signer, bob_provider) =
             crate::group::generate_key_package_with_context_params(
                 &bob_cred,
-                Some(&bob_wrapping),
+                &bob_wrapping,
                 &SystemClock,
             )
             .unwrap();
@@ -522,7 +483,7 @@ mod tests {
         let (bob_kp, bob_signer, bob_provider) =
             crate::group::generate_key_package_with_context_params(
                 &bob_cred,
-                Some(&bob_wrapping),
+                &bob_wrapping,
                 &SystemClock,
             )
             .unwrap();
@@ -537,7 +498,7 @@ mod tests {
         let (carol_kp, _carol_signer, _carol_provider) =
             crate::group::generate_key_package_with_context_params(
                 &carol_cred,
-                Some(&carol_wrapping),
+                &carol_wrapping,
                 &SystemClock,
             )
             .unwrap();
@@ -548,7 +509,13 @@ mod tests {
         // Bob processes the Carol-add commit to advance to epoch 2.
         let commit_bytes = crate::ratchet::serialize_mls_message(&add_carol.commit).unwrap();
         let mut grace_store = crate::epoch_grace::EpochGraceStore::new();
-        crate::ratchet::process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        crate::ratchet::process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        )
+        .unwrap();
 
         assert_eq!(
             alice_group.epoch().unwrap(),

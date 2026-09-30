@@ -619,6 +619,17 @@ pub mod testing {
         };
         key.public_key().to_uncompressed()
     }
+
+    /// A valid 65-byte uncompressed P-256 point derived from `label`, so each
+    /// test identity (a DID) gets its own stable wire key and two fixtures
+    /// naming the same identity get the same one.
+    #[must_use]
+    pub fn uncompressed_point_for(label: &str) -> [u8; UNCOMPRESSED_POINT_LEN] {
+        let Ok(key) = P256SigningKey::from_seed(label.as_bytes(), &[0x5a; 32]) else {
+            unreachable!("a fixed 32-byte seed derives a valid P-256 scalar");
+        };
+        key.public_key().to_uncompressed()
+    }
 }
 
 #[cfg(test)]

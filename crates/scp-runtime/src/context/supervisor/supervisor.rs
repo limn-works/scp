@@ -17398,7 +17398,10 @@ mod tests {
         )
         .expect("valid credential");
         let generated = backend
-            .generate_key_package(&joiner, None)
+            .generate_key_package(
+                &joiner,
+                &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
+            )
             .await
             .expect("generate kp");
 
@@ -17410,7 +17413,10 @@ mod tests {
         )
         .expect("valid inviter credential");
         let mut group = backend
-            .create_group(&inviter, None)
+            .create_group(
+                &inviter,
+                &scp_crypto::p256::testing::uncompressed_point_for(&inviter.did),
+            )
             .await
             .expect("create group");
         let added = backend

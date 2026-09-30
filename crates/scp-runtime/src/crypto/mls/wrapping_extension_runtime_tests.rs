@@ -221,20 +221,19 @@ fn sender_keys_wrapping_stable_001() {
 
     // 3. Create group with wrapping key -> LeafNode contains extension.
     let cred = test_credential("conformance");
-    let group = scp_mls::group::create_group_with_wrapping_key(
-        &cred,
-        Some(&pub_key),
-        &scp_clock::SystemClock,
-    )
-    .unwrap();
+    let group = scp_mls::group::create_group(&cred, &pub_key, &scp_clock::SystemClock).unwrap();
     let extracted = extract_own_wrapping_key(&group).unwrap();
     assert_eq!(extracted, Some(pub_key), "wrapping key in LeafNode");
 
     // 4. Extension survives as the same value across MLS Updates when
     //    the wrapping key is explicitly preserved.
     let bob_cred = test_credential("bob");
-    let (bob_kp, _bob_signer, _bob_provider) =
-        scp_mls::group::generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
+    let (bob_kp, _bob_signer, _bob_provider) = scp_mls::group::generate_key_package(
+        &bob_cred,
+        &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
     let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
     let mut group_mut = group;

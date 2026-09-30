@@ -5020,6 +5020,7 @@ dependencies = [
  "openmls_traits",
  "scp-clock",
  "scp-core",
+ "scp-crypto",
  "scp-did",
  "scp-identity",
  "serde",

@@ -26,13 +26,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use openmls::prelude::{KeyPackageBundle, MlsMessageOut, ProtocolVersion};
+use openmls::prelude::{KeyPackageBundle, MlsMessageOut};
 use scp_clock::Clock;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
-    add_member_with_convergent_timestamp, create_group_with_wrapping_key, destroy_group,
-    generate_key_package_with_wrapping_key, join_group_from_bytes, key_package_in_did,
-    key_package_in_wrapping_key,
+    add_member_with_convergent_timestamp, create_group, destroy_group, generate_key_package,
+    join_group_from_bytes,
 };
 use scp_mls::{
     InMemoryMlsProvider, MlsError, ScpCredential, SignatureKeyPair, restore_pending_join,
@@ -422,11 +421,7 @@ impl ScpClient {
         // leaf `Lifetime` is stamped from the hardened driver clock.
         // The secret arrives in `Zeroizing` and moves into the crypto state.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
-        let mls_group = create_group_with_wrapping_key(
-            &credential,
-            Some(&wrapping_public),
-            self.clock.as_ref(),
-        )?;
+        let mls_group = create_group(&credential, &wrapping_public, self.clock.as_ref())?;
         let crypto = ContextCryptoState::from_group_with_wrapping(
             context_id,
             mls_group,
@@ -490,11 +485,7 @@ impl ScpClient {
         // zeroizes on drop) and the retained `PendingJoin` takes it.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
         let (bundle, signer, provider): (KeyPackageBundle, _, InMemoryMlsProvider) =
-            generate_key_package_with_wrapping_key(
-                &credential,
-                Some(&wrapping_public),
-                self.clock.as_ref(),
-            )?;
+            generate_key_package(&credential, &wrapping_public, self.clock.as_ref())?;
 
         let kp_bytes = bundle
             .key_package()
@@ -568,26 +559,17 @@ impl ScpClient {
         context_id: &str,
         key_package_bytes: &[u8],
     ) -> Result<AddMemberOutput, ClientError> {
-        // ADR-057 §Prereq-1: validate the joiner's KeyPackage `Lifetime` against
-        // the hardened driver clock. Captured as an `Arc` clone before the
+        // ADR-057 §Prereq-1: `scp-mls` admission validates the joiner's
+        // KeyPackage `Lifetime` against the hardened driver clock. Captured as
+        // an `Arc` clone before the
         // `state` mutable borrow below, so the clock reference and the mutable
         // context borrow do not alias `self` simultaneously.
         let clock = Arc::clone(&self.clock);
-        let new_member_did = key_package_member_did(key_package_bytes, clock.as_ref())?;
         let timestamp = self.clock.now_secs();
         let committer_did = self.signer.did().to_owned();
 
         let key_package_in = scp_mls::wire::parse_key_package_in(key_package_bytes)
             .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
-
-        // ADR-057 §9.16.1: read the joiner's published stable wrapping key from the
-        // SAME validated KeyPackage the add consumes, so the adder can HPKE-seal
-        // its sender key to the joiner. Fail-closed if the leaf carries no wrapping
-        // extension (INVARIANT 3): a member no peer can seal to must not be
-        // admitted. Read BEFORE the `state` mutable borrow (a fresh-provider
-        // validation that does not touch `self`).
-        let new_member_wrapping_key =
-            key_package_in_wrapping_key(&key_package_in, ProtocolVersion::Mls10, clock.as_ref())?;
 
         let state = self.context_mut(context_id)?;
 
@@ -606,7 +588,12 @@ impl ScpClient {
         let commit = serialize_message(&result.commit)?;
         let welcome = serialize_message(&result.welcome)?;
 
-        state.add_member_record(&new_member_did, new_member_wrapping_key);
+        // The joiner's DID and wrapping key come from the leaf `scp-mls`
+        // admitted (spec 09 §9.16.1): its credential and a present, valid
+        // `0xFF01` that matches any key the DID already publishes in the tree.
+        let new_member_did = result.admitted_did;
+        let new_member_wrapping_key = result.admitted_wrapping_key;
+        state.admit_member_record(&new_member_did, new_member_wrapping_key)?;
         state.append_log_event(
             EventType::MemberJoined,
             &committer_did,
@@ -795,9 +782,9 @@ impl ScpClient {
         // (bystander→joiner) do NOT share this gap: they read the wrapping key from
         // a validated KeyPackage / Add proposal.
         for (member_did, member_wrapping_key) in wrapping_keys {
-            state.add_member_record(member_did, *member_wrapping_key);
+            state.admit_member_record(member_did, *member_wrapping_key)?;
         }
-        state.add_member_record(&self_did, wrapping_public);
+        state.admit_member_record(&self_did, wrapping_public)?;
 
         // ADR-057 sender-key distribution: the joiner HPKE-seals its own sender key
         // to every existing member (the directory minus self), so they can decrypt
@@ -1413,8 +1400,15 @@ impl ScpClient {
                 sender_did: committer_did,
                 added_dids,
                 added_wrapping_keys,
+                wrapping_key_updates,
                 committer_timestamp_secs,
             } => {
+                // A member's own Update may publish a new wrapping key; `scp-mls`
+                // admitted it (same DID, valid key) before merging. Only these
+                // updates change a recorded key; an Add never does.
+                for (member_did, wrapping_key) in &wrapping_key_updates {
+                    state.refresh_member_wrapping_key(member_did, *wrapping_key)?;
+                }
                 // A no-add Commit (e.g. a self-update) has `committer_timestamp_secs
                 // == None` and empty `added_dids` by construction: it advanced the
                 // MLS epoch inside `scp-mls` but stamps no membership leaf and
@@ -1448,7 +1442,7 @@ impl ScpClient {
                             Vec::new(),
                             timestamp,
                         )?;
-                        state.add_member_record(added_did, *added_wrapping_key);
+                        state.admit_member_record(added_did, *added_wrapping_key)?;
                         sender_key_distributions.push(state.crypto.seal_sender_key_distribution(
                             &self_did,
                             added_did,
@@ -2063,24 +2057,6 @@ fn serialize_message(message: &MlsMessageOut) -> Result<Vec<u8>, ClientError> {
         .map_err(|e| ClientError::Codec(format!("serializing MLS message: {e}")))
 }
 
-/// Recovers the SCP DID embedded in a serialized key package's leaf credential.
-///
-/// The driver names the new member by reading their credential out of the key
-/// package, rather than trusting a separately-supplied DID, so the membership
-/// record and the MLS leaf cannot disagree.
-fn key_package_member_did(
-    key_package_bytes: &[u8],
-    clock: &dyn Clock,
-) -> Result<String, ClientError> {
-    let key_package_in = scp_mls::wire::parse_key_package_in(key_package_bytes)
-        .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
-    // ADR-057 §Prereq-1: `key_package_in_did` re-validates the accepted
-    // `Lifetime` against the hardened clock, so this naming path accepts exactly
-    // the key packages `add_member` accepts.
-    let did = key_package_in_did(&key_package_in, ProtocolVersion::Mls10, clock)?;
-    Ok(did)
-}
-
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod ingest_emit_tests {
@@ -2104,7 +2080,12 @@ mod ingest_emit_tests {
     fn alice_state() -> PerContextState {
         let crypto = crate::crypto_state::ContextCryptoState::from_group(
             CTX,
-            create_group(&credential(ALICE), &SystemClock).unwrap(),
+            create_group(
+                &credential(ALICE),
+                &scp_crypto::p256::testing::uncompressed_point_for(ALICE),
+                &SystemClock,
+            )
+            .unwrap(),
         );
         let mut state = PerContextState::new(CTX, ALICE, crypto);
         state.set_local_pseudonym([0x01u8; 32]);

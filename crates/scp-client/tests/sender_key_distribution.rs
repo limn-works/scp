@@ -353,22 +353,23 @@ fn add_with_missing_wrapping_extension_is_rejected_fail_closed() {
     // ADR-057 sender-key distribution INVARIANT 3: an add whose KeyPackage leaf
     // carries no scp_wrapping_key extension must be rejected — a member no peer can
     // HPKE-seal a sender key to must not be admitted. The driver always publishes a
-    // wrapping key, so this crafts a PLAIN KeyPackage via raw `scp-mls` (a
+    // wrapping key, so this crafts a keyless KeyPackage via raw `scp-mls` (a
     // dev-dependency) to exercise the guard.
     use scp_did::SigningKeyId;
-    use scp_mls::ScpCredential;
-    use scp_mls::group::generate_key_package;
+    use scp_mls::group::generate_key_package_without_wrapping_key;
+    use scp_mls::{LeafAdmissionRejection, MlsError, ScpCredential};
     use tls_codec::Serialize as _;
 
     let relay = Relay::new();
     let mut alice = relay.new_party(ALICE_DID, 0);
     alice.client.create_context(CTX).expect("alice creates");
 
-    // A plain KeyPackage with NO wrapping extension.
+    // A KeyPackage whose leaf carries NO wrapping extension.
     let bob_cred =
         ScpCredential::new(BOB_DID.to_owned(), None, SigningKeyId::Active).expect("bob credential");
     let (bundle, _signer, _provider) =
-        generate_key_package(&bob_cred, &SystemClock).expect("plain key package");
+        generate_key_package_without_wrapping_key(&bob_cred, &SystemClock)
+            .expect("keyless key package");
     let plain_kp = bundle
         .key_package()
         .tls_serialize_detached()
@@ -378,11 +379,13 @@ fn add_with_missing_wrapping_extension_is_rejected_fail_closed() {
         .client
         .add_member(CTX, &plain_kp)
         .expect_err("an add with no wrapping key must be rejected fail-closed");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("scp_wrapping_key"),
-        "the error must name the missing wrapping extension, got: {msg}"
-    );
+    match err {
+        scp_client::ClientError::Mls(MlsError::LeafAdmissionRejected { did, reason }) => {
+            assert_eq!(did, BOB_DID);
+            assert_eq!(reason, LeafAdmissionRejection::MissingWrappingKey);
+        }
+        other => panic!("expected a MissingWrappingKey rejection, got {other:?}"),
+    }
 
     // The context is untouched — the rejected add stamped no membership leaf.
     assert_eq!(

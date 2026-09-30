@@ -1937,9 +1937,60 @@ impl ContextCryptoState {
                     receive_floor: ReceiveFloor { epoch, sequence },
                 })))
             }
-            scp_mls::encrypt::DecryptedContent::Commit { sender_did: _ } => Ok(OpenResult::Control),
+            scp_mls::encrypt::DecryptedContent::Commit {
+                sender_did: _,
+                wrapping_key_updates,
+            } => {
+                // A member's own Update published a new wrapping key, which
+                // `scp-mls` admitted (same DID, valid key) before the merge.
+                // A cached entry follows it so later seals reach the new key;
+                // the cache holds only keys this node already learned, so an
+                // uncached DID stays uncached.
+                for (did, key) in wrapping_key_updates {
+                    if let Some(cached) = self.member_wrapping_keys.get_mut(&did) {
+                        *cached = key;
+                    }
+                }
+                Ok(OpenResult::Control)
+            }
             scp_mls::encrypt::DecryptedContent::Proposal { sender_did: _ } => {
                 Ok(OpenResult::Control)
+            }
+        }
+    }
+
+    /// Caches a member's admitted wrapping key. An Add never overwrites a
+    /// recorded key (spec 10 §10.8.1(7)): the same key again (a second device)
+    /// changes nothing, and a different key is refused with the cached entry
+    /// left in place.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] carrying the
+    /// [`scp_mls::LeafAdmissionRejection::WrappingKeyMismatch`] rejection when
+    /// `member_did` is cached with a different key.
+    pub(crate) fn admit_member_wrapping_key(
+        &mut self,
+        member_did: String,
+        wrapping_key: [u8; 65],
+    ) -> Result<(), ContextError> {
+        match self.member_wrapping_keys.entry(member_did) {
+            std::collections::hash_map::Entry::Occupied(recorded) => {
+                if *recorded.get() == wrapping_key {
+                    Ok(())
+                } else {
+                    Err(ContextError::CryptoFailed(
+                        scp_mls::MlsError::LeafAdmissionRejected {
+                            did: recorded.key().clone(),
+                            reason: scp_mls::LeafAdmissionRejection::WrappingKeyMismatch,
+                        }
+                        .to_string(),
+                    ))
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(wrapping_key);
+                Ok(())
             }
         }
     }
@@ -2555,19 +2606,20 @@ impl PerContextState {
     }
 
     /// Real MLS add-member from explicit `KeyPackage` bytes on this actor's OWNED
-    /// group, verbatim from `NodeMlsFactory::add_member_from_bytes` (ADR-049
-    /// PR-7 STEP-C). Pre-validates the key package to extract the invitee's
-    /// DHKEM(P-256) wrapping key (needed to HPKE-seal the sender key to them
-    /// later), performs
-    /// the MLS add (advancing the group epoch), records the wrapping key, and
-    /// returns the TLS-serialized Welcome (for the joiner) + Commit (for existing
-    /// members).
+    /// group. Parses the key package once, binds its credential to
+    /// `member_did`, performs the MLS add through `scp-mls` admission (a present,
+    /// valid `0xFF01` that matches any key the DID already publishes; spec 09
+    /// §9.16.1), records the admitted wrapping key without overwriting a
+    /// recorded one, and returns the TLS-serialized Welcome (for the joiner) and
+    /// Commit (for existing members).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
-    /// `KeyPackage`, a `scp_wrapping_key` extension that is not a valid
-    /// uncompressed P-256 point (§9.5), or any MLS / serialization failure.
+    /// `KeyPackage`, a credential DID other than `member_did`, an admission
+    /// rejection, or any MLS / serialization failure; all of these leave the
+    /// epoch unchanged. After the add, [`ContextCryptoState::admit_member_wrapping_key`]
+    /// refuses to overwrite a different cached key.
     fn add_member_from_bytes(
         &mut self,
         member_did: &str,
@@ -2576,32 +2628,20 @@ impl PerContextState {
     ) -> Result<AddMemberOutput, ContextError> {
         use openmls::prelude::ProtocolVersion;
         use openmls::prelude::tls_codec::Serialize as _;
-        use openmls_traits::OpenMlsProvider as _;
 
-        // Pre-validate the key package to extract the wrapping key BEFORE the add
-        // operation consumes it, and BEFORE borrowing the crypto sub-state (no
-        // `self` borrow held across this validation). Key package bytes arrive as
-        // TLS-serialized KeyPackageIn (not MlsMessageIn).
-        //
-        // Every failure here is returned, never swallowed: a key package whose
-        // `scp_wrapping_key` extension is present but not a valid P-256 point
-        // (§9.5) is rejected before the add, rather than admitting the member
-        // with no recorded wrapping key.
-        let wrapping_key = {
-            let kp_in = scp_mls::wire::parse_key_package_in(bytes).map_err(|e| {
-                ContextError::CryptoFailed(format!("key package deserialization: {e}"))
-            })?;
-            let provider_tmp = scp_mls::InMemoryMlsProvider::default();
-            let verified = kp_in
-                .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
-                .map_err(|e| ContextError::CryptoFailed(format!("key package validation: {e}")))?;
-            scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
-                .map_err(|e| ContextError::CryptoFailed(format!("key package wrapping key: {e}")))?
-        };
-
-        // Deserialize to KeyPackageIn for the actual add operation.
         let kp_in = scp_mls::wire::parse_key_package_in(bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("key package deserialization: {e}")))?;
+        // The governance command names the invitee; the KeyPackage's own
+        // credential must name the same DID, or the member directory would
+        // record one identity's key under another's DID.
+        let credential_did =
+            scp_mls::group::key_package_in_did(&kp_in, ProtocolVersion::Mls10, clock)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        if credential_did != member_did {
+            return Err(ContextError::CryptoFailed(format!(
+                "key package credential names '{credential_did}', not the invitee '{member_did}'"
+            )));
+        }
 
         let crypto = self.encrypted_crypto_mut()?;
         let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
@@ -2621,12 +2661,7 @@ impl PerContextState {
             .tls_serialize_detached()
             .map_err(|e| ContextError::CryptoFailed(format!("serializing commit: {e}")))?;
 
-        // Store the member's wrapping key if present.
-        if let Some(wk) = wrapping_key {
-            crypto
-                .member_wrapping_keys
-                .insert(member_did.to_owned(), wk);
-        }
+        crypto.admit_member_wrapping_key(result.admitted_did, result.admitted_wrapping_key)?;
 
         Ok(AddMemberOutput {
             welcome_bytes,
@@ -4254,7 +4289,7 @@ mod crypto_ops_golden {
             let (bundle, _signer, _provider) =
                 scp_mls::group::generate_key_package_with_context_params(
                     &carol_cred,
-                    Some(wrapping),
+                    wrapping,
                     &SystemClock,
                 )
                 .unwrap();
@@ -4277,7 +4312,10 @@ mod crypto_ops_golden {
             .expect_err("an off-curve 0xFF01 point is refused");
         match err {
             ContextError::CryptoFailed(msg) => {
-                assert!(msg.contains("key package wrapping key"), "got: {msg}");
+                assert!(
+                    msg.starts_with("extension error: scp_wrapping_key extension: "),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected CryptoFailed, got {other:?}"),
         }
@@ -4290,6 +4328,117 @@ mod crypto_ops_golden {
             .expect("a valid 0xFF01 point is admitted");
         assert_eq!(epoch_of(&alice_a), epoch_before + 1, "the MLS add ran");
         assert_eq!(recorded(&alice_a), Some(valid));
+    }
+
+    /// Serialized `KeyPackage` for `did` publishing `wrapping` in `0xFF01`.
+    fn key_package_bytes(did: &str, wrapping: &[u8; 65]) -> Vec<u8> {
+        use openmls::prelude::tls_codec::Serialize as _;
+        let cred = scp_mls::ScpCredential::new(did.to_owned(), None, SigningKeyId::Active).unwrap();
+        let (bundle, _signer, _provider) =
+            scp_mls::group::generate_key_package_with_context_params(&cred, wrapping, &SystemClock)
+                .unwrap();
+        bundle.key_package().tls_serialize_detached().unwrap()
+    }
+
+    fn cached_key(state: &PerContextState, did: &str) -> Option<[u8; 65]> {
+        match &state.mode {
+            ContextModeState::Encrypted(c) => c.member_wrapping_keys.get(did).copied(),
+            ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+        }
+    }
+
+    /// Spec 10 §10.8.1(7): a second `KeyPackage` for an existing member that
+    /// publishes a different wrapping key is refused before the MLS add, and the
+    /// cached key stays. Positive control: a second device of the same DID with
+    /// the same key is admitted.
+    #[test]
+    fn add_of_existing_member_with_a_different_wrapping_key_is_refused() {
+        let (_alice_p, mut alice_a, bob_p, _bob_a, _ctx) = setup();
+        let bob_key = *bob_p.public();
+        assert_eq!(cached_key(&alice_a, BOB), Some(bob_key));
+        let epoch_before = actor_mls_epoch(&alice_a);
+
+        let (other_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        let err = alice_a
+            .add_member(BOB, Some(&key_package_bytes(BOB, &other_key)), &SystemClock)
+            .expect_err("a different key for a recorded DID is refused");
+        let expected = scp_mls::MlsError::LeafAdmissionRejected {
+            did: BOB.to_owned(),
+            reason: scp_mls::LeafAdmissionRejection::WrappingKeyMismatch,
+        }
+        .to_string();
+        match err {
+            ContextError::CryptoFailed(msg) => assert_eq!(msg, expected),
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+        assert_eq!(actor_mls_epoch(&alice_a), epoch_before, "no MLS add ran");
+        assert_eq!(
+            cached_key(&alice_a, BOB),
+            Some(bob_key),
+            "the recorded key stays"
+        );
+
+        alice_a
+            .add_member(BOB, Some(&key_package_bytes(BOB, &bob_key)), &SystemClock)
+            .expect("a second device with the same key is admitted");
+        assert_eq!(actor_mls_epoch(&alice_a), epoch_before + 1);
+        assert_eq!(cached_key(&alice_a, BOB), Some(bob_key));
+    }
+
+    /// The governance command's invitee and the `KeyPackage` credential must
+    /// name the same DID; otherwise the add is refused before any MLS state
+    /// changes and nothing is cached under either DID.
+    #[test]
+    fn add_whose_key_package_names_another_did_is_refused() {
+        const CAROL: &str = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
+        const DAVE: &str = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveD";
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
+        let epoch_before = actor_mls_epoch(&alice_a);
+        let (carol_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+
+        let err = alice_a
+            .add_member(
+                DAVE,
+                Some(&key_package_bytes(CAROL, &carol_key)),
+                &SystemClock,
+            )
+            .expect_err("a KeyPackage for Carol cannot admit Dave");
+        match err {
+            ContextError::CryptoFailed(msg) => assert_eq!(
+                msg,
+                format!("key package credential names '{CAROL}', not the invitee '{DAVE}'")
+            ),
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+        assert_eq!(actor_mls_epoch(&alice_a), epoch_before, "no MLS add ran");
+        assert_eq!(cached_key(&alice_a, DAVE), None);
+        assert_eq!(cached_key(&alice_a, CAROL), None);
+    }
+
+    /// A member's own Update that publishes a new wrapping key replaces the
+    /// receiver's cached key through `open`, so later seals target the new key.
+    #[test]
+    fn open_of_an_update_commit_applies_the_new_wrapping_key() {
+        let (alice_p, mut alice_a, _bob_p, mut bob_a, ctx) = setup();
+        // A Welcome joiner's cache starts empty; Bob learned Alice's key.
+        bob_a
+            .encrypted_crypto_mut()
+            .unwrap()
+            .admit_member_wrapping_key(ALICE.to_owned(), *alice_p.public())
+            .unwrap();
+        let (new_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+
+        let commit = alice_a.advance_epoch(new_key).unwrap().commit_bytes;
+        let outer =
+            scp_protocol::envelope::outer::create_outer_envelope(&routing(&ctx), None, 300, commit)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+        match bob_a.open(&SystemClock, CTX_STR, &outer).unwrap() {
+            OpenResult::Control => {}
+            other => panic!("expected Control, got {other:?}"),
+        }
+        assert_eq!(cached_key(&bob_a, ALICE), Some(new_key));
     }
 
     /// #2199: `dispose_secrets` on a REAL seeded encrypted state (a live MLS
@@ -4360,7 +4509,8 @@ mod crypto_ops_golden {
         match &mut state.mode {
             ContextModeState::Encrypted(c) => {
                 let group = c.mls_group.as_mut().expect("group present");
-                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace)
+                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace, &SystemClock)
+                    .map(drop)
             }
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
         }
