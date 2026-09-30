@@ -1068,9 +1068,11 @@ pub enum HostSiteError {
     /// The application node failed to build. Carries the typed [`NodeError`],
     /// so a caller matches `NodeBuild(NodeError::Identity(
     /// IdentityError::NoPreRotationBackend))` to detect a missing pre-rotation
-    /// custody backend without reading the message text.
+    /// custody backend without reading the message text. The `NodeError` text is
+    /// in this variant's Display and not returned from `source()`, so a
+    /// chain-walking reporter prints it once.
     #[error("node build error: {0}")]
-    NodeBuild(#[source] NodeError),
+    NodeBuild(NodeError),
     /// The site assets could not be loaded from the site directory.
     #[error("load assets error: {0}")]
     LoadAssets(String),
@@ -2543,11 +2545,12 @@ mod tests {
         let missing =
             HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend));
         assert!(is_missing_backend(&missing));
-        let source = std::error::Error::source(&missing).expect("NodeBuild has a source");
-        assert!(matches!(
-            source.downcast_ref::<NodeError>(),
-            Some(NodeError::Identity(IdentityError::NoPreRotationBackend))
-        ));
+        // The NodeError text is in Display only; returning it from `source()`
+        // as well would print it twice in a chain-walking reporter.
+        assert!(
+            std::error::Error::source(&missing).is_none(),
+            "NodeBuild must not return its NodeError from source(), Display already carries it"
+        );
         assert!(
             missing
                 .to_string()
@@ -2559,6 +2562,49 @@ mod tests {
         assert!(!is_missing_backend(&other));
         let other_config = HostSiteError::InvalidConfig("x".to_owned());
         assert!(!is_missing_backend(&other_config));
+    }
+
+    /// On a build without `testing`, `host_site_until` over an empty storage
+    /// directory returns `HostSiteError::NodeBuild(NodeError::Identity(
+    /// IdentityError::NoPreRotationBackend))`, the typed value the rustdoc,
+    /// `examples/website.rs`, and the deploying guide promise an embedder can
+    /// match. The name carries `pre_rotation_severance` so the CI lane that
+    /// runs `-p scp-node --lib -E 'test(pre_rotation_severance)'` without
+    /// `testing` selects it.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn pre_rotation_severance_host_site_returns_typed_node_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_dir = tmp.path().join("storage");
+        let site_dir = tmp.path().join("site");
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        std::fs::create_dir_all(&site_dir).expect("create site dir");
+        std::fs::write(site_dir.join("index.html"), "<html></html>").expect("write index");
+
+        let config = HostSiteConfig {
+            tls: TlsMode::Plaintext,
+            site_dir: Some(site_dir),
+            port: 0,
+            storage_path: Some(storage_dir),
+            ..HostSiteConfig::defaults(Reach::Local)
+        };
+        // A shutdown that never fires: a regression that builds the node would
+        // serve until the timeout below and fail instead of hanging.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            host_site_until(config, std::future::pending::<()>()),
+        )
+        .await
+        .expect("host_site_until must fail closed, not serve");
+        match outcome {
+            Err(HostSiteError::NodeBuild(NodeError::Identity(
+                IdentityError::NoPreRotationBackend,
+            ))) => {}
+            other => panic!(
+                "expected NodeBuild(Identity(NoPreRotationBackend)) on a build without \
+                 `testing`, got: {other:?}"
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------
