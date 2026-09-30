@@ -70,11 +70,12 @@ data class AndroidPlatformAdapterImpl(
  * unavailable or FCM not configured). [make] does neither. It calls the four constructors once,
  * passes no `cloudProjectNumber`, and probes no provider:
  *
- * - [AndroidKeyCustody]'s constructor creates the Keystore master key and opens
+ * - [AndroidKeyCustody]'s constructor gets or creates the Keystore master key and opens
  *   EncryptedSharedPreferences, and an exception from either reaches the caller as thrown,
  *   not wrapped in [ScpException].
- * - [AndroidDeviceAttestation] creates its `IntegrityManager` inside each attest call, so an
- *   absent Play Integrity service surfaces at that call.
+ * - [AndroidDeviceAttestation] creates its `IntegrityManager` inside each
+ *   [AndroidDeviceAttestation.attest] call, so an absent Play Integrity service surfaces at
+ *   that call.
  * - [AndroidPushProvider] does not touch Firebase until [AndroidPushProvider.register].
  * - [AndroidStorage] opens its database on its first method call.
  *
@@ -87,8 +88,8 @@ object AndroidPlatformAdapter {
      *
      * @param context Android application context. Must be an application context
      *   (not an activity context) to avoid memory leaks from long-lived references.
-     * @return [AndroidPlatformAdapterImpl] holding the four constructed providers. [make] checks
-     *   no provider's backend, so a missing Play Integrity service, an unconfigured Firebase or
+     * @return [AndroidPlatformAdapterImpl] holding the four constructed providers. [make] adds
+     *   no check of its own, so a missing Play Integrity service, an unconfigured Firebase or
      *   an unopenable database surfaces at the first call that needs it, not here.
      */
     fun make(context: Context): AndroidPlatformAdapterImpl {
