@@ -1484,10 +1484,20 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let result = runtime.block_on(mcp_client_connect_stdio_on(
-            &bi,
-            vec!["sh".to_owned(), "-c".to_owned(), script],
-        ));
+        // Bounded: the stub never closes stdout before `sleep 600` ends, so a
+        // connect that stops finishing the handshake fails here in 10 s.
+        let result = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    mcp_client_connect_stdio_on(
+                        &bi,
+                        vec!["sh".to_owned(), "-c".to_owned(), script],
+                    ),
+                )
+                .await
+            })
+            .expect("the connect must end within 10 s");
         let pid = std::fs::read_to_string(&pid_file).expect("the stub server wrote its pid");
         let _ = std::fs::remove_file(&pid_file);
 
@@ -1592,8 +1602,16 @@ mod tests {
         .expect("spawn stub server");
         let server = transport.server_process();
         let mut client = McpClient::new(McpClientTransportWrapper::Stdio(transport));
-        client
-            .initialize()
+        // Bounded: the stub holds stdout open for 600 s, so an `initialize`
+        // that stops reading its response fails here in 10 s.
+        let (init_tx, init_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = client.initialize().map(drop).map_err(|e| e.to_string());
+            let _ = init_tx.send(result.map(|()| client));
+        });
+        let client = init_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("initialize must end within 10 s")
             .expect("initialize must read past the notification");
         let handle_id = mcp_handle_id("mcp-client");
         bi.mcp_client_registry().insert(
