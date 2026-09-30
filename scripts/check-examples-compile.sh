@@ -94,13 +94,16 @@
 #     rustc reads them, and an unclosed one fails the scan instead of desynchronizing it.
 # String literals, char literals and comments are blanked first, so neither hides a
 # predicate from the scan nor fakes one into it. The blanking reads a literal where rustc
-# lexes one: a raw string (`r"`, `br"`, `cr"`) starts only where no identifier character,
-# quote or `#` stands directly before its prefix, because rustc lexes the `r` in `1r"`,
-# `'r"` or `"x"r"` as a literal suffix or a lifetime and the `"` after it as an ordinary
-# string, where `\"` is an escape; a char literal takes the `\x41` and `\u{41}` escapes;
-# and the source is decoded as UTF-8, so `'é'` is one char. A file that is not UTF-8 is
+# lexes one: every string, raw string and char literal takes the identifier characters
+# after its closing quote or hash as its suffix, as rustc does, so the `r` in `"x"r"` or
+# `r#"x"#r"` is never a raw-string prefix; a raw string (`r"`, `br"`, `cr"`) starts only
+# where no identifier character or `'` stands directly before its prefix, because rustc
+# lexes the `r` in `1r"` as a number's suffix and in `'r"` as a lifetime; in each of
+# these the `"` after the `r` opens an ordinary string, where `\"` is an escape. A `#`
+# token before the prefix (`#r"\"`) leaves it a raw string. A char literal takes the
+# `\x41` and `\u{41}` escapes, and the source is decoded as UTF-8, so `'é'` is one char. A file that is not UTF-8 is
 # scanned as bytes; rustc rejects such a file, so it compiles into no target. Cases
-# `cfgbody` to `charunicode` pin this, and case `platformcfg` pins what passes.
+# `cfgbody` to `hashraw` pin this, and case `platformcfg` pins what passes.
 #
 # RESIDUAL LIMITS. These are the bypasses known to the gate's authors, not a proof that
 # no other exists:
@@ -142,7 +145,7 @@ my @str;
 my %plat = map { $_ => 1 } qw(unix windows target_os target_family target_arch
   target_pointer_width target_endian target_env target_vendor);
 my %host = map { $_ => 1 } split /\n/, $ENV{HOST_CFG};
-s{((?<![\w'"#])[bc]?r(\#*)"(.*?)"\2|b?"((?:[^"\\]|\\.)*)"|b?'(?:[^'\\]|\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|.))')|//[^\n]*|(/\*(?:[^/*]++|/(?!\*)|\*(?!/)|(?5))*+\*/)}{
+s{((?:(?<![\w'])[bc]?r(\#*)"(.*?)"\2|b?"((?:[^"\\]|\\.)*)"|b?'(?:[^'\\]|\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|.))')\w*)|//[^\n]*|(/\*(?:[^/*]++|/(?!\*)|\*(?!/)|(?5))*+\*/)}{
   !defined $1 ? ' ' : $1 =~ /^b?'/ ? '0' : do { push @str, defined $3 ? $3 : $4; qq{"$#str"} }
 }gse;
 print "unbalanced block comment\n" if m{/\*};

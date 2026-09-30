@@ -46,11 +46,13 @@ of them reopens a bypass this repository has already measured:
    symbolic links as rustc follows them when it resolves `mod`, after blanking string
    literals, char literals and comments, with block comments nested as rustc nests them.
    The blanking must lex a literal where rustc does: a scan that reads the `r` of a literal
-   suffix or a lifetime (`1r"\" "`, `'r"\" "`) as a raw-string prefix, or stops a char
-   literal at a one-character escape (`'\x41'`), ends the literal at the wrong quote and
-   blanks the real code after it, feature cfg included, as a string. It fails on a
-   `cfg(` or `cfg!(` predicate that names anything but `not`, `any`, `all`, `unix`,
-   `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
+   suffix or a lifetime (`1r"\" "`, `"x"r"\" "`, `'r"\" "`) as a raw-string prefix, refuses
+   a raw string after a `#` token (`#r"\"`), or stops a char literal at a one-character
+   escape (`'\x41'`), ends the literal at the wrong quote and blanks the real code after
+   it, feature cfg included, as a string. A lookbehind cannot tell a closing raw hash
+   (`r#"x"#r"`) from a `#` token, so the scan takes each literal's suffix with the
+   literal. It fails on a `cfg(` or `cfg!(` predicate that names anything but `not`,
+   `any`, `all`, `unix`, `windows`, `target_os`, `target_family`, `target_arch`, `target_pointer_width`,
    `target_endian`, `target_env` and `target_vendor`, or that is false on the host running the
    gate (row 9b). It fails on any identifier that starts with `cfg_`, which covers
    `cfg_attr` and std's stable `cfg_select!` (it keeps only the arm whose predicate holds,
