@@ -591,7 +591,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 - **Lifecycle-in-extension-artifact, not in core:** Android lifecycle (`LifecycleOwner`, `lifecycleScope`) is an Android-only API. Taking this dependency in the core SDK would force JVM targets (server-side, tests) to depend on Android-specific artifacts. Separating it into `scp-kt-android` keeps the core SDK usable on any JVM and keeps the Android extension small and focused.
 - **One suspending teardown, and no `AutoCloseable`, for any type whose teardown crosses the FFI boundary (amended; see below):** Kotlin/JVM resource management follows the `AutoCloseable` / `use { }` pattern, and this ADR originally applied it to `Context`: `context.use { }` for automatic cleanup, with `AutoCloseable.close()` as a synchronous safety net that launched a `close()` coroutine and cancelled the internal scope, matching the `deinit` + `close()` pattern in the Swift SDK. **That rule no longer holds, for the reason stated in the amendment below.** A type whose teardown reaches the Rust engine exposes exactly one `suspend` teardown function and implements no `AutoCloseable`.
 
-  **Amendment (this ADR stays Decided; this bullet supersedes the rule above).** `AutoCloseable.close()` is synchronous and returns `Unit`, so a Kotlin type whose teardown reaches the Rust engine can satisfy it only by blocking its calling thread. Every teardown that crosses the FFI boundary suspends, and every one except `InvocationHandle.cancel()` suspends on its bridge's injected `ioDispatcher`: `SCP.shutdown(bridge, timeout)` through `CoroutineBridge.ffiCallSuspend`, which reaches the Rust engine through the UniFFI-generated `Scp` object. Four other teardowns suspend the same way, but no production class implements the bindings interface each one calls, so today each reaches only a test source set's stub and never the Rust engine: a subscription flow's release, when its collector cancels, runs `withContext` on that dispatcher over `ContextBindings` or `EventContextBindings`; `ScpViewModel`'s `leave` runs through `CoroutineBridge.context` over `ContextBindings`; `Relay.shutdown()` and `Node.shutdown()` run through `CoroutineBridge.ffiCall` over `ServerBindings` (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`); and `ScpHotStreams.close()` releases every subscription its `HotStreamFactory` still holds through `HotStreamFactory.stopAll()`, on that factory's injected dispatcher, over `EventContextBindings`. `InvocationHandle.cancel()` reaches the Rust engine too, and it is a `suspend` call with no `AutoCloseable` beside it, but it suspends on the UniFFI-generated async `Scp.outletStreamCancel` rather than on an injected `ioDispatcher`, and it sends a signed `OutletCancel`, a protocol message, so it propagates a bridge rejection as that operation's result. Blocking a caller on it therefore fails in two ways:
+  **Amendment (this ADR stays Decided; this bullet supersedes the rule above).** `AutoCloseable.close()` is synchronous and returns `Unit`, so a Kotlin type whose teardown reaches the Rust engine can satisfy it only by blocking its calling thread. Every teardown that crosses the FFI boundary suspends, and every one except `InvocationHandle.cancel()` suspends on its bridge's injected `ioDispatcher`: `SCP.shutdown(bridge, timeout)` through `CoroutineBridge.ffiCallSuspend`, which reaches the Rust engine through the UniFFI-generated `Scp` object. Five other teardowns suspend the same way, but no production class implements the bindings interface each one calls, so today each reaches only a test source set's stub and never the Rust engine: a subscription flow's release, when its collector cancels, runs `withContext` on that dispatcher over `ContextBindings` or `EventContextBindings`; `ScpViewModel`'s `leave` runs through `CoroutineBridge.context` over `ContextBindings`; `Relay.shutdown()` and `Node.shutdown()` run through `CoroutineBridge.ffiCall` over `ServerBindings` (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`); and `ScpHotStreams.close()` releases every subscription its `HotStreamFactory` still holds through `HotStreamFactory.stopAll()`, on that factory's injected dispatcher, over `EventContextBindings`. `InvocationHandle.cancel()` reaches the Rust engine too, and it is a `suspend` call with no `AutoCloseable` beside it, but it suspends on the UniFFI-generated async `Scp.outletStreamCancel` rather than on an injected `ioDispatcher`, and it sends a signed `OutletCancel`, a protocol message, so it propagates a bridge rejection as that operation's result. Blocking a caller on it therefore fails in two ways:
   - A caller that injects a `StandardTestDispatcher` parks the one thread that advances that dispatcher's scheduler, so the work the `close()` waits for can never run and `close()` never returns. This repository observed it, as a hang in `ScpViewModel.onCleared()`'s tests.
   - An Android caller blocks a main thread, which risks an ANR.
 
@@ -855,6 +855,9 @@ class Context internal constructor(
      * inside that block, so a collector cancelled during it cannot drop a live
      * subscription, and the release suspends in a finally rather than running in
      * awaitClose's lambda on the collector's thread (ADR-028's AutoCloseable amendment).
+     * A release that throws is logged, never rethrown (sdk-common.md §Cleanup error
+     * handling): rethrown from the finally, it would replace the collector's cancellation
+     * as the failure and propagate to the collector's parent scope.
      */
     fun receiveFlow(): Flow<Message> = callbackFlow {
         var subscribed = false
@@ -862,7 +865,10 @@ class Context internal constructor(
             withContext(NonCancellable + ioDispatcher) {
                 handle.subscribe(object : MessageListener {
                     override fun onMessage(message: ScpMessage) {
-                        trySend(Message.fromRecord(message))
+                        val result = trySend(Message.fromRecord(message))
+                        if (result.isFailure && !result.isClosed) {
+                            close(ContextException("Message buffer overflow", "SCP-CTX-2001"))
+                        }
                     }
                     override fun onError(error: ScpError) {
                         close(ScpException.fromFfi(error))
@@ -875,7 +881,16 @@ class Context internal constructor(
             }
             awaitClose()
         } finally {
-            if (subscribed) withContext(NonCancellable + ioDispatcher) { handle.unsubscribe() }
+            if (subscribed) {
+                withContext(NonCancellable + ioDispatcher) {
+                    // NonCancellable keeps the collector's cancellation out of this catch.
+                    try {
+                        handle.unsubscribe()
+                    } catch (e: Exception) {
+                        logCleanupFailure("unsubscribe failed when receiveFlow() closed", e)
+                    }
+                }
+            }
         }
     }.buffer(Channel.BUFFERED)
 
@@ -911,16 +926,15 @@ class Context internal constructor(
             throw e // the caller's own cancellation, not a cleanup error
         } catch (e: Exception) {
             // sdk-common.md §Cleanup error handling: a cleanup error is logged, never propagated.
-            logCleanupFailure(e)
+            logCleanupFailure("leave failed during close()", e)
         } finally {
             scope.cancel()
             handle.destroy()
         }
     }
 
-    private fun logCleanupFailure(cause: Throwable) {
-        System.getLogger("works.limn.scp.Context")
-            .log(System.Logger.Level.WARNING, "leave failed during close()", cause)
+    private fun logCleanupFailure(what: String, cause: Throwable) {
+        System.getLogger("works.limn.scp.Context").log(System.Logger.Level.WARNING, what, cause)
     }
 }
 ```
@@ -1301,7 +1315,7 @@ dependencies {
    - A failed `Relay.shutdown()` or `Node.shutdown()` propagates the error its `ServerBindings` implementation throws (in `ServerTest`, the test source set's `StubServerBindings`, the only implementer) and leaves `isShutdown` false, and one whose caller is cancelled after a finished teardown leaves `isShutdown` true — verified by `ServerTest`. `SCP.shutdown` meets the same two conditions for its internal `isShutdown` flag, verified by `ScpShutdownTest`.
    - `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, and `Node.shutdown()` are `suspend` functions, and none of `SCP`, `Relay`, or `Node` implements `AutoCloseable` (amended; see Rationale). This bullet and the one before it bind the types the Kotlin surface ships; `Context`, which the other bullets of this criterion name, no longer exists on it, so those bullets bind no test.
 
-5. **Message streaming via `Flow<Message>`:**
+5. **Message streaming via `Flow<Message>`** (superseded: ADR-048, SCP as a first-class multi-instance SDK object, removed `Context` from the Kotlin surface, so `scp.createContext` returning a `Context`, `context.receiveFlow()`, `context.send`, and `context.closeContext()` do not exist there, and this sample binds no test; `ColdMessageFlow` and `ColdStreamFactory.incomingMessages` in `stream/Streams.kt` stream a context handle's messages instead):
 
    ```kotlin
    val context = scp.createContext(ContextParams(ceiling = listOf("messages:read", "messages:write")))
@@ -1321,8 +1335,8 @@ dependencies {
    ```
 
 6. **Dispatcher isolation:**
-   - Every FFI call that SDK code dispatches through `withContext` runs on an injected `ioDispatcher`, which defaults to `Dispatchers.IO`, and none of those calls names `Dispatchers.IO` directly. That covers `CoroutineBridge`, `ServerBridge`, `HotStreamFactory`, `ColdStreamFactory`, `ColdMessageFlow`, `ScpHotStreams`, and `SCP`'s `shutdown`, `suspendInstance`, and `resume`. `SCP`'s other methods forward to UniFFI and dispatch nothing, so this bullet binds no test for them. Checked by reading each named type's source: every `withContext` that wraps an FFI call takes an injected `ioDispatcher`, the type's own or that of the `CoroutineBridge` it calls through, and every `ioDispatcher` parameter defaults to `Dispatchers.IO`. No test checks this criterion.
-   - `receiveFlow()` does not block the calling thread — verified by calling it from a single-threaded test dispatcher and confirming the call returns immediately.
+   - Every FFI call and every subscription release that SDK code dispatches through `withContext` runs on an injected `ioDispatcher`, the type's own or that of the `CoroutineBridge` it calls through, and none of those calls names `Dispatchers.IO` directly. That covers `CoroutineBridge`, `ServerBridge`, `HotStreamFactory`, `ColdStreamFactory`, `ColdMessageFlow`, `ScpHotStreams`, and `SCP`'s `shutdown`, `suspendInstance`, and `resume`. `SCP`'s other methods forward to UniFFI and dispatch nothing, so this bullet binds no test for them. Every `ioDispatcher` parameter those types declare defaults to `Dispatchers.IO`; `ServerBridge` and `SCP` declare none and dispatch through their `CoroutineBridge`'s. `DispatcherInjectionScanTest` in `scp-kt-android`'s test source set reads every `scp-kt` and `scp-kt-android` main source and fails on a `withContext` call whose context names `Dispatchers.IO` outside a comment. It skips the `works.limn.scp.android.platform` package, whose adapters call Play Integrity and Firebase and never the SCP FFI, and the generated UniFFI bindings under `internal/uniffi`. `StateHoldersTest`'s `ScpHotStreams subscribes and releases on its injected dispatcher` checks that an `ScpHotStreams` subscribe and release both wait for, and run on, the dispatcher it was given.
+   - The `receiveFlow()` bullet that stood here is superseded: ADR-048 removed `Context` and its `receiveFlow()` from the Kotlin surface, so that bullet binds no test.
 
 7. **`ScpException` hierarchy:**
    - All UniFFI `ScpError` variants map 1:1 to `ScpException` subclasses.

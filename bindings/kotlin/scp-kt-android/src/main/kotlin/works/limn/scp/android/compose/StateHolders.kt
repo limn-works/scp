@@ -292,10 +292,12 @@ private fun <R> rememberCollectedState(
  * [SharedFlow] instance for every caller of one subscription. A `start` that began runs to
  * completion even when its mount leaves meanwhile, so what it returned is compared too. A mount
  * whose `start` threw keeps its own `onStop`, because that `start` may have opened a
- * subscription it did not return. The `onStop` lambdas held for a key are therefore bounded by
- * the number of distinct objects its mounts' `start` returned, plus one per `start` that threw
- * and one for the `start` running under the key's mutex, not by how many mounts entered and left
- * while another mount stayed composed.
+ * subscription it did not return. The `onStop` lambdas held for a key therefore number at most
+ * the distinct objects its mounts' `start` returned, plus one for the `start` running under the
+ * key's mutex, plus one for each departed mount whose `start` threw. While another mount under
+ * the key stays composed, a departing mount whose `start` returned an object already held adds
+ * nothing, and each departing mount whose `start` threw adds one, so the held list grows
+ * linearly with those departures until the last mount leaves.
  *
  * Each stop joins the stop launched before it under that key before it takes
  * that key's mutex, and [startMounted] joins the stop its mount captured before it runs a

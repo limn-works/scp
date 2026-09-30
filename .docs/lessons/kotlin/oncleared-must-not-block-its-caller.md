@@ -166,3 +166,4 @@ teardown finished.
 - `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/compose/StateHolders.kt`
 - `bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/compose/StateHoldersTest.kt`
 - `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Server.kt`
+- `bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/ServerTest.kt`
