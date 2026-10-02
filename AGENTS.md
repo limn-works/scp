@@ -51,7 +51,7 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 
 **Change protocol (MANDATORY for all code changes):**
 - Make every change in a subagent with worktree isolation, and give coders worktree paths only: a bare main-checkout path edits the human's uncommitted work.
-- Write a test for every change and update the tests it breaks. Untested code does not ship.
+- Test every behavior `.docs/standards/testing.md` says gets a test, with a test that meets its criterion, and update the tests the change breaks. Write no test that standard rejects.
 - Review with the full roster in logical units until two consecutive passes return zero items. The roster and the two-zero-pass loop apply to code changes; a change to docs, instructions, or memory does not go through them. The human's words: "stop reviewing with the full roster. we aren't writing code."
 - Fix every finding about code the change adds or needs. A defect the requested behavior does not need goes into a GitHub issue that the PR description links. Never dismiss a finding as "pre-existing"; fix it or file it.
 - **Quick local check before push, full gate set in CI.** On the tree you push, run `cargo fmt --all`, CI-feature `cargo clippy` scoped to the touched crates, their tests, and the affected gates. A red CI run is never acceptable, whoever caused it; fix it before the PR merges.
@@ -116,7 +116,7 @@ mise installs every tool except Rust. **Never use npm or npx** (bun only). Use `
 | Specs, principles, open questions | Before changing protocol behavior | `.docs/specs/` (`01-thesis.md`, `00-open-questions.md`) |
 | ADRs | Before a design decision; most are `## ADR-NNN` sections in `phase-N.md`, some own a file — grep both | `.docs/adrs/` |
 | Stories | Before implementing or editing one | `.docs/prds/`, `.docs/standards/prd.md` |
-| Standards | Before writing code | `.docs/standards/` (`<language>.md`, `sdk-common.md`, `construction.md`, `conventions.md`, `documentation.md`, `sdk-capability-matrix.json`) |
+| Standards | Before writing code | `.docs/standards/` (`<language>.md`, `sdk-common.md`, `construction.md`, `conventions.md`, `documentation.md`, `testing.md`, `sdk-capability-matrix.json`) |
 | Writing standard | Before any prose | `.docs/standards/concrete-prose.md`, `.docs/lessons/bad-prose-and-its-rewrite.md` |
 | Architecture, sketches, scaffolds | Crate ownership, API shape, SDK layout | `.docs/architecture.md` §2.1, `.docs/sketch.md`, `.docs/scaffold/` |
 | Runbooks | Production incidents | `.docs/runbooks/` |

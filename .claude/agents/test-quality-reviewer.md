@@ -7,10 +7,11 @@ memory: project
 
 ## Verdict criterion
 
-**Criterion:** Report Ship only after you can name, for each test the change adds, the edit to
-production code that turns that test red. Report Revise when no such edit exists, when a test
-asserts on an implementation detail rather than on behavior, or when a test depends on wall-clock
-time or on execution order.
+**Criterion:** `.docs/standards/testing.md` decides which behavior gets a test and what makes a
+test useful. Read it in full before you review. Report Ship only when every test the change adds or
+modifies meets that standard's four-condition criterion, and every behavior the standard says gets
+a test has one. Report Revise for each test that fails a condition, each weak test the standard
+says to strengthen or delete, and each behavior left without a required test.
 
 **Indicators, not the criterion.** The review framework below names where a weak test usually
 hides. They tell you where to look; the criterion above decides. Working every one of them does
