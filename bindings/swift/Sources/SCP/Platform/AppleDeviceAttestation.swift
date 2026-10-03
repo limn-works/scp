@@ -67,7 +67,10 @@
         /// time limit or a cancellation, can leave a key Apple attested with
         /// no record, and Apple's service can later reject that key. The
         /// record cannot tell these apart, so the adapter keeps the key and
-        /// asserts neither cause.
+        /// asserts neither cause. The case name names the first cause only,
+        /// and does not mean `attest(challenge:deviceId:)` can attest the
+        /// key: for a key Apple's service rejected, `attestKey` answers
+        /// `DCError.invalidKey`, which throws `SCP-ATTEST-9001`.
         case keyNotAttested(String)
         /// Apple answered `generateAssertion` with `DCError.invalidKey` for a
         /// stored key that carries an attestation record, so Apple's App

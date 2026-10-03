@@ -1532,8 +1532,8 @@
     /// `attestKey:clientDataHash:completionHandler:` for a key already
     /// attested, calling `generateAssertion:clientDataHash:completionHandler:`
     /// with an unattested key, and an App Attest service rejecting a key. Only
-    /// the third condition means a key is gone, so only the third discards a
-    /// key ID. Each case drives one condition, or `DCError.serverUnavailable`,
+    /// the third, in which Apple's service rejects the key, discards a key ID.
+    /// Each case drives one condition, or `DCError.serverUnavailable`,
     /// and pins what happens to the stored key ID and the attestation record,
     /// so collapsing the conditions into one fails a case.
     struct AppAttestKeyLifecycleTests {
