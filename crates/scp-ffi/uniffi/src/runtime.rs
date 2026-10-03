@@ -809,7 +809,7 @@ impl UniffiBridgeInstance {
             .try_supervisor()
             .ok_or_else(|| crate::ScpError::Context {
                 msg: "ContextManager not yet attached — call context_create, \
-                      context_join, context_import, or init_context_manager first"
+                      context_import, or init_context_manager first"
                     .to_owned(),
                 code: codes::CTX_2000.to_owned(),
             })
@@ -973,6 +973,93 @@ impl UniffiBridgeInstance {
         );
 
         self.core.set_supervisor(supervisor_arc);
+    }
+
+    /// Reads a context's lifecycle state from that context's supervisor actor.
+    ///
+    /// An absent actor the crash watchdog poisoned reads as `Some(Poisoned)`,
+    /// because the supervisor keeps that flag outside the actor (ADR-049 §10).
+    /// [`UniffiBridgeInstance::require_active_context`] is the gate form: it
+    /// turns `None` into an error, so a gate never admits an operation on an
+    /// absent answer.
+    ///
+    /// An actor the supervisor still holds but this call could not reach, a
+    /// mailbox send that timed out against a saturated mailbox or a wedged
+    /// actor that took longer than the reply timeout, reads as an error and
+    /// never as `Ok(None)`. `Supervisor::read_context_state` folds that
+    /// outcome into `None`, so this method calls
+    /// `Supervisor::read_context_state_checked`, which keeps the two apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns. Returns `ScpError::Context` with a message that starts
+    /// `SCP-CTX-2130` when an actor serves `context_id` but did not answer the
+    /// state read. Returns `ScpError::Context` with code `SCP-CTX-2135` when
+    /// the crash watchdog despawned `context_id`'s actor for a respawn it has
+    /// not finished or its last respawn failed (ADR-049 §10).
+    pub async fn read_live_context_state(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<scp_core::context::ContextState>, crate::ScpError> {
+        let supervisor = self.context_manager_or_error()?;
+        supervisor
+            .read_context_state_checked(context_id)
+            .await
+            .map_err(crate::ScpError::from)
+    }
+
+    /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
+    ///
+    /// The gate reads the supervisor actor, never the `state` a
+    /// [`ContextHandle`](crate::ContextHandle) caches. That cached state
+    /// records only the transitions THIS bridge observed, so a TTL expiry the
+    /// supervisor applied on its own timer, a close another member initiated,
+    /// a migration that tombstoned the context, and an actor the watchdog
+    /// poisoned all leave it reading `Active`. `context_join`,
+    /// `context_leave`, `context_send`, and `context_subscribe` gate here.
+    ///
+    /// The gate fails closed: a context no actor serves refuses the
+    /// operation. `mk_err` wraps the refusal message in the error variant and
+    /// the error code the calling operation reports. The refusal names the
+    /// state through [`scp_ffi_common::context_state_str`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` with code `SCP-CTX-2134` when the
+    /// supervisor reports `Poisoned` (ADR-049 §10). Returns whatever `mk_err`
+    /// builds when the supervisor reports any other state than `Active` and
+    /// when no actor serves `context_id`. Returns the
+    /// error [`UniffiBridgeInstance::read_live_context_state`] returns when
+    /// the state read fails.
+    pub async fn require_active_context<F>(
+        &self,
+        context_id: &str,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<(), crate::ScpError>
+    where
+        F: FnOnce(String) -> crate::ScpError,
+    {
+        let state = self.read_live_context_state(context_id).await?;
+        match state {
+            Some(scp_core::context::ContextState::Active) => Ok(()),
+            // ADR-049 §10: a caller detects a poisoned context by the
+            // `SCP-CTX-2134` code on its next per-context operation, so the
+            // gate surfaces `ContextPoisoned` rather than the operation's own
+            // non-active code.
+            Some(scp_core::context::ContextState::Poisoned) => Err(crate::ScpError::from(
+                scp_core::context::ContextError::ContextPoisoned(context_id.to_owned()),
+            )),
+            Some(other) => Err(mk_err(format!(
+                "cannot {verb} in '{}' state -- context must be active",
+                scp_ffi_common::context_state_str(&other)
+            ))),
+            None => Err(mk_err(format!(
+                "context '{context_id}' has no live supervisor state — refusing to run a \
+                 lifecycle-gated operation against a context no actor serves"
+            ))),
+        }
     }
 
     /// Per-instance equivalent of the module-level
