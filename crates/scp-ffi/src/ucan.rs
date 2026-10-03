@@ -575,6 +575,9 @@ impl crate::scp::PyScp {
     /// context, or when its state read or role-state read fails; the message
     /// withholds the lifecycle state and the read failure.
     ///
+    /// Raises `ContextError` with `SCP-CTX-2001` when the supervisor admits the
+    /// context but this bridge holds no state for it.
+    ///
     /// See ADR-013 §6 and SCP-214 criterion 7.
     #[pyo3(signature = (context_id, member_did, capabilities, proofs=None))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec/Option<Vec> for method arguments.
@@ -597,7 +600,7 @@ impl crate::scp::PyScp {
             }
         }
         // The issuer is the context creator, and the ceiling bounds what may be
-        // minted (#339). Both come from the supervisor actor: a `ModifyCeiling`
+        // minted. Both come from the supervisor actor: a `ModifyCeiling`
         // narrows what a mint may grant, and a context no actor serves refuses.
         let live_role_state = active_ucan_role_state(bi, context_id, "mint a UCAN in context")?;
         require_revocable_ucan_context(bi, context_id)?;
@@ -689,6 +692,9 @@ impl crate::scp::PyScp {
     /// context, or when its state read or role-state read fails; the message
     /// withholds the lifecycle state and the read failure.
     ///
+    /// Raises `ContextError` with `SCP-CTX-2001` when the supervisor admits the
+    /// context but this bridge holds no state for it.
+    ///
     /// See ADR-016 criterion 4 and SCP-214 criterion 8.
     // PyO3 requires owned types for method arguments.
     #[allow(clippy::needless_pass_by_value)]
@@ -708,7 +714,7 @@ impl crate::scp::PyScp {
         for cap in &capabilities {
             validate::validate_capability_uri(cap)?;
         }
-        // The ceiling bounds what a delegation may carry (#339); it comes from the
+        // The ceiling bounds what a delegation may carry; it comes from the
         // supervisor actor so a narrowed ceiling binds the next delegation. Read
         // BEFORE the parent parse: an unknown or actor-less context refuses on its
         // own account rather than on the shape of a caller-supplied token.
@@ -813,6 +819,9 @@ impl crate::scp::PyScp {
     /// context, or when its state read or role-state read fails; the message
     /// withholds the lifecycle state and the read failure.
     ///
+    /// Raises `ContextError` with `SCP-CTX-2001` when the supervisor admits the
+    /// context but this bridge holds no state for it.
+    ///
     /// See ADR-016 acceptance criterion 5. Closes #499.
     pub fn ucan_revoke(&self, context_id: &str, token: &str, revoker_did: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -827,6 +836,8 @@ impl crate::scp::PyScp {
         // caller-supplied token.
         let creator_did =
             active_ucan_role_state(bi, context_id, "revoke a UCAN in context")?.creator_did;
+        // A context this bridge holds no state for also refuses before the parse.
+        require_revocable_ucan_context(bi, context_id)?;
 
         // Parse the token to extract the issuer DID for authorization.
         let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
@@ -1379,13 +1390,14 @@ mod tests {
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
-    /// `ucan_mint` and `ucan_delegate` refuse a context the supervisor serves as
-    /// `Active` when this bridge holds no `FfiBridgeState` for it, the state an
-    /// import or a restore leaves on this bridge. `ucan_revoke` writes the
-    /// revocation list that state holds, so a token either call issued there
-    /// could not be revoked on this bridge.
+    /// `ucan_mint`, `ucan_delegate` and `ucan_revoke` refuse a context the
+    /// supervisor serves as `Active` when this bridge holds no `FfiBridgeState`
+    /// for it, the state an import or a restore leaves on this bridge, with
+    /// `ContextError` `SCP-CTX-2001`. `ucan_revoke` writes the revocation list
+    /// that state holds, so a token mint or delegate issued there could not be
+    /// revoked on this bridge.
     #[test]
-    fn ucan_mint_and_delegate_refuse_a_context_this_bridge_holds_no_state_for() {
+    fn ucan_mint_delegate_and_revoke_refuse_a_context_this_bridge_holds_no_state_for() {
         let creator = "did:dht:z6MkUcanNoBridgeState";
         crate::init_runtime().ok();
         let scp = crate::scp::PyScp::new_in_memory_for_test();
@@ -1406,7 +1418,7 @@ mod tests {
             "the fixture must leave the actor Active, so only the state check refuses"
         );
 
-        let refusals: [(&str, PyResult<()>); 2] = [
+        let refusals: [(&str, PyResult<()>); 3] = [
             (
                 "mint",
                 scp.ucan_mint(
@@ -1428,6 +1440,7 @@ mod tests {
                 )
                 .map(drop),
             ),
+            ("revoke", scp.ucan_revoke(&ctx_id, "aaa.bbb.ccc", creator)),
         ];
         for (entry_point, result) in refusals {
             let message = format!(
@@ -1435,7 +1448,8 @@ mod tests {
                 result.expect_err("a context with no bridge state must refuse")
             );
             assert!(
-                message.contains("not found in FFI state registry"),
+                message.contains("SCP-CTX-2001")
+                    && message.contains("not found in FFI state registry"),
                 "{entry_point} must refuse at the bridge-state check: {message}"
             );
         }
