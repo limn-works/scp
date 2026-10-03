@@ -4260,46 +4260,54 @@ mod tests {
         );
     }
 
+    /// Polls `reconnect` exactly once and asserts it is still pending.
+    ///
+    /// `reconnect_transport_if_pending` runs synchronously from entry
+    /// through the `is_shutdown()` check, the reconnect-cancel token
+    /// snapshot and the dial spawns until it parks in its collect
+    /// `select!`. A pending first poll therefore proves the reconnect is
+    /// in flight past the shutdown check, holding the token that a later
+    /// `suspend()` / `shutdown()` cancels, whatever the scheduler does
+    /// with the spawned dial tasks.
+    async fn poll_reconnect_into_dial<F>(reconnect: &mut std::pin::Pin<&mut F>)
+    where
+        F: std::future::Future<Output = Result<(), LifecycleError>>,
+    {
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(reconnect.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "reconnect must park in its dial phase on the first poll, got {first:?}"
+        );
+    }
+
     #[tokio::test]
     async fn suspend_cancels_in_flight_reconnect_dial() {
-        // #1696 regression: a `suspend()` firing while
-        // `reconnect_transport_if_pending` is mid-dial must cancel the
-        // reconnect so the half-connected adapter is dropped before
-        // `NativeRelayAdapter` construction completes — preventing the
-        // socket leak that motivated #1696. We can't directly observe
-        // an OS-level socket handle in a unit test, but we can prove
-        // the cancellation path fires and aborts the loop: the dial
-        // target is unreachable so the future is "in-flight" until
-        // connect timeout, giving us a window to cancel.
+        // A `suspend()` firing while `reconnect_transport_if_pending` is
+        // mid-dial must cancel the reconnect so the half-connected adapter
+        // is dropped before `NativeRelayAdapter` construction completes,
+        // preventing the socket leak behind the cancellation token. A unit
+        // test cannot observe an OS-level socket handle, but it can prove
+        // the cancellation path fires and aborts the collect loop.
         use std::time::Duration;
 
-        let instance = std::sync::Arc::new(CoreFields::with_supervisor(test_supervisor()));
-        // Reserved TEST-NET-1 address (RFC 5737) with a closed port —
-        // `connect_sourced` stalls until the profile's handshake timeout.
-        let unreachable = "ws://192.0.2.1:1/".to_owned();
-        instance.add_relay_url(unreachable.clone());
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        // Reserved TEST-NET-1 address (RFC 5737) with a closed port.
+        instance.add_relay_url("ws://192.0.2.1:1/".to_owned());
 
-        let instance_clone = std::sync::Arc::clone(&instance);
-        let reconnect_handle =
-            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
+        let reconnect = instance.reconnect_transport_if_pending();
+        tokio::pin!(reconnect);
+        poll_reconnect_into_dial(&mut reconnect).await;
 
-        // Give the reconnect a moment to enter the dial. Spawn order
-        // does not guarantee the future has polled through `.await`
-        // yet, so sleep a short tick before firing suspend.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Fire suspend — rotates the reconnect-cancel token and
-        // cancels the in-flight dial.
+        // Fire suspend: cancels the token the reconnect snapshotted and
+        // rotates in a fresh one.
         instance.suspend().unwrap();
 
-        // The reconnect must wake on cancellation promptly — with a
-        // generous upper bound to tolerate slow CI runners. The
-        // production handshake timeout would be on the order of
-        // seconds, so anything inside ~1s proves the cancellation
-        // actually fired rather than the dial naturally timing out.
-        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
+        // The collect `select!` is biased toward the cancel branch, so
+        // the next poll takes it even if a dial has already finished.
+        // The bound only guards against a hang.
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect)
             .await
-            .unwrap()
             .unwrap();
 
         assert!(
@@ -4317,25 +4325,26 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_in_flight_reconnect_dial() {
-        // #1696: `shutdown()` must also cancel a pending reconnect.
-        // Same dynamics as the suspend variant — uses the same TEST-NET-1
-        // unreachable target to keep the dial in-flight.
+        // `shutdown()` must also cancel a pending reconnect. Same dynamics
+        // as the suspend variant. `shutdown()` reaches `block_in_place`
+        // through the supervisor's sync flush, so this test needs the
+        // multi-thread runtime.
         use std::time::Duration;
 
-        let instance = std::sync::Arc::new(CoreFields::with_supervisor(test_supervisor()));
-        let unreachable = "ws://192.0.2.1:1/".to_owned();
-        instance.add_relay_url(unreachable);
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance.add_relay_url("ws://192.0.2.1:1/".to_owned());
 
-        let instance_clone = std::sync::Arc::clone(&instance);
-        let reconnect_handle =
-            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
+        let reconnect = instance.reconnect_transport_if_pending();
+        tokio::pin!(reconnect);
+        // Shutting down before the reconnect passes its `is_shutdown()`
+        // check would make it return `AlreadyShutDown` instead of
+        // exercising cancellation; the pending first poll rules that out.
+        poll_reconnect_into_dial(&mut reconnect).await;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         instance.shutdown();
 
-        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect)
             .await
-            .unwrap()
             .unwrap();
 
         assert!(
