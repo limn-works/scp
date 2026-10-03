@@ -3349,7 +3349,7 @@ def condition_assignments(doc: dict) -> list[tuple[dict[str, str], str]]:
 # dependency reported, and `!cancelled()` evaluates true unless someone cancelled the
 # run. `success()`, `failure()` and `cancelled()` each evaluate false over a skipped
 # dependency, so a job naming one of those three still skips when a job in its `needs`
-# list skips, and the union comparison below still binds it. Job `ci` is the only job
+# list skips. Job `ci` is the only job
 # in ci.yml that names a status check function today: it aggregates results and has to
 # run over a skipped dependency to judge it, so it writes `always()`.
 #
