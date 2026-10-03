@@ -1341,8 +1341,12 @@ mod tests {
     // bridge copy `FfiBridgeState.ceiling_strings` carries `default_ceiling()`
     // and `FfiBridgeState.creator_did` names the registering DID. The UCAN entry
     // points read neither copy: `ucan_mint_reads_the_supervisor_creator_as_issuer`
-    // fails when the mint reads the copied creator, and the e2e tests named
-    // below fail when a ceiling read goes back to the copied ceiling.
+    // fails when the mint reads the copied creator,
+    // `ucan_revoke_authorizes_the_supervisor_creator_not_the_bridge_copy` when
+    // the revoke does, the e2e_bridge.rs test
+    // `ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_bridge_copy`
+    // when validate or evaluate does, and the e2e tests named below fail when
+    // a ceiling read goes back to the copied ceiling.
     // The absence tests below build a context no supervisor actor serves, so
     // each entry point refuses at `active_ucan_role_state`, the lifecycle gate
     // that runs before the live role-state read; the refusal carries
