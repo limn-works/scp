@@ -1415,7 +1415,7 @@ impl Drop for McpClientState {
 /// because that would deny working functionality over an optional feature:
 /// the server still serves `tools/list` and `resources/list|read`. It runs a
 /// `tools/call` only with a supervisor attached; with none, it refuses every
-/// `tools/call` (`ContextManager not yet attached`).
+/// `tools/call`.
 ///
 /// One call decides both halves: the server that advertises
 /// `resources.subscribe` and the pump that honours it, folded into one
