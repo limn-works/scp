@@ -3057,7 +3057,11 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// on it), and `let bi` and `let mut bi` together occur exactly as often as
 /// the pins bind `bi` or `bi_arc`, so no other `let` rebinds either name
 /// before the call. A rebinding through a pattern, closure parameter or
-/// `match` arm is not checked.
+/// `match` arm is not checked, and neither is a rebinding of `provider`: the
+/// gate does not check that the `provider` passed to the pinned call is the
+/// struct literal carrying the pinned `Weak`, so a `let`, pattern or closure
+/// parameter that rebinds `provider` over another instance before the call
+/// passes.
 ///
 /// "The Supervisor's receiver" is pinned by the `match` that binds it: its
 /// scrutinee is exactly `supervisor_of_bi`, the bridge's accessor for its own
@@ -3319,9 +3323,11 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
 
 /// The event-source gate must go red when the serve path hands
 /// `mcp_server_bundle` an instance other than the one its provider reads:
-/// another instance in the call, a provider over another instance, `bi`
-/// rebound (by `let` or `let mut`) before the call, or a second call over
-/// another instance, in the serve function or in another production function.
+/// another instance in the call, the pinned provider literal's `Weak` over
+/// another instance, `bi` rebound (by `let` or `let mut`) before the call, or a
+/// second call over another instance, in the serve function or in another
+/// production function. A `provider` rebound before the call is not checked
+/// (see [`serves_the_supervisor_event_source`]).
 #[test]
 fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
     let wired = WIRED_BUNDLE;
@@ -4521,11 +4527,8 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
         );
     }
 
-    let server = production_code(include_str!("../../../../crates/scp-mcp/src/server.rs"));
     assert!(
-        fn_body(&server, "check_access")
-            .and_then(events_and_members_arm)
-            .is_some_and(checks_messages_read),
+        arm_checks_messages_read(include_str!("../../../../crates/scp-mcp/src/server.rs")),
         "`ResourceKind::check_access` must authorize the events/members resources, \
          in their own `Self::Events | Self::Members =>` arm, \
          against the real capability catalogue (spec §5.5.1, Default Role Set: an observer, whose only \
