@@ -6310,8 +6310,8 @@
         },
         "references": [
           "§17.5 — Serialization: the platform-encryption table's Android row makes StrongBox opt-in for the SQLCipher key",
-          "§17.8 — Platform-specific key custody: the Android row names the Keystore for a signing key, a passkey through the platform provider for a root key, P-256 signing and DHKEM(P-256), and StrongBox as opt-in",
-          "§9.7.4.1 — Pre-rotation key custody: item 4 places the root in the platform credential provider as a passkey",
+          "§17.8 — Platform-specific key custody: the Android row",
+          "§9.7.4.1 — Pre-rotation key custody: item 4",
           "§9.12 — Compromise recovery",
           "§9.15 — Key destruction verification",
           "ADR-025 — Apple adapter as parallel reference"
@@ -6514,7 +6514,7 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "Mirrors SCP-097 (Apple platform module root). Creates conditional compilation module root for Android platform adapters. It stays done while SCP-110, SCP-111, SCP-112 and SCP-113 are in progress: its criteria judge the Rust module root in crates/scp-platform/src/android/mod.rs, not the Kotlin adapter behaviour those stories hold open."
+        "note": "Mirrors SCP-097 (Apple platform module root). Creates conditional compilation module root for Android platform adapters."
       }
     },
     {
@@ -6558,7 +6558,7 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints. It stays done while SCP-110 is in progress: its criteria judge the dispatch and cancellation of CoroutineBridge.kt, not the Kotlin Android adapters SCP-110 holds open.",
+        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
         "expectedDecisions": {
           "dispatcherStrategy": "Which operations run on Dispatchers.IO vs Dispatchers.Default"
         },
