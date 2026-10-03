@@ -3,7 +3,9 @@
 # Auto-formats staged files and re-stages them. Lint errors block the commit.
 set -euo pipefail
 
-STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+# `STAGED` holds deleted paths too, and `--no-renames` lists a renamed file as a deletion
+# plus an addition, so a commit that only deletes or moves files still runs the hook.
+STAGED=$(git diff --cached --name-only --no-renames --diff-filter=ACMD)
 [ -z "$STAGED" ] && exit 0
 
 # ── Which files this commit changes, for the language steps ──
@@ -19,17 +21,26 @@ STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 #
 # `STAGED` still decides the early exit above, so the toolchain check below runs on every
 # commit that stages a file, merge or not.
+#
+# The list also holds deleted paths, and `--no-renames` lists a renamed file as its deleted
+# old path plus its added new path. A commit that deletes a `.rs` file or moves one out of a
+# crate changes what that crate compiles, so the clippy scope below has to see the crate.
+#
+# `changed_paths` prints the list. The hook calls it twice: once here, and again after the
+# auto-format step, because `git add -u` in that step stages every tracked `.rs` file the
+# working tree modified, and the clippy scope has to cover each file the commit will hold.
 MERGE_HEAD_FILE=$(git rev-parse --git-path MERGE_HEAD)
-if [ -f "$MERGE_HEAD_FILE" ]; then
-  CHANGED=""
-  while IFS= read -r merged_head; do
-    [ -z "$merged_head" ] && continue
-    CHANGED="$CHANGED
-$(git diff --cached --name-only --diff-filter=ACM "$merged_head")"
-  done < "$MERGE_HEAD_FILE"
-else
-  CHANGED=$STAGED
-fi
+changed_paths() {
+  if [ -f "$MERGE_HEAD_FILE" ]; then
+    while IFS= read -r merged_head; do
+      [ -z "$merged_head" ] && continue
+      git diff --cached --name-only --no-renames --diff-filter=ACMD "$merged_head"
+    done < "$MERGE_HEAD_FILE"
+  else
+    git diff --cached --name-only --no-renames --diff-filter=ACMD
+  fi
+}
+CHANGED=$(changed_paths)
 
 HAS_RUST=false
 HAS_PYTHON=false
@@ -106,12 +117,34 @@ fi
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# ── Which workspace members clippy lints ──
+#
+# `scripts/pre-commit-clippy-scope.py` reads the changed paths and prints the clippy package
+# arguments: each workspace member holding a changed path plus every member that depends on
+# one of them, or `--workspace` when a changed path such as `Cargo.toml`, `Cargo.lock`, or
+# `rust-toolchain.toml` can change lints for members the commit did not touch. The script's
+# module docstring states that criterion and lists the paths that meet it. The script keeps
+# only the `CLIPPY_FEATURES` entries whose package it selects, because cargo rejects a
+# feature of a package the command does not select. It prints nothing when no changed path
+# sits in a workspace member, such as a commit touching only `fuzz/`, and clippy then does
+# not run. CI's `rust-clippy` job lints the whole workspace on every pushed head.
+CLIPPY_FEATURES=scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing
+
 if $HAS_RUST; then
   (
     echo "▸ Rust: clippy + protocol enforcement"
-    cargo clippy --workspace --all-targets \
-      --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing \
-      -- -D warnings 2>&1 || { echo "  ✗ clippy failed"; exit 1; }
+    SCOPE=$(changed_paths | python3.12 scripts/pre-commit-clippy-scope.py --features "$CLIPPY_FEATURES") \
+      || { echo "  ✗ clippy scope failed"; exit 1; }
+    CLIPPY_ARGS=()
+    while IFS= read -r arg; do
+      if [ -n "$arg" ]; then CLIPPY_ARGS+=("$arg"); fi
+    done <<< "$SCOPE"
+    if [ "${#CLIPPY_ARGS[@]}" -eq 0 ]; then
+      echo "  clippy skipped: no changed path is in a workspace member"
+    else
+      cargo clippy "${CLIPPY_ARGS[@]}" --all-targets -- -D warnings 2>&1 \
+        || { echo "  ✗ clippy failed"; exit 1; }
+    fi
     python3.12 scripts/check-protocol-sync.py 2>&1 || { echo "  ✗ async code in scp-protocol"; exit 1; }
     bash scripts/check-protocol-deps.sh 2>&1 || { echo "  ✗ banned deps in scp-protocol"; exit 1; }
   ) > "$TMPDIR/rust.log" 2>&1 && touch "$TMPDIR/rust.ok" &

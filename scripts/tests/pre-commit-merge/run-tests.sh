@@ -6,10 +6,12 @@
 # merge, when the commit stages a Rust file at all. A merge that brings in a branch's Rust
 # unchanged runs neither step, because that branch's CI already ran both over those files.
 #
-# Each case builds a throwaway repository in `mktemp -d`, copies the real hook into it, and
-# commits through that hook. `cargo` and `python3.12` are stubs on PATH that record their
-# arguments and exit 0, so no case compiles anything; the case reads the record to learn
-# which steps ran. `scripts/check-resolved-rustc.sh` and `scripts/check-protocol-deps.sh`
+# Each case builds a throwaway repository in `mktemp -d`, copies the real hook and the real
+# `scripts/pre-commit-clippy-scope.py` into it, and commits through that hook. `cargo` and
+# `python3.12` are stubs on PATH that record their arguments and exit 0, so no case
+# compiles anything; the case reads the record to learn which steps ran. The `python3.12`
+# stub runs the real interpreter for the scope script, and the `cargo` stub answers
+# `cargo metadata` with a one-member workspace at the fixture root. `scripts/check-resolved-rustc.sh` and `scripts/check-protocol-deps.sh`
 # in the fixture are stubs that record the same way, so each case can also assert that the
 # toolchain check ran on every commit.
 set -euo pipefail
@@ -27,15 +29,30 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OB
 
 STUBS="$WORK/bin"
 LOG="$WORK/calls.log"
+SCOPE="$(cd "$(dirname "$0")/../.." && pwd)/pre-commit-clippy-scope.py"
+REAL_PYTHON="$(command -v python3.12)"
 mkdir -p "$STUBS"
-for tool in cargo python3.12; do
-    cat > "$STUBS/$tool" <<EOF
+# The hook's clippy scope script asks `cargo metadata` for the member graph. The stub
+# answers with one workspace member at the fixture root, so every changed `.rs` file in the
+# fixture selects that member, and the stub runs the real interpreter for that script only.
+cat > "$STUBS/cargo" <<EOF
 #!/usr/bin/env bash
-echo "$tool \$*" >> "$LOG"
+echo "cargo \$*" >> "$LOG"
+if [ "\${1:-}" = metadata ]; then
+  root="\$(pwd -P)"
+  printf '{"workspace_root":"%s","workspace_members":["fixture"],"packages":[{"name":"fixture","id":"fixture","manifest_path":"%s/Cargo.toml","dependencies":[]}]}\n' "\$root" "\$root"
+fi
 exit 0
 EOF
-    chmod +x "$STUBS/$tool"
-done
+cat > "$STUBS/python3.12" <<EOF
+#!/usr/bin/env bash
+echo "python3.12 \$*" >> "$LOG"
+if [ "\${1:-}" = scripts/pre-commit-clippy-scope.py ]; then
+  exec "$REAL_PYTHON" "\$@"
+fi
+exit 0
+EOF
+chmod +x "$STUBS/cargo" "$STUBS/python3.12"
 export PATH="$STUBS:$PATH"
 
 g() { git -c commit.gpgsign=false -c core.hooksPath=scripts/hooks "$@"; }
@@ -49,6 +66,7 @@ new_repo() {
     git config user.name "pre-commit-merge test"
     git config user.email "test@example.invalid"
     cp "$HOOK" scripts/hooks/pre-commit
+    cp "$SCOPE" scripts/pre-commit-clippy-scope.py
     chmod +x scripts/hooks/pre-commit
     for stub in check-resolved-rustc.sh check-protocol-deps.sh; do
         printf '#!/usr/bin/env bash\necho "%s" >> "%s"\nexit 0\n' "$stub" "$LOG" > "scripts/$stub"
