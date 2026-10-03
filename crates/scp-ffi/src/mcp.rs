@@ -1214,8 +1214,7 @@ pub(crate) struct McpClientState {
 
 /// The server end an [`McpClientState`]'s [`Drop`] stops.
 enum ClientServer {
-    /// A stdio client's subprocess, killed with its process group; a call
-    /// waiting on its stdout then fails on EOF.
+    /// A stdio client's subprocess, killed with its process group.
     Stdio(Arc<Mutex<Option<Child>>>),
     /// An SSE client's closer, which shuts down the `GET` stream and every
     /// POST a call waits on; that call then fails as closed.
