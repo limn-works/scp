@@ -1071,18 +1071,30 @@ mod tests {
     /// A disconnect kills the server's whole process group, so a process the
     /// server started that inherited its stdout (the real server under a
     /// launcher such as `npx`) no longer holds the pipe open, and a reader
-    /// waiting on that stdout sees EOF.
+    /// waiting on that stdout sees EOF. The stand-in writes `ready` only after
+    /// `sh` has forked `sleep`, and the test reads that line before the stop,
+    /// so a second process holds the pipe when the stop runs: killing only
+    /// the direct child leaves `sleep` holding it, and the bounded wait fails.
     #[cfg(unix)]
     #[test]
     fn stop_server_process_kills_the_group_holding_the_stdout_pipe() {
         let mut command = std::process::Command::new("sh");
         command
-            .args(["-c", "sleep 600 & wait"])
+            .args(["-c", "sleep 600 & echo ready; wait"])
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped());
+            .stdout(std::process::Stdio::piped())
+            // A `sleep` a broken stop leaves behind must not hold the test
+            // harness's stderr open for ten minutes after the failure.
+            .stderr(std::process::Stdio::null());
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command.spawn().expect("spawn server stand-in");
-        let mut stdout = child.stdout.take().expect("stdout");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+        let mut marker = String::new();
+        std::io::BufRead::read_line(&mut stdout, &mut marker).expect("read readiness marker");
+        assert_eq!(
+            marker, "ready\n",
+            "sh must report that sleep holds the pipe"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut sink = Vec::new();
