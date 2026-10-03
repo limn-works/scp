@@ -191,9 +191,7 @@ A new job in `.github/workflows/ci.yml`:
 
 - Triggers when `python`, `typescript`, or `rust` paths change.
 - Sets up Python 3.12 and Bun. The job installs no Rust toolchain, because it
-  runs no cargo command: job `pyo3-module` and job `napi-addon` build the two
-  native bridges once per workflow run, and every job that needs one downloads
-  it.
+  runs no cargo command.
 - Downloads the PyO3 extension module that job `pyo3-module` built with
   `maturin develop --release --features testing` and uploaded as artifact
   `pyo3-module-linux`.

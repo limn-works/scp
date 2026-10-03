@@ -1885,11 +1885,10 @@ jobs:
 
   # ── Shared bridge artifacts ─────────────────────────────────────────
   #
-  # THE CRITERION: a run compiles each bridge artifact once per runner OS, and every
-  # other job that needs that artifact downloads it. Two jobs may share one build only
-  # when both would run the same command with the same cargo feature resolution on the
-  # same runner OS, because cargo hashes the feature set into every artifact's metadata
-  # and a bridge built with `testing` behaves differently from one built without it.
+  # THE CRITERION: two jobs may share one build only when both would run the same
+  # command with the same cargo feature resolution on the same runner OS, because
+  # cargo hashes the feature set into every artifact's metadata and a bridge built
+  # with `testing` behaves differently from one built without it.
   #
   # WHAT THE DUPLICATES COST. Profiled on run 34805871209, the push to `main` for the
   # commit that cut 46 crates from the cold workspace test compile: `maturin develop
