@@ -4725,9 +4725,9 @@ impl Drop for McpClientEntry {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
         // The transport is closed once the entry drops, even while a call on
-        // the handle is in flight: a stdio server's process group is dead
-        // and the call fails on the closed stdout, or an SSE client's sockets
-        // are shut down and the call fails as closed.
+        // the handle is in flight: a stdio server's process group is dead,
+        // or an SSE client's sockets are shut down and the call fails as
+        // closed.
         self.closer.close();
     }
 }
@@ -16959,8 +16959,8 @@ impl Scp {
     /// another instance returned is not found. Dropping the
     /// entry closes the client's transport, even while a call on the handle
     /// is in flight. A stdio client's server process group, which holds the
-    /// processes the server started, is dead when this returns, and the
-    /// call fails on the closed stdout. An SSE client's POST and `GET`
+    /// processes the server started, is dead when this returns. An SSE
+    /// client's POST and `GET`
     /// sockets are shut down, and the call fails as closed. A call queued
     /// behind the in-flight one, on a stdio or an SSE client, fails as
     /// disconnected once it takes the client's lock and sends nothing. A
