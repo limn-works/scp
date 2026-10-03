@@ -2047,7 +2047,10 @@ where
 ///
 /// Returns whatever `mk_err` builds when the supervisor reports any state other
 /// than `Active`, when no actor serves `context_id`, and when the state read
-/// fails.
+/// fails. Returns [`ScpNapiError::Context`] with `SCP-CTX-2000` when this
+/// bridge has no supervisor or is suspended (call `resume()` and retry); that
+/// refusal describes this bridge's own state, not the context, so it passes
+/// through unchanged.
 pub async fn require_active_context_before_authz<F>(
     bi: &NapiBridgeInstance,
     context_id: &str,
@@ -2057,7 +2060,11 @@ pub async fn require_active_context_before_authz<F>(
 where
     F: FnOnce(String) -> ScpNapiError,
 {
-    let state = read_live_context_state(bi, context_id).await;
+    let sup = Arc::clone(typed_supervisor(bi)?);
+    let state = sup
+        .read_context_state_checked(context_id)
+        .await
+        .map_err(ScpNapiError::from);
     if let Err(ref e) = state {
         tracing::debug!(
             context_id,
@@ -2085,7 +2092,7 @@ where
 /// # Errors
 ///
 /// Returns whatever `mk_err` builds when `read` is an error.
-pub fn withhold_read_after_authz_gate<T, F>(
+pub fn withhold_read_before_authz<T, F>(
     context_id: &str,
     read: Result<T, ScpNapiError>,
     verb: &str,
@@ -2919,6 +2926,49 @@ mod tests {
         }
     }
 
+    /// The pre-authorization gate passes the `SCP-CTX-2000` refusal through
+    /// for a bridge with no supervisor and for a suspended bridge, so the
+    /// caller reads "call `resume()`" rather than "context is not active", and
+    /// admits the same Active context once the bridge resumes.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_authz_gate_passes_the_bridge_local_ctx_2000_refusal_through() {
+        let bi = NapiBridgeInstance::new_napi();
+        let err = require_active_context_before_authz(&bi, "ctx-none", "probe", caller_refusal)
+            .await
+            .expect_err("a bridge with no supervisor must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("Supervisor not yet attached")),
+            "expected the no-supervisor SCP-CTX-2000 refusal, got {err:?}"
+        );
+
+        init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-preauthz-suspended-{}", uuid::Uuid::new_v4());
+        create_supervisor_context_for_test(&bi, &ctx_id, "did:key:z6MkNapiPreAuthzSuspend")
+            .await
+            .expect("test supervisor context creation must succeed");
+        bi.core.suspend().expect("suspend");
+        let err = require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a suspended bridge must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("bridge is suspended")),
+            "expected the suspended SCP-CTX-2000 refusal, got {err:?}"
+        );
+        assert!(
+            !err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a suspended bridge must not report the context as not active: {err}"
+        );
+
+        bi.core.resume().await.expect("resume");
+        require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+            .await
+            .expect("the gate must admit the Active context after resume");
+    }
+
     /// A supervisor read that fails after the gate passed becomes the same
     /// withheld refusal, and a read that succeeds passes through unchanged.
     ///
@@ -2945,7 +2995,7 @@ mod tests {
         ] {
             let raw_text = raw.to_string();
             let err =
-                withhold_read_after_authz_gate::<(), _>(ctx_id, Err(raw), "probe", caller_refusal)
+                withhold_read_before_authz::<(), _>(ctx_id, Err(raw), "probe", caller_refusal)
                     .expect_err("a failed read must stay a refusal");
             let text = err.to_string();
             assert!(
@@ -2962,7 +3012,7 @@ mod tests {
         }
 
         assert_eq!(
-            withhold_read_after_authz_gate(ctx_id, Ok(7_u8), "probe", caller_refusal)
+            withhold_read_before_authz(ctx_id, Ok(7_u8), "probe", caller_refusal)
                 .expect("a successful read passes through"),
             7
         );
