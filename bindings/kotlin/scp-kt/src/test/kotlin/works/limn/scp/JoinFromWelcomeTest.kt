@@ -84,7 +84,9 @@ class JoinFromWelcomeTest {
 
         /**
          * Length in bytes of an RFC 9180 HPKE encapsulated key under DHKEM
-         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses.
+         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses. A join
+         * boundary validates `SealedInvitation.enc` against exactly this many
+         * bytes.
          */
         private const val HPKE_ENCAPSULATED_KEY_BYTES = 32
 
@@ -257,6 +259,8 @@ class JoinFromWelcomeTest {
                     sealed.enc.size,
                     "the HPKE encapsulated key must be 32 bytes (RFC 9180 DHKEM X25519)",
                 )
+                // `ct = ciphertext || tag`, so real sealing never yields an
+                // empty ciphertext.
                 assertTrue(
                     sealed.ciphertext.isNotEmpty(),
                     "the sealed Welcome ciphertext must be non-empty",

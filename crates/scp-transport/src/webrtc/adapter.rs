@@ -15,7 +15,7 @@
 //!
 //! The adapter orchestrates SCP message framing over a pluggable
 //! [`DataChannelProvider`]. Platform code implements the provider trait
-//! with the actual WebRTC stack (webrtc-rs, web_sys, etc.). The adapter
+//! with an actual WebRTC stack (webrtc-rs, `web_sys`, etc.). That adapter
 //! handles serialization, routing, and the `TransportAdapter` contract.
 //!
 //! # Connection Model
@@ -77,7 +77,7 @@ struct PeerConnectionState {
 ///
 /// Implements [`TransportAdapter`] by mapping SCP operations to WebRTC data
 /// channel operations via an injected [`DataChannelProvider`]. The adapter
-/// handles SCP message framing (MessagePack serialization) and delegates
+/// handles SCP message framing (`MessagePack` serialization) and delegates
 /// actual data transport to the provider.
 ///
 /// # Lifecycle
@@ -188,6 +188,7 @@ impl WebRtcAdapter {
         *peer_guard = Some(PeerConnectionState {
             ice_state: IceConnectionState::Connected,
         });
+        drop(peer_guard);
 
         Ok(())
     }
@@ -195,9 +196,13 @@ impl WebRtcAdapter {
     /// Check that the peer connection is in a usable ICE state.
     async fn check_ice_state(&self) -> Result<(), TransportError> {
         let peer_guard = self.peer.lock().await;
-        let peer = peer_guard.as_ref().ok_or(TransportError::NotConnected)?;
+        let ice_state = peer_guard
+            .as_ref()
+            .ok_or(TransportError::NotConnected)?
+            .ice_state;
+        drop(peer_guard);
 
-        match peer.ice_state {
+        match ice_state {
             IceConnectionState::Connected | IceConnectionState::Completed => Ok(()),
             _ => Err(TransportError::NotConnected),
         }
@@ -443,7 +448,7 @@ mod tests {
 
     /// A mock data channel provider for testing.
     /// Channels are in-memory mpsc queues keyed by label.
-    pub(crate) struct MockDataChannelProvider {
+    pub struct MockDataChannelProvider {
         channels: TokioMutex<HashMap<String, MockChannel>>,
     }
 
@@ -481,6 +486,7 @@ mod tests {
                     buffer: std::collections::VecDeque::new(),
                     open: true,
                 });
+                drop(channels);
                 Ok(())
             })
         }
@@ -501,6 +507,7 @@ mod tests {
                     return Err(TransportError::NotConnected);
                 }
                 ch.buffer.push_back(data);
+                drop(channels);
                 Ok(())
             })
         }
@@ -521,10 +528,13 @@ mod tests {
                 let ch = channels
                     .get_mut(&label)
                     .ok_or(TransportError::NotConnected)?;
-                if !ch.open && ch.buffer.is_empty() {
-                    return Ok(None);
-                }
-                Ok(ch.buffer.pop_front())
+                let item = if ch.open || !ch.buffer.is_empty() {
+                    ch.buffer.pop_front()
+                } else {
+                    None
+                };
+                drop(channels);
+                Ok(item)
             })
         }
 
@@ -539,6 +549,7 @@ mod tests {
                 if let Some(ch) = channels.get_mut(&label) {
                     ch.open = false;
                 }
+                drop(channels);
                 Ok(())
             })
         }
@@ -571,8 +582,7 @@ mod tests {
     async fn webrtc_adapter_creation() {
         let (adapter, _, _) = make_adapter();
         // Adapter created without connecting.
-        let peer = adapter.peer.lock().await;
-        assert!(peer.is_none());
+        assert!(adapter.peer.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -590,6 +600,7 @@ mod tests {
             }
             other => panic!("expected Offer, got {other:?}"),
         }
+        drop(outbound);
 
         // Verify peer connection is established.
         let peer = adapter.peer.lock().await;
@@ -598,6 +609,7 @@ mod tests {
             peer.as_ref().unwrap().ice_state,
             IceConnectionState::Connected
         );
+        drop(peer);
     }
 
     #[tokio::test]
@@ -633,12 +645,13 @@ mod tests {
     }
 
     /// WebRTC peers are untrusted (TURN/STUN-relayed), so the data channel
-    /// handler must reject oversized payloads before calling the MessagePack
+    /// handler must reject oversized payloads before calling any `MessagePack`
     /// deserializer. `OuterEnvelope::from_bytes` provides this guard via
     /// `MAX_ENVELOPE_SIZE`. Regression test for the bypass path identified in
     /// PR #1644.
     #[tokio::test]
     async fn webrtc_rejects_oversized_envelope() {
+        use futures::StreamExt as _;
         use scp_core::serde_util::MAX_ENVELOPE_SIZE;
 
         let (adapter, _, provider) = make_adapter();
@@ -656,7 +669,6 @@ mod tests {
 
         // Pull one item from the subscription stream.
         let mut stream = adapter.subscribe(&routing_id, None).await.unwrap();
-        use futures::StreamExt as _;
         let event = stream.next().await.expect("stream should yield an event");
 
         // Must be a ProtocolError, not a panic or a successful parse.
@@ -707,6 +719,7 @@ mod tests {
         let channels = provider.channels.lock().await;
         let ch = channels.get(&routing_id_hex).unwrap();
         assert_eq!(ch.buffer.len(), 1);
+        drop(channels);
 
         // Verify the blob ID is correct.
         let wire_bytes = rmp_serde::to_vec_named(&envelope).unwrap();

@@ -20,7 +20,7 @@ use std::time::Duration;
 use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownError};
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
 
@@ -337,11 +337,12 @@ impl Scp {
         let (_sign, value, _lossless) = timeout_millis.get_u64();
         let timeout = Duration::from_millis(value);
         match self.inner.shutdown(timeout).await {
-            Ok(_) => Ok(()),
             // `AlreadyShutDown` is treated as a harmless lifecycle
             // observation — double-shutdown is idempotent at the SDK
-            // surface.
-            Err(_already) => Ok(()),
+            // surface. No wildcard arm: a new ShutdownError variant must
+            // fail to compile here until it is mapped to a JS error, instead
+            // of reporting a live engine as shut down.
+            Ok(_) | Err(ShutdownError::AlreadyShutDown) => Ok(()),
         }
     }
 
