@@ -972,8 +972,11 @@ impl<S: Storage> StorageProvider<CURRENT_VERSION> for MlsStorageBridge<S> {
 /// `ScpMlsProvider<S>` is the persistent counterpart of
 /// [`scp_mls::provider::InMemoryMlsProvider`]: it keeps MLS state through
 /// [`MlsStorageBridge<S>`] instead of openmls's in-memory `MemoryStorage`.
-/// Crypto operations and randomness use `RustCrypto`, as they do in
-/// `InMemoryMlsProvider`.
+/// Crypto operations use `RustCrypto`. Randomness comes from
+/// [`scp_mls::provider::OsRand`], which reads the operating system on every
+/// request and keeps no seed: `RustCrypto`'s own generator is one `ChaCha20Rng`
+/// seeded once and never zeroized, and openmls draws path secrets, leaf HPKE
+/// keys, and init secrets from `rand()` (security model spec §9.15 step 2).
 ///
 /// See spec section 17.9. See SCP-PERSIST-050.
 pub struct ScpMlsProvider<S: Storage> {
@@ -1007,7 +1010,7 @@ impl<S: Storage> ScpMlsProvider<S> {
 
 impl<S: Storage> OpenMlsProvider for ScpMlsProvider<S> {
     type CryptoProvider = RustCrypto;
-    type RandProvider = RustCrypto;
+    type RandProvider = scp_mls::provider::OsRand;
     type StorageProvider = MlsStorageBridge<S>;
 
     fn storage(&self) -> &Self::StorageProvider {
@@ -1019,7 +1022,7 @@ impl<S: Storage> OpenMlsProvider for ScpMlsProvider<S> {
     }
 
     fn rand(&self) -> &Self::RandProvider {
-        &self.crypto
+        &scp_mls::provider::OsRand
     }
 }
 
@@ -1404,4 +1407,13 @@ mod tests {
         let _storage = openmls_traits::OpenMlsProvider::storage(&provider);
         let _crypto = openmls_traits::OpenMlsProvider::crypto(&provider);
     }
+
+    /// openmls draws path secrets, leaf HPKE keys, and init secrets from
+    /// `rand()`; the persistent provider must answer it from the stateless OS
+    /// source, not `RustCrypto`'s once-seeded generator (security model spec
+    /// §9.15 step 2). The test build fails if `rand()` returns any other type.
+    const _: fn(
+        &ScpMlsProvider<scp_platform::in_memory::InMemoryStorage>,
+    ) -> &scp_mls::provider::OsRand =
+        <ScpMlsProvider<scp_platform::in_memory::InMemoryStorage> as OpenMlsProvider>::rand;
 }
