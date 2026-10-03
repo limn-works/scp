@@ -23368,7 +23368,10 @@ mod tests {
         supervisor
             .create_context(
                 "ctx-events-resource".to_owned(),
-                scp_core::context::ContextParams::default(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
                 scp_did::DID(creator.to_owned()),
                 None,
             )
@@ -24805,7 +24808,10 @@ mod tests {
             .clone()
             .create_context(
                 "ctx-denial".to_owned(),
-                scp_core::context::ContextParams::default(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
                 scp_did::DID("did:dht:z6MkDenialCreator".to_owned()),
                 None,
             )
