@@ -6335,7 +6335,7 @@
         "`attest` calls `IntegrityManagerFactory.createStandard(context)`, `prepareIntegrityToken` with the `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry, and `StandardIntegrityTokenProvider.request` with `requestHash` set to the lowercase hexadecimal form of the binding digest `D` of §9.3.1 (ADR-027 acceptance criterion 7)",
         "The adapter makes no Classic Play Integrity request: it never calls `IntegrityManagerFactory.create` or builds an `IntegrityTokenRequest` (ADR-027)",
         "`attest` rejects a `challenge` that is not 32 bytes and does not read `deviceId` (ADR-027 acceptance criterion 7)",
-        "Every `attest` failure, a missing Google Play services installation and a `challenge` of the wrong size included, throws `ScpException` with code `SCP-ATTEST-9001`, and no other exception escapes `attest` (ADR-027 acceptance criterion 7)",
+        "Every `attest` failure, a missing Google Play services installation and a `challenge` of the wrong size included, throws `ScpException` with code `SCP-ATTEST-9001` (ADR-027 acceptance criterion 7)",
         "`assertRequest` issues a fresh Standard integrity token whose `requestHash` is the lowercase hexadecimal form of the assertion digest `A` of §9.3.1, and does not route through `attest` (ADR-027 acceptance criterion 8)",
         "Attestation tokens validated server-side",
         "Integration tests verify attestation flow end-to-end on physical device"
