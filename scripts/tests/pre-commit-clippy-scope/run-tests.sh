@@ -67,6 +67,9 @@ new_repo() {
     git init -q -b main
     git config user.name "pre-commit-clippy-scope test"
     git config user.email "test@example.invalid"
+    # Git quotes a non-ASCII path in newline-separated output only with this set, and a
+    # global `core.quotePath = false` would let cases 3h and 3i pass on a hook without `-z`.
+    git config core.quotePath true
     cp "$HOOK" scripts/hooks/pre-commit
     chmod +x scripts/hooks/pre-commit
     cp "$SCOPE" scripts/pre-commit-clippy-scope.py
@@ -165,14 +168,18 @@ g commit -q -m "member manifest change" >/dev/null
 assert_clippy "a member Cargo.toml change lints the whole workspace" \
     "cargo clippy --workspace --features $ALL_FEATURES $TAIL"
 
-# Cases 3b on: each full-run path, alone, with no `.rs` file. The two lists are written out
-# here rather than read from the script, so deleting an entry from the script's
-# `ROOT_WIDE` or `MEMBER_WIDE` turns that entry's case red; the check after the loop turns
-# red when the script's lists and these differ in either direction.
-TEST_ROOT_WIDE="Cargo.toml Cargo.lock rust-toolchain.toml rust-toolchain .clippy.toml clippy.toml .cargo/config.toml .cargo/config"
-TEST_MEMBER_WIDE="Cargo.toml Cargo.lock build.rs clippy.toml .clippy.toml"
+# Cases 3b on: each full-run path, alone, with no `.rs` file. The three lists are written
+# out here rather than read from the script, so deleting an entry from the script's
+# `ROOT_WIDE`, `MEMBER_WIDE`, or `CLIPPY_CONFIG` turns that entry's case red; the check
+# after the loop turns red when the script's lists and these differ in either direction.
+# Each `CLIPPY_CONFIG` name is tried at the root, in `crates/` (a directory that is no
+# member), and in a member.
+TEST_ROOT_WIDE="Cargo.toml Cargo.lock rust-toolchain.toml rust-toolchain .cargo/config.toml .cargo/config"
+TEST_MEMBER_WIDE="Cargo.toml Cargo.lock build.rs"
+TEST_CLIPPY_CONFIG="clippy.toml .clippy.toml"
 FULL_RUN_PATHS="$TEST_ROOT_WIDE"
 for f in $TEST_MEMBER_WIDE; do FULL_RUN_PATHS="$FULL_RUN_PATHS crates/scp-relay/$f"; done
+for f in $TEST_CLIPPY_CONFIG; do FULL_RUN_PATHS="$FULL_RUN_PATHS $f crates/$f crates/scp-relay/$f"; done
 for f in $FULL_RUN_PATHS; do
     new_repo "$WORK/only-$(echo "$f" | tr / -)"
     edit "$f"
@@ -188,15 +195,17 @@ scope = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(scope)
 print(" ".join(sorted(scope.ROOT_WIDE)))
 print(" ".join(sorted(scope.MEMBER_WIDE)))
+print(" ".join(sorted(scope.CLIPPY_CONFIG)))
 EOF
 )"
 WANT_LISTS="$(echo "$TEST_ROOT_WIDE" | tr ' ' '\n' | LC_ALL=C sort | xargs)
-$(echo "$TEST_MEMBER_WIDE" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
+$(echo "$TEST_MEMBER_WIDE" | tr ' ' '\n' | LC_ALL=C sort | xargs)
+$(echo "$TEST_CLIPPY_CONFIG" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
 if [[ "$SCRIPT_LISTS" == "$WANT_LISTS" ]]; then
-    echo "  ok    the script's ROOT_WIDE and MEMBER_WIDE equal the lists these cases cover"
+    echo "  ok    the script's ROOT_WIDE, MEMBER_WIDE, and CLIPPY_CONFIG equal the lists these cases cover"
     PASSED=$((PASSED + 1))
 else
-    echo "  FAIL  the script's ROOT_WIDE and MEMBER_WIDE equal the lists these cases cover"
+    echo "  FAIL  the script's ROOT_WIDE, MEMBER_WIDE, and CLIPPY_CONFIG equal the lists these cases cover"
     echo "          want: ${WANT_LISTS}"
     echo "          got:  ${SCRIPT_LISTS}"
     FAILED=$((FAILED + 1))

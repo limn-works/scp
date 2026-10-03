@@ -125,9 +125,8 @@ trap 'rm -rf "$TMPDIR"' EXIT
 # one of them, or `--workspace` when a changed path is one of the files the script's module
 # docstring lists, such as `Cargo.toml`, `Cargo.lock`, or `rust-toolchain.toml`. The script
 # keeps only the `CLIPPY_FEATURES` entries whose package it selects, because cargo rejects a
-# feature of a package the command does not select. It prints nothing when no changed path
-# sits in a workspace member, such as a commit touching only `fuzz/`, and clippy then does
-# not run. CI's `rust-clippy` job lints the whole workspace on every pushed head.
+# feature of a package the command does not select. CI's `rust-clippy` job lints the whole
+# workspace on every pushed head.
 #
 # The hook runs the script on every commit, not only on a commit that changes a `.rs` file,
 # because a commit that changes only `Cargo.lock`, `rust-toolchain.toml`, or a non-Rust file

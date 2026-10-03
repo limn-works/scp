@@ -7,19 +7,21 @@ in `--features`. The script prints one cargo argument per line, and prints nothi
 path needs a lint.
 
 The script prints `--workspace` and every feature `--features` names when a changed path,
-relative to the workspace root, is in `ROOT_WIDE`, or when a changed path, relative to the
-member directory that holds it, is in `MEMBER_WIDE`. Each `ROOT_WIDE` path can change the
-lints or the dependency resolution of a member whose files the commit did not touch:
+relative to the workspace root, is in `ROOT_WIDE`, when a changed path, relative to the
+member directory that holds it, is in `MEMBER_WIDE`, or when a changed path's file name,
+in any directory, is in `CLIPPY_CONFIG`. Each `ROOT_WIDE` path can change the lints or
+the dependency resolution of a member whose files the commit did not touch:
 - `Cargo.toml` can change the features and dependency versions every member resolves, and
   `Cargo.lock` can change the versions every member builds.
 - `rust-toolchain.toml` (and its legacy name `rust-toolchain`) changes the compiler and
   therefore the lint set.
-- `.clippy.toml` or `clippy.toml` changes lint thresholds for every member that holds no
-  clippy configuration file of its own.
 - `.cargo/config.toml` (and its legacy name `.cargo/config`) reaches every cargo command
   the hook runs from the root.
-`MEMBER_WIDE` holds a member's `Cargo.toml`, `Cargo.lock`, `build.rs`, `clippy.toml`, and
-`.clippy.toml`.
+`MEMBER_WIDE` holds a member's `Cargo.toml`, `Cargo.lock`, and `build.rs`.
+`CLIPPY_CONFIG` holds `clippy.toml` and `.clippy.toml`: clippy reads the one in the
+member's directory, or else the one in the nearest parent directory that holds one, so one
+in a directory that is no member, such as `crates/`, changes lint thresholds for members
+below it.
 These root files stay out of `ROOT_WIDE`: `rustfmt.toml` changes formatting, not lints;
 `deny.toml` is read by cargo-deny, not by clippy; and `.mise.toml` sets environment
 variables for Android cross-compilation linkers, which a host clippy run never invokes.
@@ -27,15 +29,15 @@ variables for Android cross-compilation linkers, which a host clippy run never i
 Otherwise the script selects each workspace member that holds a changed path, of any file
 type, because a crate can read a non-Rust file in its directory with `include_str!`. A
 commit that deletes or moves a file outside a member's directory does not select a member
-that reads that file with `include_str!` or `include_bytes!`. It
-then adds every workspace member that depends on a selected member, directly or
-transitively, as `Graph.affected` defines the walk, and prints `-p <name>` for each.
-It keeps only the `--features` entries whose package is selected, because cargo rejects
-`<package>/<feature>` for a package the command does not select.
+that reads that file with `include_str!` or `include_bytes!`. The script then adds every
+workspace member that depends on a selected member, directly or transitively, as
+`Graph.affected` defines the walk, and prints `-p <name>` for each. It keeps only the
+`--features` entries whose package is selected, because cargo rejects `<package>/<feature>`
+for a package the command does not select.
 
-A path in no workspace member selects nothing. `fuzz/` is a standalone workspace whose
-crates `fuzz/rust-toolchain.toml` builds on a nightly compiler, so the hook does not lint
-it; the script names each such `.rs` path on stderr.
+`fuzz/` is a standalone workspace whose crates `fuzz/rust-toolchain.toml` builds on a
+nightly compiler, so the hook does not lint it; the script names each such `.rs` path on
+stderr.
 
 The script reads the member graph from `cargo metadata --format-version 1 --no-deps`, or
 from the file `--metadata` names. It exits nonzero when cargo metadata fails, so the hook
@@ -57,15 +59,17 @@ ROOT_WIDE = frozenset(
         "Cargo.lock",
         "rust-toolchain.toml",
         "rust-toolchain",
-        ".clippy.toml",
-        "clippy.toml",
         ".cargo/config.toml",
         ".cargo/config",
     }
 )
-MEMBER_WIDE = frozenset(
-    {"Cargo.toml", "Cargo.lock", "build.rs", "clippy.toml", ".clippy.toml"}
-)
+MEMBER_WIDE = frozenset({"Cargo.toml", "Cargo.lock", "build.rs"})
+CLIPPY_CONFIG = frozenset({"clippy.toml", ".clippy.toml"})
+
+
+def lints_everything(path: str) -> bool:
+    """Return whether path, relative to the workspace root, needs a whole-workspace lint."""
+    return path in ROOT_WIDE or PurePosixPath(path).name in CLIPPY_CONFIG
 
 
 class ScopeError(Exception):
@@ -161,7 +165,7 @@ def owning_member(path: str, dirs: dict[str, str]) -> tuple[str, str] | None:
 
 def select(paths: list[str], metadata: dict, features: list[str]) -> list[str]:
     """Return the cargo arguments for the changed paths; an empty list means no lint."""
-    if any(p in ROOT_WIDE for p in paths):
+    if any(lints_everything(p) for p in paths):
         return workspace_args(features)
     graph = Graph(metadata)
     changed: set[str] = set()
@@ -225,7 +229,9 @@ def main() -> int:
         return 0
     try:
         metadata = (
-            {} if any(p in ROOT_WIDE for p in paths) else load_metadata(args.metadata)
+            {}
+            if any(lints_everything(p) for p in paths)
+            else load_metadata(args.metadata)
         )
         cargo_args = select(paths, metadata, features)
     except (ScopeError, OSError, KeyError, ValueError) as err:
