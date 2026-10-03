@@ -150,6 +150,22 @@ nothing:
                needs — would skip the NAPI half of the parity harness on every
                change confined to bindings/python. A diff of either job alone
                shows nothing.
+  downloaded-module
+               Every real-FFI test module under bindings/python/tests skips
+               itself when the extension does not import, and the `scp` fixture
+               skips every test that requests it when `SCP(storage=...)` raises,
+               so a PyO3 consumer whose downloaded module does not load leaves
+               pytest exiting 0 over zero executed assertions. The check requires
+               each fragment in PYO3_ASSERTION_FRAGMENTS in the `run:` text of an
+               unguarded step before `pytest tests`.
+  downloaded-addon
+               Every real-NAPI test file under bindings/typescript/tests resolves
+               to `describe.skip` or `test.skip` when the addon load throws, so a
+               NAPI consumer whose downloaded addon does not load leaves
+               `bun test` exiting 0 over zero executed NAPI assertions. The check
+               requires each fragment in NAPI_ASSERTION_FRAGMENTS in the `run:`
+               text of an unguarded step before the first `bun test` or
+               `pytest tests` step.
   retention    The four bridge producers uploaded with `retention-days: 1`, and
                "Re-run failed jobs" re-runs a failed consumer without its
                producer, so a consumer re-run a day after its run started
@@ -159,7 +175,7 @@ nothing:
                three paths, one of them the tracked ScpBindings.swift, so the
                checkout always supplied a match and the option could not fail
                the producer when build-xcframework.sh wrote nothing.
-  lint-scope  One crate declared the lint the two rustdoc jobs exist to fire:
+  lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
                25 members did, so job rust-doc, run verbatim on the tree that
@@ -3595,27 +3611,24 @@ def a_step_that_runs_and_can_fail_its_job(step: dict) -> bool:
     return "if" not in step and step.get("continue-on-error") in (None, False, "false")
 
 
-# The three statements the PyO3 skip guards run: the import the test modules attempt,
-# the construction the `scp` fixture performs, and a read of each feature-gated method
-# whose absence turns a test module into a module-level skip.
+# The text fragments a PyO3 consumer's steps must contain before pytest.
 PYO3_ASSERTION_FRAGMENTS = (
-    ("import scp_sdk._scp_core", "imports"),
-    ("SCP(storage=", "constructs"),
-    ("relay_start_in_memory", "carries relay_start_in_memory"),
-    ("fullstack_create_node", "carries fullstack_create_node"),
+    "import scp_sdk._scp_core",
+    "SCP(storage=",
+    "relay_start_in_memory",
+    "fullstack_create_node",
 )
 
 
-def pyo3_consumers_without_a_construction_assertion(
+def pyo3_consumers_missing_an_assertion_fragment(
     doc: dict, artifacts: tuple[str, ...]
 ) -> list[str]:
-    """Return every job that downloads a PyO3 module and does not exercise it first.
+    r"""Return every PyO3-downloading job that lacks a fragment before `pytest tests`.
 
-    CRITERION: a job that downloads a PyO3 extension module runs, before its first
-    pytest invocation, a step that imports `scp_sdk._scp_core`, a step that constructs
-    `SCP(storage=...)` from it, and a step that reads every feature-gated method named
-    in PYO3_ASSERTION_FRAGMENTS off the native class, each step one that carries no
-    `if:` and no `continue-on-error` other than false.
+    CRITERION: in every job that downloads an artifact named in `artifacts`, each
+    fragment in PYO3_ASSERTION_FRAGMENTS occurs in the `run:` text of a step that
+    comes before the first step whose `run:` text matches `\bpytest tests` and that
+    carries no `if:` and no `continue-on-error` other than false.
 
     WHY: every real-FFI test module under bindings/python/tests skips itself when its
     import of the extension raises ImportError, and the `scp` fixture in
@@ -3624,12 +3637,8 @@ def pyo3_consumers_without_a_construction_assertion(
     downloaded module never reached the import path, failed to load, or was built
     without a feature a module calls therefore leaves pytest exiting 0 over zero
     executed assertions in every one of these jobs at once, which is the `zero-test`
-    shape this file names. Only the job can see that state, so the job asserts it
-    before pytest runs and names the missing method on a wrong feature resolution.
-    `crates/scp-ffi/` compiles `fullstack_create_node` only under `testing` and
-    `relay_start_in_memory` only under `server`, so reading both off the constructed
-    object decides whether the downloaded binary carries the feature resolution its
-    consumers need.
+    shape this file names. `crates/scp-ffi/` compiles `fullstack_create_node` only
+    under `testing` and `relay_start_in_memory` only under `server`.
     """
     gaps: list[str] = []
     for job_id, job in sorted(doc["jobs"].items()):
@@ -3640,57 +3649,55 @@ def pyo3_consumers_without_a_construction_assertion(
             for step in steps
         ):
             continue
-        found = {label: False for _, label in PYO3_ASSERTION_FRAGMENTS}
+        found = dict.fromkeys(PYO3_ASSERTION_FRAGMENTS, False)
         for step in steps:
             script = str(step.get("run") or "")
             if re.search(r"\bpytest tests", script):
                 break
             if not a_step_that_runs_and_can_fail_its_job(step):
                 continue
-            for fragment, label in PYO3_ASSERTION_FRAGMENTS:
-                found[label] = found[label] or fragment in script
-        missing = [label for label, present in found.items() if not present]
+            for fragment in PYO3_ASSERTION_FRAGMENTS:
+                found[fragment] = found[fragment] or fragment in script
+        missing = [fragment for fragment, present in found.items() if not present]
         if missing:
             gaps.append(
-                f"{job_id} downloads a PyO3 module and runs pytest without asserting "
-                f"that it {' and '.join(missing)}"
+                f"{job_id} downloads a PyO3 module and no unguarded step before "
+                f"pytest contains {', '.join(repr(m) for m in missing)}"
             )
     return gaps
 
 
-def check_pyo3_consumers_exercise_the_module(
+def check_pyo3_consumer_assertion_fragments(
     doc: dict, artifacts: tuple[str, ...]
 ) -> None:
-    gaps = pyo3_consumers_without_a_construction_assertion(doc, artifacts)
+    gaps = pyo3_consumers_missing_an_assertion_fragment(doc, artifacts)
     check(
-        "ci.yml: every job downloading a PyO3 module imports it, constructs it, and "
-        "reads its feature-gated methods first",
+        "ci.yml: every job downloading a PyO3 module has each PyO3 assertion fragment "
+        "in an unguarded step before pytest",
         not gaps,
         "; ".join(gaps),
     )
 
 
-# The statements the NAPI skip guards run: the SDK loader that `createRequire`s the
-# platform package, the construction of the native class the loader returns, and a
-# read of each feature-gated method whose absence turns a test file into a skip.
+# The text fragments a NAPI consumer's steps must contain before its tests.
 NAPI_ASSERTION_FRAGMENTS = (
-    ("loadNativeAddon(", "loads"),
-    ("new NativeScp(", "constructs"),
-    ("relayStartInMemory", "carries relayStartInMemory"),
-    ("fullstackCreateNode", "carries fullstackCreateNode"),
+    "loadNativeAddon(",
+    "new NativeScp(",
+    "relayStartInMemory",
+    "fullstackCreateNode",
 )
 
 
-def napi_consumers_without_a_construction_assertion(
+def napi_consumers_missing_an_assertion_fragment(
     doc: dict, artifacts: tuple[str, ...]
 ) -> list[str]:
-    """Return every job that downloads a NAPI addon and does not exercise it first.
+    r"""Return every NAPI-downloading job that lacks a fragment before its tests.
 
-    CRITERION: a job that downloads a NAPI native addon runs, before its first test
-    invocation, a step that calls `loadNativeAddon()`, a step that constructs the
-    native `SCP` class the loader returns, and a step that reads every feature-gated
-    method named in NAPI_ASSERTION_FRAGMENTS off it, each step one that carries no
-    `if:` and no `continue-on-error` other than false.
+    CRITERION: in every job that downloads an artifact named in `artifacts`, each
+    fragment in NAPI_ASSERTION_FRAGMENTS occurs in the `run:` text of a step that
+    comes before the first step whose `run:` text matches `\bbun test\b` or
+    `\bpytest tests` and that carries no `if:` and no `continue-on-error` other
+    than false.
 
     WHY: every real-NAPI test file under bindings/typescript/tests wraps its addon load
     and its first construction in one `try`, writes the caught error into a skip reason,
@@ -3698,14 +3705,7 @@ def napi_consumers_without_a_construction_assertion(
     — tests/real-napi.test.ts, tests/e2e-fullstack.test.ts and tests/persistence.test.ts
     among them. A downloaded addon that does not load therefore leaves `bun test`
     exiting 0 over zero executed NAPI assertions, which is the same `zero-test` shape
-    the PyO3 criterion above names. Checking that the downloaded file exists does not
-    close that, because a file that is present can still fail to load, so the criterion
-    names the load and the construction.
-
-    The step's `loadNativeAddon()` call speaks for those test files only while they
-    load the addon through that same loader: a file that builds its own
-    `@limn-works/scp-ts-napi-*` specifier names a package the wiring step never
-    creates, so it skips while the step reports success.
+    the PyO3 criterion above names.
     """
     gaps: list[str] = []
     for job_id, job in sorted(doc["jobs"].items()):
@@ -3716,45 +3716,46 @@ def napi_consumers_without_a_construction_assertion(
             for step in steps
         ):
             continue
-        found = {label: False for _, label in NAPI_ASSERTION_FRAGMENTS}
+        found = dict.fromkeys(NAPI_ASSERTION_FRAGMENTS, False)
         for step in steps:
             script = str(step.get("run") or "")
             if re.search(r"\bbun test\b|\bpytest tests", script):
                 break
             if not a_step_that_runs_and_can_fail_its_job(step):
                 continue
-            for fragment, label in NAPI_ASSERTION_FRAGMENTS:
-                found[label] = found[label] or fragment in script
-        missing = [label for label, present in found.items() if not present]
+            for fragment in NAPI_ASSERTION_FRAGMENTS:
+                found[fragment] = found[fragment] or fragment in script
+        missing = [fragment for fragment, present in found.items() if not present]
         if missing:
             gaps.append(
-                f"{job_id} downloads a NAPI addon and runs its tests without asserting "
-                f"that it {' and '.join(missing)}"
+                f"{job_id} downloads a NAPI addon and no unguarded step before its "
+                f"tests contains {', '.join(repr(m) for m in missing)}"
             )
     return gaps
 
 
-def check_napi_consumers_exercise_the_addon(
+def check_napi_consumer_assertion_fragments(
     doc: dict, artifacts: tuple[str, ...]
 ) -> None:
-    gaps = napi_consumers_without_a_construction_assertion(doc, artifacts)
+    gaps = napi_consumers_missing_an_assertion_fragment(doc, artifacts)
     check(
-        "ci.yml: every job downloading a NAPI addon loads and constructs it first",
+        "ci.yml: every job downloading a NAPI addon has each NAPI assertion fragment "
+        "in an unguarded step before its tests",
         not gaps,
         "; ".join(gaps),
     )
 
 
 def check_napi_assertion_control(
-    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str, label: str
+    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str
 ) -> None:
-    """Deleting one of job `job_id`'s assertions is reported."""
+    """Deleting every line of job `job_id` that contains `fragment` is reported."""
     mutated = copy.deepcopy(doc)
     steps = mutated["jobs"][job_id]["steps"]
     hits = [step for step in steps if fragment in str(step.get("run") or "")]
     if len(hits) != 1:
         check(
-            f"the control can delete the {label} assertion from {job_id}",
+            f"the control can delete {fragment!r} from {job_id}",
             False,
             f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
         )
@@ -3762,24 +3763,27 @@ def check_napi_assertion_control(
     hits[0]["run"] = "\n".join(
         line for line in str(hits[0]["run"]).splitlines() if fragment not in line
     )
-    gaps = napi_consumers_without_a_construction_assertion(mutated, artifacts)
+    gaps = napi_consumers_missing_an_assertion_fragment(mutated, artifacts)
     check(
-        f"a {job_id} that no longer asserts it {label} is reported",
-        any(f"{job_id} downloads a NAPI addon" in gap and label in gap for gap in gaps),
-        f"deleting the {label} assertion went unreported: {gaps}",
+        f"a {job_id} whose steps no longer contain {fragment!r} is reported",
+        any(
+            f"{job_id} downloads a NAPI addon" in gap and repr(fragment) in gap
+            for gap in gaps
+        ),
+        f"deleting {fragment!r} went unreported: {gaps}",
     )
 
 
 def check_pyo3_assertion_control(
-    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str, label: str
+    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str
 ) -> None:
-    """Deleting one of job `job_id`'s assertions is reported."""
+    """Deleting every line of job `job_id` that contains `fragment` is reported."""
     mutated = copy.deepcopy(doc)
     steps = mutated["jobs"][job_id]["steps"]
     hits = [step for step in steps if fragment in str(step.get("run") or "")]
     if len(hits) != 1:
         check(
-            f"the control can delete the {label} assertion from {job_id}",
+            f"the control can delete {fragment!r} from {job_id}",
             False,
             f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
         )
@@ -3787,13 +3791,14 @@ def check_pyo3_assertion_control(
     hits[0]["run"] = "\n".join(
         line for line in str(hits[0]["run"]).splitlines() if fragment not in line
     )
-    gaps = pyo3_consumers_without_a_construction_assertion(mutated, artifacts)
+    gaps = pyo3_consumers_missing_an_assertion_fragment(mutated, artifacts)
     check(
-        f"a {job_id} that no longer asserts it {label} is reported",
+        f"a {job_id} whose steps no longer contain {fragment!r} is reported",
         any(
-            f"{job_id} downloads a PyO3 module" in gap and label in gap for gap in gaps
+            f"{job_id} downloads a PyO3 module" in gap and repr(fragment) in gap
+            for gap in gaps
         ),
-        f"deleting the {label} assertion went unreported: {gaps}",
+        f"deleting {fragment!r} went unreported: {gaps}",
     )
 
 
@@ -3808,10 +3813,10 @@ def check_assertion_step_guard_controls(
     """
     if bridge == "PyO3":
         fragments = PYO3_ASSERTION_FRAGMENTS
-        gate = pyo3_consumers_without_a_construction_assertion
+        gate = pyo3_consumers_missing_an_assertion_fragment
     else:
         fragments = NAPI_ASSERTION_FRAGMENTS
-        gate = napi_consumers_without_a_construction_assertion
+        gate = napi_consumers_missing_an_assertion_fragment
     prefix = f"{job_id} downloads a {bridge} "
     for key, value, reported in (
         ("continue-on-error", True, True),
@@ -3821,7 +3826,7 @@ def check_assertion_step_guard_controls(
     ):
         mutated = copy.deepcopy(doc)
         for step in mutated["jobs"][job_id]["steps"]:
-            if any(fragment in str(step.get("run") or "") for fragment, _ in fragments):
+            if any(fragment in str(step.get("run") or "") for fragment in fragments):
                 step[key] = value
         hit = any(gap.startswith(prefix) for gap in gate(mutated, artifacts))
         check(
@@ -4069,20 +4074,20 @@ def check_a_new_producer_reaches_the_pyo3_gate(doc: dict) -> None:
     remembered to list, and says nothing about a producer added later. This control
     adds the producer and the consumer a Windows leg would add, names the artifact
     something this file never mentions, and requires the gate to report the consumer
-    that runs pytest without exercising the module it downloaded.
+    that runs pytest with no assertion fragment before it.
     """
     artifact = "pyo3-module-added-by-the-control"
     mutated = a_producer_and_an_unguarded_consumer(
         doc, artifact, "bindings/python/scp_sdk/_scp_core*.pyd", "pytest tests -v"
     )
-    gaps = pyo3_consumers_without_a_construction_assertion(
+    gaps = pyo3_consumers_missing_an_assertion_fragment(
         mutated, uploaded_artifact_names(mutated, PYO3_UPLOAD_FILENAME)
     )
     check(
         "a PyO3 consumer of a producer added under an unlisted name is reported",
         any(gap.startswith("consumer-added-by-the-control ") for gap in gaps),
-        f"a job downloading {artifact} and running pytest without exercising the "
-        f"module went unreported: {gaps}",
+        f"a job downloading {artifact} and running pytest with no assertion "
+        f"fragment went unreported: {gaps}",
     )
 
 
@@ -4092,14 +4097,14 @@ def check_a_new_producer_reaches_the_napi_gate(doc: dict) -> None:
     mutated = a_producer_and_an_unguarded_consumer(
         doc, artifact, "target/release/scp_ffi_napi.dll", "bun test"
     )
-    gaps = napi_consumers_without_a_construction_assertion(
+    gaps = napi_consumers_missing_an_assertion_fragment(
         mutated, uploaded_artifact_names(mutated, NAPI_UPLOAD_FILENAME)
     )
     check(
         "a NAPI consumer of a producer added under an unlisted name is reported",
         any(gap.startswith("consumer-added-by-the-control ") for gap in gaps),
-        f"a job downloading {artifact} and running its tests without loading the "
-        f"addon went unreported: {gaps}",
+        f"a job downloading {artifact} and running its tests with no assertion "
+        f"fragment went unreported: {gaps}",
     )
 
 
@@ -4182,12 +4187,15 @@ def main() -> int:
     )
     check_signing_guard(documents)
 
-    print("downloaded-module — a PyO3 consumer exercises the module before pytest")
+    print(
+        "downloaded-module — a PyO3 consumer's unguarded steps before pytest contain "
+        "each PyO3 assertion fragment"
+    )
     pyo3_artifacts = uploaded_artifact_names(workflow, PYO3_UPLOAD_FILENAME)
     check_a_bridge_upload_reaches_the_gate(
         workflow, PYO3_UPLOAD_FILENAME, pyo3_artifacts
     )
-    check_pyo3_consumers_exercise_the_module(workflow, pyo3_artifacts)
+    check_pyo3_consumer_assertion_fragments(workflow, pyo3_artifacts)
     check_artifact_names_reach_a_consumer(
         workflow, pyo3_artifacts, PYO3_UPLOAD_FILENAME
     )
@@ -4199,20 +4207,23 @@ def main() -> int:
     for pyo3_artifact in pyo3_artifacts:
         check_artifact_name_control(workflow, pyo3_artifacts, pyo3_artifact)
         for pyo3_job in artifact_consumers(workflow, pyo3_artifact):
-            for pyo3_fragment, pyo3_label in PYO3_ASSERTION_FRAGMENTS:
+            for pyo3_fragment in PYO3_ASSERTION_FRAGMENTS:
                 check_pyo3_assertion_control(
-                    workflow, pyo3_artifacts, pyo3_job, pyo3_fragment, pyo3_label
+                    workflow, pyo3_artifacts, pyo3_job, pyo3_fragment
                 )
             check_assertion_step_guard_controls(
                 workflow, pyo3_artifacts, pyo3_job, "PyO3"
             )
 
-    print("downloaded-addon — a NAPI consumer exercises the addon before its tests")
+    print(
+        "downloaded-addon — a NAPI consumer's unguarded steps before its tests "
+        "contain each NAPI assertion fragment"
+    )
     napi_artifacts = uploaded_artifact_names(workflow, NAPI_UPLOAD_FILENAME)
     check_a_bridge_upload_reaches_the_gate(
         workflow, NAPI_UPLOAD_FILENAME, napi_artifacts
     )
-    check_napi_consumers_exercise_the_addon(workflow, napi_artifacts)
+    check_napi_consumer_assertion_fragments(workflow, napi_artifacts)
     check_artifact_names_reach_a_consumer(
         workflow, napi_artifacts, NAPI_UPLOAD_FILENAME
     )
@@ -4220,9 +4231,9 @@ def main() -> int:
     for napi_artifact in napi_artifacts:
         check_artifact_name_control(workflow, napi_artifacts, napi_artifact)
         for napi_job in artifact_consumers(workflow, napi_artifact):
-            for napi_fragment, napi_label in NAPI_ASSERTION_FRAGMENTS:
+            for napi_fragment in NAPI_ASSERTION_FRAGMENTS:
                 check_napi_assertion_control(
-                    workflow, napi_artifacts, napi_job, napi_fragment, napi_label
+                    workflow, napi_artifacts, napi_job, napi_fragment
                 )
             check_assertion_step_guard_controls(
                 workflow, napi_artifacts, napi_job, "NAPI"
