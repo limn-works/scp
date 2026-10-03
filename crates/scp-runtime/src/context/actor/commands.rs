@@ -1098,11 +1098,10 @@ pub enum LifecycleCommand {
     /// `shutdown_all_contexts_legacy`. Destroys per-context sender keys,
     /// MLS groups, and event logs in that order (release secrets before
     /// tearing down structure; `SenderKey`s and the MLS Ed25519 signer
-    /// zeroize on drop, and the MLS provider-storage values zeroize on drop).
-    /// Does NOT send leave
-    /// messages or notify
-    /// remote peers — used by `scp_ffi_common::BridgeInstance::shutdown`
-    /// for process exit / test teardown.
+    /// zeroize on drop, and the MLS provider-storage values zeroize on
+    /// drop). Does NOT send leave messages or notify remote peers — used
+    /// by `scp_ffi_common::BridgeInstance::shutdown` for process exit /
+    /// test teardown.
     ///
     /// The handler operates on the actor's owned `&mut state` so the
     /// secrets are zeroed in place. Supervisor-level state (standing
