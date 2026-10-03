@@ -3564,8 +3564,7 @@ export class SCP {
    *
    * The capability outcome is non-throwing (it reads booleans); malformed FFI
    * inputs (bad context handle / token / capability) propagate as a typed
-   * {@link "./errors".ScpError}. Throws {@link "./errors".ContextError} carrying
-   * `SCP-CTX-2023` when the context is not active.
+   * {@link "./errors".ScpError}.
    *
    * SECURITY: the behavioral record's `attestationCount` (and any challenge
    * results, where consumed) are authentic-but-self-mintable signals — an

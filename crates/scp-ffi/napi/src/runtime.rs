@@ -2167,8 +2167,7 @@ pub async fn live_role_state(
 /// token's grants against.
 ///
 /// A caller that also needs the creator or the membership calls
-/// [`live_role_state`] once and derives the ceiling from it, so one
-/// authorization decision costs one mailbox round trip.
+/// [`live_role_state`] once and derives the ceiling from it.
 ///
 /// # Errors
 ///
