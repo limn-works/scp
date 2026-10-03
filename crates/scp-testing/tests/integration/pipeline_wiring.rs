@@ -2981,10 +2981,14 @@ fn b3_webhook_dispatch_wired() {
 ///   `scp-mcp`'s `testing` feature, which no shipped artifact resolves.
 ///
 /// The compiler holds those properties, so this test does not restate them as
-/// source-text checks. It checks the part the type system cannot see: that
-/// each bridge *sources* its receiver from the Supervisor and hands it to a
-/// transport, rather than passing `None` and honestly-but-uselessly
-/// advertising nothing.
+/// source-text checks. It checks part of what the type system cannot see:
+/// that each bridge's `mcp_server_bundle` *sources* its receiver from the
+/// Supervisor and passes it to `McpServer::with_optional_event_source`,
+/// rather than passing `None` and honestly-but-uselessly advertising nothing,
+/// and that the bridge's serve function builds a server through the pinned
+/// `mcp_server_bundle` call over the instance its provider reads. It does not
+/// check that this server is the one the serve function passes to the
+/// transport, and every count it makes covers the bridge's own file only.
 #[test]
 fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
     // Every bridge must obtain the Supervisor receiver and hand it to
@@ -3038,8 +3042,10 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
              ContextEvent receiver from `{supervisor_of_bi}` (the bridge \
              instance's own Supervisor) and hand THAT receiver to \
              `McpServer::with_optional_event_source`, the file's only call of \
-             that constructor. Passing `None`, or building the served server \
-             anywhere else, silently downgrades to resources.subscribe: false"
+             that constructor; the pinned call must be the file's only call \
+             of `mcp_server_bundle`. Passing `None` silently downgrades to \
+             resources.subscribe: false. (This gate does not check that the \
+             bundle the serve function builds is the one it hands the transport.)"
         );
     }
 }
@@ -3049,7 +3055,9 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// `mcp_server_bundle` both obtains the Supervisor's receiver and passes that
 /// receiver to `McpServer::with_optional_event_source`, which `code` calls
 /// nowhere else, and `code` calls `mcp_server_bundle` nowhere but in the
-/// pinned call.
+/// pinned call. It does not read the transport call: whether the `server` the
+/// pinned call binds reaches `run_stdio` or `run_sse` is not checked, and a
+/// server built in another file of the crate is not seen.
 ///
 /// "The instance its provider reads" is pinned by `serve_path`: each of its
 /// pins occurs exactly once in the text of `serve_fn` (the binding of the
