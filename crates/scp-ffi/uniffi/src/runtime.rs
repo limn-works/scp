@@ -1026,8 +1026,10 @@ impl UniffiBridgeInstance {
     ///
     /// # Errors
     ///
-    /// Returns whatever `mk_err` builds when the supervisor reports any state
-    /// other than `Active` and when no actor serves `context_id`. Returns the
+    /// Returns `ScpError::Context` with code `SCP-CTX-2134` when the
+    /// supervisor reports `Poisoned` (ADR-049 §10). Returns whatever `mk_err`
+    /// builds when the supervisor reports any other state than `Active` and
+    /// when no actor serves `context_id`. Returns the
     /// error [`UniffiBridgeInstance::read_live_context_state`] returns when
     /// the state read fails.
     pub async fn require_active_context<F>(
@@ -1042,6 +1044,13 @@ impl UniffiBridgeInstance {
         let state = self.read_live_context_state(context_id).await?;
         match state {
             Some(scp_core::context::ContextState::Active) => Ok(()),
+            // ADR-049 §10: a caller detects a poisoned context by the
+            // `SCP-CTX-2134` code on its next per-context operation, so the
+            // gate surfaces `ContextPoisoned` rather than the operation's own
+            // non-active code.
+            Some(scp_core::context::ContextState::Poisoned) => Err(crate::ScpError::from(
+                scp_core::context::ContextError::ContextPoisoned(context_id.to_owned()),
+            )),
             Some(other) => Err(mk_err(format!(
                 "cannot {verb} in '{}' state -- context must be active",
                 scp_ffi_common::context_state_str(&other)

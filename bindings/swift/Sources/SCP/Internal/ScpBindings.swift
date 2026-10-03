@@ -601,12 +601,8 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
      * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
      * path wrote `Poisoned` into this cached state; the watchdog poison path
      * does NOT push into this cache (it is a best-effort cached getter, not a
-     * live supervisor read). `context_join`, `context_leave`, `context_send`,
-     * and `context_subscribe` read the supervisor's live state before they
-     * run, and each refuses a poisoned context with its own error code
-     * (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`) and a
-     * message that names the `poisoned` state. An operation that reaches the
-     * supervisor without that gate returns `SCP-CTX-2134`.
+     * live supervisor read). The authoritative poison signal is the
+     * `SCP-CTX-2134` error code on the next per-context operation.
      *
      * # Errors
      *
@@ -707,12 +703,8 @@ open func creatorDid() -> String  {
      * `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
      * path wrote `Poisoned` into this cached state; the watchdog poison path
      * does NOT push into this cache (it is a best-effort cached getter, not a
-     * live supervisor read). `context_join`, `context_leave`, `context_send`,
-     * and `context_subscribe` read the supervisor's live state before they
-     * run, and each refuses a poisoned context with its own error code
-     * (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`) and a
-     * message that names the `poisoned` state. An operation that reaches the
-     * supervisor without that gate returns `SCP-CTX-2134`.
+     * live supervisor read). The authoritative poison signal is the
+     * `SCP-CTX-2134` error code on the next per-context operation.
      *
      * # Errors
      *
@@ -17724,7 +17716,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_creator_did() != 33786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 39119) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 4611) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 23309) {

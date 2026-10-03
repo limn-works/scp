@@ -3430,12 +3430,8 @@ impl ContextHandle {
     /// `"poisoned"` (ADR-049 §10) is surfaced here only when a snapshot/restore
     /// path wrote `Poisoned` into this cached state; the watchdog poison path
     /// does NOT push into this cache (it is a best-effort cached getter, not a
-    /// live supervisor read). `context_join`, `context_leave`, `context_send`,
-    /// and `context_subscribe` read the supervisor's live state before they
-    /// run, and each refuses a poisoned context with its own error code
-    /// (`SCP-CTX-2013`, `SCP-CTX-2015`, `SCP-CTX-2019`, `SCP-CTX-2021`) and a
-    /// message that names the `poisoned` state. An operation that reaches the
-    /// supervisor without that gate returns `SCP-CTX-2134`.
+    /// live supervisor read). The authoritative poison signal is the
+    /// `SCP-CTX-2134` error code on the next per-context operation.
     ///
     /// # Errors
     ///
@@ -19761,8 +19757,8 @@ mod tests {
     /// or not answering, and each refusal carries the supervisor's answer.
     ///
     /// In every case the handle's cached state reads `Active`. A poisoned
-    /// context reads `Some(Poisoned)` and refuses with the operation's own
-    /// message. A context mid-respawn or past a failed respawn reads
+    /// context reads `Some(Poisoned)` and refuses with `ContextPoisoned`
+    /// (`SCP-CTX-2134`, ADR-049 §10), not the operation's own code. A context mid-respawn or past a failed respawn reads
     /// `ActorCrashed` (`SCP-CTX-2135`), and an actor whose mailbox does not
     /// answer reads `ActorBusy` (`SCP-CTX-2130`). A gate that folded a failed
     /// read into `None` would report "no live supervisor state" for the last
@@ -19777,7 +19773,7 @@ mod tests {
             .expect("identity_create failed");
 
         for (fault, expected) in [
-            ("poisoned", "'poisoned' state"),
+            ("poisoned", codes::CTX_2134),
             ("mid_respawn", codes::CTX_2135),
             ("respawn_failed", codes::CTX_2135),
             ("unreachable", "SCP-CTX-2130"),
