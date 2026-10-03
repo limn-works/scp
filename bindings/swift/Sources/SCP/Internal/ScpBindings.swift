@@ -1360,6 +1360,9 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
     func relayUrl()  -> String
     
@@ -1580,6 +1583,9 @@ open func relayPort() -> UInt16  {
     /**
      * Returns the WebSocket URL clients should connect to for this node's
      * relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
+     *
+     * Read live per call from the node's relay-URL slot, so it reflects a NAT
+     * tier change that re-pointed the node's endpoint.
      */
 open func relayUrl() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1969,6 +1975,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
     func addressResolve(ownerDid: String, address: String, knownContextsJson: String?) throws  -> String
     
@@ -2440,7 +2451,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -2853,37 +2864,57 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func isLocalDid(did: String) async  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     * Connects to the MCP SSE server at `url`.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance. `auth_token` is
+     * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
+     * or `None` for a server that runs no bearer check; an SCP SSE server
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
-    func mcpClientConnectSse(url: String) async throws  -> String
+    func mcpClientConnectSse(url: String, authToken: String?) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     * Starts `command` as an MCP server subprocess and connects to it over
+     * stdio.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance.
      */
     func mcpClientConnectStdio(command: [String]) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     * Disconnects the MCP client registered under `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Removes the entry from this instance's MCP client registry; a handle
+     * another instance returned is not found. Dropping the
+     * entry closes the client's transport, even while a call on the handle
+     * is in flight. A stdio client's server process group, which holds the
+     * processes the server started, is dead when this returns. An SSE
+     * client's POST and `GET`
+     * sockets are shut down, and the call fails as closed. A call queued
+     * behind the in-flight one, on a stdio or an SSE client, fails as
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
     func mcpClientDisconnect(handle: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     * Invokes a tool on the MCP server behind `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
     func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String) async throws  -> McpInvokeResult
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     * Lists the tools the MCP server behind `handle` exposes.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
     func mcpClientListTools(handle: String) async throws  -> [McpOutletInfo]
     
@@ -2922,19 +2953,40 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func mcpResetStdioAllowlist() throws 
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_create`.
+     * Starts an MCP server over this instance's contexts on the `stdio` or
+     * `sse` transport.
      *
-     * Routes through `&*self.inner`. The MCP server registry is
-     * module-level (not per-instance) so the returned opaque handle
-     * string is globally unique; this method preserves that behaviour.
+     * Registers the server in this instance's MCP server registry under a
+     * random opaque handle; only this instance's `mcp_server_stop` finds it.
+     *
+     * A server created while the instance has no supervisor or is
+     * suspended serves no resource subscriptions for its whole life: it
+     * advertises `resources.subscribe: false` and rejects
+     * `resources/subscribe`, and neither attaching a supervisor nor
+     * `resume()` changes that. Create the server again once the instance
+     * has a supervisor and is not suspended to get subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
      */
     func mcpServerCreate(config: McpServerConfig) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     * Stops the MCP server registered under `handle`.
      *
-     * Routes through the module-level MCP server registry (the registry
-     * is not per-instance; the opaque handle string is globally unique).
+     * Looks the handle up in this instance's MCP server registry; a handle
+     * another instance returned is not found.
      */
     func mcpServerStop(handle: String) async throws 
     
@@ -3631,13 +3683,17 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
     
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -3897,6 +3953,11 @@ open func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String
     
     /**
      * Per-instance equivalent of the free-function `address_resolve`.
+     *
+     * Returns a JSON object with two keys: `resolutions` holds the
+     * `AddressResolution` objects sorted by trust level, and
+     * `unavailable_layers` names each layer this build could not query,
+     * with the reason.
      */
 open func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -4995,7 +5056,7 @@ open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt6
      * Per-instance equivalent of the free-function `economy_verify_payment_receipts`.
      *
      * Deserializes a JSON array of [`scp_core::economy::PaymentReceipt`] and
-     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`] to the
+     * dispatches an [`EconomyCommand::VerifyPaymentReceipts`](scp_core::context::actor::commands::EconomyCommand::VerifyPaymentReceipts) to the
      * supervisor, returning a JSON `{"all_valid": <bool>, "results": [...]}`
      * document with one entry per receipt. Mirrors the `PyO3` reference bridge
      * exactly. Maximum 10,000 receipts per call.
@@ -5842,17 +5903,22 @@ open func isLocalDid(did: String)async  -> Bool  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     * Connects to the MCP SSE server at `url`.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance. `auth_token` is
+     * sent as `Authorization: Bearer <token>` on the `GET` and on every POST,
+     * or `None` for a server that runs no bearer check; an SCP SSE server
+     * always runs one (ADR-015). The transport has no TLS, so a token is
+     * sent only to a loopback host.
      */
-open func mcpClientConnectSse(url: String)async throws  -> String  {
+open func mcpClientConnectSse(url: String, authToken: String?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_connect_sse(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(url)
+                    FfiConverterString.lower(url),FfiConverterOptionString.lower(authToken)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -5864,9 +5930,11 @@ open func mcpClientConnectSse(url: String)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     * Starts `command` as an MCP server subprocess and connects to it over
+     * stdio.
      *
-     * Routes through the module-level MCP client registry.
+     * Registers the client in this instance's MCP client registry; the
+     * returned handle works only on this instance.
      */
 open func mcpClientConnectStdio(command: [String])async throws  -> String  {
     return
@@ -5886,9 +5954,20 @@ open func mcpClientConnectStdio(command: [String])async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     * Disconnects the MCP client registered under `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Removes the entry from this instance's MCP client registry; a handle
+     * another instance returned is not found. Dropping the
+     * entry closes the client's transport, even while a call on the handle
+     * is in flight. A stdio client's server process group, which holds the
+     * processes the server started, is dead when this returns. An SSE
+     * client's POST and `GET`
+     * sockets are shut down, and the call fails as closed. A call queued
+     * behind the in-flight one, on a stdio or an SSE client, fails as
+     * disconnected once it takes the client's lock and sends nothing. A
+     * connect still waiting for its server to answer `initialize` (stdio or
+     * SSE) has no handle yet, so no disconnect, and no instance shutdown,
+     * ends it.
      */
 open func mcpClientDisconnect(handle: String)async throws   {
     return
@@ -5908,9 +5987,10 @@ open func mcpClientDisconnect(handle: String)async throws   {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     * Invokes a tool on the MCP server behind `handle`.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
 open func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
     return
@@ -5930,9 +6010,10 @@ open func mcpClientInvoke(handle: String, outletName: String, inputJson: String,
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     * Lists the tools the MCP server behind `handle` exposes.
      *
-     * Routes through the module-level MCP client registry.
+     * Looks the handle up in this instance's MCP client registry; a handle
+     * another instance returned is not found.
      */
 open func mcpClientListTools(handle: String)async throws  -> [McpOutletInfo]  {
     return
@@ -6004,11 +6085,32 @@ open func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTy
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_create`.
+     * Starts an MCP server over this instance's contexts on the `stdio` or
+     * `sse` transport.
      *
-     * Routes through `&*self.inner`. The MCP server registry is
-     * module-level (not per-instance) so the returned opaque handle
-     * string is globally unique; this method preserves that behaviour.
+     * Registers the server in this instance's MCP server registry under a
+     * random opaque handle; only this instance's `mcp_server_stop` finds it.
+     *
+     * A server created while the instance has no supervisor or is
+     * suspended serves no resource subscriptions for its whole life: it
+     * advertises `resources.subscribe: false` and rejects
+     * `resources/subscribe`, and neither attaching a supervisor nor
+     * `resume()` changes that. Create the server again once the instance
+     * has a supervisor and is not suspended to get subscriptions.
+     *
+     * A `stdio` server writes to this process's stdout, and its event pump
+     * writes there after the reading client may have exited. Before serving,
+     * this call makes such a write fail with `EPIPE` instead of raising
+     * SIGPIPE, whose default action terminates the host: on Apple targets it
+     * sets `F_SETNOSIGPIPE` on stdout alone; on other Unix targets, where a
+     * pipe has no such switch, it sets SIGPIPE to ignored when SIGPIPE still
+     * has its default action, for the whole process.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
+     * server's stdout cannot be made to fail without SIGPIPE, for example
+     * because stdout is closed.
      */
 open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
     return
@@ -6028,10 +6130,10 @@ open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     * Stops the MCP server registered under `handle`.
      *
-     * Routes through the module-level MCP server registry (the registry
-     * is not per-instance; the opaque handle string is globally unique).
+     * Looks the handle up in this instance's MCP server registry; a handle
+     * another instance returned is not found.
      */
 open func mcpServerStop(handle: String)async throws   {
     return
@@ -7469,6 +7571,10 @@ open func trustVerifyResponse(challengeJson: String, responseJson: String)throws
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * Signs each delegation with `delegator_did`'s own key, read from this
+     * instance's identity custody registry. A `delegator_did` that this
+     * instance has not registered returns `SCP-IDENT-1001`.
      */
 open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
     return
@@ -7490,7 +7596,7 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
     /**
      * Diagnostic, read-only evaluation of a UCAN token.
      *
-     * Counterpart to [`SCP::ucan_validate`]: runs the same 11-step ADR-016
+     * Counterpart to [`Scp::ucan_validate`](crate::scp::Scp::ucan_validate): runs the same 11-step ADR-016
      * pipeline via `evaluate_ucan` but returns a structured
      * [`CapabilityValidationRecord`] (six booleans) instead of failing at the
      * first error, and never records the token's nonce (read-only probe).
@@ -14231,10 +14337,10 @@ extension SourceType: Equatable, Hashable {}
  * an invalid state, so there is exactly one happy path per variant. This
  * mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
  *
- * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+ * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`](scp_platform::sqlite::SqliteStorage::new) directly (raw-key
  * mode; the existing, unchanged path).
  * - [`SqliteKeyMaterial::Passphrase`] feeds
- * [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+ * [`SqliteStorage::with_passphrase`](scp_platform::sqlite::SqliteStorage::with_passphrase), which derives the `SQLCipher` PRAGMA
  * key from the passphrase via the shared Argon2id parameterization with a
  * persisted per-database salt sidecar.
  *
@@ -17770,7 +17876,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_port() != 32247) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 19628) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_relay_url() != 35261) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_rollback_deploy() != 34442) {
@@ -17806,7 +17912,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 48565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 64098) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 23956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
@@ -17956,7 +18062,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 16710) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_verify_payment_receipts() != 40702) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 11385) {
@@ -18061,19 +18167,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 44028) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 35239) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 55993) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 63976) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 57071) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 16053) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 47603) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 20301) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 56929) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 7937) {
@@ -18088,10 +18194,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 39655) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 11371) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 33540) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 10523) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_media_activate_session() != 3062) {
@@ -18277,10 +18383,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 33478) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_evaluate() != 17617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {

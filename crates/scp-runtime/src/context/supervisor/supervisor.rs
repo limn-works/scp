@@ -11966,6 +11966,33 @@ impl Supervisor {
         event_log.event_log_entries(context_id_bytes)
     }
 
+    /// Returns the entry count and Merkle root of `context_id`'s event log,
+    /// read from the same shared provider as [`Self::event_log_entries`].
+    ///
+    /// The provider reads both values from one state of the log
+    /// ([`ContextEventLogProvider::event_log_summary`]), so an append that
+    /// lands concurrently never pairs one tree's count with another tree's
+    /// root. A context whose log exists and has no entries reports a count of
+    /// 0 and the empty-tree root, `SHA-256("")` (spec §25.8 Vector 15).
+    /// Synchronous for the reason [`Self::event_log_entries`] gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if no event-log provider is
+    /// wired, and the provider's [`ContextError`] if the context has no event
+    /// log or the provider cannot summarize it.
+    pub fn event_log_summary(
+        &self,
+        context_id_bytes: &[u8; 32],
+    ) -> Result<(usize, [u8; 32]), ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::event_log_summary — event_log provider not configured".to_owned(),
+            )
+        })?;
+        event_log.event_log_summary(context_id_bytes)
+    }
+
     /// Computes the participation record (§7.3.2) for `subject_did` in
     /// `context_id` from the context's FULL event log.
     ///
@@ -16734,6 +16761,18 @@ mod tests {
         assert!(s.lookup("any-ctx").is_none());
         assert!(s.local_dids.load().is_empty());
         assert!(s.standing_contexts.load().is_empty());
+    }
+
+    /// A supervisor with no event-log provider wired reports the summary as
+    /// `NotInitialized` rather than as an empty log.
+    #[tokio::test]
+    async fn event_log_summary_without_a_provider_is_not_initialized() {
+        let s = test_supervisor();
+        let summary = s.event_log_summary(&[7u8; 32]);
+        assert!(
+            matches!(summary, Err(ContextError::NotInitialized(_))),
+            "a supervisor with no event-log provider must not summarize a log, got {summary:?}"
+        );
     }
 
     // ---------------------------------------------------------------
