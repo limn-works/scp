@@ -23,12 +23,18 @@
 //! - **Dynamic updates** -- emits `notifications/tools/list_changed` when a
 //!   `tools/call`, or a [`ContextEvent`] that `affected_resources` classes
 //!   as a membership, capability or lifecycle change, changes the
-//!   capability-filtered tool set. When the server cannot read which
-//!   contexts it serves, it sends the notice only for a context that a list
-//!   or subscribe response or an earlier event found served, and nothing for
-//!   any other context. Any other event runs no comparison, so it sends the
-//!   notice only on such a failed read. A `tools/call` queues its notifications,
-//!   and the transport drains them with
+//!   capability-filtered tool set. When such a comparison cannot read the
+//!   agent's view of a served context (its tools, or whether one of its
+//!   resources is readable), it sends the notice to a client that holds a
+//!   recorded view of that context, listed in this session, or subscribes to
+//!   its `tools` resource. When the server cannot read which contexts it
+//!   serves, it sends the notice only for a context that a list or subscribe
+//!   response or an earlier event found served, and nothing for any other
+//!   context. Any other event runs no comparison, so it sends the notice only
+//!   on such a failed read. When the pump's broadcast receiver lags, it sends
+//!   the notice and resynchronizes through
+//!   [`McpServer::lagged_resync_notifications`]. A `tools/call` queues its
+//!   notifications, and the transport drains them with
 //!   [`McpServer::take_pending_notifications`]. A change that no compared
 //!   [`ContextEvent`] reports and no `tools/call` causes sends no
 //!   notification: the agent token reaching its expiry, its nonce passing

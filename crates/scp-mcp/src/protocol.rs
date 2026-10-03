@@ -253,9 +253,13 @@ pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 /// capability suspension, an executed governance action, a ceiling change, a
 /// consequence, a migration start, a tombstone, a close, an expiry). It sends
 /// this notice when that comparison finds a change, a `tools/call` that spent
-/// the agent's token included; when it cannot read which contexts it serves,
-/// for a context that a list or subscribe response or an earlier event found
-/// served; and when the event pump lagged and resynchronizes. A join or leave
+/// the agent's token included; when that comparison cannot read the agent's
+/// view of a served context (its tools, or whether one of its resources is
+/// readable), to a client that holds a recorded view of that context, listed
+/// in this session, or subscribes to its `tools` resource; when it cannot read
+/// which contexts it serves, for a context that a list or subscribe response
+/// or an earlier event found served; and when the event pump lagged and
+/// resynchronizes. A join or leave
 /// is one such change, not the only one. Any other `ContextEvent` (a block, an
 /// access-key revocation or restoration, a message, a data-plane event) runs
 /// no comparison, so it sends this notice only when the server cannot read
