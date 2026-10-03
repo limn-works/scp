@@ -67,7 +67,8 @@ let supervisor = test_supervisor(
 
 // Create a context. Returns a `ContextHandle` in `Active` state. A create
 // must declare a non-empty ceiling; an empty one fails with
-// `CeilingRequired(Empty)`.
+// `ContextCreationError::StateTransition(
+//     ContextError::CeilingRequired(CeilingDeclaration::Empty))`.
 let params = ContextParams {
     ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
     ..ContextParams::default()     // encrypted mode, default TTL

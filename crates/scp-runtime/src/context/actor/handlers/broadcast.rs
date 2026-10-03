@@ -2599,6 +2599,77 @@ mod tests {
         );
     }
 
+    /// On the unchecked proposal path (`check_propose_capability = false`, the
+    /// actor twin of `Supervisor::propose_governance_action`), the
+    /// proposer-eligibility gate still runs before the empty-ceiling check: a
+    /// proposer with a pending ejection who proposes an empty-ceiling migration
+    /// gets `PermissionDenied`, not `CeilingRequired`, and no proposal is
+    /// recorded. `migration_proposal_with_an_empty_destination_ceiling_is_refused`
+    /// is the partner: the same proposer without the pending ejection gets
+    /// `CeilingRequired(Empty)`.
+    #[tokio::test]
+    async fn unchecked_migration_proposal_checks_eligibility_before_the_ceiling() {
+        use scp_protocol::context::governance::{
+            GovernanceAction, GovernanceProposal, ProposalStatus,
+        };
+
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) =
+            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        let mut cell = ClassSCell::new(state);
+        let proposer = DID(CREATOR_DID.to_owned());
+
+        // An approved, not-yet-executed ejection of the proposer.
+        let ejection = GovernanceProposal {
+            proposal_id: [7u8; 32],
+            context_id: ctx_hex.clone(),
+            proposer_did: proposer.clone(),
+            action: GovernanceAction::RemoveMember {
+                did: proposer.clone(),
+                reason: None,
+            },
+            status: ProposalStatus::Approved,
+            created_at: 0,
+            voting_deadline: 0,
+            approvals: Vec::new(),
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        cell.class_c_view()
+            .governance_class_c_mut()
+            .approved_proposals_mut()
+            .insert(ejection.proposal_id, (ejection, 0, 0));
+
+        let result = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &proposer,
+            GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+                    ceiling: Vec::new(),
+                    ..undeliverable_destination_params()
+                }),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            },
+            &creator_key(),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("pending ejection")),
+            "an ineligible proposer on the unchecked path must be refused for eligibility \
+             before the ceiling is validated; got {result:?}"
+        );
+        assert!(
+            crate::context::governance_helpers::list_proposals(&cell).is_empty(),
+            "a refused migration proposal must record no proposal"
+        );
+    }
+
     /// `execute_propose_context_migration` applies nothing to the source
     /// context when the destination creation fails: the handle returns to
     /// `Active`, `migration_state` stays `None`, the receive buffer keeps its

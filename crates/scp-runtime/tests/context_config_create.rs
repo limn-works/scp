@@ -210,7 +210,10 @@ async fn create_with_template_peer_fails_loud_not_silent() {
 
     // No context was created: the deterministic id is unknown to the manager.
     assert!(
-        manager.read_context_state("ctx-with-peer").await.is_none(),
+        matches!(
+            manager.read_context_state_checked("ctx-with-peer").await,
+            Ok(None)
+        ),
         "a rejected peer create must not leave a partially-created context behind"
     );
 }
@@ -273,10 +276,12 @@ async fn create_with_empty_explicit_ceiling_is_rejected() {
         "an empty Explicit ceiling must be rejected with CeilingRequired(Empty); got {result:?}"
     );
     assert!(
-        manager
-            .read_context_state("ctx-empty-ceiling")
-            .await
-            .is_none(),
+        matches!(
+            manager
+                .read_context_state_checked("ctx-empty-ceiling")
+                .await,
+            Ok(None)
+        ),
         "a rejected empty-ceiling create must not leave a context behind"
     );
 }
@@ -301,6 +306,16 @@ async fn create_with_non_empty_explicit_ceiling_succeeds() {
 
     assert_eq!(handle.state(), ContextState::Active);
     assert_eq!(handle.params().ceiling, ceiling);
+    // The read the rejection tests use to prove absence sees this id.
+    assert!(
+        matches!(
+            manager
+                .read_context_state_checked("ctx-explicit-ceiling")
+                .await,
+            Ok(Some(ContextState::Active))
+        ),
+        "a created context must read back as Active"
+    );
 }
 
 fn params_with_ceiling(ceiling: Vec<Capability>) -> ContextParams {
@@ -344,10 +359,12 @@ async fn create_context_with_empty_ceiling_is_rejected() {
         "create_context must reject an empty ceiling with CeilingRequired(Empty); got {result:?}"
     );
     assert!(
-        manager
-            .read_context_state("ctx-params-empty-ceiling")
-            .await
-            .is_none(),
+        matches!(
+            manager
+                .read_context_state_checked("ctx-params-empty-ceiling")
+                .await,
+            Ok(None)
+        ),
         "a rejected empty-ceiling create_context must not leave a context behind"
     );
 }
@@ -371,6 +388,16 @@ async fn create_context_with_non_empty_ceiling_succeeds() {
 
     assert_eq!(handle.state(), ContextState::Active);
     assert_eq!(handle.params().ceiling, ceiling);
+    // The read the rejection tests use to prove absence sees this id.
+    assert!(
+        matches!(
+            manager
+                .read_context_state_checked("ctx-params-ceiling")
+                .await,
+            Ok(Some(ContextState::Active))
+        ),
+        "a created context must read back as Active"
+    );
 }
 
 /// A minimum protocol version no SDK of the current major satisfies.

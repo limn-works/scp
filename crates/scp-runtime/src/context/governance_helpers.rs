@@ -4160,11 +4160,20 @@ pub async fn propose_governance_action_inner(
         ));
     }
 
+    // Eligibility check (#1530). The composite proposer-eligibility gate
+    // (pending-removal + participation threshold + earned-capacity rate
+    // limit) runs against actor-owned state via `actor_check_proposer_eligibility`.
+    actor_check_proposer_eligibility(cell, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
+
     // A migration's destination create rejects an empty ceiling
     // (construction.md M2), so a proposal carrying one would fail only when it
-    // executes. Reject it here with the typed error, after both permission
-    // checks so a caller who may not propose gets `PermissionDenied`, and
-    // before any proposal is recorded.
+    // executes. Reject it here with the typed error, after the capability check
+    // (when `check_propose_capability` is set), the presence-only check and the
+    // proposer-eligibility gate, so a caller those refuse gets
+    // `PermissionDenied`, and before any proposal is recorded. The governance
+    // engine's role eligibility (`GovernanceFailed`) runs later, inside the
+    // `propose` call that records the proposal, so on the unchecked path an
+    // engine-ineligible proposer reaches this check.
     if let GovernanceAction::ProposeContextMigration {
         new_context_params, ..
     } = &action
@@ -4174,11 +4183,6 @@ pub async fn propose_governance_action_inner(
             scp_protocol::context::CeilingDeclaration::Empty,
         ));
     }
-
-    // Eligibility check (#1530). The composite proposer-eligibility gate
-    // (pending-removal + participation threshold + earned-capacity rate
-    // limit) runs against actor-owned state via `actor_check_proposer_eligibility`.
-    actor_check_proposer_eligibility(cell, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
 
     // SCP-272: Check and auto-resolve expired governance freezes.
     // Timer-triggered expiry: capture the pre-computed freeze deadline
