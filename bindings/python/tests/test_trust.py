@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scp_sdk.errors import ContextError
+from scp_sdk.errors import ContextError, ValidationError
 from scp_sdk.trust import (
     AttestationSummary,
     AttestorInfo,
@@ -203,7 +203,7 @@ class TestCapabilityValidationFieldIndependence:
 
         Per §7.2.4 the diagnostic is non-throwing for capability OUTCOMES,
         but malformed FFI input (e.g. a control char in context_id) still
-        raises a ValidationError-shaped exception that must propagate.
+        raises, as the coded SDK :class:`ValidationError`.
         """
         mock_bridge = MagicMock()
         mock_bridge.ucan_evaluate.side_effect = RuntimeError(
@@ -211,7 +211,7 @@ class TestCapabilityValidationFieldIndependence:
         )
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            with pytest.raises(RuntimeError, match="control characters"):
+            with pytest.raises(ValidationError, match="control characters") as excinfo:
                 asyncio.run(
                     evaluate_trust(
                         scp=MagicMock(),
@@ -220,6 +220,38 @@ class TestCapabilityValidationFieldIndependence:
                         capability_tokens=["fake-token"],
                     )
                 )
+        assert excinfo.value.code == "SCP-VALID-7001"
+
+    def test_inactive_context_raises_sdk_context_error_with_code(self) -> None:
+        """A native ``ContextError`` from ``ucan_evaluate`` reaches the caller as
+        the SDK :class:`ContextError` with ``.code == "SCP-CTX-2023"``.
+
+        The PyO3 ``ContextError`` is a separate class from
+        ``scp_sdk.errors.ContextError``, so an untranslated native error would
+        miss an ``except scp_sdk.ContextError`` handler.
+        """
+
+        class _NativeContextError(Exception):
+            pass
+
+        _NativeContextError.__name__ = "ContextError"  # mimic the PyO3 class name
+        mock_bridge = MagicMock()
+        mock_bridge.ucan_evaluate.side_effect = _NativeContextError(
+            "[SCP-CTX-2023] context error: cannot evaluate a UCAN in context: context is not active"
+        )
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(ContextError) as excinfo:
+                asyncio.run(
+                    evaluate_trust(
+                        scp=MagicMock(),
+                        subject_did="did:dht:z6MkBob",
+                        context_id="ctx-closing",
+                        capability_tokens=["fake-token"],
+                    )
+                )
+        assert not isinstance(excinfo.value, _NativeContextError)
+        assert excinfo.value.code == "SCP-CTX-2023"
 
 
 # -----------------------------------------------------------------------

@@ -885,10 +885,13 @@ async def evaluate_trust(
 
     Layer 1 consumes the structured bridge result directly (ADR-059): it
     does not reverse-engineer *which* check failed by parsing error prose.
-    The diagnostic is non-throwing for capability outcomes. It raises for
-    malformed FFI inputs (e.g. a ``context_id`` with control characters), and
-    it raises :class:`ContextError` (``SCP-CTX-2023``) when the context's
-    supervisor does not report it ``Active``; both propagate to the caller.
+    The diagnostic is non-throwing for capability outcomes. It raises
+    :class:`~scp_sdk.errors.ValidationError` for malformed FFI inputs (e.g. a
+    ``context_id`` with control characters), and
+    :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2023``) when the context's
+    supervisor does not report it ``Active`` or a supervisor read fails. Both
+    are coded SDK exceptions translated from the native bridge error, so a
+    caller branches on ``.code``.
 
     This module-level function consumes the :class:`SCP` instance to
     dispatch the ``ucan_evaluate`` (Layer 1) and ``participation_record``
@@ -941,7 +944,8 @@ async def evaluate_trust(
             # The structured diagnostic reads bools; it does NOT throw on
             # capability outcomes. Malformed FFI input (bad context_id /
             # token) and a context the supervisor does not report ``Active``
-            # (``ContextError``, ``SCP-CTX-2023``) raise and propagate.
+            # (``ContextError``, ``SCP-CTX-2023``) raise, re-raised as coded SDK
+            # exceptions as ``_participation_record_from`` does.
             #
             # No challenge capability is supplied: trust evaluation assesses
             # each token's GENERAL (intrinsic) validity — signatures, ceiling,
@@ -963,9 +967,12 @@ async def evaluate_trust(
             # inflation) — so the bridge refuses to assume it. The TS canonical
             # API passes the subject the same way; this keeps an identical shape
             # across bindings (Agent-first API design tenet).
-            result = await asyncio.to_thread(
-                instance.ucan_evaluate, context_id, token, None, subject_did
-            )
+            try:
+                result = await asyncio.to_thread(
+                    instance.ucan_evaluate, context_id, token, None, subject_did
+                )
+            except Exception as exc:  # PyO3 raises native Scp*Error
+                raise _coded_bridge_error(exc) from exc
             per_token = structured_to_capability_validation(result)
             cap_validation.tokens_valid &= per_token.tokens_valid
             cap_validation.signatures_valid &= per_token.signatures_valid

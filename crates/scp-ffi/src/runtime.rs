@@ -1799,19 +1799,23 @@ pub fn read_live_context_state(
         .map_err(ScpPyError::from)
 }
 
-/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
-/// withholds the lifecycle state from the refusal.
+/// Reads `context_id`'s role state for an authorization decision after its
+/// supervisor actor reports `Active`, and withholds the lifecycle state and
+/// every read failure from the refusal.
 ///
 /// The UCAN entry points in `ucan.rs` (`ucan_validate`, `ucan_evaluate`,
-/// `ucan_mint`, `ucan_delegate`, `ucan_revoke`) gate through this form, because
-/// each one runs the gate before it authorizes the caller. The outlet PRD's
-/// SCP-OUT-031 PR-2a note records the rule this form keeps: the raw lifecycle
-/// state never reaches an FFI caller before authorization. The refusal
-/// therefore reads the same for every non-`Active` state, for a context no
-/// actor serves, and for a state read that failed: a context mid-respawn or
-/// past a failed respawn (`ActorCrashed`), a poisoned context
-/// (`ContextPoisoned`), and an actor that did not answer (`ActorBusy`) refuse
-/// with the same text and the caller's code.
+/// `ucan_mint`, `ucan_delegate`, `ucan_revoke`) take their ceiling and creator
+/// from this function, because each one calls it before it authorizes the
+/// caller. The outlet PRD's SCP-OUT-031 PR-2a note records the rule this
+/// function keeps: the raw lifecycle state never reaches an FFI caller before
+/// authorization. The function makes two mailbox round trips, the lifecycle
+/// state read and then the [`live_role_state`] read, and a fault can land
+/// between them. The refusal therefore reads the same for every non-`Active`
+/// state, for a context no actor serves, and for a failure of either read: a
+/// context mid-respawn or past a failed respawn (`ActorCrashed`), a poisoned
+/// context (`ContextPoisoned`), an actor that did not answer (`ActorBusy`),
+/// and an actor that returned no role state refuse with the same text and the
+/// caller's code, and the text never names the context.
 ///
 /// `mk_err` wraps the refusal message in the error variant and the error code
 /// the calling entry point reports.
@@ -1819,24 +1823,49 @@ pub fn read_live_context_state(
 /// # Errors
 ///
 /// Returns whatever `mk_err` builds when the supervisor reports any state other
-/// than `Active`, when no actor serves `context_id`, and when the state read
-/// fails.
-pub fn require_active_context_before_authz<F>(
+/// than `Active`, when no actor serves `context_id`, when the state read fails,
+/// and when the role-state read fails or finds no role state.
+pub fn active_role_state_before_authz<F>(
     bi: &PyBridgeInstance,
     context_id: &str,
     verb: &str,
     mk_err: F,
-) -> Result<(), ScpPyError>
+) -> Result<ContextRoleState, ScpPyError>
 where
     F: FnOnce(String) -> ScpPyError,
 {
-    match read_live_context_state(bi, context_id) {
-        Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
-        Ok(Some(_) | None) | Err(_) => Err(mk_err(format!(
+    withhold_before_authz(
+        read_live_context_state(bi, context_id),
+        || live_role_state(bi, context_id),
+        verb,
+        mk_err,
+    )
+}
+
+/// Applies the [`active_role_state_before_authz`] refusal rule to a lifecycle
+/// state answer and a role-state read: `read_role_state` runs only after
+/// `state` reads `Active`, and every other outcome of either becomes the one
+/// withheld refusal `mk_err` builds.
+fn withhold_before_authz<F>(
+    state: Result<Option<scp_core::context::ContextState>, ScpPyError>,
+    read_role_state: impl FnOnce() -> Result<ContextRoleState, ScpPyError>,
+    verb: &str,
+    mk_err: F,
+) -> Result<ContextRoleState, ScpPyError>
+where
+    F: FnOnce(String) -> ScpPyError,
+{
+    let refusal = || {
+        format!(
             "cannot {verb}: {}",
             scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
-        ))),
+        )
+    };
+    match state {
+        Ok(Some(scp_core::context::ContextState::Active)) => {}
+        Ok(Some(_) | None) | Err(_) => return Err(mk_err(refusal())),
     }
+    read_role_state().map_err(|_| mk_err(refusal()))
 }
 
 /// Reads a context's role state from that context's supervisor actor.
@@ -1877,26 +1906,6 @@ pub fn live_role_state(
             code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
         },
     )
-}
-
-/// Reads a context's capability ceiling from that context's supervisor actor,
-/// normalized to the `{resource}:{action}` UCAN capability names that ADR-016
-/// step 8 compares a token's grants against.
-///
-/// Callers that also need membership, roles or the creator call
-/// [`live_role_state`] once and derive the ceiling from it, so one
-/// authorization decision costs one mailbox round trip.
-///
-/// # Errors
-///
-/// Propagates every error [`live_role_state`] returns.
-pub fn live_ceiling_strings(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-) -> Result<HashSet<String>, ScpPyError> {
-    Ok(live_role_state(bi, context_id)?
-        .ceiling()
-        .to_ucan_string_set())
 }
 
 /// Returns the IDs of all registered contexts where the given DID is a member.
@@ -3867,7 +3876,7 @@ mod tests {
                 "the fixture must leave the context unable to read Active ({fault})"
             );
 
-            let err = require_active_context_before_authz(
+            let err = active_role_state_before_authz(
                 bi,
                 &ctx_id,
                 "validate a UCAN in context",
@@ -3896,10 +3905,118 @@ mod tests {
         // above come from the fault and not from a gate that refuses everything.
         let live = unique_ctx_id("gate-active");
         create_supervisor_context_for_test(bi, &live, creator, &["messages:read".to_owned()]);
-        require_active_context_before_authz(bi, &live, "validate a UCAN in context", |message| {
-            ScpPyError::context(message)
-        })
-        .expect("the gate must admit an Active context");
+        let admitted =
+            active_role_state_before_authz(bi, &live, "validate a UCAN in context", |message| {
+                ScpPyError::context(message)
+            })
+            .expect("the gate must admit an Active context");
+        assert_eq!(
+            admitted.creator_did, creator,
+            "the gate must hand back the supervisor's role state"
+        );
+    }
+
+    /// The pre-authorization gate withholds a failure of the role-state read it
+    /// runs after the lifecycle read answered `Active`, the window in which a
+    /// crash, a poison or a saturated mailbox can land between the two mailbox
+    /// round trips. Each failure `live_role_state` can return there (the
+    /// converted `ActorCrashed`, `ContextPoisoned` and `ActorBusy` errors, and
+    /// the absent-role-state refusal that names the context) refuses with the
+    /// withheld text and the caller's code, and the role state a successful
+    /// read returns passes through unchanged.
+    #[test]
+    fn pre_authz_gate_withholds_a_role_state_read_that_fails_after_active() {
+        let creator = "did:dht:z6MkGateRoleReadFails";
+        let (bi, ctx_id) = live_state_fixture("gate-role-read", creator, &["messages:read"]);
+        let role_state = live_role_state(&bi, &ctx_id).expect("the fixture's actor answers");
+        let active = || -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
+            Ok(Some(scp_core::context::ContextState::Active))
+        };
+        let caller_err = |message: String| ScpPyError::ContextError {
+            message,
+            code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+        };
+
+        let failures = [
+            (
+                scp_ffi_common::error_codes::CTX_2135,
+                format!("context '{ctx_id}' crashed"),
+            ),
+            (
+                scp_ffi_common::error_codes::CTX_2134,
+                format!("context '{ctx_id}' poisoned"),
+            ),
+            ("SCP-CTX-2130", format!("context '{ctx_id}' actor busy")),
+            (
+                scp_ffi_common::error_codes::CTX_2023,
+                format!("context '{ctx_id}' has no live supervisor role state"),
+            ),
+        ];
+        for (code, message) in failures {
+            let err = withhold_before_authz(
+                active(),
+                || {
+                    Err(ScpPyError::ContextError {
+                        message,
+                        code: code.to_owned(),
+                    })
+                },
+                "validate a UCAN in context",
+                caller_err,
+            )
+            .expect_err("a failed role-state read must refuse");
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && text.contains(scp_ffi_common::error_codes::CTX_2023),
+                "the refusal must carry the withheld text and the caller's code ({code}): {text}"
+            );
+            assert!(
+                !text.contains(scp_ffi_common::error_codes::CTX_2135)
+                    && !text.contains(scp_ffi_common::error_codes::CTX_2134)
+                    && !text.contains("SCP-CTX-2130")
+                    && !text.contains(&ctx_id)
+                    && !text.contains("no live supervisor role state"),
+                "the refusal must not disclose the read failure or echo the id ({code}): {text}"
+            );
+        }
+
+        let passed = withhold_before_authz(
+            active(),
+            || Ok(role_state.clone()),
+            "validate a UCAN in context",
+            caller_err,
+        )
+        .expect("an Active context whose role state reads must pass");
+        assert_eq!(
+            passed, role_state,
+            "the gate must return the role state it read"
+        );
+
+        // A non-Active answer refuses without running the role-state read, even
+        // when that read would succeed.
+        let role_read_ran = std::cell::Cell::new(false);
+        let refused = withhold_before_authz(
+            Ok(Some(scp_core::context::ContextState::Closing)),
+            || {
+                role_read_ran.set(true);
+                Ok(role_state.clone())
+            },
+            "validate a UCAN in context",
+            caller_err,
+        )
+        .expect_err("a Closing context must refuse");
+        assert!(
+            !role_read_ran.get(),
+            "the role-state read must not run for a context that is not Active"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a Closing context must refuse with the withheld text: {refused}"
+        );
+        remove_context(&bi, &ctx_id);
     }
 
     /// `live_role_state` fails closed when the context has no supervisor actor,
@@ -3953,13 +4070,13 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
-    /// `live_ceiling_strings` returns the ceiling the SUPERVISOR holds, not the
-    /// `default_ceiling()` the bridge copy carries. The fixture registers FFI
+    /// The pre-authorization gate returns the ceiling the SUPERVISOR holds, not
+    /// the `default_ceiling()` the bridge copy carries. The fixture registers FFI
     /// state with an empty ceiling argument, so the copy holds the default, and
     /// gives the supervisor a narrower ceiling; a copy-reading implementation
     /// reports the wider default and fails the exclusion below.
     #[test]
-    fn live_ceiling_strings_reads_the_supervisor_ceiling() {
+    fn pre_authz_gate_returns_the_supervisor_ceiling() {
         let creator = "did:dht:z6MkLiveCeilingCreator";
         let (bi, ctx_id) = live_state_fixture(
             "live-ceiling",
@@ -3972,7 +4089,15 @@ mod tests {
             "precondition: the bridge copy carries the default ceiling: {copy:?}"
         );
 
-        let ceiling = live_ceiling_strings(&bi, &ctx_id).unwrap();
+        let ceiling = active_role_state_before_authz(
+            &bi,
+            &ctx_id,
+            "delegate a UCAN in context",
+            ScpPyError::context,
+        )
+        .unwrap()
+        .ceiling()
+        .to_ucan_string_set();
         assert!(
             ceiling.contains("messages:write"),
             "the supervisor ceiling entry must be present: {ceiling:?}"
