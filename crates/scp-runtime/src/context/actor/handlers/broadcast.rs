@@ -2670,6 +2670,75 @@ mod tests {
         );
     }
 
+    /// The freeze gate and the governance engine's proposer check both run
+    /// before the empty-ceiling check, so a refused proposer of an
+    /// empty-ceiling migration learns why it is refused, not how the payload
+    /// would be validated. On the unchecked path a member the `SingleAdmin`
+    /// engine refuses (not the admin) gets `GovernanceFailed`; in a frozen
+    /// context the admin gets the freeze refusal. Neither records a proposal.
+    /// `migration_proposal_with_an_empty_destination_ceiling_is_refused` is the
+    /// partner: the admin of an unfrozen context gets `CeilingRequired(Empty)`.
+    #[tokio::test]
+    async fn migration_proposal_checks_engine_and_freeze_before_the_ceiling() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let (deps, _appends) = build_deps().await;
+        let (state, ctx_hex) = build_broadcast_state_with_authors(
+            BroadcastAdmission::Open,
+            &[CREATOR_DID, LURKER_DID],
+        );
+        let mut cell = ClassSCell::new(state);
+        let empty_migration = || GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(scp_protocol::context::params::ContextParams {
+                ceiling: Vec::new(),
+                ..undeliverable_destination_params()
+            }),
+            reason: "fixture".to_owned(),
+            grace_period_secs: 60,
+            auto_invite: false,
+        };
+
+        let non_admin = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(LURKER_DID.to_owned()),
+            empty_migration(),
+            &creator_key(),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&non_admin, Err(ContextError::GovernanceFailed(msg)) if !msg.contains("frozen")),
+            "a proposer the engine refuses must get the engine's refusal before the ceiling \
+             is validated; got {non_admin:?}"
+        );
+
+        *cell.class_c_view().governance_class_c_mut().freeze_mut() =
+            Some(([1u8; 32], [2u8; 32], deps.clock.now_secs()));
+        let frozen = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            empty_migration(),
+            &creator_key(),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&frozen, Err(ContextError::GovernanceFailed(msg)) if msg.contains("frozen")),
+            "a frozen context must report its freeze before the ceiling is validated; \
+             got {frozen:?}"
+        );
+        assert!(
+            crate::context::governance_helpers::list_proposals(&cell).is_empty(),
+            "a refused migration proposal must record no proposal"
+        );
+    }
+
     /// `execute_propose_context_migration` applies nothing to the source
     /// context when the destination creation fails: the handle returns to
     /// `Active`, `migration_state` stays `None`, the receive buffer keeps its

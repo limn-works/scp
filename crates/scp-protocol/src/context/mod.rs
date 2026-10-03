@@ -312,15 +312,14 @@ pub enum ContextError {
     /// governance migration. The runtime's governance proposal step raises
     /// [`CeilingDeclaration::Empty`], unwrapped, for a
     /// `ProposeContextMigration` whose destination ceiling is empty; it runs
-    /// on the existing `Active` source context, after the `governance:propose`
-    /// capability check (on the checked path only; the unchecked path skips
-    /// it), the presence-only check and the proposer-eligibility gate
-    /// (pending removal, participation threshold, earned-capacity limit), and
-    /// before the governance engine's `propose` call, which checks the
-    /// proposer's role eligibility and records the proposal. So no proposal is
-    /// recorded and none reaches a vote or execution, and on the unchecked path
-    /// a proposer the engine would refuse as role-ineligible receives this
-    /// variant instead of `GovernanceFailed`. The NAPI and `PyO3` context-parameter
+    /// on the existing `Active` source context, after every check that
+    /// refuses the proposer: the `governance:propose` capability check (on the
+    /// checked path only; the unchecked path skips it), the presence-only
+    /// check, the proposer-eligibility gate (pending removal, participation
+    /// threshold, earned-capacity limit), the governance-freeze gate, and the
+    /// governance engine's proposer check (`GovernanceEngine::check_proposer`).
+    /// It runs before the engine's `propose` call records the proposal, so no
+    /// proposal is recorded and none reaches a vote or execution. The NAPI and `PyO3` context-parameter
     /// parsers raise all three declarations before they call the runtime,
     /// because their parameters can omit the ceiling or set it to null. Each
     /// bridge's error translator maps [`CeilingDeclaration::Absent`] and

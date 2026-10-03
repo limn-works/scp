@@ -329,12 +329,7 @@ impl GovernanceEngine for ThresholdEngine {
         context: &GovernanceContext,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        // Only signers can propose.
-        if !self.is_signer(proposer) {
-            return Err(GovernanceError::NotEligible(
-                "proposer is not in the signer set".to_owned(),
-            ));
-        }
+        self.check_proposer(proposer)?;
 
         // RFC 8785 JCS canonical serialization for cross-implementation
         // deterministic proposal ID computation (§9.5.2). JCS (not
@@ -425,6 +420,17 @@ impl GovernanceEngine for ThresholdEngine {
         );
 
         Ok((proposal, events))
+    }
+
+    fn check_proposer(&self, proposer: &DID) -> Result<(), GovernanceError> {
+        // Only signers can propose.
+        if self.is_signer(proposer) {
+            Ok(())
+        } else {
+            Err(GovernanceError::NotEligible(
+                "proposer is not in the signer set".to_owned(),
+            ))
+        }
     }
 
     fn approve(
