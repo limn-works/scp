@@ -12,35 +12,38 @@ import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 
 /**
- * Android implementation of [DeviceAttestationProvider] using the Play Integrity
- * Standard API.
+ * Android implementation of [DeviceAttestationProvider] using Play Integrity.
  *
- * ## Play Integrity Standard API
+ * ## Classic request, Standard required
  *
- * Standard integrity requests return a verdict signed by Google's servers,
- * sufficient for SCP's attestation purpose. Classic attestation (APK certificate
- * chain) is not used -- it requires a dedicated Google Play Developer API call per
- * attestation with stricter rate limits and is designed for offline scenarios SCP
- * does not have. Standard is lower-cost, lower-latency, and simpler.
+ * This adapter requests a Classic Play Integrity token: it passes a nonce
+ * through `IntegrityTokenRequest.builder().setNonce(nonce)`. ADR-027's
+ * 2026-09-27 amendment requires a Standard integrity request whose
+ * `requestHash` is the lowercase hexadecimal form of the binding digest `D`,
+ * and story SCP-111 tracks that change.
  *
- * ## Attestation flow (per ADR-027)
+ * ## Attestation flow as shipped
  *
  * 1. Construct `clientDataJSON` from the challenge, device ID, and attestation type.
  * 2. Compute `nonce = Base64(SHA-256(clientDataJSON))`.
- * 3. Request a standard integrity token from Play Integrity with the nonce.
- * 4. Return the integrity token JWT bytes for server-side verification.
+ * 3. Request a Classic integrity token from Play Integrity with the nonce.
+ * 4. Return the integrity token JWT bytes.
  *
  * ## Thread safety
  *
  * All I/O operations run on [Dispatchers.IO] via [withContext]. The class holds
  * no mutable state and is safe for concurrent use.
  *
- * ## Server-side verification
+ * ## Verification
  *
- * The returned integrity token is a JWT that must be verified server-side via
- * the Google Play Integrity API. The relay reconstructs the `clientDataJSON`
- * with the same fixed-field-order formula to verify the nonce embedded in the
- * integrity token.
+ * Google decodes an integrity token only for the Cloud project linked to the
+ * requesting app. ADR-027's 2026-09-27 amendment requires the package's
+ * verifier, named in the context's `accepted_android_packages`, to decode the
+ * token and sign a verdict, and requires each reader to check that verdict.
+ * §9.3.1 of `09-security-model.md` defines the procedure. No code implements
+ * the verifier, the producer that publishes the token and verdict, or the
+ * reader yet: story SCP-318 tracks the reference verifier, SCP-317 the
+ * producer, and SCP-316 the reader.
  *
  * See ADR-027 in `.docs/adrs/phase-6.md` and `crates/scp-ffi/uniffi/src/lib.rs`
  * `DeviceAttestationProvider`.
@@ -55,16 +58,35 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      *
      * Constructs a deterministic `clientDataJSON` with fixed field order:
      * `{"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`.
-     * The nonce is `Base64(SHA-256(clientDataJSON))`. A Play Integrity Standard
-     * token is requested with this nonce and returned as UTF-8 encoded JWT bytes.
+     * The nonce is `Base64(SHA-256(clientDataJSON))`. The adapter requests a
+     * Classic Play Integrity token with this nonce and returns it as UTF-8
+     * encoded JWT bytes. ADR-027 acceptance criterion 7 requires, among
+     * other things, the following four, and this adapter meets none of the four:
+     *   1. a Standard integrity token, not a Classic one;
+     *   2. a token prepared with the `cloudProjectNumber` of the package
+     *      verifier's `PlayIntegrityVerifier` entry;
+     *   3. a `requestHash` equal to the lowercase hexadecimal form of the
+     *      binding digest `D`;
+     *   4. an adapter that does not read [deviceId].
+     * The reopen note of story SCP-111, which stands in progress, names all
+     * four.
      *
-     * The relay reconstructs this JSON with the same fixed-field-order formula
-     * to verify the nonce embedded in the integrity token.
-     *
-     * @param challenge Server-issued random challenge bytes.
-     * @param deviceId Stable device/identity identifier bytes.
+     * @param challenge The 32-byte binding digest `D` of
+     *   `09-security-model.md` §9.3.1. ADR-025 and ADR-027 require the caller
+     *   to pass `D`. No Rust code calls this method yet.
+     * @param deviceId Device ID bytes, which this adapter base64-encodes into
+     *   `clientDataJSON`. No verifier checks them, and they name no identity:
+     *   `27-attestations.md` states that a device id is not an identifier, and
+     *   ADR-027 acceptance criterion 7 requires the adapter not to read this
+     *   parameter.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
-     * @throws ScpException if the Play Integrity API call fails.
+     * @throws ScpException with code `SCP-ATTEST-9001` if the Play Integrity
+     *   call throws an `ApiException`, a [SecurityException] or an
+     *   [IllegalStateException]. A coroutine `CancellationException` is an
+     *   [IllegalStateException], so cancelling the calling coroutine while the
+     *   call runs also yields `SCP-ATTEST-9001` and not a cancellation. Any other
+     *   exception from the call, and any exception thrown before or after it,
+     *   propagates unconverted.
      */
     override suspend fun attest(challenge: ByteArray, deviceId: ByteArray): ByteArray {
         val clientDataJSON = buildClientDataJSON(challenge, deviceId)
@@ -107,7 +129,7 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
             )
         }
 
-        // Return the integrity token (JWT) for server-side verification
+        // Return the integrity token (JWT) as UTF-8 bytes.
         return integrityTokenResponse.token().toByteArray(Charsets.UTF_8)
     }
 
@@ -115,18 +137,30 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
      * Generate a per-request assertion using a fresh integrity token.
      *
      * Play Integrity does not have a per-request assertion flow equivalent to
-     * Apple App Attest assertions. For assertion-equivalent use cases, a fresh
-     * Standard integrity token is requested with the request hash as the
-     * challenge and an empty device ID.
+     * Apple App Attest assertions. This method passes the request hash to
+     * [attest] as the challenge with an empty device ID, so it returns a
+     * Classic integrity token whose nonce is `Base64(SHA-256(clientDataJSON))`.
+     * ADR-027 acceptance criterion 8 requires a Standard integrity token whose
+     * `requestHash` is the lowercase hexadecimal form of `A`, requested
+     * without routing through [attest]. The reopen note of story SCP-111 names
+     * the Classic request and the routing through [attest].
      *
-     * @param requestHash SHA-256 hash of the request data being asserted.
+     * @param requestHash The 32-byte assertion digest `A` of
+     *   `09-security-model.md` §9.3.1 over the request bytes. ADR-025 and
+     *   ADR-027 require the caller to pass `A`, never the request bytes or
+     *   their plain SHA-256. No Rust code calls this method yet.
      * @return Play Integrity token bytes (JWT, UTF-8 encoded).
-     * @throws ScpException if the Play Integrity API call fails.
+     * @throws ScpException with code `SCP-ATTEST-9001` if [attest] converts the
+     *   failure; [attest] converts only an `ApiException`, a [SecurityException]
+     *   or an [IllegalStateException] from the Play Integrity call, including
+     *   a coroutine `CancellationException`, which is an
+     *   [IllegalStateException]; any other exception propagates unconverted.
      */
     override suspend fun assertRequest(requestHash: ByteArray): ByteArray {
         // Play Integrity does not have a per-request assertion flow equivalent
-        // to App Attest assertions. For assertion-equivalent use cases, a fresh
-        // Standard integrity token is requested.
+        // to App Attest assertions. This call requests a fresh Classic
+        // integrity token through `attest` (story SCP-111 tracks the Standard
+        // request ADR-027 acceptance criterion 8 requires).
         return attest(challenge = requestHash, deviceId = ByteArray(0))
     }
 
@@ -137,7 +171,7 @@ class AndroidDeviceAttestation(private val context: Context) : DeviceAttestation
     /**
      * Build the deterministic clientDataJSON string.
      *
-     * Field order is fixed to ensure cross-platform determinism:
+     * Field order is fixed so the legacy nonce is deterministic for a given input:
      * `{"challenge":"<b64>","deviceId":"<b64>","type":"scp-device-attestation-v1"}`
      *
      * Uses [Base64.NO_WRAP] for single-line Base64 encoding (no line breaks).
