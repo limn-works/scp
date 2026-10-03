@@ -3,13 +3,14 @@
 # Auto-formats staged files and re-stages them. Lint errors block the commit.
 set -euo pipefail
 
-STAGED=$(git diff --cached --name-only --diff-filter=ACM)
-[ -z "$STAGED" ] && exit 0
+# The filter counts deleted paths too, and `--no-renames` lists a renamed file as a deletion
+# plus an addition, so a commit that only deletes or moves files still runs the hook.
+if git diff --cached --quiet --no-renames --diff-filter=ACMD; then exit 0; fi
 
 # ── Which files this commit changes, for the language steps ──
 #
-# On a merge commit, `STAGED` lists every file the merged-in branch changed, and the CI of
-# that branch already formatted and linted each of them. A language step runs here only for
+# On a merge commit, the staged set lists every file the merged-in branch changed, and the
+# CI of that branch already formatted and linted each of them. A language step runs here only for
 # a file whose staged content differs from what a merged-in head carries: a file this
 # branch changed, or a file the conflict resolution changed. So when `MERGE_HEAD` exists,
 # the language flags below read the files where the staged tree differs from each merged-in
@@ -17,19 +18,37 @@ STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 # names several heads in `MERGE_HEAD`; the list is the union over all of them, so a file
 # differing from any one merged-in head still sets its flag.
 #
-# `STAGED` still decides the early exit above, so the toolchain check below runs on every
-# commit that stages a file, merge or not.
+# The staged set still decides the early exit above, so the toolchain check below runs on
+# every commit that stages a file, merge or not.
+#
+# The list also holds deleted paths, and `--no-renames` lists a renamed file as its deleted
+# old path plus its added new path. A commit that deletes a `.rs` file or moves one out of a
+# crate changes what that crate compiles, so the clippy scope below has to see the crate.
+#
+# `changed_paths` prints the list NUL-separated (`git diff -z`). Without `-z`, git wraps a
+# path holding a non-ASCII byte in double quotes with octal escapes, and word splitting
+# breaks a path holding a space, so such a path would match no member and no `*.rs`
+# pattern. The hook calls it twice: once here, and again after the
+# auto-format step, because `git add -u` in that step stages every tracked `.rs` file the
+# working tree modified, and the clippy scope has to cover each file the commit will hold.
 MERGE_HEAD_FILE=$(git rev-parse --git-path MERGE_HEAD)
-if [ -f "$MERGE_HEAD_FILE" ]; then
-  CHANGED=""
-  while IFS= read -r merged_head; do
-    [ -z "$merged_head" ] && continue
-    CHANGED="$CHANGED
-$(git diff --cached --name-only --diff-filter=ACM "$merged_head")"
-  done < "$MERGE_HEAD_FILE"
-else
-  CHANGED=$STAGED
-fi
+changed_paths() {
+  if [ -f "$MERGE_HEAD_FILE" ]; then
+    while IFS= read -r merged_head; do
+      [ -z "$merged_head" ] && continue
+      git diff --cached -z --name-only --no-renames --diff-filter=ACMD "$merged_head"
+    done < "$MERGE_HEAD_FILE"
+  else
+    git diff --cached -z --name-only --no-renames --diff-filter=ACMD
+  fi
+}
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# The list goes to a file under `set -e`, so a failing `git diff` stops the hook here. The
+# outer shell never sees the exit status of a process substitution.
+changed_paths > "$TMPDIR/changed"
 
 HAS_RUST=false
 HAS_PYTHON=false
@@ -37,7 +56,7 @@ HAS_TS=false
 HAS_KOTLIN=false
 HAS_SWIFT=false
 
-for f in $CHANGED; do
+while IFS= read -r -d '' f; do
   case "$f" in
     *.rs) HAS_RUST=true ;;
     bindings/python/*) HAS_PYTHON=true ;;
@@ -45,7 +64,7 @@ for f in $CHANGED; do
     bindings/kotlin/*) HAS_KOTLIN=true ;;
     bindings/swift/*) HAS_SWIFT=true ;;
   esac
-done
+done < "$TMPDIR/changed"
 
 # ── The compiler this shell resolves ──
 #
@@ -103,19 +122,42 @@ fi
 
 # ── Lint (parallel — read-only checks that block on failure) ──
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+# ── Which workspace members clippy lints ──
+#
+# `scripts/pre-commit-clippy-scope.py` reads the changed paths and prints the clippy package
+# arguments: each workspace member holding a changed path plus every member that depends on
+# one of them, or `--workspace` when a changed path is one of the files the script's module
+# docstring lists, such as `Cargo.toml`, `Cargo.lock`, or `rust-toolchain.toml`. The script
+# keeps only the `CLIPPY_FEATURES` entries whose package it selects, because cargo rejects a
+# feature of a package the command does not select. CI's `rust-clippy` job lints the whole
+# workspace on every pushed head.
+#
+# The hook runs the script on every commit, not only on a commit that changes a `.rs` file,
+# because a commit that changes only `Cargo.lock`, `rust-toolchain.toml`, or a non-Rust file
+# inside a member still needs the lint the script selects. The two protocol checks run when
+# the commit changes a `.rs` file or the script prints clippy arguments. The script's
+# messages and the skip notice go to `rust.log`, and the hook prints those lines after a
+# passing run too.
+CLIPPY_FEATURES=scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing
 
-if $HAS_RUST; then
-  (
-    echo "▸ Rust: clippy + protocol enforcement"
-    cargo clippy --workspace --all-targets \
-      --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing \
-      -- -D warnings 2>&1 || { echo "  ✗ clippy failed"; exit 1; }
-    python3.12 scripts/check-protocol-sync.py 2>&1 || { echo "  ✗ async code in scp-protocol"; exit 1; }
-    bash scripts/check-protocol-deps.sh 2>&1 || { echo "  ✗ banned deps in scp-protocol"; exit 1; }
-  ) > "$TMPDIR/rust.log" 2>&1 && touch "$TMPDIR/rust.ok" &
-fi
+(
+  SCOPE=$(changed_paths | python3.12 scripts/pre-commit-clippy-scope.py --features "$CLIPPY_FEATURES") \
+    || { echo "▸ Rust: clippy scope"; echo "  ✗ clippy scope failed"; exit 1; }
+  CLIPPY_ARGS=()
+  while IFS= read -r arg; do
+    if [ -n "$arg" ]; then CLIPPY_ARGS+=("$arg"); fi
+  done <<< "$SCOPE"
+  if [ "${#CLIPPY_ARGS[@]}" -eq 0 ] && ! $HAS_RUST; then exit 0; fi
+  echo "▸ Rust: clippy + protocol enforcement"
+  if [ "${#CLIPPY_ARGS[@]}" -eq 0 ]; then
+    echo "  clippy skipped: no changed path is in a workspace member"
+  else
+    cargo clippy "${CLIPPY_ARGS[@]}" --all-targets -- -D warnings 2>&1 \
+      || { echo "  ✗ clippy failed"; exit 1; }
+  fi
+  python3.12 scripts/check-protocol-sync.py 2>&1 || { echo "  ✗ async code in scp-protocol"; exit 1; }
+  bash scripts/check-protocol-deps.sh 2>&1 || { echo "  ✗ banned deps in scp-protocol"; exit 1; }
+) > "$TMPDIR/rust.log" 2>&1 && touch "$TMPDIR/rust.ok" &
 
 if $HAS_PYTHON; then
   (
@@ -159,6 +201,10 @@ for lang in rust python ts kotlin swift; do
     FAILED=true
   fi
 done
+
+if [ -f "$TMPDIR/rust.ok" ]; then
+  grep -E '^(clippy scope: |  clippy skipped: )' "$TMPDIR/rust.log" || true
+fi
 
 if $FAILED; then
   echo ""
