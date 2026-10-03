@@ -135,6 +135,46 @@ nothing:
                `pull_request` only. A merge queue evaluates a required check
                against the `merge_group` ref, so following that header would
                have left every queue entry waiting on a status no run reports.
+  needs-condition
+               Four jobs build one bridge artifact each and upload it, and six
+               jobs download what they build instead of compiling their own.
+               GitHub skips a job when any job in its `needs` list is skipped,
+               so a producer whose `if:` is narrower than one consumer's skips
+               that consumer wherever the gap opens. The aggregate evaluates the
+               consumer's own `if:` and fails that run, but only on a pull
+               request whose changed files open the gap, which is usually not
+               the pull request that narrowed the producer.
+               Job napi-addon is the case: bridge-parity reads
+               `python || typescript || rust`, so a producer reading
+               `typescript || rust` — the condition typescript-check alone
+               needs — would skip the NAPI half of the parity harness on every
+               change confined to bindings/python. A diff of either job alone
+               shows nothing.
+  downloaded-module
+               Every real-FFI test module under bindings/python/tests skips
+               itself when the extension does not import, and the `scp` fixture
+               skips every test that requests it when `SCP(storage=...)` raises,
+               so a PyO3 consumer whose downloaded module does not load leaves
+               pytest exiting 0 over zero executed assertions. The check requires
+               each fragment in PYO3_ASSERTION_FRAGMENTS in the `run:` text of an
+               unguarded step before `pytest tests`.
+  downloaded-addon
+               Every real-NAPI test file under bindings/typescript/tests resolves
+               to `describe.skip` or `test.skip` when the addon load throws, so a
+               NAPI consumer whose downloaded addon does not load leaves
+               `bun test` exiting 0 over zero executed NAPI assertions. The check
+               requires each fragment in NAPI_ASSERTION_FRAGMENTS in the `run:`
+               text of an unguarded step before the first `bun test` or
+               `pytest tests` step.
+  retention    The four bridge producers uploaded with `retention-days: 1`, and
+               "Re-run failed jobs" re-runs a failed consumer without its
+               producer, so a consumer re-run a day after its run started
+               failed its download while GitHub still offered the re-run.
+  xcframework-outputs
+               The XCFramework upload named `if-no-files-found: error` over
+               three paths, one of them the tracked ScpBindings.swift, so the
+               checkout always supplied a match and the option could not fail
+               the producer when build-xcframework.sh wrote nothing.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
@@ -175,6 +215,7 @@ Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -552,6 +593,9 @@ RUST_ONLY_RUNS = {
     "fuzz-build": False,
     "kotlin-lint": False,
     "kotlin-test": True,
+    "napi-addon": True,
+    "pyo3-module": True,
+    "pyo3-module-macos": True,
     "python-lint": False,
     "python-test": True,
     "rust-build-pyo3-production": True,
@@ -568,6 +612,7 @@ RUST_ONLY_RUNS = {
     "swift-lint": False,
     "typescript-check": True,
     "typescript-wasm-check": False,
+    "xcframework": True,
 }
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
 PYTHON_ONLY = DOCS_ONLY | {"python": "true"}
@@ -576,9 +621,13 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
         "bridge-parity",
         "bridge-parity-kotlin",
         "bridge-parity-swift",
+        "napi-addon",
+        "pyo3-module",
+        "pyo3-module-macos",
         "python-lint",
         "python-test",
         "rust-build-pyo3-production",
+        "xcframework",
     ),
     True,
 )
@@ -3248,6 +3297,816 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
     return pinned
 
 
+def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
+    """Report whether one `if:` expression selects a job under one set of inputs.
+
+    Written here rather than imported from scripts/ci-aggregate-result.py for the
+    reason this file's closing paragraph gives: an assertion that calls the function
+    it judges agrees with that function however it behaves. The grammar is the one
+    every `if:` in these workflows uses — `LHS == 'literal'` clauses joined by `||`.
+    An expression outside it raises, which stops this check rather than guessing.
+    """
+    normalised = " ".join(str(expression).split())
+    if any(token in normalised for token in ("&&", "!", "(")):
+        raise ValueError(f"expression this check cannot read: {normalised!r}")
+
+    def operand(token: str) -> str:
+        token = token.strip()
+        quoted = re.fullmatch(r"'([^']*)'", token)
+        if quoted:
+            return quoted.group(1)
+        if token in ("true", "false"):
+            return token
+        if token == "github.event_name":
+            return event_name
+        if token == "github.event.pull_request.draft":
+            # Held at false, so the enumeration covers the runs in which check-draft
+            # runs. On a draft pull request check-draft skips, every job that needs it
+            # skips with it, and scripts/ci-aggregate-result.py returns 0 on exactly
+            # that state, because GitHub blocks merging a draft and a merge queue
+            # re-runs this workflow on a merge_group event where the gate applies. A
+            # draft run therefore has no job whose skip a merge could ride, which is
+            # the state this check looks for.
+            return "false"
+        prefix = "needs.changes.outputs."
+        if token.startswith(prefix):
+            key = token[len(prefix) :]
+            if key not in outputs:
+                raise ValueError(f"filter output `changes` never published: {key!r}")
+            return outputs[key]
+        raise ValueError(f"operand this check cannot read: {token!r}")
+
+    for clause in normalised.split("||"):
+        sides = clause.split("==")
+        if len(sides) != 2:
+            raise ValueError(f"clause this check cannot read: {clause!r}")
+        if operand(sides[0]) == operand(sides[1]):
+            return True
+    return False
+
+
+def condition_assignments(doc: dict) -> list[tuple[dict[str, str], str]]:
+    """Every (filter-output assignment, event) pair a run of one workflow can present."""
+    keys = sorted((doc["jobs"].get("changes") or {}).get("outputs") or {})
+    events = ("pull_request", "push", "merge_group")
+    assignments = []
+    for mask in range(2 ** len(keys)):
+        outputs = {
+            key: "true" if mask >> index & 1 else "false"
+            for index, key in enumerate(keys)
+        }
+        assignments.extend((outputs, event) for event in events)
+    return assignments
+
+
+# GitHub applies `success()` to every job that does not name a status check function,
+# and a skipped dependency fails `success()`, so skip propagation reaches every job
+# except the two this pattern matches: `always()` evaluates true whatever every
+# dependency reported, and `!cancelled()` evaluates true unless someone cancelled the
+# run. `success()`, `failure()` and `cancelled()` each evaluate false over a skipped
+# dependency, so a job naming one of those three still skips when a job in its `needs`
+# list skips. Job `ci` is the only job
+# in ci.yml that names a status check function today: it aggregates results and has to
+# run over a skipped dependency to judge it, so it writes `always()`.
+#
+# A job whose `if:` this pattern does not match, and that `selects` cannot parse,
+# reaches the report branch below rather than an exemption, which is why this pattern
+# names the two expressions that defeat skip propagation instead of every expression
+# that contains a status check function.
+RUNS_OVER_A_SKIPPED_DEPENDENCY = re.compile(r"always\s*\(|!\s*cancelled\s*\(")
+
+
+def dependency_condition_gaps(doc: dict) -> list[str]:
+    """Return every (dependant, dependency) pair whose conditions can disagree.
+
+    CRITERION: wherever a job's own `if:` selects it, the `if:` of every job in its
+    `needs` list must select that job too.
+
+    WHY: GitHub skips a job when any job in its `needs` list is skipped, so a
+    dependency selected by a narrower condition than its dependant skips the
+    dependant. scripts/ci-aggregate-result.py evaluates the dependant's own `if:`,
+    finds it true, and fails that run, but it judges only the filter outputs of the
+    run in front of it: the pull request that narrowed the dependency passes when
+    its own changed files do not open the gap, and a later, unrelated pull request
+    goes red. This check evaluates every filter assignment, so it reports the gap
+    on the pull request that introduces it. The shape this
+    check exists for is a producer job that builds an artifact for several consumers:
+    its condition has to be the union of theirs, and an edit that narrows it, or that
+    widens one consumer's, is invisible in a diff of either job alone.
+
+    SCOPE: ci.yml, the workflow this file's aggregate judges, because that aggregate
+    is the required status check that fails on the skip. A
+    condition inside it that this grammar cannot read is reported rather than
+    stepped over, so the check cannot pass by failing to parse.
+    """
+    jobs = doc["jobs"]
+    gaps: list[str] = []
+    for job_id, job in sorted(jobs.items()):
+        needs = job.get("needs") or []
+        needs = [needs] if isinstance(needs, str) else list(needs)
+        if not needs:
+            continue
+        condition = job.get("if")
+        if condition is None:
+            # A job that carries no `if:` runs on every run of this workflow, so the
+            # criterion binds hardest on it: every job in its `needs` list has to run
+            # on every such run too. Stepping over it would exempt exactly the case
+            # the criterion states, so substitute the constant-true expression,
+            # written in the grammar `selects` reads, and compare normally. The 30
+            # jobs in this shape today all depend on check-draft alone, whose own
+            # condition selects it on every event this enumeration presents, so the
+            # substitution reports nothing on the workflow as it stands.
+            condition = "true == 'true'"
+        if RUNS_OVER_A_SKIPPED_DEPENDENCY.search(str(condition)):
+            continue
+        for dependency in needs:
+            upstream = jobs.get(dependency, {}).get("if")
+            if upstream is None:
+                continue
+            try:
+                pairs = [
+                    (outputs, event)
+                    for outputs, event in condition_assignments(doc)
+                    if selects(condition, outputs, event)
+                    and not selects(upstream, outputs, event)
+                ]
+            except ValueError as unreadable:
+                gaps.append(
+                    f"{job_id} needs {dependency} and this check cannot decide whether "
+                    f"{dependency} runs wherever {job_id} does ({unreadable})"
+                )
+                continue
+            if pairs:
+                outputs, event = pairs[0]
+                selected = sorted(key for key, on in outputs.items() if on == "true")
+                gaps.append(
+                    f"{job_id} runs and {dependency} skips on event {event} with "
+                    f"filters {selected or ['none']} true, which skips {job_id} "
+                    f"and fails the `ci` aggregate on every such pull request"
+                )
+    return gaps
+
+
+def check_dependency_conditions(doc: dict) -> None:
+    gaps = dependency_condition_gaps(doc)
+    check(
+        "ci.yml: every job's `needs` are selected wherever the job is",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def narrow_condition(expression: str, clause_fragment: str) -> str:
+    """Drop every `||` clause of one `if:` expression that names a fragment.
+
+    Splitting on `||` rather than on newlines, because `if: >-` folds an expression
+    onto one line before yaml.safe_load returns it: a line-wise filter deletes the
+    whole expression, and an empty expression makes `selects` raise, which
+    `dependency_condition_gaps` reports as a clause it cannot read. A control whose
+    mutant reaches that branch passes however the union comparison behaves, so it
+    proves nothing about the comparison it exists to guard.
+    """
+    kept = [
+        clause
+        for clause in str(expression).split("||")
+        if clause_fragment not in clause
+    ]
+    narrowed = " || ".join(clause.strip() for clause in kept)
+    if not narrowed or narrowed == " ".join(str(expression).split()):
+        raise ValueError(
+            f"narrowing {expression!r} by {clause_fragment!r} dropped every clause or "
+            f"none, and a mutant has to stay readable and has to differ"
+        )
+    return narrowed
+
+
+def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
+    """Narrowing one producer's condition by one clause is caught above."""
+    narrowed = copy.deepcopy(doc)
+    producer = narrowed["jobs"]["pyo3-module"]
+    producer["if"] = narrow_condition(producer["if"], "outputs.kotlin")
+    gaps = dependency_condition_gaps(narrowed)
+    check(
+        "dropping the kotlin clause from pyo3-module is reported",
+        any("bridge-parity-kotlin runs and pyo3-module skips" in gap for gap in gaps),
+        f"a producer that no longer covers bridge-parity-kotlin went unreported: {gaps}",
+    )
+    # The mutant has to reach the union comparison, not the branch that reports an
+    # expression this grammar cannot read: that branch names every dependant of the
+    # mutated job whatever the comparison answers, which would let this control pass
+    # over a comparison that had been deleted.
+    check(
+        "the narrowed producer is reported by the comparison, not by a parse refusal",
+        not any("cannot decide" in gap for gap in gaps),
+        f"the mutant expression went unread: {gaps}",
+    )
+
+
+def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> None:
+    """A job with no `if:` whose dependency carries one is compared, not exempted."""
+    mutated = copy.deepcopy(doc)
+    # Job error-codes carries `needs: [check-draft]` and no `if:`, so it runs on every
+    # run. Pointing it at a producer selected by one filter output gives the shape a
+    # later change would create by having a gate job download a built artifact.
+    mutated["jobs"]["error-codes"]["needs"] = ["check-draft", "pyo3-module"]
+    gaps = dependency_condition_gaps(mutated)
+    check(
+        "a conditionless job whose dependency can skip is reported",
+        any("error-codes runs and pyo3-module skips" in gap for gap in gaps),
+        f"a job with no `if:` was exempted from the comparison: {gaps}",
+    )
+
+
+def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> None:
+    """Only `always()` and `!cancelled()` exempt a consumer from the comparison.
+
+    A consumer that writes `success()`, `failure()` or `cancelled()` still skips when
+    a job in its `needs` list skips, because each of those three evaluates false over
+    a skipped dependency. Exempting such a consumer would let the gap through to a
+    later pull request's red aggregate exactly as an unexempted gap would, and would
+    let it through silently, since the exemption runs before the branch that reports an expression this grammar
+    cannot read. Job `error-codes` carries `needs: [check-draft]` and no `if:`; adding
+    a producer selected by one filter output gives each mutant a pair to compare.
+    """
+    for expression, exempt in (
+        ("success()", False),
+        ("failure()", False),
+        ("cancelled()", False),
+        ("always()", True),
+        ("!cancelled()", True),
+    ):
+        mutated = copy.deepcopy(doc)
+        mutated["jobs"]["error-codes"]["needs"] = ["check-draft", "pyo3-module"]
+        mutated["jobs"]["error-codes"]["if"] = expression
+        gaps = dependency_condition_gaps(mutated)
+        named = [gap for gap in gaps if "error-codes" in gap]
+        if exempt:
+            check(
+                f"a consumer written `if: {expression}` is exempted",
+                not named,
+                f"an expression that runs over a skipped dependency was "
+                f"compared: {named}",
+            )
+        else:
+            check(
+                f"a consumer written `if: {expression}` is still compared",
+                bool(named),
+                "a consumer that skips with its dependency was exempted, and "
+                "the gate reported nothing about it",
+            )
+
+
+# The file each bridge producer uploads, named by the build that writes it rather
+# than by the artifact name a workflow author chooses. maturin writes the PyO3
+# extension module that `bindings/python/scp_sdk/__init__.py` imports as
+# `_scp_core`, and crates/scp-ffi/napi links its cdylib as `scp_ffi_napi`, so a
+# producer's `path:` carries the substring below whatever it calls the artifact.
+PYO3_UPLOAD_FILENAME = "_scp_core"
+NAPI_UPLOAD_FILENAME = "scp_ffi_napi"
+
+
+def uploaded_artifact_names(doc: dict, filename: str) -> tuple[str, ...]:
+    """Return every artifact name `doc` uploads whose path carries `filename`.
+
+    CRITERION: an artifact holds a bridge binary when the `actions/upload-artifact`
+    step that publishes it names a path carrying that binary's filename.
+
+    WHY: the two consumer gates below select the jobs they judge by matching a
+    download step's artifact name. Reading those names off ci.yml's own upload steps
+    closes the set by construction: a producer added under a name nobody wrote here
+    still publishes `_scp_core` or `scp_ffi_napi`, so the gate selects its consumers.
+    A tuple written in this file instead holds the names somebody remembered to list,
+    and says nothing about a producer added later.
+    """
+    names = set()
+    for job in doc["jobs"].values():
+        for step in job.get("steps") or []:
+            if not str(step.get("uses") or "").startswith("actions/upload-artifact"):
+                continue
+            uploaded = step.get("with") or {}
+            if uploaded.get("name") and filename in str(uploaded.get("path") or ""):
+                names.add(str(uploaded["name"]))
+    return tuple(sorted(names))
+
+
+def check_a_bridge_upload_reaches_the_gate(
+    doc: dict, filename: str, artifacts: tuple[str, ...]
+) -> None:
+    """A derivation returning nothing selects no consumer and reports nothing."""
+    check(
+        f"ci.yml uploads at least one artifact carrying {filename}",
+        bool(artifacts),
+        f"no `actions/upload-artifact` step names a path carrying {filename!r}, so "
+        f"the gate over its consumers selects no job and reports nothing",
+    )
+
+
+def a_step_that_runs_and_can_fail_its_job(step: dict) -> bool:
+    """Return whether `step` runs on every run of its job and a failure stops the job.
+
+    A step that carries an `if:` may be skipped, and a step whose `continue-on-error`
+    is anything but false lets the job pass when it fails, so neither guards the tests
+    that follow it.
+    """
+    return "if" not in step and step.get("continue-on-error") in (None, False, "false")
+
+
+# The text fragments a PyO3 consumer's steps must contain before pytest.
+PYO3_ASSERTION_FRAGMENTS = (
+    "import scp_sdk._scp_core",
+    "SCP(storage=",
+    "relay_start_in_memory",
+    "fullstack_create_node",
+)
+
+
+def pyo3_consumers_missing_an_assertion_fragment(
+    doc: dict, artifacts: tuple[str, ...]
+) -> list[str]:
+    r"""Return every PyO3-downloading job that lacks a fragment before `pytest tests`.
+
+    CRITERION: in every job that downloads an artifact named in `artifacts`, each
+    fragment in PYO3_ASSERTION_FRAGMENTS occurs in the `run:` text of a step that
+    comes before the first step whose `run:` text matches `\bpytest tests` and that
+    carries no `if:` and no `continue-on-error` other than false.
+
+    WHY: every real-FFI test module under bindings/python/tests skips itself when its
+    import of the extension raises ImportError, and the `scp` fixture in
+    bindings/python/tests/conftest.py skips every test that requests it when
+    `scp_sdk` does not import or `SCP(storage=...)` raises anything. A consumer whose
+    downloaded module never reached the import path, failed to load, or was built
+    without a feature a module calls therefore leaves pytest exiting 0 over zero
+    executed assertions in every one of these jobs at once, which is the `zero-test`
+    shape this file names. `crates/scp-ffi/` compiles `fullstack_create_node` only
+    under `testing` and `relay_start_in_memory` only under `server`.
+    """
+    gaps: list[str] = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        steps = job.get("steps") or []
+        if not any(
+            str(step.get("uses") or "").startswith("actions/download-artifact")
+            and (step.get("with") or {}).get("name") in artifacts
+            for step in steps
+        ):
+            continue
+        found = dict.fromkeys(PYO3_ASSERTION_FRAGMENTS, False)
+        for step in steps:
+            script = str(step.get("run") or "")
+            if re.search(r"\bpytest tests", script):
+                break
+            if not a_step_that_runs_and_can_fail_its_job(step):
+                continue
+            for fragment in PYO3_ASSERTION_FRAGMENTS:
+                found[fragment] = found[fragment] or fragment in script
+        missing = [fragment for fragment, present in found.items() if not present]
+        if missing:
+            gaps.append(
+                f"{job_id} downloads a PyO3 module and no unguarded step before "
+                f"pytest contains {', '.join(repr(m) for m in missing)}"
+            )
+    return gaps
+
+
+def check_pyo3_consumer_assertion_fragments(
+    doc: dict, artifacts: tuple[str, ...]
+) -> None:
+    gaps = pyo3_consumers_missing_an_assertion_fragment(doc, artifacts)
+    check(
+        "ci.yml: every job downloading a PyO3 module has each PyO3 assertion fragment "
+        "in an unguarded step before pytest",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+# The text fragments a NAPI consumer's steps must contain before its tests.
+NAPI_ASSERTION_FRAGMENTS = (
+    "loadNativeAddon(",
+    "new NativeScp(",
+    "relayStartInMemory",
+    "fullstackCreateNode",
+)
+
+
+def napi_consumers_missing_an_assertion_fragment(
+    doc: dict, artifacts: tuple[str, ...]
+) -> list[str]:
+    r"""Return every NAPI-downloading job that lacks a fragment before its tests.
+
+    CRITERION: in every job that downloads an artifact named in `artifacts`, each
+    fragment in NAPI_ASSERTION_FRAGMENTS occurs in the `run:` text of a step that
+    comes before the first step whose `run:` text matches `\bbun test\b` or
+    `\bpytest tests` and that carries no `if:` and no `continue-on-error` other
+    than false.
+
+    WHY: every real-NAPI test file under bindings/typescript/tests wraps its addon load
+    and its first construction in one `try`, writes the caught error into a skip reason,
+    and resolves its whole `describe` block to `describe.skip` or to a lone `test.skip`
+    — tests/real-napi.test.ts, tests/e2e-fullstack.test.ts and tests/persistence.test.ts
+    among them. A downloaded addon that does not load therefore leaves `bun test`
+    exiting 0 over zero executed NAPI assertions, which is the same `zero-test` shape
+    the PyO3 criterion above names.
+    """
+    gaps: list[str] = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        steps = job.get("steps") or []
+        if not any(
+            str(step.get("uses") or "").startswith("actions/download-artifact")
+            and (step.get("with") or {}).get("name") in artifacts
+            for step in steps
+        ):
+            continue
+        found = dict.fromkeys(NAPI_ASSERTION_FRAGMENTS, False)
+        for step in steps:
+            script = str(step.get("run") or "")
+            if re.search(r"\bbun test\b|\bpytest tests", script):
+                break
+            if not a_step_that_runs_and_can_fail_its_job(step):
+                continue
+            for fragment in NAPI_ASSERTION_FRAGMENTS:
+                found[fragment] = found[fragment] or fragment in script
+        missing = [fragment for fragment, present in found.items() if not present]
+        if missing:
+            gaps.append(
+                f"{job_id} downloads a NAPI addon and no unguarded step before its "
+                f"tests contains {', '.join(repr(m) for m in missing)}"
+            )
+    return gaps
+
+
+def check_napi_consumer_assertion_fragments(
+    doc: dict, artifacts: tuple[str, ...]
+) -> None:
+    gaps = napi_consumers_missing_an_assertion_fragment(doc, artifacts)
+    check(
+        "ci.yml: every job downloading a NAPI addon has each NAPI assertion fragment "
+        "in an unguarded step before its tests",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def check_napi_assertion_control(
+    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str
+) -> None:
+    """Deleting every line of job `job_id` that contains `fragment` is reported."""
+    mutated = copy.deepcopy(doc)
+    steps = mutated["jobs"][job_id]["steps"]
+    hits = [step for step in steps if fragment in str(step.get("run") or "")]
+    if len(hits) != 1:
+        check(
+            f"the control can delete {fragment!r} from {job_id}",
+            False,
+            f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
+        )
+        return
+    hits[0]["run"] = "\n".join(
+        line for line in str(hits[0]["run"]).splitlines() if fragment not in line
+    )
+    gaps = napi_consumers_missing_an_assertion_fragment(mutated, artifacts)
+    check(
+        f"a {job_id} whose steps no longer contain {fragment!r} is reported",
+        any(
+            f"{job_id} downloads a NAPI addon" in gap and repr(fragment) in gap
+            for gap in gaps
+        ),
+        f"deleting {fragment!r} went unreported: {gaps}",
+    )
+
+
+def check_pyo3_assertion_control(
+    doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str
+) -> None:
+    """Deleting every line of job `job_id` that contains `fragment` is reported."""
+    mutated = copy.deepcopy(doc)
+    steps = mutated["jobs"][job_id]["steps"]
+    hits = [step for step in steps if fragment in str(step.get("run") or "")]
+    if len(hits) != 1:
+        check(
+            f"the control can delete {fragment!r} from {job_id}",
+            False,
+            f"{len(hits)} steps carry {fragment!r}, so the mutant is not the one intended",
+        )
+        return
+    hits[0]["run"] = "\n".join(
+        line for line in str(hits[0]["run"]).splitlines() if fragment not in line
+    )
+    gaps = pyo3_consumers_missing_an_assertion_fragment(mutated, artifacts)
+    check(
+        f"a {job_id} whose steps no longer contain {fragment!r} is reported",
+        any(
+            f"{job_id} downloads a PyO3 module" in gap and repr(fragment) in gap
+            for gap in gaps
+        ),
+        f"deleting {fragment!r} went unreported: {gaps}",
+    )
+
+
+def check_assertion_step_guard_controls(
+    doc: dict, artifacts: tuple[str, ...], job_id: str, bridge: str
+) -> None:
+    """An assertion step in `job_id` that may be skipped or may fail open is reported.
+
+    `bridge` is "PyO3" or "NAPI". Each mutant sets one key on every step of the job
+    that carries one of the bridge's fragments; the last sets `continue-on-error:
+    false`, which leaves the step able to fail its job, and requires no report.
+    """
+    if bridge == "PyO3":
+        fragments = PYO3_ASSERTION_FRAGMENTS
+        gate = pyo3_consumers_missing_an_assertion_fragment
+    else:
+        fragments = NAPI_ASSERTION_FRAGMENTS
+        gate = napi_consumers_missing_an_assertion_fragment
+    prefix = f"{job_id} downloads a {bridge} "
+    for key, value, reported in (
+        ("continue-on-error", True, True),
+        ("continue-on-error", "${{ github.event_name == 'pull_request' }}", True),
+        ("if", "github.event_name == 'push'", True),
+        ("continue-on-error", False, False),
+    ):
+        mutated = copy.deepcopy(doc)
+        for step in mutated["jobs"][job_id]["steps"]:
+            if any(fragment in str(step.get("run") or "") for fragment in fragments):
+                step[key] = value
+        hit = any(gap.startswith(prefix) for gap in gate(mutated, artifacts))
+        check(
+            f"a {job_id} whose {bridge} assertion step sets `{key}: {value}` is "
+            f"{'reported' if reported else 'not reported'}",
+            hit == reported,
+            f"the gate {'missed' if reported else 'reported'} that mutant",
+        )
+
+
+def artifact_consumers(doc: dict, artifact: str) -> list[str]:
+    """Return every job id that downloads the artifact named `artifact`."""
+    return sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if any(
+            str(step.get("uses") or "").startswith("actions/download-artifact")
+            and (step.get("with") or {}).get("name") == artifact
+            for step in (job.get("steps") or [])
+        )
+    )
+
+
+def artifact_names_without_a_consumer(
+    doc: dict, artifacts: tuple[str, ...]
+) -> list[str]:
+    """Return every name in `artifacts` that no job in `doc` downloads.
+
+    CRITERION: each artifact name a bridge producer in ci.yml uploads is a name some
+    job in ci.yml passes to `actions/download-artifact`.
+
+    WHY: both gates above select the jobs they judge by matching a download step's
+    `name` against the names `uploaded_artifact_names` reads off ci.yml's upload
+    steps. A download renamed away from the upload that publishes it therefore leaves
+    the gate selecting no job for that artifact, and leaves the producer building a
+    binary no job reads, while the self-test stays green — the silent drop-out the
+    gates exist to prevent. `pyo3-module-macos` reaches exactly one consumer,
+    bridge-parity-swift, so renaming that one download deletes a whole job from the
+    checked set.
+    """
+    return [artifact for artifact in artifacts if not artifact_consumers(doc, artifact)]
+
+
+def check_artifact_names_reach_a_consumer(
+    doc: dict, artifacts: tuple[str, ...], filename: str
+) -> None:
+    unreached = artifact_names_without_a_consumer(doc, artifacts)
+    check(
+        f"ci.yml: every artifact uploading {filename} reaches a job that downloads it",
+        not unreached,
+        f"no job downloads {unreached}, so the gate over consumers of {filename} "
+        f"checks no job for that artifact",
+    )
+
+
+def check_artifact_name_control(
+    doc: dict, artifacts: tuple[str, ...], artifact: str
+) -> None:
+    """Renaming every download of one artifact is reported."""
+    mutated = copy.deepcopy(doc)
+    renamed = f"{artifact}-renamed-by-the-control"
+    for job in mutated["jobs"].values():
+        for step in job.get("steps") or []:
+            if (
+                str(step.get("uses") or "").startswith("actions/download-artifact")
+                and (step.get("with") or {}).get("name") == artifact
+            ):
+                step["with"]["name"] = renamed
+    check(
+        f"renaming every download of {artifact} is reported",
+        artifact in artifact_names_without_a_consumer(mutated, artifacts),
+        f"a ci.yml that downloads {renamed} instead of {artifact} went unreported",
+    )
+
+
+# GitHub permits re-running a workflow run, or its failed jobs, for 30 days after the
+# run starts. A re-run of failed jobs leaves a producer that passed alone, so its
+# consumers download the copy the first attempt uploaded.
+RERUN_WINDOW_DAYS = 30
+
+
+def shared_uploads_expiring_inside_the_rerun_window(doc: dict) -> list[str]:
+    """Return every job:artifact pair whose shared upload expires before re-runs end.
+
+    CRITERION: an `actions/upload-artifact` step in ci.yml whose artifact name a job
+    in ci.yml downloads sets `retention-days` to at least RERUN_WINDOW_DAYS.
+
+    WHY: "Re-run failed jobs" re-runs the failed consumer and not the producer that
+    passed, so the consumer's download reads the first attempt's upload. An upload
+    that expired first fails that download, and the consumer fails over a binary it
+    could have tested. An omitted `retention-days` falls back to a repository
+    setting this file cannot read, so this check reports an omission too.
+    """
+    downloaded = {
+        (step.get("with") or {}).get("name")
+        for job in doc["jobs"].values()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "").startswith("actions/download-artifact")
+    }
+    short: list[str] = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        for step in job.get("steps") or []:
+            if not str(step.get("uses") or "").startswith("actions/upload-artifact"):
+                continue
+            inputs = step.get("with") or {}
+            if inputs.get("name") not in downloaded:
+                continue
+            days = inputs.get("retention-days")
+            if not isinstance(days, int) or days < RERUN_WINDOW_DAYS:
+                short.append(f"{job_id}:{inputs.get('name')} ({days!r} days)")
+    return short
+
+
+def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
+    short = shared_uploads_expiring_inside_the_rerun_window(doc)
+    check(
+        f"ci.yml: every downloaded artifact is kept {RERUN_WINDOW_DAYS} days",
+        not short,
+        f"{short} expire while GitHub still offers 'Re-run failed jobs', so a "
+        f"consumer re-run after they expire fails its download",
+    )
+    # Control: every shared upload, lowered to one day in turn, is reported.
+    for job_id, job in doc["jobs"].items():
+        for index, step in enumerate(job.get("steps") or []):
+            inputs = step.get("with") or {}
+            if not str(step.get("uses") or "").startswith("actions/upload-artifact"):
+                continue
+            if not artifact_consumers(doc, inputs.get("name")):
+                continue
+            mutated = copy.deepcopy(doc)
+            mutated["jobs"][job_id]["steps"][index]["with"]["retention-days"] = 1
+            label = f"{job_id}:{inputs.get('name')}"
+            check(
+                f"lowering {label} to one day of retention is reported",
+                any(
+                    gap.startswith(label + " ")
+                    for gap in shared_uploads_expiring_inside_the_rerun_window(mutated)
+                ),
+                f"a ci.yml keeping {label} for one day went unreported",
+            )
+
+
+def check_xcframework_outputs_are_verified(doc: dict) -> None:
+    """Run the xcframework job's verify step against each uploaded path gone or stale.
+
+    CRITERION: for every path the `swift-xcframework-dev` upload lists, the step
+    before that upload exits non-zero when the path is absent or holds nothing
+    newer than the marker the build step touches, and exits 0 when every path is
+    fresh.
+
+    WHY: `if-no-files-found: error` fires only when all listed paths together match
+    nothing. The upload lists the tracked ScpBindings.swift, so the checkout always
+    supplies a match and the option alone cannot fail the producer.
+    """
+    steps = doc["jobs"]["xcframework"]["steps"]
+    upload = next(
+        i
+        for i, step in enumerate(steps)
+        if (step.get("with") or {}).get("name") == "swift-xcframework-dev"
+    )
+    script = steps[upload - 1].get("run") or ""
+    paths = (steps[upload]["with"]["path"]).split()
+    now = 1_000_000_000
+
+    def run_with(missing: str | None, stale: str | None) -> int:
+        with tempfile.TemporaryDirectory() as root:
+            runner_temp = Path(root, "runner-temp")
+            runner_temp.mkdir()
+            marker = runner_temp / "xcframework-build-start"
+            marker.touch()
+            os.utime(marker, (now, now))
+            for path in paths:
+                if path == missing:
+                    continue
+                target = Path(root, "tree", path)
+                file = target / "content" if target.suffix != ".swift" else target
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.touch()
+                stamp = now - 100 if path == stale else now + 100
+                for entry in {file, target}:
+                    os.utime(entry, (stamp, stamp))
+            env = {**os.environ, "RUNNER_TEMP": str(runner_temp)}
+            return subprocess.run(
+                ["bash", "-c", script],
+                cwd=Path(root, "tree"),
+                env=env,
+                capture_output=True,
+                check=False,
+            ).returncode
+
+    check(
+        "xcframework: the verify step passes when the build wrote every output",
+        run_with(None, None) == 0,
+        "the verify step rejects a build that wrote every uploaded path",
+    )
+    for path in paths:
+        check(
+            f"xcframework: a missing {path} fails the producer",
+            run_with(path, None) != 0,
+            f"the verify step before the upload passes without {path}",
+        )
+        check(
+            f"xcframework: a {path} older than the build fails the producer",
+            run_with(None, path) != 0,
+            f"the verify step before the upload passes over a stale {path}",
+        )
+
+
+def a_producer_and_an_unguarded_consumer(
+    doc: dict, artifact: str, upload_path: str, test_command: str
+) -> dict:
+    """Return `doc` with one producer of `artifact` and one consumer that skips it.
+
+    The consumer downloads `artifact` and runs `test_command`, and no step before
+    the test carries any assertion fragment.
+    """
+    mutated = copy.deepcopy(doc)
+    mutated["jobs"]["producer-added-by-the-control"] = {
+        "runs-on": "windows-latest",
+        "steps": [
+            {
+                "uses": "actions/upload-artifact@v4",
+                "with": {"name": artifact, "path": upload_path},
+            }
+        ],
+    }
+    mutated["jobs"]["consumer-added-by-the-control"] = {
+        "runs-on": "windows-latest",
+        "steps": [
+            {
+                "uses": "actions/download-artifact@v4",
+                "with": {"name": artifact, "path": "."},
+            },
+            {"run": test_command},
+        ],
+    }
+    return mutated
+
+
+def check_a_new_producer_reaches_the_pyo3_gate(doc: dict) -> None:
+    """A PyO3 producer added under a name no line of this file writes is still gated.
+
+    A tuple of artifact names written in this file holds the names somebody
+    remembered to list, and says nothing about a producer added later. This control
+    adds the producer and the consumer a Windows leg would add, names the artifact
+    something this file never mentions, and requires the gate to report the consumer
+    that runs pytest with no assertion fragment before it.
+    """
+    artifact = "pyo3-module-added-by-the-control"
+    mutated = a_producer_and_an_unguarded_consumer(
+        doc, artifact, "bindings/python/scp_sdk/_scp_core*.pyd", "pytest tests -v"
+    )
+    gaps = pyo3_consumers_missing_an_assertion_fragment(
+        mutated, uploaded_artifact_names(mutated, PYO3_UPLOAD_FILENAME)
+    )
+    check(
+        "a PyO3 consumer of a producer added under an unlisted name is reported",
+        any(gap.startswith("consumer-added-by-the-control ") for gap in gaps),
+        f"a job downloading {artifact} and running pytest with no assertion "
+        f"fragment went unreported: {gaps}",
+    )
+
+
+def check_a_new_producer_reaches_the_napi_gate(doc: dict) -> None:
+    """A NAPI producer added under a name no line of this file writes is still gated."""
+    artifact = "napi-addon-added-by-the-control"
+    mutated = a_producer_and_an_unguarded_consumer(
+        doc, artifact, "target/release/scp_ffi_napi.dll", "bun test"
+    )
+    gaps = napi_consumers_missing_an_assertion_fragment(
+        mutated, uploaded_artifact_names(mutated, NAPI_UPLOAD_FILENAME)
+    )
+    check(
+        "a NAPI consumer of a producer added under an unlisted name is reported",
+        any(gap.startswith("consumer-added-by-the-control ") for gap in gaps),
+        f"a job downloading {artifact} and running its tests with no assertion "
+        f"fragment went unreported: {gaps}",
+    )
+
+
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -3326,6 +4185,70 @@ def main() -> int:
         "input set first"
     )
     check_signing_guard(documents)
+
+    print(
+        "downloaded-module — a PyO3 consumer's unguarded steps before pytest contain "
+        "each PyO3 assertion fragment"
+    )
+    pyo3_artifacts = uploaded_artifact_names(workflow, PYO3_UPLOAD_FILENAME)
+    check_a_bridge_upload_reaches_the_gate(
+        workflow, PYO3_UPLOAD_FILENAME, pyo3_artifacts
+    )
+    check_pyo3_consumer_assertion_fragments(workflow, pyo3_artifacts)
+    check_artifact_names_reach_a_consumer(
+        workflow, pyo3_artifacts, PYO3_UPLOAD_FILENAME
+    )
+    check_a_new_producer_reaches_the_pyo3_gate(workflow)
+    # Every consumer of every name, read off ci.yml rather than written here: a control
+    # that mutates one hardcoded job proves the gate goes red for that job's artifact
+    # name alone, which left `pyo3-module-macos` — and so job bridge-parity-swift, its
+    # one consumer — tied to nothing this file executes.
+    for pyo3_artifact in pyo3_artifacts:
+        check_artifact_name_control(workflow, pyo3_artifacts, pyo3_artifact)
+        for pyo3_job in artifact_consumers(workflow, pyo3_artifact):
+            for pyo3_fragment in PYO3_ASSERTION_FRAGMENTS:
+                check_pyo3_assertion_control(
+                    workflow, pyo3_artifacts, pyo3_job, pyo3_fragment
+                )
+            check_assertion_step_guard_controls(
+                workflow, pyo3_artifacts, pyo3_job, "PyO3"
+            )
+
+    print(
+        "downloaded-addon — a NAPI consumer's unguarded steps before its tests "
+        "contain each NAPI assertion fragment"
+    )
+    napi_artifacts = uploaded_artifact_names(workflow, NAPI_UPLOAD_FILENAME)
+    check_a_bridge_upload_reaches_the_gate(
+        workflow, NAPI_UPLOAD_FILENAME, napi_artifacts
+    )
+    check_napi_consumer_assertion_fragments(workflow, napi_artifacts)
+    check_artifact_names_reach_a_consumer(
+        workflow, napi_artifacts, NAPI_UPLOAD_FILENAME
+    )
+    check_a_new_producer_reaches_the_napi_gate(workflow)
+    for napi_artifact in napi_artifacts:
+        check_artifact_name_control(workflow, napi_artifacts, napi_artifact)
+        for napi_job in artifact_consumers(workflow, napi_artifact):
+            for napi_fragment in NAPI_ASSERTION_FRAGMENTS:
+                check_napi_assertion_control(
+                    workflow, napi_artifacts, napi_job, napi_fragment
+                )
+            check_assertion_step_guard_controls(
+                workflow, napi_artifacts, napi_job, "NAPI"
+            )
+
+    print("retention — a downloaded artifact outlives the re-run window")
+    check_shared_uploads_outlive_the_rerun_window(workflow)
+
+    print("xcframework-outputs — the XCFramework producer fails on a missing output")
+    check_xcframework_outputs_are_verified(workflow)
+
+    print("needs-condition — a job's dependencies run wherever the job does")
+    check_dependency_conditions(workflow)
+    check_dependency_conditions_detect_a_narrowed_producer(workflow)
+    check_dependency_conditions_detect_a_conditionless_consumer(workflow)
+    check_dependency_conditions_read_a_status_guarded_consumer(workflow)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
@@ -3532,6 +4455,20 @@ def main() -> int:
     needs["rust-test"]["result"] = "skipped"
     code, out = run_aggregate(needs, rust_merge.event)
     check("merge_group event, a workspace test job skipped -> exit 1", code == 1, out)
+
+    # A producer that skips takes every consumer in its `needs` list down with it.
+    # The comments on the producer jobs in ci.yml and the needs-condition check above
+    # rest on this aggregate failing that run, because it evaluates the consumer's
+    # own `if:`, not its dependency's.
+    needs = build_needs(jobs, rust_pr)
+    needs["napi-addon"]["result"] = "skipped"
+    needs["bridge-parity"]["result"] = "skipped"
+    code, out = run_aggregate(needs, rust_pr.event)
+    check(
+        "a producer skip that skips a selected consumer -> exit 1",
+        code == 1 and "bridge-parity: skipped" in out,
+        f"exit {code}: {out}",
+    )
 
     needs = build_needs(jobs, docs_pr)
     needs["cross-layer"]["result"] = "skipped"
