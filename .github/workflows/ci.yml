@@ -79,7 +79,7 @@ env:
 #                     share and omits three direct dependencies
 #                     crates/scp-ffi/napi/Cargo.toml names that reach no other member
 #                     of this workspace — napi, napi-derive and napi-build — which
-#                     napi-addon compiles each run. Giving napi-addon a second group
+#                     napi-addon compiles on each run that builds the addon. Giving napi-addon a second group
 #                     would cache those three and would also store a second copy of
 #                     the shared tree, which is nearly all of `target/release`,
 #                     against the 10 GB repository cap the paragraph below counts, so
@@ -1962,6 +1962,39 @@ jobs:
   # the re-run consumer downloads the first attempt's upload. An upload that expired
   # sooner would fail that download. scripts/tests/ci-gate/ci_gate_selftest.py
   # reports a downloaded artifact kept for fewer days.
+  #
+  # REUSE ACROSS RUNS. Each producer restores its artifact files from `actions/cache`
+  # under a key built from every input that can change those files, and skips the
+  # toolchain, cargo-cache and build steps when the key hits. The upload runs either
+  # way, so consumers download the same artifact name and path on a hit and on a miss.
+  # The key holds:
+  #
+  #   * a literal `bridge-artifact-v1`; raising the number makes every producer miss
+  #     and rebuild, for an input nobody listed;
+  #   * the job id, the runner OS and the runner architecture;
+  #   * `hashFiles` over rust-toolchain.toml (the compiler), Cargo.lock (every
+  #     dependency version), every Cargo.toml (features, profiles, workspace
+  #     inheritance), `.cargo/**` (rustflags), all of `crates/**` (the sources of
+  #     every crate any bridge reaches, hashed whole so that no hand-kept crate list
+  #     can go stale), and the job's own build input outside crates/: the
+  #     `[tool.maturin]` features in bindings/python/pyproject.toml for the two PyO3
+  #     jobs, and bindings/swift/build-xcframework.sh for job xcframework;
+  #   * a digest the `artifact-inputs` step computes over the job's own definition in
+  #     this file (its build command and feature list), the list of tracked paths
+  #     under crates/ (`hashFiles` hashes contents alone, so a renamed file changes
+  #     no file hash), the runner image name, and the versions of the tools the
+  #     build runs outside cargo: Python and maturin for the PyO3 jobs, glibc on
+  #     Linux, and Xcode and its macOS SDK on macOS.
+  #
+  # The cache holds the uploaded files alone, never `target/`. A run triggered by a
+  # push to `main` or by a pull request saves on a miss. A merge-queue run does not
+  # save, because GitHub lets only the `gh-readonly-queue/…` ref that wrote an entry
+  # read it, and no later run uses that ref. A
+  # pull-request entry is readable by that pull request alone, so no pull request
+  # can place an artifact that `main` or another pull request restores. No workflow
+  # under .github/workflows/ restores a `bridge-artifact-` key, so nothing a release
+  # publishes passes through this cache. scripts/tests/ci-gate/ci_gate_selftest.py
+  # reports a producer whose key drops one of the file inputs above.
   pyo3-module:
     needs: changes
     # The union of the three consumers' conditions: python-test reads
@@ -2000,17 +2033,51 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: workspace-release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Installed before the key is computed, because the maturin version is one of
+      # the key's inputs.
       - name: Create virtualenv and install maturin
         run: |
           python -m venv .venv
           source .venv/bin/activate
           pip install maturin
+      - name: Hash the artifact inputs no file glob covers
+        id: artifact-inputs
+        run: |
+          set -euo pipefail
+          job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
+            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          if [ -z "$job_definition" ]; then
+            echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
+            exit 1
+          fi
+          source .venv/bin/activate
+          digest=$(
+            {
+              printf '%s\n' "$job_definition"
+              git ls-files -- crates
+              echo "image=${ImageOS:-unset}"
+              python -VV
+              maturin --version
+              ldd --version 2>&1 | sed -n 1p
+            } | shasum -a 256 | cut -d ' ' -f 1
+          )
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Restore the PyO3 module a run with the same inputs built
+        id: artifact-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bindings/python/scp_sdk/_scp_core*.so
+          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        with:
+          shared-key: workspace-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           source .venv/bin/activate
           cd bindings/python
@@ -2038,6 +2105,12 @@ jobs:
           path: bindings/python/scp_sdk/_scp_core*.so
           retention-days: 30
           if-no-files-found: error
+      - name: Save the PyO3 module under its input key
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@v4
+        with:
+          path: bindings/python/scp_sdk/_scp_core*.so
+          key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
   napi-addon:
     needs: changes
@@ -2069,12 +2142,41 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
+      - name: Hash the artifact inputs no file glob covers
+        id: artifact-inputs
+        run: |
+          set -euo pipefail
+          job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
+            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          if [ -z "$job_definition" ]; then
+            echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
+            exit 1
+          fi
+          digest=$(
+            {
+              printf '%s\n' "$job_definition"
+              git ls-files -- crates
+              echo "image=${ImageOS:-unset}"
+              ldd --version 2>&1 | sed -n 1p
+            } | shasum -a 256 | cut -d ' ' -f 1
+          )
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Restore the NAPI addon a run with the same inputs built
+        id: artifact-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: target/release/libscp_ffi_napi.so
+          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**') }}-${{ steps.artifact-inputs.outputs.digest }}
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: workspace-release
           save-if: false
       - name: Build NAPI native addon
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           # `scp-ffi-napi/testing` compiles the in-memory DHT seam
           # (`FfiDhtClient::InMemory`) the co-located multi-party TypeScript tests
@@ -2093,6 +2195,12 @@ jobs:
           path: target/release/libscp_ffi_napi.so
           retention-days: 30
           if-no-files-found: error
+      - name: Save the NAPI addon under its input key
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@v4
+        with:
+          path: target/release/libscp_ffi_napi.so
+          key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
   xcframework:
     needs: changes
@@ -2112,12 +2220,45 @@ jobs:
       # consumers install the Swift toolchain, because they are the jobs that run
       # `swift build`. Leaving it out of this job saves the 1.0-1.1 min that step took
       # in each macOS job of run 34805871209.
+      - name: Hash the artifact inputs no file glob covers
+        id: artifact-inputs
+        run: |
+          set -euo pipefail
+          job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
+            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          if [ -z "$job_definition" ]; then
+            echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
+            exit 1
+          fi
+          digest=$(
+            {
+              printf '%s\n' "$job_definition"
+              git ls-files -- crates
+              echo "image=${ImageOS:-unset}"
+              xcodebuild -version
+              xcrun --sdk macosx --show-sdk-version
+            } | shasum -a 256 | cut -d ' ' -f 1
+          )
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Restore the XCFramework a run with the same inputs built
+        id: artifact-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            bindings/swift/ScpFFI.xcframework
+            bindings/swift/Headers
+            bindings/swift/Sources/SCP/Internal/ScpBindings.swift
+          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/swift/build-xcframework.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: apple-uniffi
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build XCFramework (dev mode — macOS arm64 only)
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           touch "$RUNNER_TEMP/xcframework-build-start"
           bindings/swift/build-xcframework.sh --dev
@@ -2128,8 +2269,12 @@ jobs:
       # the checkout's copy under a green producer. This step fails the producer when
       # any uploaded path is absent or holds nothing written after the build began.
       # scripts/tests/ci-gate/ci_gate_selftest.py runs it against each path missing
-      # and each path stale.
+      # and each path stale. On a cache hit no build ran, so the step checks presence
+      # alone: the restore wrote the three paths a verified build saved, and their
+      # timestamps predate this run's marker.
       - name: Verify the build wrote every uploaded output
+        env:
+          ARTIFACT_CACHE_HIT: ${{ steps.artifact-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           marker="$RUNNER_TEMP/xcframework-build-start"
@@ -2137,9 +2282,16 @@ jobs:
             bindings/swift/ScpFFI.xcframework \
             bindings/swift/Headers \
             bindings/swift/Sources/SCP/Internal/ScpBindings.swift; do
+            if [ ! -e "$output" ] && [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
+              echo "::error::the cache restore reported a hit without writing $output"
+              exit 1
+            fi
             if [ ! -e "$output" ]; then
               echo "::error::build-xcframework.sh --dev exited 0 without writing $output"
               exit 1
+            fi
+            if [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
+              continue
             fi
             if [ -z "$(find "$output" -newer "$marker" -print -quit)" ]; then
               echo "::error::$output holds nothing written by this build"
@@ -2164,6 +2316,15 @@ jobs:
             bindings/swift/Sources/SCP/Internal/ScpBindings.swift
           retention-days: 30
           if-no-files-found: error
+      - name: Save the XCFramework under its input key
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            bindings/swift/ScpFFI.xcframework
+            bindings/swift/Headers
+            bindings/swift/Sources/SCP/Internal/ScpBindings.swift
+          key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
   pyo3-module-macos:
     needs: changes
@@ -2183,17 +2344,52 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: apple-parity
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Installed before the key is computed, because the maturin version is one of
+      # the key's inputs.
       - name: Create virtualenv and install maturin
         run: |
           python -m venv .venv
           source .venv/bin/activate
           pip install maturin
+      - name: Hash the artifact inputs no file glob covers
+        id: artifact-inputs
+        run: |
+          set -euo pipefail
+          job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
+            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          if [ -z "$job_definition" ]; then
+            echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
+            exit 1
+          fi
+          source .venv/bin/activate
+          digest=$(
+            {
+              printf '%s\n' "$job_definition"
+              git ls-files -- crates
+              echo "image=${ImageOS:-unset}"
+              python -VV
+              maturin --version
+              xcodebuild -version
+              xcrun --sdk macosx --show-sdk-version
+            } | shasum -a 256 | cut -d ' ' -f 1
+          )
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Restore the PyO3 module a run with the same inputs built
+        id: artifact-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bindings/python/scp_sdk/_scp_core*.so
+          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        with:
+          shared-key: apple-parity
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           source .venv/bin/activate
           cd bindings/python
@@ -2205,6 +2401,12 @@ jobs:
           path: bindings/python/scp_sdk/_scp_core*.so
           retention-days: 30
           if-no-files-found: error
+      - name: Save the PyO3 module under its input key
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        uses: actions/cache/save@v4
+        with:
+          path: bindings/python/scp_sdk/_scp_core*.so
+          key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:

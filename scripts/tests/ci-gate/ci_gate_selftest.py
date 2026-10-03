@@ -159,6 +159,12 @@ nothing:
                three paths, one of them the tracked ScpBindings.swift, so the
                checkout always supplied a match and the option could not fail
                the producer when build-xcframework.sh wrote nothing.
+  artifact-key
+               Each bridge producer restores the artifact an earlier run built
+               when its cache key matches, and then skips its build. A key that
+               omits one input, such as Cargo.lock, restores the earlier build
+               after a dependency bump, and every consumer tests the stale
+               binary and passes.
   lint-scope  One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
@@ -3964,6 +3970,191 @@ def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
             )
 
 
+# Each entry is (text the restore key must carry, the input that text stands for).
+# The file patterns are `hashFiles` arguments; the expressions are `${{ }}` contexts.
+ARTIFACT_KEY_FILE_INPUTS = (
+    ("rust-toolchain.toml", "the compiler version"),
+    ("Cargo.lock", "every dependency version"),
+    ("**/Cargo.toml", "every manifest's features, profiles and inheritance"),
+    (".cargo/**", "the repository's cargo config"),
+    ("crates/**", "the sources of every crate a bridge reaches"),
+)
+ARTIFACT_KEY_EXPRESSION_INPUTS = (
+    ("runner.os", "the runner OS"),
+    ("runner.arch", "the runner architecture"),
+    ("github.job", "the producer's job id"),
+    ("steps.artifact-inputs.outputs.digest", "the job definition and tool versions"),
+)
+ARTIFACT_KEY_VERSION = re.compile(r"^bridge-artifact-v\d+-")
+HASH_FILES_CALL = re.compile(r"hashFiles\(([^)]*)\)")
+
+
+def step_paths(step: dict) -> list[str]:
+    return str((step.get("with") or {}).get("path") or "").split()
+
+
+def bridge_producers(doc: dict) -> list[str]:
+    """Return every ci.yml job that uploads an artifact another job downloads."""
+    return sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if any(
+            str(step.get("uses") or "").startswith("actions/upload-artifact")
+            and artifact_consumers(doc, (step.get("with") or {}).get("name"))
+            for step in job.get("steps") or []
+        )
+    )
+
+
+def artifact_cache_key_gaps(doc: dict) -> list[str]:
+    """Return one line per input a bridge producer's artifact cache key omits.
+
+    CRITERION: every ci.yml job that uploads an artifact another ci.yml job downloads
+    restores that artifact with `actions/cache/restore` under a key that names the
+    version literal, each file pattern in ARTIFACT_KEY_FILE_INPUTS inside a
+    `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
+    digest that key reads in a step that hashes the job's own definition out of
+    ci.yml; restores, saves and uploads one path list; and saves under the key it
+    restored.
+
+    WHY: on a key hit the producer skips its build and uploads what an earlier run
+    built. A key that omits one input restores that earlier build after the input
+    changes, and every consumer then tests a stale binary and passes.
+    """
+    gaps: list[str] = []
+    for job_id in bridge_producers(doc):
+        steps = [
+            step for step in doc["jobs"][job_id]["steps"] if isinstance(step, dict)
+        ]
+        uploads = [
+            step
+            for step in steps
+            if str(step.get("uses") or "").startswith("actions/upload-artifact")
+            and artifact_consumers(doc, (step.get("with") or {}).get("name"))
+        ]
+        restores = [
+            step
+            for step in steps
+            if str(step.get("uses") or "").startswith("actions/cache/restore")
+        ]
+        if len(restores) != 1:
+            gaps.append(
+                f"{job_id}: {len(restores)} actions/cache/restore steps, want 1"
+            )
+            continue
+        restore = restores[0]
+        key = str((restore.get("with") or {}).get("key") or "")
+        hashed = {
+            argument.strip().strip("'\"")
+            for call in HASH_FILES_CALL.findall(key)
+            for argument in call.split(",")
+        }
+        if not ARTIFACT_KEY_VERSION.search(key):
+            gaps.append(
+                f"{job_id}: key carries no bridge-artifact-v<N> version literal"
+            )
+        for pattern, meaning in ARTIFACT_KEY_FILE_INPUTS:
+            if pattern not in hashed:
+                gaps.append(f"{job_id}: key hashes no {pattern} ({meaning})")
+        expressions = re.findall(r"\$\{\{\s*([^}]*?)\s*\}\}", key)
+        for context, meaning in ARTIFACT_KEY_EXPRESSION_INPUTS:
+            if context not in expressions:
+                gaps.append(f"{job_id}: key reads no {context} ({meaning})")
+        digest = next(
+            (step for step in steps if step.get("id") == "artifact-inputs"), None
+        )
+        digest_run = str((digest or {}).get("run") or "")
+        if (
+            "GITHUB_JOB" not in digest_run
+            or ".github/workflows/ci.yml" not in digest_run
+        ):
+            gaps.append(
+                f"{job_id}: no artifact-inputs step hashes the job's definition in ci.yml"
+            )
+        saves = [
+            step
+            for step in steps
+            if str(step.get("uses") or "").startswith("actions/cache/save")
+        ]
+        restore_id = restore.get("id")
+        if len(saves) != 1:
+            gaps.append(f"{job_id}: {len(saves)} actions/cache/save steps, want 1")
+        else:
+            saved_key = str((saves[0].get("with") or {}).get("key") or "")
+            if saved_key not in (
+                key,
+                f"${{{{ steps.{restore_id}.outputs.cache-primary-key }}}}",
+            ):
+                gaps.append(
+                    f"{job_id}: the save key {saved_key!r} is not the restore key"
+                )
+            if step_paths(saves[0]) != step_paths(restore):
+                gaps.append(f"{job_id}: the save and the restore name different paths")
+        for upload in uploads:
+            if step_paths(upload) != step_paths(restore):
+                gaps.append(
+                    f"{job_id}: the restore paths {step_paths(restore)} are not the "
+                    f"upload paths {step_paths(upload)}"
+                )
+    return gaps
+
+
+def without_key_input(key: str, text: str) -> str:
+    """Return `key` with one input removed: a hashFiles argument, a context, or the version."""
+    if text == "version":
+        return ARTIFACT_KEY_VERSION.sub("bridge-artifact-", key)
+    quoted = f"'{text}'"
+    if quoted in key:
+        return (
+            key.replace(f"{quoted}, ", "")
+            .replace(f", {quoted}", "")
+            .replace(quoted, "")
+        )
+    return re.sub(r"\$\{\{\s*" + re.escape(text) + r"\s*\}\}-?", "", key)
+
+
+def check_artifact_cache_keys(doc: dict) -> None:
+    gaps = artifact_cache_key_gaps(doc)
+    check(
+        "ci.yml: every bridge producer keys its artifact cache on every input",
+        not gaps,
+        f"{gaps}; a key missing an input restores a stale artifact after that input "
+        f"changes",
+    )
+    producers = bridge_producers(doc)
+    check(
+        "ci.yml: the artifact cache check reads all four bridge producers",
+        {"napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
+        <= set(producers),
+        f"found {producers}",
+    )
+    # Control: each producer, with each input removed from its key in turn, is reported.
+    removable = (
+        [pattern for pattern, _ in ARTIFACT_KEY_FILE_INPUTS]
+        + [context for context, _ in ARTIFACT_KEY_EXPRESSION_INPUTS]
+        + ["version"]
+    )
+    for job_id in producers:
+        for index, step in enumerate(doc["jobs"][job_id]["steps"]):
+            if not str(step.get("uses") or "").startswith("actions/cache/restore"):
+                continue
+            for text in removable:
+                mutated = copy.deepcopy(doc)
+                inputs = mutated["jobs"][job_id]["steps"][index]["with"]
+                stripped = without_key_input(inputs["key"], text)
+                inputs["key"] = stripped
+                named = "bridge-artifact-v<N>" if text == "version" else text
+                check(
+                    f"{job_id}: a key without {text} is reported",
+                    stripped != step["with"]["key"]
+                    and any(
+                        gap.startswith(f"{job_id}: ") and named in gap
+                        for gap in artifact_cache_key_gaps(mutated)
+                    ),
+                    f"a ci.yml whose {job_id} key omits {text} went unreported",
+                )
+
+
 def check_xcframework_outputs_are_verified(doc: dict) -> None:
     """Run the xcframework job's verify step against each uploaded path gone or stale.
 
@@ -4230,6 +4421,11 @@ def main() -> int:
 
     print("retention — a downloaded artifact outlives the re-run window")
     check_shared_uploads_outlive_the_rerun_window(workflow)
+
+    print(
+        "artifact-key — a bridge producer reuses an artifact only for unchanged inputs"
+    )
+    check_artifact_cache_keys(workflow)
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
