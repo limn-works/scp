@@ -4350,44 +4350,67 @@ mod tests {
 
     /// A subscribe in a session that has not listed, made while the view
     /// cannot be read, records `ContextView::UNKNOWN`, so the next event
-    /// announces the view the client has never seen: the `scp://{ctx}/tools`
-    /// update and the list-changed pair, whether or not the view reads by
-    /// then. An unchanged view after that is silent.
+    /// sends the list-changed pair, whether or not the view reads by then, and
+    /// a `tools` subscription also gets the `scp://{ctx}/tools` update. An
+    /// unchanged view after that sends neither.
+    ///
+    /// The `members` and `events` cases are the ones that fail without the
+    /// `UNKNOWN` record: `refresh_view` notifies a `tools` subscription on its
+    /// own, but a session that neither listed nor subscribed to `tools` gets
+    /// the pair only from a recorded view. For those two kinds the pair goes
+    /// out to a client that holds no list, which over-notifies and hides
+    /// nothing; a context that returns after a removal has no record and stays
+    /// silent for them, as
+    /// `return_after_removal_notifies_a_tools_subscription_in_an_unlisted_session`
+    /// pins.
     #[test]
     fn subscribe_without_a_list_while_the_view_is_unreadable_notifies_next_event() {
-        for still_unreadable in [false, true] {
-            let mut server = subscribing_server(MockProvider::default());
-            // The role read fails, so `visible_tools` and the view fail, while
-            // the tools resource, which needs membership only, stays readable.
-            server.provider.unreadable_roles.push("ctx_a".to_owned());
-            subscribe(&mut server, "scp://ctx_a/tools");
-            if !still_unreadable {
+        let tools_uri = "scp://ctx_a/tools";
+        for subscribed in [tools_uri, "scp://ctx_a/members", "scp://ctx_a/events"] {
+            for still_unreadable in [false, true] {
+                let mut server = subscribing_server(MockProvider::default());
+                // The role read fails, so `visible_tools` and the view fail,
+                // while the subscribed resource, which needs membership only,
+                // stays readable.
+                server.provider.unreadable_roles.push("ctx_a".to_owned());
+                subscribe(&mut server, subscribed);
+                if !still_unreadable {
+                    server.provider.unreadable_roles.clear();
+                }
+
+                let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
+                assert!(
+                    list_changed_pair_sent(&notifs),
+                    "{subscribed}, unreadable={still_unreadable}: the list-changed pair must \
+                     go out, got: {notifs:?}"
+                );
+                let tools_updated = |notifs: &[JsonRpcNotification]| {
+                    notifs.iter().any(|n| {
+                        n.method == protocol::METHOD_RESOURCES_UPDATED
+                            && n.params.as_ref().and_then(|p| p.get("uri"))
+                                == Some(&serde_json::json!(tools_uri))
+                    })
+                };
+                assert_eq!(
+                    tools_updated(&notifs),
+                    subscribed == tools_uri,
+                    "{subscribed}, unreadable={still_unreadable}: resources/updated for \
+                     {tools_uri} goes to a tools subscription only, got: {notifs:?}"
+                );
+
                 server.provider.unreadable_roles.clear();
+                let _ = server.notifications_for_event("ctx_a", &members_and_tools_event());
+                let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
+                assert!(
+                    !tools_updated(&notifs)
+                        && notifs.iter().all(|n| {
+                            n.method != protocol::METHOD_TOOLS_LIST_CHANGED
+                                && n.method != protocol::METHOD_RESOURCES_LIST_CHANGED
+                        }),
+                    "{subscribed}, unreadable={still_unreadable}: an unchanged view must send \
+                     no list-changed notice and no tools update, got: {notifs:?}"
+                );
             }
-
-            let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
-            assert!(
-                list_changed_pair_sent(&notifs),
-                "unreadable={still_unreadable}: the list-changed pair must go out, got: {notifs:?}"
-            );
-            assert!(
-                notifs.iter().any(|n| {
-                    n.method == protocol::METHOD_RESOURCES_UPDATED
-                        && n.params.as_ref().and_then(|p| p.get("uri"))
-                            == Some(&serde_json::json!("scp://ctx_a/tools"))
-                }),
-                "unreadable={still_unreadable}: the subscribed tools resource must be \
-                 announced, got: {notifs:?}"
-            );
-
-            server.provider.unreadable_roles.clear();
-            let _ = server.notifications_for_event("ctx_a", &members_and_tools_event());
-            assert!(
-                server
-                    .notifications_for_event("ctx_a", &members_and_tools_event())
-                    .is_empty(),
-                "unreadable={still_unreadable}: an unchanged view must be silent"
-            );
         }
     }
 
