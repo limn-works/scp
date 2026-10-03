@@ -1296,9 +1296,10 @@ pub(crate) async fn reserve_key_package_on(
     // Local-custody gate — same trust model as context_create.
     ensure_local_custody(bi, &owning_did)?;
 
-    // reserve may be a node's FIRST context op (it joins before it ever
-    // creates), so attach the supervisor first — the same idempotent init the
-    // join performs (OnceLock, first-call-wins).
+    // reserve may be a node's FIRST context op (it joins from a Welcome before
+    // it ever creates), so attach the supervisor here. `init_supervisor` is
+    // idempotent (OnceLock, first-call-wins); `context_join` never attaches
+    // one and refuses with SCP-CTX-2000 until an earlier operation has.
     crate::runtime::init_supervisor(bi, &owning_did);
 
     let sup = crate::runtime::supervisor(bi)?;
@@ -1350,9 +1351,10 @@ pub(crate) async fn context_join_from_welcome_on(
     // carries no MLS Welcome, spec §5.14) is rejected INSIDE the runtime at the
     // fused `ConfirmConsume` — not at this boundary.
 
-    // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
-    // node's supervisor is attached first (may be the joiner's first context op
-    // — the same idempotent init the join performs).
+    // spawn-from-Welcome always stands up an ENCRYPTED context and may be the
+    // joiner's first context op, so attach the node's supervisor here.
+    // `init_supervisor` is idempotent (OnceLock, first-call-wins);
+    // `context_join` never attaches one.
     crate::runtime::init_supervisor(bi, &owning_did);
 
     // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing pseudonym

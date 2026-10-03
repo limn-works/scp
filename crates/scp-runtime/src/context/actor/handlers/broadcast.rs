@@ -2538,6 +2538,25 @@ mod tests {
             auto_invite: false,
         };
 
+        // Authorization comes first: a proposer without `governance:propose`
+        // learns `PermissionDenied`, not how the payload would be validated.
+        let unauthorized = crate::context::governance_helpers::propose_governance_action_inner(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(LURKER_DID.to_owned()),
+            migrate(Vec::new()),
+            &creator_key(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(unauthorized, Err(ContextError::PermissionDenied(_))),
+            "an unauthorized empty-ceiling proposal must be refused for permission; \
+             got {unauthorized:?}"
+        );
+
         let refused = crate::context::governance_helpers::propose_governance_action_inner(
             &mut cell,
             &deps,

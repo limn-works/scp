@@ -881,7 +881,7 @@ fn typed_supervisor(
         .try_supervisor()
         .ok_or_else(|| ScpNapiError::Context {
             message: "Supervisor not yet attached — call context_create, \
-                  context_join_from_welcome, context_import, or init_supervisor first"
+                  context_import, reserve_key_package, or context_join_from_welcome first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
         })

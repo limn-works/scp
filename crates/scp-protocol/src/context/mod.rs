@@ -294,26 +294,32 @@ pub enum ContextError {
     #[error("capability ceiling is immutable and cannot be modified")]
     CeilingImmutable,
 
-    /// A context create declared no capability ceiling, a null one, or an
-    /// empty one (`.docs/standards/construction.md` M2: the `Explicit`
-    /// ceiling is required and non-empty).
+    /// A context create, or a proposal to migrate to a new context, declared
+    /// no capability ceiling, a null one, or an empty one
+    /// (`.docs/standards/construction.md` M2: the `Explicit` ceiling is
+    /// required and non-empty).
     ///
     /// An undeclared ceiling leaves the context's security boundary to a
     /// default nobody chose, and an empty ceiling describes a context no
     /// member can use, so neither is created. Three kinds of site raise this
-    /// variant, each before any context state exists. The runtime's
-    /// context-creation step raises [`CeilingDeclaration::Empty`] (wrapped in
+    /// variant. The runtime's context-creation step raises
+    /// [`CeilingDeclaration::Empty`] (wrapped in
     /// [`builder::ContextCreationError::StateTransition`]) for every create
-    /// whose [`ContextParams`] ceiling is empty; every create path reaches
-    /// that step: `Supervisor::create`, `Supervisor::create_context`, the
+    /// whose [`ContextParams`] ceiling is empty, before any state for the new
+    /// context exists; every create path reaches that step:
+    /// `Supervisor::create`, `Supervisor::create_context`, the
     /// `CreateContext` lifecycle command, the standing-pair recreate, and the
     /// governance migration. The runtime's governance proposal step raises
     /// [`CeilingDeclaration::Empty`], unwrapped, for a
-    /// `ProposeContextMigration` whose destination ceiling is empty, so the
-    /// proposal never reaches a vote. The NAPI and `PyO3` context-parameter
-    /// parsers raise all three declarations, because their parameters can
-    /// omit the ceiling or set it to null. Each bridge's error translator maps
-    /// [`CeilingDeclaration::Absent`] and [`CeilingDeclaration::Null`] to
+    /// `ProposeContextMigration` whose destination ceiling is empty; it runs
+    /// on the existing `Active` source context, after the proposer passes the
+    /// `governance:propose` and presence-only permission checks and before any
+    /// proposal is recorded, so the source context is unchanged and the
+    /// proposal never reaches a vote or execution. The NAPI and `PyO3` context-parameter
+    /// parsers raise all three declarations before they call the runtime,
+    /// because their parameters can omit the ceiling or set it to null. Each
+    /// bridge's error translator maps [`CeilingDeclaration::Absent`] and
+    /// [`CeilingDeclaration::Null`] to
     /// `SCP-VALID-7004` (missing required field) and
     /// [`CeilingDeclaration::Empty`] to `SCP-VALID-7005` (invalid field
     /// value).

@@ -4136,19 +4136,6 @@ pub async fn propose_governance_action_inner(
         require_active(&cell.handle)?;
     }
 
-    // A migration's destination create rejects an empty ceiling
-    // (construction.md M2), so a proposal carrying one could only fail after
-    // the vote. Reject it here with the typed error instead.
-    if let GovernanceAction::ProposeContextMigration {
-        new_context_params, ..
-    } = &action
-        && new_context_params.ceiling.is_empty()
-    {
-        return Err(ContextError::CeilingRequired(
-            scp_protocol::context::CeilingDeclaration::Empty,
-        ));
-    }
-
     if check_propose_capability
         && !cell
             .role_state
@@ -4170,6 +4157,21 @@ pub async fn propose_governance_action_inner(
     {
         return Err(ContextError::PermissionDenied(
             "presence-only members cannot propose governance actions".into(),
+        ));
+    }
+
+    // A migration's destination create rejects an empty ceiling
+    // (construction.md M2), so a proposal carrying one would fail only when it
+    // executes. Reject it here with the typed error, after both permission
+    // checks so a caller who may not propose gets `PermissionDenied`, and
+    // before any proposal is recorded.
+    if let GovernanceAction::ProposeContextMigration {
+        new_context_params, ..
+    } = &action
+        && new_context_params.ceiling.is_empty()
+    {
+        return Err(ContextError::CeilingRequired(
+            scp_protocol::context::CeilingDeclaration::Empty,
         ));
     }
 
