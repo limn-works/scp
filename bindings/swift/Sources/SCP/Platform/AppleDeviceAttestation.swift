@@ -17,9 +17,13 @@
     /// Errors produced by `AppleDeviceAttestation`.
     public nonisolated enum AttestationError: Error, Sendable {
         /// The platform App Attest service returned an error no other case
-        /// names: an error other than `DCError.featureUnsupported` and
-        /// `DCError.serverUnavailable`, or `DCError.invalidKey` from
-        /// `generateKey` or `attestKey`. Or the caller's task was cancelled
+        /// names: any error from `generateKey` other than
+        /// `DCError.featureUnsupported`, `DCError.serverUnavailable` included;
+        /// any error from `attestKey` other than `DCError.featureUnsupported`
+        /// and `DCError.serverUnavailable`, `DCError.invalidKey` included; or
+        /// any error from `generateAssertion` other than
+        /// `DCError.featureUnsupported`, `DCError.serverUnavailable` and
+        /// `DCError.invalidKey`. Or the caller's task was cancelled
         /// while its App Attest call waited in the queue or for Apple's
         /// answer. For a cancellation the adapter throws no Swift
         /// `CancellationError`: it returns this case, with a message that
@@ -54,11 +58,15 @@
         /// stored key that carries no attestation record.
         ///
         /// `DCError.h` lists "you call `generateAssertion:clientDataHash:`
-        /// with an unattested key" as one cause of that code. A caller
-        /// reaches this state when an earlier `attest` stored a generated key
-        /// and failed before Apple attested it, so it calls
-        /// `attest(challenge:deviceId:)` before asserting again. The adapter
-        /// keeps that key.
+        /// with an unattested key" and "the App Attest service rejects the
+        /// key" among the causes of that code, and a key with no record can
+        /// meet either. An earlier `attest` that stored a generated key and
+        /// failed before Apple attested it leaves an unattested key. An
+        /// `attestKey` answer that arrived after its call ended, through the
+        /// time limit or a cancellation, can leave a key Apple attested with
+        /// no record, and Apple's service can later reject that key. The
+        /// record cannot tell these apart, so the adapter keeps the key and
+        /// asserts neither cause.
         case keyNotAttested(String)
         /// Apple answered `generateAssertion` with `DCError.invalidKey` for a
         /// stored key that carries an attestation record, so Apple's App
@@ -456,8 +464,10 @@
         ///   `AttestationError.serverUnavailable` when `attestKey` answers
         ///   with `DCError.serverUnavailable`; this method keeps the key, so a
         ///   retry reaches Apple with a key Apple already saw.
-        ///   `AttestationError.serviceError` when `generateKey` or `attestKey`
-        ///   answers with any other error, `DCError.invalidKey` included, or
+        ///   `AttestationError.serviceError` when `generateKey` answers with
+        ///   any error other than `DCError.featureUnsupported`,
+        ///   `DCError.serverUnavailable` included, when `attestKey` answers
+        ///   with any other error, `DCError.invalidKey` included, or
         ///   when the caller's task is cancelled while the call is queued or
         ///   outstanding. `classify(_:keyId:operation:)` states why
         ///   `attestKey`'s `DCError.invalidKey` keeps the key.
@@ -555,7 +565,9 @@
         ///   discarded it and no later `attest` stored a new one.
         ///   `AttestationError.keyNotAttested` when `generateAssertion`
         ///   answers with `DCError.invalidKey` for a key that carries no
-        ///   attestation record; this method keeps the key.
+        ///   attestation record, which names either an unattested key or a
+        ///   rejected key whose record was never written; this method keeps
+        ///   the key.
         ///   `AttestationError.keyRejected` when `generateAssertion` answers
         ///   with `DCError.invalidKey` for a key that carries an attestation
         ///   record; this method discards the key ID and its record.
@@ -679,11 +691,20 @@
         /// | either | `featureUnsupported` | any | `unsupported` | kept |
         /// | either | any other | any | `serviceError` | kept |
         ///
+        /// `generateKey` errors do not reach this method:
+        /// `AttestationError.fromAppAttest(_:call:)` maps them, so a
+        /// `generateKey` answer of `DCError.serverUnavailable` or
+        /// `DCError.invalidKey` gives `serviceError`.
+        ///
         /// `attest` hands `attestKey` only a key with no attestation record,
         /// so a record cannot tell apart the two conditions `attestKey`'s
         /// `invalidKey` can name: a key Apple attested whose record was never
         /// written, and a key Apple's service rejected. The adapter keeps
-        /// that key and reports `serviceError`.
+        /// that key and reports `serviceError`. A key with no record that
+        /// `generateAssertion` answers with `invalidKey` is likewise either
+        /// unattested or a rejected key whose record was never written, so
+        /// the adapter keeps it and reports `keyNotAttested`, whose message
+        /// names both causes.
         ///
         /// **What makes the attestation record a sound input.** The record
         /// describes the key App Attest holds only while no other call writes
@@ -701,8 +722,9 @@
             case .invalidKey where operation == .assertion:
                 guard isKeyAttested(keyId) else {
                     return .keyNotAttested(
-                        "App Attest holds no attestation for the stored key, so attest it before asking "
-                            + "for an assertion: \(error.localizedDescription)"
+                        "App Attest refused an assertion with the stored key, which carries no attestation "
+                            + "record, so this adapter kept the key; the key is either unattested or rejected: "
+                            + "\(error.localizedDescription)"
                     )
                 }
                 return rejectKey(keyId, error)

@@ -337,7 +337,7 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9019` | Apple App Attest is unsupported on this device: `DCAppAttestService.isSupported` is `false`, or an App Attest call answered with `DCError.featureUnsupported` |
 | `SCP-ATTEST-9020` | No App Attest key ID is stored, so no assertion is possible |
 | `SCP-ATTEST-9021` | Apple already attested this App Attest key |
-| `SCP-ATTEST-9022` | Apple holds no attestation for the stored App Attest key |
+| `SCP-ATTEST-9022` | Apple refused an assertion with a stored App Attest key that carries no attestation record |
 | `SCP-ATTEST-9023` | Apple's App Attest service rejected this device's key |
 | `SCP-ATTEST-9024` | Apple could not reach its App Attest service |
 | `SCP-ATTEST-9025` | The App Attest adapter reached a state no caller input produces: Apple's service answered a completion handler with neither a value nor an error |

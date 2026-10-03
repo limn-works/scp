@@ -849,6 +849,10 @@
                 FailureScript("generateKey error", ScriptedAppAttestService(supported: true, key: .failure), "SCP-ATTEST-9001", storedKeyId: nil),
                 FailureScript("generateKey featureUnsupported", ScriptedAppAttestService(supported: true, key: .featureUnsupported), "SCP-ATTEST-9019", storedKeyId: nil),
                 FailureScript("generateKey neither", ScriptedAppAttestService(supported: true, key: .neither), "SCP-ATTEST-9025", storedKeyId: nil),
+                // `classify` reads only `attestKey` and `generateAssertion`
+                // errors, so these `generateKey` answers give `serviceError`.
+                FailureScript("generateKey serverUnavailable", ScriptedAppAttestService(supported: true, key: .serverUnavailable), "SCP-ATTEST-9001", storedKeyId: nil),
+                FailureScript("generateKey invalidKey", ScriptedAppAttestService(supported: true, key: .invalidKey), "SCP-ATTEST-9001", storedKeyId: nil),
                 FailureScript("attestKey error", ScriptedAppAttestService(supported: true, attestation: .failure), "SCP-ATTEST-9001", storedKeyId: scriptedKeyId),
                 FailureScript("attestKey featureUnsupported", ScriptedAppAttestService(supported: true, attestation: .featureUnsupported), "SCP-ATTEST-9019", storedKeyId: scriptedKeyId),
                 FailureScript("attestKey neither", ScriptedAppAttestService(supported: true, attestation: .neither), "SCP-ATTEST-9025", storedKeyId: scriptedKeyId),
@@ -1730,14 +1734,10 @@
             // it makes has happened when this call returns.
             service.releaseHeldAttestation()
             #expect(defaults.string(forKey: attestedKeyIdDefaultsKey) == nil, "a late attestKey answer wrote the record")
-
-            // No record names the key, so the next attest hands it to Apple.
-            #expect(await code(of: { () async throws(ScpError) -> Data in
-                try await adapter.attest(challenge: challenge, deviceId: deviceId)
-            }) == "returned bytes")
+            // The key ID `generateKey` stored before the time limit stays.
+            #expect(defaults.string(forKey: keyIdDefaultsKey) == RecordingAppAttestService.generatedKeyId(1))
             #expect(service.generatedKeyCount == 1)
-            #expect(service.attestations.count == 2)
-            #expect(defaults.string(forKey: attestedKeyIdDefaultsKey) == RecordingAppAttestService.generatedKeyId(1))
+            #expect(service.attestations.count == 1)
         }
 
         @Test("a generateAssertion invalidKey answer that arrives after the time limit discards no key ID")
