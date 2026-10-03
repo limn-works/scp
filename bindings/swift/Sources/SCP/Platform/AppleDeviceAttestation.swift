@@ -79,14 +79,16 @@
         /// `attest(challenge:deviceId:)` generates a new key.
         case keyRejected(String)
         /// Apple answered `attestKey` or `generateAssertion` with
-        /// `DCError.serverUnavailable`: it could not reach its App Attest
-        /// service.
+        /// `DCError.serverUnavailable`.
         ///
-        /// `DCError.h` instructs a caller to "try the attestation again later
-        /// using the same key and the same value for the `clientDataHash`
-        /// parameter", because "retrying with the same inputs helps to
-        /// preserve the risk metric for a given device". The adapter keeps
-        /// that key, so a retry reaches Apple with a key Apple already saw.
+        /// For `attestKey`, `DCError.h` describes this code as a failed
+        /// attempt to contact the App Attest service and instructs a caller
+        /// to "try the attestation again later using the same key and the
+        /// same value for the `clientDataHash` parameter", because "retrying
+        /// with the same inputs helps to preserve the risk metric for a given
+        /// device". `DCError.h` documents this code for `attestKey` only. The
+        /// adapter keeps the key after either call, because it discards a key
+        /// only when Apple's service rejects it.
         case serverUnavailable(String)
         /// An internal invariant was violated.
         case internalError(String)
@@ -464,7 +466,7 @@
         ///   method and keeps the key and its record.
         ///   `AttestationError.serverUnavailable` when `attestKey` answers
         ///   with `DCError.serverUnavailable`; this method keeps the key, so a
-        ///   retry reaches Apple with a key Apple already saw.
+        ///   retry uses the same key, as `DCError.h` instructs.
         ///   `AttestationError.serviceError` when `generateKey` answers with
         ///   any error other than `DCError.featureUnsupported`,
         ///   `DCError.serverUnavailable` included, when `attestKey` answers
@@ -715,7 +717,7 @@
             switch (error as? DCError)?.code {
             case .serverUnavailable:
                 return .serverUnavailable(
-                    "\(operation.method) could not reach Apple's App Attest service; this adapter kept the key "
+                    "\(operation.method) answered DCError.serverUnavailable; this adapter kept the key "
                         + "for a retry: \(error.localizedDescription)"
                 )
             case .invalidKey where operation == .assertion:

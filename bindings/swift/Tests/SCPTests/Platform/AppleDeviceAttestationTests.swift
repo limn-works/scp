@@ -110,8 +110,8 @@
         /// `DCError.invalidKey` and no value, the code `DCError.h` gives for
         /// an already-attested key, an unattested key and a rejected key.
         case invalidKey
-        /// `DCError.serverUnavailable` and no value: Apple could not reach
-        /// its App Attest service.
+        /// `DCError.serverUnavailable` and no value, the code `DCError.h`
+        /// gives `attestKey` for a failed attempt to contact App Attest.
         case serverUnavailable
 
         func deliver(to handler: (Value?, Error?) -> Void) {
@@ -1537,7 +1537,7 @@
     /// and pins what happens to the stored key ID and the attestation record,
     /// so collapsing the conditions into one fails a case.
     struct AppAttestKeyLifecycleTests {
-        @Test("assertRequest throws SCP-ATTEST-9024 and keeps an attested key when Apple cannot reach its service")
+        @Test("assertRequest throws SCP-ATTEST-9024 and keeps an attested key when generateAssertion answers serverUnavailable")
         func assertRequestKeepsKeyOnServerUnavailable() async {
             let service = ScriptedAppAttestService(supported: true, assertion: .serverUnavailable)
             let harness = makeAdapter(service, storedKeyId: scriptedKeyId, attested: true)
@@ -1586,7 +1586,7 @@
             #expect(service.keyGenerationCount == 1)
         }
 
-        @Test("attest throws SCP-ATTEST-9024 and keeps its key when Apple cannot reach its service")
+        @Test("attest throws SCP-ATTEST-9024 and keeps its key when attestKey answers serverUnavailable")
         func attestKeepsKeyOnServerUnavailable() async {
             let service = ScriptedAppAttestService(supported: true, attestation: .serverUnavailable)
             let harness = makeAdapter(service, storedKeyId: scriptedKeyId)
