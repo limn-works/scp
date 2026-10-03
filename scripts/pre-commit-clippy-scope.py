@@ -22,9 +22,8 @@ the dependency resolution of a member whose files the commit did not touch:
 member's directory, or else the one in the nearest parent directory that holds one, so one
 in a directory that is no member, such as `crates/`, changes lint thresholds for members
 below it.
-These root files stay out of `ROOT_WIDE`: `rustfmt.toml` changes formatting, not lints;
-`deny.toml` is read by cargo-deny, not by clippy; and `.mise.toml` sets environment
-variables for Android cross-compilation linkers, which a host clippy run never invokes.
+These root files stay out of `ROOT_WIDE`: `rustfmt.toml` changes formatting, not lints,
+and `deny.toml` is read by cargo-deny, not by clippy.
 
 Otherwise the script selects each workspace member that holds a changed path, of any file
 type, because a crate can read a non-Rust file in its directory with `include_str!`. A
