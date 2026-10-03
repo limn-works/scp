@@ -915,8 +915,12 @@ fn mcp_server_bundle(
 /// `tools.listChanged` as false, rejects `resources/subscribe`, and sends no
 /// `list_changed` notification. With or without a supervisor, this server
 /// lists no tools and refuses every `tools/call`. Attaching a supervisor or
-/// calling `resume()` later does not change a running server; stop it and
-/// serve again.
+/// calling `resume()` later does not add subscriptions or `list_changed`
+/// notifications to a running server; stop it and serve again to get them.
+/// Authorization and `resources/list|read` read role state on every request,
+/// from the bridge's copy while no supervisor is attached and from the actor
+/// once one is, so attaching a supervisor changes which contexts a running
+/// server serves from the next request on.
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
     bi: &Arc<NapiBridgeInstance>,
