@@ -629,10 +629,11 @@ class AndroidKeyCustody internal constructor(
      * key.
      *
      * For Keystore keys ([CustodyType.HARDWARE]): throws an error because Keystore does
-     * not hand the private key bytes to the app, so a Keystore key cannot sign a governance vote through
-     * this adapter. ADR-063's curve slice requires every core function that takes a raw
-     * signing key to take a signer instead, and every key-export accessor to leave the
-     * custody adapters and all three bridges. That slice has not landed, so this accessor
+     * not hand the private key bytes to the app, so this method cannot hand a Keystore key's
+     * bytes to a core function that takes a raw signing key. ADR-063's curve slice requires
+     * every core function that takes a raw signing key to take a signer instead, and every
+     * key-export accessor to leave the custody adapters and all three bridges. That slice
+     * has not landed, so this accessor
      * still exports the seed of a software key. ADR-027 acceptance criterion 14 (private key isolation) already says
      * the Rust engine receives only signatures and public keys, never private key material,
      * and the UniFFI `KeyCustodyProvider` callback's `export_signing_key_bytes` would carry this
