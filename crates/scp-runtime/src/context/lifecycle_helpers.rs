@@ -1558,9 +1558,18 @@ fn rollback_join_economy_ticket(
 ///
 /// # Errors
 ///
-/// - [`ContextCreationError::CreationFailed`] for version
-///   incompatibility, governance / consequence-rule / economic-policy
-///   validation failures, or supervisor registration failures.
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+///   with [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
+///   when `params.ceiling` is empty, before any context state exists.
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::VersionIncompatible`](scp_protocol::context::ContextError::VersionIncompatible)
+///   when the running SDK does not satisfy `params.min_protocol_version`.
+/// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
+///   breaks the ceiling-entry grammar (spec §5.3.1.1).
+/// - [`ContextCreationError::CreationFailed`] for governance /
+///   consequence-rule / economic-policy validation failures, or supervisor
+///   registration failures.
 /// - Crypto / transport / event-log failures during the initial MLS
 ///   group setup.
 #[allow(clippy::too_many_lines)]
@@ -1576,6 +1585,21 @@ pub async fn create_context(
     creator_did: DID,
     local_pseudonym: Option<[u8; 32]>,
 ) -> Result<ContextHandle, ContextCreationError> {
+    // The ceiling must be non-empty (construction.md M2, Alec's ruling of
+    // 2026-09-30): an empty ceiling describes a context no member can use.
+    // Every create path (`Supervisor::create`, `Supervisor::create_context`,
+    // the `CreateContext` lifecycle command, the standing-pair recreate, and
+    // the governance migration) reaches this function. The rejection runs
+    // here, before any context state exists; `builder::create_context`, which
+    // builds the MLS group, repeats it in its Phase 1 validation so the rule
+    // holds for every in-crate caller.
+    if params.ceiling.is_empty() {
+        return Err(ContextCreationError::StateTransition(
+            scp_protocol::context::ContextError::CeilingRequired(
+                scp_protocol::context::CeilingDeclaration::Empty,
+            ),
+        ));
+    }
     // Defense-in-depth: verify creator's SDK version satisfies
     // min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -4022,11 +4046,13 @@ mod restore_reconcile_tests {
                 mode: ContextMode::Broadcast,
                 // Broadcast contexts only support `MemoryScope::Full`.
                 memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ..ContextParams::default()
             }
         } else {
             ContextParams {
                 mode: ContextMode::Encrypted,
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ..ContextParams::default()
             }
         };

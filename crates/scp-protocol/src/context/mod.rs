@@ -248,6 +248,28 @@ impl ContextState {
 // ContextError
 // ---------------------------------------------------------------------------
 
+/// What a context create declared in place of a non-empty capability ceiling
+/// ([`ContextError::CeilingRequired`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingDeclaration {
+    /// The parameters carried no `ceiling` key.
+    Absent,
+    /// The `ceiling` key held `null` (`None` in Python).
+    Null,
+    /// The `ceiling` key held an empty list.
+    Empty,
+}
+
+impl std::fmt::Display for CeilingDeclaration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Absent => "no `ceiling` was declared",
+            Self::Null => "`ceiling` is null or None",
+            Self::Empty => "`ceiling` is an empty list",
+        })
+    }
+}
+
 /// Errors produced by context lifecycle operations.
 ///
 /// Error codes follow the `SCP-CTX-` prefix (range 2000-2999) as defined in
@@ -271,6 +293,42 @@ pub enum ContextError {
     /// a ceiling modification is attempted.
     #[error("capability ceiling is immutable and cannot be modified")]
     CeilingImmutable,
+
+    /// A context create, or a proposal to migrate to a new context, declared
+    /// no capability ceiling, a null one, or an empty one
+    /// (`.docs/standards/construction.md` M2: the `Explicit` ceiling is
+    /// required and non-empty).
+    ///
+    /// An undeclared ceiling leaves the context's security boundary to a
+    /// default nobody chose, and an empty ceiling describes a context no
+    /// member can use, so neither is created. Three kinds of site raise this
+    /// variant. The runtime's context-creation step raises
+    /// [`CeilingDeclaration::Empty`] (wrapped in
+    /// [`builder::ContextCreationError::StateTransition`]) for every create
+    /// whose [`ContextParams`] ceiling is empty, before any state for the new
+    /// context exists; every create path reaches that step:
+    /// `Supervisor::create`, `Supervisor::create_context`, the
+    /// `CreateContext` lifecycle command, the standing-pair recreate, and the
+    /// governance migration. The runtime's governance proposal step raises
+    /// [`CeilingDeclaration::Empty`], unwrapped, for a
+    /// `ProposeContextMigration` whose destination ceiling is empty; it runs
+    /// on the existing `Active` source context, after every check that
+    /// refuses the proposer: the `governance:propose` capability check (on the
+    /// checked path only; the unchecked path skips it), the presence-only
+    /// check, the proposer-eligibility gate (pending removal, participation
+    /// threshold, earned-capacity limit), the governance-freeze gate, and the
+    /// governance engine's proposer check (`GovernanceEngine::check_proposer`).
+    /// It runs before the engine's `propose` call records the proposal, so no
+    /// proposal is recorded and none reaches a vote or execution. The NAPI and `PyO3` context-parameter
+    /// parsers raise all three declarations before they call the runtime,
+    /// because their parameters can omit the ceiling or set it to null. Each
+    /// bridge's error translator maps [`CeilingDeclaration::Absent`] and
+    /// [`CeilingDeclaration::Null`] to
+    /// `SCP-VALID-7004` (missing required field) and
+    /// [`CeilingDeclaration::Empty`] to `SCP-VALID-7005` (invalid field
+    /// value).
+    #[error("context creation requires a non-empty capability ceiling: {0}")]
+    CeilingRequired(CeilingDeclaration),
 
     /// An operation was attempted that requires the context to be in the
     /// `Active` state, but the context is in a different state.
@@ -545,13 +603,31 @@ pub enum ContextError {
         attempts: u32,
     },
 
-    /// A caller-side mailbox send exceeded the 30-second per-command
-    /// backpressure deadline (ADR-049 §"Mailbox parameters"). The target
-    /// [`ContextActor`](https://example.invalid) is draining slowly or
-    /// backed up; the caller's command was never delivered to the actor
-    /// and may be retried. Distinct from
-    /// [`Self::RateLimited`], which rejects pre-mailbox on capability
-    /// grounds.
+    /// An actor or a reservation the call needed gave no answer (ADR-049 §10).
+    ///
+    /// Producers, and what each means for a retry:
+    /// - A per-context actor's mailbox send failed (a closed mailbox whose
+    ///   actor task has terminated) or exceeded `SEND_TIMEOUT` (a backed-up
+    ///   mailbox), or the per-identity key-package actor's send failed or
+    ///   exceeded `KP_SEND_TIMEOUT`. The actor never received the command, so
+    ///   a fresh call cannot apply it twice.
+    /// - A per-context actor dropped the reply channel or its reply missed
+    ///   `REPLY_TIMEOUT`, or the key-package actor did the same or missed
+    ///   `KP_REPLY_TIMEOUT`. The actor had already received the command and
+    ///   may have run it, so a retry can apply a non-idempotent operation (a
+    ///   send, a governance action, a key-package reservation) twice. Check
+    ///   whether the first call took effect before retrying one.
+    /// - `start_saga`, when the saga's participant context set overlaps an
+    ///   in-flight saga, and the checked role read, when an actor registers
+    ///   while it classifies a miss. Neither reaches an actor with the
+    ///   command, so a fresh call cannot apply it twice.
+    ///
+    /// A retry after a per-context actor fault or a checked role read reads
+    /// the context's current state and can meet a respawning, failed-respawn,
+    /// or poisoned context rather than a live actor; a retry after the
+    /// key-package actor or `start_saga` reads no context lifecycle state.
+    /// Distinct from [`Self::RateLimited`], which rejects pre-mailbox on
+    /// capability grounds.
     ///
     /// Mapped to canonical code `SCP-CTX-2130` through the bridge error
     /// translators.

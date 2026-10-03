@@ -856,26 +856,35 @@ fn document_vm_key_resolver(
 pub fn supervisor(
     bi: &NapiBridgeInstance,
 ) -> napi::Result<&Arc<scp_core::context::supervisor::Supervisor>> {
+    typed_supervisor(bi).map_err(napi::Error::from)
+}
+
+/// [`supervisor`] with the refusal kept as the typed [`ScpNapiError`], so a
+/// caller that returns `ScpNapiError` passes the `SCP-CTX-2000` refusal on
+/// as built instead of re-wrapping the rendered `napi::Error` text.
+fn typed_supervisor(
+    bi: &NapiBridgeInstance,
+) -> Result<&Arc<scp_core::context::supervisor::Supervisor>, ScpNapiError> {
     // Suspended: return error (recoverable — caller should resume()).
     // AlreadyShutDown: warn only — shutdown already destroyed state,
     // operations will fail naturally at MLS/transport layer.
     if bi.core.is_suspended() {
-        return Err(napi::Error::from(ScpNapiError::Context {
+        return Err(ScpNapiError::Context {
             message: "bridge is suspended — call resume() before performing operations".to_owned(),
             code: codes::CTX_2000.to_owned(),
-        }));
+        });
     }
     if bi.core.is_shutdown() {
         tracing::warn!("supervisor() called after shutdown — operations may fail");
     }
-    bi.core.try_supervisor().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Context {
+    bi.core
+        .try_supervisor()
+        .ok_or_else(|| ScpNapiError::Context {
             message: "Supervisor not yet attached — call context_create, \
-                      context_join, context_import, or init_supervisor first"
+                  context_import, reserve_key_package, or context_join_from_welcome first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
         })
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,9 +1153,9 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
 /// instead of `NotConfiguredTransportProvider` (rejects everything).
 ///
-/// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_supervisor` which
-/// will win the `OnceLock` race if called first.
+/// **Must be called before any `context_create` / `context_import` /
+/// `reserve_key_package` / `context_join_from_welcome`** — those functions
+/// call `init_supervisor`, which wins the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via `crate::transport::configure_local_transport` so
 /// that E2E tests can exercise `contextSend` and `broadcastPublish` without
@@ -1198,9 +1207,9 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
 /// the given relay URL. This allows the supervisor's send pipeline (and
 /// thus `contextSend`) to publish encrypted payloads through the relay.
 ///
-/// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_supervisor` which
-/// will win the `OnceLock` race if called first.
+/// **Must be called before any `context_create` / `context_import` /
+/// `reserve_key_package` / `context_join_from_welcome`** — those functions
+/// call `init_supervisor`, which wins the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via `crate::transport::configure_relay_transport` so
 /// that E2E tests can exercise the full send → relay → subscribe → receive
@@ -1839,11 +1848,7 @@ pub async fn sync_role_state_from_manager(
     context_id: &str,
 ) -> Result<(), ScpNapiError> {
     use scp_core::context::actor::commands::QueriesCommand;
-    let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
-        message: e.to_string(),
-        code: codes::CTX_2000.to_owned(),
-    })?;
-    let sup = Arc::clone(sup);
+    let sup = Arc::clone(typed_supervisor(bi)?);
     // Route through the ADR-049 query shim. The handler returns
     // `Ok(None)` when the context is unknown, matching the legacy
     // `ContextManager::get_role_state` `Option` contract.
@@ -1891,7 +1896,6 @@ pub async fn sync_role_state_from_manager(
 /// by the joined MLS group's signed context binding. The ceiling entries are
 /// normalized to their enforced UCAN capability-name form (`{resource}:{action}`),
 /// matching the set [`build_ucan_context_state`] builds on the create path.
-/// Mirrors the `PyO3` reference bridge's `sync_ceiling_from_params`.
 ///
 /// # Errors
 ///
@@ -1911,6 +1915,121 @@ pub fn sync_ceiling_from_params(
         st.core.ceiling_strings = ceiling_strings;
         Ok(())
     })
+}
+
+/// Reads a context's lifecycle state from that context's supervisor actor.
+///
+/// A context with no registered actor reads as `None` instead of as an error,
+/// unless the supervisor holds a poison flag or a recovery in progress for it:
+/// an absent actor the crash watchdog poisoned reads as `Some(Poisoned)`,
+/// because the supervisor keeps that flag outside the actor (ADR-049 §10), and
+/// an absent actor the supervisor is still recovering reads as an error (see
+/// `# Errors`). A crash-window record that is neither poisoned, respawning, nor
+/// marked failed does not change the answer: that context reads as `None`.
+///
+/// [`require_active_context`] is the gate form: it turns `None` into an error so
+/// a gate never admits an operation on an absent answer.
+///
+/// An actor the supervisor still holds but this call got no answer from — a
+/// mailbox send that failed or timed out (a saturated mailbox, or a closed one
+/// because the actor task has terminated and the watchdog has not yet
+/// despawned it), a reply channel the actor dropped, or a reply that missed
+/// the reply timeout — reads as an error, never as `Ok(None)`.
+/// `Supervisor::read_context_state` folds that outcome into `None`; this
+/// function calls `Supervisor::read_context_state_checked`, which
+/// keeps the two outcomes apart.
+///
+/// # Errors
+///
+/// Returns [`ScpNapiError::Context`] with:
+///
+/// - `SCP-CTX-2000` when this instance holds no supervisor, or when the bridge
+///   is suspended (the supervisor stays attached; call `resume()` and retry);
+/// - `SCP-CTX-2130` when an actor serves `context_id` but the mailbox send
+///   failed or timed out, or the actor dropped its reply to the state read or
+///   missed the reply timeout;
+/// - `SCP-CTX-2135` when no actor is registered for `context_id` because the
+///   crash watchdog despawned it and has not finished the respawn, because an
+///   operator's `clear_poison` cleared its poison flag and has not yet
+///   respawned it, because an import despawned it and has not yet registered
+///   the imported actor, or because its last respawn failed and the context is
+///   not yet poisoned (ADR-049 §10).
+///
+/// It also returns whatever error the actor's `ReadContextState` handler
+/// returned, translated by `From<ContextError>`. The state read reports a
+/// context the supervisor neither serves nor is recovering as `Ok(None)`, so
+/// a caller distinguishes "no actor serves this context" from "this bridge
+/// could not get an answer".
+pub async fn read_live_context_state(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<Option<scp_core::context::ContextState>, ScpNapiError> {
+    let sup = Arc::clone(typed_supervisor(bi)?);
+    sup.read_context_state_checked(context_id)
+        .await
+        .map_err(ScpNapiError::from)
+}
+
+/// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`.
+///
+/// The lifecycle gate reads the supervisor actor, never the `state` string
+/// [`NapiContextHandle`](crate::context::NapiContextHandle) caches. That string
+/// records only the transitions THIS bridge observed, so a TTL expiry the
+/// supervisor applied on its own timer, a close another member initiated, a
+/// migration that tombstoned the context, and an actor the watchdog poisoned
+/// all leave it reading `"active"`. A gate reading that string admits an
+/// operation into a context the supervisor stopped serving.
+///
+/// Fails closed: a context no actor serves refuses the operation. `mk_err`
+/// wraps the refusal message in the error variant and the error code the
+/// calling operation reports, so a lifecycle refusal keeps whichever
+/// [`ScpNapiError`] variant that operation already returned. A poisoned
+/// context is the exception: it refuses with `ContextPoisoned`
+/// (`SCP-CTX-2134`), the code ADR-049 §10 names as the consumer's signal to
+/// start operator recovery.
+///
+/// # Errors
+///
+/// Returns [`ScpNapiError::Context`] with `SCP-CTX-2134` when the supervisor
+/// reports `Poisoned`; whatever `mk_err` builds when it reports any other state
+/// than `Active` and when no actor serves `context_id`; and the supervisor's
+/// own error (`SCP-CTX-2130` busy, `SCP-CTX-2135` crashed or mid-respawn) when
+/// the supervisor query itself fails, or `SCP-CTX-2000` when this bridge has no
+/// supervisor or is suspended (call `resume()` and retry).
+pub async fn require_active_context<F>(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<(), ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    match read_live_context_state(bi, context_id).await? {
+        Some(scp_core::context::ContextState::Active) => Ok(()),
+        // ADR-049 §10: a caller detects a poisoned context by the
+        // `SCP-CTX-2134` code on its next per-context operation, not by
+        // polling `state()`, so the gate surfaces `ContextPoisoned` rather
+        // than the operation's own non-active code.
+        Some(scp_core::context::ContextState::Poisoned) => Err(ScpNapiError::from(
+            scp_core::context::ContextError::ContextPoisoned(context_id.to_owned()),
+        )),
+        Some(other) => Err(mk_err(format!(
+            "cannot {verb} in '{}' state -- context must be active",
+            context_state_str(&other)
+        ))),
+        None => Err(mk_err(format!(
+            "context '{context_id}' has no live supervisor state -- refusing to run a \
+             lifecycle-gated operation against a context no actor serves"
+        ))),
+    }
+}
+
+/// Renders a [`ContextState`](scp_core::context::ContextState) as the lowercase
+/// name a lifecycle-gate error reports.
+#[must_use]
+pub const fn context_state_str(state: &scp_core::context::ContextState) -> &'static str {
+    scp_ffi_common::context_state_str(state)
 }
 
 /// Registers an outlet handler for an outlet in a context.
@@ -2015,6 +2134,50 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
     };
 
     map.entry(context_id.to_owned()).or_insert(state);
+}
+
+/// Attaches a supervisor to `bi` if none is attached, then creates `context_id`
+/// inside it under `creator_did` with `default_ceiling()` as the capability
+/// ceiling.
+///
+/// [`register_test_context`] alone registers the bridge's UCAN state; it does
+/// NOT create the context inside a supervisor, so every lifecycle gate refuses
+/// a context a test only registered. Tests call this to give the context the
+/// actor a real `context_create` would have spawned.
+///
+/// Gated on `testing` as well as `test`: its only callers are `testing`-gated
+/// tests, and the production test lane (`--features server`) must compile it
+/// out rather than warn that it is unused.
+///
+/// # Errors
+///
+/// Returns the bridge error when no supervisor is attached or when
+/// `create_context` rejects the request. The calling test fails on either,
+/// because both are a broken fixture rather than a condition under test.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) async fn create_supervisor_context_for_test(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+) -> napi::Result<()> {
+    init_supervisor_for_test_on(bi);
+    let params = scp_core::context::ContextParams {
+        ceiling: scp_core::context::roles::default_ceiling()
+            .iter()
+            .cloned()
+            .collect(),
+        ..scp_core::context::ContextParams::default()
+    };
+    let sup = Arc::clone(supervisor(bi)?);
+    sup.create_context(
+        context_id.to_owned(),
+        params,
+        scp_did::DID(creator_did.to_owned()),
+        None,
+    )
+    .await
+    .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2180,6 +2343,49 @@ mod tests {
             Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
             "supervisor(&bi) must match bi.core.try_supervisor()"
         );
+    }
+
+    /// `read_live_context_state` passes the `SCP-CTX-2000` refusal on as
+    /// `supervisor` built it: one code, and no rendered `napi::Error` status
+    /// inside the message. Covers a bridge with no supervisor, a suspended
+    /// one, and an attached one that answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_live_context_state_keeps_the_ctx_2000_refusal_as_built() {
+        let assert_refusal = |err: ScpNapiError, expected: &str| {
+            let rendered = err.to_string();
+            assert!(
+                matches!(&err, ScpNapiError::Context { code, .. } if code == codes::CTX_2000),
+                "expected an SCP-CTX-2000 context error, got {err:?}"
+            );
+            assert!(
+                rendered.starts_with(&format!("[{}] context error: {expected}", codes::CTX_2000)),
+                "rendered: {rendered}"
+            );
+            assert_eq!(
+                rendered.matches(codes::CTX_2000).count(),
+                1,
+                "the code appears once: {rendered}"
+            );
+            assert!(
+                !rendered.contains("GenericFailure"),
+                "the message re-wraps a rendered napi::Error: {rendered}"
+            );
+        };
+
+        let bi = NapiBridgeInstance::new_napi();
+        let err = read_live_context_state(&bi, "ctx-none").await.unwrap_err();
+        assert_refusal(err, "Supervisor not yet attached");
+
+        init_supervisor_for_test_on(&bi);
+        assert_eq!(
+            read_live_context_state(&bi, "ctx-none").await.unwrap(),
+            None,
+            "an attached supervisor answers for a context it does not serve"
+        );
+
+        bi.core.suspend().expect("suspend");
+        let err = read_live_context_state(&bi, "ctx-none").await.unwrap_err();
+        assert_refusal(err, "bridge is suspended");
     }
 
     #[test]

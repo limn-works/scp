@@ -16,8 +16,10 @@ use std::time::Duration;
 use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::params::{ContextParams, TemplateId};
-use scp_protocol::context::{ContextError, ContextState};
+use scp_protocol::context::params::{
+    Capability, ContextParams, GovernanceModel, MemoryScope, TemplateId,
+};
+use scp_protocol::context::{CeilingDeclaration, ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::config::{ContextConfig, ContextCreation};
 use scp_runtime::context::supervisor::Supervisor;
@@ -208,7 +210,10 @@ async fn create_with_template_peer_fails_loud_not_silent() {
 
     // No context was created: the deterministic id is unknown to the manager.
     assert!(
-        manager.read_context_state("ctx-with-peer").await.is_none(),
+        matches!(
+            manager.read_context_state_checked("ctx-with-peer").await,
+            Ok(None)
+        ),
         "a rejected peer create must not leave a partially-created context behind"
     );
 }
@@ -233,4 +238,231 @@ async fn create_without_peer_succeeds() {
         .await
         .unwrap();
     assert_eq!(handle.state(), ContextState::Active);
+}
+
+const fn explicit_config(ceiling: Vec<Capability>) -> ContextConfig {
+    ContextConfig::defaults(ContextCreation::Explicit {
+        ceiling,
+        roles: Vec::new(),
+        governance: GovernanceModel::SingleAdmin,
+        memory_scope: MemoryScope::Ephemeral,
+    })
+}
+
+/// An `Explicit` config with an empty ceiling describes a context no member
+/// can use (construction.md M2), so `Supervisor::create` rejects it with
+/// `ContextError::CeilingRequired(CeilingDeclaration::Empty)` and creates no
+/// context.
+#[tokio::test]
+async fn create_with_empty_explicit_ceiling_is_rejected() {
+    let manager = new_manager();
+
+    let result = manager
+        .create(
+            "ctx-empty-ceiling".into(),
+            explicit_config(Vec::new()),
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::CeilingRequired(CeilingDeclaration::Empty)
+            ))
+        ),
+        "an empty Explicit ceiling must be rejected with CeilingRequired(Empty); got {result:?}"
+    );
+    assert!(
+        matches!(
+            manager
+                .read_context_state_checked("ctx-empty-ceiling")
+                .await,
+            Ok(None)
+        ),
+        "a rejected empty-ceiling create must not leave a context behind"
+    );
+}
+
+/// The empty-ceiling guard rejects only an empty ceiling: an `Explicit`
+/// config naming a non-empty ceiling creates an `Active` context carrying
+/// exactly that ceiling.
+#[tokio::test]
+async fn create_with_non_empty_explicit_ceiling_succeeds() {
+    let manager = new_manager();
+    let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+
+    let handle = manager
+        .create(
+            "ctx-explicit-ceiling".into(),
+            explicit_config(ceiling.clone()),
+            alice(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(handle.state(), ContextState::Active);
+    assert_eq!(handle.params().ceiling, ceiling);
+    // The read the rejection tests use to prove absence sees this id.
+    assert!(
+        matches!(
+            manager
+                .read_context_state_checked("ctx-explicit-ceiling")
+                .await,
+            Ok(Some(ContextState::Active))
+        ),
+        "a created context must read back as Active"
+    );
+}
+
+fn params_with_ceiling(ceiling: Vec<Capability>) -> ContextParams {
+    ContextParams {
+        ceiling,
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    }
+}
+
+/// The empty-ceiling rejection sits in `lifecycle_helpers::create_context`,
+/// which every create path reaches: `Supervisor::create_context` and the
+/// `CreateContext` lifecycle command it dispatches, the standing-pair
+/// recreate, and the governance migration. This test covers the
+/// `Supervisor::create_context` path: an empty ceiling fails with
+/// `ContextError::CeilingRequired(CeilingDeclaration::Empty)` and creates no
+/// context. `builder::create_context` repeats the check, so this test alone
+/// stays green without the lifecycle check;
+/// `create_context_rejects_empty_ceiling_before_version_check` pins the
+/// lifecycle check itself.
+#[tokio::test]
+async fn create_context_with_empty_ceiling_is_rejected() {
+    let manager = new_manager();
+
+    let result = manager
+        .create_context(
+            "ctx-params-empty-ceiling".into(),
+            params_with_ceiling(Vec::new()),
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::CeilingRequired(CeilingDeclaration::Empty)
+            ))
+        ),
+        "create_context must reject an empty ceiling with CeilingRequired(Empty); got {result:?}"
+    );
+    assert!(
+        matches!(
+            manager
+                .read_context_state_checked("ctx-params-empty-ceiling")
+                .await,
+            Ok(None)
+        ),
+        "a rejected empty-ceiling create_context must not leave a context behind"
+    );
+}
+
+/// The `create_context` guard rejects only an empty ceiling: a non-empty one
+/// creates an `Active` context carrying exactly that ceiling.
+#[tokio::test]
+async fn create_context_with_non_empty_ceiling_succeeds() {
+    let manager = new_manager();
+    let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+
+    let handle = manager
+        .create_context(
+            "ctx-params-ceiling".into(),
+            params_with_ceiling(ceiling.clone()),
+            alice(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(handle.state(), ContextState::Active);
+    assert_eq!(handle.params().ceiling, ceiling);
+    // The read the rejection tests use to prove absence sees this id.
+    assert!(
+        matches!(
+            manager
+                .read_context_state_checked("ctx-params-ceiling")
+                .await,
+            Ok(Some(ContextState::Active))
+        ),
+        "a created context must read back as Active"
+    );
+}
+
+/// A minimum protocol version no SDK of the current major satisfies.
+const UNSATISFIABLE_MIN_VERSION: Option<(u8, u8)> = Some((9, 0));
+
+/// `lifecycle_helpers::create_context` rejects an empty ceiling before it runs
+/// `check_version_compatibility`, so a create with both an empty ceiling and
+/// an unsatisfiable `min_protocol_version` fails with `CeilingRequired(Empty)`.
+/// Without that check the version check fails first and returns
+/// `VersionIncompatible`, so this test fails if the lifecycle check is removed
+/// or moved below the version check.
+#[tokio::test]
+async fn create_context_rejects_empty_ceiling_before_version_check() {
+    let manager = new_manager();
+
+    let result = manager
+        .create_context(
+            "ctx-params-empty-ceiling-bad-version".into(),
+            ContextParams {
+                min_protocol_version: UNSATISFIABLE_MIN_VERSION,
+                ..params_with_ceiling(Vec::new())
+            },
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::CeilingRequired(CeilingDeclaration::Empty)
+            ))
+        ),
+        "the empty-ceiling check must run before the version check; got {result:?}"
+    );
+}
+
+/// The partner of `create_context_rejects_empty_ceiling_before_version_check`:
+/// with a non-empty ceiling the same unsatisfiable `min_protocol_version`
+/// fails the version check, so the order that test pins is between two live
+/// checks.
+#[tokio::test]
+async fn create_context_rejects_unsatisfiable_version_with_non_empty_ceiling() {
+    let manager = new_manager();
+
+    let result = manager
+        .create_context(
+            "ctx-params-bad-version".into(),
+            ContextParams {
+                min_protocol_version: UNSATISFIABLE_MIN_VERSION,
+                ..params_with_ceiling(vec![Capability::MessagesRead])
+            },
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::VersionIncompatible { .. }
+            ))
+        ),
+        "an unsatisfiable min_protocol_version must fail the version check; got {result:?}"
+    );
 }
