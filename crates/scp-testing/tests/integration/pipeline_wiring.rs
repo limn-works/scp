@@ -3028,11 +3028,11 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
             UNIFFI_SERVE_PATH,
         ),
     ] {
-        // Search the PRODUCTION code only: every `#[cfg(test)]` test module
+        // Search the PRODUCTION code only: every `#[cfg(test)]` `mod tests`
         // removed, with comments and string contents blanked (see
-        // `production_code`). Each
-        // bridge's unit tests and its comments name the same symbols, so a bare
-        // `contains` over the file stayed green after the real call was deleted.
+        // `production_code`). Each bridge's unit tests and its comments name
+        // the same symbols, so a bare `contains` over the file stayed green
+        // after the real call was deleted.
         let code = production_code(src);
         assert!(
             serves_the_supervisor_event_source(&code, serve_fn, supervisor_of_bi, serve_path),
@@ -3363,10 +3363,11 @@ fn mcp_wiring_gate_reads_past_a_test_module_marker_in_a_comment_or_literal() {
     }
 }
 
-/// `production_code` must drop every `#[cfg(test)]` test module, wherever it
+/// `production_code` must drop every `#[cfg(test)]` `mod tests`, wherever it
 /// sits and whatever attributes follow the `cfg`, and keep everything else:
 /// code after a test module, a `mod tests` compiled without `#[cfg(test)]`, and
-/// code after a comment or literal that holds `mod tests {`.
+/// code after a comment or literal that holds `mod tests {`. A `#[cfg(test)]`
+/// module with any other name is not dropped (see [`without_test_modules`]).
 #[test]
 fn production_code_drops_only_cfg_test_modules() {
     let src = "fn a() { one(); }\n\
