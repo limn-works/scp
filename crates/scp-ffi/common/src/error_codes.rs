@@ -1207,8 +1207,8 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 // Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
 // from its UniFFI `DeviceAttestationProvider` callback methods
-// (`AttestationError.scpError`). Each of these five codes belongs to one of
-// the six `AttestationError` cases; the sixth case, `serviceError`, reuses
+// (`AttestationError.scpError`). Each of these nine codes belongs to one of
+// the ten `AttestationError` cases; the tenth case, `serviceError`, reuses
 // `ATTEST_9001`.
 
 /// Apple App Attest is unsupported on this device.
@@ -1218,6 +1218,26 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 pub const ATTEST_9019: &str = "SCP-ATTEST-9019";
 /// No App Attest key ID is stored, so no assertion is possible.
 pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
+/// Apple already attested this App Attest key.
+///
+/// The stored key carries the Apple adapter's attestation record, and Apple
+/// attests one key once, so `attest` calls no App Attest method.
+pub const ATTEST_9021: &str = "SCP-ATTEST-9021";
+/// Apple holds no attestation for the stored App Attest key.
+///
+/// `generateAssertion` answered `DCError.invalidKey` for a key that carries
+/// no attestation record; the Apple adapter keeps the key.
+pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
+/// Apple's App Attest service rejected this device's key.
+///
+/// `generateAssertion` answered `DCError.invalidKey` for a key that carries
+/// an attestation record; the Apple adapter discards the key ID and record.
+pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
+/// Apple could not reach its App Attest service.
+///
+/// `attestKey` or `generateAssertion` answered `DCError.serverUnavailable`;
+/// the Apple adapter keeps the key for a retry.
+pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
 /// The App Attest adapter reached a state no caller input produces.
 ///
 /// Apple's service answered a completion handler with neither a value nor an
@@ -1243,7 +1263,8 @@ pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 /// When the bound expires, the waiting
 /// `attest` or `assert_request` throws this code, the serializer starts the
 /// next queued call, and an answer Apple gives later is discarded: it stores
-/// no key ID and reaches no caller. `SCP-ATTEST-9025` names a completion
+/// no key ID, writes no attestation record, discards no key ID, and reaches
+/// no caller. `SCP-ATTEST-9025` names a completion
 /// handler that answered with neither a value nor an error, a different
 /// condition.
 pub const ATTEST_9027: &str = "SCP-ATTEST-9027";
