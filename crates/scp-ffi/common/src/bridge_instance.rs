@@ -4267,8 +4267,9 @@ mod tests {
     /// snapshot and the dial spawns until it parks in its collect
     /// `select!`. A pending first poll therefore proves the reconnect is
     /// in flight past the shutdown check, holding the token that a later
-    /// `suspend()` / `shutdown()` cancels, whatever the scheduler does
-    /// with the spawned dial tasks.
+    /// `suspend()` / `shutdown()` cancels. The first poll is pending only
+    /// while a dial is still outstanding, so callers dial
+    /// [`stalling_relay_url`].
     async fn poll_reconnect_into_dial<F>(reconnect: &mut std::pin::Pin<&mut F>)
     where
         F: std::future::Future<Output = Result<(), LifecycleError>>,
@@ -4279,6 +4280,18 @@ mod tests {
             first.is_pending(),
             "reconnect must park in its dial phase on the first poll, got {first:?}"
         );
+    }
+
+    /// Binds a loopback listener that never accepts and returns it with
+    /// its `ws://` URL. A loopback `ws://` URL passes relay URL
+    /// validation, the kernel completes the TCP handshake from the listen
+    /// backlog, and the WebSocket handshake response never arrives, so a
+    /// reconnect dial to the URL stays outstanding until
+    /// `RECONNECT_PER_URL_TIMEOUT` while the listener is alive.
+    async fn stalling_relay_url() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        (listener, url)
     }
 
     /// Asserts `result` is the error the mid-dial cancel branch of
@@ -4333,16 +4346,12 @@ mod tests {
     #[tokio::test]
     async fn suspend_cancels_in_flight_reconnect_dial() {
         // A `suspend()` firing while `reconnect_transport_if_pending` is
-        // mid-dial must cancel the reconnect so the half-connected adapter
-        // is dropped before `NativeRelayAdapter` construction completes,
-        // preventing the socket leak behind the cancellation token. A unit
-        // test cannot observe an OS-level socket handle, but it can prove
-        // the cancellation path fires and aborts the collect loop.
+        // mid-dial must cancel the reconnect.
         use std::time::Duration;
 
         let instance = CoreFields::with_supervisor(test_supervisor());
-        // Reserved TEST-NET-1 address (RFC 5737) with a closed port.
-        instance.add_relay_url("ws://192.0.2.1:1/".to_owned());
+        let (_relay, url) = stalling_relay_url().await;
+        instance.add_relay_url(url);
 
         let reconnect = instance.reconnect_transport_if_pending();
         tokio::pin!(reconnect);
@@ -4375,7 +4384,8 @@ mod tests {
         use std::time::Duration;
 
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.add_relay_url("ws://192.0.2.1:1/".to_owned());
+        let (_relay, url) = stalling_relay_url().await;
+        instance.add_relay_url(url);
 
         let reconnect = instance.reconnect_transport_if_pending();
         tokio::pin!(reconnect);
