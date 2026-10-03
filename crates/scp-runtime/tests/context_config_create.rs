@@ -317,7 +317,10 @@ fn params_with_ceiling(ceiling: Vec<Capability>) -> ContextParams {
 /// recreate, and the governance migration. This test covers the
 /// `Supervisor::create_context` path: an empty ceiling fails with
 /// `ContextError::CeilingRequired(CeilingDeclaration::Empty)` and creates no
-/// context.
+/// context. `builder::create_context` repeats the check, so this test alone
+/// stays green without the lifecycle check;
+/// `create_context_rejects_empty_ceiling_before_version_check` pins the
+/// lifecycle check itself.
 #[tokio::test]
 async fn create_context_with_empty_ceiling_is_rejected() {
     let manager = new_manager();
@@ -368,4 +371,71 @@ async fn create_context_with_non_empty_ceiling_succeeds() {
 
     assert_eq!(handle.state(), ContextState::Active);
     assert_eq!(handle.params().ceiling, ceiling);
+}
+
+/// A minimum protocol version no SDK of the current major satisfies.
+const UNSATISFIABLE_MIN_VERSION: Option<(u8, u8)> = Some((9, 0));
+
+/// `lifecycle_helpers::create_context` rejects an empty ceiling before it runs
+/// `check_version_compatibility`, so a create with both an empty ceiling and
+/// an unsatisfiable `min_protocol_version` fails with `CeilingRequired(Empty)`.
+/// Without that check the version check fails first and returns
+/// `VersionIncompatible`, so this test fails if the lifecycle check is removed
+/// or moved below the version check.
+#[tokio::test]
+async fn create_context_rejects_empty_ceiling_before_version_check() {
+    let manager = new_manager();
+
+    let result = manager
+        .create_context(
+            "ctx-params-empty-ceiling-bad-version".into(),
+            ContextParams {
+                min_protocol_version: UNSATISFIABLE_MIN_VERSION,
+                ..params_with_ceiling(Vec::new())
+            },
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::CeilingRequired(CeilingDeclaration::Empty)
+            ))
+        ),
+        "the empty-ceiling check must run before the version check; got {result:?}"
+    );
+}
+
+/// The partner of `create_context_rejects_empty_ceiling_before_version_check`:
+/// with a non-empty ceiling the same unsatisfiable `min_protocol_version`
+/// fails the version check, so the order that test pins is between two live
+/// checks.
+#[tokio::test]
+async fn create_context_rejects_unsatisfiable_version_with_non_empty_ceiling() {
+    let manager = new_manager();
+
+    let result = manager
+        .create_context(
+            "ctx-params-bad-version".into(),
+            ContextParams {
+                min_protocol_version: UNSATISFIABLE_MIN_VERSION,
+                ..params_with_ceiling(vec![Capability::MessagesRead])
+            },
+            alice(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(ContextCreationError::StateTransition(
+                ContextError::VersionIncompatible { .. }
+            ))
+        ),
+        "an unsatisfiable min_protocol_version must fail the version check; got {result:?}"
+    );
 }
