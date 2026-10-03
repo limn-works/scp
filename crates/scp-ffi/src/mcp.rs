@@ -920,9 +920,11 @@ impl FfiBridgeProvider {
         // This trait method is sync but its callers vary:
         //   (a) `py_mcp_serve` stdio loop → `rt.spawn(async move …)`
         //       on the multi-thread bridge runtime: `py_mcp_serve` refuses
-        //       a current-thread runtime while a supervisor is attached
-        //       (`check_serve_runtime`), and without one this call fails at
-        //       `supervisor` below.
+        //       a current-thread runtime (`check_serve_runtime`). The
+        //       supervisor is looked up on each call, so this call fails at
+        //       `supervisor` below while none is attached or the instance is
+        //       suspended, and passes it once one is attached and the
+        //       instance resumes.
         //   (b) SSE async handler → multi-thread runtime.
         //   (c) Sync `#[test]` tests → no runtime.
         //
@@ -1434,25 +1436,25 @@ fn mcp_server_bundle(
     McpServer::with_optional_event_source(provider, context_events)
 }
 
-/// Refuses to serve from a current-thread bridge runtime while a supervisor is
-/// attached.
+/// Refuses to serve from a current-thread bridge runtime.
 ///
-/// With a supervisor attached, every provider gate reads the actor's role
+/// While a supervisor is attached, every provider gate reads the actor's role
 /// state (`FfiBridgeProvider::held_role_state`), which blocks the transport
 /// task's thread until the actor answers. On a current-thread runtime that
 /// thread is the only one that could run the actor, so every gated request
-/// would fail; `py_mcp_serve` fails instead of returning a handle to a server
-/// that answers none of them. The bridge runtime falls back to current-thread
-/// only when the multi-thread build fails (`crate::init_runtime`).
-fn check_serve_runtime(
-    flavor: tokio::runtime::RuntimeFlavor,
-    has_supervisor: bool,
-) -> Result<(), ScpPyError> {
-    if has_supervisor && flavor != tokio::runtime::RuntimeFlavor::MultiThread {
+/// would fail. A gate looks the supervisor up on each request, so a server
+/// served before `init_context_manager` attaches one starts failing every
+/// gated request at that moment; the check therefore refuses a current-thread
+/// runtime whether or not a supervisor is attached at serve time, and
+/// `py_mcp_serve` fails instead of returning a handle to such a server. The
+/// bridge runtime falls back to current-thread only when the multi-thread
+/// build fails (`crate::init_runtime`).
+fn check_serve_runtime(flavor: tokio::runtime::RuntimeFlavor) -> Result<(), ScpPyError> {
+    if flavor != tokio::runtime::RuntimeFlavor::MultiThread {
         return Err(ScpPyError::transport(
-            "cannot serve MCP from a current-thread bridge runtime while a supervisor \
-             is attached: every gate reads the actor's role state, which that runtime \
-             cannot run while the gate blocks its only thread"
+            "cannot serve MCP from a current-thread bridge runtime: a gate reads the \
+             actor's role state whenever a supervisor is attached, and that runtime \
+             cannot run the actor while the gate blocks its only thread"
                 .to_owned(),
         ));
     }
@@ -1495,9 +1497,13 @@ fn generate_handle_id(prefix: &str) -> String {
 /// is suspended, has no resource subscriptions for its whole life: it
 /// advertises `resources.subscribe`, `resources.listChanged` and
 /// `tools.listChanged` as false, rejects `resources/subscribe`, and sends no
-/// `list_changed` notification. With no supervisor attached it also refuses
-/// every `tools/call`. Attaching a supervisor or calling `resume()` later
-/// does not change a running server; stop it and serve again.
+/// `list_changed` notification. Attaching a supervisor or calling `resume()`
+/// later does not add subscriptions to a running server; stop it and serve
+/// again. Every other request reads the instance's state when it arrives:
+/// `tools/call` fails while no supervisor is attached or the instance is
+/// suspended, and stops failing for those reasons once both end; every
+/// access gate reads the actor's role state while a supervisor is attached
+/// and the bridge's copy of the context otherwise.
 ///
 /// # Arguments
 ///
@@ -1513,9 +1519,8 @@ fn generate_handle_id(prefix: &str) -> String {
 /// # Errors
 ///
 /// Raises `TransportError` if the server fails to start, if the bridge
-/// runtime is current-thread while a supervisor is attached (see
-/// `check_serve_runtime`), or if the instance shuts down before the server
-/// is registered.
+/// runtime is current-thread (see `check_serve_runtime`), or if the instance
+/// shuts down before the server is registered.
 ///
 /// See ADR-015: MCP server with context namespace mapping.
 #[pymethods]
@@ -1572,10 +1577,7 @@ impl crate::scp::PyScp {
 
         // Start the transport task on the tokio runtime.
         let rt = crate::runtime()?;
-        check_serve_runtime(
-            rt.handle().runtime_flavor(),
-            bi.core.try_supervisor().is_some(),
-        )?;
+        check_serve_runtime(rt.handle().runtime_flavor())?;
         let transport_mode = transport.to_owned();
         // Capture the cancel token so the server task exits when the
         // instance is dropped, even if the caller never calls
@@ -5780,21 +5782,18 @@ mod tests {
         crate::runtime::remove_context(&bi, &granted);
     }
 
-    /// `py_mcp_serve` refuses a current-thread bridge runtime only while a
-    /// supervisor is attached, the one case where every gate would fail.
+    /// `py_mcp_serve` refuses a current-thread bridge runtime whether or not a
+    /// supervisor is attached at serve time, because a gate looks the
+    /// supervisor up on each request and one attached later would make every
+    /// gated request fail; a multi-thread runtime serves.
     #[test]
-    fn serve_refuses_a_current_thread_runtime_only_with_a_supervisor() {
+    fn serve_refuses_a_current_thread_runtime() {
         use tokio::runtime::RuntimeFlavor;
-        let error = check_serve_runtime(RuntimeFlavor::CurrentThread, true)
+        let error = check_serve_runtime(RuntimeFlavor::CurrentThread)
             .expect_err("a current-thread runtime cannot run the actor a gate waits on")
             .to_string();
         assert!(error.contains("current-thread"), "{error}");
-        check_serve_runtime(RuntimeFlavor::MultiThread, true)
-            .expect("a multi-thread runtime serves with a supervisor");
-        check_serve_runtime(RuntimeFlavor::CurrentThread, false)
-            .expect("without a supervisor the gates read the bridge copy");
-        check_serve_runtime(RuntimeFlavor::MultiThread, false)
-            .expect("a multi-thread runtime serves without a supervisor");
+        check_serve_runtime(RuntimeFlavor::MultiThread).expect("a multi-thread runtime serves");
     }
 
     /// A context the actor holds while the bridge holds no copy of it has no
