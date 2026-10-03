@@ -1,32 +1,33 @@
 #!/usr/bin/env python3.12
 """Print the `cargo clippy` package and feature arguments for the paths a commit changes.
 
-`scripts/hooks/pre-commit` pipes the paths its `CHANGED` list holds, one per line, into
-this script and passes the testing features it lints with in `--features`. The script
-prints one cargo argument per line, and prints nothing when no path needs a lint.
+`scripts/hooks/pre-commit` pipes the paths its changed-path list holds, NUL-separated as
+`git diff -z` prints them, into this script and passes the testing features it lints with
+in `--features`. The script prints one cargo argument per line, and prints nothing when no
+path needs a lint.
 
-THE CRITERION for a full run: a changed path that can change the lints or the dependency
-resolution of a workspace member whose `.rs` files the commit did not touch. Such a path
-makes this script print `--workspace` and every feature `--features` names. The paths in
-`ROOT_WIDE` and `MEMBER_WIDE` are the files in this repository that meet the criterion:
-- `Cargo.toml` at the root or in a member changes features and dependency versions that
-  every dependent member resolves; `Cargo.lock` changes the versions every member builds.
+The script prints `--workspace` and every feature `--features` names when a changed path,
+relative to the workspace root, is in `ROOT_WIDE`, or when a changed path, relative to the
+member directory that holds it, is in `MEMBER_WIDE`. Each `ROOT_WIDE` path can change the
+lints or the dependency resolution of a member whose files the commit did not touch:
+- `Cargo.toml` can change the features and dependency versions every member resolves, and
+  `Cargo.lock` can change the versions every member builds.
 - `rust-toolchain.toml` (and its legacy name `rust-toolchain`) changes the compiler and
   therefore the lint set.
-- `.clippy.toml` or `clippy.toml` at the root changes lint thresholds for every member;
-  clippy also reads one from a member directory, as `crates/scp-runtime/clippy.toml` shows.
-- `.cargo/config.toml` (and its legacy name `.cargo/config`) at the root reaches every cargo
-  command the hook runs from the root.
-- `build.rs` in a member can emit `cfg` flags and environment variables its member compiles
-  against.
-Files that meet none of those conditions stay out: `rustfmt.toml` changes formatting, not
-lints; `deny.toml` is read by cargo-deny, not by clippy; `.mise.toml` sets environment
-variables for Android cross-compilation linkers, which a host clippy run never invokes;
-and a `.cargo/config.toml` inside a member directory is not read by a cargo command that
-runs from the root.
+- `.clippy.toml` or `clippy.toml` changes lint thresholds for every member that holds no
+  clippy configuration file of its own.
+- `.cargo/config.toml` (and its legacy name `.cargo/config`) reaches every cargo command
+  the hook runs from the root.
+`MEMBER_WIDE` holds a member's `Cargo.toml`, `Cargo.lock`, `build.rs`, `clippy.toml`, and
+`.clippy.toml`.
+These root files stay out of `ROOT_WIDE`: `rustfmt.toml` changes formatting, not lints;
+`deny.toml` is read by cargo-deny, not by clippy; and `.mise.toml` sets environment
+variables for Android cross-compilation linkers, which a host clippy run never invokes.
 
 Otherwise the script selects each workspace member that holds a changed path, of any file
-type, because a crate can read a non-Rust file in its directory with `include_str!`. It
+type, because a crate can read a non-Rust file in its directory with `include_str!`. A
+commit that deletes or moves a file outside a member's directory does not select a member
+that reads that file with `include_str!` or `include_bytes!`. It
 then adds every workspace member that depends on a selected member, directly or
 transitively, as `Graph.affected` defines the walk, and prints `-p <name>` for each.
 It keeps only the `--features` entries whose package is selected, because cargo rejects
@@ -45,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import PurePosixPath
@@ -211,7 +213,7 @@ def main() -> int:
         "--metadata", help="read this cargo metadata JSON file instead of running cargo"
     )
     args = parser.parse_args()
-    paths = [line.strip() for line in sys.stdin if line.strip()]
+    paths = [os.fsdecode(p) for p in sys.stdin.buffer.read().split(b"\0") if p]
     features = [f for f in args.features.split(",") if f]
     for feature in features:
         if "/" not in feature:

@@ -656,11 +656,10 @@ jobs:
       # cases commit through the real hook in throwaway repositories with `cargo` stubbed.
       - name: Run pre-commit merge cases
         run: bash scripts/tests/pre-commit-merge/run-tests.sh
-      # The hook lints only the workspace members a commit changes plus their dependents,
-      # or the whole workspace when a manifest, the lockfile, or a toolchain or lint
-      # configuration file changes. These cases commit through the real hook with `cargo`
-      # stubbed and compare each recorded `cargo clippy` command with the one that rule
-      # requires.
+      # The hook lints the workspace members `scripts/pre-commit-clippy-scope.py` selects;
+      # its module docstring states the rule. These cases commit through the real hook with
+      # `cargo` stubbed and compare each recorded `cargo clippy` command with the one that
+      # rule requires.
       - name: Run pre-commit clippy scope cases
         run: bash scripts/tests/pre-commit-clippy-scope/run-tests.sh
       # The compile-steps check reads every workflow file with PyYAML, which

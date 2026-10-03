@@ -3,8 +3,8 @@
 #
 # THE CRITERION: the hook lints the workspace members that hold a path the commit changes,
 # plus every member that depends on one of them, and lints the whole workspace when a
-# changed path can change lints or dependency resolution for members the commit did not
-# touch. `scripts/pre-commit-clippy-scope.py` states the criterion in full.
+# changed path is one the full-run lists of `scripts/pre-commit-clippy-scope.py` name.
+# That script's module docstring states the rule in full.
 #
 # Each case builds a throwaway repository in `mktemp -d`, copies the real hook and the real
 # scope script into it, and commits through that hook. `cargo` is a stub on PATH that
@@ -83,8 +83,9 @@ new_repo() {
     git -c commit.gpgsign=false commit -q --no-verify -m "initial"
 }
 
-# edit <path> — change one line of a file and stage it.
+# edit <path> — change one line of a file, creating it if it is absent, and stage it.
 edit() {
+    mkdir -p "$(dirname "$1")"
     echo "// edited $RANDOM" >> "$1"
     git add "$1"
 }
@@ -164,8 +165,15 @@ g commit -q -m "member manifest change" >/dev/null
 assert_clippy "a member Cargo.toml change lints the whole workspace" \
     "cargo clippy --workspace --features $ALL_FEATURES $TAIL"
 
-# Cases 3b to 3e: a manifest, the lockfile, or the toolchain file with no `.rs` file.
-for f in Cargo.toml Cargo.lock rust-toolchain.toml crates/scp-relay/Cargo.toml; do
+# Cases 3b on: each full-run path, alone, with no `.rs` file. The two lists are written out
+# here rather than read from the script, so deleting an entry from the script's
+# `ROOT_WIDE` or `MEMBER_WIDE` turns that entry's case red; the check after the loop turns
+# red when the script's lists and these differ in either direction.
+TEST_ROOT_WIDE="Cargo.toml Cargo.lock rust-toolchain.toml rust-toolchain .clippy.toml clippy.toml .cargo/config.toml .cargo/config"
+TEST_MEMBER_WIDE="Cargo.toml Cargo.lock build.rs clippy.toml .clippy.toml"
+FULL_RUN_PATHS="$TEST_ROOT_WIDE"
+for f in $TEST_MEMBER_WIDE; do FULL_RUN_PATHS="$FULL_RUN_PATHS crates/scp-relay/$f"; done
+for f in $FULL_RUN_PATHS; do
     new_repo "$WORK/only-$(echo "$f" | tr / -)"
     edit "$f"
     : > "$LOG"
@@ -173,6 +181,26 @@ for f in Cargo.toml Cargo.lock rust-toolchain.toml crates/scp-relay/Cargo.toml; 
     assert_clippy "a commit changing only $f lints the whole workspace" \
         "cargo clippy --workspace --features $ALL_FEATURES $TAIL"
 done
+SCRIPT_LISTS="$("$REAL_PYTHON" - "$SCOPE" <<'EOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("scope", sys.argv[1])
+scope = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(scope)
+print(" ".join(sorted(scope.ROOT_WIDE)))
+print(" ".join(sorted(scope.MEMBER_WIDE)))
+EOF
+)"
+WANT_LISTS="$(echo "$TEST_ROOT_WIDE" | tr ' ' '\n' | LC_ALL=C sort | xargs)
+$(echo "$TEST_MEMBER_WIDE" | tr ' ' '\n' | LC_ALL=C sort | xargs)"
+if [[ "$SCRIPT_LISTS" == "$WANT_LISTS" ]]; then
+    echo "  ok    the script's ROOT_WIDE and MEMBER_WIDE equal the lists these cases cover"
+    PASSED=$((PASSED + 1))
+else
+    echo "  FAIL  the script's ROOT_WIDE and MEMBER_WIDE equal the lists these cases cover"
+    echo "          want: ${WANT_LISTS}"
+    echo "          got:  ${SCRIPT_LISTS}"
+    FAILED=$((FAILED + 1))
+fi
 
 # Case 3f: a non-Rust file inside a member, with no `.rs` file.
 new_repo "$WORK/member-data"
@@ -188,6 +216,31 @@ edit docs/notes.md
 : > "$LOG"
 g commit -q -m "docs change" >/dev/null
 assert_clippy "a commit changing only docs/notes.md runs no clippy and no protocol check" none no
+
+# Case 3h: a non-ASCII file name in a member. Read without `-z`, git prints the path quoted
+# with octal escapes, which matches no member.
+new_repo "$WORK/non-ascii-member"
+edit "crates/scp-relay/src/é.rs"
+: > "$LOG"
+g commit -q -m "non-ASCII relay module" >/dev/null
+assert_clippy "a commit adding only crates/scp-relay/src/é.rs lints scp-relay" \
+    "cargo clippy -p scp-relay $TAIL"
+
+# Case 3i: a non-ASCII `.rs` file name in no member. The hook's `*.rs` match must still see
+# it, so the protocol checks run and the notice names the path as written.
+new_repo "$WORK/non-ascii-fuzz"
+edit "fuzz/src/é.rs"
+: > "$LOG"
+OUT="$(g commit -q -m "non-ASCII fuzz module" 2>&1)"
+assert_clippy "a commit adding only fuzz/src/é.rs runs the protocol checks and no clippy" none
+if [[ "$OUT" == *"clippy scope: fuzz/src/é.rs is in no workspace member; not linted"* ]]; then
+    echo "  ok    a passing commit names the unlinted non-ASCII path as written"
+    PASSED=$((PASSED + 1))
+else
+    echo "  FAIL  a passing commit names the unlinted non-ASCII path as written"
+    echo "          got: ${OUT}"
+    FAILED=$((FAILED + 1))
+fi
 
 # Case 5: a .rs file in the standalone fuzz workspace. The author sees which path went unlinted.
 new_repo "$WORK/fuzz"

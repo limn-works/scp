@@ -3,15 +3,14 @@
 # Auto-formats staged files and re-stages them. Lint errors block the commit.
 set -euo pipefail
 
-# `STAGED` holds deleted paths too, and `--no-renames` lists a renamed file as a deletion
+# The filter counts deleted paths too, and `--no-renames` lists a renamed file as a deletion
 # plus an addition, so a commit that only deletes or moves files still runs the hook.
-STAGED=$(git diff --cached --name-only --no-renames --diff-filter=ACMD)
-[ -z "$STAGED" ] && exit 0
+if git diff --cached --quiet --no-renames --diff-filter=ACMD; then exit 0; fi
 
 # ── Which files this commit changes, for the language steps ──
 #
-# On a merge commit, `STAGED` lists every file the merged-in branch changed, and the CI of
-# that branch already formatted and linted each of them. A language step runs here only for
+# On a merge commit, the staged set lists every file the merged-in branch changed, and the
+# CI of that branch already formatted and linted each of them. A language step runs here only for
 # a file whose staged content differs from what a merged-in head carries: a file this
 # branch changed, or a file the conflict resolution changed. So when `MERGE_HEAD` exists,
 # the language flags below read the files where the staged tree differs from each merged-in
@@ -19,14 +18,17 @@ STAGED=$(git diff --cached --name-only --no-renames --diff-filter=ACMD)
 # names several heads in `MERGE_HEAD`; the list is the union over all of them, so a file
 # differing from any one merged-in head still sets its flag.
 #
-# `STAGED` still decides the early exit above, so the toolchain check below runs on every
-# commit that stages a file, merge or not.
+# The staged set still decides the early exit above, so the toolchain check below runs on
+# every commit that stages a file, merge or not.
 #
 # The list also holds deleted paths, and `--no-renames` lists a renamed file as its deleted
 # old path plus its added new path. A commit that deletes a `.rs` file or moves one out of a
 # crate changes what that crate compiles, so the clippy scope below has to see the crate.
 #
-# `changed_paths` prints the list. The hook calls it twice: once here, and again after the
+# `changed_paths` prints the list NUL-separated (`git diff -z`). Without `-z`, git wraps a
+# path holding a non-ASCII byte in double quotes with octal escapes, and word splitting
+# breaks a path holding a space, so such a path would match no member and no `*.rs`
+# pattern. The hook calls it twice: once here, and again after the
 # auto-format step, because `git add -u` in that step stages every tracked `.rs` file the
 # working tree modified, and the clippy scope has to cover each file the commit will hold.
 MERGE_HEAD_FILE=$(git rev-parse --git-path MERGE_HEAD)
@@ -34,13 +36,12 @@ changed_paths() {
   if [ -f "$MERGE_HEAD_FILE" ]; then
     while IFS= read -r merged_head; do
       [ -z "$merged_head" ] && continue
-      git diff --cached --name-only --no-renames --diff-filter=ACMD "$merged_head"
+      git diff --cached -z --name-only --no-renames --diff-filter=ACMD "$merged_head"
     done < "$MERGE_HEAD_FILE"
   else
-    git diff --cached --name-only --no-renames --diff-filter=ACMD
+    git diff --cached -z --name-only --no-renames --diff-filter=ACMD
   fi
 }
-CHANGED=$(changed_paths)
 
 HAS_RUST=false
 HAS_PYTHON=false
@@ -48,7 +49,7 @@ HAS_TS=false
 HAS_KOTLIN=false
 HAS_SWIFT=false
 
-for f in $CHANGED; do
+while IFS= read -r -d '' f; do
   case "$f" in
     *.rs) HAS_RUST=true ;;
     bindings/python/*) HAS_PYTHON=true ;;
@@ -56,7 +57,7 @@ for f in $CHANGED; do
     bindings/kotlin/*) HAS_KOTLIN=true ;;
     bindings/swift/*) HAS_SWIFT=true ;;
   esac
-done
+done < <(changed_paths)
 
 # ── The compiler this shell resolves ──
 #
@@ -121,10 +122,9 @@ trap 'rm -rf "$TMPDIR"' EXIT
 #
 # `scripts/pre-commit-clippy-scope.py` reads the changed paths and prints the clippy package
 # arguments: each workspace member holding a changed path plus every member that depends on
-# one of them, or `--workspace` when a changed path such as `Cargo.toml`, `Cargo.lock`, or
-# `rust-toolchain.toml` can change lints for members the commit did not touch. The script's
-# module docstring states that criterion and lists the paths that meet it. The script keeps
-# only the `CLIPPY_FEATURES` entries whose package it selects, because cargo rejects a
+# one of them, or `--workspace` when a changed path is one of the files the script's module
+# docstring lists, such as `Cargo.toml`, `Cargo.lock`, or `rust-toolchain.toml`. The script
+# keeps only the `CLIPPY_FEATURES` entries whose package it selects, because cargo rejects a
 # feature of a package the command does not select. It prints nothing when no changed path
 # sits in a workspace member, such as a commit touching only `fuzz/`, and clippy then does
 # not run. CI's `rust-clippy` job lints the whole workspace on every pushed head.
