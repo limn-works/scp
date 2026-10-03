@@ -1562,9 +1562,14 @@ fn rollback_join_economy_ticket(
 ///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
 ///   with [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
 ///   when `params.ceiling` is empty, before any context state exists.
-/// - [`ContextCreationError::CreationFailed`] for version
-///   incompatibility, governance / consequence-rule / economic-policy
-///   validation failures, or supervisor registration failures.
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::VersionIncompatible`](scp_protocol::context::ContextError::VersionIncompatible)
+///   when the running SDK does not satisfy `params.min_protocol_version`.
+/// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
+///   breaks the ceiling-entry grammar (spec §5.3.1.1).
+/// - [`ContextCreationError::CreationFailed`] for governance /
+///   consequence-rule / economic-policy validation failures, or supervisor
+///   registration failures.
 /// - Crypto / transport / event-log failures during the initial MLS
 ///   group setup.
 #[allow(clippy::too_many_lines)]

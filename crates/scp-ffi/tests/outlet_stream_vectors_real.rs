@@ -433,24 +433,11 @@ mod live {
             let params = PyDict::new(py);
             // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
             // outlet calls all sit inside the ceiling.
-            params
-                .set_item(
-                    "ceiling",
-                    vec![
-                        "messages:read",
-                        "messages:write",
-                        "outlet:register",
-                        "outlet:query:*",
-                        "outlet:call:*",
-                        "role:assign",
-                        "member:invite",
-                        "member:remove",
-                        "governance:propose",
-                        "governance:vote",
-                        "context:close",
-                    ],
-                )
-                .unwrap();
+            let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect();
+            params.set_item("ceiling", ceiling).unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };
