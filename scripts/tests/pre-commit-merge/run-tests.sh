@@ -5,13 +5,16 @@
 # commit stages differs from the copy a merged-in head carries, or, on a commit that is not a
 # merge, when the commit stages a Rust file at all. A merge that brings in a branch's Rust
 # unchanged runs neither step, because that branch's CI already ran both over those files.
+# The lint step also runs for a changed non-Rust path the clippy scope script selects, which
+# `scripts/tests/pre-commit-clippy-scope/run-tests.sh` covers; no path these cases change
+# meets that condition.
 #
 # Each case builds a throwaway repository in `mktemp -d`, copies the real hook and the real
 # `scripts/pre-commit-clippy-scope.py` into it, and commits through that hook. `cargo` and
 # `python3.12` are stubs on PATH that record their arguments and exit 0, so no case
 # compiles anything; the case reads the record to learn which steps ran. The `python3.12`
 # stub runs the real interpreter for the scope script, and the `cargo` stub answers
-# `cargo metadata` with a one-member workspace at the fixture root. `scripts/check-resolved-rustc.sh` and `scripts/check-protocol-deps.sh`
+# `cargo metadata` with one workspace member in the fixture's `src/` directory. `scripts/check-resolved-rustc.sh` and `scripts/check-protocol-deps.sh`
 # in the fixture are stubs that record the same way, so each case can also assert that the
 # toolchain check ran on every commit.
 set -euo pipefail
@@ -33,14 +36,14 @@ SCOPE="$(cd "$(dirname "$0")/../.." && pwd)/pre-commit-clippy-scope.py"
 REAL_PYTHON="$(command -v python3.12)"
 mkdir -p "$STUBS"
 # The hook's clippy scope script asks `cargo metadata` for the member graph. The stub
-# answers with one workspace member at the fixture root, so every changed `.rs` file in the
-# fixture selects that member, and the stub runs the real interpreter for that script only.
+# answers with one workspace member in `src/`, so a changed `.rs` file there selects that
+# member and `docs/notes.md` selects nothing, and the stub runs the real interpreter for that script only.
 cat > "$STUBS/cargo" <<EOF
 #!/usr/bin/env bash
 echo "cargo \$*" >> "$LOG"
 if [ "\${1:-}" = metadata ]; then
   root="\$(pwd -P)"
-  printf '{"workspace_root":"%s","workspace_members":["fixture"],"packages":[{"name":"fixture","id":"fixture","manifest_path":"%s/Cargo.toml","dependencies":[]}]}\n' "\$root" "\$root"
+  printf '{"workspace_root":"%s","workspace_members":["fixture"],"packages":[{"name":"fixture","id":"fixture","manifest_path":"%s/src/Cargo.toml","dependencies":[]}]}\n' "\$root" "\$root"
 fi
 exit 0
 EOF

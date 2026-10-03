@@ -73,7 +73,8 @@ new_repo() {
     for stub in check-resolved-rustc.sh check-protocol-deps.sh; do
         printf '#!/usr/bin/env bash\necho "%s" >> "%s"\nexit 0\n' "$stub" "$LOG" > "scripts/$stub"
     done
-    for f in Cargo.toml crates/scp-relay/Cargo.toml crates/scp-relay/src/main.rs \
+    for f in Cargo.toml Cargo.lock rust-toolchain.toml crates/scp-relay/Cargo.toml \
+        crates/scp-relay/src/main.rs crates/scp-relay/data.json \
         crates/scp-relay/src/extra.rs crates/scp-protocol/src/lib.rs fuzz/src/lib.rs docs/notes.md; do
         mkdir -p "$(dirname "$f")"
         echo "// $f" > "$f"
@@ -97,15 +98,23 @@ PROTOCOL_MEMBERS="scp-client scp-client-wasm scp-core scp-ffi scp-ffi-common scp
 PROTOCOL_ARGS=""
 for m in $PROTOCOL_MEMBERS; do PROTOCOL_ARGS="$PROTOCOL_ARGS -p $m"; done
 
-# assert_clippy <name> <want: the exact `cargo clippy` line, or "none">
-# Also requires that the toolchain check ran, and that both protocol checks ran, because
-# the hook runs those whenever a `.rs` file changed, whatever the clippy scope is.
+# assert_clippy <name> <want: the exact `cargo clippy` line, or "none"> [protocol: yes|no]
+# Also requires that the toolchain check ran. With `protocol` yes (the default), both
+# protocol checks must have run, because the hook runs those whenever a `.rs` file changed
+# or the scope script selected a member; with `no`, neither may have run.
 assert_clippy() {
-    local name="$1" want="$2" got checks=yes
+    local name="$1" want="$2" protocol="${3:-yes}" got checks=yes step
     got="$(command grep '^cargo clippy' "$LOG" 2>/dev/null || true)"
     [ -z "$got" ] && got=none
-    for step in check-resolved-rustc.sh check-protocol-deps.sh "python3.12 scripts/check-protocol-sync.py"; do
-        if ! command grep -q "^$step" "$LOG" 2>/dev/null; then checks="no ($step missing)"; fi
+    if ! command grep -q "^check-resolved-rustc.sh" "$LOG" 2>/dev/null; then
+        checks="no (check-resolved-rustc.sh missing)"
+    fi
+    for step in check-protocol-deps.sh "python3.12 scripts/check-protocol-sync.py"; do
+        if command grep -q "^$step" "$LOG" 2>/dev/null; then
+            [ "$protocol" = no ] && checks="no ($step ran)"
+        else
+            [ "$protocol" = yes ] && checks="no ($step missing)"
+        fi
     done
     if [[ "$got" == "$want" && "$checks" == yes ]]; then
         echo "  ok    ${name}"
@@ -155,12 +164,46 @@ g commit -q -m "member manifest change" >/dev/null
 assert_clippy "a member Cargo.toml change lints the whole workspace" \
     "cargo clippy --workspace --features $ALL_FEATURES $TAIL"
 
-# Case 5: a .rs file in the standalone fuzz workspace.
+# Cases 3b to 3e: a manifest, the lockfile, or the toolchain file with no `.rs` file.
+for f in Cargo.toml Cargo.lock rust-toolchain.toml crates/scp-relay/Cargo.toml; do
+    new_repo "$WORK/only-$(echo "$f" | tr / -)"
+    edit "$f"
+    : > "$LOG"
+    g commit -q -m "only $f" >/dev/null
+    assert_clippy "a commit changing only $f lints the whole workspace" \
+        "cargo clippy --workspace --features $ALL_FEATURES $TAIL"
+done
+
+# Case 3f: a non-Rust file inside a member, with no `.rs` file.
+new_repo "$WORK/member-data"
+edit crates/scp-relay/data.json
+: > "$LOG"
+g commit -q -m "relay data change" >/dev/null
+assert_clippy "a commit changing only a non-Rust file in scp-relay lints scp-relay" \
+    "cargo clippy -p scp-relay $TAIL"
+
+# Case 3g: a file in no member, with no `.rs` file, runs neither clippy nor the protocol checks.
+new_repo "$WORK/docs"
+edit docs/notes.md
+: > "$LOG"
+g commit -q -m "docs change" >/dev/null
+assert_clippy "a commit changing only docs/notes.md runs no clippy and no protocol check" none no
+
+# Case 5: a .rs file in the standalone fuzz workspace. The author sees which path went unlinted.
 new_repo "$WORK/fuzz"
 edit fuzz/src/lib.rs
 : > "$LOG"
-g commit -q -m "fuzz change" >/dev/null
+OUT="$(g commit -q -m "fuzz change" 2>&1)"
 assert_clippy "a change only under fuzz/ runs no clippy and the commit succeeds" none
+if [[ "$OUT" == *"clippy scope: fuzz/src/lib.rs is in no workspace member; not linted"* \
+    && "$OUT" == *"clippy skipped: no changed path is in a workspace member"* ]]; then
+    echo "  ok    a passing fuzz-only commit prints the unlinted path and the skip notice"
+    PASSED=$((PASSED + 1))
+else
+    echo "  FAIL  a passing fuzz-only commit prints the unlinted path and the skip notice"
+    echo "          got: ${OUT}"
+    FAILED=$((FAILED + 1))
+fi
 
 # Case 6: a commit that only deletes a .rs file changes what its crate compiles.
 new_repo "$WORK/delete"
