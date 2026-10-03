@@ -1235,10 +1235,11 @@ pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
 /// `generateAssertion` answered `DCError.invalidKey` for a key that carries
 /// an attestation record; the Apple adapter discards the key ID and record.
 pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
-/// Apple could not reach its App Attest service.
+/// App Attest `attestKey` or `generateAssertion` answered
+/// `DCError.serverUnavailable`.
 ///
-/// `attestKey` or `generateAssertion` answered `DCError.serverUnavailable`;
-/// the Apple adapter keeps the key for a retry.
+/// The Apple adapter keeps the key for a retry. A `generateKey` answer of
+/// `DCError.serverUnavailable` gives `SCP-ATTEST-9001`.
 pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
 /// The App Attest adapter reached a state no caller input produces.
 ///

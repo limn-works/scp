@@ -48,18 +48,19 @@
         /// record, so `attest(challenge:deviceId:)` called no App Attest
         /// method.
         ///
-        /// Apple attests one key once: `DCError.h` lists "you call
-        /// `attestKey:clientDataHash:` for a key that's already been
-        /// attested" as one cause of `DCError.invalidKey`. The adapter keeps
+        /// Apple attests one key once: `DCError.h` lists a call to
+        /// `attestKey:clientDataHash:completionHandler:` for a key already
+        /// attested as one cause of `DCError.invalidKey`. The adapter keeps
         /// the key and its record, so `assertRequest(requestHash:)` keeps
         /// asserting with the attested key.
         case keyAlreadyAttested(String)
         /// Apple answered `generateAssertion` with `DCError.invalidKey` for a
         /// stored key that carries no attestation record.
         ///
-        /// `DCError.h` lists "you call `generateAssertion:clientDataHash:`
-        /// with an unattested key" and "the App Attest service rejects the
-        /// key" among the causes of that code, and a key with no record can
+        /// `DCError.h` lists a call to
+        /// `generateAssertion:clientDataHash:completionHandler:` with an
+        /// unattested key and an App Attest service rejecting the key among
+        /// the causes of that code, and a key with no record can
         /// meet either. An earlier `attest` that stored a generated key and
         /// failed before Apple attested it leaves an unattested key. An
         /// `attestKey` answer that arrived after its call ended, through the
@@ -73,7 +74,7 @@
         /// Attest service rejected the key, and the adapter discarded its key
         /// ID and record.
         ///
-        /// `DCError.h` lists "the App Attest service rejects the key" as one
+        /// `DCError.h` lists an App Attest service rejecting the key as one
         /// cause of `DCError.invalidKey`. A later
         /// `attest(challenge:deviceId:)` generates a new key.
         case keyRejected(String)
@@ -673,14 +674,12 @@
         /// into an `AttestationError`, and discard the key ID when that error
         /// says Apple's service rejected the key.
         ///
-        /// **Criterion this method applies**, quoting `DCError.h` word for word.
-        /// `DCErrorInvalidKey` is "an error caused by a failed attempt to use
-        /// the App Attest key. You receive this error if something goes wrong
-        /// with generating, retrieving, or using an App Attest cryptographic
-        /// key, when: you call `attestKey:clientDataHash:completionHandler:`
-        /// for a key that's already been attested; you call
+        /// **Criterion this method applies.** `DCError.h` lists three
+        /// conditions behind `DCErrorInvalidKey`: a call to
+        /// `attestKey:clientDataHash:completionHandler:` for a key already
+        /// attested, a call to
         /// `generateAssertion:clientDataHash:completionHandler:` with an
-        /// unattested key; the App Attest service rejects the key."
+        /// unattested key, and an App Attest service rejecting the key.
         ///
         /// | Call | Error | Record | Case | Key |
         /// | --- | --- | --- | --- | --- |
