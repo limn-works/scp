@@ -1498,8 +1498,8 @@ fn generate_handle_id(prefix: &str) -> String {
 /// advertises `resources.subscribe`, `resources.listChanged` and
 /// `tools.listChanged` as false, rejects `resources/subscribe`, and sends no
 /// `list_changed` notification. Attaching a supervisor or calling `resume()`
-/// later does not add subscriptions to a running server; stop it and serve
-/// again. Every other request reads the instance's state when it arrives:
+/// later does not add subscriptions or `list_changed` notifications to a
+/// running server; stop it and serve again to get them. Every other request reads the instance's state when it arrives:
 /// `tools/call` fails while no supervisor is attached or the instance is
 /// suspended, and stops failing for those reasons once both end; every
 /// access gate reads the actor's role state while a supervisor is attached
