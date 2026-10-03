@@ -3028,9 +3028,9 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
             UNIFFI_SERVE_PATH,
         ),
     ] {
-        // Search the PRODUCTION code only: everything before the trailing
-        // `#[cfg(test)]\nmod tests { ... }`, with comments and string
-        // contents blanked (see `production_code`). Each
+        // Search the PRODUCTION code only: every `#[cfg(test)]` test module
+        // removed, with comments and string contents blanked (see
+        // `production_code`). Each
         // bridge's unit tests and its comments name the same symbols, so a bare
         // `contains` over the file stayed green after the real call was deleted.
         let code = production_code(src);
@@ -3203,7 +3203,7 @@ const WIRED_BUNDLE: &str = "fn mcp_server_bundle(bi: &Bi, provider: P) -> McpSer
                              fn serve(bi: &Arc<Bi>) {\n    \
                              let provider = P {\n        bi: Arc::downgrade(bi),\n    };\n    \
                              let server = mcp_server_bundle(bi, provider);\n}\n\
-                             mod tests {\n    fn t() { let _ = supervisor.subscribe_events(); }\n}\n";
+                             #[cfg(test)]\n#[allow(clippy::unwrap_used)]\nmod tests {\n    fn t() { let _ = supervisor.subscribe_events(); }\n}\n";
 
 /// The event-source gate above must go red when the wiring it pins is deleted
 /// and only a comment or a `None` receiver remains, when a rebinding or a
@@ -3329,6 +3329,84 @@ fn mcp_wiring_gate_code_search_ignores_comments_and_none_receivers() {
     ));
 }
 
+/// The event-source gate must go red when a comment or a string literal holding
+/// `mod tests {` sits before a second production function that serves a server
+/// over a `None` receiver: the marker must not end the production code early.
+#[test]
+fn mcp_wiring_gate_reads_past_a_test_module_marker_in_a_comment_or_literal() {
+    let wired = WIRED_BUNDLE;
+    // A comment or a string literal holding `mod tests {` sits before a second
+    // production function that serves a server over a `None` receiver. Both
+    // must stay in the production code the gate reads.
+    let detached = "fn serve_detached(provider: P) {\n    \
+                    let server = McpServer::with_optional_event_source(provider, None);\n}\n";
+    for marker in [
+        "// mirrors mod tests { fixture }\n",
+        "/* mod tests { */\n",
+        "const NOTE: &str = \"mod tests {\";\n",
+    ] {
+        let regression = wired.replacen(
+            "#[cfg(test)]",
+            &format!("{marker}{detached}#[cfg(test)]"),
+            1,
+        );
+        assert_ne!(regression, wired);
+        assert!(
+            !serves_the_supervisor_event_source(
+                &production_code(&regression),
+                "serve",
+                SUPERVISOR_OF_BI,
+                WIRED_SERVE_PATH
+            ),
+            "{regression}"
+        );
+    }
+}
+
+/// `production_code` must drop every `#[cfg(test)]` test module, wherever it
+/// sits and whatever attributes follow the `cfg`, and keep everything else:
+/// code after a test module, a `mod tests` compiled without `#[cfg(test)]`, and
+/// code after a comment or literal that holds `mod tests {`.
+#[test]
+fn production_code_drops_only_cfg_test_modules() {
+    let src = "fn a() { one(); }\n\
+               // mod tests { in a comment\n\
+               fn b() { let _ = \"mod tests {\"; two(); }\n\
+               #[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::panic)]\n\
+               mod tests {\n    fn t() { if x { hidden_one(); } }\n}\n\
+               fn c() { three(); }\n\
+               #[cfg(test)] mod tests { fn u() { hidden_two(); } }\n\
+               #[allow(dead_code)]\nmod tests { fn v() { shipped(); } }\n\
+               fn d() { four(); }\n";
+    let code = production_code(src);
+    for kept in ["one();", "two();", "three();", "shipped();", "four();"] {
+        assert!(code.contains(kept), "{kept} missing from {code}");
+    }
+    for dropped in ["hidden_one", "hidden_two", "cfg(test)", "clippy::panic"] {
+        assert!(!code.contains(dropped), "{dropped} kept in {code}");
+    }
+    // Each bridge source the MCP gates read keeps its production MCP code and
+    // loses its trailing test module.
+    for (src, production_fn) in [
+        (
+            include_str!("../../../../crates/scp-ffi/src/mcp.rs"),
+            "fn mcp_server_bundle(",
+        ),
+        (
+            include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs"),
+            "fn mcp_server_bundle(",
+        ),
+        (
+            include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
+            "fn mcp_server_bundle(",
+        ),
+    ] {
+        let code = production_code(src);
+        assert!(code.contains(production_fn));
+        assert!(!code.contains("mod tests {"));
+    }
+}
+
 /// The event-source gate must go red when the serve path hands
 /// `mcp_server_bundle` an instance other than the one its provider reads:
 /// another instance in the call, the pinned provider literal's `Weak` over
@@ -3370,11 +3448,11 @@ fn mcp_wiring_gate_rejects_a_serve_path_over_another_instance() {
     // The serve function keeps its one pinned call, and a second production
     // function serves a bundle over another instance.
     let second_serve_fn = wired.replace(
-        "mod tests {",
+        "#[cfg(test)]",
         "fn serve_other(bi: &Arc<Bi>, other: &Arc<Bi>) {\n    \
          let provider = P {\n        bi: Arc::downgrade(bi),\n    };\n    \
          let server = mcp_server_bundle(other, provider);\n}\n\
-         mod tests {",
+         #[cfg(test)]",
     );
     for regression in [
         serve_other_instance,
@@ -4386,20 +4464,82 @@ fn mcp_capability_stub_gate_rejects_a_grant() {
 }
 
 /// Returns the production code of a Rust source file as one whitespace-collapsed
-/// line: everything before the trailing `#[cfg(test)] mod tests { ... }`, with
-/// every comment (a whole-line or trailing `//` comment, a `/* */` block) and
-/// the contents of every string and char literal blanked by
-/// [`strip_non_code`], the lexer [`extract_fn_body`] uses. A string literal
-/// keeps its quotes, so `"text"` reads as `" "`.
+/// line: the file with every comment (a whole-line or trailing `//` comment, a
+/// `/* */` block) and the contents of every string and char literal blanked by
+/// [`strip_non_code`], the lexer [`extract_fn_body`] uses, and then every
+/// `#[cfg(test)]` `mod tests { ... }` removed by [`without_test_modules`]. A
+/// string literal keeps its quotes, so `"text"` reads as `" "`.
 ///
-/// A gate reading this cannot be satisfied by a bridge's own unit tests, by a
-/// comment, or by a string literal that names the symbol. Collapsing
-/// whitespace lets one pattern match a call rustfmt wraps across lines.
+/// Blanking runs first, so a comment or string literal holding `mod tests {`
+/// cannot end the production code early, and code after a test module that is
+/// not the file's last item stays in. A gate reading this cannot be satisfied
+/// by a bridge's own unit tests, by a comment, or by a string literal that
+/// names the symbol. Collapsing whitespace lets one pattern match a call
+/// rustfmt wraps across lines.
 fn production_code(src: &str) -> String {
-    strip_non_code(production_source(src))
+    without_test_modules(&strip_non_code(src))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Returns `code` (from [`strip_non_code`]) with every `mod tests { ... }`
+/// whose outer attributes include `#[cfg(test)]` removed, from its first
+/// attribute through its matching `}`. A `mod tests {` without `#[cfg(test)]`
+/// is compiled into the shipped crate, so it stays.
+fn without_test_modules(code: &str) -> String {
+    const MARKER: &str = "mod tests {";
+    let mut kept = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(at) = rest.find(MARKER) {
+        let open = at + MARKER.len() - 1;
+        if let (Some(start), Some(len)) = (
+            test_cfg_attrs_start(&rest[..at]),
+            matching_brace_end(&rest[open..]),
+        ) {
+            kept.push_str(&rest[..start]);
+            kept.push(' ');
+            rest = &rest[open + len..];
+        } else {
+            kept.push_str(&rest[..=open]);
+            rest = &rest[open + 1..];
+        }
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// Where the run of outer attributes that ends `head` begins, when one of them
+/// is `#[cfg(test)]`; `None` otherwise.
+fn test_cfg_attrs_start(head: &str) -> Option<usize> {
+    let mut start = head.trim_end().len();
+    let mut cfg_test = false;
+    while head[..start].ends_with(']') {
+        let attr = head[..start].rfind("#[")?;
+        cfg_test |= head[attr..start].split_whitespace().collect::<String>() == "#[cfg(test)]";
+        start = head[..attr].trim_end().len();
+    }
+    cfg_test.then_some(start)
+}
+
+/// The byte length of `s` up to and including the `}` that balances its
+/// leading `{`, counting braces only, because `s` comes from
+/// [`strip_non_code`] and holds no comment or literal.
+fn matching_brace_end(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Returns the `Self::Events | Self::Members =>` arm of `check_access` in
@@ -4419,16 +4559,6 @@ fn checks_messages_read(code: &str) -> bool {
             .find(')')
             .is_some_and(|end| code[at..=at + end].ends_with(", &Capability::MessagesRead)"))
     })
-}
-
-/// Returns the production portion of a Rust source file: everything before the
-/// trailing `#[cfg(test)] mod tests { ... }`.
-///
-/// Source-text wiring gates must not be satisfiable by a bridge's own unit
-/// tests, which legitimately name the same production symbols. Splitting on the
-/// conventional `mod tests {` marker keeps the search on shipped code.
-fn production_source(src: &str) -> &str {
-    src.split_once("mod tests {").map_or(src, |(prod, _)| prod)
 }
 
 /// Resource authorization must run the SAME predicate for `resources/read` and
