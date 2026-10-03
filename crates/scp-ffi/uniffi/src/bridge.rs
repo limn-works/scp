@@ -10974,12 +10974,6 @@ impl Scp {
                     })
                     .transpose()?;
 
-                // Ensure the ContextManager is initialized with the joining
-                // identity's DID — context_join is a valid first operation
-                // (e.g. a device joining a context without creating one).
-                // `init_context_manager_with_did` is idempotent (`OnceLock`). #1073
-                bi.init_context_manager_with_did(&identity.did);
-
                 // Delegate to the shared ContextManager. Build a core ContextHandle
                 // to pass the context_id, then join via the manager.
                 //
@@ -20545,6 +20539,34 @@ mod tests {
         assert_ne!(
             entry.routing_id, [0u8; 32],
             "encrypted join routing id must be a real derived pseudonym"
+        );
+    }
+
+    /// `context_join` on an instance with no attached supervisor fails with
+    /// `SCP-CTX-2000` and attaches none: the lifecycle gate reads the
+    /// supervisor before anything else touches the instance.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_join_without_a_supervisor_fails_and_attaches_none() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        assert!(
+            !scp.inner.core.has_supervisor(),
+            "fresh instance must not have a supervisor attached"
+        );
+        let err = rt
+            .block_on(scp.context_join(test_handle_for(&scp), identity, None))
+            .expect_err("context_join with no supervisor must fail");
+        assert!(
+            matches!(&err, ScpError::Context { code, .. } if code == codes::CTX_2000),
+            "expected SCP-CTX-2000, got {err:?}"
+        );
+        assert!(
+            !scp.inner.core.has_supervisor(),
+            "a refused join must not attach a supervisor"
         );
     }
 

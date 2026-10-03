@@ -809,7 +809,7 @@ impl UniffiBridgeInstance {
             .try_supervisor()
             .ok_or_else(|| crate::ScpError::Context {
                 msg: "ContextManager not yet attached — call context_create, \
-                      context_join, context_import, or init_context_manager first"
+                      context_import, or init_context_manager first"
                     .to_owned(),
                 code: codes::CTX_2000.to_owned(),
             })
