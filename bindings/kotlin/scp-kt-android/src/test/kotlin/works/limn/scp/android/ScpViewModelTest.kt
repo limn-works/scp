@@ -14,6 +14,7 @@ import works.limn.scp.bridge.CancellationHandle
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.bridge.MessageCallback
 import works.limn.scp.bridge.NativeBindings
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -25,10 +26,20 @@ import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
+// Every method runs on its own thread under a wall-clock limit, so a method that parks a
+// thread forever — the SCP-117 `runBlocking` deadlock this suite regressed on — fails the
+// build instead of hanging the CI runner until the job's own limit expires.
+@Timeout(value = 30, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 @OptIn(ExperimentalCoroutinesApi::class)
 class ScpViewModelTest {
     private lateinit var testDispatcher: TestDispatcher
@@ -101,6 +112,83 @@ class ScpViewModelTest {
         assertTrue(stubBindings.leaveCalledHandles.contains(2L))
     }
 
+    // `.docs/standards/sdk-common.md` §Cleanup error handling requires that a cleanup error be
+    // logged rather than dropped. An earlier revision swallowed every throwable except
+    // CancellationException, so an app author learned nothing when a departure did not land.
+    @Test
+    fun `onCleanupFailure receives every leave failure`() = runTest(testDispatcher) {
+        stubBindings.leaveThrowsForHandle = 1L
+
+        val viewModel = TestScpViewModel()
+        val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
+        val ctx2 = TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge)
+        viewModel.trackContext(ctx1)
+        viewModel.trackContext(ctx2)
+        advanceUntilIdle()
+
+        viewModel.callOnCleared()
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(ctx1),
+            viewModel.cleanupFailures.map { it.first },
+            "a failing leave must reach onCleanupFailure exactly once, naming its context",
+        )
+        assertTrue(
+            viewModel.cleanupFailures.single().second is ScpLeaveException,
+            "onCleanupFailure must receive whatever leave threw, not a wrapper",
+        )
+        // A reported failure does not stop remaining departures.
+        assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
+    }
+
+    // Nothing cancels ScpViewModel's cleanup scope, so a CancellationException that `leave`
+    // throws comes from inside `leave` (an injected dispatcher that rejected the task, for
+    // one) and never reports that the cleanup coroutine was cancelled. An earlier revision
+    // rethrew it, which ended the loop: context 2 was never left and nothing was reported.
+    @Test
+    fun `a cancellation thrown inside leave reaches onCleanupFailure and later leaves still run`() =
+        runTest(testDispatcher) {
+            stubBindings.leaveCancelsForHandle = 1L
+
+            val viewModel = TestScpViewModel()
+            val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
+            viewModel.trackContext(ctx1)
+            viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
+            advanceUntilIdle()
+
+            viewModel.callOnCleared()
+            advanceUntilIdle()
+
+            assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
+            assertEquals(listOf(ctx1), viewModel.cleanupFailures.map { it.first })
+            assertTrue(
+                viewModel.cleanupFailures.single().second is CancellationException,
+                "onCleanupFailure must receive the cancellation leave threw",
+            )
+        }
+
+    // An uncaught throw from the cleanup coroutine would reach the thread's
+    // uncaught-exception handler, which on Android kills the process, and would stop every
+    // later leave. onCleared catches an override's throw, logs it, and keeps going.
+    @Test
+    fun `an onCleanupFailure override that throws does not stop later leaves`() =
+        runTest(testDispatcher) {
+            stubBindings.leaveThrowsForHandle = 1L
+
+            val viewModel = TestScpViewModel(throwFromOnCleanupFailure = true)
+            viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
+            viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
+            viewModel.trackContext(TrackedContext(handle = 3L, identityHandle = 3L, bridge = bridge))
+            advanceUntilIdle()
+
+            viewModel.callOnCleared()
+            advanceUntilIdle()
+
+            assertEquals(listOf(1L, 2L, 3L), stubBindings.leaveCalledHandles)
+            assertEquals(listOf(1L), viewModel.cleanupFailures.map { it.first.handle })
+        }
+
     @Test
     fun `untrackContext prevents leave on cleared`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel()
@@ -134,6 +222,10 @@ class ScpViewModelTest {
         assertEquals(ctx, returned)
     }
 
+    // A cancelled cleanup scope would satisfy an "is empty" assertion whether or not
+    // onCleared() cleared its tracked list, so this method asserts on recorded contents at
+    // each step. Delete `activeContexts.clear()` from onCleared() and a second
+    // assertEquals reports [1] against an expected empty list.
     @Test
     fun `onCleared clears the active contexts list`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel()
@@ -143,12 +235,254 @@ class ScpViewModelTest {
         viewModel.callOnCleared()
         advanceUntilIdle()
 
+        assertEquals(listOf(1L), stubBindings.leaveCalledHandles)
         stubBindings.leaveCalledHandles.clear()
 
         viewModel.callOnCleared()
         advanceUntilIdle()
 
-        assertTrue(stubBindings.leaveCalledHandles.isEmpty(), "Second onCleared should have no contexts")
+        assertEquals(
+            emptyList<Long>(),
+            stubBindings.leaveCalledHandles,
+            "a second onCleared finds an empty tracked list, so it leaves nothing",
+        )
+    }
+
+    // Guards against two regressions that end cleanupScope's job after onCleared dispatches:
+    // `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }` and `cleanupJob.complete()`.
+    // launchLeave starts its child with CoroutineStart.UNDISPATCHED, so the child's loop still
+    // runs under a cancelled or completed job, but each `leave` then enters the bridge's
+    // `withContext(ioDispatcher)`, which throws CancellationException on entry. The leave
+    // never reaches TestNativeBindings, and a CancellationException reaches onCleanupFailure
+    // instead.
+    @Test
+    fun `a context tracked after onCleared is left without a second onCleared`() =
+        runTest(testDispatcher) {
+            val viewModel = TestScpViewModel()
+            viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
+            advanceUntilIdle()
+
+            viewModel.callOnCleared()
+            advanceUntilIdle()
+            assertEquals(listOf(1L), stubBindings.leaveCalledHandles)
+
+            // Android clears a view model once, so nothing but trackContext itself can leave
+            // a context registered after that clear.
+            viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
+            advanceUntilIdle()
+
+            assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
+        }
+
+    // onCleared's cleanup coroutine and the one a post-clear trackContext launches run
+    // `leave` in parallel on Dispatchers.IO. Without the lock around onCleanupFailure, the
+    // second failure enters the override while the first is still inside it.
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    fun `onCleanupFailure calls from parallel cleanup coroutines never overlap`() {
+        stubBindings.leaveAlwaysThrows = true
+        val ioBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.IO,
+            cpuDispatcher = Dispatchers.IO,
+        )
+        val viewModel = OverlapProbeViewModel()
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
+        viewModel.callOnCleared()
+        assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
+
+        // The first override call is parked inside onCleanupFailure; this leave fails on
+        // another IO thread while it stays there.
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = ioBridge))
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!stubBindings.leaveCalledHandles.contains(2L) && System.nanoTime() < deadline) {
+            Thread.sleep(5)
+        }
+        assertTrue(stubBindings.leaveCalledHandles.contains(2L), "second leave never ran")
+        Thread.sleep(OVERLAP_WINDOW_MS)
+        assertEquals(1, viewModel.entered.get(), "second call entered onCleanupFailure concurrently")
+
+        viewModel.releaseFirst.countDown()
+        assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "second failure never arrived")
+        assertEquals(1, viewModel.maxInFlight.get())
+    }
+
+    // An inline bridge runs a post-clear leave and its onCleanupFailure call inside
+    // trackContext only while no other cleanup coroutine holds the failure lock. When one
+    // does, trackContext returns with the call still pending, and the call later runs on
+    // the thread that released the lock. The KDoc on trackContext, onCleared, and
+    // onCleanupFailure states this exception; this method keeps that statement true.
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    fun `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread`() {
+        stubBindings.leaveAlwaysThrows = true
+        val ioBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.IO,
+            cpuDispatcher = Dispatchers.IO,
+        )
+        val inlineBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.Unconfined,
+            cpuDispatcher = Dispatchers.Unconfined,
+        )
+        val viewModel = OverlapProbeViewModel()
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
+        viewModel.callOnCleared()
+        assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
+
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = inlineBridge))
+
+        assertTrue(
+            stubBindings.leaveCalledHandles.contains(2L),
+            "inline leave did not run inside trackContext",
+        )
+        assertEquals(
+            1,
+            viewModel.entered.get(),
+            "second call ran inside trackContext although the failure lock was held",
+        )
+
+        viewModel.releaseFirst.countDown()
+        assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "second failure never arrived")
+        val threads = viewModel.callThreads.toList()
+        assertEquals(2, threads.size)
+        assertEquals(threads[0], threads[1], "second call did not run on the releasing thread")
+        assertNotEquals(Thread.currentThread(), threads[1], "second call ran on the trackContext caller")
+    }
+
+    // An override that retries calls trackContext from inside a cleanup coroutine on
+    // Dispatchers.Unconfined. The first context's leave fails on a Dispatchers.IO thread, and
+    // the cleanup coroutine resumes there inside an active unconfined event loop, so the
+    // override runs inside that loop. A default-start launch from trackContext would be
+    // queued on the loop until the override returned, and the retry's inline leave would run
+    // only then; undispatched start runs it inside trackContext, as trackContext's KDoc
+    // states. A caller with no active loop, such as a test thread calling onCleared with an
+    // inline bridge, runs a default-start launch inline too, so this method needs the
+    // dispatching first context to fail when `CoroutineStart.UNDISPATCHED` is removed.
+    // The retry's own failure waits for the retrying override and then runs on its thread.
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    fun `an inline leave retried from onCleanupFailure runs before trackContext returns`() {
+        stubBindings.leaveAlwaysThrows = true
+        val ioBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.IO,
+            cpuDispatcher = Dispatchers.IO,
+        )
+        val inlineBridge = CoroutineBridge(
+            nativeBindings = stubBindings,
+            ioDispatcher = Dispatchers.Unconfined,
+            cpuDispatcher = Dispatchers.Unconfined,
+        )
+        val retry = TrackedContext(handle = 2L, identityHandle = 2L, bridge = inlineBridge)
+        val viewModel = RetryingViewModel(retry, stubBindings)
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
+
+        viewModel.callOnCleared()
+        assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "both failures never arrived")
+
+        assertEquals(
+            listOf(1L, 2L),
+            viewModel.leftWhenRetryReturned,
+            "retried leave ran after trackContext returned",
+        )
+        assertEquals(listOf(1L, 2L), viewModel.failedHandles)
+        val threads = viewModel.callThreads.toList()
+        assertEquals(2, threads.size)
+        assertEquals(threads[0], threads[1], "retry's failure did not run on the retrying thread")
+        assertNotEquals(Thread.currentThread(), threads[0], "first failure ran on the onCleared caller")
+    }
+
+    // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
+    // part of this artifact's published surface. Adding a primary-constructor parameter
+    // without a default removes it and fails this method.
+    @Test
+    fun `ScpViewModel exposes a zero-argument constructor to Java callers`() {
+        val parameterCounts = ScpViewModel::class.java.declaredConstructors
+            .map { it.parameterCount }
+            .toSet()
+        assertTrue(
+            parameterCounts.contains(0),
+            "expected a zero-argument constructor, found arities $parameterCounts",
+        )
+    }
+
+}
+
+private const val OVERLAP_WINDOW_MS = 200L
+
+/** Records how many [onCleanupFailure] calls run at once; parks the first until released. */
+private class OverlapProbeViewModel : ScpViewModel() {
+    val entered = AtomicInteger()
+    val maxInFlight = AtomicInteger()
+    val firstEntered = CountDownLatch(1)
+    val releaseFirst = CountDownLatch(1)
+    val bothDone = CountDownLatch(2)
+    private val inFlight = AtomicInteger()
+
+    /** The thread each [onCleanupFailure] call ran on, in call order. */
+    val callThreads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
+
+    override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        callThreads += Thread.currentThread()
+        val now = inFlight.incrementAndGet()
+        maxInFlight.accumulateAndGet(now) { a, b -> maxOf(a, b) }
+        if (entered.incrementAndGet() == 1) {
+            firstEntered.countDown()
+            releaseFirst.await(5, TimeUnit.SECONDS)
+        }
+        inFlight.decrementAndGet()
+        bothDone.countDown()
+    }
+
+    fun callOnCleared() {
+        val store = ViewModelStore()
+        val self = this
+        val factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = self as T
+            }
+        ViewModelProvider(store, factory)[OverlapProbeViewModel::class.java]
+        store.clear()
+    }
+}
+
+/** Retries the first failed departure once by tracking [retry] from inside the override. */
+private class RetryingViewModel(
+    private val retry: TrackedContext,
+    private val bindings: TestNativeBindings,
+) : ScpViewModel() {
+    // Written by onCleanupFailure calls, which never overlap; read after [bothDone].
+    val failedHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+    val callThreads: MutableList<Thread> = Collections.synchronizedList(mutableListOf())
+    val bothDone = CountDownLatch(2)
+
+    /** The bridge's recorded `leave` handles at the moment the retry's trackContext returned. */
+    @Volatile var leftWhenRetryReturned: List<Long> = emptyList()
+
+    override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        failedHandles += context.handle
+        callThreads += Thread.currentThread()
+        if (context !== retry) {
+            trackContext(retry)
+            val left = bindings.leaveCalledHandles
+            leftWhenRetryReturned = synchronized(left) { left.toList() }
+        }
+        bothDone.countDown()
+    }
+
+    fun callOnCleared() {
+        val store = ViewModelStore()
+        val self = this
+        val factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = self as T
+            }
+        ViewModelProvider(store, factory)[RetryingViewModel::class.java]
+        store.clear()
     }
 }
 
@@ -159,7 +493,19 @@ class ScpViewModelTest {
  * the same `ViewModel.clear()` Android runs: `clear()` cancels `viewModelScope` and then
  * calls [onCleared]. Calling [onCleared] directly would skip the cancellation.
  */
-private class TestScpViewModel : ScpViewModel() {
+private class TestScpViewModel(
+    private val throwFromOnCleanupFailure: Boolean = false,
+) : ScpViewModel() {
+    /** Every (context, cause) pair that [onCleanupFailure] received, in call order. */
+    val cleanupFailures = mutableListOf<Pair<TrackedContext, Throwable>>()
+
+    override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        cleanupFailures += context to cause
+        if (throwFromOnCleanupFailure) {
+            throw IllegalStateException("override failed closed for handle ${context.handle}", cause)
+        }
+    }
+
     fun callOnCleared() {
         val store = ViewModelStore()
         val self = this
@@ -177,13 +523,26 @@ private class TestScpViewModel : ScpViewModel() {
  * Test stub for [NativeBindings] that tracks leave calls per context handle.
  */
 @Suppress("TooManyFunctions")
-private class TestNativeBindings : NativeBindings {
-    val leaveCalledHandles = mutableListOf<Long>()
+internal class TestNativeBindings : NativeBindings {
+    /** Synchronized because a test with a dispatching bridge calls `leave` from two threads. */
+    val leaveCalledHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     var leaveThrowsForHandle: Long? = null
+
+    /** When true, every leave throws, whatever its handle. */
+    @Volatile var leaveAlwaysThrows = false
+
+    /**
+     * Handle whose leave raises a cancellation the cleanup coroutine did not cause, as an
+     * injected dispatcher that rejects the task does.
+     */
+    var leaveCancelsForHandle: Long? = null
 
     override fun contextLeave(contextHandle: Long, identityHandle: Long) {
         leaveCalledHandles.add(contextHandle)
-        if (contextHandle == leaveThrowsForHandle) {
+        if (contextHandle == leaveCancelsForHandle) {
+            throw CancellationException("cleanup cancelled at handle $contextHandle")
+        }
+        if (leaveAlwaysThrows || contextHandle == leaveThrowsForHandle) {
             throw ScpLeaveException("leave failed for handle $contextHandle")
         }
     }
@@ -369,4 +728,4 @@ private class TestNativeBindings : NativeBindings {
 /**
  * Test-specific exception for simulating leave failures in [TestNativeBindings].
  */
-private class ScpLeaveException(message: String) : IllegalStateException(message)
+internal class ScpLeaveException(message: String) : IllegalStateException(message)

@@ -29,7 +29,8 @@
       "status": "done",
       "files": [
         "crates/scp-node/src/main.rs",
-        "crates/scp-node/Cargo.toml"
+        "crates/scp-node/Cargo.toml",
+        "crates/scp-node/tests/run_mode_selection.rs"
       ],
       "description": "The shipped `scp-node` binary mandates `SCP_NODE_DOMAIN` and always takes the `.domain()` path (`crates/scp-node/src/main.rs`), so the binary itself never calls `no_domain()` and does no NAT traversal. This story adds an opt-in self-host run mode: a `--self-host` CLI flag and a `SCP_NODE_SELF_HOST` environment variable that select the `.no_domain()` deployment path described in §10.12.8 ('Behavior when `.no_domain()` is set') and the `--self-host` website surface specified in §10.12.11. Self-host mode MUST be opt-in only — never selected by default; when neither the flag nor the env var is set the binary keeps its existing domain behavior unchanged. A `--site-dir <PATH>` override is also parsed for use by SHB-003. NAT port-mapping (Tier 1) depends on the `upnp` cargo feature, which MUST remain non-default (`upnp = [\"scp-transport/upnp\"]` is already declared in `crates/scp-node/Cargo.toml` and absent from `[features].default`); this story only verifies that invariant and does not change defaults. This is the entry-point selection story; the Supervisor/relay wiring is SHB-002, payload publication is SHB-003.",
       "acceptanceCriteria": [
@@ -41,7 +42,8 @@
         "main.rs parses `--site-dir <PATH>` into the CliConfig site_dir field: test `cli_site_dir_argument_is_parsed` asserts the path is captured",
         "main.rs parses `--storage-path <PATH>` overriding `SCP_STORAGE_PATH` (test `cli_storage_path_argument_overrides_env`) and env fallbacks apply when the argument is absent (test `cli_env_fallbacks_apply_when_no_argument`)",
         "The `[features]` `default` list does NOT contain `upnp` (CI command: `grep -A2 '^default' crates/scp-node/Cargo.toml | grep -qv upnp`)",
-        "`grep -q 'upnp = \\[\"scp-transport/upnp\"\\]' crates/scp-node/Cargo.toml` confirms the non-default `upnp` feature is declared"
+        "`grep -q 'upnp = \\[\"scp-transport/upnp\"\\]' crates/scp-node/Cargo.toml` confirms the non-default `upnp` feature is declared",
+        "The binary runs exactly one run mode: when two or more of `--relay-only`, self-host mode (`--self-host` or `SCP_NODE_SELF_HOST`) and `--ephemeral` are selected, `main` prints an error naming each selector and exits 1 before the `--health` probe and before it starts or opens anything, so no selector is silently ignored (unit tests `two_run_modes_are_refused` and `one_run_mode_is_accepted` in main.rs; binary test `two_run_modes_exit_1_before_the_health_probe_and_the_mode_dispatch` in `crates/scp-node/tests/run_mode_selection.rs`)"
       ],
       "actionItems": [
         "Add `self_host: bool` and `site_dir: Option<PathBuf>` fields to CliConfig in main.rs",
@@ -49,7 +51,8 @@
         "Parse `--site-dir <PATH>` argument into site_dir",
         "Add `--self-host`, `--site-dir`, and `SCP_NODE_SELF_HOST` lines to the printed usage/help text",
         "Make the domain requirement conditional: domain is only mandated on the non-self-host path",
-        "Add tests: cli_self_host_flag_selects_self_host_mode, cli_self_host_env_selects_self_host_mode, cli_defaults_to_not_self_host, cli_self_host_does_not_require_domain, cli_site_dir_argument_is_parsed, cli_storage_path_argument_overrides_env, cli_env_fallbacks_apply_when_no_argument"
+        "Add tests: cli_self_host_flag_selects_self_host_mode, cli_self_host_env_selects_self_host_mode, cli_defaults_to_not_self_host, cli_self_host_does_not_require_domain, cli_site_dir_argument_is_parsed, cli_storage_path_argument_overrides_env, cli_env_fallbacks_apply_when_no_argument",
+        "Refuse a configuration that selects two run modes (`--relay-only`, self-host, `--ephemeral`) with exit 1 before the `--health` probe and the mode dispatch"
       ],
       "blockedBy": [],
       "sources": [

@@ -63,8 +63,9 @@ data class AndroidPlatformAdapterImpl(
  *
  * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access.
  * - [AndroidDeviceAttestation] requires context for Play Integrity API access.
- * - [AndroidPushProvider] takes a context it does not read; FCM token retrieval goes through
- *   `FirebaseMessaging.getInstance()`, which needs the default FirebaseApp initialised before
+ * - [AndroidPushProvider] takes a context because ADR-027's reference code declares
+ *   `AndroidPushProvider(private val context: Context)`. It does not read it; FCM token
+ *   retrieval goes through `FirebaseMessaging.getInstance()`, which needs the default FirebaseApp initialised before
  *   [AndroidPushProvider.register] runs (FirebaseInitProvider does this at app start when the
  *   app carries its Firebase configuration; otherwise the caller calls
  *   `FirebaseApp.initializeApp`).

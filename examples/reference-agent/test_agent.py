@@ -19,13 +19,12 @@ import json
 import pytest
 
 from agent import (
+    TOOL_SCHEMAS,
     AgentState,
     McpAgent,
-    TOOL_SCHEMAS,
     agent_has_capability,
     filtered_tools,
 )
-
 
 # ---------------------------------------------------------------------------
 # JSON Schema validation tests

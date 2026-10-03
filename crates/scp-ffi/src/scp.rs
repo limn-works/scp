@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError};
 
 use crate::error::ScpPyError;
 use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
@@ -313,9 +313,12 @@ impl PyScp {
             rt.block_on(async move {
                 match inner.shutdown(timeout).await {
                     Ok(_) => Ok::<(), ScpPyError>(()),
-                    Err(e) => {
-                        // AlreadyShutDown is swallowed: Python callers
-                        // expect `.shutdown()` to be idempotent.
+                    // AlreadyShutDown is swallowed: Python callers expect
+                    // `.shutdown()` to be idempotent. No wildcard arm: a new
+                    // ShutdownError variant must fail to compile here until it
+                    // is mapped to a Python error, instead of reporting a live
+                    // engine as shut down.
+                    Err(e @ ShutdownError::AlreadyShutDown) => {
                         tracing::debug!("SCP.shutdown: {e} — treating as no-op");
                         Ok(())
                     }

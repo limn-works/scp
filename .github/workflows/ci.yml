@@ -237,6 +237,10 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              # The rust-clippy job runs scripts/check-examples-compile.sh and
+              # its cases, so a change to either must trigger the job that runs it.
+              - 'scripts/check-examples-compile.sh'
+              - 'scripts/tests/examples-compile/**'
               # The `docker-image` job builds from these two and is guarded by this
               # filter, so a change to either has to reach it.
               - 'Dockerfile'
@@ -377,14 +381,28 @@ jobs:
           save-if: false
       - name: scp-node self-host create paths fail closed
         # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
-        # its filter selects no test. Both tests this lane names carry
-        # `#[cfg(not(feature = "testing"))]`, so a dependency edge that turned
-        # `testing` on for scp-node would delete them and leave this lane green
-        # over zero assertions. Measured on this tree: `cargo test -p scp-node
-        # --lib no_such_name` exits 0, while `cargo nextest run
-        # --no-tests=fail -p scp-node --lib -E 'test(no_such_name)'` exits 4.
+        # its filter selects no test. Every test this filter selects (each
+        # `pre_rotation_severance` test in crates/scp-node/src/lib.rs and
+        # src/self_host.rs) carries `#[cfg(not(feature = "testing"))]`, so a
+        # dependency edge that turned `testing` on for scp-node would delete
+        # them and leave this lane green over zero assertions. Measured on this
+        # tree: `cargo test -p scp-node --lib no_such_name` exits 0, while
+        # `cargo nextest run --no-tests=fail -p scp-node --lib -E
+        # 'test(no_such_name)'` exits 4.
         # This lane now reports such a loss instead of hiding it.
         run: cargo nextest run --no-tests=fail -p scp-node --lib -E 'test(pre_rotation_severance)'
+      - name: scp-node shipped binary refuses --ephemeral before --health
+        # The test spawns the shipped `scp-node` binary and asserts that `main`
+        # calls `unavailable_mode` before the `--health` probe. It carries
+        # `#[cfg(not(feature = "testing"))]`, and every other lane builds
+        # scp-node with `testing` (the workspace nextest unifies it through
+        # scp-ffi-common's `scp-node?/testing`), so every other lane compiles it
+        # out. `-p scp-node` without `--features` builds it without `testing`,
+        # as the step above relies on. This is its own step, not a second
+        # filter on the step above, because `--no-tests=fail` fails only when an
+        # invocation selects zero tests overall: kept apart, either test
+        # disappearing turns its own step red.
+        run: cargo nextest run --no-tests=fail -p scp-node --test run_mode_selection -E 'test(shipped_build_refuses_ephemeral_before_the_health_probe)'
       - name: scp-identity create paths fail closed
         # Three manifests turn `scp-identity/testing` on, each in its own
         # `[dev-dependencies]`: crates/scp-testing/Cargo.toml,
@@ -1018,6 +1036,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # scripts/check-examples-compile.sh parses cargo metadata with jq, which
+      # the runner image ships. This step fails the job by name if an image drops it.
+      - name: Require jq
+        run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-compile.sh needs it"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1048,7 +1070,25 @@ jobs:
           # broken optional transport fails CI. They co-compile (openssl-backed
           # udp/coap alongside ring-backed quic/http3), so a single combined
           # invocation covers all four.
-          cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+          # `nostr` and `webrtc` join this list for that same reason: each
+          # gates a `src/` module plus a `[[test]] required-features` target,
+          # and no lint or test invocation activated either feature, so 41
+          # tests and both adapter modules went unlinted and unrun.
+          cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
+          # Job rust-test-optional-features also runs code behind four more
+          # feature sets that no command above activates: scp-node's quic test
+          # files and its http3/udp well_known arms, scp-platform's `apple`
+          # SQLCipher adapter and `sync` storage module, and scp-testing's
+          # persistence_advanced tests. That job denies no warnings, so these
+          # commands are the only lint those builds get.
+          cargo clippy -p scp-node --features quic,http3,udp,testing --all-targets -- -D warnings
+          cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
+          cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
+          # Asserts two things: every example target compiles and its example
+          # source holds no construct the script's source scan rejects, and every
+          # published examples/*.rs is some target's source. The script header
+          # states what the check cannot prove; do not restate it here.
+          bash scripts/check-examples-compile.sh
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
           # --workspace sweep above leaves off. The first command lints the
@@ -1063,6 +1103,10 @@ jobs:
           cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+      # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
+      # workspaces, each carrying a defect the gate must reject or a layout it must accept.
+      - name: Run examples-compile cases
+        run: bash scripts/tests/examples-compile/run-tests.sh
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven
@@ -1242,11 +1286,64 @@ jobs:
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
           cargo test -p scp-transport --features combined,local-cache
-          # The optional network transports (quic, http3, udp, coap) are also
-          # not activated by --workspace. They co-compile, so a single combined
-          # invocation exercises every transport's test suite and guards against
-          # the silent rot that broke the quic feature for months.
-          cargo nextest run -p scp-transport --features quic,http3,udp,coap
+          # Optional network transports (quic, http3, udp, coap, nostr,
+          # webrtc) are also not activated by --workspace. They co-compile, so
+          # one combined invocation exercises every transport's test suite and
+          # guards against silent rot, which broke `quic` for months.
+          # `nostr` and `webrtc` each declare a `[[test]] required-features`
+          # target (nostr_roundtrip, webrtc_roundtrip) that this list must
+          # activate; without them those 10 tests plus 31 in-module tests under
+          # src/nostr/ and src/webrtc/ compiled into no test binary CI ran.
+          # The first run takes every other transport test; each run after it
+          # selects one of those four groups with `--no-tests=fail`, so
+          # re-gating a group behind another feature, or deleting it, leaves
+          # its run with nothing to select and fails this lane.
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc -E 'not (binary(nostr_roundtrip) | binary(webrtc_roundtrip) | test(/^nostr::/) | test(/^webrtc::/))'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test nostr_roundtrip
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test webrtc_roundtrip
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^nostr::/)'
+          cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^webrtc::/)'
+          # scp-node holds two auto-discovered test files (quic_listener,
+          # quic_cross_transport), each gated on `quic` and
+          # `allow_unencrypted_storage`, which `testing` implies. --workspace
+          # activates `quic` for neither, so their 5 tests ran nowhere. One run
+          # per file with `--no-tests=fail` (see the well_known lanes below), so
+          # re-gating either file leaves its run with nothing to select and fails
+          # this lane.
+          cargo nextest run --no-tests=fail -p scp-node --features quic,testing --test quic_listener
+          cargo nextest run --no-tests=fail -p scp-node --features quic,testing --test quic_cross_transport
+          # scp-node's well_known module asserts its advertised-transport
+          # list twice per transport: once for a feature-off arm and once for a
+          # feature-on arm. --workspace activates neither http3 nor udp, so only
+          # those off arms ran.
+          #
+          # One nextest run per feature-on arm, each selecting that one test by
+          # its exact path, with `--no-tests=fail`: a filter that selects nothing
+          # exits 0 under `cargo test`, while `--no-tests=fail` exits 4. Because
+          # each expression names exactly one test, renaming the module, deleting
+          # that arm, or re-gating it behind another feature selects nothing and
+          # fails this lane. A substring filter such as `test(well_known)` would
+          # not: it also selects well_known-named tests in http.rs and lib.rs, so
+          # it keeps selecting tests after both arms are gone.
+          cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_webtransport_with_feature)'
+          cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_udp_dtls_with_feature)'
+          # scp-platform gates its Apple SQLCipher storage adapter behind `apple`
+          # and its syncable-storage trait behind `sync`. --workspace enables
+          # neither (only scp-testing's opt-in `sync` feature enables
+          # `scp-platform/sync`), so both modules' tests — including a
+          # storage_conformance! expansion over SyncableStorage — compiled into
+          # nothing. Each run below selects one of those three groups by module
+          # path with `--no-tests=fail`, so deleting or re-gating a group fails
+          # this lane; the crate's other tests already run under --workspace.
+          cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^apple::/)'
+          cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^syncable::tests::storage_conformance::/)'
+          cargo nextest run --no-tests=fail -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --lib -E 'test(/^syncable::tests::/) - test(/^syncable::tests::storage_conformance::/)'
+          # persistence_advanced holds two tests gated on scp-testing's `sync` and
+          # `combined` features, which --workspace does not activate; its other
+          # tests already run under --workspace. One run per gated test, each
+          # naming it exactly, with `--no-tests=fail`.
+          cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=syncable_storage_export_apply_roundtrip)'
+          cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=combined_node_storage_both_traits_roundtrip)'
           # scp-node and scp-relay compile the PostgreSQL and S3 arms of
           # `storage_from_env` only under their off-by-default `cloud-blobs`
           # feature, which --workspace leaves off. Run the two binaries' backend
@@ -1856,6 +1953,47 @@ jobs:
           # Parity tests require Bun/Kotlin/Swift runners that are not
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
+      # `cd bindings/python` above resolves `tests/` to `bindings/python/tests/`,
+      # so this step runs no pytest suite that lives elsewhere in this
+      # repository. Four such suites exist. Two of them, under `scripts/`, run in
+      # their own steps (`scripts/test_check_sdk_coverage.py` and
+      # `scripts/tests/call-invariants/`). The other two run in no CI job, and
+      # each comment below says why its suite gets no step.
+      #
+      # `examples/reference-agent/test_agent.py` gets no step. Two of its 23
+      # tests, `TestEndToEnd::test_full_lifecycle` and
+      # `TestDemoScript::test_demo_exits_zero`, fail whenever `scp_sdk` imports,
+      # which the `maturin develop` step above makes true. Every one of the eleven
+      # SDK call sites in `examples/reference-agent/agent.py` names a symbol
+      # `scp_sdk` no longer defines: `Identity.create_sync`, `Identity.load_sync`,
+      # `Context.create_sync`, `Context.join_sync`, `context.send_sync`,
+      # `context.leave_sync`, and a `Context(context_id=..., identity=...)`
+      # constructor whose real signature reads `Context(handle, identity_did,
+      # scp)`. `scp_sdk` defines no `*_sync` method at all today, because
+      # identity and context operations moved onto an async `SCP` facade whose
+      # constructor requires a storage config, as
+      # `await scp.identity_create(custody)` and
+      # `await scp.context_create(identity_did, params)`. Each call site sits
+      # under `except ImportError`, which does not catch the `AttributeError`
+      # that a deleted attribute raises, so that example returns a
+      # `uuid`-fabricated DID when `scp_sdk` is absent and raises when it is
+      # present. Rewriting that example against the async facade replaces its
+      # agent module, its demo module, and its end-to-end tests, and makes the
+      # suite require the compiled PyO3 module that its README calls optional,
+      # which is a scoped work item rather than a CI wiring change.
+      #
+      # `tests/integration/phase3_integration_test.py` gets no step. Its 17 tests
+      # import `ToolDefinition` and call `Identity.create`, `Context.create`,
+      # `ctx.join`, `ctx.send`, `ctx.receive`, `ctx.close`, and `ctx.invoke`.
+      # `scp_sdk` exports none of those today: an outlet redesign replaced
+      # `ToolDefinition` with `scp_sdk.outlets.OutletDefinition`, which adds a
+      # required `kind: OutletKind`, and context operations moved onto an `SCP`
+      # facade as `SCP.context_create(identity_did, params)` and its siblings.
+      # That module therefore fails at import, and every test in it patches
+      # `sys.modules["_scp_core"]` with a `MagicMock`, so no test in it reaches
+      # a PyO3 bridge either way. Rewriting that suite against a current facade
+      # means re-deriving its 13 steps from `.docs/adrs/phase-3.md`, which is a
+      # scoped work item rather than a CI wiring change.
 
   # ── TypeScript ──────────────────────────────────────────────────────
   # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
@@ -2144,6 +2282,16 @@ jobs:
       # whatever the caller asked to build. It compiles no Rust, which is why it
       # belongs in this job rather than in `kotlin-test`.
       - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
+      # `:scp-kt-android` declares detekt in its own build.gradle.kts and no job
+      # invoked it, so every rule in ../detekt.yml — ForbiddenComment among them,
+      # which is how this repository enforces its Kotlin stub policy — went
+      # unread across that entire Android module.
+      #
+      # Run it in a step of its own rather than alongside a test task: Gradle
+      # rejects `detekt` in one invocation with `:scp-kt:generateUniffiBindings`,
+      # because detekt reads that task's output directory without declaring a
+      # dependency on it.
+      - run: ./gradlew :scp-kt-android:detekt
 
   # ORs on `rust` for a reason spelled out above python-test: this job builds
   # a UniFFI cdylib and runs a Kotlin suite against it, and that cdylib
@@ -2319,6 +2467,16 @@ jobs:
       - name: Check fuzz crate compiles
         working-directory: fuzz
         run: cargo check
+      # `cargo check` never compiles `#[cfg(test)]`, so the fuzz crate's one
+      # library test — which asserts that Arbitrary MessageType discriminants
+      # still match a production enum — ran in no job. This step selects that
+      # test by its exact path with `--no-tests=fail`, so renaming, deleting,
+      # or cfg-gating it selects nothing and fails the step, whatever other
+      # library tests the crate gains.
+      - uses: taiki-e/install-action@nextest
+      - name: Run fuzz crate library tests
+        working-directory: fuzz
+        run: cargo nextest run --no-tests=fail --lib -E 'test(=tests::arb_message_type_discriminants_match_production)'
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and

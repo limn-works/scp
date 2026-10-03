@@ -1676,9 +1676,10 @@ impl
         // Migrated to the ADR-052 flat-config front door (Phase B-P2). The
         // dropped `.tls_provider(SelfSignedTlsProvider::new("localhost"))` is
         // reproduced by the default `TlsMode::SelfSigned`, which installs a
-        // byte-identical self-signed provider for the `Domain` reach. `Domain`
-        // is a publishing reach, so M2 requires `DhtMode::Production`
-        // (advisory in P1 — the in-memory DHT client publishes nothing).
+        // byte-identical self-signed provider for the `Domain` reach. This
+        // node opts into `DhtMode::Production` (M2 accepts `Disabled` for every
+        // `Reach`, `Domain` included), which makes `Node::start` publish
+        // through `did_method` and fail the start if that publish fails.
         //
         // Storage goes through a production `Node::start` front door: an
         // ephemeral `InMemoryStorage` is wrapped in `EncryptingAdapter` under a
@@ -2639,7 +2640,7 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             custody,
             did_method,
         } => {
-            // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+            // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)), which
             // requires a `PreRotationCustody` backend. The only implementation
             // is the test-harness `InMemoryPreRotationCustody` nullifier.
             #[cfg(feature = "testing")]
@@ -2655,8 +2656,8 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
                     did = %identity.did,
                     "identity created without a persistent PreRotationCustody — migration \
                      (Layer-2 DID rotation) will be impossible until the builder API is \
-                     widened to accept a real backend. Recovery from `#0` compromise via \
-                     spec §9.7.4.1 is unreachable for this identity."
+                     widened to accept a real backend. The reveal that spec §9.7.4.1 item 4 \
+                     says recovers a root compromise is unreachable for this identity."
                 );
                 Ok((identity, document, did_method))
             }
@@ -2844,7 +2845,7 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
             } else {
                 // 3. Generate a new identity and persist it.
                 //
-                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 item 5(a)),
                 // which requires a `PreRotationCustody` backend. The only
                 // implementation is the test-harness `InMemoryPreRotationCustody`.
                 #[cfg(feature = "testing")]
@@ -2861,8 +2862,8 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
                         did = %identity.did,
                         "persisted identity created without a persistent PreRotationCustody — \
                          migration (Layer-2 DID rotation) will be impossible after process \
-                         restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
-                         for this identity until the builder API is widened to accept a real \
+                         restart. The reveal that spec §9.7.4.1 item 4 says recovers a root \
+                         compromise is unreachable for this identity until the builder API is widened to accept a real \
                          backend."
                     );
                     let persisted = PersistedIdentity {
@@ -4066,8 +4067,10 @@ mod tests {
 
     /// Builds a domain-mode `NodeConfig` for `test.example.com` with a
     /// succeeding self-signed TLS provider and a fresh generated identity.
-    /// `Reach::Domain` is a publishing reach, so `DhtMode::Production` is set
-    /// (M2); the in-memory `TestDidDht` publishes nothing offline.
+    /// The config opts into `DhtMode::Production` (M2 accepts `Disabled` for
+    /// every `Reach`, `Reach::Domain` included), so `Node::start` publishes the
+    /// identity document to the in-memory `TestDidDht`, which receives it in
+    /// process and never reaches live Mainline.
     fn domain_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
@@ -4479,8 +4482,9 @@ mod tests {
     }
 
     /// Builds a no-domain (`Reach::NatTraversal`) `NodeConfig` whose NAT probe
-    /// is a `MockNatStrategy` returning `tier` (no real STUN). `NatTraversal` is a
-    /// publishing reach → `DhtMode::Production` (M2).
+    /// is a `MockNatStrategy` returning `tier` (no real STUN). The config opts
+    /// into `DhtMode::Production` (M2 accepts `Disabled` for every `Reach`,
+    /// `NatTraversal` included).
     fn no_domain_config(
         tier: ReachabilityTier,
     ) -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> {

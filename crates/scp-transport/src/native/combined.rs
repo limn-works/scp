@@ -559,8 +559,8 @@ impl BlobStorage for CombinedNodeStorage {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .map_err(|e| StorageError::Internal(format!("count failed: {e}")))?;
-        #[allow(clippy::cast_sign_loss)]
-        Ok(count as usize)
+        usize::try_from(count)
+            .map_err(|e| StorageError::Internal(format!("blob count {count} out of range: {e}")))
     }
 }
 

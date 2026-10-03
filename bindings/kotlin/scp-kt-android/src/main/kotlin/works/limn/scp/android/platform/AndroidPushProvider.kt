@@ -67,8 +67,10 @@ import kotlinx.coroutines.withContext
  * `{"data": {"scp": "1"}}`; [handleNotification] rejects a missing or wrong `scp` field and
  * accepts any other fields beside it.
  *
- * @param context Android application [Context]. The class does not read it and does not
- *   initialise Firebase: [register] calls `FirebaseMessaging.getInstance()`, which uses the
+ * @param context Android application [Context]. ADR-027's reference code declares this
+ *   provider as `AndroidPushProvider(private val context: Context)`, and this class keeps
+ *   that constructor. The class does not read it and does not initialise Firebase:
+ *   [register] calls `FirebaseMessaging.getInstance()`, which uses the
  *   default FirebaseApp, so the default FirebaseApp must be initialised before [register]
  *   runs. FirebaseInitProvider does this at app start when the app carries its Firebase
  *   configuration; otherwise the caller calls `FirebaseApp.initializeApp`.
