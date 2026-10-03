@@ -164,8 +164,7 @@ pub(crate) enum McpClientStop {
     /// stdout.
     StdioServer(Arc<Mutex<Option<std::process::Child>>>),
     /// An SSE client's closer, which shuts down the `GET` stream's socket and
-    /// the socket of every POST a call waits on; a call in flight then fails
-    /// at once, and the transport sends nothing more.
+    /// the socket of every connected POST.
     Sse(scp_mcp::sse_client::SseCloser),
 }
 
@@ -2936,10 +2935,17 @@ mod tests {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
         crate::runtime::init_supervisor_for_test_on(&bi);
         let supervisor = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![
+                scp_core::context::params::Capability::new("messages:read")
+                    .expect("known capability"),
+            ],
+            ..scp_core::context::ContextParams::default()
+        };
         crate::runtime()
             .block_on(supervisor.create_context(
                 ctx.to_owned(),
-                scp_core::context::ContextParams::default(),
+                params,
                 scp_did::DID(agent.to_owned()),
                 None,
             ))
