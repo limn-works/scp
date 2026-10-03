@@ -2879,6 +2879,74 @@ async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
     handle.send_shutdown().await.unwrap();
 }
 
+/// A Welcome whose tree holds a KeyPackage-sourced leaf that expired under the
+/// actor backend's injected clock fails the fused join with `CryptoFailed`
+/// carrying the lifetime error, not `InvalidKeyPackage`, because the rejected
+/// leaf is in the sender's tree, not the caller's KeyPackage. The reserved
+/// KeyPackage is not burned.
+#[tokio::test]
+async fn fused_confirm_rejects_expired_tree_leaf_as_crypto_failed() {
+    use scp_clock::TestClock;
+
+    let real_now = SystemClock.now_secs();
+    let storage = in_memory_storage();
+    let backend = Arc::new(ProductionMlsBackend::new(Arc::new(TestClock::new(
+        real_now + 1200,
+    ))));
+    backend.set_consumed_init_key_store(Arc::clone(&storage));
+    let mls: Arc<dyn MlsBackend> = backend;
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+    );
+    let _ = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await;
+    let kp_ref = live_index(&storage, &alice()).await[0].clone();
+    let (reservation_id, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::Reserve {
+            kp_ref: kp_ref.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+
+    // Carol's leaf expires at `real_now + 600`: valid under the real clock
+    // openmls reads, expired under the actor backend's clock.
+    let mut group = scp_mls::group::group_holding_carol_leaf_expiring_soon(real_now).unwrap();
+    let added = real_backend()
+        .add_member_raw(&mut group, &public_bytes)
+        .await
+        .unwrap();
+
+    let err = handle
+        .send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id: reservation_id.clone(),
+            welcome_bytes: added.welcome,
+            reply,
+        })
+        .await
+        .err()
+        .expect("a Welcome holding an expired leaf makes the fused join fail");
+    let expected_not_after = format!("not_after={}", real_now + 600);
+    assert!(
+        matches!(
+            &err,
+            ContextError::CryptoFailed(msg)
+                if msg.starts_with("join from welcome: ")
+                    && msg.contains("key package lifetime invalid")
+                    && msg.contains(&expected_not_after)
+        ),
+        "expected CryptoFailed carrying Carol's lifetime error, got {err:?}"
+    );
+    assert!(
+        kp_record_present(&storage, &alice(), &kp_ref).await,
+        "a rejected join must not burn the KP"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn fused_welcome_cancel_flow() {
     let storage = in_memory_storage();

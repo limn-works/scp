@@ -2074,9 +2074,10 @@ pub fn sync_ceiling_from_params(
 ///
 /// `ceiling` entries take the colon form the Python surface accepts
 /// (`"outlet:register"`, `"messages:write"`), as `register_context` takes
-/// them. An empty slice creates a supervisor context whose ceiling grants
-/// nothing; `register_context` reads the same empty slice as
-/// `default_ceiling()`.
+/// them. An empty slice fails the create with
+/// `ContextError::CeilingRequired(CeilingDeclaration::Empty)`, so this helper
+/// panics on it; pass at least one entry. (`register_context` still reads an
+/// empty slice as `default_ceiling()` for the bridge's own ceiling copy.)
 ///
 /// # Panics
 ///
@@ -3219,7 +3220,12 @@ mod tests {
         let bi = std::sync::Arc::new(PyBridgeInstance::new_py());
         init_context_manager_for_test(&bi);
         let ctx_id = format!("{prefix}{}", "0".repeat(56));
-        create_supervisor_context_for_test(&bi, &ctx_id, "did:dht:z6MkRegimeCreator", &[]);
+        create_supervisor_context_for_test(
+            &bi,
+            &ctx_id,
+            "did:dht:z6MkRegimeCreator",
+            &["messages:read".to_owned()],
+        );
         (bi, ctx_id)
     }
 

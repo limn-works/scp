@@ -3,6 +3,7 @@
 
 package works.limn.scp.android.compose
 
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.MutableState
@@ -10,17 +11,32 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import works.limn.scp.stream.EventContextBindings
+import works.limn.scp.stream.HotStreamFactory
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Holder for an SCP context's observable state within a Composable.
@@ -39,9 +55,11 @@ import kotlinx.coroutines.launch
  * @property scope Coroutine scope that lives as long as the holder.
  *   Cancelled on disposal, which ends every [rememberScpStateIn]
  *   collection bound to this holder.
- * @property onDispose Cleanup callback invoked when the Composable
- *   leaves composition. Receives both the context handle and identity handle.
- *   Typically calls leave/close on the context.
+ * @property onDispose Cleanup callback that [dispose] invokes, after it cancels [scope], when
+ *   the Composable leaves composition. Receives both the context handle and identity handle.
+ *   It runs on a composition thread, which on Android is a main thread, so it MUST NOT block:
+ *   it launches `leave` (or, for an admin, `close`) on a scope that outlives disposal and
+ *   returns, as [rememberScpContext]'s `onDispose` parameter states.
  */
 class ScpContextHolder(
     val contextHandle: Long,
@@ -60,19 +78,28 @@ class ScpContextHolder(
  *
  * Creates a [ScpContextHolder] that persists across recompositions for the
  * same [contextHandle] and [identityHandle]. When the Composable leaves composition, the
- * [onDispose] callback is invoked to clean up the context (e.g., call
- * `contextBridge.leave(handle, identityHandle)`), and the internal coroutine
- * scope is cancelled.
+ * holder's internal coroutine scope is cancelled first, and the [onDispose] callback is
+ * invoked after it to clean up the context (e.g., launch
+ * `contextBridge.leave(handle, identityHandle)` on a scope that outlives disposal).
  *
- * Per ADR-028: `DisposableEffect(contextId) { onDispose { context.close() } }`
- * ensures the context is closed when the composable leaves composition.
+ * Per ADR-028 (amended): [onDispose] launches its teardown on a scope that outlives
+ * disposal, so the teardown runs off the composition thread and `onDispose` never blocks it.
  *
  * Usage:
  * ```kotlin
  * @Composable
  * fun ChatScreen(contextHandle: Long, identityHandle: Long, bridge: CoroutineBridge) {
+ *     // A scope that outlives disposal, because rememberScpContext cancels a
+ *     // holder's own scope before it calls onDispose.
+ *     val cleanupScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
  *     val holder = rememberScpContext(contextHandle, identityHandle) { ctxH, idH ->
- *         runBlocking(Dispatchers.IO) { bridge.context.leave(ctxH, idH) }
+ *         cleanupScope.launch {
+ *             // A leave failure is logged, never thrown: an exception escaping this launch
+ *             // reaches the thread's uncaught-exception handler, which on Android kills the
+ *             // process (.docs/standards/sdk-common.md §Cleanup error handling).
+ *             runCatching { bridge.context.leave(ctxH, idH) }
+ *                 .onFailure { Log.w("ChatScreen", "leave failed after disposal", it) }
+ *         }
  *     }
  *     // Use holder to collect SCP streams
  * }
@@ -81,8 +108,12 @@ class ScpContextHolder(
  * @param contextHandle Opaque context handle from create/join.
  * @param identityHandle Opaque identity handle for the member in this context.
  * @param onDispose Callback invoked when the Composable leaves composition.
- *   Receives the context handle and identity handle for cleanup. Runs on the
- *   composition thread; launch a coroutine for suspending cleanup operations.
+ *   Receives a context handle and an identity handle for cleanup. Runs on a composition
+ *   thread, which on Android is a main thread, so it MUST NOT block on a coroutine:
+ *   `runBlocking` around a suspending SCP call risks an ANR, and deadlocks outright when
+ *   a dispatcher underneath that call schedules its work onto a blocked thread. Launch
+ *   that work on a scope which outlives disposal instead, as shown above. See
+ *   `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
  * @return A [ScpContextHolder] scoped to this Composable.
  */
 @Composable
@@ -228,63 +259,625 @@ private fun <R> rememberCollectedState(
 }
 
 /**
- * Remember and manage an SCP hot stream subscription within a Composable.
+ * Sequences hot stream subscriptions that separate mounts open under one same key.
  *
- * Creates a hot stream subscription that persists across recompositions
- * for the same [key]. The [start] suspend lambda is launched in a
- * coroutine scope tied to the Composable's lifetime. When the Composable
- * leaves composition, [onStop] is invoked to unsubscribe from the Rust
- * engine (e.g., call `hotStreamFactory.stopContextEvents(handle)`).
+ * Compose forgets every `remember(key)` value when a composable leaves composition, so no value
+ * a composable remembers can order one mount's `onStop` against a later mount's `start`, or tell
+ * one mount that another mount under that same key is still collecting. A registry such as
+ * [works.limn.scp.stream.HotStreamFactory] keys a subscription by context handle alone and hands
+ * a second subscriber that same subscription, so without that knowledge a departing mount's
+ * `onStop` releases a subscription that a different, still-composed mount collects from: that
+ * collector then observes a [SharedFlow] that receives nothing further, and reports no error.
+ * Navigating away from a screen and back produces it, and so does a navigation transition that
+ * keeps an outgoing screen composed while an incoming screen under that same key starts.
  *
- * The returned [State] is initially `null` until the [start] coroutine
- * completes and the [SharedFlow] is available. Callers should handle the
- * null case (e.g., show a loading indicator).
+ * [ScpHotStreams] constructs one coordinator together with the one [HotStreamFactory] whose
+ * subscriptions it orders, so a coordinator and its registry share one lifetime and one
+ * sharing, and no other coordinator orders that factory. A coordinator constructed per
+ * composition, or per navigation destination, would count only its own mounts, so during a
+ * transition between two screens that show one context handle, the outgoing screen's stop
+ * would release the subscription the incoming screen collects.
+ *
+ * This class holds per-key state: a count of live mounts, a [Mutex] that admits one start or one
+ * stop at a time, the `onStop` lambdas of mounts that left while another mount under that key
+ * stayed composed, one [Job] naming the most recent stop it launched, and one [Job] that the
+ * next stop it launches completes. [mount] counts a mount and captures the most recent stop.
+ * [unmount] holds a departing mount's `onStop` while another mount under that key stays
+ * composed, and when it removes the last live mount it launches one stop that runs the `onStop`
+ * lambdas it held for that key and then the departing mount's own, skipping each one whose
+ * mount's `start` returned an object that an earlier one in that same list's `start` returned,
+ * as the next paragraph states. So a mount that leaves while another mount under that key stays composed stops
+ * nothing yet.
+ *
+ * Only a mount whose `start` ran has its `onStop` run: a mount that leaves before its `start`
+ * takes the key's mutex opened nothing, and its `start` never runs afterwards. Two departed
+ * mounts whose `start` returned one same object (compared by identity) and whose `onStop` lambdas
+ * this class holds together under one key hold one subscription, so it keeps and runs one
+ * `onStop` for that object; a registry such as `HotStreamFactory` returns one [SharedFlow]
+ * instance for every caller of one subscription. The comparison reaches only the `onStop`
+ * lambdas held since the key's last stop launched: a stop clears the held list, so a later mount
+ * whose `start` returns an object an earlier stop already released keeps its own `onStop`, and
+ * that `onStop` runs. A `start` that began runs to completion even when its mount leaves
+ * meanwhile, so what it returned is compared too. A mount whose `start` threw keeps its own
+ * `onStop`, because that `start` may have opened a subscription it did not return.
+ *
+ * [unmount] compacts the held list only when a mount departs, and keeps each entry whose
+ * `start` is still running at that moment. The `onStop` lambdas held for a key therefore number
+ * at most the distinct objects its mounts' `start` returned, plus one for each departed mount
+ * whose `start` threw, plus one for each whose `start` was still running when a departure last
+ * compacted the list; the next departure or the key's stop drops such an entry when its `start`
+ * returned an object already held. While another mount under the key stays composed, a departing
+ * mount whose `start` has returned an object already held adds nothing, a departing mount whose
+ * `start` is still running adds one until the next compaction, and each departing mount whose
+ * `start` threw adds one, so the held list grows linearly with the departures whose `start`
+ * threw until the last mount leaves.
+ *
+ * Each stop joins the stop launched before it under that key before it takes
+ * that key's mutex, and [startMounted] joins the stop its mount captured before it runs a
+ * `start` lambda. Ordering therefore rests on when a caller launched `onStop`, not on when
+ * `onStop` reached a dispatcher: a mount's `start` runs after every stop launched under its key
+ * before that mount began. Per-key state leaves this map as soon as no live mount and no
+ * pending stop holds it.
+ *
+ * A key therefore groups lifetimes: a subscription stays open until the last mount under its
+ * key leaves. Two mounts that share a key but hold different subscriptions — a `contextEvents`
+ * stream and an `incomingMessages` stream keyed by one context handle — each still have their
+ * `onStop` run, but the first one's runs only when the second one leaves. A key that names one
+ * subscription, such as `"events" to handle` for `contextEvents(handle)` and
+ * `"messages" to handle` for `incomingMessages(handle)`, releases each subscription as soon as
+ * its own mounts leave.
+ *
+ * Every mount that reaches one subscription MUST pass one same key. This class counts and
+ * orders mounts per key only, so two keys for one subscription are two unrelated groups: a mount
+ * under `handle` and a mount under `"events" to handle` that both reach one `contextEvents`
+ * subscription never see each other, and the first to leave releases the subscription the other
+ * still collects, which then receives nothing further and reports no error. [ScpHotStreams]
+ * derives every key from one stream and one context handle, so no caller chooses a key.
+ *
+ * An `onStop` releases the subscription its mount's `start` returned and nothing
+ * else, and must be idempotent, because a mount whose `start` returned a different object for
+ * one subscription still has its own `onStop` run; `HotStreamFactory`'s stop functions return
+ * without effect on a handle they no longer hold.
+ *
+ * An `onStop` that throws anything other than a [CancellationException] raised by cancelling
+ * [scope] is logged at warning level and goes no further, and the stop runs its next `onStop`,
+ * as `.docs/standards/sdk-common.md` §Cleanup error handling requires of a cleanup error. Letting
+ * it escape would reach the thread's uncaught-exception handler, which on Android kills the
+ * process after the screen that mounted the stream is gone, and on a [scope] without a
+ * [SupervisorJob] would also cancel that scope, so every later `onStop` would never run.
+ *
+ * Cancelling [scope] ends this coordinator. A stop that cancellation prevents from running
+ * every `onStop` it holds is logged at warning level, because each `onStop` it skipped leaves a
+ * subscription open, and the [Job] [unmount] returned for each departure that stop covers
+ * completes exceptionally instead of reporting that its `onStop` ran. A cancellation that
+ * arrives after every `onStop` returned skips nothing, so that stop logs nothing and completes
+ * that [Job] normally. A stop that held no `onStop` skipped none, so it logs nothing and completes
+ * that [Job] normally. [startMounted] then refuses every
+ * `start` with [ScpHotStreamCoordinatorClosedException], because no stop could release what that
+ * `start` opened. [close] ends this coordinator the same way before [scope] is cancelled, and
+ * returns once every `start` running when it reached that key and every stop launched before it
+ * read that key's last stop has finished; it does not wait for a stop launched after that read,
+ * or under a key first mounted after `close` began.
+ *
+ * @param scope Scope that runs every `onStop` lambda this coordinator launches. The owner of
+ *   the [ScpHotStreams] that constructed this coordinator owns that scope, and cancels it only
+ *   once every mount that passed that [ScpHotStreams] has left composition. Composable
+ *   disposal never cancels it, so an `onStop` outlives whichever mount launched it.
+ */
+internal class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
+    private val keyStates = ConcurrentHashMap<Any, KeyState>()
+
+    /** Set by [close]; [startMounted] refuses every `start` once it is set. */
+    private val closed = AtomicBoolean(false)
+
+    /**
+     * Refuse every later `start`, then, key by key over the keys present when this began, wait
+     * for each `start` running under that key's mutex and for the last stop launched under that
+     * key, which joins every stop launched before it. A stop that a departing mount launches
+     * under a key after this read that key's last stop, or under a key first mounted after this
+     * began, is not awaited: this returns without it, and it runs on [scope] afterwards, or is
+     * skipped and logged if the owner cancels [scope] first. A stop whose scope was already
+     * cancelled returns from that wait at once.
+     */
+    internal suspend fun close() {
+        closed.set(true)
+        keyStates.values.toList().forEach { state ->
+            // A start that passed the closed check holds this mutex until it returns.
+            state.mutex.withLock {}
+            synchronized(state) { state.lastStop }?.join()
+        }
+    }
+
+    /**
+     * Run [onStop], logging whatever it throws, so the next held `onStop` still runs. A
+     * [CancellationException] thrown while this coordinator's own [scope] is cancelled
+     * propagates, because [ensureActive] rethrows it, and the stop runs no further `onStop`.
+     * Any other throw is logged even when [scope] was cancelled meanwhile, and the next
+     * `onStop` then runs under that cancellation.
+     */
+    private suspend fun runStop(onStop: suspend () -> Unit) {
+        runCatching { onStop() }.onFailure { failure ->
+            if (failure is CancellationException) currentCoroutineContext().ensureActive()
+            Log.w(COORDINATOR_TAG, "onStop threw while releasing a hot stream", failure)
+        }
+    }
+
+    /**
+     * One live mount under [key], as [mount] recorded it.
+     *
+     * @property key Key this mount was counted under.
+     * @property state [key]'s state, which this mount holds until [unmount] releases it.
+     * @property pendingStop Stop that [unmount] launched for [key] before this mount began, or
+     *   `null` when none was recorded. [startMounted] joins it.
+     */
+    internal class Mount(
+        val key: Any,
+        val state: KeyState,
+        val pendingStop: Job?,
+    ) {
+        /** Set by [unmount], so unmounting this mount twice removes it from the count once. */
+        val unmounted = AtomicBoolean(false)
+
+        /**
+         * [MountPhase.NOT_STARTED] until [startMounted] claims it for its `start`
+         * ([MountPhase.STARTING]) or [unmount] claims it first ([MountPhase.LEFT_UNSTARTED]),
+         * then a [Started] carrying what `start` returned. A `start` that threw leaves
+         * [MountPhase.STARTING], which [unmount] treats as a subscription of its own. Whichever
+         * of those two calls moves it off [MountPhase.NOT_STARTED] first decides whether this
+         * mount's `start` runs and whether its `onStop` runs.
+         */
+        val phase = AtomicReference<Any>(MountPhase.NOT_STARTED)
+    }
+
+    /** What a mount's `start` returned; two are equal only when they carry one same object. */
+    internal class Started(val value: Any?) {
+        override fun equals(other: Any?): Boolean = other is Started && other.value === value
+
+        override fun hashCode(): Int = System.identityHashCode(value)
+    }
+
+    /** A departed mount's `onStop`, kept with that mount so a stop can read what it started. */
+    internal class HeldStop(val mount: Mount, val onStop: suspend () -> Unit)
+
+    /**
+     * Count one live mount under [key], and capture whichever stop [unmount] launched last for
+     * [key], so this mount's [startMounted] waits for it.
+     */
+    internal fun mount(key: Any): Mount {
+        val state = acquire(key)
+        val pendingStop =
+            synchronized(state) {
+                state.liveMounts++
+                state.lastStop
+            }
+        return Mount(key, state, pendingStop)
+    }
+
+    /**
+     * Join the stop [mount] captured, then run [start] under that key's mutex and return what
+     * [start] returned.
+     *
+     * A caller cancelling this call while it waits for that stop or that mutex ends it there,
+     * and its `start` never runs. Once [start] runs, it runs to completion under
+     * [NonCancellable], so a mount that leaves while its `start` is suspended still records what
+     * that `start` returned, and a stop compares that object against the other held departures'
+     * instead of keeping one more `onStop` for a subscription it cannot identify. A stop under
+     * that key therefore waits for a running `start` to return, whoever cancelled its caller.
+     *
+     * @throws ScpHotStreamCoordinatorClosedException when [close] has run or this coordinator's
+     *   scope is cancelled, checked under the mutex, because no stop could release what [start]
+     *   opened.
+     * @throws CancellationException when [unmount] has already removed [mount], checked under
+     *   the mutex. That mount's own stop may have taken the mutex first and found nothing to
+     *   release, and a start run after it would open a subscription that no stop releases.
+     *   `Mutex.withLock` takes a free mutex without checking cancellation, so a cancelled
+     *   caller alone does not prevent that.
+     */
+    internal suspend fun <T> startMounted(
+        mount: Mount,
+        start: suspend () -> T,
+    ): T {
+        mount.pendingStop?.join()
+        return mount.state.mutex.withLock {
+            if (closed.get() || !scope.isActive) {
+                throw ScpHotStreamCoordinatorClosedException("the coordinator is closed or its scope is cancelled")
+            }
+            if (!mount.phase.compareAndSet(MountPhase.NOT_STARTED, MountPhase.STARTING)) {
+                throw CancellationException("mount left before its start ran")
+            }
+            withContext(NonCancellable) { start().also { mount.phase.set(Started(it)) } }
+        }
+    }
+
+    /**
+     * Remove [mount] from its key's live mounts. When another mount under that key is still
+     * live, hold [onStop] for that key. When that leaves no live mount under that key, launch
+     * one stop on this coordinator's scope that joins the stop launched before it under that
+     * key, then runs every held `onStop` and then [onStop] under that key's mutex, and record
+     * its [Job] before returning, so a [mount] that begins afterwards captures it.
+     *
+     * [onStop] is kept only when [mount]'s `start` ran or is running, and the stop runs it only
+     * when no `onStop` that same stop runs earlier came from a mount whose `start` returned that
+     * same object. A departure beside a live mount whose `start` has returned an object that a
+     * `start` of a held departure returned adds nothing to the held list; one whose `start` is
+     * still running stays held until the next departure or the stop compares it.
+     *
+     * @return A [Job] that the stop covering [onStop] completes once it has run every `onStop`
+     *   it holds. Every departure that stop covers gets this one [Job], whether that stop
+     *   launched now or launches at the last live mount's departure. It completes exceptionally
+     *   when cancelling this coordinator's scope kept that stop from running every `onStop` it
+     *   held, and normally when that cancellation arrived after the last `onStop` returned.
+     *   `null` when [mount] was already unmounted, so [onStop] is dropped.
+     */
+    internal fun unmount(
+        mount: Mount,
+        onStop: suspend () -> Unit,
+    ): Job? {
+        if (!mount.unmounted.compareAndSet(false, true)) return null
+        // Claimed before the mutex: a start that has not claimed the phase yet never runs.
+        val leftUnstarted = mount.phase.compareAndSet(MountPhase.NOT_STARTED, MountPhase.LEFT_UNSTARTED)
+        val own = if (leftUnstarted) null else HeldStop(mount, onStop)
+        val state = mount.state
+        var launched: Job? = null
+        val stopDone =
+            synchronized(state) {
+                state.liveMounts--
+                if (state.liveMounts > 0) {
+                    if (own != null) {
+                        val kept = distinctStarts(state.heldStops + own)
+                        state.heldStops.clear()
+                        state.heldStops += kept
+                    }
+                    state.nextStop ?: Job().also { state.nextStop = it }
+                } else {
+                    val stops = state.heldStops.toList() + listOfNotNull(own)
+                    state.heldStops.clear()
+                    // A stop launched earlier under this key may not have reached the mutex
+                    // yet, so without this join a later stop could take the mutex first, and a
+                    // mount that captured only the later stop would start before the earlier
+                    // stop releases what that start opened.
+                    val prior = state.lastStop
+                    // One Job for every departure this stop covers, held ones and this one.
+                    val done = state.nextStop ?: Job()
+                    state.nextStop = null
+                    // Set once every onStop has returned. Cancelling the scope while the last
+                    // onStop runs still completes this stop's Job as cancelled, so the Job's
+                    // completion cause alone cannot tell a skipped onStop from none skipped.
+                    val ranEvery = AtomicBoolean(false)
+                    scope.launch(start = CoroutineStart.LAZY) {
+                        prior?.join()
+                        state.mutex.withLock { distinctStarts(stops).forEach { runStop(it.onStop) } }
+                        ranEvery.set(true)
+                    }.also { stop ->
+                        state.lastStop = stop
+                        launched = stop
+                        stop.invokeOnCompletion { cause ->
+                            // A stop that held no onStop skipped none, so it reports no skip.
+                            if (cause == null || ranEvery.get() || stops.isEmpty()) {
+                                done.complete()
+                            } else {
+                                Log.w(COORDINATOR_TAG, SCOPE_CANCELLED_BEFORE_STOP, cause)
+                                done.completeExceptionally(cause)
+                            }
+                        }
+                    }
+                    done
+                }
+            }
+        val stopJob = launched
+        if (stopJob == null) {
+            release(mount.key)
+        } else {
+            // This mount's hold on the state passes to its stop, so a later mount finds the
+            // recorded stop until that stop completes.
+            stopJob.invokeOnCompletion { release(mount.key) }
+            stopJob.start()
+        }
+        return stopDone
+    }
+
+    /**
+     * [stops] without each entry whose mount's `start` returned an object an earlier entry's
+     * `start` returned, in order. An entry whose `start` threw, or is still running, is kept.
+     */
+    private fun distinctStarts(stops: List<HeldStop>): List<HeldStop> {
+        val seen = HashSet<Started>()
+        return stops.filter { held ->
+            val started = held.mount.phase.get() as? Started
+            started == null || seen.add(started)
+        }
+    }
+
+    /**
+     * Return [key]'s state, creating it when nothing holds it, and count this caller as one
+     * holder.
+     *
+     * [ConcurrentHashMap.compute] runs this function while it holds that key's bin lock, and
+     * [release] removes an entry under that same lock, so no caller acquires a state that
+     * another thread is removing.
+     */
+    private fun acquire(key: Any): KeyState =
+        checkNotNull(
+            keyStates.compute(key) { _, existing ->
+                (existing ?: KeyState()).also { it.holders.incrementAndGet() }
+            },
+        ) { "compute returned no state for key $key" }
+
+    /** Drop one holder of [key]'s state, and remove that state when it has no holder left. */
+    private fun release(key: Any) {
+        keyStates.computeIfPresent(key) { _, state ->
+            if (state.holders.decrementAndGet() == 0) null else state
+        }
+    }
+
+    /**
+     * One key's coordination state.
+     *
+     * @property mutex Admits one start lambda or one stop lambda at a time for this key.
+     * @property liveMounts Count of mounts that [mount] counted and [unmount] has not yet
+     *   removed. Guarded by this object's monitor.
+     * @property heldStops `onStop` lambdas of mounts that [unmount] removed while another mount
+     *   under this key stayed live and whose `start` ran, in departure order, at most one per
+     *   object those mounts' `start` returned, plus each whose `start` threw or was still
+     *   running when [unmount] last compacted this list. The stop that the last live mount's departure
+     *   launches runs them. Guarded by this object's monitor.
+     * @property lastStop Job of the stop [unmount] launched most recently for this key, or
+     *   `null` when it has launched none since this state was created. The next stop [unmount]
+     *   launches joins it. Guarded by this object's monitor.
+     * @property nextStop Job that [unmount] returned for a departure it held, which the next
+     *   stop [unmount] launches for this key completes on finishing, or `null` when no held
+     *   departure is waiting. Guarded by this object's monitor.
+     * @property holders Count of live mounts and pending stops holding this state.
+     *   [ScpHotStreamCoordinator] removes this state from its map when that count reaches zero,
+     *   which happens only after every stop this state recorded has completed.
+     */
+    internal class KeyState {
+        val mutex = Mutex()
+        var liveMounts = 0
+        val heldStops = mutableListOf<HeldStop>()
+        var lastStop: Job? = null
+        var nextStop: CompletableJob? = null
+        val holders = AtomicInteger(0)
+    }
+}
+
+/**
+ * Compose access to one [HotStreamFactory]'s context-event and incoming-message streams.
+ *
+ * This class constructs its own [HotStreamFactory] over [bindings] and its own
+ * [ScpHotStreamCoordinator] on [scope], and exposes neither, so the coordinator that orders a
+ * factory's subscriptions is always the one constructed with that factory, and no second
+ * coordinator can reach it. [rememberContextEvents] and [rememberIncomingMessages] derive each
+ * subscription's key from its stream and its context handle, so every mount of one
+ * subscription counts under one key. A second instance over the same [bindings] opens a
+ * second Rust subscription per stream it serves, and only that instance's stops release it.
+ *
+ * An application container, a dependency-graph singleton, or a ViewModel that every navigation
+ * destination shares (one scoped to the activity or to the navigation graph) holds one instance
+ * and passes it to every composable that shows a context's streams, so every screen showing
+ * one context's stream shares one Rust subscription.
  *
  * Usage:
  * ```kotlin
+ * // Built once, outside composition. Once every composable that passed hotStreams has left
+ * // composition, its owner calls hotStreams.close() and then cancels streamScope.
+ * val streamScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+ * val hotStreams = ScpHotStreams(bindings, streamScope, Dispatchers.IO)
+ *
  * @Composable
- * fun EventList(handle: Long, factory: HotStreamFactory) {
- *     val eventsState = rememberScpHotStream(
- *         key = handle,
- *         start = { factory.contextEvents(handle) },
- *         onStop = { factory.stopContextEvents(handle) },
- *     )
- *     val events = eventsState.value
+ * fun EventList(handle: Long, hotStreams: ScpHotStreams) {
+ *     val events = rememberContextEvents(hotStreams, handle).value
  *     if (events != null) {
  *         val eventList by rememberScpFlow(events, emptyList<String>())
  *     }
  * }
  * ```
  *
- * @param key Recomposition key. The subscription restarts if this changes.
- * @param start Suspend factory lambda that creates the [SharedFlow]. Called
- *   once per [key] value. Runs in a coroutine scoped to the Composable.
- * @param onStop Suspend cleanup lambda invoked when the Composable leaves
- *   composition. Called inside `runBlocking` on the Main thread, so it
- *   must not dispatch to `Dispatchers.Main` — doing so will deadlock.
- * @return Compose [State] holding the [SharedFlow], or `null` until
- *   the subscription is established.
+ * @param bindings Event bindings the owned [HotStreamFactory] subscribes through.
+ * @param scope Scope that runs every `onStop` the owned coordinator launches. Its owner calls
+ *   [close] and then cancels it, once every mount that passed this instance has left
+ *   composition; cancelling it without [close] skips each pending stop, logs that skip, and
+ *   refuses every later start.
+ * @param ioDispatcher Dispatcher the owned [HotStreamFactory] subscribes and releases on. A test
+ *   injects a `StandardTestDispatcher` here.
+ */
+class ScpHotStreams(
+    bindings: EventContextBindings,
+    scope: CoroutineScope,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) {
+    internal val factory = HotStreamFactory(bindings, ioDispatcher)
+    internal val coordinator = ScpHotStreamCoordinator(scope)
+
+    /**
+     * Release every Rust subscription this instance opened. Its owner calls this once every
+     * mount that passed this instance has left composition, and before it cancels `scope`.
+     *
+     * This refuses every later `start` with [ScpHotStreamCoordinatorClosedException], waits for
+     * each running `start` and each stop launched before it reached that stream (not a stop a
+     * mount leaving during this call launches later), and then calls
+     * [HotStreamFactory.stopAll], so a subscription whose stop a cancelled `scope` skipped, or
+     * whose stop this call did not wait for, is released too. A mount still composed when this
+     * runs loses its subscription and receives nothing further.
+     *
+     * The whole body runs under [NonCancellable], so an owner that calls this from a cancelled
+     * coroutine (a `finally` block, or a scope already being torn down) still waits for each
+     * pending stop and still reaches [HotStreamFactory.stopAll]. A cancellable wait would throw
+     * there first, and every subscription this call exists to release would stay open.
+     */
+    suspend fun close() {
+        withContext(NonCancellable) {
+            coordinator.close()
+            factory.stopAll()
+        }
+    }
+}
+
+/**
+ * Remember [contextHandle]'s context-event stream from [hotStreams], opened through
+ * [HotStreamFactory.contextEvents] and released through [HotStreamFactory.stopContextEvents]
+ * when the last mount of that stream leaves composition.
+ *
+ * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens. A
+ *   mount that starts after [hotStreams] is closed or its scope is cancelled has its start
+ *   refused, and its [State] stays `null`. A subscribe that throws (for example on a context
+ *   the engine has already dropped) is logged at warning level under `ScpHotStreamCoordinator`
+ *   and leaves its [State] `null`; the release still runs once the last mount of that stream
+ *   leaves composition. A mount that already holds a [SharedFlow] keeps it; once
+ *   [ScpHotStreams.close] runs, that flow receives nothing further.
  */
 @Composable
-fun <T> rememberScpHotStream(
+fun rememberContextEvents(
+    hotStreams: ScpHotStreams,
+    contextHandle: Long,
+): State<SharedFlow<String>?> =
+    rememberScpHotStream(
+        key = HotStreamKind.CONTEXT_EVENTS to contextHandle,
+        coordinator = hotStreams.coordinator,
+        start = { hotStreams.factory.contextEvents(contextHandle) },
+        onStop = { hotStreams.factory.stopContextEvents(contextHandle) },
+    )
+
+/**
+ * Remember [contextHandle]'s incoming-message stream from [hotStreams], opened through
+ * [HotStreamFactory.incomingMessages] and released through [HotStreamFactory.stopMessageStream]
+ * when the last mount of that stream leaves composition.
+ *
+ * @return Compose [State] holding the [SharedFlow], or `null` until the subscription opens. A
+ *   mount that starts after [hotStreams] is closed or its scope is cancelled has its start
+ *   refused, and its [State] stays `null`. A subscribe that throws (for example on a context
+ *   the engine has already dropped) is logged at warning level under `ScpHotStreamCoordinator`
+ *   and leaves its [State] `null`; the release still runs once the last mount of that stream
+ *   leaves composition. A mount that already holds a [SharedFlow] keeps it; once
+ *   [ScpHotStreams.close] runs, that flow receives nothing further.
+ */
+@Composable
+fun rememberIncomingMessages(
+    hotStreams: ScpHotStreams,
+    contextHandle: Long,
+): State<SharedFlow<String>?> =
+    rememberScpHotStream(
+        key = HotStreamKind.INCOMING_MESSAGES to contextHandle,
+        coordinator = hotStreams.coordinator,
+        start = { hotStreams.factory.incomingMessages(contextHandle) },
+        onStop = { hotStreams.factory.stopMessageStream(contextHandle) },
+    )
+
+/** Which [HotStreamFactory] stream a hot-stream key names, paired with a context handle. */
+internal enum class HotStreamKind {
+    CONTEXT_EVENTS,
+    INCOMING_MESSAGES,
+}
+
+/**
+ * Remember and manage one hot stream subscription within a Composable. [rememberContextEvents]
+ * and [rememberIncomingMessages] are its only production callers, and each passes a key that
+ * names one subscription.
+ *
+ * [start] runs once each time this mount begins under a ([key], [coordinator]) pair, and not
+ * at all when the mount leaves before [start] takes the key's mutex. [coordinator] sequences
+ * [start] and [onStop] across mounts: a [start] for one key waits for an [onStop] that an
+ * earlier mount launched under that key, and a mount that leaves while another mount under
+ * that key is still composed defers its [onStop] until the last mount under that key leaves.
+ * [coordinator] drops this mount's [onStop] when this mount's [start] never ran, or when its
+ * [start] returned the instance that the [start] of another departed mount, whose [onStop]
+ * [coordinator] still holds under [key], returned; it then runs that held [onStop] in its
+ * place. A mount whose [onStop] already ran in an earlier stop is not compared, so a later
+ * mount whose [start] returns that same instance keeps its own [onStop], which runs.
+ *
+ * @param key Recomposition key, compared with `equals`. The subscription restarts if it
+ *   changes. It names the one subscription [start] returns, because [coordinator] counts and
+ *   orders mounts per key only.
+ * @param coordinator Orders this mount's [start] after any [onStop] an earlier mount launched
+ *   under [key]. The subscription restarts if it changes. [State] stays `null` once its scope
+ *   is cancelled: the start is refused and logged at warning level.
+ * @param start Suspend lambda that opens the [SharedFlow]. Once it begins, disposal does not
+ *   cancel it: it runs to completion, so [coordinator] learns what it returned. It returns one
+ *   same [SharedFlow] instance to every mount of one subscription, as `HotStreamFactory` does,
+ *   because one stop of [coordinator] runs one [onStop] per instance among those it holds.
+ * @param onStop Suspend lambda that releases the subscription [start] returned, and nothing
+ *   else. [coordinator] runs it on its own scope once the last live mount under [key] leaves,
+ *   and skips it when this mount left before its [start] ran or when an [onStop] it runs first
+ *   came from a mount whose [start] returned the same instance. It must be idempotent, because
+ *   mounts that got one subscription as different instances each have their own [onStop] run.
+ *   Disposal returns without waiting for it.
+ * @return Compose [State] holding the [SharedFlow], or `null` until the subscription is
+ *   established. A [start] that throws is logged at warning level under
+ *   `ScpHotStreamCoordinator` and leaves the [State] `null` for this mount; its [onStop] still
+ *   runs once the last live mount under [key] leaves.
+ */
+@Composable
+internal fun <T> rememberScpHotStream(
     key: Any,
+    coordinator: ScpHotStreamCoordinator,
     start: suspend () -> SharedFlow<T>,
     onStop: suspend () -> Unit,
 ): State<SharedFlow<T>?> {
-    val flowState = remember(key) { mutableStateOf<SharedFlow<T>?>(null) }
-    val scope = remember(key) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+    // Both remembered values key on `key` AND `coordinator`, matching the
+    // DisposableEffect below. Keying the scope on `key` alone handed a changed
+    // coordinator the scope the previous effect's onDispose had already
+    // cancelled, so `scope.launch` returned an already-cancelled Job, `start`
+    // never ran, and `flowState` kept the previous coordinator's flow — a
+    // subscription nobody was serving, reported as a live one.
+    val flowState = remember(key, coordinator) { mutableStateOf<SharedFlow<T>?>(null) }
+    val scope = remember(key, coordinator) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
 
-    DisposableEffect(key) {
+    DisposableEffect(key, coordinator) {
+        // Counted when this effect applies, after composition and after every onDispose in
+        // the same apply pass, and before this effect's start launches. A mount under this
+        // key that leaves from here on therefore sees this one as live and stops nothing,
+        // and a mount that left in this pass has already run its unmount. A count taken during
+        // composition (in `remember`) would run before the outgoing mount's unmount, and would
+        // leak when Compose abandons that composition.
+        val mount = coordinator.mount(key)
         scope.launch {
-            flowState.value = start()
+            // `scope` has no CoroutineExceptionHandler, so an exception escaping this launch
+            // reaches the thread's uncaught-exception handler, which on Android kills the
+            // process. A throwing `start` (an FFI subscribe on a context the engine dropped)
+            // is logged here instead and leaves `flowState` null; the coordinator keeps this
+            // mount's onStop, because that `start` may have opened a subscription it did not
+            // return. `start` runs under NonCancellable, so a CancellationException it throws
+            // (a dispatcher that rejected its task, say) does not mean this mount was
+            // cancelled; it is wrapped so it is logged like any other throw. A
+            // CancellationException from startMounted itself (this mount left before its start
+            // ran) and an Error (a JVM fault) still propagate.
+            val loggedStart: suspend () -> SharedFlow<T> = {
+                try {
+                    start()
+                } catch (e: CancellationException) {
+                    throw IllegalStateException("hot stream start threw CancellationException", e)
+                }
+            }
+            runCatching { coordinator.startMounted(mount, loggedStart) }
+                .onSuccess { flowState.value = it }
+                .onFailure { failure ->
+                    if (failure is CancellationException || failure is Error) throw failure
+                    val message = if (failure is ScpHotStreamCoordinatorClosedException) {
+                        "hot stream not started"
+                    } else {
+                        "hot stream start threw; its State stays null"
+                    }
+                    Log.w(COORDINATOR_TAG, message, failure)
+                }
         }
         onDispose {
-            // Run onStop before cancelling the scope. Using runBlocking here
-            // is safe because onDispose runs on the composition thread (Main),
-            // and the scope uses Dispatchers.IO, so there is no deadlock risk.
-            // We must NOT launch { onStop() } then cancel — that races the
-            // coroutine against scope cancellation and onStop may never execute.
-            kotlinx.coroutines.runBlocking { onStop() }
+            // onDispose runs on a composition thread, which on Android is a main thread.
+            // A `runBlocking { onStop() }` here parks that thread until onStop returns,
+            // which risks an ANR and deadlocks whenever a dispatcher underneath onStop
+            // schedules work back onto a parked thread — SCP-117's failure, in a
+            // second spelling. See
+            // `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+            // unmount launches a stop only when this was the last live mount under this key
+            // (holding onStop for that stop otherwise), and records that stop's Job before it
+            // returns, so a start that a later mount begins under this same key joins that job
+            // instead of racing it. It drops onStop when this mount's start never ran there,
+            // and when this mount's start returned the object that the start of another
+            // departed mount, whose onStop it still holds under this key, returned; it runs that
+            // held onStop in its place. An onStop that an earlier stop already ran is not
+            // compared, so this onStop then stays held and runs.
+            // Cancelling `scope` afterwards cancels this mount's start only while it waits to
+            // run (a start already running finishes), and never that stop.
+            coordinator.unmount(mount, onStop)
             scope.cancel()
         }
     }
@@ -341,3 +934,35 @@ class ScpContextState(
 }
 
 private const val MAX_EVENT_LIST_SIZE = 100
+
+/**
+ * Log tag for every hot-stream warning in this file: an `onStop` that threw, which
+ * [ScpHotStreamCoordinator] catches; a stop that the cancellation of the coordinator's scope
+ * kept from running every `onStop` it held ([SCOPE_CANCELLED_BEFORE_STOP]); and, from
+ * [rememberScpHotStream], a `start` the coordinator refused ("hot stream not started") and a
+ * `start` that threw ("hot stream start threw; its State stays null").
+ */
+private const val COORDINATOR_TAG = "ScpHotStreamCoordinator"
+
+/** Warning [ScpHotStreamCoordinator] logs when its scope's cancellation skipped an `onStop`. */
+private const val SCOPE_CANCELLED_BEFORE_STOP =
+    "coordinator scope cancelled before every onStop ran; a hot stream subscription stays open"
+
+/** Where a mount stands before its `start` returns; [ScpHotStreamCoordinator.Mount.phase]. */
+internal enum class MountPhase {
+    /** Neither [ScpHotStreamCoordinator.startMounted] nor `unmount` has claimed the mount. */
+    NOT_STARTED,
+
+    /** `startMounted` claimed the mount and its `start` has not returned, or threw. */
+    STARTING,
+
+    /** `unmount` claimed the mount first, so its `start` never runs and its `onStop` is dropped. */
+    LEFT_UNSTARTED,
+}
+
+/**
+ * Thrown by [ScpHotStreamCoordinator]'s start path once that coordinator is closed or its scope
+ * is cancelled: no stop could release a subscription a `start` opened then, so the coordinator
+ * runs none.
+ */
+internal class ScpHotStreamCoordinatorClosedException(message: String) : IllegalStateException(message)

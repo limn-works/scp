@@ -23,10 +23,10 @@
 //!
 //! # Relationship to the openmls `Lifetime` clock (ADR-057 Prerequisite 1)
 //!
-//! openmls's `js` feature wires `fluvio_wasm_timer::SystemTime`, which reads a
-//! *live, un-captured* `Date.now()` — a second, unhardened clock openmls uses
-//! internally to stamp (`Lifetime::default`/`new`) and validate
-//! (`Lifetime::is_valid`) `KeyPackage` / `LeafNode` lifetimes. Prerequisite 1
+//! openmls's `js` feature wires `web_time::SystemTime` (openmls 0.9.0), which
+//! reads a *live, un-captured* `Date.now()` — a second, unhardened clock openmls
+//! uses internally to stamp (`Lifetime::default`/`new`) and validate
+//! (`Lifetime::validate`) `KeyPackage` / `LeafNode` lifetimes. Prerequisite 1
 //! routes SCP's use of that clock through the captured/hardened
 //! [`Clock`](scp_clock::Clock) this module provides. As of the Prereq-1 landing:
 //!
@@ -41,28 +41,30 @@
 //!   (add-member / key-package-DID) and pre-merge on staged-commit Add proposals
 //!   — and the RFC 9420 maximum-range bound openmls never enforces is added
 //!   there too.
-//! - **Residual (V3).** openmls's own internal `Lifetime::is_valid` on the
-//!   *Welcome tree-leaf* validation path is NOT injectable and NOT bracketable —
-//!   but not because the accessor is private. `LeafNode::life_time()` is
-//!   `pub(crate)`, yet `leaf_node_source()` IS public and its public
-//!   `LeafNodeSource::KeyPackage(Lifetime)` variant hands back the `Lifetime`
-//!   whenever you hold the `LeafNode`. The real blocker is that a *joined*
-//!   `MlsGroup` gives no public way to reach another member's `LeafNode`:
-//!   `members()`/`member_at()` yield `Member` (no lifetime),
-//!   `export_ratchet_tree()`'s `RatchetTree` has no public node iterator,
-//!   `public_group()` is `pub(crate)`, and only `own_leaf_node()`/`own_leaf()`
-//!   are public — and that own leaf is SCP-minted anyway, so bracketing it is
-//!   possible but pointless (it is not the attacker-supplied Welcome leaf).
-//!   openmls 0.8 also exposes no time-provider seam, so the internal check still
-//!   reads openmls's internal clock. Do NOT "fix" V3 by calling the public
-//!   `leaf_node_source()` on the wrong object — there is no object that yields
-//!   the joining peers' leaves. Closing this residual requires an upstream
-//!   openmls change — a time-provider seam on `OpenMlsProvider` covering
-//!   `Lifetime::new`/`is_valid` — requested upstream (see this change's PR body /
-//!   report for the filed feature-request text). Until then, page same-origin
-//!   integrity (CSP/SRI/COOP/COEP) remains load-bearing for the Welcome-leaf
-//!   freshness check, exactly as it already is for the wall clock this module
-//!   hardens.
+//! - **Welcome tree leaves: one check, against this module's clock (V3).**
+//!   openmls 0.9.0 exposes `MlsGroup::treesync()`, so `treesync().full_leaves()`
+//!   with `leaf_node_source()` reaches every joined-tree leaf's
+//!   `LeafNodeSource::KeyPackage(Lifetime)`. `scp_mls::group::join_group_from_bytes`
+//!   switches openmls's own tree-leaf `Lifetime` check off
+//!   (`skip_lifetime_validation`) and validates every KeyPackage-sourced leaf
+//!   against the injected hardened clock, with the maximum-range bound, after
+//!   `into_group` and before the group is adopted. A `Date.now()` override
+//!   made after this module initializes plays no part in a Welcome's
+//!   `Lifetime` decision; one made before it shifts the captured clock too.
+//! - **Residual: openmls's internal check still runs on two paths.** openmls
+//!   0.9.0's internal checks call `Lifetime::validate`, never
+//!   `validate_with_time` with a caller's time, so its own check inside
+//!   `KeyPackageIn::validate` and `process_message` still reads `web_time`'s
+//!   `Date.now()`, in addition to SCP's checks. Prerequisite 1's one-clock
+//!   criterion is therefore not yet met. Every accept decision on those paths
+//!   also needs SCP's check against this module's clock, so openmls's clock can
+//!   only add rejections: a page script that overrides `Date.now()` after this
+//!   module initializes can make an honest `KeyPackage` or commit fail, but
+//!   cannot get a forged `Lifetime` accepted. Page same-origin integrity
+//!   (CSP/SRI/COOP/COEP) stays load-bearing for every `Lifetime` decision,
+//!   because a script that runs before this module initializes shifts the
+//!   captured clock too. The residual closes when openmls lets the caller supply the
+//!   clock that `KeyPackageIn::validate` and `process_message` read.
 
 use scp_clock::Clock;
 

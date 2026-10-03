@@ -61,8 +61,8 @@ scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 # via openmls; dev-deps never ship in production or wasm32 builds. MPL-2.0
 # (allowed in deny.toml). Gated #[cfg(not(target_arch = "wasm32"))] in the
 # oracle test so `cargo check --target wasm32` is unaffected.
-hpke-rs = "0.6"
-hpke-rs-rust-crypto = "0.6"
+hpke-rs = "0.7"
+hpke-rs-rust-crypto = "0.7"
 
 [lints]
 workspace = true

@@ -430,10 +430,18 @@ SCP objects hold crypto state (MLS groups, key material, WebSocket connections) 
 | Python | `async with` (context manager) | `Context`, `Identity`, transport connections |
 | TypeScript | `using` / `Symbol.dispose` (Explicit Resource Management) | `Context`, `Identity` |
 | Swift | `deinit` + explicit `close()` | `Context`, `Identity` |
-| Kotlin | `use { }` / `Closeable` | `Context`, `Identity` |
+| Kotlin | one `suspend` teardown function, and no `Closeable` — see below | `SCP`, `Relay`, `Node`, `ScpHotStreams` (`scp-kt-android`) |
 | Go | `defer ctx.Close()` / `io.Closer` | `Context`, `Identity` |
 | C# | `await using` / `IAsyncDisposable` | `Context`, `Identity` |
 | Java | `try-with-resources` / `AutoCloseable` | `Context`, `Identity` |
+
+### Kotlin: why no `Closeable`
+
+`AutoCloseable.close()` is synchronous, and `use { }` treats its return as the end of the teardown, so a `close()` whose teardown suspends on an injected dispatcher can keep that promise only by blocking its calling thread. That fails in two ways: a caller injecting a `StandardTestDispatcher` parks the one thread that advances that dispatcher's scheduler, so the teardown never runs and `close()` never returns, which this repository observed as a hang in `ScpViewModel.onCleared()`'s tests; and an Android caller blocks a main thread, which risks an ANR. A bounded wait still blocks, so it trades a deadlock for an ANR rather than removing a blocking wait.
+
+`SCP`, `Relay`, `Node`, and `ScpHotStreams` (`scp-kt-android`) therefore each expose their teardown as one `suspend` function — `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()`, `ScpHotStreams.close()` — implement no `AutoCloseable`, and a caller invokes the teardown from a coroutine. The classes UniFFI generates, such as `Scp`, keep the synchronous `close()` UniFFI gives them. `SCP.shutdown` reaches the Rust engine through the UniFFI-generated `Scp` object. No production class implements the `ServerBindings` interface that `Relay` and `Node` call (`.docs/standards/sdk-capability-matrix.json` marks every Server operation `"kotlin": false`) or the `EventContextBindings` interface that `ScpHotStreams` releases through, so today those three teardowns reach only a test source set's stub; they suspend so that a production implementation inherits a suspending teardown. ADR-028 in `.docs/adrs/phase-6.md` carries this amendment; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records the observed deadlock and the ANR risk. Every other language in the table above keeps its idiomatic pattern, because none of them must satisfy a synchronous, `Unit`-returning interface method over a suspending call.
+
+Each of the three `shutdown` functions sets its shutdown flag inside its bridge call, once its teardown call returns, so a teardown call that throws leaves the object reading as live, while a cancellation the bridge raises after a finished teardown still finds the flag set. A caller that tears down from a `finally` block runs the call as `withContext(NonCancellable) { scp.shutdown(bridge) }`: `finally` usually runs because its coroutine was cancelled, and in a cancelled coroutine the bridge's `withContext(ioDispatcher)` throws `CancellationException` before the FFI call starts, so a bare `scp.shutdown(bridge)` there tears nothing down.
 
 ### Lifecycle invariant
 

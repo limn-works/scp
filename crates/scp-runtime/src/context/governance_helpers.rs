@@ -4203,6 +4203,29 @@ pub async fn propose_governance_action_inner(
         ));
     }
 
+    // A migration's destination create rejects an empty ceiling
+    // (construction.md M2), so a proposal carrying one would fail only when it
+    // executes. Reject it here with the typed error, before any proposal is
+    // recorded and after every check that refuses the proposer: the capability
+    // check (when `check_propose_capability` is set) and the presence-only check
+    // (`PermissionDenied`), the proposer-eligibility gate (`PermissionDenied`),
+    // the freeze gate (`GovernanceFailed`), and the governance engine's own
+    // proposer check (`GovernanceFailed`), which `check_proposer` runs here
+    // without recording and `propose` runs again below.
+    if let GovernanceAction::ProposeContextMigration {
+        new_context_params, ..
+    } = &action
+        && new_context_params.ceiling.is_empty()
+    {
+        cell.governance
+            .engine
+            .check_proposer(proposer_did)
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+        return Err(ContextError::CeilingRequired(
+            scp_protocol::context::CeilingDeclaration::Empty,
+        ));
+    }
+
     let gov_ctx = build_governance_context(&*cell, &*deps.clock);
     let (proposal, events) = {
         let mut view = cell.class_c_view();
