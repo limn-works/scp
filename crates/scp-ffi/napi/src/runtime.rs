@@ -1153,9 +1153,9 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
 /// instead of `NotConfiguredTransportProvider` (rejects everything).
 ///
-/// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_supervisor` which
-/// will win the `OnceLock` race if called first.
+/// **Must be called before any `context_create` / `context_import` /
+/// `reserve_key_package` / `context_join_from_welcome`** — those functions
+/// call `init_supervisor`, which wins the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via `crate::transport::configure_local_transport` so
 /// that E2E tests can exercise `contextSend` and `broadcastPublish` without
@@ -1207,9 +1207,9 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
 /// the given relay URL. This allows the supervisor's send pipeline (and
 /// thus `contextSend`) to publish encrypted payloads through the relay.
 ///
-/// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_supervisor` which
-/// will win the `OnceLock` race if called first.
+/// **Must be called before any `context_create` / `context_import` /
+/// `reserve_key_package` / `context_join_from_welcome`** — those functions
+/// call `init_supervisor`, which wins the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via `crate::transport::configure_relay_transport` so
 /// that E2E tests can exercise the full send → relay → subscribe → receive
