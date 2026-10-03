@@ -4281,6 +4281,55 @@ mod tests {
         );
     }
 
+    /// Asserts `result` is the error the mid-dial cancel branch of
+    /// `reconnect_transport_if_pending` returns: `ReconnectFailed` with an
+    /// empty `url` and the "while dials were in flight" reason. A per-URL
+    /// dial failure carries the URL, and the cancel check before install
+    /// carries a "before install" reason, so both fail this assertion.
+    fn assert_cancelled_mid_dial(result: &Result<(), LifecycleError>) {
+        assert!(
+            matches!(
+                result,
+                Err(LifecycleError::ReconnectFailed { url, reason })
+                    if url.is_empty() && reason.contains("while dials were in flight")
+            ),
+            "reconnect must end through the mid-dial cancel branch \
+             (ReconnectFailed, empty url, \"while dials were in flight\"), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn assert_cancelled_mid_dial_accepts_only_the_mid_dial_cancel_error() {
+        let failed = |url: &str, reason: &str| -> Result<(), LifecycleError> {
+            Err(LifecycleError::ReconnectFailed {
+                url: url.to_owned(),
+                reason: reason.to_owned(),
+            })
+        };
+        assert_cancelled_mid_dial(&failed(
+            "",
+            "reconnect suspended during reconnect — caller invoked suspend()/shutdown() while dials were in flight",
+        ));
+        let rejected = [
+            // Per-URL dial failure.
+            failed("ws://192.0.2.1:1/", "connect timeout after 5s"),
+            // Cancel check before install.
+            failed(
+                "",
+                "reconnect suspended during reconnect — caller invoked suspend()/shutdown() before install",
+            ),
+            // Spawned dial task panicked.
+            failed("", "spawned reconnect task panicked: boom"),
+            Ok(()),
+        ];
+        for result in rejected {
+            assert!(
+                std::panic::catch_unwind(|| assert_cancelled_mid_dial(&result)).is_err(),
+                "assert_cancelled_mid_dial must reject {result:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn suspend_cancels_in_flight_reconnect_dial() {
         // A `suspend()` firing while `reconnect_transport_if_pending` is
@@ -4310,13 +4359,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            matches!(
-                reconnect_result,
-                Err(LifecycleError::ReconnectFailed { .. })
-            ),
-            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
-        );
+        assert_cancelled_mid_dial(&reconnect_result);
         assert!(
             !instance.has_transport(),
             "suspend must leave transport cleared after the cancelled reconnect"
@@ -4327,7 +4370,7 @@ mod tests {
     async fn shutdown_cancels_in_flight_reconnect_dial() {
         // `shutdown()` must also cancel a pending reconnect. Same dynamics
         // as the suspend variant. `shutdown()` reaches `block_in_place`
-        // through the supervisor's sync flush, so this test needs the
+        // through `shutdown_all_contexts_sync`, so this test needs the
         // multi-thread runtime.
         use std::time::Duration;
 
@@ -4347,13 +4390,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            matches!(
-                reconnect_result,
-                Err(LifecycleError::ReconnectFailed { .. })
-            ),
-            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
-        );
+        assert_cancelled_mid_dial(&reconnect_result);
     }
 
     #[tokio::test]
