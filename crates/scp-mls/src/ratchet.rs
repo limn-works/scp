@@ -237,7 +237,8 @@ mod tests {
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
-        let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+        let bob_group =
+            join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         (alice_group, bob_group)
     }

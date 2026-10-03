@@ -32,28 +32,59 @@ use crate::convergent_timestamp::decode_convergent_timestamp_aad;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
 
-/// Maps an openmls `process_message` error to an [`MlsError`], distinguishing the
-/// **own-message** case — a self-authored frame the untrusted relay echoed back to
-/// its author (ADR-057) — from a genuine decryption failure.
-///
-/// The relay delivers a PUBLISH to ALL subscribers of a routing id, INCLUDING the
-/// publisher, so every member receives the echo of its own
-/// `PseudonymAnnouncement` on the shared `context_routing_id` it publishes to and
-/// subscribes to. openmls returns [`ValidationError::CannotDecryptOwnMessage`] for
-/// that echo; this maps it to the typed [`MlsError::CannotDecryptOwnMessage`] so
-/// the receive loop can DROP it benignly (symmetric with an unknown-routing_id
-/// drop) rather than surfacing a spurious decrypt error. Every other
-/// `process_message` failure remains a [`MlsError::DecryptionFailed`].
-fn classify_process_message_error<S: std::fmt::Display>(e: ProcessMessageError<S>) -> MlsError {
-    match e {
-        ProcessMessageError::ValidationError(ValidationError::CannotDecryptOwnMessage) => {
-            MlsError::CannotDecryptOwnMessage
-        }
-        other => MlsError::DecryptionFailed(other.to_string()),
-    }
-}
 use crate::lifetime::validate_key_package_lifetime;
 use crate::wrapping_extension::extract_wrapping_key;
+
+/// Runs `MlsGroup::process_message` on an inbound protocol message and rejects
+/// a self-authored echo.
+///
+/// Every `process_message` error maps to [`MlsError::DecryptionFailed`]. A
+/// tampered ciphertext is one such error: openmls 0.9.0 returns
+/// `MessageDecryptionError::AeadError` for it in debug and release builds
+/// alike (ADR-057 §Prereq-4). The `catch_unwind` guard converts any other
+/// upstream panic into [`MlsError::DecryptionFailed`], so a malicious relay
+/// cannot crash a native client process. On wasm32 (`panic=abort`) the guard
+/// catches nothing; the typed error return is the guarantee there.
+///
+/// After a successful `process_message`, a frame this member authored that the
+/// untrusted relay echoed back returns [`MlsError::CannotDecryptOwnMessage`]
+/// before any caller reads the sender or the content (ADR-057). The relay
+/// delivers a PUBLISH to every subscriber of a routing id, the publisher
+/// included, so every member receives the echo of its own
+/// `PseudonymAnnouncement` on the shared `context_routing_id`. openmls 0.9.0
+/// returns `Ok` for that echo, with content
+/// `ProcessedMessageContent::OwnPrivateMessage`, an undecrypted body, and an
+/// unverified signature; the typed error lets the receive loop drop it benignly
+/// instead of reading an unauthenticated sender or AAD.
+/// `ProcessedMessageContent::OwnPendingCommit` gets the same error, but a
+/// `PrivateMessage` never reaches it: openmls 0.9.0's `from_inbound_ciphertext`
+/// (`framing/validation.rs`) returns `OwnPrivateMessage` for every
+/// `PrivateMessage` whose sender is the local member, before decryption, so a
+/// member's own Commit sent as a `PrivateMessage` also arrives as
+/// `OwnPrivateMessage`.
+fn process_inbound(
+    g: &mut MlsGroup,
+    provider: &crate::InMemoryMlsProvider,
+    protocol_message: ProtocolMessage,
+) -> Result<ProcessedMessage, MlsError> {
+    let processed = match catch_unwind(AssertUnwindSafe(|| {
+        g.process_message(provider, protocol_message)
+    })) {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Err(_) => {
+            return Err(MlsError::DecryptionFailed(
+                "OpenMLS panicked during message processing".to_string(),
+            ));
+        }
+    };
+    match processed.content() {
+        ProcessedMessageContent::OwnPrivateMessage | ProcessedMessageContent::OwnPendingCommit => {
+            Err(MlsError::CannotDecryptOwnMessage)
+        }
+        _ => Ok(processed),
+    }
+}
 
 /// The result of decrypting an MLS protocol message.
 ///
@@ -160,45 +191,10 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
         .try_into_protocol_message()
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
-    // Process the message — this verifies membership tag and generation number.
-    //
-    // In a DEBUG/native build, OpenMLS's decrypt path can panic on AEAD
-    // decryption failure for a tampered ciphertext (e.g. a corrupted
-    // authentication tag): the panic is an openmls `debug_assert!`
-    // ("Ciphertext decryption failed",
-    // openmls-0.8.1/src/framing/private_message_in.rs). We guard against it with
-    // `catch_unwind`, converting the panic into an `MlsError::DecryptionFailed`
-    // so a malicious relay cannot crash a native client process (DoS).
-    //
-    // NOTE (ADR-057 §Prereq-4): the LOAD-BEARING fail-closed guarantee is NOT
-    // this `catch_unwind` — it is the `--release` build. That openmls panic is a
-    // `debug_assert!`, so it is COMPILED OUT of release builds; a shipped
-    // `--release` client (native cdylib and the browser `wasm-pack build
-    // --release` artifact alike) gets a typed `Err` from `process_message` on
-    // tampered/malformed ciphertext, which becomes `MlsError::DecryptionFailed`
-    // (browser: `[SCP-CRYPTO-4010]`). Pinned by `[profile.release]
-    // debug-assertions = false` (root `Cargo.toml`) plus the decrypt-path fuzz
-    // target `fuzz/fuzz_targets/fuzz_mls_decrypt.rs`; the browser SDK MUST build
-    // `--release` (a `--dev` build would re-arm the `debug_assert`). This
-    // `catch_unwind` remains as DEFENSE-IN-DEPTH for native/debug builds (where
-    // the assert can fire) and is a harmless no-op on the release wasm path
-    // (wasm `panic=abort`, so nothing to catch — and no release-mode panic has
-    // been *found* on this path). It is NOT relied upon for the browser
-    // guarantee. This applies to every `catch_unwind` site in this file.
+    // Process the message — this verifies membership tag and generation number,
+    // and rejects a self-authored echo (see `process_inbound`).
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    let process_result = catch_unwind(AssertUnwindSafe(|| {
-        g.process_message(&group.provider, protocol_message)
-    }));
-
-    let processed = match process_result {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(classify_process_message_error(e)),
-        Err(_) => {
-            return Err(MlsError::DecryptionFailed(
-                "OpenMLS panicked during message processing".to_string(),
-            ));
-        }
-    };
+    let processed = process_inbound(g, &group.provider, protocol_message)?;
 
     // Extract the application message content.
     match processed.into_content() {
@@ -252,28 +248,10 @@ pub fn decrypt_with_sender_key(
         .try_into_protocol_message()
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
-    // Process the message — this verifies membership tag and generation number.
-    //
-    // Debug/native-only openmls decrypt `debug_assert!` panic on a tampered
-    // ciphertext; guarded with catch_unwind (same as in `decrypt`).
-    // NOTE (ADR-057 §Prereq-4): the load-bearing fail-closed guarantee is the
-    // `--release` build (the assert is compiled out → typed `Err`); this
-    // catch_unwind is defense-in-depth for native/debug builds, a no-op on the
-    // release wasm path. See the full note on the `decrypt` site above.
+    // Process the message — this verifies membership tag and generation number,
+    // and rejects a self-authored echo before the sender lookup below.
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    let process_result = catch_unwind(AssertUnwindSafe(|| {
-        g.process_message(&group.provider, protocol_message)
-    }));
-
-    let processed = match process_result {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(classify_process_message_error(e)),
-        Err(_) => {
-            return Err(MlsError::DecryptionFailed(
-                "OpenMLS panicked during message processing".to_string(),
-            ));
-        }
-    };
+    let processed = process_inbound(g, &group.provider, protocol_message)?;
 
     // Extract the sender's leaf index from the ProcessedMessage before
     // consuming it with into_content().
@@ -345,7 +323,7 @@ pub fn decrypt_with_sender_key(
 /// * `clock` - The injected hardened [`Clock`]. For a Commit, each Add
 ///   proposal's `KeyPackage` `Lifetime` is re-validated against it *before*
 ///   `merge_staged_commit`, so an add carrying a forged/expired lifetime is
-///   rejected pre-merge — the openmls internal `Lifetime::is_valid` that ran
+///   rejected pre-merge — the openmls internal `Lifetime::validate` that ran
 ///   during `process_message` is on the un-injectable (wasm: unhardened) clock.
 pub fn decrypt_with_sender_did(
     group: &mut ScpMlsGroup,
@@ -364,24 +342,8 @@ pub fn decrypt_with_sender_did(
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    // NOTE (ADR-057 §Prereq-4): the load-bearing fail-closed guarantee is the
-    // `--release` build (openmls's decrypt `debug_assert!` is compiled out →
-    // typed `Err`); this catch_unwind is defense-in-depth for native/debug
-    // builds, a harmless no-op on the release wasm path. See the full note on
-    // the `decrypt` site above.
-    let process_result = catch_unwind(AssertUnwindSafe(|| {
-        g.process_message(&group.provider, protocol_message)
-    }));
-
-    let processed = match process_result {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(classify_process_message_error(e)),
-        Err(_) => {
-            return Err(MlsError::DecryptionFailed(
-                "OpenMLS panicked during message processing".to_string(),
-            ));
-        }
-    };
+    // Rejects a self-authored echo before the sender lookup below.
+    let processed = process_inbound(g, &group.provider, protocol_message)?;
 
     // Extract the sender's leaf index before consuming the ProcessedMessage.
     let sender = processed.sender().clone();
@@ -440,6 +402,11 @@ pub fn decrypt_with_sender_did(
             // Proposals are cached by OpenMLS automatically during
             // process_message — no explicit action needed.
             Ok(DecryptedContent::Proposal { sender_did })
+        }
+        // `process_inbound` already rejected both variants; the arm keeps the
+        // match exhaustive and fails closed with the same typed error.
+        ProcessedMessageContent::OwnPrivateMessage | ProcessedMessageContent::OwnPendingCommit => {
+            Err(MlsError::CannotDecryptOwnMessage)
         }
     }
 }
@@ -743,24 +710,8 @@ pub fn decrypt_with_membership_changes(
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    // NOTE (ADR-057 §Prereq-4): the load-bearing fail-closed guarantee is the
-    // `--release` build (openmls's decrypt `debug_assert!` is compiled out →
-    // typed `Err`); this catch_unwind is defense-in-depth for native/debug
-    // builds, a harmless no-op on the release wasm path. See the full note on
-    // the `decrypt` site above.
-    let process_result = catch_unwind(AssertUnwindSafe(|| {
-        g.process_message(&group.provider, protocol_message)
-    }));
-
-    let processed = match process_result {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(classify_process_message_error(e)),
-        Err(_) => {
-            return Err(MlsError::DecryptionFailed(
-                "OpenMLS panicked during message processing".to_string(),
-            ));
-        }
-    };
+    // Rejects a self-authored echo before the sender lookup below.
+    let processed = process_inbound(g, &group.provider, protocol_message)?;
 
     // Capture the VERIFIED authenticated_data (AAD) before consuming the
     // ProcessedMessage. `ProcessedMessage::aad()` is post-verification: it is the
@@ -859,7 +810,7 @@ pub fn decrypt_with_membership_changes(
             // SECURITY (ADR-057 §Prereq-1): re-validate each Add proposal's
             // KeyPackage `Lifetime` against the injected hardened clock (plus the
             // RFC 9420 max-range bound) BEFORE merging. process_message ran
-            // openmls's own `Lifetime::is_valid` on its un-injectable (wasm:
+            // openmls's own `Lifetime::validate` on its un-injectable (wasm:
             // unhardened) clock; this bracket is the hardened counterpart. On
             // failure we return WITHOUT merging (via `?`), leaving the group on
             // its current epoch — fail-closed, consistent with the Remove path
@@ -910,6 +861,11 @@ pub fn decrypt_with_membership_changes(
             // A bare proposal commits no membership change and stamps no leaf, so
             // it carries no convergent timestamp — the AAD is ignored here.
             Ok(InboundChange::Proposal { sender_did })
+        }
+        // `process_inbound` already rejected both variants; the arm keeps the
+        // match exhaustive and fails closed with the same typed error.
+        ProcessedMessageContent::OwnPrivateMessage | ProcessedMessageContent::OwnPendingCommit => {
+            Err(MlsError::CannotDecryptOwnMessage)
         }
     }
 }
@@ -964,7 +920,8 @@ mod tests {
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
         // Bob joins using the Welcome message.
-        let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+        let bob_group =
+            join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         (alice_group, bob_group)
     }
@@ -1111,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
+    #[allow(clippy::unwrap_used, clippy::panic)]
     fn decrypt_returns_error_for_tampered_aead_tag() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
 
@@ -1126,27 +1083,24 @@ mod tests {
             *byte ^= 0xFF;
         }
 
-        // Must return an error (not panic) thanks to the catch_unwind guard.
+        // openmls 0.9.0 returns a typed AEAD error for a tampered tag; the
+        // message must not be the panic guard's.
         let result = decrypt(&mut bob_group, &ciphertext_bytes);
-        assert!(
-            result.is_err(),
-            "decrypt must return error for tampered AEAD tag, not panic"
-        );
-
-        // Verify the error is DecryptionFailed.
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("decryption failed"),
-            "error should indicate decryption failure, got: {err_msg}"
-        );
+        match result {
+            Err(MlsError::DecryptionFailed(msg)) => assert!(
+                !msg.contains("panicked"),
+                "tampered AEAD tag must be a typed openmls error, not a caught panic: {msg}"
+            ),
+            other => panic!("expected DecryptionFailed for tampered AEAD tag, got {other:?}"),
+        }
     }
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn group_remains_usable_after_caught_decrypt_panic() {
+    fn group_remains_usable_after_rejected_tampered_ciphertext() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
 
-        // First: trigger a caught panic via tampered ciphertext.
+        // First: a tampered ciphertext is rejected.
         let ct_msg = encrypt(&mut alice_group, b"will be tampered").unwrap();
         let mut tampered_bytes = serialize_ciphertext(&ct_msg).unwrap();
         if let Some(byte) = tampered_bytes.last_mut() {
@@ -1157,7 +1111,7 @@ mod tests {
         assert!(bad_result.is_err(), "tampered ciphertext must fail");
 
         // Second: encrypt and decrypt a legitimate message to prove the
-        // group is still functional after the caught panic.
+        // group is still functional after the rejection.
         let good_plaintext = b"still works";
         let good_ct_msg = encrypt(&mut alice_group, good_plaintext).unwrap();
         let good_ct_bytes = serialize_ciphertext(&good_ct_msg).unwrap();
@@ -1165,8 +1119,41 @@ mod tests {
         let decrypted = decrypt(&mut bob_group, &good_ct_bytes).unwrap();
         assert_eq!(
             decrypted, good_plaintext,
-            "group must remain usable after a caught decrypt panic"
+            "group must remain usable after a rejected tampered ciphertext"
         );
+    }
+
+    /// A member that processes its own ciphertext (the relay's echo) gets the
+    /// typed `CannotDecryptOwnMessage` from every decrypt entry point, not a
+    /// wildcard `NotApplicationMessage` or a sender lookup on its own leaf.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn own_echo_is_rejected_by_all_four_decrypt_functions() {
+        type DecryptFn = fn(&mut ScpMlsGroup, &[u8]) -> Result<(), MlsError>;
+        let entry_points: [(&str, DecryptFn); 4] = [
+            ("decrypt", |g, ct| decrypt(g, ct).map(drop)),
+            ("decrypt_with_sender_key", |g, ct| {
+                decrypt_with_sender_key(g, ct).map(drop)
+            }),
+            ("decrypt_with_sender_did", |g, ct| {
+                decrypt_with_sender_did(g, ct, &SystemClock).map(drop)
+            }),
+            ("decrypt_with_membership_changes", |g, ct| {
+                decrypt_with_membership_changes(g, ct, &SystemClock).map(drop)
+            }),
+        ];
+        let (mut alice_group, _bob_group) = setup_alice_bob();
+        for (name, decrypt_fn) in entry_points {
+            let ct_msg = encrypt(&mut alice_group, name.as_bytes()).unwrap();
+            let ct_bytes = serialize_ciphertext(&ct_msg).unwrap();
+            let result = decrypt_fn(&mut alice_group, &ct_bytes);
+            assert!(
+                matches!(result, Err(MlsError::CannotDecryptOwnMessage)),
+                "{name} must reject the own echo with CannotDecryptOwnMessage, got {result:?}"
+            );
+        }
+        // The group stays usable: the next own message still encrypts.
+        encrypt(&mut alice_group, b"after echoes").unwrap();
     }
 
     #[test]
@@ -1208,7 +1195,8 @@ mod tests {
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
         let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
-        let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
+        let mut bob_group =
+            join_group(&add_result.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         // Record Bob's epoch before Alice's update.
         let bob_epoch_before = bob_group.group.as_ref().unwrap().epoch().as_u64();
@@ -1281,7 +1269,8 @@ mod tests {
             generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
         let add_bob = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
-        let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
+        let mut bob_group =
+            join_group(&add_bob.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         let carol_cred = test_credential("carol");
         // ADR-057 sender-key distribution: Carol's KeyPackage must publish an
@@ -1356,7 +1345,8 @@ mod tests {
             &SystemClock,
         )
         .unwrap();
-        let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
+        let mut bob_group =
+            join_group(&add_bob.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         // Carol's KeyPackage has NO wrapping key (plain generate_key_package).
         let carol_cred = test_credential("carol");
@@ -1406,7 +1396,8 @@ mod tests {
             &SystemClock,
         )
         .unwrap();
-        let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
+        let mut bob_group =
+            join_group(&add_bob.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         let carol_cred = test_credential("carol");
         // ADR-057 sender-key distribution INVARIANT 3: Carol's KeyPackage must

@@ -800,6 +800,85 @@ fn malformed_welcome_join_leaves_no_half_built_context() {
 }
 
 // ===========================================================================
+// 12b. A Welcome whose tree holds a leaf expired under the joiner's injected
+//      clock is rejected and leaves NO context (ADR-057 §Prereq-1)
+// ===========================================================================
+
+#[test]
+fn welcome_with_tree_leaf_expired_under_joiner_clock_is_rejected() {
+    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+    let real_now = SystemClock.now_secs();
+    let relay = Relay::new();
+
+    let mut alice = relay.party_with(
+        Arc::new(LocalSigner::active(ALICE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    alice.client.create_context(CTX).expect("Alice creates");
+
+    // Carol's KeyPackage is minted with her clock set so her leaf expires at
+    // `real_now + 600`, inside the window openmls's real-clock check accepts.
+    // Carol never commits, so her leaf keeps its KeyPackage `Lifetime` into
+    // Bob's tree; Alice's own leaf turns `Commit`-sourced when her add
+    // commits with a path.
+    let mut carol = relay.party_with(
+        Arc::new(LocalSigner::active(CAROL_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600)),
+    );
+    let carol_kp = carol
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Carol key package");
+    alice
+        .client
+        .add_member(CTX, &carol_kp)
+        .expect("Alice adds Carol");
+
+    // Bob's injected clock reads `real_now + 1200`: Carol's leaf is expired
+    // under it, while Bob's own leaf is valid.
+    let mut bob = relay.party_with(
+        Arc::new(LocalSigner::active(BOB_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now + 1200)),
+    );
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+
+    let err = bob
+        .client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .expect_err("a Welcome whose tree holds an expired leaf must be rejected");
+    match err {
+        ClientError::Mls(scp_mls::error::MlsError::KeyPackageLifetimeInvalid {
+            not_after,
+            now,
+            ..
+        }) => {
+            assert_eq!(not_after, real_now + 600, "the rejected leaf is Carol's");
+            assert_eq!(
+                now,
+                real_now + 1200,
+                "validated against Bob's injected clock"
+            );
+        }
+        other => panic!("expected Mls(KeyPackageLifetimeInvalid), got {other:?}"),
+    }
+
+    // Fail-closed: Bob holds NO context.
+    assert_eq!(bob.client.member_dids(CTX), None);
+    assert!(bob.client.mls_epoch(CTX).is_err());
+    assert_eq!(bob.client.event_log_root(CTX), None);
+}
+
+// ===========================================================================
 // 13. A failed join CONSUMES the in-memory pending material (single-use per
 //     attempt); recovery is via reconstruct-from-durable, not in-memory reuse
 // ===========================================================================

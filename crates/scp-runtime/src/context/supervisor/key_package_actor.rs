@@ -841,7 +841,11 @@ impl KeyPackageStoreActor {
     /// the dedicated [`ContextError::KeyPackageReplay`] — distinct from
     /// [`ContextError::InvalidState`] (which also means "unknown reservation")
     /// so a caller can detect a security-relevant single-use replay. Everything
-    /// else is a crypto failure.
+    /// else is a crypto failure, including a Welcome whose tree holds a
+    /// KeyPackage-sourced leaf that fails the injected-clock or maximum-range
+    /// lifetime check (ADR-057 §Prereq-1): that is the sender's tree, not the
+    /// caller's KeyPackage, so it is not [`ContextError::InvalidKeyPackage`].
+    /// No dedicated error variant for a rejected Welcome exists yet.
     fn map_join_error(e: &MlsError) -> ContextError {
         match e {
             MlsError::KeyPackageReplay => ContextError::KeyPackageReplay(

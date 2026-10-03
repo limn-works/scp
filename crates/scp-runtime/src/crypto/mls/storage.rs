@@ -969,9 +969,11 @@ impl<S: Storage> StorageProvider<CURRENT_VERSION> for MlsStorageBridge<S> {
 
 /// Complete `OpenMLS` provider combining `RustCrypto` with persistent storage.
 ///
-/// `ScpMlsProvider<S>` replaces the in-memory `OpenMlsRustCrypto` provider
-/// with one that persists MLS state through [`MlsStorageBridge<S>`]. Crypto
-/// operations and randomness use `RustCrypto` (same as `OpenMlsRustCrypto`).
+/// `ScpMlsProvider<S>` is the persistent counterpart of
+/// [`scp_mls::provider::InMemoryMlsProvider`]: it keeps MLS state through
+/// [`MlsStorageBridge<S>`] instead of openmls's in-memory `MemoryStorage`.
+/// Crypto operations and randomness use `RustCrypto`, as they do in
+/// `InMemoryMlsProvider`.
 ///
 /// See spec section 17.9. See SCP-PERSIST-050.
 pub struct ScpMlsProvider<S: Storage> {
@@ -1029,8 +1031,9 @@ impl<S: Storage> OpenMlsProvider for ScpMlsProvider<S> {
 ///
 /// Each provider instance has independent storage. This is retained for
 /// backward compatibility with existing tests and Phase 1 code. The
-/// `InMemoryMlsProvider` type alias itself now lives in the `scp-mls` crate
-/// (ADR-057); it is re-exported from `crate::crypto::mls`.
+/// `InMemoryMlsProvider` type itself lives in `scp_mls::provider` (ADR-057),
+/// which zeroizes its storage when the provider drops; callers import it from
+/// `scp_mls`.
 ///
 /// # Example
 ///
@@ -1039,7 +1042,7 @@ impl<S: Storage> OpenMlsProvider for ScpMlsProvider<S> {
 /// ```
 #[must_use]
 pub(crate) fn new_provider() -> scp_mls::InMemoryMlsProvider {
-    openmls_rust_crypto::OpenMlsRustCrypto::default()
+    scp_mls::InMemoryMlsProvider::default()
 }
 
 // ---------------------------------------------------------------------------

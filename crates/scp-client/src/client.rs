@@ -237,7 +237,8 @@ pub struct ScpClient {
     routing_index: HashMap<[u8; 32], String>,
     /// Observability counter: inbound frames dropped as **self-echoes** — this
     /// member's own publish delivered back by the relay (which has no publisher
-    /// exclusion) and rejected by openmls as `CannotDecryptOwnMessage`. In-memory
+    /// exclusion), which openmls returns as `OwnPrivateMessage` and scp-mls
+    /// rejects as `MlsError::CannotDecryptOwnMessage`. In-memory
     /// only; read via [`Self::dropped_frame_counts`]. Expected to be non-zero in
     /// normal operation (every announcement self-echoes once).
     dropped_self_echo: u64,
@@ -737,7 +738,12 @@ impl ScpClient {
         // `join_group_from_bytes` is the wire-path variant: it deserializes the
         // Welcome (as `MlsMessageIn`) internally, so the driver never has to
         // name the inbound MLS message type.
-        let mls_group = join_group_from_bytes(welcome_bytes, pending.provider, pending.signer)?;
+        let mls_group = join_group_from_bytes(
+            welcome_bytes,
+            pending.provider,
+            pending.signer,
+            self.clock.as_ref(),
+        )?;
         let crypto = ContextCryptoState::from_group_with_wrapping(
             context_id,
             mls_group,
@@ -781,10 +787,9 @@ impl ScpClient {
         //
         // The authenticated source is each member's signed
         // `scp_wrapping_key` leaf extension in the (now Welcome-embedded) ratchet
-        // tree; sourcing recipients from there is blocked only because openmls does
-        // not expose remote leaf extensions via its public API, and lands with the
-        // leaf-signing / custody slice (§23.13) — the same residual T3/T4 name for
-        // the convergent timestamp. Triggers 1 (adder→joiner) and 3
+        // tree, but [`scp_mls::extract_member_wrapping_key`] returns only the
+        // local member's key; its rustdoc says why.
+        // Triggers 1 (adder→joiner) and 3
         // (bystander→joiner) do NOT share this gap: they read the wrapping key from
         // a validated KeyPackage / Add proposal.
         for (member_did, member_wrapping_key) in wrapping_keys {

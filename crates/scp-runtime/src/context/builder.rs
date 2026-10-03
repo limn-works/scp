@@ -704,12 +704,11 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 // it back to the caller, which seeds the spawning actor directly. There is no
 // provider-side crypto to roll back. On a post-birth creation failure the owned
 // material is disposed on the rollback branch (`OwnedMlsCryptoState::dispose_secrets`,
-// F6) — a bare drop FREES the group's in-memory OpenMLS storage but does NOT
-// zeroize the Ed25519 signer (OpenMLS `SignatureKeyPair` has no `Zeroize`;
-// scp-mls `EagerDropSigner` / issue #82). `destroy_group` eagerly frees the same
-// material (signer freed, NOT zeroized — #82); on this rollback branch the owner
-// drops immediately after, so the explicit dispose is defense-in-depth /
-// forward-compat with #82. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
+// F6) — a bare drop zeroizes the group's in-memory OpenMLS storage values and
+// the Ed25519 signer (OpenMLS `SignatureKeyPair` holds its private key in
+// `SecretVLBytes`). `destroy_group` releases the same material; on this rollback
+// branch the owner drops immediately after, so the explicit dispose is
+// equivalent to that drop. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
 // Only the event log retains a provider-resident rollback handle.
 
 /// Opaque handle representing ownership of a created event log.
@@ -750,8 +749,8 @@ impl EventLogHandle {
 /// and transport publication (`bool` — no recoverable local state, rollback
 /// issues a best-effort DELETE to remote relays). A post-birth creation failure
 /// disposes the `OwnedMlsCryptoState` on the rollback branch (`dispose_secrets`,
-/// which eagerly frees the group via `destroy_group` — signer freed, NOT
-/// zeroized, #82; the `SenderKey` zeroizes on drop), so there is nothing
+/// which eagerly frees the group via `destroy_group` — the signer and the
+/// `SenderKey` zeroize on drop), so there is nothing
 /// crypto-shaped left for the receipt to roll back.
 #[derive(Debug, Default)]
 pub struct CreationReceipt {
@@ -773,9 +772,9 @@ impl CreationReceipt {
     /// rollback arms are GONE — crypto is never provider-resident during
     /// creation. A post-birth failure disposes the owned material on the caller's
     /// rollback branch (`dispose_secrets` eagerly frees the group via
-    /// `destroy_group` — signer freed, NOT zeroized, #82; the `SenderKey`
-    /// zeroizes on drop). On this branch the owner drops immediately after, so
-    /// the dispose is defense-in-depth / forward-compat with #82. Only the event
+    /// `destroy_group` — the signer and the `SenderKey` zeroize on drop). On
+    /// this branch the owner drops immediately after, so the dispose is
+    /// equivalent to that drop. Only the event
     /// log + publication are reversed here.
     pub async fn rollback(
         &self,
@@ -1009,12 +1008,11 @@ pub async fn create_context(
 
     // Step 4: Initialise event log.
     if let Err(e) = event_log_provider.init_event_log(&id_bytes).await {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto's OpenMLS
-        // group (`destroy_group`) before `owned` drops on this rollback. A bare
-        // drop already frees the in-memory group storage; the signer is freed
-        // either way, NOT zeroized (#82) — so this explicit dispose is
-        // defense-in-depth / forward-compat with #82. `SenderKey` zeroizes on
-        // its own drop.
+        // Dispose the born-but-never-seeded crypto's OpenMLS group
+        // (`destroy_group`) before `owned` drops on this rollback. A bare drop
+        // already wipes the in-memory group storage and zeroizes the signer, so
+        // this explicit dispose is equivalent to that drop. `SenderKey`
+        // zeroizes on its own drop.
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
@@ -1048,8 +1046,8 @@ pub async fn create_context(
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active) {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         if let Some(mut owned) = owned_crypto {
             owned.dispose_secrets();
         }
@@ -1072,8 +1070,8 @@ pub async fn create_context(
         )
         .await
     {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         // The handle is Active but `owned_crypto` is still live (returned to the
         // caller on success at step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {
@@ -1110,8 +1108,8 @@ pub async fn create_context(
         )
         .await
     {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         // `owned_crypto` is still live (returned to the caller on success at
         // step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {
@@ -1186,8 +1184,8 @@ pub async fn create_context(
     }
     .await;
     if let Err(e) = genesis_outlet_leaves {
-        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
-        // freed, NOT zeroized — #82) before it drops on this rollback.
+        // Dispose the born-but-never-seeded crypto before it drops on this
+        // rollback; the call is equivalent to that drop.
         // `owned_crypto` is still live (returned to the caller on success at
         // step 9), so it is the live owner here.
         if let Some(mut owned) = owned_crypto {

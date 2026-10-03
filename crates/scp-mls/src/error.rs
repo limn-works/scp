@@ -117,7 +117,7 @@ pub enum MlsError {
     /// range. Raised by
     /// [`validate_key_package_lifetime`](crate::lifetime::validate_key_package_lifetime),
     /// SCP's hardened counterpart to openmls's un-injectable internal
-    /// `Lifetime::is_valid` (ADR-057 §Prereq-1). The same variant covers both the
+    /// `Lifetime::validate` (ADR-057 §Prereq-1). The same variant covers both the
     /// temporal (expiry / not-before) failure and the maximum-range failure;
     /// `now` is the timestamp read from the injected clock at validation.
     #[error(
@@ -160,7 +160,8 @@ pub enum MlsError {
     /// exclusion). Every member publishes its `PseudonymAnnouncement` to the shared
     /// `context_routing_id` AND subscribes to it, so each announcement is echoed to
     /// its author, whose MLS state cannot decrypt its own outbound message
-    /// (openmls `ValidationError::CannotDecryptOwnMessage`). This is a **benign,
+    /// (openmls 0.9.0 returns it as `ProcessedMessageContent::OwnPrivateMessage`,
+    /// which `scp-mls` maps to this variant). This is a **benign,
     /// expected** outcome under the untrusted-relay model — the receive loop MUST
     /// treat it as a DROP (symmetric with an unknown-routing_id drop), NOT a
     /// failure. Distinct from [`Self::DecryptionFailed`] so callers can tell a

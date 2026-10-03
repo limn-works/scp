@@ -101,9 +101,9 @@ env:
 # ninth entry per generation would cost cache space that every run shares.
 #
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
-# 10 GB: it writes two further groups, `fuzz-run` and `fuzz-run-opt`, both holding
+# 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
-# comment on job fuzz-nightly says why two). Ten groups per generation across the two
+# comment on job fuzz-nightly says more). Nine groups per generation across the two
 # workflows, where the two together wrote thirty-six entries before.
 # `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
 # rust-cache step in any workflow that names no `shared-key` or no `save-if`, and any
@@ -2463,7 +2463,7 @@ jobs:
       # command runs in, so running `cargo check` from `fuzz/` resolves
       # `fuzz/rust-toolchain.toml` and installs the nightly it names — the same
       # invocation `fuzz/README.md` documents. That file records why the channel is a
-      # dated nightly and what unpins it.
+      # dated nightly.
       - name: Check fuzz crate compiles
         working-directory: fuzz
         run: cargo check

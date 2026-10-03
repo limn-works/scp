@@ -15,12 +15,12 @@
 //! override would reach `main` reporting a green check.
 //!
 //! WHAT IT COMPARES. `fuzz/rust-toolchain.toml` names a dated nightly, and rustc's version
-//! string carries the commit date rather than the channel date — `nightly-2026-05-03`
-//! reports `1.97.0-nightly (20de910db 2026-05-02)` — so the two dates do not match by
+//! string carries the commit date rather than the channel date — `nightly-2026-09-28`
+//! reports `1.101.0-nightly (d080e7dff 2026-09-27)` — so the two dates do not match by
 //! construction and this script does not compare them. It compares the release channel:
 //! when the file names a nightly, the compiler must be a nightly. A different nightly
-//! fails later, loudly, at openmls 0.8.1's prelude (E0365), which is the condition
-//! `fuzz/rust-toolchain.toml` records.
+//! can fail later, loudly, at openmls 0.9.0's prelude glob re-export (E0365), which is
+//! the condition `fuzz/rust-toolchain.toml` records.
 
 use std::path::Path;
 use std::process::Command;

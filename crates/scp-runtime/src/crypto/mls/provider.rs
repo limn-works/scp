@@ -382,14 +382,15 @@ impl OwnedMlsCryptoState {
         }
     }
 
-    /// Best-effort teardown of a born-but-never-seeded payload's secrets on a
-    /// creation-rollback path (#2148 F6). A bare drop FREES the group's
-    /// in-memory `OpenMLS` storage but does NOT zeroize its epoch-secret bytes or
-    /// the Ed25519 signer (`OpenMLS` `SignatureKeyPair` implements no `Zeroize` —
-    /// `scp-mls` `EagerDropSigner` / issue #82); [`scp_mls::group::destroy_group`]
-    /// eagerly FREES the signer's `Vec<u8>` via `EagerDropSigner::take` (freed,
-    /// not overwritten — signer zeroization stays open upstream, #82). The
+    /// Teardown of a born-but-never-seeded payload's secrets on a
+    /// creation-rollback path. A bare drop zeroizes every value in
+    /// the group's in-memory `OpenMLS` provider storage (`scp_mls::InMemoryMlsProvider`
+    /// wipes on drop); the Ed25519 signer zeroizes on drop (`OpenMLS` `SignatureKeyPair` holds its
+    /// private key in `SecretVLBytes`), and [`scp_mls::group::destroy_group`]
+    /// drops both. The
     /// [`SenderKey`] zeroizes on its own `ZeroizeOnDrop` when the payload drops.
+    /// Every caller drops the payload right after this call, so the call is
+    /// equivalent to that drop.
     pub(crate) fn dispose_secrets(&mut self) {
         let _ = scp_mls::group::destroy_group(&mut self.mls_group);
     }
@@ -733,10 +734,10 @@ impl NodeMlsFactory {
     /// `pending_distributions`, and `member_wrapping_keys` start empty — the same
     /// initial shape a fresh join produces. `member_wrapping_keys` STAYS empty
     /// for a joiner: it caches other members' STABLE wrapping keys, used ONLY by
-    /// the proactive/offline PUSH path and populated on the incumbent/adder side;
-    /// openmls 0.8.1 exposes no way to read a remote member's `scp_wrapping_key`
-    /// `LeafNode` extension from a joined group (ADR-057), and a joiner does not
-    /// need them — it reaches every incumbent through the pull protocol and
+    /// the proactive/offline PUSH path and populated on the incumbent/adder side.
+    /// [`scp_mls::extract_member_wrapping_key`] returns only the local member's
+    /// key; its rustdoc says why. A joiner
+    /// does not need the cache — it reaches every incumbent through the pull protocol and
     /// answers incumbents' pulls via the ephemeral key in their requests.
     pub fn install_joined_group(&self, group: ScpMlsGroup) -> OwnedMlsCryptoState {
         // Direct assembly — the joined group moves in verbatim; `fresh_birth`
@@ -826,7 +827,7 @@ impl NodeMlsFactory {
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
 
         // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
-        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // internal `Lifetime::validate` against openmls's (wasm: unhardened)
         // clock. This eager join gate is the accept-family sibling of
         // `ProductionMlsBackend::validate_key_package` — re-validate the accepted
         // `Lifetime` against the injected hardened clock and enforce the RFC 9420
@@ -1056,11 +1057,6 @@ impl NodeMlsFactory {
         // deserialized — the Ed25519 private key should not linger in this
         // intermediate buffer.
         snapshot.signer_bytes.zeroize();
-
-        // Re-store the signer in the provider's key store so OpenMLS can find it.
-        signer
-            .store(provider.storage())
-            .map_err(|e| ContextError::CryptoFailed(format!("signer store failed: {e}")))?;
 
         // Reconstruct the MLS group from persisted storage via MlsGroup::load.
         let group_id = GroupId::from_slice(&snapshot.group_id);
@@ -1526,7 +1522,7 @@ mod tests {
         // `Lifetime` against the provider's injected hardened clock — mirroring
         // its accept-family sibling `ProductionMlsBackend::validate_key_package`
         // — so a KeyPackage that is temporally invalid under the SCP clock is
-        // rejected even though openmls's own internal `is_valid` (against the
+        // rejected even though openmls's own internal `validate` (against the
         // real system clock) accepts it.
 
         // Bob's KeyPackage is minted at the REAL present via `SystemClock`, so
