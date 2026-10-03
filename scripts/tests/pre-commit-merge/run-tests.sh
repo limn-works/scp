@@ -158,6 +158,24 @@ git add docs/notes.md
 g commit -q -m "plain docs commit" >/dev/null
 assert_steps "plain commit staging no .rs file skips the Rust lint" no
 
+# Case 6: `MERGE_HEAD` names an object the repository does not hold, so `git diff` fails
+# while the hook lists the changed paths. The hook must exit nonzero at that point, before
+# the toolchain check, instead of reading an empty list and running on.
+new_repo "$WORK/case6"
+echo '# notes, bad merge head' > docs/notes.md
+git add docs/notes.md
+printf '%s\n' 0123456789abcdef0123456789abcdef01234567 > "$(git rev-parse --git-path MERGE_HEAD)"
+: > "$LOG"
+if bash scripts/hooks/pre-commit >/dev/null 2>&1; then status=0; else status=$?; fi
+if [[ "$status" -ne 0 ]] && ! command grep -q '^check-resolved-rustc.sh' "$LOG"; then
+    echo "  ok    a git diff failure while listing changed paths stops the hook (exit ${status})"
+    PASSED=$((PASSED + 1))
+else
+    echo "  FAIL  a git diff failure while listing changed paths stops the hook (exit ${status}, want nonzero before the toolchain check)"
+    sed 's/^/          /' "$LOG" 2>/dev/null || true
+    FAILED=$((FAILED + 1))
+fi
+
 echo ""
 echo "passed: ${PASSED}  failed: ${FAILED}"
 [[ "$FAILED" -eq 0 ]]

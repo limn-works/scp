@@ -43,6 +43,13 @@ changed_paths() {
   fi
 }
 
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# The list goes to a file under `set -e`, so a failing `git diff` stops the hook here. The
+# outer shell never sees the exit status of a process substitution.
+changed_paths > "$TMPDIR/changed"
+
 HAS_RUST=false
 HAS_PYTHON=false
 HAS_TS=false
@@ -57,7 +64,7 @@ while IFS= read -r -d '' f; do
     bindings/kotlin/*) HAS_KOTLIN=true ;;
     bindings/swift/*) HAS_SWIFT=true ;;
   esac
-done < <(changed_paths)
+done < "$TMPDIR/changed"
 
 # ── The compiler this shell resolves ──
 #
@@ -114,9 +121,6 @@ if $HAS_SWIFT; then
 fi
 
 # ── Lint (parallel — read-only checks that block on failure) ──
-
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
 
 # ── Which workspace members clippy lints ──
 #
