@@ -977,9 +977,8 @@ impl UniffiBridgeInstance {
 
     /// Reads a context's lifecycle state from that context's supervisor actor.
     ///
-    /// An absent actor reads as `None` instead of as an error. An absent actor
-    /// the crash watchdog poisoned reads as `Some(Poisoned)`, because the
-    /// supervisor keeps that flag outside the actor (ADR-049 §10).
+    /// An absent actor the crash watchdog poisoned reads as `Some(Poisoned)`,
+    /// because the supervisor keeps that flag outside the actor (ADR-049 §10).
     /// [`UniffiBridgeInstance::require_active_context`] is the gate form: it
     /// turns `None` into an error, so a gate never admits an operation on an
     /// absent answer.
