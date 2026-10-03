@@ -2187,16 +2187,14 @@ impl ContextCryptoState {
     /// expiry) the context's crypto must be released while the `PerContextState`
     /// stays alive (the actor is NOT dropped), so nothing would otherwise free
     /// the material. Each [`ScpMlsGroup`] owns its OWN in-memory OpenMLS provider
-    /// (`InMemoryMlsProvider`), so a bare drop DOES free that storage — but it
-    /// does NOT zeroize the Ed25519 signer (OpenMLS `SignatureKeyPair` implements
-    /// no `Zeroize`; `scp-mls` `EagerDropSigner` / issue #82).
-    /// [`scp_mls::group::destroy_group`] eagerly FREES the signer's `Vec<u8>`
-    /// (via `EagerDropSigner::take`) but does NOT overwrite it — signer
-    /// zeroization stays open upstream (#82). This is NOT a shared persistent
-    /// store. This method:
+    /// (`InMemoryMlsProvider`), so a bare drop zeroizes that storage's values, and the
+    /// Ed25519 signer zeroizes on drop (OpenMLS `SignatureKeyPair` holds its
+    /// private key in `SecretVLBytes`). [`scp_mls::group::destroy_group`] drops
+    /// the signer eagerly, so it is zeroized NOW rather than when the state
+    /// drops. This is NOT a shared persistent store. This method:
     ///
-    /// - runs `destroy_group` on the MLS group (eagerly frees the signer bytes —
-    ///   not zeroized, #82 — and drops the in-memory OpenMLS state), then nulls
+    /// - runs `destroy_group` on the MLS group (eagerly drops the signer, which
+    ///   zeroizes its private key, and zeroizes the provider storage), then nulls
     ///   the handle;
     /// - drops the local `sender_key` and the whole `sender_key_store`, whose
     ///   `SenderKey`s zeroize on drop (`ZeroizeOnDrop`);
@@ -2240,8 +2238,7 @@ impl ContextCryptoState {
             // teardown or the idempotent `Err(MlsError::GroupDestroyed)` on a
             // retry — BOTH mean the group is gone. There is no partial-failure
             // branch, so an MLS group present at entry is verifiably destroyed
-            // here (subject to the #82 signer-not-zeroized-only-freed caveat
-            // documented above).
+            // here, and its signer's private key zeroized.
             let _ = scp_mls::group::destroy_group(group);
         }
         self.mls_group = None;
@@ -2373,9 +2370,9 @@ impl PerContextState {
     /// failed-persist creation-rollback branches (#2148 F6) so the crypto is
     /// eagerly freed via `destroy_group` — consistent with the close/TTL
     /// teardown seam. On these rollback branches the owner drops on the very
-    /// next line regardless, so this is defense-in-depth / forward-compat with
-    /// #82 (destroy_group frees but does NOT zeroize the Ed25519 signer today;
-    /// if upstream ever adds `Zeroize` this path would then zeroize it).
+    /// next line regardless, so this is defense-in-depth (`destroy_group` drops
+    /// the Ed25519 signer, whose private key zeroizes on drop, a line earlier
+    /// than the bare drop would).
     ///
     /// # Returns — the OBSERVED disposal outcome (#2199)
     ///
@@ -3196,10 +3193,10 @@ impl PerContextState {
     ///
     /// #2148 (birth-into-actor): the provider's `destroy_mls_group` is DELETED;
     /// this actor-owned method is the sole group-teardown path. It eagerly frees
-    /// the group (via `destroy_group`; the Ed25519 signer is freed, NOT zeroized —
-    /// #82) + nulls the GROUP handle (`crypto.mls_group = None`); the sibling crypto material
-    /// (`sender_key`, `sender_key_store`, `member_wrapping_keys`, epoch/sequence)
-    /// stays RESIDENT and its old `sender_key` is NOT zeroized.
+    /// the group (via `destroy_group`; the Ed25519 signer zeroizes on drop) and
+    /// nulls the GROUP handle (`crypto.mls_group = None`); the sibling crypto
+    /// material (`sender_key`, `sender_key_store`, `member_wrapping_keys`,
+    /// epoch/sequence) stays RESIDENT and its old `sender_key` is NOT zeroized.
     ///
     /// # Disposal-hygiene contract for the caller (atomic core)
     ///

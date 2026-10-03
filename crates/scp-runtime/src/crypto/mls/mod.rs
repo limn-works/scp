@@ -2,7 +2,7 @@
 //!
 //! The **synchronous** MLS state machine (`group`, `encrypt`, `ratchet`,
 //! `credential`, `key_package`, `error`, `wrapping_extension`, `epoch_grace`,
-//! and the `InMemoryMlsProvider` alias) lives in the wasm32-safe [`scp_mls`]
+//! and the `provider` module's `InMemoryMlsProvider`) lives in the wasm32-safe [`scp_mls`]
 //! crate (ADR-057) so it can be shared by both the native node runtime and
 //! in-browser SCP clients. `scp-runtime` call sites import those items from
 //! `scp_mls` directly (no re-export shim — ADR-057 Amendment).

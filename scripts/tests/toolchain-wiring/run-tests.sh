@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# run-tests.sh — exercise all four checks in `scripts/check-toolchain-wiring.sh` against
-# canned repositories.
+# run-tests.sh — exercise all five checks in `scripts/check-toolchain-wiring.sh` against
+# canned repositories, and the mise floor refusal in `scripts/setup-toolchain.sh`.
 #
 # WHAT THIS TESTS.
 #   * Check 1 fails when a file Docker builds from a `rust` base image does not carry the
@@ -65,9 +65,29 @@
 #     comparison passes a mise-dispatched compiler that answers with the pinned version. Check 4 fails closed
 #     when the pin is absent, when the pin names no channel, and when
 #     `scripts/check-resolved-rustc.sh` is absent. Every other case in this file runs with a
-#     compiler that agrees with the pin, so each one also proves check 4 stays silent then.
+#     compiler that agrees with the pin, and each of those that expects exit 0 proves check
+#     4 stays silent then, because `run_case` fails any case whose gate exit differs from
+#     the one it expects.
 #     One state has no case: `rustc` absent from PATH, which a canned repository cannot
 #     produce without also taking `bash`, `sed`, and `grep` off PATH.
+#   * Check 5 fails when `.mise.toml` lets a mise older than 2026.9.15 run, which it does
+#     when `min_version` is absent, a soft floor only, lower than 2026.9.15, or not
+#     dot-separated integers, and fails when `settings.npm.package_manager` is absent or
+#     names a manager other than bun. It passes a `{ hard = ... }` table, which mise
+#     enforces like a string, and a floor above 2026.9.15 whose month has two digits, which
+#     a string comparison would order below 2026.9.15. It fails closed, with its own
+#     message, on an absent `.mise.toml`, on one tomllib rejects, and when no interpreter on
+#     PATH imports tomllib. Every case except the "policy-*" ones, the absent `.mise.toml`,
+#     and the malformed one writes both settings. `run_case` fails any case that writes
+#     both settings and has a TOML parser on PATH whose output carries a check 5 finding, so
+#     each one proves check 5 stays silent then, whatever else the case expects. The two
+#     cases without a parser write both settings too; `run_case` exempts them because their
+#     finding is the parser's absence, whose message names the check 5 settings.
+#   * `scripts/setup-toolchain.sh` exits 1 with its own "mise refused to load" line when
+#     mise refuses to load `.mise.toml`, before any further mise call, and runs on to its
+#     next mise call when mise loads the file. Its first mise call names the repository
+#     with `--cd`, and carries `--yes`, which trusts the file, in install mode and not
+#     under `--check`.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate and
 # `scripts/check-resolved-rustc.sh` into `scripts/`, runs `git init` so the gate's
@@ -100,6 +120,23 @@ fi
 TMP_PARENT=$(mktemp -d)
 trap 'rm -rf "$TMP_PARENT"' EXIT
 
+# The directory holding the Python interpreter the gate's TOML checks run. When `python3.12`
+# is a mise shim, the shim exits with an untrusted-config error in a canned repository,
+# because mise demands trust for a `.mise.toml` holding a `[settings]` table, which most
+# canned `.mise.toml` files below hold. The harness asks the interpreter for its own path
+# from this repository, where mise trusts the configuration, and `run_case` puts that
+# directory on PATH after `stub-bin`, so every case runs an interpreter that imports
+# tomllib. When no candidate answers, PATH keeps its order and the gate reports the
+# missing parser.
+TOML_PYTHON_DIR=""
+for toml_python_candidate in python3.12 python3 python; do
+    if toml_python_path=$(cd "$REPO_ROOT" && "$toml_python_candidate" -c 'import sys, tomllib; print(sys.executable)' 2>/dev/null) \
+        && [[ -n $toml_python_path ]]; then
+        TOML_PYTHON_DIR=$(dirname "$toml_python_path")
+        break
+    fi
+done
+
 passed=0
 failed=0
 
@@ -118,6 +155,10 @@ failed=0
 #   MISE_SOURCE     — "none" writes a `.mise.toml` naming no Rust version source, "tools"
 #                     writes a `rust` key under `[tools]`, "idiomatic" writes the
 #                     `idiomatic_version_file_enable_tools` setting, "absent" writes no file.
+#                     Every spelling except "absent", "malformed", and the "policy-*" ones
+#                     also writes `min_version = "2026.9.15"` and
+#                     `[settings.npm] package_manager = "bun"`, which check 5 requires; the
+#                     "policy-*" spellings each write those two settings with one mutated.
 #   EXTRA_ROOT_FILE — one more root-level file to create, or "" for none.
 #   EXTRA_FILES     — path and producer-function name, in pairs, for files below the root.
 #                     `run_case` creates each parent directory.
@@ -151,6 +192,9 @@ failed=0
 #                     the same way it reads an unset variable, so no case has to unset it.
 #   COPY_RESOLVED_RUSTC — "no" leaves `scripts/check-resolved-rustc.sh` out of the canned
 #                     repository, which is the one defect no file's contents can express.
+#   STUB_NO_TOML_PARSER — "yes" writes `python3.12`, `python3`, and `python` into
+#                     `stub-bin/`, each exiting 1, so no interpreter on the gate's PATH
+#                     imports tomllib. "no" writes none.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
 EXTRA_FILTER_ENTRY=""
@@ -167,6 +211,7 @@ STUB_RUSTC_INSTALLER="rustup"
 STUB_OVERRIDE="none"
 CASE_RUSTUP_TOOLCHAIN=""
 COPY_RESOLVED_RUSTC="yes"
+STUB_NO_TOML_PARSER="no"
 
 RESOLVED_RUSTC_CHECK="$REPO_ROOT/scripts/check-resolved-rustc.sh"
 if [[ ! -f "$RESOLVED_RUSTC_CHECK" ]]; then
@@ -313,8 +358,69 @@ YAML
 YAML
 }
 
+# The two settings check 5 requires. `emit_mise` wraps every check-3 spelling in them, so a
+# check-3 case can fail only through check 3.
+MISE_POLICY_HEAD='min_version = "2026.9.15"\n\n'
+MISE_POLICY_TAIL='\n[settings.npm]\npackage_manager = "bun"\n'
+# Every check 5 finding holds one of these phrases, and no other check prints any of them:
+# each program finding names `min_version` or `settings.npm.package_manager`, and the
+# fail-closed branches name the floor and the package manager.
+CHECK5_PHRASES=(
+    "min_version"
+    "settings.npm.package_manager"
+    "mise version floor and npm package manager"
+    "mise refuses to run below"
+)
+
 emit_mise() {
     case "$MISE_SOURCE" in
+        absent | malformed | policy-*)
+            emit_mise_body
+            ;;
+        *)
+            printf '%b' "$MISE_POLICY_HEAD"
+            emit_mise_body
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+    esac
+}
+
+emit_mise_body() {
+    case "$MISE_SOURCE" in
+        # Check 5 spellings. Each writes a `[tools]` table naming no Rust version source,
+        # so each one can fail only through check 5.
+        policy-min-version-absent)
+            printf '[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-soft)
+            printf 'min_version = { soft = "2026.9.15" }\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-lower)
+            printf 'min_version = "2026.2.22"\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-not-numeric)
+            printf 'min_version = "latest"\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-hard-table)
+            printf 'min_version = { hard = "2026.9.15", soft = "2026.9.20" }\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-min-version-two-digit-month)
+            printf 'min_version = "2026.10.1"\n\n[tools]\nbun = "1.3.9"\n'
+            printf '%b' "$MISE_POLICY_TAIL"
+            ;;
+        policy-npm-manager-absent)
+            printf '%b' "$MISE_POLICY_HEAD"
+            printf '[tools]\nbun = "1.3.9"\n'
+            ;;
+        policy-npm-manager-npm)
+            printf '%b' "$MISE_POLICY_HEAD"
+            printf '[tools]\nbun = "1.3.9"\n\n[settings.npm]\npackage_manager = "npm"\n'
+            ;;
         none)
             printf '# mise names no Rust version source. rustup reads the toolchain file of\n'
             printf '# whichever directory a command runs in.\n[tools]\nbun = "1.3.9"\n"cargo:cargo-fuzz" = "latest"\n'
@@ -443,6 +549,13 @@ run_case() {
         emit_stub_rustc > "$root/stub-bin/rustc"
         chmod +x "$root/stub-bin/rustc"
     fi
+    if [[ $STUB_NO_TOML_PARSER == "yes" ]]; then
+        local interpreter
+        for interpreter in python3.12 python3 python; do
+            printf '#!/usr/bin/env bash\nexit 1\n' > "$root/stub-bin/$interpreter"
+            chmod +x "$root/stub-bin/$interpreter"
+        done
+    fi
     git -C "$root" init -q
     "$ci_producer" > "$root/.github/workflows/ci.yml"
     "$mise_producer" > "$root/.mise.toml"
@@ -460,7 +573,9 @@ run_case() {
     # The canned `stub-bin` leads PATH so check 4 reads the case's rustup and rustc rather
     # than the ones running this harness, and `RUSTUP_TOOLCHAIN` carries the case's value
     # rather than whatever the harness's own shell holds.
-    output=$(PATH="$root/stub-bin:$PATH" RUSTUP_TOOLCHAIN="$CASE_RUSTUP_TOOLCHAIN" \
+    local case_path="$root/stub-bin:$PATH"
+    if [[ -n $TOML_PYTHON_DIR ]]; then case_path="$root/stub-bin:$TOML_PYTHON_DIR:$PATH"; fi
+    output=$(PATH="$case_path" RUSTUP_TOOLCHAIN="$CASE_RUSTUP_TOOLCHAIN" \
         bash "$root/scripts/$(basename "$CHECK")" 2>&1)
     actual_exit=$?
 
@@ -472,6 +587,21 @@ run_case() {
         echo "FAIL [$name]: output contains a FAIL line, and the case expects none" >&2
         ok=0
     fi
+    # Every mise producer sets MISE_SOURCE, and every source outside these three writes
+    # both settings check 5 requires, so check 5 must stay silent however the case fails,
+    # unless the case takes the TOML parser away.
+    local check5_phrase
+    case $STUB_NO_TOML_PARSER:$MISE_SOURCE in
+        yes:* | no:absent | no:malformed | no:policy-*) ;;
+        *)
+            for check5_phrase in "${CHECK5_PHRASES[@]}"; do
+                if grep -Fq -- "$check5_phrase" <<< "$output"; then
+                    echo "FAIL [$name]: output carries a check 5 finding ($check5_phrase), and the case's .mise.toml sets both values check 5 requires" >&2
+                    ok=0
+                fi
+            done
+            ;;
+    esac
     if [[ $actual_exit -ne $want_exit ]]; then
         echo "FAIL [$name]: gate exited $actual_exit, expected $want_exit" >&2
         ok=0
@@ -827,6 +957,44 @@ mise_absent() {
 }
 run_case "mise-config-absent" 1 \
     ".mise.toml does not exist" routing_ok mise_absent
+
+# ── Check 5: mise refuses to run below 2026.9.15, and installs npm tools through bun ───
+
+# Check 3 fails on the same two documents, so these cases require check 5's own message:
+# each goes red if check 5 skips an absent or unparseable `.mise.toml` rather than
+# reporting it.
+mise_source_case malformed "mise-config-is-not-a-toml-document-for-check-5" 1 \
+    "is not a TOML document tomllib accepts, so the gate cannot check its mise version floor"
+run_case "mise-config-absent-for-check-5" 1 \
+    "does not exist, so the gate cannot check that mise refuses to run below 2026.9.15" \
+    routing_ok mise_absent
+
+mise_source_case policy-min-version-absent "mise-declares-no-min-version" 1 \
+    "declares no top-level min_version"
+mise_source_case policy-min-version-soft "mise-min-version-is-soft-only" 1 \
+    "which gives mise no hard floor"
+mise_source_case policy-min-version-lower "mise-min-version-below-the-floor" 1 \
+    "which is lower than 2026.9.15"
+mise_source_case policy-min-version-not-numeric "mise-min-version-not-dot-separated-integers" 1 \
+    "which is not dot-separated integers"
+mise_source_case policy-min-version-hard-table "mise-min-version-as-a-hard-table" 0 ""
+mise_source_case policy-min-version-two-digit-month "mise-min-version-above-the-floor-with-a-two-digit-month" 0 ""
+mise_source_case policy-npm-manager-absent "mise-sets-no-npm-package-manager" 1 \
+    "sets settings.npm.package_manager to None, not 'bun'"
+mise_source_case policy-npm-manager-npm "mise-sets-npm-as-the-npm-package-manager" 1 \
+    "sets settings.npm.package_manager to 'npm', not 'bun'"
+
+# No interpreter on PATH imports tomllib. Checks 3 and 5 each report the missing parser,
+# so one case requires each message: either goes red if its check skips `.mise.toml`
+# instead of reporting that it cannot read it.
+STUB_NO_TOML_PARSER="yes"
+run_case "no-toml-parser-for-check-3" 1 \
+    "so the gate cannot parse .mise.toml to check that mise names no Rust version source" \
+    routing_ok mise_ok
+run_case "no-toml-parser-for-check-5" 1 \
+    "so the gate cannot parse .mise.toml to check its mise version floor and npm package manager" \
+    routing_ok mise_ok
+STUB_NO_TOML_PARSER="no"
 
 # ── Check 1: every container build asserts the compiler it resolved ──────────────────
 #
@@ -1314,6 +1482,96 @@ COPY_RESOLVED_RUSTC="no"
 run_case "resolved-rustc-check-absent" 1 \
     "scripts/check-resolved-rustc.sh does not exist" routing_ok mise_ok
 COPY_RESOLVED_RUSTC="yes"
+
+# ── scripts/setup-toolchain.sh stops when mise refuses to load `.mise.toml` ─────────────
+
+SETUP="$REPO_ROOT/scripts/setup-toolchain.sh"
+FLOOR_ERR="mise ERROR mise version 2026.9.15 is required, but you are using 2026.2.22"
+
+# setup_case <name> <mode: "check" or "install"> <canned mise answer to `config ls`> <required substring>
+#
+# Each case copies the script into a canned repository whose `.mise.toml` holds only
+# `min_version`, and runs it with a canned `mise` that appends its arguments to `mise-calls`
+# and answers every call but `config ls` with exit 97, and a canned `brew`, `rustc`, and
+# `cargo` that exit 97. The script's other probes (`xcode-select`, directories under
+# `$HOME`, `~/.zshenv`) still read this machine; no assertion depends on their answers.
+# The canned answers to `config ls`: "refuse" prints the error a mise below `min_version`
+# prints and exits 1; "load" exits 0; "untrusted" prints mise's untrusted-config error and
+# exits 1 when the call carries no `--yes`, and otherwise prints the floor error and exits
+# 1. The "install" case therefore passes only when the script passes `--yes`, and it stops
+# at the floor before any install step runs.
+# Every case fails unless the script exits 1 (on the refusal, or on the tools the canned
+# mise reports missing) and its first mise call is `--cd <canned repository>`, then `--yes`
+# in install mode only, then `config ls`. A refused case also fails unless that call was
+# the only mise call and the output carries the script's own "mise refused to load" line;
+# a loading case fails unless the script made a mise call after it.
+setup_case() {
+    local name=$1 mode=$2 answer=$3 want_msg=$4
+    local root output actual_exit ok=1 stub calls first want_first
+    local -a flag=()
+    root="$TMP_PARENT/setup-$name"
+    mkdir -p "$root/scripts" "$root/stub-bin"
+    cp "$SETUP" "$root/scripts/"
+    printf 'min_version = "2026.9.15"\n' > "$root/.mise.toml"
+    {
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$root/mise-calls"
+        printf 'if [[ " $* " == *" config ls "* ]]; then\n'
+        case $answer in
+            refuse) printf '  echo %q >&2\n  exit 1\n' "$FLOOR_ERR" ;;
+            load) printf '  exit 0\n' ;;
+            untrusted)
+                printf '  if [[ " $* " != *" --yes "* ]]; then echo %q >&2; exit 1; fi\n' \
+                    "mise ERROR Config files in $root/.mise.toml are not trusted."
+                printf '  echo %q >&2\n  exit 1\n' "$FLOOR_ERR" ;;
+        esac
+        printf 'fi\nexit 97\n'
+    } > "$root/stub-bin/mise"
+    for stub in brew rustc cargo; do
+        printf '#!/usr/bin/env bash\nexit 97\n' > "$root/stub-bin/$stub"
+    done
+    chmod +x "$root/stub-bin/"*
+    [[ $mode == "check" ]] && flag=(--check)
+    output=$(PATH="$root/stub-bin:$PATH" bash "$root/scripts/setup-toolchain.sh" ${flag[@]+"${flag[@]}"} 2>&1)
+    actual_exit=$?
+    calls=0
+    [[ -f $root/mise-calls ]] && calls=$(( $(wc -l < "$root/mise-calls") ))
+    first=$(head -n 1 "$root/mise-calls" 2>/dev/null)
+    want_first="--cd $root config ls"
+    [[ $mode == "install" ]] && want_first="--cd $root --yes config ls"
+    if ! grep -Fq -- "$want_msg" <<< "$output"; then
+        echo "FAIL [setup-$name]: output missing required substring: $want_msg" >&2
+        ok=0
+    fi
+    if [[ $actual_exit -ne 1 ]]; then
+        echo "FAIL [setup-$name]: setup-toolchain.sh exited $actual_exit, expected 1" >&2
+        ok=0
+    fi
+    if [[ $first != "$want_first" ]]; then
+        echo "FAIL [setup-$name]: the first mise call is '$first', expected '$want_first'" >&2
+        ok=0
+    fi
+    if [[ $answer != "load" ]] && { [[ $calls -ne 1 ]] || ! grep -Fq "mise refused to load" <<< "$output"; }; then
+        echo "FAIL [setup-$name]: the script did not stop with its own message after one mise call ($calls calls)" >&2
+        ok=0
+    fi
+    if [[ $answer == "load" && $calls -lt 2 ]]; then
+        echo "FAIL [setup-$name]: the canned mise answered $calls calls" >&2
+        ok=0
+    fi
+    if [[ $ok -eq 1 ]]; then
+        echo "PASS [setup-$name]: exit=$actual_exit"
+        passed=$((passed + 1))
+    else
+        echo "---- output begin ----" >&2
+        echo "$output" >&2
+        echo "---- output end ----" >&2
+        failed=$((failed + 1))
+    fi
+}
+
+setup_case "stops-when-mise-refuses-the-floor" check refuse "$FLOOR_ERR"
+setup_case "runs-on-when-mise-loads-the-config" check load "java not installed via mise"
+setup_case "install-trusts-the-config-and-stops-at-the-floor" install untrusted "$FLOOR_ERR"
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"

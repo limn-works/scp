@@ -272,7 +272,7 @@ async fn seed_owner_document_into_resolver(
 fn streaming_context_params(ceiling: &[&str]) -> crate::bridge::ContextParams {
     crate::bridge::ContextParams {
         mode: crate::bridge::ContextMode::Encrypted,
-        ceiling: Some(ceiling.iter().map(|s| (*s).to_owned()).collect()),
+        ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
         ceiling_policy: crate::bridge::CeilingPolicy::Immutable,
         governance: crate::bridge::GovernanceModel::SingleAdmin,
         memory_scope: crate::bridge::MemoryScope::Ephemeral,

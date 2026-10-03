@@ -286,7 +286,7 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpError> {
 /// §Decision 6).
 ///
 /// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// §3 — mandatory), which requires a `PreRotationCustody` backend. The only
+/// item 5(a) — mandatory), which requires a `PreRotationCustody` backend. The only
 /// implementation is the test-harness `InMemoryPreRotationCustody` nullifier, so
 /// a shipped (no-`testing`) build returns this typed [`codes::IDENT_1059`] error
 /// rather than silently minting the nullifier. Mirrors the `PyO3` reference
@@ -1381,6 +1381,25 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // construction.md M2: a create with no ceiling or a null one omits
+            // a required field; an empty one is an invalid field value. The
+            // UniFFI create path reaches this arm with `Empty` through the
+            // `ContextCreationError` translation below.
+            CE::CeilingRequired(declared) => Self::Validation {
+                msg: format!("{e}"),
+                code: match declared {
+                    scp_core::context::CeilingDeclaration::Absent
+                    | scp_core::context::CeilingDeclaration::Null => codes::VALID_7004,
+                    scp_core::context::CeilingDeclaration::Empty => codes::VALID_7005,
+                }
+                .to_owned(),
+            },
+            // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
+            // `ContextError::ActorBusy` doc states producers and retry behaviour.
+            CE::ActorBusy(_) => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2130.to_owned(),
+            },
             // ADR-049 §10: actor poisoned (exceeded the respawn budget).
             // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
             // Swift / Kotlin caller can detect "dormant, needs operator
@@ -1476,6 +1495,14 @@ impl From<scp_core::context::ContextError> for ScpError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
+        // construction.md M2: the runtime's empty-ceiling rejection keeps its
+        // own validation code; every other creation failure is SCP-CTX-2002.
+        if let scp_core::context::builder::ContextCreationError::StateTransition(
+            inner @ scp_core::context::ContextError::CeilingRequired(_),
+        ) = e
+        {
+            return inner.into();
+        }
         Self::Context {
             msg: format!("context creation failed: {e} — check context parameters and identity"),
             code: codes::CTX_2002.to_owned(),
@@ -1897,10 +1924,9 @@ pub struct ContextParams {
     /// See spec §5.14.
     pub mode: ContextMode,
     /// Capability ceiling — maximum capabilities any participant can hold.
-    /// `None` declares no ceiling, and the context records `default_ceiling()`.
-    /// `Some(list)` records exactly `list`, so `Some([])` records a ceiling
-    /// that grants nothing.
-    pub ceiling: Option<Vec<String>>,
+    /// Required and non-empty (construction.md M2): an empty list fails the
+    /// create with `SCP-VALID-7005`.
+    pub ceiling: Vec<String>,
     /// Ceiling mutability policy — `Immutable` (default) or `Governed`.
     /// See spec §5.3.
     pub ceiling_policy: CeilingPolicy,
@@ -6684,15 +6710,7 @@ fn bridge_params_to_core(
 
     let common = scp_ffi_common::context_params::CommonContextParams {
         mode: mode_str.to_owned(),
-        // An absent ceiling records `default_ceiling()`, in the capability
-        // vocabulary a caller writes, so the shared parser reads it the way it
-        // reads a caller's list.
-        ceiling: params.ceiling.clone().unwrap_or_else(|| {
-            scp_core::context::roles::default_ceiling()
-                .iter()
-                .map(|cap| cap.name().into_owned())
-                .collect()
-        }),
+        ceiling: params.ceiling.clone(),
         ceiling_policy: ceiling_policy_str.to_owned(),
         promotion_policy: promotion_policy_str.to_owned(),
         memory_scope: memory_scope_str.to_owned(),
@@ -9815,7 +9833,7 @@ impl Scp {
 
                 // FAIL CLOSED on a shipped build (ADR-062 §Decision 6,
                 // IDENT_1059): every create commits a mandatory pre-rotation
-                // commitment (spec §9.7.4.1 §3), which requires a
+                // commitment (spec §9.7.4.1 item 5(a)), which requires a
                 // `PreRotationCustody` backend. The only implementation is the
                 // test-harness `InMemoryPreRotationCustody` nullifier, which the
                 // `testing` feature severs from production — so a shipped build
@@ -10322,11 +10340,7 @@ impl Scp {
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
-                bi.ensure_ucan_registered(
-                    &context_id,
-                    &identity.did,
-                    params.ceiling.as_deref().unwrap_or_default(),
-                );
+                bi.ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -10354,7 +10368,6 @@ impl Scp {
                     ceiling_strings: params
                         .ceiling
                         .iter()
-                        .flatten()
                         .filter_map(|s| {
                             scp_core::context::roles::Capability::new(s)
                                 .map(|c| c.ucan_capability_name())
@@ -19568,7 +19581,8 @@ mod tests {
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: Some(Vec::new()),
+            // A create must declare a non-empty ceiling (construction.md M2).
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: CeilingPolicy::Immutable,
             governance: GovernanceModel::SingleAdmin,
             memory_scope: MemoryScope::Ephemeral,
@@ -19686,11 +19700,11 @@ mod tests {
             .block_on(scp.identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
         let params = ContextParams {
-            ceiling: Some(vec![
+            ceiling: vec![
                 "messages:read".to_owned(),
                 "messages:write".to_owned(),
                 "context:close".to_owned(),
-            ]),
+            ],
             ..encrypted_join_test_params()
         };
         let handle = rt
@@ -19797,28 +19811,46 @@ mod tests {
         }
     }
 
-    /// `context_create` records `default_ceiling()` for `ceiling: None` and
-    /// exactly the declared list for `ceiling: Some(list)`, so `Some([])`
-    /// records a ceiling that grants nothing.
+    /// The bridge's `context_create` with `ceiling: []` fails with the core's
+    /// `ContextError::CeilingRequired(Empty)`, surfaced as
+    /// `ScpError::Validation` with `SCP-VALID-7005` (construction.md M2), and
+    /// a declared ceiling records exactly the declared list. A bridge that
+    /// replaced the empty list with `default_ceiling()`, or any other default,
+    /// would create the context here instead of refusing it.
     #[test]
     #[cfg(feature = "testing")]
-    fn context_create_records_default_ceiling_for_none_and_empty_for_some_empty() {
+    fn context_create_rejects_an_empty_ceiling_and_records_a_declared_one() {
         let rt = runtime();
         let scp = scp_test();
         let identity = rt
             .block_on(scp.identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
-        let recorded_ceiling = |ceiling: Option<Vec<String>>| {
-            let handle = rt
-                .block_on(scp.context_create(
-                    Arc::clone(&identity),
-                    ContextParams {
-                        ceiling,
-                        ..encrypted_join_test_params()
-                    },
-                ))
-                .expect("context_create should succeed");
-            rt.block_on(
+
+        let err = rt
+            .block_on(scp.context_create(
+                Arc::clone(&identity),
+                ContextParams {
+                    ceiling: Vec::new(),
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect_err("a create with an empty ceiling must fail");
+        assert!(
+            matches!(&err, ScpError::Validation { code, .. } if code == codes::VALID_7005),
+            "an empty ceiling must fail with ScpError::Validation SCP-VALID-7005, got: {err:?}"
+        );
+
+        let handle = rt
+            .block_on(scp.context_create(
+                Arc::clone(&identity),
+                ContextParams {
+                    ceiling: vec!["messages:read".to_owned()],
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("a create with a declared ceiling must succeed");
+        let recorded = rt
+            .block_on(
                 scp.inner
                     .context_manager_or_error()
                     .expect("supervisor")
@@ -19827,21 +19859,9 @@ mod tests {
             .expect("the actor answers")
             .expect("the actor holds role state")
             .ceiling()
-            .to_ucan_string_set()
-        };
-
+            .to_ucan_string_set();
         assert_eq!(
-            recorded_ceiling(None),
-            scp_core::context::roles::default_ceiling().to_ucan_string_set(),
-            "an absent ceiling must record default_ceiling()"
-        );
-        let empty = recorded_ceiling(Some(Vec::new()));
-        assert!(
-            empty.is_empty(),
-            "an empty ceiling must record a ceiling that grants nothing: {empty:?}"
-        );
-        assert_eq!(
-            recorded_ceiling(Some(vec!["messages:read".to_owned()])),
+            recorded,
             std::collections::HashSet::from(["messages:read".to_owned()]),
             "a declared ceiling must record exactly the declared list"
         );
@@ -23736,6 +23756,54 @@ mod tests {
         }
     }
 
+    /// ADR-049 §10: `ContextError::ActorBusy` must surface the dedicated
+    /// SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001, as the
+    /// NAPI and `PyO3` translators do. The code reaches Swift and Kotlin only
+    /// where the failing operation routes its error through this translator.
+    #[test]
+    fn actor_busy_surfaces_ctx_2130() {
+        let err: ScpError = scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2130);
+    }
+
+    /// construction.md M2: a create that declared no usable ceiling surfaces
+    /// as a validation error, not a context error: an absent or null ceiling
+    /// with `SCP-VALID-7004`, an empty one with `SCP-VALID-7005`.
+    #[test]
+    fn ceiling_required_surfaces_valid_7004_or_7005() {
+        use scp_core::context::CeilingDeclaration as D;
+        for (declared, expected) in [
+            (D::Absent, codes::VALID_7004),
+            (D::Null, codes::VALID_7004),
+            (D::Empty, codes::VALID_7005),
+        ] {
+            let err: ScpError = scp_core::context::ContextError::CeilingRequired(declared).into();
+            match err {
+                ScpError::Validation { code, .. } => assert_eq!(code, expected, "{declared:?}"),
+                other => panic!("expected ScpError::Validation, got {other:?}"),
+            }
+        }
+    }
+
+    /// construction.md M2: the core's empty-ceiling rejection, which reaches
+    /// the bridge wrapped in `ContextCreationError::StateTransition`, keeps
+    /// `SCP-VALID-7005`; every other creation failure keeps `SCP-CTX-2002`.
+    #[test]
+    fn creation_ceiling_required_keeps_valid_7005() {
+        use scp_core::context::builder::ContextCreationError as CCE;
+        let err: ScpError = CCE::StateTransition(scp_core::context::ContextError::CeilingRequired(
+            scp_core::context::CeilingDeclaration::Empty,
+        ))
+        .into();
+        match err {
+            ScpError::Validation { code, .. } => assert_eq!(code, codes::VALID_7005),
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+        let err: ScpError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingImmutable).into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
+    }
+
     /// ADR-049 §10: a poisoned context must surface the dedicated
     /// SCP-CTX-2134 code, NOT the catch-all SCP-CTX-2001.
     #[test]
@@ -25623,7 +25691,7 @@ mod tests {
         fn saga_context_params(ceiling: &[&str]) -> ContextParams {
             ContextParams {
                 mode: ContextMode::Encrypted,
-                ceiling: Some(ceiling.iter().map(|s| (*s).to_owned()).collect()),
+                ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
                 ceiling_policy: CeilingPolicy::Immutable,
                 governance: GovernanceModel::SingleAdmin,
                 memory_scope: MemoryScope::Ephemeral,

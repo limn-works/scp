@@ -18,7 +18,7 @@
 //!
 //! # Security — this blob contains raw private key material
 //!
-//! [`MlsGroupSnapshot`] carries the Ed25519 signer private key and the `OpenMLS`
+//! `MlsGroupSnapshot` carries the Ed25519 signer private key and the `OpenMLS`
 //! `MemoryStorage` dump (which includes MLS epoch secrets and HPKE private
 //! keys). It is NOT self-encrypting: the `Storage` backend that persists it MUST
 //! provide encryption at rest (§17.5, and the ADR-057 tab-boundary consequence —
@@ -32,13 +32,11 @@
 //! The native runtime has its own crypto-state snapshot
 //! (`MlsCryptoSnapshot` in `scp-runtime/src/crypto/mls/provider.rs`) with a
 //! **different, flat byte layout** — it folds provider storage, signer, sender
-//! keys, wrapping keypair, and sequence counters into one struct, and its wire
-//! form is pinned by committed legacy KAT fixtures. This crate's snapshots
-//! deliberately keep their own, smaller byte format (group state + signer, or
-//! pending material + signer): they are not byte-compatible with the runtime's,
-//! and are not meant to be. A future refactor MUST NOT "unify" the two formats
-//! on the assumption they are the same shape — they are not, and the runtime's
-//! is fixture-locked.
+//! keys, wrapping keypair, and sequence counters into one struct. This crate's
+//! snapshots deliberately keep their own, smaller byte format (group state +
+//! signer, or pending material + signer): they are not byte-compatible with the
+//! runtime's, and are not meant to be. A future refactor MUST NOT "unify" the
+//! two formats on the assumption they are the same shape — they are not.
 
 use openmls::prelude::{GroupId, MlsGroup};
 use openmls_basic_credential::SignatureKeyPair;
@@ -67,7 +65,7 @@ use crate::group::ScpMlsGroup;
 struct ProviderSignerDump {
     /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`. Each pair is
     /// `(key_bytes, value_bytes)`. Includes MLS epoch secrets, HPKE private keys,
-    /// the stored signer, and the key schedule.
+    /// and the key schedule; the signer travels only in `signer_bytes`.
     mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
     /// The MLS signer (`SignatureKeyPair`) serialized to bytes via serde.
     /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
@@ -129,9 +127,8 @@ impl ProviderSignerDump {
     ///
     /// Drains `mls_storage_entries` into the new provider and zeroizes the raw
     /// signer bytes once deserialized, so no residual key material lingers in the
-    /// dump. The caller decides whether to also `store` the signer into the
-    /// provider (a group needs it in the key store; a bare pending pair carries it
-    /// out-of-band to `join_group`).
+    /// dump. The signer is never written into the provider's storage: every
+    /// openmls operation SCP calls takes it as an argument.
     ///
     /// # Errors
     ///
@@ -238,15 +235,15 @@ impl ScpMlsGroup {
     /// [`Self::serialize_state`].
     ///
     /// Rebuilds a fresh in-memory provider, re-injects the persisted storage
-    /// entries, restores the signer into the provider key store, reloads the
+    /// entries, deserializes the signer, reloads the
     /// group via `MlsGroup::load`, and reassembles via [`Self::from_parts`]. The
     /// intermediate snapshot's key material is zeroized before returning.
     ///
     /// # Errors
     ///
     /// Returns [`MlsError::Snapshot`] if the blob cannot be deserialized, the
-    /// provider-storage lock is poisoned, the signer cannot be re-stored, or the
-    /// group cannot be reloaded (`MlsGroup::load` errored or returned `None` —
+    /// provider-storage lock is poisoned, the signer cannot be deserialized, or
+    /// the group cannot be reloaded (`MlsGroup::load` errored or returned `None` —
     /// the blob does not contain a group under the recorded id).
     pub fn deserialize_state(blob: &[u8]) -> Result<Self, MlsError> {
         let mut snapshot: MlsGroupSnapshot = rmp_serde::from_slice(blob)
@@ -255,12 +252,6 @@ impl ScpMlsGroup {
         // Rebuild the provider + signer from the shared dump (drains storage
         // entries into a fresh provider, deserializes + zeroizes the signer bytes).
         let (provider, signer) = snapshot.provider_signer.rebuild()?;
-
-        // A loaded group needs its signer in the provider key store so OpenMLS can
-        // find it.
-        signer
-            .store(provider.storage())
-            .map_err(|e| MlsError::Snapshot(format!("signer store failed: {e}")))?;
 
         let group_id = GroupId::from_slice(&snapshot.group_id);
         let mls_group = MlsGroup::load(provider.storage(), &group_id)
@@ -455,7 +446,7 @@ mod tests {
         )
         .unwrap();
         let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
-        let bob = join_group(&add.welcome, bob_provider, bob_signer).unwrap();
+        let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
 
         // Snapshot Bob, then restore into a fresh group.
         let blob = bob.serialize_state().unwrap();
@@ -510,7 +501,13 @@ mod tests {
         let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
 
         // The RESTORED pending pair must process the Welcome into a live group.
-        let bob = join_group(&add.welcome, restored_provider, restored_signer).unwrap();
+        let bob = join_group(
+            &add.welcome,
+            restored_provider,
+            restored_signer,
+            &SystemClock,
+        )
+        .unwrap();
         assert_eq!(
             bob.epoch().unwrap(),
             alice.epoch().unwrap(),

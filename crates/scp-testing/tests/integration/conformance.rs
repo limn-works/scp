@@ -1453,13 +1453,19 @@ async fn conf_032_push_notification() {
     let token = push.register().await.expect("push registration");
     println!("    Token: {token:?}");
 
-    print_step(2, "Handle notification");
-    let payload = b"notification-payload";
+    print_step(2, "Handle notification: fixed wake signal (§10.7)");
+    let payload = br#"{"aps":{"content-available":1},"contextId":"ctx-42"}"#;
     let wake = push
         .handle_notification(payload)
         .await
         .expect("handle notification");
     println!("    Wake signal: {wake:?}");
+    assert_eq!(
+        wake.payload(),
+        br#"{"aps":{"content-available":1}}"#,
+        "InMemoryPush must return the fixed ADR-006 wake signal"
+    );
+    scp_testing::conformance::push::check_fixed_wake_signal(&push).await;
 
     println!("  PASS: Push notification registration verified");
 }

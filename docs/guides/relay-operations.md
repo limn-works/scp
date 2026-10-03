@@ -81,23 +81,23 @@ scp-relay
 
 ### scp-node modes
 
-`scp-node` supports three modes (defined in `crates/scp-node/src/main.rs`):
+`scp-node` supports four modes (defined in `crates/scp-node/src/main.rs`); `--self-host` is covered in `.docs/guides/self-hosting-a-website-on-scp.md`:
 
 | Mode | Flag | Storage | Identity | HTTP | Use case |
 |------|------|---------|----------|------|----------|
-| **Full node** (default) | none | SQLite (SQLCipher) | Persistent DID | `.well-known/scp` + dev API | Production deployment |
+| **Full node** (default) | none | SQLite (SQLCipher) | Generated on every run; a shipped build logs `no production pre-rotation custody backend available` and exits 1 | `.well-known/scp` + dev API | Development only: a `--features testing` build, whose identities use the in-memory test-harness pre-rotation custody (see section 6) |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay` |
-| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
+| **Ephemeral** (`testing` builds only) | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
 
 ```bash
-# Full node (production)
+# Full node (a shipped binary logs "no production pre-rotation custody backend available" and exits 1; see section 6)
 SCP_NODE_DOMAIN=relay.example.com scp-node
 
 # Relay-only mode
 scp-node --relay-only
 
-# Ephemeral mode (everything in memory)
-SCP_NODE_DOMAIN=localhost scp-node --ephemeral
+# Ephemeral mode (everything in memory); a shipped binary exits 1 on --ephemeral, alone or beside another mode flag
+SCP_NODE_DOMAIN=localhost cargo run -p scp-node --features testing -- --ephemeral
 ```
 
 ---
@@ -141,7 +141,7 @@ These only apply to `scp-node` (not `scp-relay`):
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP server bind address |
 | `SCP_NODE_TLS_SELF_SIGNED` | `false` | Use self-signed TLS (development only) |
 | `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit for projection endpoints |
-| `SCP_NODE_DHT_MODE` | `production` | DHT client mode: `production` or `memory` |
+| `SCP_NODE_DHT_MODE` | `production` | DHT client mode. A shipped full node accepts only `production`, because it must publish its DID to be discoverable; a `--features testing` build of the full node also accepts `memory`. `--self-host` also accepts `disabled`, which turns the DHT layer off so the node publishes nothing. `--ephemeral`, which only a `--features testing` build carries, ignores this variable and always uses the in-memory client. A shipped binary rejects every other value, including `memory`, whose match arm compiles only under `--features testing`: it logs `unrecognized SCP_NODE_DHT_MODE` and exits 1. A full node given `disabled` logs `DhtMode::Disabled is not a full-relay-node mode` and exits 1, and it does so only after opening its encrypted storage, so the storage directory and databases already exist when it exits. |
 | `SCP_NODE_DHT_GATEWAYS` | (none) | Comma-separated DHT HTTP gateway URLs |
 | `SCP_STORAGE_PATH` | `$XDG_DATA_HOME/scp/node` | SQLite database directory |
 | `SCP_STORAGE_KEY` | (auto-generated) | Hex-encoded 32-byte SQLCipher encryption key |
@@ -153,7 +153,17 @@ scp-node [OPTIONS]
 
 OPTIONS:
     --relay-only            Run as a bare relay server (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems
+    --ephemeral             Use in-memory storage for all subsystems (testing builds only;
+                            a shipped binary exits 1)
+    --self-host             Host a static site entirely on SCP (no DNS name required);
+                            opens an inbound port to the public internet. Also set
+                            by SCP_NODE_SELF_HOST=1. A shipped binary starts only
+                            from a storage directory that already holds an
+                            identity; otherwise it exits 1. See
+                            .docs/guides/self-hosting-a-website-on-scp.md
+    --site-dir <PATH>       Directory of static files to host in --self-host mode
+                            (must contain index.html; default: embedded site).
+                            Also set by SCP_NODE_SITE_DIR
     --storage-path <PATH>   SQLite database directory
     --health                TCP health probe (exit 0/1)
     --help, -h              Show help
@@ -246,7 +256,7 @@ kill -TERM $(pidof scp-relay)
 The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (defined in `crates/scp-node/src/lib.rs`) that composes:
 
 - A relay server (internal, on a random port with bridge secret auth)
-- A DID identity (persistent across restarts via SQLite)
+- A DID identity, generated on every run (a shipped build fails closed; see Production deployment)
 - An HTTP server serving `.well-known/scp`, WebSocket upgrade, dev API, and broadcast projection
 - Automatic TLS provisioning via ACME (or self-signed for development)
 
@@ -259,24 +269,68 @@ SCP_STORAGE_PATH=/var/lib/scp/node \
 scp-node
 ```
 
-On first run, the node:
-1. Creates the storage directory and generates a SQLCipher encryption key (stored at `$SCP_STORAGE_PATH/.key`, mode 0600).
+A shipped binary exits 1 on this command; the paragraph after the steps says why. A
+`--features testing` build runs the steps below, and it is for development only. It
+creates each identity over `scp_platform::testing::InMemoryPreRotationCustody`, the
+test-harness pre-rotation custody, which holds the pre-rotation key only in process
+memory. That identity can never be migrated, and the reveal that spec §9.7.4.1 item 4
+says recovers a root compromise is unreachable for it. Do not deploy a `testing` build
+on a public domain: each run publishes a new such identity to the Mainline DHT and
+provisions an ACME certificate for the domain.
+
+A `--features testing` build of the full node, on every run:
+1. Creates the storage directory when it is absent, and takes the SQLCipher encryption key from `SCP_STORAGE_KEY` when that is set. Otherwise it reads `$SCP_STORAGE_PATH/.key`, and generates a key into that file (mode 0600) only when the file does not exist yet.
 2. Generates a new Ed25519 identity and publishes the DID document to the DHT.
 3. Starts the internal relay server with bridge secret authentication.
 4. Provisions a TLS certificate via ACME (unless `SCP_NODE_TLS_SELF_SIGNED=1`).
 5. Starts the HTTP server with `.well-known/scp` endpoint.
 
-On subsequent runs, the node loads the existing identity from SQLite and reuses the DID.
+The full node never reloads a stored identity: it asks `Node::start` for a newly
+generated one on every run (`IdentitySource::Generate` in `run_node_with`,
+`crates/scp-node/src/main.rs`). On a build without `testing`, `Node::start` answers every
+`Generate` request with `IdentityError::NoPreRotationBackend`: that path takes no
+`PreRotationCustody` input, so no custody backend and no storage directory the operator
+supplies changes the result. The binary logs `application node failed to build` with
+the error `identity error: no production pre-rotation custody backend available; ...`,
+so search the log for that error text; the variant name never appears in it. A shipped
+binary therefore fails closed in step 2 and exits 1 on every run, before it publishes
+anything. Only `--self-host` loads an identity already in its
+storage directory.
 
 ### Development deployment
 
+For local development, build the test-harness binary and run it in ephemeral
+mode. It keeps its DHT client and key custody in memory, so it publishes nothing
+to the DHT:
+
 ```bash
-# Self-signed TLS, in-memory DHT
-SCP_NODE_DOMAIN=localhost \
-SCP_NODE_TLS_SELF_SIGNED=1 \
-SCP_NODE_DHT_MODE=memory \
-scp-node --ephemeral
+SCP_NODE_DOMAIN=localhost SCP_NODE_TLS_SELF_SIGNED=1 \
+cargo run -p scp-node --features testing -- --ephemeral
 ```
+
+Ephemeral mode ignores `SCP_NODE_DHT_MODE`, because it wires the in-memory DHT
+client unconditionally. Pass `SCP_NODE_DHT_MODE=memory` to a `--features testing`
+build only when you want the persistent full node to keep its SQLite storage while
+its DHT stays process-local.
+
+`--help` or `-h` prints usage and exits 0 before `main` checks any mode flag. Without
+it, every build exits 1 when given two or more of `--relay-only`, `--self-host` (or
+`SCP_NODE_SELF_HOST`) and `--ephemeral`, because `main` refuses a second mode flag. A
+shipped binary also exits 1 on `--ephemeral` alone: in a build without `--features
+testing`, `main` (`crates/scp-node/src/main.rs`) calls `unavailable_mode` right after
+the two-mode check and before the `--health` probe and the mode dispatch, and it
+prints `ERROR: --ephemeral is a test-harness mode ...` and exits there, so the binary
+never reaches `run_full_node_ephemeral`. In a shipped binary the
+full node and `--self-host` exit 1 on `SCP_NODE_DHT_MODE=memory`; a `--features testing`
+build accepts it on both. `--relay-only` runs no DHT client and never reads the variable.
+The call to `run_full_node_ephemeral` and the `"memory"` match arm
+(`parse_dht_mode_or_exit`) both compile only under `--features testing`, so ADR-062,
+capability injection, keeps the in-memory DHT client and the in-memory key custody out
+of every released build.
+
+`SCP_NODE_DHT_MODE` defaults to `production`, so a `--features testing` build of the
+full node (no mode flag) with the variable unset publishes the host's address to the
+global Mainline DHT, a location disclosure, even under `SCP_NODE_DOMAIN=localhost`.
 
 ### Programmatic usage (Rust SDK)
 
@@ -350,13 +404,21 @@ pub struct CertificateData {
 
 ### Self-signed (development)
 
-For development, set `SCP_NODE_TLS_SELF_SIGNED=1`:
+For development, set `SCP_NODE_TLS_SELF_SIGNED=1` on the ephemeral test-harness
+binary from section 6, Development deployment:
 
 ```bash
+# A shipped full node logs "no production pre-rotation custody backend available" and exits 1
+# (see section 6), so this recipe uses a --features testing build in ephemeral mode.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
-scp-node
+cargo run -p scp-node --features testing -- --ephemeral
 ```
+
+Do not drop `--ephemeral` from this command: a `--features testing` full node with
+`SCP_NODE_DHT_MODE` unset publishes the host's address to the global Mainline DHT, even
+under `SCP_NODE_DOMAIN=localhost`. Set `SCP_NODE_DHT_MODE=memory` when you need the
+persistent full node instead.
 
 This generates a self-signed certificate for the configured domain. Not suitable for production -- clients will reject the certificate unless they disable verification.
 
@@ -400,6 +462,14 @@ scp-node --relay-only --health  # checks SCP_RELAY_BIND_ADDR
 
 The health probe attempts a TCP connection to the bind address and exits immediately. It does not initialize tracing or start any servers.
 
+`scp-node` checks its run mode before it probes: with two of `--relay-only`, `--self-host`
+(or `SCP_NODE_SELF_HOST`) and `--ephemeral` selected, `--health` prints `ERROR: ... each
+select a run mode; select exactly one.` and exits 1 whatever the listener's state. So
+`scp-node --relay-only --health` exits 1 in an environment that sets `SCP_NODE_SELF_HOST`
+to `1` or `true`; leave that variable out of the relay container's environment. A shipped
+binary also refuses `--ephemeral` before it probes, so `scp-node --ephemeral --health`
+exits 1 whatever the listener's state.
+
 ### Container health check
 
 ```dockerfile
@@ -419,8 +489,8 @@ Both binaries use the `tracing` crate with configurable output:
 Log levels are controlled by `RUST_LOG` (takes precedence) or `SCP_RELAY_LOG_LEVEL`:
 
 ```bash
-# Module-level filtering
-RUST_LOG=scp_transport::native::server=debug,scp_node=info scp-node
+# Module-level filtering, on relay-only mode because a shipped full node exits 1 (see section 6)
+RUST_LOG=scp_transport::native::server=debug,scp_node=info scp-node --relay-only
 
 # Simple level override
 SCP_RELAY_LOG_LEVEL=warn scp-relay

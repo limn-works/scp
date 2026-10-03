@@ -106,9 +106,10 @@ ws.onmessage = (evt) => client.handleRelayFrame(new Uint8Array(evt.data as Array
 - **Same-human native↔browser pseudonym equality does not hold pre-#1980** (the browser
   keys on the per-context MLS key, native on the identity key). Cross-target *algorithm*
   determinism holds and is KAT-pinned (ADR-057 A1).
-- **Fail-closed decrypt rests on the `--release` build** (ADR-057 Prereq-4): the shipped
-  wasm is always built `--release` so openmls's decrypt `debug_assert!` is compiled out
-  and a tampered ciphertext surfaces a typed `[SCP-CRYPTO-4041]` error, not a tab-abort.
+- **The shipped wasm is always a `--release` build** (ADR-057 Prereq-4): a `--dev` build
+  carries `debug_assert!` and overflow-check panic sites the release build does not, and in
+  the browser a panic aborts the tab. A tampered ciphertext surfaces a typed
+  `[SCP-CRYPTO-4041]` error.
 
 ## License
 

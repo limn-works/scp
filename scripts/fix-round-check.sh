@@ -125,20 +125,22 @@
 #   7. Every suite a job of `.github/workflows/ci.yml` runs over `.github/` or over
 #      `scripts/`. Running a gate below against this repository's own files does not
 #      duplicate that gate's fixture suite: the gate reads a clean tree and passes, and
-#      the suite feeds it the planted violation that proves it still rejects. The ten,
+#      the suite feeds it the planted violation that proves it still rejects. The twelve,
 #      by the job that runs each: `scripts/tests/cross-layer/run-tests.sh` in
 #      `cross-layer`; `scripts/tests/bridge-symmetry/run-tests.sh` in `bridge-symmetry`;
 #      `scripts/test_check_sdk_coverage.py` and `scripts/tests/call-invariants/` in
-#      `sdk-coverage`; `scripts/tests/toolchain-wiring/run-tests.sh` and
+#      `sdk-coverage`; `scripts/tests/toolchain-wiring/run-tests.sh`,
+#      `scripts/tests/pre-commit-merge/run-tests.sh` and
 #      `scripts/tests/workflow-compile-steps/run-tests.sh` in `toolchain-wiring`;
 #      `scripts/tests/fix-round-check/run-tests.sh` in `fix-round-check-selftest`;
 #      `scripts/tests/agent-verdict-criterion/run-tests.sh` in `agent-verdict-criterion`;
+#      `scripts/tests/examples-compile/run-tests.sh` in `rust-clippy`;
 #      and `scripts/tests/ci-gate/run-tests.sh` and
 #      `scripts/tests/signing-guard/run-tests.sh` in `ci-workflow-selftest`. The
 #      fix-round-check one runs the whole gate list below twice against this repository,
 #      so running it from inside this script would run that list three times in one
 #      invocation.
-#      TWO OF THE ELEVEN read a workflow file of this repository rather than one their
+#      TWO OF THE TWELVE read a workflow file of this repository rather than one their
 #      own fixture wrote: `scripts/tests/ci-gate/run-tests.sh`, whose
 #      `ci_gate_selftest.py` resolves `REPO / ".github/workflows/ci.yml"` and asserts the
 #      job structure that file declares, and `scripts/tests/fix-round-check/run-tests.sh`,
@@ -153,9 +155,40 @@
 #      `.github/workflows/release.yml` leaves it green. The `scripts/` entry names it,
 #      because the script it tests lives under `scripts/`.
 #      `scripts/tests/fix-round-check/run-tests.sh` holds the `scripts/` entry of
-#      UNRUN_LANES below to this list: it reads every `scripts/` program a job of
-#      `.github/workflows/ci.yml` starts, subtracts the GATES array below, and fails when
-#      that entry names fewer than what remains.
+#      UNRUN_LANES below to this list: its case 23 reads every `scripts/` program that
+#      `.github/workflows/ci.yml` starts with `bash`, `python3`, `python3.12`, `python3.12
+#      -m pytest` or a `./` path, on a one-line `run:` step or on any line of a `run: |`
+#      block, subtracts the GATES and GATES_NOT_RUN arrays below, and fails when that entry
+#      names fewer than what remains. The entry also names the two programs that remain and
+#      are neither a gate nor a suite. GATES_NOT_RUN is subtracted because case 22d holds
+#      each of its unstarted entries to an item of this list instead, and case 22c holds a
+#      branch that edits any unstarted entry to a NOT CHECKED line naming that entry.
+#   8. Both assertions of `scripts/check-examples-compile.sh`, which the `rust-clippy` job
+#      runs and GATES_NOT_RUN below lists. Assertion 1 runs `cargo clippy -p <owner>
+#      --example <name> -- -D warnings` without `--no-deps`, so it lints each example
+#      target and every workspace library that example compiles, under the example owner's
+#      dev-target feature set rather than the unified feature set of the workspace clippy
+#      step. Assertion 2 runs `cargo package --list -p` on every workspace package and
+#      fails when that command fails, as it does on a readme key naming a missing file, or
+#      when a published `examples/NAME.rs` or `examples/NAME/main.rs` file is no example
+#      target's source. Assertion 1 also scans source: each example target's source file
+#      and every `.rs` file under the `examples/` directory of every workspace package,
+#      including a package with no example target, and it fails on code it cannot show
+#      compiles on the Linux `rust-clippy` runner. `scripts/check-examples-compile.sh` is
+#      the one statement of the rules that scan applies. No run starts that
+#      gate, so this script prints up to four NOT CHECKED lines for it. A run that
+#      compiles at least one crate prints the assertion 2 line, naming every crate it
+#      compiled. That run also prints the
+#      assertion 1 line when at least one crate it compiled is a package some example
+#      target compiles, and names only those packages, and prints the source-scan line
+#      when at least one crate it compiled owns an example target or holds an `examples/`
+#      directory, and names only those packages. A run that cannot read the example
+#      targets out of cargo metadata prints the assertion 1 line and the source-scan line
+#      over every crate it compiled, each with a clause saying some of them may have no
+#      example target.
+#      A run that compiles no crate prints none of these three lines. A branch that edits
+#      `scripts/check-examples-compile.sh`, or any other GATES_NOT_RUN entry this run never
+#      starts, gets one more line naming that edit, whatever it compiled.
 #
 # USAGE
 #   bash scripts/fix-round-check.sh [crate ...]
@@ -481,8 +514,9 @@ wide_list=""
 # `crates/` is absent because the compile, format and gate steps above read it, and the
 # Rust commands they still leave unrun are the same for every run, which is why items 1,
 # 2, 3 and 6 of the DOES-NOT-RUN list state them once rather than per changed file. The
-# reverse-dependency line and the wasm line below are the two that name the packages a
-# given run selected, so both are computed rather than listed here.
+# lines that name the packages a given run selected are computed below rather than listed
+# here: the sibling-feature line, the reverse-dependency line, the three
+# scripts/check-examples-compile.sh lines, the wasm line and the workspace-wide-input line.
 UNRUN_LANES=(
     "bindings/python/|ruff and pytest, which the python-lint and python-test jobs of .github/workflows/ci.yml run"
     "bindings/typescript/|biome, tsc and bun test, which the typescript-check job of .github/workflows/ci.yml runs"
@@ -492,7 +526,7 @@ UNRUN_LANES=(
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
     ".github/|scripts/tests/ci-gate/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest, toolchain-wiring and workflow-compile-steps jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
-    "scripts/|the eleven suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
+    "scripts/|the twelve suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in a job of .github/workflows/ci.yml and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the kotlin-test and bridge-parity-kotlin jobs start to generate the Kotlin bindings they build, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
 if [[ $changed_rc -eq 0 ]]; then
@@ -750,6 +784,70 @@ else
     done
 
     NOTES+=("the reverse dependencies of $crate_list: cargo check -p compiles the packages it names and none of their dependents, so a changed public signature compiles here and fails to compile its dependents in the rust-clippy job of .github/workflows/ci.yml")
+    # scripts/check-examples-compile.sh makes two assertions, and each gets its own line
+    # when it reads a package this run compiled; assertion 1's source scan gets a third.
+    # Assertion 2 runs `cargo package --list` on every workspace package, whether or not
+    # it has an example target, so its line names every package compiled. Assertion 1
+    # lints each `example` target, which compiles against the owning package's normal,
+    # build and dev dependencies and, below those, only normal and build dependencies,
+    # because cargo builds a dev-dependency for the package that declares it alone. The
+    # gate passes no `--no-deps`, so clippy lints every workspace library in that walk as
+    # well as the example, and the line names each changed package that walk reaches.
+    # When cargo metadata cannot be read, it names every package compiled.
+    NOTES+=("scripts/check-examples-compile.sh assertion 2 over $crate_list: that gate runs cargo package --list -p on every workspace package, whether or not it has an example target, and fails when that command fails, as it does on a readme key naming a missing file, or when the package publishes an examples/NAME.rs or examples/NAME/main.rs file that no example target compiles, as autoexamples = false or a redirected path key leaves; the compile above never packages a crate, so either failure passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
+    example_rc=0
+    example_list=""
+    if [[ $metadata_rc -ne 0 ]]; then
+        example_rc=1
+    else
+        example_list=$(printf '%s' "$metadata" | "$PYTHON" -c '
+import json, sys
+selected = set(sys.argv[1:])
+pkgs = json.load(sys.stdin)["packages"]
+deps = {p["name"]: [(d["name"], d.get("kind")) for d in p.get("dependencies", [])]
+    for p in pkgs}
+reached = {p["name"] for p in pkgs
+    if any("example" in t.get("kind", []) for t in p.get("targets", []))}
+owners = set(reached)
+todo = [d for o in reached for d, _ in deps[o] if d in deps]
+while todo:
+    n = todo.pop()
+    if n in reached:
+        continue
+    reached.add(n)
+    todo.extend(d for d, k in deps[n] if k != "dev" and d in deps)
+print(" ".join(sorted(selected & reached)))
+print(" ".join(sorted(selected & owners)))
+' "${CRATES[@]}" 2>/dev/null) || example_rc=$?
+    fi
+    # The gate's source scan reads each example target's source file and every .rs file
+    # under a package's examples/ directory, and it scans that directory in every workspace
+    # package, including one with no example target, so its line names each package this
+    # run compiled that owns an example target or holds an examples/ directory.
+    scan_list=""
+    if [[ $example_rc -ne 0 ]]; then
+        example_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target)"
+        scan_list="$crate_list (this run could not read their targets out of cargo metadata, so some of them may have no example target and no examples/ directory)"
+    else
+        example_owners=$(printf '%s\n' "$example_list" | sed -n 2p)
+        example_list=$(printf '%s\n' "$example_list" | sed -n 1p)
+        example_list=${example_list// /, }
+        for c in "${CRATES[@]}"; do
+            scan_dir=""
+            for i in "${!MANIFEST_NAMES[@]}"; do
+                [[ ${MANIFEST_NAMES[$i]} == "$c" ]] && scan_dir=${MANIFEST_DIRS[$i]}
+            done
+            if [[ " $example_owners " == *" $c "* || ( -n $scan_dir && -d $scan_dir/examples ) ]]; then
+                scan_list+="${scan_list:+, }$c"
+            fi
+        done
+    fi
+    if [[ -n $example_list ]]; then
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 over the example targets that compile $example_list: the compile above runs cargo check, which reports no clippy lint, while that gate runs cargo clippy -- -D warnings on each example alone and without --no-deps, so it lints the example and every workspace library that example compiles, in that one package's dev-target feature set and without the --features list the compile above passed; an example with a clippy warning, an example that names an item behind a feature the compile above turned on, and a library with a clippy warning that only that narrower feature set raises, such as an import left unused when a feature is off, each pass here and fail that gate in the rust-clippy job of .github/workflows/ci.yml")
+    fi
+    if [[ -n $scan_list ]]; then
+        NOTES+=("scripts/check-examples-compile.sh assertion 1 source scan over $scan_list: that gate reads each example target's source file and every .rs file under the package's examples/ directory, symbolic links followed, in every workspace package whether or not it has an example target, and fails on code it cannot show compiles on the Linux runner of the rust-clippy job, and scripts/check-examples-compile.sh is the one statement of the rules that scan applies; the compile above reads none of those files this way, so a file holding such code passes here and fails that gate in the rust-clippy job of .github/workflows/ci.yml")
+    fi
 
     declare -a SELECTED_WASM=()
     for c in "${CRATES[@]}"; do
@@ -784,9 +882,9 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 31 files named
-# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other one with
-# the reason it is absent. Neither count is load-bearing: the loop below globs
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 32 files named
+# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other two with
+# the reason each is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
 # unnoticed.
@@ -850,7 +948,34 @@ GATES=(
 GATES_NOT_RUN=(
     # The toolchain precondition this script runs before any cargo command, above.
     scripts/check-resolved-rustc.sh
+    # Runs `cargo clippy` over every example target in the workspace, one target at a
+    # time, and `cargo package --list` over every workspace package, so it compiles and
+    # takes the shared target directory's build lock, which the criterion above GATES
+    # excludes. The rust-clippy job of .github/workflows/ci.yml runs it on the pushed head.
+    scripts/check-examples-compile.sh
 )
+
+# Every GATES_NOT_RUN entry but `scripts/check-resolved-rustc.sh`, which the toolchain
+# precondition above starts, is a gate this run never starts, so a branch that edits one
+# gets a line saying the edited gate went unrun over this repository. The loop reads the
+# array rather than naming a path, so an entry added to it later gets the line without an
+# edit here; `scripts/tests/fix-round-check/run-tests.sh` case 22c adds one to a fixture
+# copy of this script and holds it to that line. The fixture suite the scripts/ lane names
+# runs `scripts/check-examples-compile.sh` over throwaway workspaces, never over this one.
+if [[ $changed_rc -eq 0 ]]; then
+    while IFS= read -r f; do
+        for g in "${GATES_NOT_RUN[@]}"; do
+            [[ $f == "$g" && $g != scripts/check-resolved-rustc.sh ]] || continue
+            case $g in
+                scripts/check-examples-compile.sh)
+                    why="because it compiles and GATES_NOT_RUN lists it, so an edit that makes it reject a shipped crate's examples or published files passes here and fails the rust-clippy job of .github/workflows/ci.yml, which runs it over every workspace package" ;;
+                *)
+                    why="because GATES_NOT_RUN lists it, so an edit that makes it fail passes here and fails whichever job of .github/workflows/ starts it" ;;
+            esac
+            NOTES+=("$g over this repository's workspace: this branch changed that gate, and this run never starts it, $why")
+        done
+    done <<< "$CHANGED"
+fi
 
 # `scripts/check-workflow-compile-steps.py` imports PyYAML, which the standard library does
 # not carry, so an interpreter without it fails that gate for a missing library rather than
@@ -919,7 +1044,11 @@ else
 fi
 
 # ── The summary ──────────────────────────────────────────────────────────────────────
-# `crate_list` is set above the compile step, because two of the NOT CHECKED lines name it.
+# `crate_list` is set above the compile step, because the summary line below and these
+# NOT CHECKED lines name it: the sibling-feature line, the reverse-dependency line, the
+# scripts/check-examples-compile.sh assertion 2 line, the assertion 1 line and the
+# source-scan line when cargo metadata could not list the example targets, and the
+# workspace-wide-input line.
 #
 # `IFS` joins an array on its FIRST character alone, so "; " would separate on ";" and drop
 # the space. The loop writes the two-character separator the summary line reads with.
@@ -936,7 +1065,7 @@ done
 # CHECKED lines below rather than by listing the rest, because the rest depends on which
 # files the branch changed. An earlier revision ended the sentence after the two commands,
 # which told a fix agent editing a binding source that nothing else was left to fail.
-skip_list="cargo nextest, cargo test and cargo build in every form, and cargo clippy in every form, which the rust-test and rust-clippy jobs of .github/workflows/ci.yml run on the pushed head; the NOT CHECKED lines below name what this branch's own changed files reached, and the DOES-NOT-RUN section of this script states all seven kinds, cargo doc and cargo deny and the docker build among them"
+skip_list="cargo nextest, cargo test and cargo build in every form, and cargo clippy in every form, which the rust-test and rust-clippy jobs of .github/workflows/ci.yml run on the pushed head; the NOT CHECKED lines below name what this branch's own changed files reached, and the DOES-NOT-RUN section of this script states all eight kinds, cargo doc and cargo deny and the docker build among them"
 for s in ${SKIPPED[@]+"${SKIPPED[@]}"}; do skip_list+="; $s"; done
 
 printf '\nfix-round-check: crates %s (%s); target dir %s; %s; %s; ran %s; skipped %s.\n' \

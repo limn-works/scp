@@ -442,15 +442,14 @@ public extension ContextParams {
     /// strings — it removes the round-trip through hand-rolled JSON and gives
     /// callers compile-time checks against the discriminated unions.
     ///
-    /// `ceiling` is a required argument whose type is optional, matching the
-    /// generated field: `nil` declares no ceiling, and the context records
-    /// `default_ceiling()`. A list stands as written, so `[]` declares a
-    /// ceiling that grants nothing.
+    /// `ceiling` is forwarded as written. An empty list makes the create fail
+    /// with `ScpError.Validation` code `SCP-VALID-7005` (construction.md M2);
+    /// no default ceiling replaces it.
     ///
     /// - Throws: `EncodingError` if a typed value cannot be serialized.
     init(
         mode: ContextMode,
-        ceiling: [String]?,
+        ceiling: [String],
         ceilingPolicy: CeilingPolicy,
         governance: GovernanceModel,
         memoryScope: MemoryScope,

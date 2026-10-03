@@ -2,15 +2,14 @@
 import XCTest
 
 /// Tests that the typed ``ContextParams`` initializer forwards the ceiling the
-/// caller declared, including an absent one.
+/// caller declared, as written.
 ///
-/// The bridge reads `ceiling == nil` as "no ceiling declared" and records
-/// `default_ceiling()`, and it records `[]` as a ceiling that grants nothing.
-/// An initializer that took a non-optional `[String]` forwarded every call as
-/// a declared list, so a Swift caller on the typed path could not ask for the
-/// default ceiling.
+/// A create whose ceiling is empty fails in the bridge with `SCP-VALID-7005`
+/// (construction.md M2). An initializer that replaced an empty list with a
+/// default ceiling would turn that refusal into a context with capabilities
+/// nobody chose, so the empty list must reach the bridge unchanged.
 final class ContextParamsTypedInitTests: XCTestCase {
-    private func makeParams(ceiling: [String]?) throws -> ContextParams {
+    private func makeParams(ceiling: [String]) throws -> ContextParams {
         try ContextParams(
             mode: .encrypted,
             ceiling: ceiling,
@@ -22,10 +21,6 @@ final class ContextParamsTypedInitTests: XCTestCase {
             consequenceRules: nil,
             consequenceConfig: nil
         )
-    }
-
-    func testAbsentCeilingStaysAbsent() throws {
-        XCTAssertNil(try makeParams(ceiling: nil).ceiling)
     }
 
     func testEmptyCeilingStaysEmpty() throws {

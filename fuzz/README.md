@@ -42,8 +42,9 @@ Rust version so that mise does not export the variable; unset it if something el
 cd fuzz
 
 # Nightly Rust, which cargo-fuzz requires. rustup reads the channel out of
-# `rust-toolchain.toml` in this directory and installs it. Nightlies after the date that
-# file names fail to build openmls 0.8.1, which is why it names a date.
+# `rust-toolchain.toml` in this directory and installs it. That file names a date
+# because openmls 0.9.0's prelude still carries the glob re-export that some
+# nightlies reject (E0365); the date is a nightly checked to build this crate.
 rustup toolchain install
 
 # cargo-fuzz

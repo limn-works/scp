@@ -333,8 +333,13 @@ mod tests {
         let add_result = crate::group::add_member(&mut alice_group, kp_in, &SystemClock).unwrap();
 
         // Bob joins using the Welcome, with the provider and signer from the buffer entry.
-        let bob_group =
-            crate::group::join_group(&add_result.welcome, entry.provider, entry.signer).unwrap();
+        let bob_group = crate::group::join_group(
+            &add_result.welcome,
+            entry.provider,
+            entry.signer,
+            &SystemClock,
+        )
+        .unwrap();
 
         assert_eq!(bob_group.epoch().unwrap(), 1, "Bob should join at epoch 1");
     }
