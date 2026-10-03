@@ -3396,7 +3396,7 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
             # criterion binds hardest on it: every job in its `needs` list has to run
             # on every such run too. Stepping over it would exempt exactly the case
             # the criterion states, so substitute the constant-true expression,
-            # written in the grammar `selects` reads, and compare normally. The 29
+            # written in the grammar `selects` reads, and compare normally. The 30
             # jobs in this shape today all depend on check-draft alone, whose own
             # condition selects it on every event this enumeration presents, so the
             # substitution reports nothing on the workflow as it stands.
@@ -3585,6 +3585,16 @@ def check_a_bridge_upload_reaches_the_gate(
     )
 
 
+def a_step_that_runs_and_can_fail_its_job(step: dict) -> bool:
+    """Return whether `step` runs on every run of its job and a failure stops the job.
+
+    A step that carries an `if:` may be skipped, and a step whose `continue-on-error`
+    is anything but false lets the job pass when it fails, so neither guards the tests
+    that follow it.
+    """
+    return "if" not in step and step.get("continue-on-error") in (None, False, "false")
+
+
 # The three statements the PyO3 skip guards run: the import the test modules attempt,
 # the construction the `scp` fixture performs, and a read of each feature-gated method
 # whose absence turns a test module into a module-level skip.
@@ -3604,7 +3614,8 @@ def pyo3_consumers_without_a_construction_assertion(
     CRITERION: a job that downloads a PyO3 extension module runs, before its first
     pytest invocation, a step that imports `scp_sdk._scp_core`, a step that constructs
     `SCP(storage=...)` from it, and a step that reads every feature-gated method named
-    in PYO3_ASSERTION_FRAGMENTS off the native class.
+    in PYO3_ASSERTION_FRAGMENTS off the native class, each step one that carries no
+    `if:` and no `continue-on-error` other than false.
 
     WHY: every real-FFI test module under bindings/python/tests skips itself when its
     import of the extension raises ImportError, and the `scp` fixture in
@@ -3634,6 +3645,8 @@ def pyo3_consumers_without_a_construction_assertion(
             script = str(step.get("run") or "")
             if re.search(r"\bpytest tests", script):
                 break
+            if not a_step_that_runs_and_can_fail_its_job(step):
+                continue
             for fragment, label in PYO3_ASSERTION_FRAGMENTS:
                 found[label] = found[label] or fragment in script
         missing = [label for label, present in found.items() if not present]
@@ -3657,11 +3670,14 @@ def check_pyo3_consumers_exercise_the_module(
     )
 
 
-# Both statements the NAPI skip guards run: the SDK loader that `createRequire`s the
-# platform package, and the construction of the native class the loader returns.
+# The statements the NAPI skip guards run: the SDK loader that `createRequire`s the
+# platform package, the construction of the native class the loader returns, and a
+# read of each feature-gated method whose absence turns a test file into a skip.
 NAPI_ASSERTION_FRAGMENTS = (
     ("loadNativeAddon(", "loads"),
     ("new NativeScp(", "constructs"),
+    ("relayStartInMemory", "carries relayStartInMemory"),
+    ("fullstackCreateNode", "carries fullstackCreateNode"),
 )
 
 
@@ -3671,8 +3687,10 @@ def napi_consumers_without_a_construction_assertion(
     """Return every job that downloads a NAPI addon and does not exercise it first.
 
     CRITERION: a job that downloads a NAPI native addon runs, before its first test
-    invocation, a step that calls `loadNativeAddon()` and a step that constructs the
-    native `SCP` class the loader returns.
+    invocation, a step that calls `loadNativeAddon()`, a step that constructs the
+    native `SCP` class the loader returns, and a step that reads every feature-gated
+    method named in NAPI_ASSERTION_FRAGMENTS off it, each step one that carries no
+    `if:` and no `continue-on-error` other than false.
 
     WHY: every real-NAPI test file under bindings/typescript/tests wraps its addon load
     and its first construction in one `try`, writes the caught error into a skip reason,
@@ -3703,6 +3721,8 @@ def napi_consumers_without_a_construction_assertion(
             script = str(step.get("run") or "")
             if re.search(r"\bbun test\b|\bpytest tests", script):
                 break
+            if not a_step_that_runs_and_can_fail_its_job(step):
+                continue
             for fragment, label in NAPI_ASSERTION_FRAGMENTS:
                 found[label] = found[label] or fragment in script
         missing = [label for label, present in found.items() if not present]
@@ -3728,7 +3748,7 @@ def check_napi_consumers_exercise_the_addon(
 def check_napi_assertion_control(
     doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str, label: str
 ) -> None:
-    """Deleting one half of job `job_id`'s assertion is reported."""
+    """Deleting one of job `job_id`'s assertions is reported."""
     mutated = copy.deepcopy(doc)
     steps = mutated["jobs"][job_id]["steps"]
     hits = [step for step in steps if fragment in str(step.get("run") or "")]
@@ -3753,7 +3773,7 @@ def check_napi_assertion_control(
 def check_pyo3_assertion_control(
     doc: dict, artifacts: tuple[str, ...], job_id: str, fragment: str, label: str
 ) -> None:
-    """Deleting one half of job `job_id`'s assertion is reported."""
+    """Deleting one of job `job_id`'s assertions is reported."""
     mutated = copy.deepcopy(doc)
     steps = mutated["jobs"][job_id]["steps"]
     hits = [step for step in steps if fragment in str(step.get("run") or "")]
@@ -3775,6 +3795,41 @@ def check_pyo3_assertion_control(
         ),
         f"deleting the {label} assertion went unreported: {gaps}",
     )
+
+
+def check_assertion_step_guard_controls(
+    doc: dict, artifacts: tuple[str, ...], job_id: str, bridge: str
+) -> None:
+    """An assertion step in `job_id` that may be skipped or may fail open is reported.
+
+    `bridge` is "PyO3" or "NAPI". Each mutant sets one key on every step of the job
+    that carries one of the bridge's fragments; the last sets `continue-on-error:
+    false`, which leaves the step able to fail its job, and requires no report.
+    """
+    if bridge == "PyO3":
+        fragments = PYO3_ASSERTION_FRAGMENTS
+        gate = pyo3_consumers_without_a_construction_assertion
+    else:
+        fragments = NAPI_ASSERTION_FRAGMENTS
+        gate = napi_consumers_without_a_construction_assertion
+    prefix = f"{job_id} downloads a {bridge} "
+    for key, value, reported in (
+        ("continue-on-error", True, True),
+        ("continue-on-error", "${{ github.event_name == 'pull_request' }}", True),
+        ("if", "github.event_name == 'push'", True),
+        ("continue-on-error", False, False),
+    ):
+        mutated = copy.deepcopy(doc)
+        for step in mutated["jobs"][job_id]["steps"]:
+            if any(fragment in str(step.get("run") or "") for fragment, _ in fragments):
+                step[key] = value
+        hit = any(gap.startswith(prefix) for gap in gate(mutated, artifacts))
+        check(
+            f"a {job_id} whose {bridge} assertion step sets `{key}: {value}` is "
+            f"{'reported' if reported else 'not reported'}",
+            hit == reported,
+            f"the gate {'missed' if reported else 'reported'} that mutant",
+        )
 
 
 def artifact_consumers(doc: dict, artifact: str) -> list[str]:
@@ -4148,6 +4203,9 @@ def main() -> int:
                 check_pyo3_assertion_control(
                     workflow, pyo3_artifacts, pyo3_job, pyo3_fragment, pyo3_label
                 )
+            check_assertion_step_guard_controls(
+                workflow, pyo3_artifacts, pyo3_job, "PyO3"
+            )
 
     print("downloaded-addon — a NAPI consumer exercises the addon before its tests")
     napi_artifacts = uploaded_artifact_names(workflow, NAPI_UPLOAD_FILENAME)
@@ -4166,6 +4224,9 @@ def main() -> int:
                 check_napi_assertion_control(
                     workflow, napi_artifacts, napi_job, napi_fragment, napi_label
                 )
+            check_assertion_step_guard_controls(
+                workflow, napi_artifacts, napi_job, "NAPI"
+            )
 
     print("retention — a downloaded artifact outlives the re-run window")
     check_shared_uploads_outlive_the_rerun_window(workflow)

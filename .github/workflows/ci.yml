@@ -2285,7 +2285,7 @@ jobs:
       # runs the import and the construction those guards run, so such a module fails
       # the job here rather than skipping every real-FFI module. It then reads the two
       # methods the `server` and `testing` feature lists compile onto the native class,
-      # so a build with a different feature resolution fails here, before pytest, with
+      # so a build missing either feature fails here, before pytest, with
       # the name of the missing method. Every consumer of a PyO3 artifact runs this step.
       - name: Assert the downloaded extension imports, constructs, and carries the gated methods
         run: |
@@ -2414,8 +2414,8 @@ jobs:
       # reads whether target/release holds the cdylib and never resolves the package.
       # This step runs the SDK loader and the native constructor, so such an addon
       # fails the job here, and it reads the two methods the `server` and
-      # `testing` feature lists compile onto the native class, so a build with a
-      # different feature resolution fails here, before `bun test`, with the name of
+      # `testing` feature lists compile onto the native class, so a build missing
+      # either feature fails here, before `bun test`, with the name of
       # the missing method. Every consumer of a NAPI artifact runs this step.
       - name: Assert the downloaded addon loads and constructs
         working-directory: bindings/typescript
