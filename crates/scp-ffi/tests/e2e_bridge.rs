@@ -151,7 +151,16 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        // Every UCAN authorization check reads the supervisor's ceiling, so the
+        // fixture names one: `default_ceiling()`, which holds every capability
+        // the tests below mint, delegate and invoke.
+        let params = scp_core::context::ContextParams {
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .cloned()
+                .collect(),
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
@@ -251,8 +260,12 @@ fn context_create_registers_in_runtime() {
     let did = create_test_identity(&bi);
     let ctx_id = create_test_context(&bi, &did);
 
-    let creator = runtime::with_context(&bi, &ctx_id, |rt| Ok(rt.creator_did.clone())).unwrap();
+    let creator = runtime::live_role_state(&bi, &ctx_id).unwrap().creator_did;
     assert_eq!(creator, did);
+    assert!(
+        runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
+        "register_context must leave FFI bridge state for the context"
+    );
 }
 
 #[test]
@@ -3254,5 +3267,168 @@ fn outlet_stream_pure_wrappers_roundtrip() {
             .unwrap(),
             "chunk signed by a different key must NOT verify"
         );
+    });
+}
+
+/// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` compare a token's
+/// grants against the ceiling the SUPERVISOR holds for the context named in the
+/// call.
+///
+/// One creator owns two contexts: `wide` holds `messages:write` and `narrow`
+/// omits it. Both register their bridge state with an empty ceiling argument,
+/// so both bridge copies `FfiBridgeState.ceiling_strings` carry
+/// `default_ceiling()`, which holds `messages:write`. A `messages:write` token
+/// minted in `wide` passes each call there and fails the ceiling check in
+/// `narrow`. An edit that hands the core the bridge copy, an empty ceiling, or
+/// the other context's ceiling passes one of the two halves and fails the
+/// other.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let holder = published_identity_did(py, &scp);
+        let delegatee = published_identity_did(py, &scp);
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+
+        let wide = random_context_id();
+        let narrow = random_context_id();
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        for (ctx, ceiling) in [
+            (&wide, &["messages:read", "messages:write"][..]),
+            (&narrow, &["messages:read"][..]),
+        ] {
+            runtime::register_context(bi, ctx, &owner, &[]).unwrap();
+            let params = scp_core::context::ContextParams {
+                ceiling: ceiling
+                    .iter()
+                    .map(|c| scp_core::context::roles::Capability::new(c).unwrap())
+                    .collect(),
+                ..scp_core::context::ContextParams::default()
+            };
+            let (sup, id, creator) = (supervisor.clone(), ctx.clone(), scp_did::DID(owner.clone()));
+            rt.block_on(async move { sup.create_context(id, params, creator, None).await })
+                .unwrap();
+        }
+        let creator = scp_did::DID(owner);
+        let sup = supervisor;
+        rt.block_on(async move { sup.register_local_did(creator).await })
+            .unwrap();
+
+        let token = scp
+            .ucan_mint(&wide, &holder, vec!["messages:write".to_owned()], None)
+            .expect("a mint inside the wide ceiling must succeed")
+            .encoded;
+
+        // Evaluate and validate take a full capability URI. The token's grant is
+        // scoped to the wide context, and every call names that grant, so the
+        // narrow context refuses at its ceiling rather than at a scope mismatch.
+        let cap = format!("scp:ctx:{wide}/messages:write");
+
+        let in_wide = scp
+            .ucan_evaluate(&wide, &token, Some(cap.as_str()), &holder, None)
+            .unwrap();
+        let in_narrow = scp
+            .ucan_evaluate(&narrow, &token, Some(cap.as_str()), &holder, None)
+            .unwrap();
+        assert!(
+            in_wide.within_ceiling,
+            "evaluate must pass the wide ceiling"
+        );
+        assert!(
+            !in_narrow.within_ceiling,
+            "evaluate must report the narrow supervisor ceiling"
+        );
+
+        scp.ucan_delegate(&wide, &holder, &delegatee, &token, vec![cap.clone()])
+            .expect("a delegation inside the wide ceiling must succeed");
+        let delegate_err = scp
+            .ucan_delegate(&narrow, &holder, &delegatee, &token, vec![cap.clone()])
+            .expect_err("the narrow supervisor ceiling must refuse the delegation")
+            .to_string()
+            .to_lowercase();
+        assert!(
+            delegate_err.contains("ceiling"),
+            "the delegation refusal must be the ceiling check: {delegate_err}"
+        );
+
+        let validate_err = scp
+            .ucan_validate(&narrow, &token, &cap, &holder, None)
+            .expect_err("the narrow supervisor ceiling must refuse the validation")
+            .to_string()
+            .to_lowercase();
+        assert!(
+            validate_err.contains("ceiling"),
+            "the validation refusal must be the ceiling check: {validate_err}"
+        );
+        scp.ucan_validate(&wide, &token, &cap, &holder, None)
+            .expect("a validation inside the wide ceiling must succeed");
+    });
+}
+
+/// `ucan_mint` enforces the ceiling the SUPERVISOR holds, not one the bridge was
+/// registered with.
+///
+/// The fixture hands `register_context` a WIDE ceiling carrying `outlet:call:*`
+/// and creates the supervisor context with a NARROW one that omits it, then
+/// mints `outlet_call:*`. The supervisor's ceiling forbids that capability, so
+/// the mint must refuse. `register_context` builds the bridge copy
+/// `FfiBridgeState.ceiling_strings` from the wide argument, so a mint that read
+/// that copy would succeed here.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let audience = published_identity_did(py, &scp);
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+
+        let ctx_id = random_context_id();
+        let wide = vec![
+            "outlet:call:*".to_owned(),
+            "messages:read".to_owned(),
+            "messages:write".to_owned(),
+        ];
+        runtime::register_context(bi, &ctx_id, &owner, &wide).unwrap();
+
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        let creator = scp_did::DID(owner);
+        let narrow_ctx = ctx_id.clone();
+        rt.block_on(async move {
+            let params = scp_core::context::ContextParams {
+                ceiling: vec![
+                    scp_core::context::roles::Capability::new("messages:read").unwrap(),
+                    scp_core::context::roles::Capability::new("messages:write").unwrap(),
+                ],
+                ..scp_core::context::ContextParams::default()
+            };
+            supervisor
+                .create_context(narrow_ctx, params, creator.clone(), None)
+                .await
+                .unwrap();
+            supervisor.register_local_did(creator).await.unwrap();
+        });
+
+        let err = scp
+            .ucan_mint(&ctx_id, &audience, vec!["outlet_call:*".to_owned()], None)
+            .expect_err("the supervisor ceiling omits outlet_call, so the mint must refuse");
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("ceiling"),
+            "the refusal must be the ceiling check: {message}"
+        );
+
+        // The capability the supervisor's ceiling holds still mints, so the
+        // refusal above is the ceiling check and not a broken fixture.
+        scp.ucan_mint(&ctx_id, &audience, vec!["messages:read".to_owned()], None)
+            .expect("a mint inside the supervisor's ceiling must succeed");
     });
 }

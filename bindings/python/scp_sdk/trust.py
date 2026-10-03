@@ -885,9 +885,10 @@ async def evaluate_trust(
 
     Layer 1 consumes the structured bridge result directly (ADR-059): it
     does not reverse-engineer *which* check failed by parsing error prose.
-    The diagnostic is non-throwing for capability outcomes; it raises only
-    for malformed FFI inputs (e.g. a ``context_id`` with control
-    characters), which propagate to the caller.
+    The diagnostic is non-throwing for capability outcomes. It raises for
+    malformed FFI inputs (e.g. a ``context_id`` with control characters), and
+    it raises :class:`ContextError` (``SCP-CTX-2023``) when the context's
+    supervisor does not report it ``Active``; both propagate to the caller.
 
     This module-level function consumes the :class:`SCP` instance to
     dispatch the ``ucan_evaluate`` (Layer 1) and ``participation_record``
@@ -939,7 +940,8 @@ async def evaluate_trust(
         for token in capability_tokens:
             # The structured diagnostic reads bools; it does NOT throw on
             # capability outcomes. Malformed FFI input (bad context_id /
-            # token) still raises and propagates.
+            # token) and a context the supervisor does not report ``Active``
+            # (``ContextError``, ``SCP-CTX-2023``) raise and propagate.
             #
             # No challenge capability is supplied: trust evaluation assesses
             # each token's GENERAL (intrinsic) validity — signatures, ceiling,
