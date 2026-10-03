@@ -6514,7 +6514,7 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "Mirrors SCP-097 (Apple platform module root). Creates conditional compilation module root for Android platform adapters."
+        "note": "Mirrors SCP-097 (Apple platform module root). Creates conditional compilation module root for Android platform adapters. It stays done while SCP-110, SCP-111, SCP-112 and SCP-113 are in progress: its criteria judge the Rust module root in crates/scp-platform/src/android/mod.rs, not the Kotlin adapter behaviour those stories hold open."
       }
     },
     {
@@ -6558,7 +6558,7 @@
       ],
       "details": {
         "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "ADR not yet fully written — story derived from expected approach and known constraints. It stays done while SCP-110 is in progress: its criteria judge the dispatch and cancellation of CoroutineBridge.kt, not the Kotlin Android adapters SCP-110 holds open.",
         "expectedDecisions": {
           "dispatcherStrategy": "Which operations run on Dispatchers.IO vs Dispatchers.Default"
         },
