@@ -3559,7 +3559,7 @@ def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> Non
 # The file each bridge producer uploads, named by the build that writes it rather
 # than by the artifact name a workflow author chooses. maturin writes the PyO3
 # extension module that `bindings/python/scp_sdk/__init__.py` imports as
-# `_scp_core`, and crates/scp-ffi-napi links its cdylib as `scp_ffi_napi`, so a
+# `_scp_core`, and crates/scp-ffi/napi links its cdylib as `scp_ffi_napi`, so a
 # producer's `path:` carries the substring below whatever it calls the artifact.
 PYO3_UPLOAD_FILENAME = "_scp_core"
 NAPI_UPLOAD_FILENAME = "scp_ffi_napi"
@@ -4040,9 +4040,8 @@ def a_producer_and_an_unguarded_consumer(
 ) -> dict:
     """Return `doc` with one producer of `artifact` and one consumer that skips it.
 
-    The consumer downloads `artifact` and runs `test_command` without importing,
-    loading or constructing what it downloaded, which is the shape both consumer
-    gates report.
+    The consumer downloads `artifact` and runs `test_command`, and no step before
+    the test carries any assertion fragment.
     """
     mutated = copy.deepcopy(doc)
     mutated["jobs"]["producer-added-by-the-control"] = {
