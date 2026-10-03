@@ -4335,47 +4335,79 @@ mod tests {
         assert!(slot.lock().expect("slot lock").is_none());
     }
 
-    /// A call that checked the handle out before a disconnect, and takes the
-    /// client's lock after it, fails as disconnected and sends nothing. The
-    /// helper's `tools/list` holds the lock when the queued call checks the
-    /// handle out, so the queued call gets the lock only after the disconnect
-    /// has set the closed flag, whichever of its lock attempt and the
-    /// disconnect runs first.
+    /// A `tools/list` and a `tools/call` that checked the handle out before a
+    /// disconnect, and take the client's lock after it, fail as disconnected
+    /// with TRANS-5021 and TRANS-5024 and send nothing. The helper's
+    /// `tools/list` holds the lock while both queued calls run, so neither
+    /// gets the lock before the disconnect has set the closed flag. Each
+    /// queued call's checkout adds one reference to the client, so the test
+    /// disconnects only after the reference count shows both checked out.
     #[cfg(unix)]
     #[test]
     fn a_call_queued_at_disconnect_sends_no_request() {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let (handle, server, done_rx) = start_call_on_a_silent_stdio_server(&scp);
-        let queued = LiveMcpClient::checkout(&scp.inner, &handle, codes::TRANS_5020)
+        let probe = LiveMcpClient::checkout(&scp.inner, &handle, codes::TRANS_5020)
             .expect("check out the live handle");
-        let queued_handle = handle.clone();
-        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let outcome = queued
-                .lock(&queued_handle, codes::TRANS_5021, codes::TRANS_5022)
-                .map(drop)
-                .map_err(|e| e.to_string());
-            let _ = queued_tx.send(outcome);
+        let checked_out = Arc::strong_count(&probe.client);
+        let queue = |invoke: bool| {
+            let caller = crate::scp::PyScp {
+                inner: Arc::clone(&scp.inner),
+            };
+            let call_handle = handle.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let error = Python::with_gil(|py| {
+                    if invoke {
+                        caller
+                            .py_mcp_client_invoke(
+                                py,
+                                &call_handle,
+                                "test-outlet",
+                                &PyDict::new(py),
+                                "ctx-test",
+                                "did:dht:z6MkTestUser",
+                            )
+                            .map(drop)
+                    } else {
+                        caller.py_mcp_client_list_tools(py, &call_handle).map(drop)
+                    }
+                    .map_err(|e| e.to_string())
+                });
+                let _ = tx.send(error);
+            });
+            rx
+        };
+        let queued_list = queue(false);
+        let queued_invoke = queue(true);
+        wait_for("both queued calls check the handle out", || {
+            Arc::strong_count(&probe.client) == checked_out + 2
         });
+        drop(probe);
 
         scp.py_mcp_client_disconnect(&handle)
             .expect("disconnect a known handle");
 
         let timeout = std::time::Duration::from_secs(10);
-        let queued = queued_rx
+        let list = queued_list
             .recv_timeout(timeout)
-            .expect("the queued call must end");
+            .expect("the queued tools/list must end");
+        let invoke = queued_invoke
+            .recv_timeout(timeout)
+            .expect("the queued tools/call must end");
         assert_failed_in_tools_list(
             done_rx
                 .recv_timeout(timeout)
                 .expect("the in-flight call must end"),
         );
         stop_stdio_server(&server);
-        let error = queued.expect_err("the queued call took the client after the disconnect");
-        assert!(
-            error.contains("was disconnected") && error.contains(codes::TRANS_5021),
-            "the queued call must fail as disconnected with TRANS-5021, got: {error}"
-        );
+        let list = list.expect_err("the queued tools/list took the client after the disconnect");
+        assert!(list.contains("was disconnected"), "got: {list}");
+        assert_mcp_client_code(&list, codes::TRANS_5021);
+        let invoke =
+            invoke.expect_err("the queued tools/call took the client after the disconnect");
+        assert!(invoke.contains("was disconnected"), "got: {invoke}");
+        assert_mcp_client_code(&invoke, codes::TRANS_5024);
     }
 
     /// Connects a stdio client to a stub server that answers `initialize`
@@ -4458,7 +4490,8 @@ mod tests {
     /// unregistered handle is TRANS-5020 and TRANS-5023. A disconnect cannot
     /// be raced into a call deterministically, so
     /// `a_call_queued_at_disconnect_sends_no_request` checks the
-    /// disconnected-while-waiting refusal through `LiveMcpClient::lock`.
+    /// disconnected-while-waiting refusal, TRANS-5021 and TRANS-5024, on a
+    /// `tools/list` and a `tools/call` queued behind an in-flight call.
     #[cfg(unix)]
     #[test]
     fn mcp_client_calls_return_the_documented_codes() {
