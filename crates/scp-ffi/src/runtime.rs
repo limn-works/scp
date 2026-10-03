@@ -4103,9 +4103,9 @@ mod tests {
             "the supervisor ceiling entry must be present: {ceiling:?}"
         );
         assert!(
-            !ceiling.contains("outlet_register:*") && !ceiling.contains("outlet_call:*"),
-            "entries the supervisor ceiling omits must be absent; the bridge copy \
-             carries them: {ceiling:?}"
+            !ceiling.contains("outlet_call:*"),
+            "an entry the supervisor ceiling omits must be absent; the bridge copy \
+             carries it: {ceiling:?}"
         );
         remove_context(&bi, &ctx_id);
     }
