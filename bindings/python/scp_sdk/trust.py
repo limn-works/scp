@@ -885,13 +885,12 @@ async def evaluate_trust(
 
     Layer 1 consumes the structured bridge result directly (ADR-059): it
     does not reverse-engineer *which* check failed by parsing error prose.
-    The diagnostic is non-throwing for capability outcomes. It raises
-    :class:`~scp_sdk.errors.ValidationError` for malformed FFI inputs (e.g. a
-    ``context_id`` with control characters), and
-    :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2023``) when the context's
-    supervisor does not report it ``Active`` or a supervisor read fails. Both
-    are coded SDK exceptions translated from the native bridge error, so a
-    caller branches on ``.code``.
+    The diagnostic is non-throwing for capability outcomes; it raises
+    for malformed FFI inputs (e.g. a ``context_id`` with control
+    characters), which propagate to the caller.
+
+    Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+    the context is not active.
 
     This module-level function consumes the :class:`SCP` instance to
     dispatch the ``ucan_evaluate`` (Layer 1) and ``participation_record``

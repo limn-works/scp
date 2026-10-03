@@ -226,9 +226,9 @@ impl PyCapabilityValidation {
     }
 }
 
-/// Refuses to issue a UCAN in `context_id` unless this bridge holds the
-/// context's `FfiBridgeState`, whose revocation list `ucan_revoke` writes and
-/// `ucan_validate` reads.
+/// Refuses to mint, delegate or revoke a UCAN in `context_id` unless this
+/// bridge holds the context's `FfiBridgeState`, whose revocation list
+/// `ucan_revoke` writes and `ucan_validate` reads.
 ///
 /// `ucan_mint` and `ucan_delegate` read nothing else from that state, so
 /// without this check they would issue a token for a context whose state this
@@ -1353,8 +1353,9 @@ mod tests {
     // `ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling`
     // and `ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling`
     // prove which ceiling value step 8 compares against.
-    // `ucan_mint_and_delegate_refuse_a_context_this_bridge_holds_no_state_for`
-    // covers the revocable-state check mint and delegate run after the gate.
+    // `ucan_mint_delegate_and_revoke_refuse_a_context_this_bridge_holds_no_state_for`
+    // covers the revocable-state check mint, delegate and revoke run after the
+    // gate.
     // -----------------------------------------------------------------------
 
     /// Builds a `PyScp` whose context has FFI state but NO supervisor actor, so

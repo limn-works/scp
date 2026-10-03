@@ -1472,13 +1472,8 @@ class SCP:
     ) -> Any:
         """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`).
 
-        Raises the coded SDK exception translated from the native bridge error:
-        :class:`~scp_sdk.errors.ValidationError` for malformed input,
-        :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2023``) when the
-        context's supervisor does not report it ``Active`` or a supervisor read
-        fails, :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2001``) when
-        this bridge holds no state for the context, and
-        :class:`~scp_sdk.errors.UcanPermissionError` when delegation fails.
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
         from scp_sdk.ucan import UcanToken
 
@@ -1504,13 +1499,8 @@ class SCP:
     ) -> Any:
         """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`).
 
-        Raises the coded SDK exception translated from the native bridge error:
-        :class:`~scp_sdk.errors.ValidationError` for malformed input,
-        :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2023``) when the
-        context's supervisor does not report it ``Active`` or a supervisor read
-        fails, :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2001``) when
-        this bridge holds no state for the context, and
-        :class:`~scp_sdk.errors.UcanPermissionError` when minting fails.
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
         from scp_sdk.ucan import UcanToken
 
@@ -1525,13 +1515,8 @@ class SCP:
     async def ucan_revoke(self, context_id: str, token: str, revoker_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.ucan_revoke``.
 
-        Raises the coded SDK exception translated from the native bridge error:
-        :class:`~scp_sdk.errors.ValidationError` for malformed input,
-        :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2023``) when the
-        context's supervisor does not report it ``Active`` or a supervisor read
-        fails, :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2001``) when
-        this bridge holds no state for the context, and
-        :class:`~scp_sdk.errors.UcanPermissionError` when revocation fails.
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
         try:
             return await asyncio.to_thread(self._native.ucan_revoke, context_id, token, revoker_did)
@@ -1553,6 +1538,9 @@ class SCP:
         presenting agent to the token's own ``aud`` (which would make the
         step-5 audience check the tautology ``aud == aud`` and inflate trust).
         Pass the DID the token must be addressed to.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
 
         try:
@@ -1608,13 +1596,13 @@ class SCP:
         capability URI to additionally require the token grants it. (The
         enforcing :meth:`ucan_validate` gate keeps a mandatory capability.)
 
-        Raises :class:`~scp_sdk.errors.ValidationError` for malformed FFI
-        input (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
-        ``did``), and :class:`~scp_sdk.errors.ContextError` (``SCP-CTX-2023``)
-        when the context's supervisor does not report it ``Active`` or a
-        supervisor read fails; both are coded SDK exceptions translated from
-        the native bridge error. Capability/signature/expiry outcomes are
-        reported via the returned booleans, never as exceptions.
+        Raises ``ValidationError`` for malformed FFI input
+        (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
+        ``did``); capability/signature/expiry outcomes are reported via the
+        returned booleans, never as exceptions.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
         from scp_sdk.trust import structured_to_capability_validation
 
