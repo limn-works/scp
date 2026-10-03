@@ -517,7 +517,9 @@ pub struct McpServer<P: ContextProvider> {
     ///
     /// [`Self::notifications_for_event`] sends the `tools/list_changed` +
     /// `resources/list_changed` pair and the `scp://{ctx}/tools` update only
-    /// when the context's current view differs from this record. Another
+    /// when the context's current view differs from this record, or, with no
+    /// record, when the client listed or subscribes to `scp://{ctx}/tools`
+    /// (see [`Self::refresh_view`]). Another
     /// member's join, departure or revocation leaves this agent's view
     /// unchanged, so a member denied `scp://{ctx}/members` does not learn
     /// from those notifications when the roster changes. A `Mutex` because the
@@ -1880,17 +1882,24 @@ impl<P: ContextProvider> McpServer<P> {
     ///
     /// With a view recorded, that is whether the current view differs from
     /// it. With none recorded, it is whether the client listed in this
-    /// session: a context it listed has a recorded view unless the context
-    /// joined the served set after that list or its view could not be read,
-    /// and a client that never listed holds no list to re-read, so the first
-    /// event of such a session records the view and stays silent. When the
-    /// view cannot be read, the change cannot be ruled out, so a client that
-    /// holds a view or a list is told; the recorded view is kept, so the next
-    /// readable event compares against what the client last saw rather than
-    /// against nothing.
+    /// session or subscribes to the context's `tools` resource: a context it
+    /// listed has a recorded view unless the context joined the served set
+    /// after that list or its view could not be read. A subscribe in a session
+    /// that has not listed records a view, so a subscribed context has none
+    /// only after an event removed it; the subscription survives that removal
+    /// filtered, and the context's return must tell the client its `tools`
+    /// resource is readable again. A client with neither holds nothing to
+    /// re-read, so the first event of such a session records the view and
+    /// stays silent. When the view cannot be read, the change cannot be ruled
+    /// out, so a client that holds a view, a list or a `tools` subscription
+    /// is told; the recorded view is kept, so the next readable event compares
+    /// against what the client last saw rather than against nothing.
     fn refresh_view(&self, served: &[ContextId], context_id: &str) -> bool {
         let current = self.context_view(served, context_id);
-        let listed = self.client_listed.load(std::sync::atomic::Ordering::SeqCst);
+        let holds_cache = self.client_listed.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .subscriptions
+                .contains(&ResourceKind::Tools.uri(context_id));
         let mut views = self
             .client_views
             .lock()
@@ -1898,8 +1907,8 @@ impl<P: ContextProvider> McpServer<P> {
         match current {
             Some(view) => views
                 .insert(context_id.to_owned(), view.clone())
-                .map_or(listed, |recorded| recorded != view),
-            None => listed || views.contains_key(context_id),
+                .map_or(holds_cache, |recorded| recorded != view),
+            None => holds_cache || views.contains_key(context_id),
         }
     }
 
@@ -4711,6 +4720,45 @@ mod tests {
             "after announcing the removal once, events on the removed context \
              must stay silent"
         );
+    }
+
+    /// A subscription survives the removal of its context, filtered, so in a
+    /// session that never listed, the context's return tells a client that
+    /// subscribes to its `tools` resource that the resource is readable
+    /// again. A client that subscribes only to another kind holds no tool list
+    /// or list cache, so the return sends no `tools` update and no
+    /// list-changed pair.
+    #[test]
+    fn return_after_removal_notifies_a_tools_subscription_in_an_unlisted_session() {
+        let tools_uri = "scp://ctx_a/tools";
+        for (subscribed, expect_tools_notice) in [(tools_uri, true), ("scp://ctx_a/members", false)]
+        {
+            let mut server = subscribing_server(MockProvider::default());
+            subscribe(&mut server, subscribed);
+            server.provider.contexts.retain(|c| c != "ctx_a");
+            let removal = server.notifications_for_event("ctx_a", &members_and_tools_event());
+            assert!(has_list_changed_pair(&removal), "got: {removal:?}");
+
+            server.provider.contexts.push("ctx_a".to_owned());
+            let notifs = server.notifications_for_event("ctx_a", &members_and_tools_event());
+            let tools_updated = notifs.iter().any(|n| {
+                n.method == protocol::METHOD_RESOURCES_UPDATED
+                    && n.params
+                        .as_ref()
+                        .and_then(|p| p.get("uri"))
+                        .and_then(Value::as_str)
+                        == Some(tools_uri)
+            });
+            assert_eq!(
+                tools_updated, expect_tools_notice,
+                "subscribed to {subscribed}: resources/updated for {tools_uri}; got: {notifs:?}"
+            );
+            assert_eq!(
+                has_list_changed_pair(&notifs),
+                expect_tools_notice,
+                "subscribed to {subscribed}: list-changed pair; got: {notifs:?}"
+            );
+        }
     }
 
     /// The contexts a previous session listed belong to that session's cache.
