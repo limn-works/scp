@@ -25,8 +25,11 @@
 //! The bridge delegates to real `scp-mcp` implementations:
 //!
 //! - **Server side**: `FfiBridgeProvider` implements
-//!   [`scp_mcp::server::ContextProvider`], reading outlet registrations and
-//!   context state from the scp-ffi runtime registry. The MCP server is run
+//!   [`scp_mcp::server::ContextProvider`]. It reads outlet registrations
+//!   from the bridge's copy of each context in the scp-ffi runtime registry,
+//!   and role state and the event-log summary from the supervisor actor while
+//!   a supervisor is attached, from that bridge copy otherwise. The MCP
+//!   server is run
 //!   on the tokio runtime via [`scp_mcp::stdio::run_stdio`] or
 //!   [`scp_mcp::sse::run_sse`].
 //!
@@ -295,13 +298,17 @@ impl McpTransport for ClientTransport {
 /// [`FfiBridgeProvider::outlet_timeout_ms`].
 const FFI_OUTLET_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_MS as u64;
 
-/// Implements [`ContextProvider`] by reading from the scp-ffi runtime registry.
+/// Implements [`ContextProvider`] for one bridge instance.
 ///
-/// Bridges the MCP server's context/outlet queries to the live runtime state
-/// managed by `crates/scp-ffi/src/runtime.rs`.
+/// Outlet registrations come from the bridge's copy of each context in the
+/// runtime registry managed by `crates/scp-ffi/src/runtime.rs`. Role state
+/// (every role, resource and outlet gate, `active_context_ids`, `agent_role`
+/// and `context_members`) and the top level of `context_events` come from the
+/// supervisor actor while a supervisor is attached, and from that bridge copy
+/// otherwise.
 struct FfiBridgeProvider {
-    /// Weak reference to the bridge instance whose runtime registry this
-    /// provider reads.
+    /// Weak reference to the bridge instance whose runtime registry and
+    /// supervisor this provider reads.
     ///
     /// # Why `Weak` and not `Arc` (#1549 round-2 bug-catcher)
     ///
@@ -1486,8 +1493,11 @@ fn generate_handle_id(prefix: &str) -> String {
 
 /// Starts an MCP server that exposes SCP context outlets.
 ///
-/// Creates an MCP server backed by a `FfiBridgeProvider` that reads outlets
-/// and context state from the scp-ffi runtime registry. For `"stdio"`
+/// Creates an MCP server backed by a `FfiBridgeProvider`, which reads outlet
+/// registrations from the bridge's copy of each context in the scp-ffi
+/// runtime registry, and role state and the event-log summary from the
+/// supervisor actor while a supervisor is attached, from that bridge copy
+/// otherwise. For `"stdio"`
 /// transport, the server processes JSON-RPC messages via a tokio task. For
 /// `"sse"` transport, the server binds a loopback HTTP server on an ephemeral
 /// port behind a per-server bearer token. This function returns neither the
@@ -5782,12 +5792,14 @@ mod tests {
         crate::runtime::remove_context(&bi, &granted);
     }
 
-    /// `py_mcp_serve` refuses a current-thread bridge runtime whether or not a
-    /// supervisor is attached at serve time, because a gate looks the
-    /// supervisor up on each request and one attached later would make every
-    /// gated request fail; a multi-thread runtime serves.
+    /// `check_serve_runtime`, the check `py_mcp_serve` runs on the bridge
+    /// runtime's flavor, refuses a current-thread flavor and accepts a
+    /// multi-thread one. A gate looks the supervisor up on each request, and
+    /// one attached later would make every gated request fail on a
+    /// current-thread runtime. This test calls the helper only: it does not
+    /// show that `py_mcp_serve` calls it.
     #[test]
-    fn serve_refuses_a_current_thread_runtime() {
+    fn check_serve_runtime_refuses_a_current_thread_flavor() {
         use tokio::runtime::RuntimeFlavor;
         let error = check_serve_runtime(RuntimeFlavor::CurrentThread)
             .expect_err("a current-thread runtime cannot run the actor a gate waits on")
