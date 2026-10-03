@@ -160,8 +160,7 @@ pub(crate) struct McpClientEntry {
 /// How a disconnect ends a client's transport.
 pub(crate) enum McpClientStop {
     /// A stdio client's server process, stopped through
-    /// [`stop_stdio_server`]; a call in flight then fails on the closed
-    /// stdout.
+    /// [`stop_stdio_server`].
     StdioServer(Arc<Mutex<Option<std::process::Child>>>),
     /// An SSE client's closer, which shuts down the `GET` stream's socket and
     /// the socket of every connected POST.
