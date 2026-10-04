@@ -305,6 +305,12 @@ async fn live_poll_next_drains_to_terminal() {
     .await
     .expect("ucan_mint should succeed");
 
+    // The open authorizes against the supervisor's ceiling and creator: with
+    // the bridge copy narrowed to `messages:read` under another creator, an
+    // open that read the copy would refuse the token.
+    crate::runtime::narrow_bridge_copy_for_test(&bi, &ctx)
+        .expect("the context has a bridge copy to narrow");
+
     // OPEN — succeeds (member + valid UCAN + zero cost), returning the hex
     // StreamHandleId PROMPTLY (Commit transition, never block-until-terminal).
     let handle_id = outlet_stream_open_on(
@@ -1506,6 +1512,174 @@ mod xctx_streaming_saga_tests {
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
+        );
+    }
+
+    /// A streaming-saga open authorizes against the target's supervisor ceiling
+    /// and creator, and resolves both signing keys from the creators the
+    /// supervisor holds.
+    ///
+    /// Both bridge copies are narrowed to `messages:read` under
+    /// `crate::runtime::NARROWED_COPY_CREATOR`, and both handles name that
+    /// creator too. No supervisor saga interface exists, so the open fails after
+    /// both reads. An open that read the copy's ceiling or creator fails the
+    /// UCAN check instead; one that took either creator from a copy or a handle
+    /// fails to resolve that creator's identity, and the refusal names it.
+    #[cfg(feature = "outlet-capability-test-grant")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_open_reads_the_supervisor_not_the_bridge_copy() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let resolver_dht = install_seedable_resolver(&bi);
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let owner = owner_identity.inner.did.clone();
+        seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
+        let source = create_closeable_saga_context(&bi, &owner_identity).await;
+        let target = create_closeable_saga_context(&bi, &owner_identity).await;
+        let outlet_id = crate::outlets::outlet_register_on(
+            &bi,
+            &target,
+            crate::outlets::NapiOutletDefinition {
+                name: "xctx_streaming_live_state_probe".to_owned(),
+                description: "streaming-saga live-state probe".to_owned(),
+                kind: crate::outlets::NapiOutletKind::Action,
+                input_schema_json:
+                    r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
+                        .to_owned(),
+                output_schema_json: r#"{"type":"object"}"#.to_owned(),
+                test_vectors_json: None,
+                implementation_hash: None,
+                operator_did: owner.clone(),
+                cost: None,
+            },
+        )
+        .await
+        .expect("outlet_register should succeed");
+        let invoker = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (invoker) should succeed")
+            .inner
+            .did
+            .clone();
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor must be initialized")
+            .test_insert_member(
+                &source.context_id(),
+                scp_did::DID(invoker.clone()),
+                "member",
+            )
+            .await
+            .expect("test_insert_member seeds the invoker in the caller context");
+        let token = crate::ucan::ucan_mint_on(
+            &bi,
+            &target,
+            invoker.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("ucan_mint should succeed")
+        .encoded();
+
+        crate::runtime::ensure_registered(&bi, &source)
+            .expect("registering the caller context's bridge copy must succeed");
+        crate::runtime::narrow_bridge_copy_for_test(&bi, &source.context_id())
+            .expect("the context has a bridge copy to narrow");
+        crate::runtime::narrow_bridge_copy_for_test(&bi, &target.context_id())
+            .expect("the context has a bridge copy to narrow");
+        let narrowed = crate::runtime::NARROWED_COPY_CREATOR;
+        let source = NapiContextHandle::test_active_on(&bi, source.context_id(), narrowed.into());
+        let target = NapiContextHandle::test_active_on(&bi, target.context_id(), narrowed.into());
+
+        let err = Box::pin(outlet_streaming_saga_open_on(
+            &bi,
+            &source,
+            &target,
+            invoker,
+            outlet_id,
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms(),
+            1,
+            token,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect_err("no saga interface connects the two contexts");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("has no established interface") && !msg.contains(narrowed),
+            "the open must authorize and sign from the supervisor's state, got: {msg}"
+        );
+    }
+
+    /// Recovery resolves the target's signing key from the creator the
+    /// supervisor holds, never from the bridge copy.
+    ///
+    /// In the first context the copy names a creator no identity carries and
+    /// the supervisor names the hosted invoker, so the key resolves and the
+    /// recovery driver refuses a saga the supervisor does not hold. In the
+    /// second the copy names the hosted invoker and the supervisor names a
+    /// creator no identity carries, so the key resolution refuses and names
+    /// that creator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_recover_signs_as_the_supervisor_creator() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let invoker = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (invoker)")
+            .inner
+            .did
+            .clone();
+
+        let hosted = format!("napi-recover-hosted-creator-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &hosted, &invoker)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &hosted, &invoker);
+        crate::runtime::narrow_bridge_copy_for_test(&bi, &hosted)
+            .expect("the context has a bridge copy to narrow");
+        scp.insert_test_streaming_saga_entry("saga-napi-recover-hosted", &hosted, &invoker);
+        let err = outlet_streaming_saga_recover_truncated_close_on(
+            &bi,
+            "saga-napi-recover-hosted",
+            &invoker,
+        )
+        .await
+        .expect_err("no supervisor saga exists to recover");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("truncated-close recovery") && !msg.contains(codes::IDENT_1001),
+            "the key must resolve and the recovery driver refuse, got: {msg}"
+        );
+
+        let keyless_creator = "did:dht:z6MkNapiRecoverKeylessCreator";
+        let keyless = format!("napi-recover-keyless-creator-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &keyless, keyless_creator)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &keyless, &invoker);
+        scp.insert_test_streaming_saga_entry("saga-napi-recover-keyless", &keyless, &invoker);
+        let err = outlet_streaming_saga_recover_truncated_close_on(
+            &bi,
+            "saga-napi-recover-keyless",
+            &invoker,
+        )
+        .await
+        .expect_err("the supervisor's creator holds no key on this bridge");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::IDENT_1001) && msg.contains(keyless_creator),
+            "the key resolution must refuse the supervisor's keyless creator, got: {msg}"
         );
     }
 }

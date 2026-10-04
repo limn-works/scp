@@ -8824,9 +8824,7 @@ mod tests {
 
     /// `outlet_stream_open_on` gates on the live lifecycle before the UCAN
     /// pipeline reads the role state, so a context no actor serves refuses with
-    /// the withheld text and `SCP-OUTLET-6005`. Reaching the UCAN pipeline
-    /// first told an unauthorized caller that no actor serves the context, and
-    /// named it.
+    /// the withheld text and `SCP-OUTLET-6005`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stream_open_withholds_an_absent_actor_before_authorization() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -8977,6 +8975,128 @@ mod tests {
         )
         .await
         .expect("a supervisor ceiling carrying outlet:register must admit registration");
+    }
+
+    /// Outlet invocation, cross-context invocation, session invocation,
+    /// exposure and acceptance pass with the ceiling, roles and creator the
+    /// supervisor holds, while both contexts' bridge copies are narrowed to
+    /// `messages:read` under another creator
+    /// (`crate::runtime::narrow_bridge_copy_for_test`).
+    ///
+    /// An edit that hands any of these calls the bridge copy's ceiling, role
+    /// state or creator fails it: the copy grants neither `outlet:call` nor
+    /// `role:assign`, and the tokens' root issuer is not the copy's creator.
+    #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_authorization_follows_the_supervisor_not_the_bridge_copy() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, target, _token, _cap, owner_did, holder_did) = active_context_with_token(
+            &scp,
+            &[
+                "messages:read",
+                "messages:write",
+                "outlet:register",
+                "outlet:call:*",
+                "role:assign",
+            ],
+        )
+        .await;
+        let target_id = target.context_id();
+        let source_id = format!("napi-outlet-live-source-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &source_id, &owner_did)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &source_id, BRIDGE_COPY_CREATOR);
+        let source = active_handle_for(&bi, &source_id, &owner_did);
+
+        let outlet_id = crate::outlets::outlet_register_on(
+            &bi,
+            &target,
+            outlet_fixture_definition("napi-live-authz-probe", &owner_did),
+        )
+        .await
+        .expect("the supervisor ceiling carries outlet:register");
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        sup.test_insert_member(&target_id, DID(holder_did.clone()), "member")
+            .await
+            .expect("test_insert_member seeds the holder as a member");
+        sup.test_grant_member_capability(&target_id, DID(holder_did.clone()), "outlet_call:*")
+            .await
+            .expect("grant OutletCallAll to the member holder");
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            tokens.push(
+                crate::ucan::ucan_mint_on(
+                    &bi,
+                    &target,
+                    holder_did.clone(),
+                    vec!["outlet_call:*".to_owned()],
+                    None,
+                )
+                .await
+                .expect("the supervisor ceiling carries outlet_call:*")
+                .encoded(),
+            );
+        }
+        let session_id = crate::outlets::outlet_session_create_on(
+            &bi,
+            &target,
+            outlet_id.clone(),
+            source_id.clone(),
+            None,
+        )
+        .await
+        .expect("session creation must succeed");
+
+        crate::runtime::narrow_bridge_copy_for_test(&bi, &target_id)
+            .expect("the context has a bridge copy to narrow");
+        crate::runtime::narrow_bridge_copy_for_test(&bi, &source_id)
+            .expect("the context has a bridge copy to narrow");
+        let input = r#"{"a":"x","b":1}"#;
+
+        crate::outlets::outlet_invoke_on(
+            &bi,
+            &target,
+            outlet_id.clone(),
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[0].clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("invocation authorizes against the supervisor ceiling and creator");
+        crate::outlets::outlet_invoke_cross_context_on(
+            &bi,
+            &source,
+            &target,
+            outlet_id.clone(),
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[1].clone(),
+            1,
+            None,
+        )
+        .await
+        .expect("cross-context invocation authorizes against the target's supervisor state");
+        crate::outlets::outlet_session_invoke_on(
+            &bi,
+            &target,
+            session_id,
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[2].clone(),
+            None,
+        )
+        .await
+        .expect("session invocation authorizes against the supervisor ceiling and creator");
+        let interface =
+            crate::outlets::outlet_interface_expose_on(&bi, &target, outlet_id, source_id, None)
+                .await
+                .expect("the supervisor's creator holds role:assign in the target");
+        crate::outlets::outlet_interface_accept_on(&bi, &source, interface)
+            .await
+            .expect("the supervisor's creator holds role:assign in the source");
     }
 
     /// Every gated outlet entry point refuses a context whose actor is resident

@@ -1837,7 +1837,7 @@ pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
 ///
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
-/// the NAPI-side copy used by UCAN/outlet capability checks stays current.
+/// the NAPI-side copy stays current.
 ///
 /// # Errors
 ///
@@ -2420,6 +2420,51 @@ pub(crate) async fn create_supervisor_context_with_ceiling_for_test(
         })
         .collect::<napi::Result<Vec<_>>>()?;
     create_supervisor_context_with_capabilities(bi, context_id, creator_did, ceiling).await
+}
+
+/// The creator [`narrow_bridge_copy_for_test`] writes into a bridge copy. No
+/// identity and no supervisor context carries it.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) const NARROWED_COPY_CREATOR: &str = "did:dht:z6MkNapiNarrowedBridgeCopyCreator";
+
+/// Overwrites the bridge copy of `context_id`'s role state
+/// (`UcanContextState::role_state`, `core.ceiling_strings` and
+/// `core.creator_did`) with a `messages:read`-only ceiling and
+/// [`NARROWED_COPY_CREATOR`] as the creator.
+///
+/// An entry point that still passes after this call took its ceiling, roles
+/// and creator from the supervisor: the copy would refuse it.
+///
+/// # Errors
+///
+/// Returns the registry error when `context_id` has no bridge copy. The
+/// calling test fails on it, because it is a broken fixture rather than a
+/// condition under test.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) fn narrow_bridge_copy_for_test(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpNapiError> {
+    let ceiling = scp_core::context::roles::CapabilityCeiling::new([
+        scp_core::context::roles::Capability::MessagesRead,
+    ]);
+    let role_state = ContextRoleState::new(
+        context_id,
+        NARROWED_COPY_CREATOR,
+        ceiling.clone(),
+        Vec::new(),
+        &SystemClock,
+    )
+    .map_err(|e| ScpNapiError::Validation {
+        message: format!("narrowed role state does not build: {e}"),
+        code: codes::VALID_7004.to_owned(),
+    })?;
+    with_context(bi, context_id, |rt| {
+        rt.core.ceiling_strings = ceiling.to_ucan_string_set();
+        NARROWED_COPY_CREATOR.clone_into(&mut rt.core.creator_did);
+        rt.role_state = role_state;
+        Ok(())
+    })
 }
 
 /// The shared body of the two supervisor-context test fixtures.

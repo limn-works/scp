@@ -2356,6 +2356,27 @@ mod tests {
             // A 16-byte nonce as 32 lowercase-hex chars.
             let nonce_hex = "0123456789abcdef0123456789abcdef".to_owned();
 
+            // Each side signs as the creator its supervisor reports. The bridge
+            // copies and the handles below name a creator that holds no signing
+            // key, so a saga that took either side's creator from them would
+            // fail to resolve that side's signing key.
+            crate::runtime::ensure_registered(&bi, &handle_a)
+                .expect("registering context A's bridge copy must succeed");
+            crate::runtime::narrow_bridge_copy_for_test(&bi, &ctx_a)
+                .expect("the context has a bridge copy to narrow");
+            crate::runtime::narrow_bridge_copy_for_test(&bi, &ctx_b)
+                .expect("the context has a bridge copy to narrow");
+            let handle_a = crate::context::NapiContextHandle::test_active_on(
+                &bi,
+                ctx_a.clone(),
+                crate::runtime::NARROWED_COPY_CREATOR.to_owned(),
+            );
+            let handle_b = crate::context::NapiContextHandle::test_active_on(
+                &bi,
+                ctx_b.clone(),
+                crate::runtime::NARROWED_COPY_CREATOR.to_owned(),
+            );
+
             let result = Box::pin(outlet_invoke_cross_context_saga_on(
                 &bi,
                 &handle_a,
