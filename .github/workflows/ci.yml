@@ -2755,10 +2755,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-        # A push to `main` skips this job, and the push-writers check in
-        # scripts/tests/ci-gate/ci_gate_selftest.py rejects a cache writer a push skips.
-        with:
-          no-cache: true
       - name: Download NAPI native addon
         uses: actions/download-artifact@v4
         with:
@@ -2952,10 +2948,6 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-        # A push to `main` skips this job, and the push-writers check in
-        # scripts/tests/ci-gate/ci_gate_selftest.py rejects a cache writer a push skips.
-        with:
-          no-cache: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -3319,10 +3311,6 @@ jobs:
         with:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
-        # A push to `main` skips this job, and the push-writers check in
-        # scripts/tests/ci-gate/ci_gate_selftest.py rejects a cache writer a push skips.
-        with:
-          no-cache: true
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:

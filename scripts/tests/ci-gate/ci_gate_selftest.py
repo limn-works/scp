@@ -218,7 +218,9 @@ nothing:
                aggregate evaluates that writer's own `if:`; a push-only skip
                that leaks into a pull_request or merge_group run removes a gate
                the same way. The check reports a cache-writing job some
-               merge_group run selects and the same push does not, a writer's
+               merge_group run selects and the same push does not (for the
+               setup-bun cache, whose key names no job, that no push runs any
+               job writing it), a writer's
                matrix that drops on push the leg its `save-if` names, and any
                job whose `if:` answers a scenario differently from SCENARIOS.
 
@@ -725,6 +727,33 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
     ),
     True,
 )
+# One filter per job clause: no job ORs two of swift, typescript and
+# scaffold-typescript-web together, so dropping any one of those clauses from a
+# job's `if:` changes that job's answer in this scenario. typescript-wasm sits
+# in its own scenario because scaffold-typescript-web-check ORs it with
+# scaffold-typescript-web.
+SWIFT_TYPESCRIPT = DOCS_ONLY | dict.fromkeys(
+    ("swift", "typescript", "scaffold-typescript-web"), "true"
+)
+SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+    (
+        "bridge-parity",
+        "bridge-parity-swift",
+        "napi-addon",
+        "pyo3-module",
+        "pyo3-module-macos",
+        "scaffold-typescript-web-check",
+        "swift-build-test",
+        "swift-lint",
+        "typescript-check",
+        "xcframework",
+    ),
+    True,
+)
+WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true"}
+WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+    ("scaffold-typescript-web-check", "typescript-wasm-check"), True
+)
 
 SCENARIOS = {
     "rust-only, pull_request": Scenario(
@@ -769,6 +798,18 @@ SCENARIOS = {
         event="push",
         runs=on_event(PYTHON_ONLY_RUNS, "push"),
     ),
+} | {
+    f"{label}, {event}": Scenario(
+        name=f"{label}, {event}",
+        filters=filters,
+        event=event,
+        runs=on_event(filter_runs, event),
+    )
+    for label, filters, filter_runs in (
+        ("swift-and-typescript", SWIFT_TYPESCRIPT, SWIFT_TYPESCRIPT_RUNS),
+        ("typescript-wasm-only", WASM_ONLY, WASM_ONLY_RUNS),
+    )
+    for event in ("pull_request", "merge_group")
 }
 
 failures: list[str] = []
@@ -4983,8 +5024,17 @@ def cache_write(step: dict) -> str | None:
     return None
 
 
-def cache_writers(doc: dict) -> dict[str, list[str]]:
-    """Map each job holding a cache-writing step to the caches it writes."""
+# Caches whose key names no job: setup-bun keys its entry by bun version, OS and
+# architecture, so a push that runs any one job writing it refreshes the entry
+# every other job restores.
+SHARED_KEY_CACHES = frozenset({"the setup-bun executable cache"})
+
+
+def cache_writers(doc: dict, shared: bool = True) -> dict[str, list[str]]:
+    """Map each job holding a cache-writing step to the caches it writes.
+
+    With `shared` false, the caches SHARED_KEY_CACHES names are left out.
+    """
     writers: dict[str, list[str]] = {}
     for job_id, job in doc["jobs"].items():
         written = [
@@ -4992,7 +5042,7 @@ def cache_writers(doc: dict) -> dict[str, list[str]]:
             for step in job.get("steps") or []
             if isinstance(step, dict)
             for name in [cache_write(step)]
-            if name is not None
+            if name is not None and (shared or name not in SHARED_KEY_CACHES)
         ]
         if written:
             writers[job_id] = written
@@ -5014,7 +5064,8 @@ def push_writer_gaps(doc: dict) -> list[str]:
 
     CRITERION: a job holding a cache-writing step runs on a push to `main` wherever
     a merge_group run with the same filter outputs runs it, and some push runs it at
-    all; and a matrix leg a writer's `save-if` names exists on push.
+    all; and a matrix leg a writer's `save-if` names exists on push. A cache
+    SHARED_KEY_CACHES names needs only that some push runs some job writing it.
 
     WHY: rust-cache and `actions/cache/save` write only on `refs/heads/main`, so a
     writer that a push skips leaves its entry to go stale until eviction, and every
@@ -5025,7 +5076,26 @@ def push_writer_gaps(doc: dict) -> list[str]:
     """
     gaps: list[str] = []
     assignments = condition_assignments(doc)
-    for job_id, written in sorted(cache_writers(doc).items()):
+    holders = cache_writers(doc)
+    for cache in sorted(SHARED_KEY_CACHES):
+        pushed = False
+        for job_id in sorted(job for job, written in holders.items() if cache in written):
+            condition = doc["jobs"][job_id].get("if") or "true == 'true'"
+            try:
+                pushed = pushed or any(
+                    selects(condition, outputs, event)
+                    for outputs, event in assignments
+                    if event == "push"
+                )
+            except ValueError as unreadable:
+                gaps.append(
+                    f"{job_id} writes {cache} and this check cannot decide whether a "
+                    f"push runs it ({unreadable})"
+                )
+                pushed = True
+        if not pushed and any(cache in written for written in holders.values()):
+            gaps.append(f"jobs write {cache} and no push to `main` runs any of them")
+    for job_id, written in sorted(cache_writers(doc, shared=False).items()):
         job = doc["jobs"][job_id]
         condition = job.get("if") or "true == 'true'"
         caches = ", ".join(written)
@@ -5116,8 +5186,9 @@ def scenario_disagreements(doc: dict) -> list[str]:
 
 
 def skipped_writers(doc: dict) -> list[str]:
-    """Return each job NOT_ON_PUSH_JOBS or NOT_ON_PUSH_FILTER_JOBS lists that writes a cache."""
-    writers = cache_writers(doc)
+    """Return each job NOT_ON_PUSH_JOBS or NOT_ON_PUSH_FILTER_JOBS lists that writes a
+    cache SHARED_KEY_CACHES does not name."""
+    writers = cache_writers(doc, shared=False)
     skipped = set(writers) & (set(NOT_ON_PUSH_JOBS) | set(NOT_ON_PUSH_FILTER_JOBS))
     return [f"{job_id} writes {', '.join(writers[job_id])}" for job_id in sorted(skipped)]
 
@@ -5248,12 +5319,38 @@ def check_push_writer_mutants(doc: dict) -> None:
 
     writing = copy.deepcopy(doc)
     writing["jobs"]["error-codes"].setdefault("steps", []).append(
-        {"uses": "oven-sh/setup-bun@v2"}
+        {"uses": "actions/cache@v4", "with": {"key": "k", "path": "p"}}
     )
     check(
         "a cache write in a job NOT_ON_PUSH_JOBS lists is reported",
         any(found.startswith("error-codes writes") for found in skipped_writers(writing)),
         f"{skipped_writers(writing)}",
+    )
+
+    bun = copy.deepcopy(doc)
+    bun["jobs"]["error-codes"].setdefault("steps", []).append(
+        {"uses": "oven-sh/setup-bun@v2"}
+    )
+    check(
+        "a setup-bun write in a push-skipped job is not reported while a push writes it",
+        not skipped_writers(bun) and not push_writer_gaps(bun),
+        f"{skipped_writers(bun)} {push_writer_gaps(bun)}",
+    )
+    for job in bun["jobs"].values():
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and str(step.get("uses", "")).startswith(
+                "oven-sh/setup-bun@"
+            ):
+                guard = job.get("if")
+                if guard is not None and "github.event_name != 'push'" not in guard:
+                    job["if"] = f"github.event_name != 'push' && ({guard})"
+                elif guard is None:
+                    job["if"] = "github.event_name != 'push'"
+    gaps = push_writer_gaps(bun)
+    check(
+        "no push running any setup-bun writer is reported",
+        any("setup-bun executable cache and no push" in gap for gap in gaps),
+        f"{gaps}",
     )
 
     draft = copy.deepcopy(doc)
@@ -5269,6 +5366,8 @@ def check_push_writer_mutants(doc: dict) -> None:
     for job_id, event, scenario in (
         ("rust-fmt", "merge_group", "rust-only, merge_group"),
         ("error-codes", "pull_request", "docs-only, pull_request"),
+        ("swift-lint", "merge_group", "swift-and-typescript, merge_group"),
+        ("scaffold-typescript-web-check", "pull_request", "typescript-wasm-only, pull_request"),
     ):
         leaked = copy.deepcopy(doc)
         current = leaked["jobs"][job_id]["if"]
@@ -5282,6 +5381,33 @@ def check_push_writer_mutants(doc: dict) -> None:
                 for found in scenario_disagreements(leaked)
             ),
             f"{scenario_disagreements(leaked)}",
+        )
+
+    for job_id, clause, scenario in (
+        ("swift-build-test", "swift", "swift-and-typescript, merge_group"),
+        ("bridge-parity-swift", "swift", "swift-and-typescript, pull_request"),
+        ("bridge-parity", "typescript", "swift-and-typescript, merge_group"),
+        ("typescript-check", "typescript", "swift-and-typescript, pull_request"),
+        (
+            "scaffold-typescript-web-check",
+            "scaffold-typescript-web",
+            "swift-and-typescript, merge_group",
+        ),
+        ("scaffold-typescript-web-check", "typescript-wasm", "typescript-wasm-only, merge_group"),
+    ):
+        dropped = copy.deepcopy(doc)
+        current = dropped["jobs"][job_id]["if"]
+        text = f"needs.changes.outputs.{clause} == 'true'"
+        narrowed = re.sub(rf"\s*\|\|\s*{re.escape(text)}|{re.escape(text)}\s*\|\|\s*", "", current)
+        check(f"the {clause} clause is found in {job_id}'s `if:`", narrowed != current, current)
+        dropped["jobs"][job_id]["if"] = narrowed
+        check(
+            f"{job_id} without its {clause} clause disagrees with SCENARIOS",
+            any(
+                f"{scenario}: {job_id} skips" in found
+                for found in scenario_disagreements(dropped)
+            ),
+            f"{scenario_disagreements(dropped)}",
         )
 
 
@@ -5788,7 +5914,7 @@ def main() -> int:
                 code == 1 and job_id in out,
                 f"exit {code}: {out}",
             )
-    for scenario in (rust_pr, rust_merge):
+    for scenario in (s for s in SCENARIOS.values() if s.event != "push"):
         for job_id in NOT_ON_PUSH_JOBS + NOT_ON_PUSH_FILTER_JOBS:
             if not scenario.runs[job_id]:
                 continue
