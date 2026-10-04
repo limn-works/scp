@@ -5,6 +5,7 @@
 **Phase:** Phase 4 remainder (issue #1549)
 **Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`); this ADR's multi-instance model now spans three bridges (PyO3, UniFFI, napi-rs). The §1 per-SDK idiom WASM bullet and the §7b WASM-only semantic-divergence entries (which described behavior in the now-deleted `crates/scp-ffi/wasm/`) have been removed accordingly.
 **Amended 2026-09-10 (the P-256 curve ruling):** ADR-063, inception-derived self-certifying identity over a key-event log, makes every SCP key an ECDSA key on NIST P-256 in its §The curve and the root's custody, which carries the ruling and its reason. Two statements in this ADR named the superseded curve and both now name P-256. The `Identity` struct's `verifying_key_hex` field carries the hex encoding of a 33-byte SEC1 compressed P-256 verifying key, and the `testing_seed` parameter's deterministic generator produces byte-identical P-256 keys across the three bridges. The multi-instance model this ADR decides is unaffected, because it concerns instance lifetime and handle affinity and not the signature algorithm.
+**Amended 2026-10-04 (§5, supervisor drain before storage close):** the bounded shutdown wait covers the Supervisor's tracked tasks (ADR-049, the actor-per-context concurrency model, Decision 16), bridge storage `close()` runs only after that wait completes, and a timed-out wait returns `ShutdownOutcome::TimedOut` with the store's lock still held until the last writer exits.
 **Related:** ADR-021 (UniFFI Bridge), ADR-022 (Language Bindings), ADR-028 (Kotlin SDK), ADR-034 (WASM Constraints), ADR-043 (Scope Registration as Handle Convention, phase-3), ADR-046 (Bridge Parity Harness, sibling), ADR-047 (Bridge Symmetry Enforcement, sibling), ADR-055 (WASM bridge removal)
 
 ## Context
@@ -104,6 +105,11 @@ Signature across bridges:
 - UniFFI: `suspend fun shutdown(timeoutMs: Long)` (Kotlin) / `func shutdown(timeoutMs: UInt64) async` (Swift)
 
 This is a breaking change versus the Phase 4a `shutdown()` that took no arguments. Migration is mechanical: pass a sensible default (e.g. 30 seconds). Documented in the Phase 4 migration guide (PR 4).
+
+**Amendment 2026-10-04: the bounded wait drains the Supervisor before storage closes.** The bounded wait covers the Supervisor's tasks as well as the bridge's own `JoinSet`. `shutdown(timeout)` awaits `shutdown_all_contexts`, which awaits every task the Supervisor's task tracker spawned (ADR-049, the actor-per-context concurrency model, Decision 16), inside the same deadline. The bridge's storage `close()` runs only after that wait completes, and only when the wait completed before the deadline. The two outcomes:
+
+- **Every task exits before the deadline.** The bridge closes the store, which releases the store's advisory file lock and its database connection, and returns `ShutdownOutcome::GracefulWithin`. An open of the same directory in the same process then succeeds on its first attempt (§17.6 of the persistence and storage spec, One Writer per Durable Directory).
+- **The deadline expires first.** The bridge returns `ShutdownOutcome::TimedOut` and does not close the store. The store keeps its lock and its connection until the last remaining writer exits and drops its reference, and the store then releases both. Until that release, a same-process open of the same directory fails with the typed lock-still-held error, so no moment exists at which two writers hold one directory (red-hat finding RED-1002, two writers on one database).
 
 ### 6. Long-lived background tasks capture `Weak<BridgeInstance>`, not `Arc`
 
@@ -228,6 +234,7 @@ The registry currently has no live entries. The three bridges share the real eng
 - **Multi-identity and multi-relay coexistence work.** A single process may hold multiple `SCP` instances, each with its own identity and its own relay connection. No shared mutable state leaks across them.
 - **Handle misuse is caught at the boundary.** Cross-instance handle reuse returns `SCP-PERM-3030` immediately, rather than corrupting silently.
 - **Shutdown is bounded and recoverable.** `shutdown(timeout)` drains outstanding work deterministically. Callers no longer deadlock on stuck tasks.
+- **A completed shutdown frees the storage directory.** After `shutdown(timeout)` returns `ShutdownOutcome::GracefulWithin`, no Supervisor task holds the store, so the same process can reopen the same directory at once. After it returns `ShutdownOutcome::TimedOut`, the store's lock stays held until the last writer exits, and a reopen in that window fails with a typed error (§5 amendment, 2026-10-04).
 - **No deprecation window.** The free-function façade is deleted in PR 4. There is no one-release-cycle tolerance period; every call site migrates in the same change that removes the façade. SCP is pre-release with no external consumers, so the cost of dropping the sunset window is zero and the benefit is eliminating a migration that would have to happen anyway two releases later.
 - **Breaking change to `shutdown` signature.** Documented in the migration guide with a minimal upgrade example.
 

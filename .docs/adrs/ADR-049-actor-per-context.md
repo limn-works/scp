@@ -4,6 +4,7 @@
 **Date:** 2026-04-19
 **Phase:** Runtime concurrency redesign
 **Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`). The §10 note about a WASM-specific `scp_init` panic-hook in the now-deleted `crates/scp-ffi/wasm/src/lib.rs`, and the dead `cargo check -p scp-ffi-wasm` verification command, have been removed. The actor/watchdog model and its native payload-free panic-redaction principle are unchanged; `scp-protocol` still compiles to `wasm32-unknown-unknown` (it is the pure sync core, not the deleted bridge), so that compile check stays.
+**Amended 2026-10-04 (Decision 16, supervisor task drain):** every task that holds the Supervisor, a `SupervisorHandle`, or an `ActorDeps` spawns through one supervisor-owned task tracker, `shutdown_all_contexts` refuses new spawns and awaits that tracker, and every back-reference to the Supervisor is a `Weak<Supervisor>`. Decision 2 gains one sentence that points at Decision 16.
 **Related:** ADR-034 (WASM Constraints), ADR-046 (Bridge Parity Harness), ADR-047 (Bridge Symmetry Enforcement), ADR-048 (SCP Multi-Instance), ADR-055 (WASM bridge removal). Plan: `~/.claude/plans/generic-moseying-lightning.md`.
 
 ## Context
@@ -48,7 +49,7 @@ Lookups are on the hot path of every public API call. Making the supervisor an a
 
 Read path is lock-free via `DashMap::get` + `ArcSwap::load`. Write path acquires `write_lock` before touching any ArcSwap/DashMap.
 
-Strict hierarchy, no cycles: Supervisor → ContextActor → (KeyPackageStoreActor | KeyCustody | TransportActor). Never ContextActor → ContextActor directly.
+Strict hierarchy, no cycles: Supervisor → ContextActor → (KeyPackageStoreActor | KeyCustody | TransportActor). Never ContextActor → ContextActor directly. Every reference from a task in this hierarchy back to the Supervisor is a `Weak<Supervisor>` (Decision 16), so the hierarchy holds no reference cycle while the Supervisor runs.
 
 ### 3. Cross-context saga for atomicity across 2+ actors
 
@@ -391,6 +392,35 @@ These prep changes land in forward-only prep stories (`SCP-CRYPTOMOVE-000a..000e
 **Full unification of the two `ContextCryptoState` structs is NOT undertaken in PR-7.** The provider's private `ContextCryptoState` (`provider.rs:249`) and the actor's `ContextCryptoState` (`state.rs:398`) stay two distinct structs. Unifying them would **invert the crypto→actor module layering**: `crypto/mls/provider.rs` imports nothing from `context::actor` — the dependency runs downward (actor → crypto) — so hoisting a shared struct into the crypto module, or having the provider depend on the actor struct, reverses that edge. It also conflicts with the actor-struct AC-pinning: the actor struct forbids a `send_sequence` field (it lives on `send_tracker`) and keeps `recv_sequence_tracker` dormant, whereas the provider struct carries `send_sequence` non-optionally and has no such dormancy constraint — the two shapes are deliberately different. The provider keeps its private per-context struct as **birth/restore-seam machinery** *only through PR-7*; the dissolution of the concrete `NodeMlsFactory` struct's per-context state (the §6 provider-*struct* end-state, distinct from §6's trait deletion) is **no longer an open-ended "eventual" — it is executed by #2148 (birth-into-actor)** as the closing edge. After #2148 the provider's private per-context `ContextCryptoState` (`provider.rs`) and its `contexts` map are DELETED and **only the actor's `ContextCryptoState` (`state.rs`) survives**; the struct is reduced to a node-level MLS-birth / HPKE helper (`local_did` / `clock` / `mls_backend` / `hpke_backend` / wrapping keypair — no per-context state). The **pure NAME rename** of that now-node-level helper (it no longer "provides" per-context crypto) is executed by **#2185** (`MlsCryptoProvider` -> `NodeMlsFactory`).
 
 Cross-refs: §1 (actor owns state by move), §6 (`ContextCryptoProvider` *trait* deleted, replaced by two narrow backends; orchestration moves to inherent methods on `&mut PerContextState`; primitives on `MlsBackend`/`HpkeBackend`), §9 (Class-S/Class-M split; read-authority-switch paragraph), §10 (respawn rehydrate).
+
+### 16. Supervisor task drain and `Weak` back-references (2026-10-04)
+
+**Problem.** Decision 2 requires a hierarchy with no cycles, and the as-built runtime broke that requirement. Each context actor holds a strong `SupervisorHandle`, which wraps an `Arc<Supervisor>`, in its `ActorDeps`, while the Supervisor's actor registry holds that actor's mailbox sender, so the Supervisor and every live actor keep each other alive. Actor watchdogs, key-package actors, the context-gauge refresh task that the close path detaches, and the streaming saga seal task also hold an `Arc<Supervisor>`. The Supervisor never clears `key_package_stores`. `shutdown_all_contexts` sends `ShutdownSelf` to each context actor and returns without waiting for any task to exit. The Supervisor therefore never drops, and each task that still runs keeps its reference to the storage backend. A bridge's `SqliteStorage::close()` then releases the advisory file lock while those tasks can still write, and a second opener of the same directory can write beside them. §17.6 of the persistence and storage spec, "One Writer per Durable Directory", forbids that two-writer case (issue #2345, the `SqliteStorage` advisory lock that outlives its handle).
+
+**Decision.**
+
+1. **One supervisor-owned task tracker.** The Supervisor owns one `tokio_util::task::TaskTracker`. Every task whose future holds an `Arc<Supervisor>`, a `SupervisorHandle`, or an `ActorDeps` spawns through that tracker. The captured reference decides membership, not the task's role. Context actors, actor watchdogs, key-package actors, the context-gauge refresh task, and the streaming saga seal task are the members known on 2026-10-04, and that list names indicators only. A bare `tokio::spawn` of a future that captures one of those three types bypasses the drain, so this decision forbids it.
+2. **Shutdown refuses new spawns.** The Supervisor carries a closed flag. `shutdown_all_contexts` sets the flag before it stops any actor. After the flag is set, every spawn through the tracker fails with a typed error that the spawning caller receives, so a watchdog respawn or a create that races shutdown cannot add a task the drain would miss.
+3. **Shutdown stops every actor and awaits the tracker.** `shutdown_all_contexts` sends shutdown to every context actor and to every key-package actor, clears `key_package_stores`, closes the tracker, and awaits `TaskTracker::wait()`. It returns only after every tracked task has exited. `shutdown_all_contexts` imposes no deadline of its own; the bridge's bounded wait (ADR-048, SCP as a first-class multi-instance SDK object, §5, as amended 2026-10-04) bounds the await.
+4. **Back-references are `Weak<Supervisor>`.** Every reference from an actor, a watchdog, or another supervisor-spawned task back to the Supervisor is a `Weak<Supervisor>`; the `SupervisorHandle` in `ActorDeps` wraps a `Weak<Supervisor>`. A task upgrades the reference for one operation and drops the upgraded `Arc` when that operation ends. A failed upgrade ends the task, or returns a typed error to the task's caller. The Supervisor's strong references therefore come only from owners outside the hierarchy, such as a bridge instance or a node, and no reference cycle exists while the Supervisor runs.
+5. **Every owner drains before it closes storage.** Every owner of a Supervisor calls `shutdown_all_contexts` before it closes the storage backend it passed to the Supervisor. The owners on 2026-10-04 are each bridge instance, through its shared shutdown path, and the node's `SelfHostDeployer`.
+
+**Reasoning.** The tracker gives a deterministic drain. When `shutdown_all_contexts` returns, no task holds the Supervisor or the store, so the bridge can release the lock and a same-process reopen succeeds on its first attempt, as §17.6 of the persistence and storage spec requires. The `Weak` back-references restore Decision 2's no-cycle invariant. With that invariant, the Supervisor drops when its last outside owner drops, including on a path that never calls `shutdown_all_contexts`, such as an owner that unwinds from a panic. Each mechanism alone leaves a defect. With `Weak` references and no tracker, dropping the Supervisor does not wait for an actor that is mid-write, and that actor still holds its storage reference, so release still races a writer. With the tracker and no `Weak` references, every path that skips shutdown leaks the Supervisor, its actors, and the store's lock for the life of the process.
+
+**Alternatives rejected.**
+
+- **Retry the reopen until the lock frees.** A retry loop hides a live writer behind a delay; it does not remove the writer. A reopen that wins the race opens the second writer that §17.6 of the persistence and storage spec forbids.
+- **Close the connection while tasks still run.** Closing the connection under running tasks prevents a second writer, but an actor's in-flight Class-S persist (Decision 9) then fails during shutdown, and the task receives the typed closed-store error instead of completing the persist.
+- **Abort tracked tasks at the deadline.** An abort cancels a task at an `.await` point, which can fall inside a persist. On a timed-out wait the bridge instead returns `ShutdownOutcome::TimedOut` and leaves the store open until the last writer exits (the 2026-10-04 amendment to ADR-048 §5; §17.6 of the persistence and storage spec).
+
+**Consequences.**
+
+- Every spawn site whose future captures an `Arc<Supervisor>`, a `SupervisorHandle`, or an `ActorDeps` moves onto the tracker.
+- Code that reads the Supervisor from a task pays one `Weak::upgrade` per operation.
+- A spawn after shutdown fails with a typed error instead of starting a task.
+- `shutdown_all_contexts` can block for as long as its slowest tracked task takes to exit, which is why the bridge bounds it.
+
+**Verification.** A unit test in `crates/scp-runtime/src/context/supervisor/supervisor.rs` holds a `Weak<Supervisor>` probe, runs `shutdown_all_contexts`, drops the owning `Arc`, and asserts that the probe fails to upgrade. An integration test in `scp-testing` closes a `SqliteStorage`-backed instance and reopens the same directory in the same process on the first attempt. A test in `scp-platform` asserts that a closed `SqliteStorage` rejects every further operation with the typed closed-store error.
 
 ## Rejected alternatives
 
