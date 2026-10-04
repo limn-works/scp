@@ -220,7 +220,7 @@ pub struct SelfDidRepublishing<D: DhtClient + 'static> {
     /// a synchronous `drop` cannot perform it inline. Behind a
     /// [`std::sync::Mutex`] because the node owns the cycle behind an
     /// [`Arc`] and stops it through a shared `&self`, exactly as
-    /// `TierReEvalHandle` holds its completion receiver.
+    /// `TierReEvalHandle` holds its task's `JoinHandle`.
     reseed_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Set by every teardown path so the [`Drop`] backstop stays out of the way
     /// once the arms are already accounted for.
@@ -394,8 +394,7 @@ pub struct ActiveArms {
 /// `DidPublisher` trait exists in `published_state`.
 ///
 /// Object safety is why neither method returns `impl Future`: `stop_and_wait` is
-/// synchronous (it bridges to the async stop the way `TierReEvalHandle` does),
-/// and `active_arms` returns a boxed future. `active_arms` carries
+/// synchronous, and `active_arms` returns a boxed future. `active_arms` carries
 /// `#[cfg(all(test, feature = "testing"))]`, so a doc build compiles no link
 /// target for it.
 pub trait RepublishCycle: Send + Sync {
@@ -436,8 +435,7 @@ impl<D: DhtClient + 'static> RepublishCycle for SelfDidRepublishing<D> {
     /// off-runtime, so it is used only when the caller is already on a worker of
     /// this cycle's own multi-thread runtime — the case where blocking makes
     /// teardown deterministic. Every other caller gets a spawn onto the same
-    /// runtime. Mirrors `TierReEvalHandle::stop_and_wait`, including its
-    /// runtime-flavor check, and its fallback that still aborts.
+    /// runtime.
     fn stop_and_wait(&self) {
         // Synchronous and unconditional: after this line no re-seed can start an
         // arm, whether or not the stop below gets to run promptly.
