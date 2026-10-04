@@ -1230,12 +1230,13 @@ pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
 /// `attestKey` answered `DCError.invalidKey` and the key probe's assertion
 /// with that key succeeded, so the adapter keeps the key and records it.
 pub const ATTEST_9021: &str = "SCP-ATTEST-9021";
-/// Apple refused an assertion with a stored App Attest key that carries no
-/// attestation record.
+/// Apple refused an `assertRequest` assertion with a stored App Attest key that
+/// carries no attestation record.
 ///
-/// `generateAssertion` answered `DCError.invalidKey` for a key that carries
-/// no attestation record, which names either an unattested key or a rejected
-/// key whose record was never written; the Apple adapter keeps the key.
+/// `assertRequest`'s `generateAssertion` answered `DCError.invalidKey` for a
+/// key that carries no attestation record, which names either an unattested
+/// key or a rejected key whose record was never written; the Apple adapter
+/// keeps the key.
 pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
 /// Apple's App Attest service rejected this device's key.
 ///

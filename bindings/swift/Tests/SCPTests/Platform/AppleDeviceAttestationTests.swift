@@ -56,8 +56,9 @@
 // 6. When `attestKey` returns an attestation object, the adapter records
 //    that key ID as attested, and a later `attest` on that key throws
 //    `SCP-ATTEST-9021` without calling Apple. `DCError.invalidKey` from
-//    `generateAssertion` keeps a key with no record (`SCP-ATTEST-9022`) and
-//    discards a recorded key's ID and record (`SCP-ATTEST-9023`);
+//    `assertRequest`'s `generateAssertion` keeps a key with no record
+//    (`SCP-ATTEST-9022`) and discards a recorded key's ID and record
+//    (`SCP-ATTEST-9023`);
 //    `DCError.serverUnavailable` from `attestKey` or `generateAssertion`
 //    keeps the key (`SCP-ATTEST-9024`). `DCError.invalidKey` from
 //    `attestKey` leads to the key probe, an assertion over the key-probe

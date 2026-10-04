@@ -58,8 +58,9 @@
         /// the key and its record, so `assertRequest(requestHash:)` keeps
         /// asserting with the attested key.
         case keyAlreadyAttested(String)
-        /// Apple answered `generateAssertion` with `DCError.invalidKey` for a
-        /// stored key that carries no attestation record.
+        /// Apple answered the `generateAssertion` call of
+        /// `assertRequest(requestHash:)` with `DCError.invalidKey` for a stored
+        /// key that carries no attestation record.
         ///
         /// `DCError.h` lists a call to
         /// `generateAssertion:clientDataHash:completionHandler:` with an
@@ -743,10 +744,10 @@
         /// `requestAttestation(keyId:challenge:call:)` therefore hands that
         /// answer to the key probe, `probeKey(_:after:call:)`, whose own
         /// table says what each probe answer gives. A key with no record that
-        /// `generateAssertion` answers with `invalidKey` is either unattested
-        /// or a rejected key whose record was never written, so the adapter
-        /// keeps it and reports `keyNotAttested`, whose message names both
-        /// causes.
+        /// the `generateAssertion` call of `assertRequest(requestHash:)`
+        /// answers with `invalidKey` is either unattested or a rejected key
+        /// whose record was never written, so the adapter keeps it and
+        /// reports `keyNotAttested`, whose message names both causes.
         ///
         /// **What makes the attestation record a sound input.** The record
         /// describes the key App Attest holds only while no other call writes
@@ -787,10 +788,6 @@
         /// Ask Apple for an assertion over `keyProbeClientDataHash` with a
         /// key `attestKey` answered `DCError.invalidKey` for, discard that
         /// assertion, and end `call` with what Apple's answer shows.
-        ///
-        /// `DCError.h` lists two conditions under which `attestKey` answers
-        /// `DCError.invalidKey` for a key with no attestation record: Apple
-        /// already attested the key, or Apple's service rejected it.
         ///
         /// | Probe answer | Case | Key |
         /// | --- | --- | --- |
