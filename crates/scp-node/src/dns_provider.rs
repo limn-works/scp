@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_falls_back_to_self_signed_when_api_unreachable() {
+    async fn provision_falls_back_to_self_signed_when_api_closes_connections() {
         let api_url = closing_api_url().await;
         let provider = ScpDnsProvider::new(
             "did:dht:test-fallback",
@@ -696,6 +696,14 @@ mod tests {
         assert!(
             elapsed >= minimum,
             "each attempt should wait out the request timeout: elapsed {elapsed:?}, expected at least {minimum:?}"
+        );
+        // Production timing takes 3 x 30 s plus 2 x 2 s, and the production
+        // retry delay alone adds 4 s, so this ceiling fails the test if
+        // register() ignores either configured value.
+        let ceiling = Duration::from_secs(3);
+        assert!(
+            elapsed < ceiling,
+            "register() should use the configured timing: elapsed {elapsed:?}, expected under {ceiling:?}"
         );
         let mut accepted = 0_u32;
         while held.try_recv().is_ok() {
