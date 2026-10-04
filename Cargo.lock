@@ -5230,6 +5230,7 @@ dependencies = [
  "rmp-serde",
  "rusqlite",
  "scp-crypto",
+ "scp-sqlite-pools",
  "scp-testing",
  "serde",
  "sha2 0.10.9",
@@ -5376,6 +5377,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scp-sqlite-pools"
+version = "0.1.0-beta.2"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "scp-testing"
 version = "0.1.0"
 dependencies = [
@@ -5468,6 +5477,7 @@ dependencies = [
  "scp-platform",
  "scp-protocol",
  "scp-relay-client",
+ "scp-sqlite-pools",
  "scp-testing",
  "serde",
  "serde_bytes",

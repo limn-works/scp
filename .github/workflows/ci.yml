@@ -449,6 +449,8 @@ jobs:
               - 'crates/scp-protocol/**'
               - 'crates/scp-relay-client/**'
               - 'crates/scp-runtime/**'
+              # scp-platform's sqlite and apple features pull in scp-sqlite-pools.
+              - 'crates/scp-sqlite-pools/**'
               - 'crates/scp-transport/**'
               # Every crate above is a member of the root workspace and reads
               # its dependency versions from the root manifest's
