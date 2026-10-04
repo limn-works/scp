@@ -13,6 +13,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # CARGO_INCREMENTAL=0 turns off incremental compilation, which a CI job that compiles
+  # a tree once gains nothing from. `Swatinem/rust-cache` hashes every CARGO_* variable
+  # into its cache key, so the value also has to match across every job that shares a
+  # cache group.
+  CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
@@ -36,6 +41,9 @@ env:
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
 # every merge-queue run can read.
+# Job rust-test-optional-features later split its one group into three, one per matrix
+# group, and job rust-clippy split its one group into three, one per matrix leg, so
+# this workflow now writes twelve groups per generation.
 #
 # THE GROUPS. Cargo hashes the compile mode into every artifact's metadata
 # suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,
@@ -68,14 +76,29 @@ env:
 #                     each `-p` command it runs — rust-clippy's `packages` leg, the
 #                     only member. None of its commands resolves the workspace
 #                     feature set, so the `workspace-check` entry holds few of its units.
-#   workspace-release `target/release` on Linux — pyo3-module, which runs
-#                     `maturin develop --release`, and napi-addon, which runs
-#                     `cargo build -p scp-ffi-napi --release`. Those two jobs are the
+#   workspace-ci-bridge
+#                     `target/ci-bridge` on Linux — pyo3-module, which runs
+#                     `maturin develop --profile ci-bridge`, and napi-addon, which runs
+#                     `cargo build -p scp-ffi-napi --profile ci-bridge`. The four
+#                     bridge producers build under the `ci-bridge` profile the root
+#                     Cargo.toml defines (SCP's crates at opt-level 1, dependencies at
+#                     opt-level 3). This group and the two `-ci-bridge` groups below
+#                     replaced `workspace-release`, `apple-uniffi` and `apple-parity`,
+#                     which held `--release` output, when the producers moved to the
+#                     profile. Keeping the old names would have stalled each group:
+#                     rust-cache's key hashes no `[profile]` table, so the old entry
+#                     matched the new key in full, restored a `target/release` the
+#                     profile never reads, and a full match skips the save, so `main`
+#                     would never have written the `target/ci-bridge` entry. Measured
+#                     on the pull request's run: napi-addon restored
+#                     `v0-rust-workspace-release-…` with `full match: true` and
+#                     compiled every dependency (6m49s). Those two jobs are the
 #                     only members. python-test, typescript-check and bridge-parity
-#                     ran one or both of those commands and belonged to this group;
+#                     ran the `--release` form of one or both of those commands and
+#                     belonged to `workspace-release`;
 #                     they now download what the producers upload, so none of them
 #                     runs cargo and none of them reads a cargo cache.
-#                     bridge-parity-kotlin belonged to it for its `maturin develop
+#                     bridge-parity-kotlin belonged to `workspace-release` for its `maturin develop
 #                     --release`; it now downloads the PyO3 module and restores
 #                     workspace-debug for its one remaining cargo command, the
 #                     dev-profile `scp-ffi-uniffi` build. The two members write one
@@ -87,37 +110,49 @@ env:
 #                     of this workspace — napi, napi-derive and napi-build — which
 #                     napi-addon compiles on each run that builds the addon. Giving napi-addon a second group
 #                     would cache those three and would also store a second copy of
-#                     the shared tree, which is nearly all of `target/release`,
+#                     the shared tree, which is nearly all of `target/ci-bridge`,
 #                     against the 10 GB repository cap the paragraph below counts, so
-#                     the group keeps one writer. bridge-parity wrote this entry
-#                     before this arrangement and ran both commands, so what it wrote
+#                     the group keeps one writer. bridge-parity wrote the
+#                     `workspace-release` entry before this arrangement and ran both
+#                     `--release` commands, so what it wrote
 #                     did cover the NAPI dependencies.
-#   transport-optional
-#                     `target/debug` again, but under a feature resolution no
-#                     other job produces — rust-test-optional-features. Its
-#                     `-p scp-transport`, `-p scp-testing`, `-p scp-node` and
-#                     `-p scp-relay` selections resolve features over one
-#                     package's subgraph, not the workspace. The scp-transport
-#                     and scp-testing selections drop `scp-runtime/testing`,
-#                     which gave 337 packages a fingerprint the `workspace-debug`
-#                     entry does not hold, measured before the scp-node and
-#                     scp-relay selections existed. Sharing that entry would
-#                     restore artifacts none of its units match.
+#   transport-optional-transport, transport-optional-node-relay,
+#   transport-optional-platform-testing
+#                     `target/debug` again, but under feature resolutions no
+#                     other job produces — rust-test-optional-features, one group
+#                     per value of its matrix `group` axis, named by
+#                     `shared-key: transport-optional-${{ matrix.group }}`. Its
+#                     `-p scp-transport`, `-p scp-testing`, `-p scp-node`,
+#                     `-p scp-relay` and `-p scp-platform` selections resolve
+#                     features over one package's subgraph, not the workspace.
+#                     The scp-transport and scp-testing selections drop
+#                     `scp-runtime/testing`, which gave 337 packages a
+#                     fingerprint the `workspace-debug` entry does not hold,
+#                     measured before the scp-node and scp-relay selections
+#                     existed. Sharing that entry would restore artifacts none
+#                     of its units match. Each matrix group runs its own
+#                     selections, so one entry for all three would hold only
+#                     the units of whichever leg saved first; three entries per
+#                     runner OS cost more of the 10 GB cap below, a cost taken
+#                     on 2026-10-03 in exchange for the shorter job.
 #   wasm32            `target/wasm32-unknown-unknown/release` — typescript-wasm-check
 #                     and scaffold-typescript-web-check, which both run
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
 #                     group for its registry alone, because both compile under the dev
 #                     profile; each step below says so where it sits.
-#   apple-uniffi      `target/aarch64-apple-darwin/release` — xcframework, which runs
-#                     `bindings/swift/build-xcframework.sh --dev` for both macOS jobs
-#                     that read an XCFramework. swift-build-test ran that script and
-#                     wrote this entry; it downloads the result instead and reads no
+#   apple-uniffi-ci-bridge
+#                     `target/aarch64-apple-darwin/ci-bridge` — xcframework, which runs
+#                     `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`
+#                     for both macOS jobs that read an XCFramework. swift-build-test
+#                     ran `build-xcframework.sh --dev` and wrote the `apple-uniffi`
+#                     entry; it downloads the result instead and reads no
 #                     cargo cache.
-#   apple-parity      `target/release` on macOS — pyo3-module-macos, which runs
-#                     `maturin develop --release` for bridge-parity-swift. The name
-#                     stays as bridge-parity-swift wrote it, because renaming a group
-#                     abandons the entry `main` holds under the old name and makes the
-#                     next run compile cold.
+#   apple-parity-ci-bridge
+#                     `target/ci-bridge` on macOS — pyo3-module-macos, which runs
+#                     `maturin develop --profile ci-bridge` for bridge-parity-swift.
+#                     A rename abandons the entry `main` holds under the old name, so
+#                     a group keeps its name unless, as here, that entry holds a
+#                     directory its members no longer read.
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
@@ -136,7 +171,7 @@ env:
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
-# comment on job fuzz-nightly says more). Eleven groups per generation across the two
+# comment on job fuzz-nightly says more). Thirteen groups per generation across the two
 # workflows, where the two together wrote thirty-six entries before. The four
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the
 # comment above job pyo3-module counts them.
@@ -151,9 +186,11 @@ env:
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
 # and it finishes eleven minutes before rust-test. The producers are rust-test
 # (workspace-debug), rust-clippy's three legs (workspace-check, clippy-examples and
-# clippy-packages, one each), rust-test-optional-features
-# (transport-optional), pyo3-module (workspace-release), typescript-wasm-check
-# (wasm32), xcframework (apple-uniffi), pyo3-module-macos (apple-parity) and
+# clippy-packages, one each), rust-test-optional-features (each of its three
+# transport-optional groups, one writer per group because each matrix leg's step
+# expands the key to its own group), pyo3-module (workspace-ci-bridge), typescript-wasm-check
+# (wasm32), xcframework (apple-uniffi-ci-bridge), pyo3-module-macos
+# (apple-parity-ci-bridge) and
 # fuzz-build (fuzz): in each group, the job that compiles the most of that directory
 # under that mode.
 #
@@ -411,7 +448,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
@@ -482,7 +518,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -630,7 +665,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
 
@@ -770,7 +804,6 @@ jobs:
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
-      - uses: dtolnay/rust-toolchain@stable
       # This job reads the `workspace-debug` cache group for its registry alone,
       # the way job shipped-feature-graph does: the twelve `cargo tree`
       # resolutions the suite drives download the index and the `.crate` files,
@@ -1011,9 +1044,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       # Reads the `wasm32` group typescript-wasm-check writes. This command compiles
       # under the dev profile and that job builds under release, so what this restore
       # supplies is the registry — the crates.io sources every dependency of these nine
@@ -1034,9 +1064,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1070,9 +1097,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
       - run: cargo fmt --all -- --check
 
   # ── Why this job is a three-leg matrix ──────────────────────────────────────
@@ -1114,9 +1138,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       # scripts/check-examples-compile.sh parses cargo metadata with jq, which
       # the runner image ships. This step fails the job by name if an image drops it.
       - name: Require jq
@@ -1293,7 +1314,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1365,28 +1385,54 @@ jobs:
   # The cache group buys the same time and deletes nothing: this job's own
   # artifacts, under its own feature resolution, restore on every later run. It
   # writes on a push to `main` because it is the only job that builds them.
+  #
+  # Builds and tests the code that sits behind features `--workspace` never
+  # activates. One job id, six legs: two runners times three groups of commands,
+  # so the `ci` aggregate's `needs` names every leg through this one id. Each
+  # command runs in exactly one group. The groups were balanced on the macOS leg
+  # of the single-step job this replaced, which took 12 min 11 s, 10 min 46 s of
+  # it in its one test step (run 2026-10-03, job 111299315917): transport about
+  # 4 min 0 s of cargo time (the scp-transport `combined,local-cache` run, the
+  # five optional-transport runs and the blob-backend `startup` run),
+  # node-relay about 3 min 43 s (the scp-node quic and well_known runs and both
+  # binaries' `cloud-blobs` runs), platform-testing about 3 min 3 s (the
+  # scp-platform and persistence_advanced runs, saga_bridge_journal_swap and the
+  # two `cargo check -p scp-testing` commands). Every leg also pays its own
+  # checkout, toolchain and cache restore, 1 min 21 s on that leg.
+  #
+  # Each command stays literal in a `run:` step whose `if:` names its group.
+  # A command list passed through `${{ matrix.* }}` would be one expression
+  # token to the zero-test scan in scripts/tests/ci-gate/ci_gate_selftest.py,
+  # which then could not see a filter that lacks `--no-tests=fail`; that file
+  # also requires the groups the steps name to equal the matrix list.
+  #
+  # Each group writes its own rust-cache entry, `transport-optional-<group>`,
+  # because each group compiles feature resolutions of scp-transport, scp-node,
+  # scp-relay, scp-platform or scp-testing that the other two do not, and one
+  # shared entry would hold only the units of whichever leg saved first.
   rust-test-optional-features:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / test (optional features, ${{ matrix.os }})
+    name: Rust / test (optional features, ${{ matrix.os }}, ${{ matrix.group }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        group: [transport, node-relay, platform-testing]
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: transport-optional
+          shared-key: transport-optional-${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
-      - name: Run tests
+      - name: Run transport tests
+        if: matrix.group == 'transport'
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -1415,6 +1461,23 @@ jobs:
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test webrtc_roundtrip
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^nostr::/)'
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^webrtc::/)'
+          # scp-transport compiles the PostgreSQL and S3 arms of
+          # `storage_from_env` only under its `postgres-blob` and `s3-blob`
+          # features, which --workspace leaves off. This command runs the
+          # `BackendChoice` unit tests with both arms compiled, the only build in
+          # which they assert that `postgres` and `s3` parse in either case and
+          # are cloud backends. The node-relay group runs the two binaries'
+          # `cloud-blobs` tests.
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
+      - name: Run node and relay tests
+        if: matrix.group == 'node-relay'
+        run: |
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export DYLD_LIBRARY_PATH="${LIBDIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          else
+            export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           # scp-node holds two auto-discovered test files (quic_listener,
           # quic_cross_transport), each gated on `quic` and
           # `allow_unencrypted_storage`, which `testing` implies. --workspace
@@ -1439,6 +1502,33 @@ jobs:
           # it keeps selecting tests after both arms are gone.
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_webtransport_with_feature)'
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_udp_dtls_with_feature)'
+          # scp-node and scp-relay compile the PostgreSQL and S3 arms of
+          # `storage_from_env` only under their off-by-default `cloud-blobs`
+          # feature, which --workspace leaves off. Run the two binaries' backend
+          # selection tests with it on. Each test fails when its own package's
+          # `cloud-blobs` feature is on and the build does not list both the
+          # `postgres` and `s3` backends, and when a build that lists a backend
+          # stops exiting on a missing SCP_RELAY_DATABASE_URL or
+          # SCP_RELAY_S3_BUCKET. Each binary
+          # runs in its own invocation because cargo unifies scp-transport's
+          # features across every package one invocation builds: a combined
+          # invocation compiles both arms into scp-relay through scp-node's
+          # feature alone, and passes when scp-relay's `cloud-blobs` enables
+          # nothing. The scp-node command also enables `testing`, the only
+          # build that compiles `--ephemeral`, so the test checks that
+          # `--ephemeral` exits on `postgres` and `s3`. The transport group runs
+          # the scp-transport `BackendChoice` unit tests with both arms compiled.
+          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
+          cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
+      - name: Run platform and scp-testing tests
+        if: matrix.group == 'platform-testing'
+        run: |
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export DYLD_LIBRARY_PATH="${LIBDIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          else
+            export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           # scp-platform gates its Apple SQLCipher storage adapter behind `apple`
           # and its syncable-storage trait behind `sync`. --workspace enables
           # neither (only scp-testing's opt-in `sync` feature enables
@@ -1456,27 +1546,6 @@ jobs:
           # naming it exactly, with `--no-tests=fail`.
           cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=syncable_storage_export_apply_roundtrip)'
           cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=combined_node_storage_both_traits_roundtrip)'
-          # scp-node and scp-relay compile the PostgreSQL and S3 arms of
-          # `storage_from_env` only under their off-by-default `cloud-blobs`
-          # feature, which --workspace leaves off. Run the two binaries' backend
-          # selection tests with it on. Each test fails when its own package's
-          # `cloud-blobs` feature is on and the build does not list both the
-          # `postgres` and `s3` backends, and when a build that lists a backend
-          # stops exiting on a missing SCP_RELAY_DATABASE_URL or
-          # SCP_RELAY_S3_BUCKET. Each binary
-          # runs in its own invocation because cargo unifies scp-transport's
-          # features across every package one invocation builds: a combined
-          # invocation compiles both arms into scp-relay through scp-node's
-          # feature alone, and passes when scp-relay's `cloud-blobs` enables
-          # nothing. The scp-transport command runs the `BackendChoice` unit
-          # tests with both arms compiled, the only build in which they assert
-          # that `postgres` and `s3` parse in either case and are cloud
-          # backends. The scp-node command also enables `testing`, the only
-          # build that compiles `--ephemeral`, so the test checks that
-          # `--ephemeral` exits on `postgres` and `s3`.
-          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
-          cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
-          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
           # The saga-journal durable crash-recovery round-trip is gated behind
           # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
           # processes). --workspace does NOT activate this optional feature, so
@@ -1532,7 +1601,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
         with:
@@ -1631,7 +1699,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
         with:
@@ -1751,7 +1818,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1849,7 +1915,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -2129,7 +2194,7 @@ jobs:
   # reports a downloaded artifact kept for fewer days.
   #
   # REUSE ACROSS RUNS. Each producer restores its artifact files from `actions/cache`
-  # under the key below, and skips the toolchain, cargo-cache and build steps when the
+  # under the key below, and skips the cargo-cache and build steps when the
   # key hits. The upload runs either way, so consumers download the same artifact name
   # and path on a hit and on a miss.
   # The key holds:
@@ -2237,12 +2302,10 @@ jobs:
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: workspace-release
+          shared-key: workspace-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -2256,7 +2319,7 @@ jobs:
           # resolution, and same-process governance vote verification would
           # fail-close to "unknown voter" (ADR-062 §Decision 1 gated the in-memory
           # DHT nullifier behind `testing`; the functional test harness opts in).
-          maturin develop --release --features testing
+          maturin develop --profile ci-bridge --features testing
       - name: Upload PyO3 native module
         uses: actions/upload-artifact@v4
         with:
@@ -2338,14 +2401,12 @@ jobs:
         id: artifact-cache
         uses: actions/cache/restore@v4
         with:
-          path: target/release/libscp_ffi_napi.so
+          path: target/ci-bridge/libscp_ffi_napi.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: workspace-release
+          shared-key: workspace-ci-bridge
           save-if: false
       - name: Build NAPI native addon
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -2359,19 +2420,19 @@ jobs:
           # (ADR-062 §Decision 1 gated the in-memory DHT nullifier behind `testing`).
           # crates/scp-ffi/napi/Cargo.toml opens that feature's list with
           # `scp-core/testing`, so this one flag is the set both consumers spelled.
-          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing
+          cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing
       - name: Upload NAPI native addon
         uses: actions/upload-artifact@v4
         with:
           name: napi-addon-linux
-          path: target/release/libscp_ffi_napi.so
+          path: target/ci-bridge/libscp_ffi_napi.so
           retention-days: 30
           if-no-files-found: error
       - name: Save the NAPI addon under its input key
         if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
-          path: target/release/libscp_ffi_napi.so
+          path: target/ci-bridge/libscp_ffi_napi.so
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
   xcframework:
@@ -2422,18 +2483,16 @@ jobs:
             bindings/swift/Headers
             bindings/swift/Sources/SCP/Internal/ScpBindings.swift
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/swift/build-xcframework.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: apple-uniffi
+          shared-key: apple-uniffi-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build XCFramework (dev mode — macOS arm64 only)
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           touch "$RUNNER_TEMP/xcframework-build-start"
-          bindings/swift/build-xcframework.sh --dev
+          bindings/swift/build-xcframework.sh --dev --profile ci-bridge
       # The upload below cannot fail on its own: `if-no-files-found: error` fires only
       # when all three paths together match nothing, and ScpBindings.swift is tracked,
       # so the checkout always supplies one match. A script that exited 0 without
@@ -2556,19 +2615,17 @@ jobs:
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: apple-parity
+          shared-key: apple-parity-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features testing
+          maturin develop --profile ci-bridge --features testing
       - name: Upload PyO3 native module
         uses: actions/upload-artifact@v4
         with:
@@ -2756,7 +2813,7 @@ jobs:
           # Into the directory the wiring step below reads, so that step keeps its
           # one source of truth for the cdylib's path.
           name: napi-addon-linux
-          path: target/release
+          path: target/ci-bridge
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install
@@ -2773,10 +2830,10 @@ jobs:
           PKG_DIR="bindings/typescript/node_modules/${NAPI_PKG}"
           mkdir -p "$PKG_DIR"
           # The cargo build produces a cdylib; copy and rename to .node for NAPI loading
-          LIB_FILE="target/release/libscp_ffi_napi.so"
+          LIB_FILE="target/ci-bridge/libscp_ffi_napi.so"
           if [ ! -f "$LIB_FILE" ]; then
             echo "ERROR: cdylib not found at $LIB_FILE"
-            ls -la target/release/libscp_ffi_napi* 2>/dev/null || true
+            ls -la target/ci-bridge/libscp_ffi_napi* 2>/dev/null || true
             exit 1
           fi
           cp "$LIB_FILE" "$PKG_DIR/index.node"
@@ -2789,7 +2846,7 @@ jobs:
       # that does not load, would leave `bun test` exiting 0 over zero executed NAPI
       # assertions, which is the `zero-test` shape
       # scripts/tests/ci-gate/ci_gate_selftest.py names. The `[ ! -f ]` check above
-      # reads whether target/release holds the cdylib and never resolves the package.
+      # reads whether target/ci-bridge holds the cdylib and never resolves the package.
       # This step runs the SDK loader and the native constructor, so such an addon
       # fails the job here, and it reads the two methods the `server` and
       # `testing` feature lists compile onto the native class, so a build missing
@@ -2814,7 +2871,7 @@ jobs:
             const loaderRequire = createRequire(process.cwd() + "/src/internal/native.ts");
             const resolved = loaderRequire.resolve(pkg);
             const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
-            const downloaded = "../../target/release/libscp_ffi_napi.so";
+            const downloaded = "../../target/ci-bridge/libscp_ffi_napi.so";
             if (digest(resolved) !== digest(downloaded)) {
               throw new Error(resolved + " is not the downloaded addon " + downloaded);
             }
@@ -2870,9 +2927,6 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm32
@@ -2943,9 +2997,6 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm32
@@ -3138,7 +3189,6 @@ jobs:
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
       - run: sdkmanager "platforms;android-35"
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -3315,7 +3365,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: napi-addon-linux
-          path: target/release
+          path: target/ci-bridge
       - name: Python deps
         run: |
           python -m venv .venv
@@ -3354,10 +3404,10 @@ jobs:
           esac
           PKG_DIR="bindings/typescript/node_modules/${NAPI_PKG}"
           mkdir -p "$PKG_DIR"
-          LIB_FILE="target/release/libscp_ffi_napi.so"
+          LIB_FILE="target/ci-bridge/libscp_ffi_napi.so"
           if [ ! -f "$LIB_FILE" ]; then
             echo "ERROR: cdylib not found at $LIB_FILE"
-            ls -la target/release/libscp_ffi_napi* 2>/dev/null || true
+            ls -la target/ci-bridge/libscp_ffi_napi* 2>/dev/null || true
             exit 1
           fi
           cp "$LIB_FILE" "$PKG_DIR/index.node"
@@ -3384,7 +3434,7 @@ jobs:
             const loaderRequire = createRequire(process.cwd() + "/src/internal/native.ts");
             const resolved = loaderRequire.resolve(pkg);
             const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
-            const downloaded = "../../target/release/libscp_ffi_napi.so";
+            const downloaded = "../../target/ci-bridge/libscp_ffi_napi.so";
             if (digest(resolved) !== digest(downloaded)) {
               throw new Error(resolved + " is not the downloaded addon " + downloaded);
             }
@@ -3464,14 +3514,13 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # `workspace-debug`, not `workspace-release`: the one cargo command left in
+          # `workspace-debug`, not `workspace-ci-bridge`: the one cargo command left in
           # this job builds `scp-ffi-uniffi` under the dev profile into `target/debug`,
           # which is the directory and the compile mode that group holds. It read
           # `workspace-release` while it also ran `maturin develop --release`, and job
-          # pyo3-module now runs that command instead. kotlin-test, which runs the same
+          # pyo3-module now builds that module instead. kotlin-test, which runs the same
           # `cargo build -p scp-ffi-uniffi --features testing`, reads this group too.
           shared-key: workspace-debug
           save-if: false

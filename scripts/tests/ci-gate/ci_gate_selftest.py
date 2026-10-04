@@ -203,6 +203,17 @@ nothing:
                no assertion. Both now sit in a fenced block or name the block
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
+  matrix-axis
+               Job rust-test-optional-features runs its commands on six legs,
+               two runners times three values of a matrix `group` axis, and job
+               rust-clippy runs on three values of a `leg` axis. GitHub runs a
+               leg whose value no step names and reports it green over none of
+               the gated commands, and it skips a step whose value the axis
+               lacks on every leg, so deleting `platform-testing` from the
+               `group` axis would have dropped eight commands from every run
+               while `ci` passed. The check reports a step gated with
+               `if: matrix.<axis> == '<value>'` on an axis the job's matrix does
+               not define.
   package-writers
                Job docker-image-cache writes the Docker layer cache to the
                ghcr.io tag `buildcache:docker-image` with the `docker-cache`
@@ -5057,6 +5068,9 @@ PUSH_MATRIX = re.compile(
     r"\s*\|\|\s*'(\[[^']*\])'\s*\)\s*\}\}$"
 )
 SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?")
+# A matrix axis a cache key expands, so that each value of the axis writes its own
+# entry: `shared-key: transport-optional-${{ matrix.group }}`.
+KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}")
 
 
 def push_writer_gaps(doc: dict) -> list[str]:
@@ -5064,8 +5078,11 @@ def push_writer_gaps(doc: dict) -> list[str]:
 
     CRITERION: a job holding a cache-writing step runs on a push to `main` wherever
     a merge_group run with the same filter outputs runs it, and some push runs it at
-    all; and a matrix leg a writer's `save-if` names exists on push. A cache
-    SHARED_KEY_CACHES names needs only that some push runs some job writing it.
+    all; a matrix leg that a writing step's `save-if` or `if:` names exists on push;
+    and every value that every other event runs on an axis a writing step's cache
+    key expands (`shared-key` or `key` holding `${{ matrix.<axis> }}`) also runs on
+    push, because each such value names its own entry. A cache SHARED_KEY_CACHES
+    names needs only that some push runs some job writing it.
 
     WHY: rust-cache and `actions/cache/save` write only on `refs/heads/main`, so a
     writer that a push skips leaves its entry to go stale until eviction, and every
@@ -5132,9 +5149,11 @@ def push_writer_gaps(doc: dict) -> list[str]:
             gaps.append(f"{job_id} writes {caches} through a matrix this check cannot read")
             continue
         on_push: dict[str, list] = {}
+        elsewhere: dict[str, list] = {}
         for key, values in matrix.items():
             if isinstance(values, list):
                 on_push[key] = values
+                elsewhere[key] = values
                 continue
             chosen = PUSH_MATRIX.match(str(values))
             if chosen is None:
@@ -5150,16 +5169,133 @@ def push_writer_gaps(doc: dict) -> list[str]:
                     f"the {other_values} every other event runs"
                 )
             on_push[key] = push_values
+            elsewhere[key] = other_values
         for step in job.get("steps") or []:
             if not isinstance(step, dict) or cache_write(step) is None:
                 continue
-            save_if = str((step.get("with") or {}).get("save-if", ""))
-            for key, value in SAVE_IF_MATRIX.findall(save_if):
+            inputs = step.get("with") or {}
+            leg_conditions = f"{inputs.get('save-if', '')} {step.get('if') or ''}"
+            for key, value in SAVE_IF_MATRIX.findall(leg_conditions):
                 if key in on_push and value not in map(str, on_push[key]):
                     gaps.append(
                         f"{job_id} saves {cache_write(step)} only from matrix leg "
                         f"`{key} == {value}`, and a push runs `{key}` over "
                         f"{on_push[key]} alone"
+                    )
+            key_text = f"{inputs.get('shared-key', '')} {inputs.get('key', '')}"
+            for key in sorted(set(KEY_MATRIX_AXIS.findall(key_text))):
+                if key not in on_push:
+                    continue
+                pushed_values = set(map(str, on_push[key]))
+                unwritten = [v for v in elsewhere[key] if str(v) not in pushed_values]
+                if unwritten:
+                    gaps.append(
+                        f"{job_id} writes {cache_write(step)}, one entry per value of "
+                        f"matrix `{key}`, and a push never runs {unwritten}, so those "
+                        f"entries are never written"
+                    )
+    return gaps
+
+
+# A step's `if:` that selects one value of one matrix axis, with or without the
+# `${{ … }}` wrapper GitHub accepts around a step condition.
+AXIS_CONDITION = re.compile(
+    r"^\s*(?:\$\{\{\s*)?matrix\.([A-Za-z0-9_-]+)\s*==\s*'([^']*)'\s*(?:\}\})?\s*$"
+)
+
+
+def matrix_axis_gaps(doc: dict) -> list[str]:
+    """Return each disagreement between a job's matrix axes and its steps.
+
+    CRITERION: in every job, an axis of `strategy.matrix` is read when at least
+    one step's `if:` reads exactly `matrix.<axis> == '<value>'`. For each axis
+    read, every value such a step names is in the axis list, and, unless the
+    job's `runs-on` reads that axis, every value the axis lists is named by at
+    least one such step. A value no step names runs legs that skip every gated
+    step, and a step naming a value the axis lacks never runs on any leg, so
+    its commands run nowhere while every leg passes. An axis `runs-on` reads
+    picks each leg's runner, so a step gated to one of its values (a macOS-only
+    install) leaves the other legs running every ungated step. Another step whose `if:` mentions `matrix.<axis>` for an axis read
+    is reported rather than read, because this check could not say which legs
+    run it. A matrix carrying `include` or `exclude` is reported rather than
+    read, because either one can add or remove an axis value's legs while the
+    axis list stays the same. A step whose `if:` reads that form on an axis the
+    job's matrix does not define, as a key or inside an `include` entry, is
+    reported, because GitHub runs it on no leg.
+    """
+    gaps = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        matrix = (job.get("strategy") or {}).get("matrix") or {}
+        if not isinstance(matrix, dict):
+            continue
+        steps = [
+            (step.get("name") or f"step {index + 1}", str(step.get("if") or ""))
+            for index, step in enumerate(job.get("steps") or [])
+            if isinstance(step, dict)
+        ]
+        defined = {key for key in matrix if key not in ("include", "exclude")}
+        for entry in matrix.get("include") or []:
+            if isinstance(entry, dict):
+                defined.update(entry)
+        for label, condition in steps:
+            match = AXIS_CONDITION.match(condition)
+            if match and match.group(1) not in defined:
+                gaps.append(
+                    f"{job_id}: {label!r} has `if: {condition}`, but the job's "
+                    f"matrix defines no axis {match.group(1)}, so it runs on no leg"
+                )
+        read_axes = sorted(
+            {
+                match.group(1)
+                for _, condition in steps
+                if (match := AXIS_CONDITION.match(condition))
+                and match.group(1) in matrix
+                and match.group(1) not in ("include", "exclude")
+            }
+        )
+        if not read_axes:
+            continue
+        expanders = [key for key in ("include", "exclude") if key in matrix]
+        if expanders:
+            gaps.append(
+                f"{job_id}: matrix carries {' and '.join(expanders)}, which this "
+                f"check does not expand into legs"
+            )
+            continue
+        for axis_name in read_axes:
+            axis = matrix[axis_name]
+            if not isinstance(axis, list) or not all(isinstance(v, str) for v in axis):
+                gaps.append(
+                    f"{job_id}: matrix axis {axis_name} {axis!r} is not a list of names"
+                )
+                continue
+            mention = re.compile(rf"\bmatrix\.{re.escape(axis_name)}(?![A-Za-z0-9_-])")
+            named: set[str] = set()
+            for label, condition in steps:
+                if not mention.search(condition):
+                    continue
+                match = AXIS_CONDITION.match(condition)
+                if match is None or match.group(1) != axis_name:
+                    gaps.append(
+                        f"{job_id}: {label!r} has `if: {condition}`, which is not "
+                        f"`matrix.{axis_name} == '<value>'`"
+                    )
+                    continue
+                value = match.group(2)
+                named.add(value)
+                if value not in axis:
+                    gaps.append(
+                        f"{job_id}: {label!r} names {axis_name} {value!r}, which "
+                        f"matrix axis {axis_name} {axis} lacks, so its commands "
+                        f"run on no leg"
+                    )
+            if mention.search(str(job.get("runs-on") or "")):
+                continue
+            for value in axis:
+                if value not in named:
+                    gaps.append(
+                        f"{job_id}: matrix axis {axis_name} value {value!r} has no "
+                        f"step whose `if:` names it"
                     )
     return gaps
 
@@ -5265,6 +5401,47 @@ def check_push_writer_mutants(doc: dict) -> None:
         any("rust-test saves" in gap for gap in gaps),
         f"{gaps}",
     )
+
+    # rust-test-optional-features writes one rust-cache entry per `group` value
+    # through its key, and rust-clippy one entry per `leg` value through a writing
+    # step gated on that leg. A push matrix dropping a value leaves its entry
+    # unwritten; a push matrix keeping every value leaves nothing to report.
+    for job_id, axis, dropped_value, reported in (
+        (
+            "rust-test-optional-features",
+            "group",
+            "node-relay",
+            "one entry per value of matrix `group`, and a push never runs ['node-relay']",
+        ),
+        ("rust-clippy", "leg", "examples", "only from matrix leg `leg == examples`"),
+    ):
+        live_axis = doc["jobs"][job_id]["strategy"]["matrix"][axis]
+        check(
+            f"{job_id}'s `{axis}` axis lists {dropped_value} for the push-matrix control",
+            isinstance(live_axis, list) and dropped_value in live_axis,
+            f"{live_axis!r}",
+        )
+        every = json.dumps(live_axis)
+        fewer = json.dumps([value for value in live_axis if value != dropped_value])
+        narrowed = copy.deepcopy(doc)
+        narrowed["jobs"][job_id]["strategy"]["matrix"][axis] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && '{fewer}' || '{every}') }}}}"
+        )
+        gaps = push_writer_gaps(narrowed)
+        check(
+            f"a push matrix dropping {job_id}'s `{axis}` value {dropped_value} is reported",
+            any(gap.startswith(f"{job_id} ") and reported in gap for gap in gaps),
+            f"{gaps}",
+        )
+        whole = copy.deepcopy(doc)
+        whole["jobs"][job_id]["strategy"]["matrix"][axis] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && '{every}' || '{every}') }}}}"
+        )
+        check(
+            f"a push matrix keeping every {job_id} `{axis}` value is not reported",
+            not any(gap.startswith(f"{job_id} ") for gap in push_writer_gaps(whole)),
+            f"{push_writer_gaps(whole)}",
+        )
 
     partial = copy.deepcopy(doc)
     pyo3 = partial["jobs"]["pyo3-module"]
@@ -5549,6 +5726,189 @@ def run_one_job_aggregate(expression: str, event: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def check_matrix_axes(path: Path, doc: dict) -> None:
+    gaps = matrix_axis_gaps(doc)
+    check(
+        f"{path.name}: every gated matrix axis agrees with the steps gated on it",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def check_matrix_axis_controls(doc: dict) -> None:
+    """Mutants of the live jobs, each of which the check must report.
+
+    They mutate rust-test-optional-features' `group` axis and rust-clippy's
+    `leg` axis in ci.yml, so a control fails if either job loses its axis as
+    well as if the reader stops working.
+    """
+    for job_id, axis_name, kept, dropped_value in (
+        ("rust-test-optional-features", "group", "transport", "platform-testing"),
+        ("rust-clippy", "leg", "workspace", "packages"),
+    ):
+        live = doc["jobs"].get(job_id) or {}
+        axis = ((live.get("strategy") or {}).get("matrix") or {}).get(axis_name)
+        prefix = f"matrix.{axis_name} =="
+        has_gated_step = any(
+            str(step.get("if") or "").startswith(prefix)
+            for step in live.get("steps") or []
+            if isinstance(step, dict)
+        )
+        ready = isinstance(axis, list) and dropped_value in axis and has_gated_step
+        check(
+            f"{job_id} carries the {axis_name} axis and gated steps the controls "
+            f"mutate",
+            ready,
+            f"{axis_name} axis {axis!r}, gated step present: {has_gated_step}",
+        )
+        if not ready:
+            continue
+
+        def gated(mutant: dict, job_id: str = job_id, prefix: str = prefix) -> list:
+            return [
+                step
+                for step in mutant["jobs"][job_id]["steps"]
+                if str(step.get("if") or "").startswith(prefix)
+            ]
+
+        extra = copy.deepcopy(doc)
+        extra["jobs"][job_id]["strategy"]["matrix"][axis_name].append(
+            "added-by-the-control"
+        )
+        gaps = matrix_axis_gaps(extra)
+        check(
+            f"a {axis_name} value no step names is reported",
+            any(
+                f"{job_id}: matrix axis {axis_name} value 'added-by-the-control' "
+                f"has no step" in gap
+                for gap in gaps
+            ),
+            f"a {axis_name} value with no step went unreported: {gaps}",
+        )
+
+        unknown = copy.deepcopy(doc)
+        gated(unknown)[0]["if"] = f"matrix.{axis_name} == 'absent-from-the-matrix'"
+        gaps = matrix_axis_gaps(unknown)
+        check(
+            f"a step gated on a {axis_name} value the matrix lacks is reported",
+            any(
+                f"names {axis_name} 'absent-from-the-matrix', which matrix axis" in gap
+                for gap in gaps
+            ),
+            f"a step no leg runs went unreported: {gaps}",
+        )
+
+        dropped = copy.deepcopy(doc)
+        dropped["jobs"][job_id]["strategy"]["matrix"][axis_name].remove(dropped_value)
+        gaps = matrix_axis_gaps(dropped)
+        check(
+            f"deleting {dropped_value} from the {axis_name} list is reported",
+            any(f"names {axis_name} {dropped_value!r}" in gap for gap in gaps),
+            f"steps left without a leg went unreported: {gaps}",
+        )
+
+        for expander, entries in (
+            ("include", [{"os": "ubuntu-latest", axis_name: "added-by-the-control"}]),
+            ("exclude", [{axis_name: dropped_value}]),
+        ):
+            expanded = copy.deepcopy(doc)
+            expanded["jobs"][job_id]["strategy"]["matrix"][expander] = entries
+            gaps = matrix_axis_gaps(expanded)
+            check(
+                f"a matrix carrying {expander} over {axis_name} is reported",
+                any(f"{job_id}: matrix carries {expander}," in gap for gap in gaps),
+                f"a matrix whose legs {expander} changes went unreported: {gaps}",
+            )
+
+        undefined = copy.deepcopy(doc)
+        gated(undefined)[0]["if"] = f"matrix.{axis_name}-misspelt == '{kept}'"
+        gaps = matrix_axis_gaps(undefined)
+        check(
+            f"a step gated on an axis the {job_id} matrix does not define is reported",
+            any(
+                f"{job_id}: " in gap
+                and f"matrix defines no axis {axis_name}-misspelt," in gap
+                for gap in gaps
+            ),
+            f"a step gated on an undefined axis went unreported: {gaps}",
+        )
+
+        either = copy.deepcopy(doc)
+        gated(either)[0]["if"] = (
+            f"matrix.{axis_name} == '{kept}' || matrix.{axis_name} == '{dropped_value}'"
+        )
+        gaps = matrix_axis_gaps(either)
+        check(
+            f"a step gated on an `||` of two {axis_name} values is reported",
+            any(
+                f"which is not `matrix.{axis_name} == '<value>'`" in gap for gap in gaps
+            ),
+            f"a step whose condition names two values went unreported: {gaps}",
+        )
+
+    ungated = {"jobs": {"j": {"strategy": {"matrix": {"os": ["a", "b"]}}, "steps": []}}}
+    check(
+        "matrix_axis_gaps passes the live ci.yml and skips an axis no step gates on",
+        not matrix_axis_gaps(doc) and not matrix_axis_gaps(ungated),
+        f"gaps on ci.yml or on an ungated axis: {matrix_axis_gaps(doc)}",
+    )
+
+    def one_os_gate(runs_on: str) -> dict:
+        return {
+            "jobs": {
+                "j": {
+                    "runs-on": runs_on,
+                    "strategy": {"matrix": {"os": ["ubuntu-latest", "macos-latest"]}},
+                    "steps": [{"name": "brew", "if": "matrix.os == 'macos-latest'"}],
+                }
+            }
+        }
+
+    gaps = matrix_axis_gaps(one_os_gate("${{ matrix.os }}"))
+    check(
+        "a step gated to one value of an axis runs-on reads is not reported",
+        not gaps,
+        f"a one-value gate on the runner axis was reported: {gaps}",
+    )
+    gaps = matrix_axis_gaps(one_os_gate("ubuntu-latest"))
+    check(
+        "the same gate on an axis runs-on does not read reports the unnamed value",
+        any("matrix axis os value 'ubuntu-latest' has no step" in gap for gap in gaps),
+        f"an axis value no step names went unreported: {gaps}",
+    )
+    runner_typo = one_os_gate("${{ matrix.os }}")
+    runner_typo["jobs"]["j"]["steps"][0]["if"] = "matrix.os == 'macos-lates'"
+    gaps = matrix_axis_gaps(runner_typo)
+    check(
+        "a step gated on a value the runs-on axis lacks is still reported",
+        any("names os 'macos-lates', which matrix axis" in gap for gap in gaps),
+        f"a step no leg runs went unreported on the runner axis: {gaps}",
+    )
+
+    no_matrix = {"jobs": {"j": {"steps": [{"name": "s", "if": "matrix.leg == 'a'"}]}}}
+    gaps = matrix_axis_gaps(no_matrix)
+    check(
+        "a step gated on a matrix axis in a job with no matrix is reported",
+        any("j: 's' has" in gap and "defines no axis leg," in gap for gap in gaps),
+        f"a step gated on an axis of an absent matrix went unreported: {gaps}",
+    )
+    include_axis = {
+        "jobs": {
+            "j": {
+                "strategy": {"matrix": {"include": [{"leg": "a"}]}},
+                "steps": [{"name": "s", "if": "matrix.leg == 'a'"}],
+            }
+        }
+    }
+    gaps = matrix_axis_gaps(include_axis)
+    check(
+        "a step gated on an axis an include entry defines is not reported as "
+        "an undefined axis",
+        not any("defines no axis" in gap for gap in gaps),
+        f"an axis an include entry defines was reported undefined: {gaps}",
+    )
+
+
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -5621,6 +5981,14 @@ def main() -> int:
     print("win-shell — every `run:` step a Windows runner can execute names a shell")
     for path, doc in documents:
         check_windows_shell(path, doc)
+
+    print(
+        "matrix-axis — each matrix axis a step gates on and its steps' `if:` "
+        "values agree"
+    )
+    for path, doc in documents:
+        check_matrix_axes(path, doc)
+    check_matrix_axis_controls(workflow)
 
     print(
         "empty-input — a job publishing a -signed artifact rejects an empty "

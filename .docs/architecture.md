@@ -279,6 +279,9 @@ scp/
 │   │
 │   ├── scp-event-log/         # Merkle event log
 │   │
+│   ├── scp-alloc/             # Wiping global allocator — wasm-safe leaf, no dependencies; one GlobalAlloc impl and the
+│   │                          #   one #[global_allocator] static, which each shipped binary and cdylib links (09-security-model.md §9.15)
+│   │
 │   ├── scp-clock/             # Clock port — wasm-safe capability leaf (Clock, SystemClock, TestClock)
 │   │
 │   ├── scp-crypto/            # P-256 signature verification — wasm-safe capability leaf
@@ -670,7 +673,9 @@ This section documents the layered dependency graph, every replaceable subsystem
 Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `p256` directly), so there are no intra-layer edges among them. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
-Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
+Layer 0 ─ scp-alloc                 Wiping global allocator (09-security-model.md §9.15). Wasm-safe leaf;
+           │                          no dependencies. Only the shipped binaries and cdylibs depend on it.
+           │  scp-clock               Clock port (wall-clock time). Wasm-safe leaf.
            │  scp-crypto             P-256 signature verification. Wasm-safe leaf.
            │  scp-did                Identity data model (identifier, SigningKeyId, key state,
            │                          attestation). Wasm-safe leaf; deps =

@@ -1,0 +1,13 @@
+name: Bad
+on: push
+jobs:
+  optional:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: optional-${{ matrix.group }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
