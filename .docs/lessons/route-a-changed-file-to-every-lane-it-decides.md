@@ -13,7 +13,7 @@ therefore merges with every job that reads it skipped.
 - **Route a file to every lane whose behaviour it decides, not to the lane whose name
   matches it.** The toolchain pin selects the compiler for `pyo3-module` and
   `pyo3-module-macos` (`maturin develop`), `napi-addon`, `typescript-wasm-check`,
-  `scaffold-typescript-web-check`, `kotlin-test`, `bridge-parity-kotlin`, `xcframework`,
+  `scaffold-typescript-web-check`, `kotlin-test`, `xcframework`,
   and `rust-docs` in `.github/workflows/docs.yml`, not only the `rust` lane. `.cargo/config.toml` decides every
   `wasm-pack build` through its `[target.wasm32-unknown-unknown]` stanza.
 - **The workflow file that defines a lane decides that lane.** A commit that only rewrites a

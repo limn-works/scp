@@ -204,8 +204,9 @@ A new job in `.github/workflows/ci.yml`:
   NAPI bridge alone. Job `bridge-parity-kotlin` selects `uniffi-kotlin` and job
   `bridge-parity-swift` selects `uniffi-swift`, because each of those two jobs
   supplies the UniFFI artifact and the parity runner its own target needs:
-  `bridge-parity-kotlin` builds the cdylib on Ubuntu, and
-  `bridge-parity-swift` downloads the XCFramework that job `xcframework`
+  `bridge-parity-kotlin` downloads the cdylib and the Kotlin bindings that job
+  `kotlin-test` built on Ubuntu and uploaded as artifact `uniffi-kotlin-linux`,
+  and `bridge-parity-swift` downloads the XCFramework that job `xcframework`
   built on macOS.
 - Joins the final `ci` aggregator gate.
 
