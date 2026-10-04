@@ -3455,10 +3455,10 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
     return pinned
 
 
-# One token of an `if:` expression: an operator, a parenthesis, a quoted literal, or a
-# dotted name. A `!` standing alone matches nothing here, and a function call's name
-# followed by `(` fails the grammar in parse_condition.
-CONDITION_TOKEN = re.compile(r"&&|\|\||==|!=|\(|\)|'[^']*'|[A-Za-z_][A-Za-z0-9_.-]*")
+# One token of an `if:` expression: an operator, a parenthesis, a quoted literal, a
+# dotted name, or a whole number. A `!` standing alone matches nothing here, and a
+# function call's name followed by `(` fails the grammar in parse_condition.
+CONDITION_TOKEN = re.compile(r"&&|\|\||==|!=|\(|\)|'[^']*'|[A-Za-z_][A-Za-z0-9_.-]*|[0-9]+")
 CONDITION_OPERATORS = frozenset(("&&", "||", "==", "!=", "(", ")"))
 
 
@@ -5076,6 +5076,67 @@ KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}")
 KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b")
 
 
+def push_runs_step(step: dict) -> bool:
+    """Report whether a push to `main` can run one step and meet its `save-if`.
+
+    The step's `if:` and its `save-if`, each with or without the `${{ … }}`
+    wrapper, are joined with `&&` and read with parse_condition's grammar.
+    `github.event_name` reads `push` and `github.ref` reads `refs/heads/main`.
+    Every other comparison that names some other name may come out either way,
+    and one pair of operands gets one answer wherever it appears. The step runs
+    on push when some choice of those answers makes the whole expression true.
+    An expression outside the grammar raises ValueError.
+    """
+    inputs = step.get("with") or {}
+    parts = []
+    for text in (step.get("if"), inputs.get("save-if")):
+        text = str(text or "").strip()
+        wrapped = re.fullmatch(r"\$\{\{(.*)\}\}", text, re.DOTALL)
+        text = (wrapped.group(1) if wrapped else text).strip()
+        if text:
+            parts.append(f"({text})")
+    if not parts:
+        return True
+    tree = parse_condition(" && ".join(parts))
+    known = {"github.event_name": "push", "github.ref": "refs/heads/main"}
+
+    def operand(token: str) -> str | None:
+        quoted = re.fullmatch(r"'([^']*)'", token)
+        if quoted:
+            return quoted.group(1)
+        if token in ("true", "false") or token.isdigit():
+            return token
+        return known.get(token)
+
+    free: list[tuple[str, ...]] = []
+
+    def collect(node: tuple) -> None:
+        if node[0] in ("or", "and"):
+            for part in node[1]:
+                collect(part)
+        elif None in (operand(node[1]), operand(node[2])):
+            pair = tuple(sorted((node[1], node[2])))
+            if pair not in free:
+                free.append(pair)
+
+    def value(node: tuple, answers: dict) -> bool:
+        if node[0] in ("or", "and"):
+            results = [value(part, answers) for part in node[1]]
+            return any(results) if node[0] == "or" else all(results)
+        left, right = operand(node[1]), operand(node[2])
+        if None in (left, right):
+            equal = answers[tuple(sorted((node[1], node[2])))]
+        else:
+            equal = left == right
+        return equal if node[0] == "==" else not equal
+
+    collect(tree)
+    return any(
+        value(tree, {pair: bool(mask >> index & 1) for index, pair in enumerate(free)})
+        for mask in range(2 ** len(free))
+    )
+
+
 def push_writer_gaps(doc: dict) -> list[str]:
     """Return every way a push to `main` would skip a cache write.
 
@@ -5085,7 +5146,9 @@ def push_writer_gaps(doc: dict) -> list[str]:
     and every value that every other event runs on an axis a writing step's cache
     key expands (`shared-key` or `key` holding `${{ matrix.<axis> }}`, or, for a
     rust-cache step or a key holding `runner.os` or `runner.arch`, an axis the job's
-    `runs-on` names) also runs on push, because each such value names its own entry. A cache SHARED_KEY_CACHES
+    `runs-on` names) also runs on push, because each such value names its own entry;
+    and push_runs_step finds that a push can meet each writing step's `if:` and
+    `save-if` together. A cache SHARED_KEY_CACHES
     names needs only that some push runs some job writing it.
 
     WHY: rust-cache and `actions/cache/save` write only on `refs/heads/main`, so a
@@ -5178,6 +5241,17 @@ def push_writer_gaps(doc: dict) -> list[str]:
             if not isinstance(step, dict) or cache_write(step) is None:
                 continue
             inputs = step.get("with") or {}
+            try:
+                if not push_runs_step(step):
+                    gaps.append(
+                        f"{job_id} saves {cache_write(step)} from a step whose `if:` "
+                        f"and `save-if` no push to `main` meets"
+                    )
+            except ValueError as unreadable:
+                gaps.append(
+                    f"{job_id} saves {cache_write(step)} from a step whose `if:` or "
+                    f"`save-if` this check cannot read ({unreadable})"
+                )
             leg_conditions = f"{inputs.get('save-if', '')} {step.get('if') or ''}"
             for key, value in SAVE_IF_MATRIX.findall(leg_conditions):
                 if key in on_push and value not in map(str, on_push[key]):
@@ -5502,6 +5576,100 @@ def check_push_writer_mutants(doc: dict) -> None:
         ),
         f"{gaps}",
     )
+
+    # A writing step's own `if:` or `save-if` can exclude push while its job runs.
+    def step_where(job: dict, predicate) -> dict:
+        return next(
+            step for step in job["steps"] if isinstance(step, dict) and predicate(step)
+        )
+
+    def clippy_workspace(job: dict) -> dict:
+        return step_where(job, lambda step: step.get("if") == "matrix.leg == 'workspace'")
+
+    def test_cache(job: dict) -> dict:
+        return step_where(
+            job, lambda step: str(step.get("uses", "")).startswith("Swatinem/rust-cache")
+        )
+
+    def pyo3_save(job: dict) -> dict:
+        return step_where(
+            job, lambda step: str(step.get("uses", "")).startswith("actions/cache/save")
+        )
+
+    no_push = "github.event_name != 'push'"
+    for label, job_id, locate, field, text, reported in (
+        (
+            "a push exclusion on rust-clippy's workspace rust-cache `if:`",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            f"matrix.leg == 'workspace' && {no_push}",
+            "no push to `main` meets",
+        ),
+        (
+            "a merge_group-only rust-test rust-cache `save-if`",
+            "rust-test",
+            test_cache,
+            "save-if",
+            "${{ github.event_name == 'merge_group' && matrix.shard == 1 }}",
+            "no push to `main` meets",
+        ),
+        (
+            "a push exclusion on pyo3-module's cache save `if:`",
+            "pyo3-module",
+            pyo3_save,
+            "if",
+            f"steps.artifact-cache.outputs.cache-hit != 'true' && {no_push}",
+            "no push to `main` meets",
+        ),
+        (
+            "a writing step condition that contradicts itself on one operand pair",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "matrix.leg == 'workspace' && matrix.leg != 'workspace'",
+            "no push to `main` meets",
+        ),
+        (
+            "a writing step `if:` outside the grammar",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "matrix.leg == 'workspace' && !cancelled()",
+            "this check cannot read",
+        ),
+        (
+            "a writing step `if:` that admits push alongside other events",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            f"matrix.leg == 'workspace' && ({no_push} || github.ref == 'refs/heads/main')",
+            None,
+        ),
+        (
+            "a rust-cache `save-if` naming a number and the main ref",
+            "rust-test",
+            test_cache,
+            "save-if",
+            "${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}",
+            None,
+        ),
+    ):
+        changed = copy.deepcopy(doc)
+        step = locate(changed["jobs"][job_id])
+        if field == "if":
+            step["if"] = text
+        else:
+            step.setdefault("with", {})[field] = text
+        gaps = [gap for gap in push_writer_gaps(changed) if gap.startswith(f"{job_id} ")]
+        if reported is None:
+            check(f"{label} is not reported", not gaps, f"{gaps}")
+        else:
+            check(
+                f"{label} is reported",
+                any(gap.startswith(f"{job_id} saves") and reported in gap for gap in gaps),
+                f"{gaps}",
+            )
 
     push_shards = "${{ fromJSON(github.event_name == 'push' && '[1, 5]' || '[1, 2, 3, 4]') }}"
     for label, key, value, reported in (
