@@ -197,10 +197,7 @@ impl PySagaResult {
 /// context's supervisor actor reports `Active`, and refuses with `code`, the
 /// entry point's own error code, otherwise.
 ///
-/// Every outlet entry point that authorizes a caller calls this function
-/// before it authorizes, and reads the capability ceiling, the roles and the
-/// context creator from the role state it returns, never from the bridge
-/// copies in `FfiBridgeState`. A `Closing`, `Expired`, `MigratingOut`,
+/// A `Closing`, `Expired`, `MigratingOut`,
 /// `Tombstoned` or `Poisoned` context, a context no actor serves, and an actor
 /// that did not answer refuse with the same withheld text, because
 /// [`crate::runtime::active_role_state_before_authz`] withholds the lifecycle
@@ -1325,7 +1322,11 @@ pub(crate) fn enforce_caller_principal_binding(
 /// 1. **Validate inputs** (well-formed ids/dids/outlet-id; the nonce decodes to
 ///    `[u8; 16]`, fail-closed on a wrong length — a hex string is the one
 ///    canonical form).
-/// 2. **Caller-principal binding (§6.2.4 *Caller authentication*, normative).**
+/// 2. **Lifecycle gate.** Read the caller and target contexts' role states
+///    from their supervisor actors through [`active_outlet_role_state`]; a
+///    context that is not `Active` raises `ContextError` with
+///    `SCP-OUTLET-6010` (caller) or `SCP-OUTLET-6011` (target).
+/// 3. **Caller-principal binding (§6.2.4 *Caller authentication*, normative).**
 ///    `caller_did` MUST be an identity THIS bridge instance hosts/authenticated
 ///    (present in the per-instance identity registry — the co-resident SDK
 ///    seam's channel-authenticated principal) AND a member of
@@ -1334,17 +1335,17 @@ pub(crate) fn enforce_caller_principal_binding(
 ///    unauthenticated caller). `nonce` / `timestamp` / `chain_depth` REMAIN
 ///    caller-supplied freshness fields (the target B validates them — they are
 ///    not minted here).
-/// 3. **Chokepoint (ADR-056).** Convert the caller/target id STRINGS → `[u8; 32]`
+/// 4. **Chokepoint (ADR-056).** Convert the caller/target id STRINGS → `[u8; 32]`
 ///    via `scp_core::context::state::context_id_to_bytes` (decode-64-hex-else-
 ///    SHA256). Raw `Sha256` of a 64-hex id would double-hash and miss the actor.
-/// 4. **Signing keys.** Resolve each co-resident context's Active Signing Key
+/// 5. **Signing keys.** Resolve each co-resident context's Active Signing Key
 ///    via the context's `creator_did`.
-/// 5. **Executor.** Snapshot the TARGET context's outlet handler under
+/// 6. **Executor.** Snapshot the TARGET context's outlet handler under
 ///    [`with_context`](crate::runtime::with_context) and build the
 ///    non-`Send`-safe `move |input| async {…}` closure the supervisor runs
 ///    supervisor-side at Commit-B (mirrors `outlet_invoke_impl`'s executor
 ///    pattern).
-/// 6. [`block_on`](tokio::runtime::Runtime::block_on) the producer; map the
+/// 7. [`block_on`](tokio::runtime::Runtime::block_on) the producer; map the
 ///    terminal `SagaError` → typed bridge error, `Committed` →
 ///    [`PySagaResult`].
 #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
@@ -2244,7 +2245,9 @@ impl crate::scp::PyScp {
     /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
     /// handle), or `SagaBusyError` (the participant context set overlapped an
     /// in-flight saga — §5.15.4). Raises `ValidationError` if an id/DID/outlet-id
-    /// is malformed or `asserted_nonce_hex` does not decode to 16 bytes.
+    /// is malformed or `asserted_nonce_hex` does not decode to 16 bytes. Raises
+    /// `ContextError` (`SCP-OUTLET-6010` caller, `SCP-OUTLET-6011` target) if
+    /// either context is not `Active`.
     ///
     /// See spec §6.2.4 and ADR-049 §3a.
     #[pyo3(name = "outlet_invoke_cross_context_saga")]

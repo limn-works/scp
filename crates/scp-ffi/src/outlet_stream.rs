@@ -1846,7 +1846,9 @@ impl crate::scp::PyScp {
     /// binding fails; `UcanError` if authorization fails; a saga terminal error
     /// (`SagaAbortedError` / `SagaNeedsRepairError` / `SagaBusyError`) if the
     /// Prepare/Commit-transition is rejected; `ValidationError` if an
-    /// id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
+    /// id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes;
+    /// `ContextError` (`SCP-OUTLET-6010` caller, `SCP-OUTLET-6011` target) if
+    /// either context is not `Active`.
     #[pyo3(name = "outlet_streaming_saga_open")]
     #[pyo3(signature = (
         caller_context_id, target_context_id, caller_did, outlet_registration_id,

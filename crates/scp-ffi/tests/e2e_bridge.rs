@@ -151,10 +151,6 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        // The supervisor's role state is what every outlet authorization check
-        // reads, so the fixture creates the context with `default_ceiling()`,
-        // the ceiling `build_core_context_params` sends when a caller supplies
-        // none.
         let params = scp_core::context::ContextParams {
             ceiling: scp_core::context::roles::default_ceiling()
                 .iter()
@@ -1443,10 +1439,6 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
     let ctx_id = context_id.to_owned();
 
     rt.block_on(async move {
-        // The supervisor's role state is what every outlet authorization check
-        // reads, so the fixture creates the context with `default_ceiling()`,
-        // the ceiling `build_core_context_params` sends when a caller supplies
-        // none.
         let params = scp_core::context::ContextParams {
             ceiling: scp_core::context::roles::default_ceiling()
                 .iter()
@@ -2130,13 +2122,6 @@ fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
 /// (caller axis) / `SCP-OUTLET-6011` (target axis) — parity with the NAPI and
 /// `UniFFI` streaming-open guards — BEFORE the caller-principal binding, the UCAN
 /// check, or the saga drive, so NO saga is started and NO receiver is handed out.
-///
-/// The guard is LOAD-BEARING: the runtime streaming reserve path
-/// (`reserve_outlet_stream_economy`) debits escrow with no context-active gate,
-/// so this bridge check is the sole barrier. `PyO3` is string-keyed (no handle),
-/// so the state is read authoritatively from the supervisor actor via
-/// `read_context_state`; the context is driven to `Closed` through the REAL
-/// supervisor close path.
 #[test]
 fn xctx_streaming_saga_open_rejects_non_active_context() {
     Python::with_gil(|py| {
