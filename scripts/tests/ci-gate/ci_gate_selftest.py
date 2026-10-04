@@ -204,7 +204,7 @@ nothing:
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
   profile-env  ci.yml sets `CARGO_PROFILE_DEV_DEBUG: "0"` in its workflow-level
-               `env:` to drop debug info from every dev and test build in CI.
+               `env:`.
                Swatinem/rust-cache hashes every `CARGO*` environment variable
                its step sees into its cache key. A `CARGO_PROFILE_*` key in one
                job's `env:` therefore gives that job a key no other member of
@@ -218,8 +218,7 @@ nothing:
                noticing.
                compile-timings.yml runs the cargo invocations `rust-test` runs
                to measure their compile, so the same rule holds there: without
-               the key it would time builds that carry line tables, which no
-               CI build compiles.
+               the key it would time builds that carry line tables.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
