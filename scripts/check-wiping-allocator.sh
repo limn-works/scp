@@ -35,7 +35,20 @@
 # 6. No other Rust file carries `#[global_allocator]`, except a file under a
 #    `tests/` directory: an integration test is its own binary, never shipped,
 #    and may install an inspecting allocator (as scp-alloc's and scp-mls's wipe
-#    tests do) provided it does not name `scp_alloc`.
+#    tests do) provided it does not name `scp_alloc`. The files scanned are the
+#    `*.rs` files `git ls-files` lists, and the listing must hold
+#    `crates/scp-alloc/src/lib.rs`, so a listing that reads the wrong files
+#    fails instead of scanning nothing.
+#
+# A metadata document with no non-empty `packages` array fails before any
+# check runs, because every check would otherwise pass over an empty list.
+#
+# The script runs under macOS's bash 3.2 as well as bash 5: every expansion
+# of an array that may be empty uses `${arr[@]+"${arr[@]}"}`, which bash 3.2
+# requires under `set -u`. On bash 3.2 `$?` inside an EXIT trap reads 0 after
+# a `set -u` death, so the trap cannot take the status from it: each deliberate
+# exit records its status in `exit_code` first, and every other way out of the
+# script, a death included, exits 1.
 #
 # What this does not prove: that a built artifact contains the allocator. The
 # `use` line, the dependency edge and the uncfg'd static together make that a
@@ -85,13 +98,13 @@ fail() {
 
 shipped_has() { # <pkg:target>
   local entry
-  for entry in "${SHIPPED[@]}"; do [[ "$entry" == "$1" ]] && return 0; done
+  for entry in ${SHIPPED[@]+"${SHIPPED[@]}"}; do [[ "$entry" == "$1" ]] && return 0; done
   return 1
 }
 
 dev_tool_has() { # <pkg:target>
   local entry
-  for entry in "${DEV_TOOLS[@]}"; do [[ "${entry%%|*}" == "$1" ]] && return 0; done
+  for entry in ${DEV_TOOLS[@]+"${DEV_TOOLS[@]}"}; do [[ "${entry%%|*}" == "$1" ]] && return 0; done
   return 1
 }
 
@@ -234,14 +247,11 @@ code_lines_matching() { # <pattern> <path>
   grep -rnHE "$1" "$2" 2>/dev/null | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true
 }
 
-# Rust sources to scan for `#[global_allocator]`, relative to <root>.
+# Rust sources to scan for `#[global_allocator]`, relative to <root>, which is
+# a git work tree (the real repository, or a fixture the self-test commits to
+# its own index).
 rust_sources() { # <root>
-  if git -C "$1" rev-parse --show-toplevel >/dev/null 2>&1 \
-    && [[ "$(cd "$1" && git rev-parse --show-toplevel)" == "$(cd "$1" && pwd -P)" ]]; then
-    git -C "$1" ls-files -- '*.rs'
-  else
-    (cd "$1" && find . -type f -name '*.rs' -not -path './target/*' | sed 's|^\./||')
-  fi
+  git -C "$1" ls-files -- '*.rs'
 }
 
 # ---------------------------------------------------------------------------
@@ -252,6 +262,12 @@ run_checks() { # <root> <metadata json>
   local root="$1" metadata="$2"
   local pkg target src key entry rel
 
+  echo ">> cargo metadata lists the workspace's packages"
+  if ! jq -e '(.packages | type) == "array" and (.packages | length) > 0' "$metadata" >/dev/null 2>&1; then
+    fail "cargo metadata holds no non-empty packages array, so no target can be checked"
+    return 1
+  fi
+
   echo ">> every bin, cdylib and staticlib target is classified"
   local seen=()
   while IFS=$'\t' read -r pkg target src; do
@@ -261,9 +277,9 @@ run_checks() { # <root> <metadata json>
       fail "$key is a bin/cdylib/staticlib target in neither SHIPPED nor DEV_TOOLS of $0"
     fi
   done < <(artifact_targets "$metadata")
-  for entry in "${SHIPPED[@]}" "${DEV_TOOLS[@]%%|*}"; do
+  for entry in ${SHIPPED[@]+"${SHIPPED[@]}"} ${DEV_TOOLS[@]+"${DEV_TOOLS[@]%%|*}"}; do
     local found=0 s
-    for s in "${seen[@]}"; do [[ "$s" == "$entry" ]] && found=1; done
+    for s in ${seen[@]+"${seen[@]}"}; do [[ "$s" == "$entry" ]] && found=1; done
     [[ "$found" -eq 1 ]] || fail "$entry is listed but cargo metadata reports no such bin/cdylib/staticlib target"
   done
 
@@ -306,7 +322,7 @@ run_checks() { # <root> <metadata json>
 
   echo ">> every SHIPPED package depends on scp-alloc unconditionally"
   local shipped_pkg
-  for shipped_pkg in $(printf '%s\n' "${SHIPPED[@]%%:*}" | sort -u); do
+  for shipped_pkg in $(printf '%s\n' ${SHIPPED[@]+"${SHIPPED[@]%%:*}"} | sort -u); do
     local edges
     edges=$(jq -r --arg p "$shipped_pkg" '.packages[] | select(.name == $p) | .dependencies[]
       | select(.name == "scp-alloc" and .kind == null and (.optional | not) and .target == null)
@@ -334,13 +350,20 @@ run_checks() { # <root> <metadata json>
   fi
 
   echo ">> no other Rust file outside a tests/ directory defines a global allocator"
+  local sources
+  if ! sources=$(rust_sources "$root"); then
+    fail "git ls-files could not list the Rust sources of $root"
+  elif ! grep -qxF "$ALLOC_LIB_REL" <<<"$sources"; then
+    fail "the Rust source listing of $root lacks $ALLOC_LIB_REL, so it does not list the files this check must scan"
+  fi
   while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
     [[ "$rel" == "$ALLOC_LIB_REL" ]] && continue
     case "/$rel" in */tests/*) continue ;; esac
     if [[ -n "$(code_lines_matching "$GLOBAL_ALLOC_PATTERN" "$root/$rel")" ]]; then
       fail "$rel carries #[global_allocator] outside a comment; only $ALLOC_LIB_REL may define one"
     fi
-  done < <(rust_sources "$root")
+  done <<<"$sources"
 
   [[ "$failures" -eq 0 ]]
 }
@@ -398,7 +421,7 @@ EOF
   printf '#[global_allocator]\nstatic A: W = W;\n' > "$d/crates/scp-mls/tests/inspect.rs"
 
   local packages="[]" tool
-  for key in "${SHIPPED[@]}" "${DEV_TOOLS[@]%%|*}"; do
+  for key in ${SHIPPED[@]+"${SHIPPED[@]}"} ${DEV_TOOLS[@]+"${DEV_TOOLS[@]%%|*}"}; do
     pkg="${key%%:*}"
     target="${key#*:}"
     src="$d/crates/$pkg/src/$target.rs"
@@ -415,6 +438,10 @@ EOF
       else . + [$n] end' <<<"$packages")
   done
   jq -n --argjson p "$packages" '{packages: $p}' > "$d/metadata.json"
+  # Check 6 lists the sources the way it lists the real tree's, through
+  # `git ls-files`, so the fixture's files go into a fresh index.
+  git -C "$d" init -q
+  git -C "$d" add -A
 }
 
 run_fixture() { # <dir> — run the checks on a fixture, silently, and return their status
@@ -555,6 +582,20 @@ run_fixtures() {
     || { echo "   FAIL — stale fixture lost its scp-alloc edge"; fixture_failures=$((fixture_failures + 1)); }
   expect_fail_on "a SHIPPED entry naming no real target fails" "$d" "is listed but cargo metadata reports no such"
 
+  d="$base/nopackages"; make_fixture "$d"
+  edit_metadata "$d" '.packages = []'
+  expect_fail_on "a metadata document with an empty packages array fails" "$d" "holds no non-empty packages array"
+
+  d="$base/nopackageskey"; make_fixture "$d"
+  edit_metadata "$d" 'del(.packages)'
+  expect_fail_on "a metadata document with no packages array fails" "$d" "holds no non-empty packages array"
+
+  # A tree whose index lacks scp-alloc's root: the listing check 6 scans is
+  # not the tree's sources.
+  d="$base/unlisted"; make_fixture "$d"
+  git -C "$d" rm -q --cached "$ALLOC_LIB_REL"
+  expect_fail_on "a source listing without scp-alloc's lib.rs fails" "$d" "lacks $ALLOC_LIB_REL"
+
   if [[ "$fixture_failures" -eq 0 ]]; then
     echo "FIXTURE HARNESS: all behavioral proofs passed."
     return 0
@@ -563,27 +604,38 @@ run_fixtures() {
   return 1
 }
 
+exit_code=""
+metadata=""
+# The EXIT trap. Only a deliberate exit sets `exit_code`, so a run that dies
+# (an unbound variable under `set -u`, a failed command under `set -e`) exits 1.
+finish() {
+  if [[ -n "$metadata" ]]; then rm -f "$metadata"; fi
+  exit "${exit_code:-1}"
+}
+
 main() {
-  command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }
-  run_fixtures || exit 1
+  trap finish EXIT
+  command -v jq >/dev/null || { echo "error: jq is required" >&2; exit_code=2; exit 2; }
+  run_fixtures || { exit_code=1; exit 1; }
   if [[ "${1:-}" == "--self-test" ]]; then
     echo "--self-test: skipping the real workspace."
+    exit_code=0
     exit 0
   fi
 
   echo
-  local metadata
   metadata=$(mktemp)
-  trap 'rm -f "$metadata"' EXIT
   (cd "$REPO_ROOT" && cargo metadata --no-deps --format-version 1) > "$metadata"
   if run_checks "$REPO_ROOT" "$metadata"; then
     echo
     echo "PASSED: every shipped binary and cdylib links scp-alloc's wiping allocator, and no other global allocator exists."
+    exit_code=0
     exit 0
   fi
   echo
   echo "FAILED: $failures check(s). §9.15 of 09-security-model.md requires every shipped artifact to"
   echo "install the wiping allocator by linking scp-alloc (\`$INSTALL_LINE\` at its crate root)."
+  exit_code=1
   exit 1
 }
 
