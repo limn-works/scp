@@ -151,9 +151,8 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        // Every UCAN authorization check reads the supervisor's ceiling, so the
-        // fixture names one: `default_ceiling()`, which holds every capability
-        // the tests below mint, delegate and invoke.
+        // `default_ceiling()` holds every capability the tests below mint,
+        // delegate and invoke.
         let params = scp_core::context::ContextParams {
             ceiling: scp_core::context::roles::default_ceiling()
                 .iter()
