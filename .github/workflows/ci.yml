@@ -2279,11 +2279,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      # No `swift-actions/setup-swift` step: `build-xcframework.sh` runs cargo,
-      # `xcodebuild -create-xcframework` and `lipo`, and compiles no Swift. The two
-      # consumers install the Swift toolchain, because they are the jobs that run
-      # `swift build`. Leaving it out of this job saves the 1.0-1.1 min that step took
-      # in each macOS job of run 34805871209.
+      # `build-xcframework.sh` runs cargo, `xcodebuild -create-xcframework` and `lipo`,
+      # and compiles no Swift. No macOS job installs a Swift toolchain: the two
+      # consumers that run `swift build` use the one the runner image ships, and each
+      # prints `swift --version`.
       - name: Hash the artifact inputs no file glob covers
         id: artifact-inputs
         run: |
@@ -3093,9 +3092,11 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.2"
+      # The Swift toolchain is the one the runner image ships, not a pinned download:
+      # Swift 6.2, the minimum Package.swift declares, is not tested. This step records
+      # which toolchain the build and tests below ran on.
+      - name: Print Swift toolchain version
+        run: swift --version
       - name: Download XCFramework and generated bindings
         uses: actions/download-artifact@v4
         with:
@@ -3458,9 +3459,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.2"
+      # The Swift toolchain is the one the runner image ships; see job swift-build-test.
+      - name: Print Swift toolchain version
+        run: swift --version
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
@@ -3496,13 +3497,17 @@ jobs:
               raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
           print('PyO3 extension carries the gated methods')
           "
+      # Debug, not release: the runner only decodes JSON-RPC frames and calls the UniFFI
+      # bindings, whose work runs in the prebuilt Rust static library, and no parity
+      # case asserts on timing, so an optimized Swift build buys nothing for its
+      # compile time.
       - name: Build Swift parity runner
         run: |
           cd bindings/python/tests/bridge_parity/helpers/swift_bridge_runner
-          swift build -c release
+          swift build
       - name: Run parity tests (UniFFI Swift only)
         env:
-          SCP_PARITY_SWIFT_RUNNER: ${{ github.workspace }}/bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/release/swift-bridge-runner
+          SCP_PARITY_SWIFT_RUNNER: ${{ github.workspace }}/bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/debug/swift-bridge-runner
         run: |
           source .venv/bin/activate
           cd bindings/python
