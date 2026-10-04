@@ -213,8 +213,9 @@ nothing:
                scratch. A `CARGO_PROFILE_*` key in one step's `env:` leaves the
                key alone, but cargo then compiles that step's units under a
                profile the restored entry does not hold and rebuilds each one.
-               Dropping the workflow-level key returns every CI build to the
-               root Cargo.toml's `line-tables-only` without any check noticing.
+               Dropping the workflow-level key returns CI's dev-profile builds
+               to the root Cargo.toml's `line-tables-only` without any check
+               noticing.
                compile-timings.yml runs the cargo invocations `rust-test` runs
                to measure their compile, so the same rule holds there: without
                the key it would time builds that carry line tables, which no
@@ -4031,7 +4032,7 @@ def check_profile_env_is_workflow_level(doc: dict, name: str) -> None:
         f"step sets a {CARGO_PROFILE_PREFIX}* key",
         not gaps,
         f"{gaps}: a per-job value splits a rust-cache group, and a missing "
-        f"workflow-level value restores debug info to every CI build",
+        f"workflow-level value restores debug info to CI's dev-profile builds",
     )
     # Controls: each mutation below breaks one half of the rule and must be reported.
     job_id = next(job_id for job_id, job in doc["jobs"].items() if job.get("steps"))
