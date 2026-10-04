@@ -4678,6 +4678,61 @@ MULTI_PATH_PRODUCERS = (
 UPLOADED_FILE_SUFFIXES = (".swift", ".so", ".kt")
 
 
+def multi_path_producer_gaps(doc: dict) -> list[str]:
+    """Name each job whose upload lists several paths but is not in the tuple, or
+    sits in the tuple with no such upload."""
+    uploaders = {
+        job_id
+        for job_id, job in (doc.get("jobs") or {}).items()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "").startswith("actions/upload-artifact")
+        and len(str((step.get("with") or {}).get("path") or "").split()) > 1
+    }
+    listed = {row[0] for row in MULTI_PATH_PRODUCERS}
+    return [
+        f"{job_id} uploads several paths and is missing from MULTI_PATH_PRODUCERS"
+        for job_id in sorted(uploaders - listed)
+    ] + [
+        f"{job_id} is in MULTI_PATH_PRODUCERS and has no upload listing several paths"
+        for job_id in sorted(listed - uploaders)
+    ]
+
+
+def check_multi_path_producers_are_listed(doc: dict) -> None:
+    """MULTI_PATH_PRODUCERS holds exactly the jobs whose upload lists several paths."""
+    gaps = multi_path_producer_gaps(doc)
+    check(
+        "MULTI_PATH_PRODUCERS equals the jobs whose upload lists several paths",
+        not gaps,
+        "; ".join(gaps),
+    )
+    mutated = copy.deepcopy(doc)
+    for step in mutated["jobs"]["napi-addon"]["steps"]:
+        if (step.get("with") or {}).get("name") == "napi-addon-linux":
+            step["with"]["path"] += "\nbindings/typescript/index.d.ts"
+    gaps = multi_path_producer_gaps(mutated)
+    check(
+        "a second path on napi-addon's upload is reported as missing from the tuple",
+        gaps
+        == ["napi-addon uploads several paths and is missing from MULTI_PATH_PRODUCERS"],
+        f"got {gaps}",
+    )
+    mutated = copy.deepcopy(doc)
+    for step in mutated["jobs"]["kotlin-test"]["steps"]:
+        if (step.get("with") or {}).get("name") == "uniffi-kotlin-linux":
+            step["with"]["path"] = step["with"]["path"].split()[0]
+    gaps = multi_path_producer_gaps(mutated)
+    check(
+        "kotlin-test uploading one path is reported as extra in the tuple",
+        gaps
+        == [
+            "kotlin-test is in MULTI_PATH_PRODUCERS and has no upload listing "
+            "several paths"
+        ],
+        f"got {gaps}",
+    )
+
+
 def check_multi_path_outputs_are_verified(
     doc: dict,
     job_id: str,
@@ -5028,6 +5083,7 @@ def main() -> int:
         "producer-outputs — a producer uploading several paths fails on a missing "
         "output"
     )
+    check_multi_path_producers_are_listed(workflow)
     for job_id, artifact, marker_name, tracked, rejects_empty in MULTI_PATH_PRODUCERS:
         check_multi_path_outputs_are_verified(
             workflow, job_id, artifact, marker_name, tracked, rejects_empty
