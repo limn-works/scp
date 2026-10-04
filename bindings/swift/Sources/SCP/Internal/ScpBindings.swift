@@ -9160,8 +9160,6 @@ public func FfiConverterTypeCheckpoint_lower(_ value: Checkpoint) -> RustBuffer 
 /**
  * Context creation parameters.
  *
- * All fields are optional and fall back to protocol defaults when omitted.
- *
  * See ADR-008 (Context Lifecycle) and spec §5 (Contexts).
  */
 public struct ContextParams {

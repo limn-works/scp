@@ -1915,8 +1915,6 @@ pub struct DIDDocument {
 
 /// Context creation parameters.
 ///
-/// All fields are optional and fall back to protocol defaults when omitted.
-///
 /// See ADR-008 (Context Lifecycle) and spec §5 (Contexts).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ContextParams {
@@ -3351,7 +3349,7 @@ impl Drop for Identity {
 pub struct ContextHandle {
     /// Unique identifier for this context.
     pub(crate) context_id: String,
-    /// Current lifecycle state.
+    /// Lifecycle state.
     pub(crate) state: tokio::sync::Mutex<ContextState>,
     /// DID of the context creator.
     pub(crate) creator_did: String,
