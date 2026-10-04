@@ -1198,11 +1198,10 @@ pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
 
 /// The store has released its database connection.
 ///
-/// Returned when an operation reaches a `SqliteStorage` after its `close()`
-/// ran (`scp_platform::PlatformError::StorageClosed`). Spec §17.6 "One
-/// Writer per Durable Directory": a closed store refuses every operation and
-/// never reopens its database implicitly. Construct a new `SCP` instance on
-/// the directory to continue.
+/// Each bridge's `From<scp_platform::PlatformError>` translation maps
+/// `scp_platform::PlatformError::StorageClosed` to this code. A
+/// `SqliteStorage` returns that error for every operation after its
+/// `close()` ran (spec §17.6 "One Writer per Durable Directory").
 pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
 
 // -------------------------------------------------------------------------

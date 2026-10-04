@@ -3266,10 +3266,8 @@ pub enum ShutdownOutcome {
         /// completed before the deadline are not counted). Supervisor tracked
         /// tasks are never aborted, so they never count here.
         aborted_tasks: usize,
-        /// Number of tasks that panicked during the abort drain. A nonzero
-        /// count indicates a task unwound on the abort path — typically a
-        /// secondary failure mode when the primary shutdown path races with
-        /// a panicking task.
+        /// Number of the bridge's own `JoinSet` tasks that panicked during
+        /// the drain, plus one when the Supervisor drain task panicked.
         panicked_tasks: usize,
         /// True when the Supervisor drain did not finish and the instance has
         /// a durable store: the store was not closed and keeps its advisory
@@ -5609,21 +5607,21 @@ mod tests {
             }
         ));
 
-        let loser = {
-            let instance = Arc::clone(&instance);
-            let unused = Arc::clone(&unused);
-            tokio::spawn(async move {
-                instance
-                    .shutdown_core_async(
-                        Duration::from_secs(10),
-                        Some(recording_closer(Ok(()), &unused)),
-                    )
-                    .await
-            })
-        };
+        // Poll the loser once before releasing the winner, so it is parked
+        // waiting on the winner's close rather than reading a store already
+        // released.
+        let mut loser = std::pin::pin!(instance.shutdown_core_async(
+            Duration::from_secs(10),
+            Some(recording_closer(Ok(()), &unused)),
+        ));
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(loser.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(parked, "the loser waits while the winner is still closing");
         release_tx.send(()).unwrap();
         assert!(matches!(
-            loser.await.unwrap(),
+            loser.await,
             Err(ShutdownError::AlreadyShutDown {
                 durable_store_open: false
             })

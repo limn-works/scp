@@ -49,6 +49,7 @@ import uniffi.scp.PublishResult
 import uniffi.scp.ReconnectReport
 import uniffi.scp.ReservedKeyPackage
 import uniffi.scp.SagaResult
+import uniffi.scp.ScpException
 import uniffi.scp.SealedInvitation
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
@@ -65,6 +66,9 @@ import java.util.logging.Logger
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import uniffi.scp.Scp as NativeScp
+
+/** The code an SDK `shutdown` raises when the durable store still holds its advisory lock. */
+private const val STORAGE_LOCK_HELD_CODE = "SCP-STORAGE-8005"
 
 /**
  * Caller-owned SCP instance — the SDK entry point.
@@ -97,19 +101,19 @@ class SCP internal constructor(
     internal val inner: NativeScp,
 ) {
     /**
-     * Tracks whether [shutdown] has completed successfully. Read from the
+     * Tracks whether a [shutdown] call's teardown has run. Read from the
      * finalizer fallback to decide whether to emit a "leaked without
      * shutdown" warning; written inside [shutdown] after the FFI call
-     * returns. Must be atomic because finalizers run on a JVM-internal
+     * returns or throws `SCP-STORAGE-8005`. Must be atomic because finalizers run on a JVM-internal
      * thread pool that does not happen-before the coroutine that invoked
      * [shutdown].
      */
     private val shutdownRecorded: AtomicBoolean = AtomicBoolean(false)
 
     /**
-     * `true` once a [shutdown] call's FFI teardown has returned without throwing, the same
-     * contract as `Relay.isShutdown` and `Node.isShutdown`. Internal so that ScpShutdownTest
-     * can check that a failed teardown leaves it false and a cancelled caller still sets it.
+     * `true` once a [shutdown] call's FFI teardown has returned, or has thrown
+     * `SCP-STORAGE-8005` after the teardown ran. Internal so that ScpShutdownTest can check
+     * that a failed teardown leaves it false and a cancelled caller still sets it.
      */
     internal val isShutdown: Boolean
         get() = shutdownRecorded.get()
@@ -197,7 +201,14 @@ class SCP internal constructor(
     ) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
         bridge.ffiCallSuspend {
-            inner.shutdown(timeoutMillis = millis)
+            try {
+                inner.shutdown(timeoutMillis = millis)
+            } catch (e: ScpException.Validation) {
+                // `SCP-STORAGE-8005` is raised after the teardown ran: only the durable
+                // store still holds its lock, so the instance is recorded as shut down.
+                if (e.code == STORAGE_LOCK_HELD_CODE) shutdownRecorded.set(true)
+                throw e
+            }
             // Record shutdown as soon as the FFI call returns, inside the bridge block: an
             // engine failure throws before this line, so a failed shutdown does not silence
             // the finalizer warning, while a cancellation the bridge raises after a finished

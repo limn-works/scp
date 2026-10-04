@@ -685,6 +685,8 @@ export class SCP {
    * Shuts down the instance with a graceful deadline.
    *
    * @param timeoutSecs Maximum seconds to wait. Defaults to 5.
+   * @throws {StorageError} With `SCP-STORAGE-8005` when the durable store
+   *   still holds its advisory lock after the call.
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
     try {
