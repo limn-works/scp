@@ -79,3 +79,12 @@ jobs:
             -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
             --library=target/x86_64-unknown-linux-gnu/release/libscp_ffi_uniffi.so \
             --language kotlin
+  custom-profile:
+    runs-on: macos-26
+    steps:
+      # A custom profile writes a directory named after itself: the shape
+      # build-xcframework.sh takes under `--profile ci-bridge`.
+      - run: |
+          cargo run --profile ci-bridge --target aarch64-apple-darwin -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/aarch64-apple-darwin/ci-bridge/libscp_ffi_uniffi.dylib \
+            --language swift
