@@ -17,22 +17,22 @@ use rusqlite::ffi;
 
 /// Slots in the buffer: enough for the first statements of a constructor.
 const SLOTS: c_int = 16;
-/// The largest `SQLite` page size; a slot holds a page and its header.
-const LARGEST_PAGE: c_int = 65_536;
 /// The text `PoolsError::PageCacheBufferUsed` puts before its high-water mark.
 const REFUSAL: &str = "SQLITE_CONFIG_PAGECACHE buffer has held pages in this process \
                        (high-water mark ";
 
 /// Installs a leaked, 8-byte-aligned buffer of [`SLOTS`] slots, each large
-/// enough for any page. Must run before `SQLite` starts.
-pub fn install() {
+/// enough for a page of `page` bytes and its header and for no larger page;
+/// `65_536`, `SQLite`'s largest page size, makes every page fit a slot. Must
+/// run before `SQLite` starts.
+pub fn install(page: c_int) {
     let mut header: c_int = 0;
     // SAFETY: `SQLITE_CONFIG_PCACHE_HDRSZ` takes one `int*` and writes the
     // bytes each page-cache slot needs beyond the page; nothing runs `SQLite`
     // yet.
     let code = unsafe { ffi::sqlite3_config(ffi::SQLITE_CONFIG_PCACHE_HDRSZ, &raw mut header) };
     assert_eq!(code, ffi::SQLITE_OK, "SQLite must not be started yet");
-    let slot = (LARGEST_PAGE + header + 7) / 8 * 8;
+    let slot = (page + header + 7) / 8 * 8;
     let words = usize::try_from(slot * SLOTS / 8).expect("buffer size fits usize");
     let buffer: &'static mut [u64] = Vec::leak(vec![0_u64; words]);
     let start: *mut c_void = buffer.as_mut_ptr().cast();

@@ -23,7 +23,8 @@ const KEY: &[u8; 32] = b"SCP page-cache buffer test key!!";
 
 #[test]
 fn apple_storage_refuses_a_page_cache_buffer() {
-    page_cache_buffer::install();
+    // `SQLite`'s largest page size, so every page fits a slot.
+    page_cache_buffer::install(65_536);
 
     let dir = tempfile::tempdir().expect("tempdir should succeed");
     let database = dir.path().join("scp.db");

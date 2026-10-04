@@ -35,15 +35,23 @@
 //! list without calling `sqlite3_free`.
 //!
 //! - **Page-cache buffer.** Before it opens the caller's connection, each call
-//!   opens a throwaway in-memory connection, runs one statement on it that
-//!   reads a page, closes it, and reads the process's
+//!   opens a throwaway in-memory connection, sets its page size to 512 bytes,
+//!   runs one statement on it that writes a page, closes it, and reads the
+//!   process's
 //!   `SQLITE_STATUS_PAGECACHE_USED` high-water mark, refusing with
 //!   [`PoolsError::PageCacheBufferUsed`] unless it is 0. The check must come
 //!   before the caller's connection opens: opening a connection already checks
 //!   a buffer slot out for the pager's scratch space, and the connection's
 //!   first statement reads the database's pages into slots, so a check made
 //!   after either would leave that connection's pages in slots `SQLite` reuses
-//!   unwiped.
+//!   unwiped. `SQLite` asks a buffer only for blocks of at least one page of
+//!   the asking connection's page size (`pcache1Alloc` callers in
+//!   `sqlite3.c`), 512 bytes is its smallest page size, and the probe's
+//!   statement asks for a 512-byte B-tree scratch page. The probe therefore
+//!   draws a slot from every buffer whose slots could serve any connection,
+//!   unless every slot is already in use, and then the high-water mark is
+//!   already above 0. A buffer whose slots are smaller than 512 bytes passes
+//!   and never holds a page.
 //!
 //! The throwaway connection is the one `SQLCipher` connection exempt from the
 //! requirements above and from the pragma: it sets no key, keeps its
@@ -67,12 +75,14 @@
 //! open's page-cache buffer check and its connection, after which that
 //! connection keeps its pages there although the check read 0.
 //!
-//! The pragma itself must run before the connection's `PRAGMA key` statement,
-//! because `SQLCipher` wipes only blocks freed after the pragma takes effect.
-//! After the batch that holds the key statement, each constructor calls
+//! Each constructor runs the pragma in a statement of its own and then calls
 //! [`require_memory_security`], which reads the pragma back and refuses unless
-//! it returns `1`; a plain `SQLite` returns no row, so the readback also
-//! shows `SQLCipher` is the linked engine.
+//! it returns `1`, before the connection's `PRAGMA key` statement, or, on a
+//! connection that runs no key statement, before any statement that reads a
+//! page. `SQLCipher` wipes only blocks freed after the pragma takes effect, so
+//! a refusal after the key statement would come after `SQLite` had freed
+//! blocks holding the key's hex text unwiped. A plain `SQLite` returns no row,
+//! so the readback also shows `SQLCipher` is the linked engine.
 
 #![deny(unsafe_code)]
 
@@ -210,8 +220,11 @@ pub fn open_in_memory() -> Result<Connection, PoolsError> {
 }
 
 /// Reads `PRAGMA cipher_memory_security` back on `conn` and refuses unless it
-/// returns `1`. Each `SQLCipher` constructor calls this after the batch that
-/// holds its key statement (spec §17.6).
+/// returns `1`.
+///
+/// Each `SQLCipher` constructor calls this after running the
+/// pragma alone and before its key statement, or, unkeyed, before any
+/// statement that reads a page (spec §17.6).
 ///
 /// # Errors
 ///
@@ -245,12 +258,17 @@ fn require_no_page_cache_buffer() -> Result<(), PoolsError> {
     require_no_buffer_slot_used(page_cache_used_high_water()?)
 }
 
-/// Opens a throwaway in-memory connection, runs one statement that reads a
-/// page, and closes it. The connection holds no data of any database.
+/// Writes one page on a throwaway in-memory connection at a 512-byte page.
+///
+/// 512 bytes is `SQLite`'s smallest page size. Every
+/// block `SQLite` asks a page-cache buffer for is at least one page of the
+/// asking connection's page size, so the probe's 512-byte scratch page fits
+/// any slot that could serve any connection (spec §17.6). The connection
+/// holds no data of any database.
 fn probe_page_cache() -> Result<(), PoolsError> {
     let probe = Connection::open_in_memory().map_err(PoolsError::Probe)?;
     probe
-        .execute_batch("CREATE TABLE probe (x)")
+        .execute_batch("PRAGMA page_size = 512; CREATE TABLE probe (x)")
         .map_err(PoolsError::Probe)?;
     probe.close().map_err(|(_, e)| PoolsError::Probe(e))
 }

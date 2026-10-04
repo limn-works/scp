@@ -14,7 +14,8 @@ use scp_sqlite_pools::PoolsError;
 
 #[test]
 fn open_refuses_a_configured_buffer_before_opening() {
-    page_cache_buffer::install();
+    // `SQLite`'s largest page size, so every page fits a slot.
+    page_cache_buffer::install(65_536);
 
     let dir = tempfile::tempdir().expect("tempdir should succeed");
     let path = dir.path().join("pools.db");

@@ -26,22 +26,28 @@ SQLCipher connection; each SQLCipher constructor in `scp-platform` and
 The connections that the Android and Swift SDKs open in host code do not go
 through this crate.
 
-Each constructor runs `PRAGMA cipher_memory_security = ON` before its
-`PRAGMA key` statement, because SQLCipher wipes only blocks freed after the
-pragma takes effect, and after that batch calls `require_memory_security`,
-which reads the pragma back and fails with `PoolsError::MemorySecurityOff`
-unless it returns `1`. A plain SQLite returns no row, so the readback also
+Each constructor runs `PRAGMA cipher_memory_security = ON` alone and then
+calls `require_memory_security`, which reads the pragma back and fails with
+`PoolsError::MemorySecurityOff` unless it returns `1`, before its
+`PRAGMA key` statement, or, on a connection with no key, before any statement
+that reads a page. SQLCipher wipes only blocks freed after the pragma takes
+effect, so a refusal after the key statement would come after SQLite had freed
+the key's hex text unwiped. A plain SQLite returns no row, so the readback also
 shows SQLCipher is the linked engine.
 
 A page-cache buffer that a process hands SQLite with
 `sqlite3_config(SQLITE_CONFIG_PAGECACHE, ...)` before it starts reuses its
 slots the same way. Before it opens the caller's connection, every open runs
-one page-reading statement on a throwaway in-memory connection, closes it,
+one page-writing statement on a throwaway in-memory connection whose page
+size is 512 bytes, SQLite's smallest, closes it,
 reads the `SQLITE_STATUS_PAGECACHE_USED` high-water mark with
 `sqlite3_status64`, and fails with `PoolsError::PageCacheBufferUsed` unless it
 is 0. The check precedes the caller's open because opening a connection already
 checks a buffer slot out for the pager's scratch space, and its first statement
-reads the database's pages into slots. The throwaway connection is the one
+reads the database's pages into slots. SQLite asks a buffer only for blocks
+of at least one page of the asking connection's page size, so the probe's
+512-byte scratch page fits any slot that could serve any connection; a buffer
+whose slots are smaller than 512 bytes passes and never holds a page. The throwaway connection is the one
 SQLCipher connection exempt from these requirements and from the pragma: it
 opens no database SCP stores data in and holds no data.
 
