@@ -21,9 +21,7 @@ use crate::error::ScpNapiError;
 /// Validates a UCAN token for outlet invocation authorization.
 ///
 /// Builds the refusal an outlet entry point reports under `code`: the message
-/// the lifecycle gate or a withheld post-gate read composed, unchanged. The
-/// returned closure captures only `code`, so one value serves both the gate and
-/// the [`crate::runtime::withhold_read_before_authz`] read that follows it.
+/// the pre-authorization gate composed, unchanged.
 fn outlet_refusal(code: &'static str) -> impl Fn(String) -> ScpNapiError + Copy {
     move |message| ScpNapiError::Outlet {
         message,
@@ -36,7 +34,7 @@ fn outlet_refusal(code: &'static str) -> impl Fn(String) -> ScpNapiError + Copy 
 /// ADR-016 step 8 compares the token's grants against the context's capability
 /// ceiling, and step 4 anchors the chain on the context creator. Both come from
 /// `role_state`, which every caller reads from the supervisor actor through
-/// [`crate::runtime::live_role_state`] after its lifecycle gate passed, never
+/// [`crate::runtime::active_role_state_before_authz`], never
 /// from the bridge copies (`UcanContextStateCore.ceiling_strings` and
 /// `UcanContextStateCore.creator_did`), so a context no actor serves refuses.
 pub(crate) fn validate_ucan_for_outlet(
@@ -310,8 +308,8 @@ pub(crate) async fn outlet_register_on(
     // The pure input checks above refuse a malformed definition before the
     // lifecycle gate. The supervisor actor answers the lifecycle question,
     // never the handle's cached string — see
-    // `crate::runtime::require_active_context_before_authz`.
-    crate::runtime::require_active_context_before_authz(
+    // `crate::runtime::active_role_state_before_authz`.
+    let role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &handle.context_id(),
         "register outlet in context",
@@ -344,22 +342,14 @@ pub(crate) async fn outlet_register_on(
         signature: Vec::new(),
     };
 
-    // Read the registrant's authority from the supervisor actor BEFORE taking
-    // the FFI shard lock. `register_outlet` checks whether the registrant it
+    // The gate above read the registrant's authority from the supervisor
+    // actor, before this call takes the FFI shard lock. `register_outlet` checks whether the registrant it
     // receives holds `outlet:register`, and this entry point passes the context
     // creator (`role_state.creator_did`) as that registrant: it receives no
     // caller identity, so the check does not ask whether the caller holds the
     // capability. The role state is the one the supervisor holds now, not a
     // bridge copy that a governance action or a membership change could have
     // left permissive.
-    let role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &context_id,
-        crate::runtime::live_role_state(bi, &context_id).await,
-        "register outlet in context",
-        outlet_refusal(codes::OUTLET_6003),
-    )
-    .map_err(napi::Error::from)?;
     let creator_did = role_state.creator_did.clone();
 
     // Register the outlet in the context's outlet registry.
@@ -402,8 +392,8 @@ pub(crate) async fn outlet_invoke_on(
     }
 
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
-    crate::runtime::require_active_context_before_authz(
+    // handle's cached string — see `crate::runtime::active_role_state_before_authz`.
+    let role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &handle.context_id(),
         "invoke outlet in context",
@@ -425,14 +415,6 @@ pub(crate) async fn outlet_invoke_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    let role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &context_id,
-        crate::runtime::live_role_state(bi, &context_id).await,
-        "invoke outlet in context",
-        outlet_refusal(codes::OUTLET_6005),
-    )
-    .map_err(napi::Error::from)?;
     validate_ucan_for_outlet(
         bi,
         &context_id,
@@ -655,8 +637,8 @@ pub(crate) async fn outlet_invoke_cross_context_on(
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
-    // Validate both contexts are active. The target refusal captures nothing,
-    // so the post-gate role-state read below reports the same refusal.
+    // Validate both contexts are active; the target gate also reads the target
+    // context's role state for the UCAN pipeline below.
     let target_refusal = |msg: String| ScpNapiError::Outlet {
         message: format!("cannot invoke cross-context outlet: {msg}"),
         code: codes::OUTLET_6011.to_owned(),
@@ -673,7 +655,7 @@ pub(crate) async fn outlet_invoke_cross_context_on(
     .await
     .map_err(napi::Error::from)?;
 
-    crate::runtime::require_active_context_before_authz(
+    let target_role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &target_handle.context_id(),
         "use target context",
@@ -717,14 +699,6 @@ pub(crate) async fn outlet_invoke_cross_context_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    let target_role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &target_context_id,
-        crate::runtime::live_role_state(bi, &target_context_id).await,
-        "use target context",
-        target_refusal,
-    )
-    .map_err(napi::Error::from)?;
     validate_ucan_for_outlet(
         bi,
         &target_context_id,
@@ -884,7 +858,7 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// authorized to act for `target_context_id`).
 ///
 /// Every caller passes the `creator_did` of the role state it read from the
-/// supervisor actor through [`crate::runtime::live_role_state`], never the
+/// supervisor actor through [`crate::runtime::active_role_state_before_authz`], never the
 /// creator a context handle recorded: this call chooses the authority a
 /// cross-context saga signs as, and a context no actor serves must refuse to
 /// sign. `context_id` is carried only for the error message.
@@ -1034,8 +1008,7 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
 
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
-    // Both refusals capture nothing, so each side's post-gate role-state read
-    // below reports the refusal its gate reports.
+    // Each side's gate also reads the creator that side signs as.
     let caller_refusal = |msg: String| ScpNapiError::Outlet {
         message: format!("cannot start cross-context saga: {msg}"),
         code: codes::OUTLET_6010.to_owned(),
@@ -1044,22 +1017,24 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
         message: format!("cannot start cross-context saga: {msg}"),
         code: codes::OUTLET_6011.to_owned(),
     };
-    crate::runtime::require_active_context_before_authz(
+    let caller_creator_did = crate::runtime::active_role_state_before_authz(
         bi,
         &source_handle.context_id(),
         "use caller context",
         caller_refusal,
     )
     .await
-    .map_err(napi::Error::from)?;
-    crate::runtime::require_active_context_before_authz(
+    .map_err(napi::Error::from)?
+    .creator_did;
+    let target_creator_did = crate::runtime::active_role_state_before_authz(
         bi,
         &target_handle.context_id(),
         "use target context",
         target_refusal,
     )
     .await
-    .map_err(napi::Error::from)?;
+    .map_err(napi::Error::from)?
+    .creator_did;
 
     let caller_context_id = source_handle.context_id();
     let target_context_id = target_handle.context_id();
@@ -1096,25 +1071,8 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
     let target_context_bytes = scp_core::context::state::context_id_to_bytes(&target_context_id);
 
     // ----- Signing keys: each context's Active Signing Key -------------------
-    // Each side signs as the creator its supervisor actor holds now.
-    let target_creator_did = crate::runtime::withhold_read_before_authz(
-        bi,
-        &target_context_id,
-        crate::runtime::live_role_state(bi, &target_context_id).await,
-        "use target context",
-        target_refusal,
-    )
-    .map_err(napi::Error::from)?
-    .creator_did;
-    let caller_creator_did = crate::runtime::withhold_read_before_authz(
-        bi,
-        &caller_context_id,
-        crate::runtime::live_role_state(bi, &caller_context_id).await,
-        "use caller context",
-        caller_refusal,
-    )
-    .map_err(napi::Error::from)?
-    .creator_did;
+    // Each side signs as the creator its supervisor actor reported to that
+    // side's gate above.
     let target_signing_key =
         resolve_context_signing_key(bi, &target_creator_did, &target_context_id).await?;
     let caller_signing_key =
@@ -1277,8 +1235,8 @@ pub(crate) async fn outlet_session_invoke_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
-    crate::runtime::require_active_context_before_authz(
+    // handle's cached string — see `crate::runtime::active_role_state_before_authz`.
+    let role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &handle.context_id(),
         "invoke session in context",
@@ -1313,14 +1271,6 @@ pub(crate) async fn outlet_session_invoke_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    let role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &context_id,
-        crate::runtime::live_role_state(bi, &context_id).await,
-        "invoke session in context",
-        outlet_refusal(codes::OUTLET_6017),
-    )
-    .map_err(napi::Error::from)?;
     validate_ucan_for_outlet(
         bi,
         &context_id,
@@ -1465,8 +1415,8 @@ pub(crate) async fn outlet_interface_expose_on(
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // The supervisor actor answers the lifecycle question, never the
-    // handle's cached string — see `crate::runtime::require_active_context_before_authz`.
-    crate::runtime::require_active_context_before_authz(
+    // handle's cached string — see `crate::runtime::active_role_state_before_authz`.
+    let role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &handle.context_id(),
         "expose outlet interface in context",
@@ -1498,14 +1448,6 @@ pub(crate) async fn outlet_interface_expose_on(
     // whether the caller may offer this context's outlet. Roles and the creator
     // come from the supervisor actor, so a role change that strips the
     // creator's `RoleAssign` refuses the next offer.
-    let role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &context_id,
-        crate::runtime::live_role_state(bi, &context_id).await,
-        "expose outlet interface in context",
-        outlet_refusal(codes::OUTLET_6030),
-    )
-    .map_err(napi::Error::from)?;
     let creator_did = role_state.creator_did.clone();
 
     crate::runtime::with_context(bi, &context_id, |rt| {
@@ -1546,8 +1488,8 @@ pub(crate) async fn outlet_interface_accept_on(
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id();
     // The supervisor actor answers the lifecycle question, never the handle's
-    // cached string — see `crate::runtime::require_active_context_before_authz`.
-    crate::runtime::require_active_context_before_authz(
+    // cached string — see `crate::runtime::active_role_state_before_authz`.
+    let role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &context_id,
         "accept outlet interface in context",
@@ -1571,15 +1513,6 @@ pub(crate) async fn outlet_interface_accept_on(
     // so the check does not ask whether the caller may bind another context's
     // outlet offer into this context. Roles and the creator come from the
     // supervisor actor.
-    let role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &context_id,
-        crate::runtime::live_role_state(bi, &context_id).await,
-        "accept outlet interface in context",
-        outlet_refusal(codes::OUTLET_6032),
-    )
-    .map_err(napi::Error::from)?;
-
     crate::runtime::with_context(bi, &context_id, |_rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),

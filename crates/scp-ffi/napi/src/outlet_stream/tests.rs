@@ -1420,7 +1420,7 @@ mod xctx_streaming_saga_tests {
     ///
     /// The context is driven to `Closing` through the supervisor close path
     /// ([`drive_context_closing`] asserts the state). The guard reads the actor
-    /// state through `require_active_context_before_authz`, not the
+    /// state through `active_role_state_before_authz`, not the
     /// `NapiContextHandle::state()` cache, which still reads `Active`, and
     /// reports the withheld refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

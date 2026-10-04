@@ -429,14 +429,12 @@ pub(crate) async fn outlet_stream_open_on(
     // The supervisor actor answers the lifecycle question before the UCAN
     // pipeline reads the live role state, so a context no actor serves refuses
     // with the same withheld text as every other non-`Active` state — see
-    // `crate::runtime::require_active_context_before_authz`.
-    // The refusal captures nothing, so the post-gate role-state read below
-    // reports the refusal the gate reports.
+    // `crate::runtime::active_role_state_before_authz`.
     let open_refusal = |message: String| ScpNapiError::Outlet {
         message,
         code: codes::OUTLET_6005.to_owned(),
     };
-    crate::runtime::require_active_context_before_authz(
+    let role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &context_id,
         "open outlet stream in context",
@@ -456,14 +454,6 @@ pub(crate) async fn outlet_stream_open_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    let role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &context_id,
-        crate::runtime::live_role_state(bi, &context_id).await,
-        "open outlet stream in context",
-        open_refusal,
-    )
-    .map_err(napi::Error::from)?;
     crate::outlets::validate_ucan_for_outlet(
         bi,
         &context_id,
@@ -1201,9 +1191,9 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     // non-active context is rejected before any receiver is handed out.
     // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis). Both gates
     // run before the caller-principal binding, so both withhold the lifecycle
-    // state (see `crate::runtime::require_active_context_before_authz`).
-    // Both refusals capture nothing, so each side's post-gate role-state read
-    // below reports the refusal its gate reports.
+    // state (see `crate::runtime::active_role_state_before_authz`). The caller
+    // gate also reads the creator the caller side signs as, and the target gate
+    // reads the role state step (c) authorizes against.
     let caller_refusal = |message: String| ScpNapiError::Outlet {
         message,
         code: codes::OUTLET_6010.to_owned(),
@@ -1212,15 +1202,16 @@ pub(crate) async fn outlet_streaming_saga_open_on(
         message,
         code: codes::OUTLET_6011.to_owned(),
     };
-    crate::runtime::require_active_context_before_authz(
+    let caller_creator_did = crate::runtime::active_role_state_before_authz(
         bi,
         &caller_context_id,
         "start cross-context streaming saga from caller context",
         caller_refusal,
     )
     .await
-    .map_err(napi::Error::from)?;
-    crate::runtime::require_active_context_before_authz(
+    .map_err(napi::Error::from)?
+    .creator_did;
+    let target_role_state = crate::runtime::active_role_state_before_authz(
         bi,
         &target_context_id,
         "start cross-context streaming saga into target context",
@@ -1288,14 +1279,6 @@ pub(crate) async fn outlet_streaming_saga_open_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    let target_role_state = crate::runtime::withhold_read_before_authz(
-        bi,
-        &target_context_id,
-        crate::runtime::live_role_state(bi, &target_context_id).await,
-        "start cross-context streaming saga into target context",
-        target_refusal,
-    )
-    .map_err(napi::Error::from)?;
     crate::outlets::validate_ucan_for_outlet(
         bi,
         &target_context_id,
@@ -1462,17 +1445,8 @@ pub(crate) async fn outlet_streaming_saga_open_on(
 
     // ----- (d) signing keys: each co-resident context's Active Signing Key ----
     //
-    // Each side signs as the creator its supervisor actor holds: the target's
-    // from the role state read for step (c), the caller's read here.
-    let caller_creator_did = crate::runtime::withhold_read_before_authz(
-        bi,
-        &caller_context_id,
-        crate::runtime::live_role_state(bi, &caller_context_id).await,
-        "start cross-context streaming saga from caller context",
-        caller_refusal,
-    )
-    .map_err(napi::Error::from)?
-    .creator_did;
+    // Each side signs as the creator its supervisor actor reported to that
+    // side's gate at the top of this function.
     let target_signing_key = crate::outlets::resolve_context_signing_key(
         bi,
         &target_role_state.creator_did,
