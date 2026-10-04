@@ -56,12 +56,20 @@ env:
 #                     profile), fail-closed-pre-rotation, shipped-feature-graph; and
 #                     rust-doc (its `cargo test --doc`) in part, as the paragraph after
 #                     this list says.
-#   workspace-check   `target/debug` under check mode — rust-clippy, whose five
-#                     `cargo clippy` commands compile every dependency to an `.rmeta`,
-#                     and rust-doc in part (its `cargo doc --no-deps`, whose dependency
-#                     units cargo compiles in check mode as well). rust-doc restores both
-#                     groups, one rust-cache step each, because its two commands read
-#                     two disjoint artifact sets out of the one directory.
+#   workspace-check   `target/debug` under check mode and the workspace feature
+#                     resolution — rust-clippy's `workspace` leg, whose
+#                     `cargo clippy --workspace` command compiles every dependency to an
+#                     `.rmeta`, and rust-doc in part (its `cargo doc --no-deps`, whose
+#                     dependency units cargo compiles in check mode as well). rust-doc
+#                     restores both groups, one rust-cache step each, because its two
+#                     commands read two disjoint artifact sets out of the one directory.
+#   clippy-examples   `target/debug` under check mode, one package's dev-target feature
+#                     set at a time — rust-clippy's `examples` leg, which runs
+#                     scripts/check-examples-compile.sh and is the only member.
+#   clippy-packages   `target/debug` under check mode and the feature resolution of
+#                     each `-p` command it runs — rust-clippy's `packages` leg, the
+#                     only member. None of its eight commands resolves the workspace
+#                     feature set, so the `workspace-check` entry holds few of its units.
 #   workspace-release `target/release` on Linux — pyo3-module, which runs
 #                     `maturin develop --release`, and napi-addon, which runs
 #                     `cargo build -p scp-ffi-napi --release`. Those two jobs are the
@@ -125,12 +133,12 @@ env:
 # neither entry holds those units under rust-doc's feature resolution, and
 # rust-doc recompiles them on every run because it saves no entry. No group
 # holds rust-doc's resolution: the recompile costs one job's minutes, and a
-# ninth entry per generation would cost cache space that every run shares.
+# further entry per generation would cost cache space that every run shares.
 #
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
-# comment on job fuzz-nightly says more). Nine groups per generation across the two
+# comment on job fuzz-nightly says more). Eleven groups per generation across the two
 # workflows, where the two together wrote thirty-six entries before.
 # `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
 # rust-cache step in any workflow that names no `shared-key` or no `save-if`, and any
@@ -142,7 +150,8 @@ env:
 # `save-if` at its default would let the shortest job in a group decide the entry's
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
 # and it finishes eleven minutes before rust-test. The producers are rust-test
-# (workspace-debug), rust-clippy (workspace-check), rust-test-optional-features
+# (workspace-debug), rust-clippy's three legs (workspace-check, clippy-examples and
+# clippy-packages, one each), rust-test-optional-features
 # (transport-optional), pyo3-module (workspace-release), typescript-wasm-check
 # (wasm32), xcframework (apple-uniffi), pyo3-module-macos (apple-parity) and
 # fuzz-build (fuzz): in each group, the job that compiles the most of that directory
@@ -1038,12 +1047,29 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # ── Why this job is a three-leg matrix ──────────────────────────────────────
+  #
+  # Measured on the 2026-10-04 runs, the single job spent 53 s restoring its cache
+  # and then about 6.5 min in three serial blocks of work that share no compiled
+  # output: the `--workspace` sweep (87 s), scripts/check-examples-compile.sh
+  # (about 77 s), and eight per-package feature commands (about 4 min). Each leg
+  # runs one block, so the job takes as long as its longest leg rather than the
+  # sum. Every command the single job ran runs on exactly one leg, with the
+  # flags and features it had there.
+  #
+  # Each leg compiles under its own feature resolution, so each restores and
+  # writes its own rust-cache group (the group listing at the top of this file
+  # names all three), and only `main` writes.
   rust-clippy:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / clippy
+    name: Rust / clippy (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [workspace, examples, packages]
     steps:
       - name: Free disk space when the runner is short of it
         run: |
@@ -1066,23 +1092,41 @@ jobs:
       # scripts/check-examples-compile.sh parses cargo metadata with jq, which
       # the runner image ships. This step fails the job by name if an image drops it.
       - name: Require jq
+        if: matrix.leg == 'examples'
         run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-compile.sh needs it"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Writes the `workspace-check` group. The five `cargo clippy` commands below
-      # compile every dependency in check mode, to an `.rmeta` under a metadata hash
-      # that includes the mode, so the `workspace-debug` entry rust-test writes under build
-      # mode holds nothing this job can restore: reading that entry gave this job the
+      # Writes the `workspace-check` group. The `--workspace` sweep compiles every
+      # dependency in check mode, to an `.rmeta` under a metadata hash that includes
+      # the mode, so the `workspace-debug` entry rust-test writes under build mode
+      # holds nothing this leg can restore: reading that entry gave this job the
       # registry and a `Checking` line for every one of the ~650 dependencies on every
-      # run. This job is the one that compiles the most of `target/debug` in check
-      # mode, so it is the group's producer; rust-doc reads the group for its
-      # `cargo doc`.
+      # run. This leg is the one that compiles the most of `target/debug` in check
+      # mode under the workspace feature resolution, so it is the group's producer;
+      # rust-doc reads the group for its `cargo doc`.
       - uses: Swatinem/rust-cache@v2
+        if: matrix.leg == 'workspace'
         with:
           shared-key: workspace-check
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run clippy
+      # Writes the `clippy-examples` group: scripts/check-examples-compile.sh lints
+      # each example target alone, one package's dev-target feature set at a time,
+      # a resolution the `workspace-check` entry does not hold.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.leg == 'examples'
+        with:
+          shared-key: clippy-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Writes the `clippy-packages` group: each `-p` command below resolves features
+      # over one package's subgraph under the features it names.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.leg == 'packages'
+        with:
+          shared-key: clippy-packages
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run clippy over the workspace
+        if: matrix.leg == 'workspace'
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Enable testing for scp-ffi-uniffi so that the
@@ -1090,9 +1134,22 @@ jobs:
           # builds (iOS XCFramework, Android .aar) MUST NOT enable this
           # feature. See GitHub issue #88.
           cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant -- -D warnings
+      - name: Run the examples gate
+        if: matrix.leg == 'examples'
+        run: |
+          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # Asserts two things: every example target compiles and its example
+          # source holds no construct the script's source scan rejects, and every
+          # published examples/*.rs is some target's source. The script header
+          # states what the check cannot prove; do not restate it here.
+          bash scripts/check-examples-compile.sh
+      - name: Run clippy over per-package feature sets
+        if: matrix.leg == 'packages'
+        run: |
+          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # The optional network transports (quic, http3, udp, coap) are not in
           # the default feature set and are not activated by --workspace, so the
-          # sweep above never lints them. They rotted undetected for months
+          # workspace leg's sweep never lints them. They rotted undetected for months
           # (the quic feature stopped compiling). Lint them explicitly so a
           # broken optional transport fails CI. They co-compile (openssl-backed
           # udp/coap alongside ring-backed quic/http3), so a single combined
@@ -1103,7 +1160,7 @@ jobs:
           # tests and both adapter modules went unlinted and unrun.
           cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
           # Job rust-test-optional-features also runs code behind four more
-          # feature sets that no command above activates: scp-node's quic test
+          # feature sets that no other command of this job activates: scp-node's quic test
           # files and its http3/udp well_known arms, scp-platform's `apple`
           # SQLCipher adapter and `sync` storage module, and scp-testing's
           # persistence_advanced tests. That job denies no warnings, so these
@@ -1111,14 +1168,9 @@ jobs:
           cargo clippy -p scp-node --features quic,http3,udp,testing --all-targets -- -D warnings
           cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
           cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
-          # Asserts two things: every example target compiles and its example
-          # source holds no construct the script's source scan rejects, and every
-          # published examples/*.rs is some target's source. The script header
-          # states what the check cannot prove; do not restate it here.
-          bash scripts/check-examples-compile.sh
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
-          # --workspace sweep above leaves off. The first command lints the
+          # --workspace sweep of the workspace leg leaves off. The first command lints the
           # backends' own modules and their `#[ignore]`d unit tests, which need a
           # live PostgreSQL or S3 endpoint to run; the second and third lint each
           # binary's cloud-blobs build and its backend-selection test, which job
@@ -1133,6 +1185,7 @@ jobs:
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
       # workspaces, each carrying a defect the gate must reject or a layout it must accept.
       - name: Run examples-compile cases
+        if: matrix.leg == 'examples'
         run: bash scripts/tests/examples-compile/run-tests.sh
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
