@@ -4266,7 +4266,8 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
     entries in ARTIFACT_KEY_JOB_FILE_INPUTS inside a `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
     digest that key reads in a step before the restore that hashes the job's own
     definition out of ci.yml; restores, saves and uploads one path list; and saves under the key it
-    restored.
+    restored. Each entry in ARTIFACT_KEY_JOB_FILE_INPUTS for the job is listed, or
+    covered by a `/**` entry, under a paths-filter key that gates the job.
 
     WHY: on a key hit the producer skips its build and uploads what an earlier run
     built. A key that omits one input restores that earlier build after the input
@@ -4309,6 +4310,17 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
         ):
             if pattern not in hashed:
                 gaps.append(f"{job_id}: key hashes no {pattern} ({meaning})")
+        routed = {
+            entry
+            for step in paths_filter_steps(doc)
+            for key in gating_filter_keys(doc, doc["jobs"][job_id])
+            for entry in (step.filters.get(key) or [])
+        }
+        for pattern, meaning in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ()):
+            if pattern not in routed and not directory_covered(routed, pattern):
+                gaps.append(
+                    f"{job_id}: no paths filter gating the job lists {pattern} ({meaning})"
+                )
         expressions = re.findall(r"\$\{\{\s*([^}]*?)\s*\}\}", key)
         for context, meaning in ARTIFACT_KEY_EXPRESSION_INPUTS:
             if context not in expressions:
@@ -4411,6 +4423,33 @@ def check_artifact_cache_keys(doc: dict) -> None:
                     ),
                     f"a ci.yml whose {job_id} key omits {text} went unreported",
                 )
+        # Control: each job file input dropped from the filters gating the job is reported.
+        for pattern, _ in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ()):
+            mutated = copy.deepcopy(doc)
+            for job in mutated["jobs"].values():
+                for step in job.get("steps") or []:
+                    if not str(step.get("uses") or "").startswith("dorny/paths-filter"):
+                        continue
+                    filters = yaml.safe_load(step["with"]["filters"])
+                    step["with"]["filters"] = yaml.safe_dump(
+                        {
+                            key: [
+                                entry
+                                for entry in entries
+                                if entry != pattern
+                                and not directory_covered({entry}, pattern)
+                            ]
+                            for key, entries in filters.items()
+                        }
+                    )
+            check(
+                f"{job_id}: a filter set that does not route {pattern} is reported",
+                any(
+                    gap.startswith(f"{job_id}: no paths filter") and pattern in gap
+                    for gap in artifact_cache_key_gaps(mutated)
+                ),
+                f"a ci.yml whose filters omit {pattern} went unreported for {job_id}",
+            )
         # Control: the artifact-inputs step moved after the restore is reported.
         mutated = copy.deepcopy(doc)
         moved = mutated["jobs"][job_id]["steps"]

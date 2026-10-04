@@ -363,6 +363,7 @@ jobs:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
+              - 'scripts/generate-uniffi-kotlin.sh'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
