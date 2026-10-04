@@ -486,6 +486,12 @@ run_fixtures() {
   grep -q 'cfg(not(debug_assertions))' "$d/crates/scp-ffi-napi/src/scp_ffi_napi.rs" || { echo "   FAIL — cfg fixture not written"; fixture_failures=$((fixture_failures + 1)); }
   expect_fail_on "a cfg-gated install line fails" "$d" "lacks a column-0"
 
+  # A crate-level `#![cfg(...)]` gates the whole root, the install line with it.
+  d="$base/cratecfg"; make_fixture "$d"
+  replace_install "$d/crates/scp-ffi-uniffi/src/scp_ffi_uniffi.rs" '#![cfg(not(debug_assertions))]\nuse scp_alloc as _;'
+  grep -q '^#!\[cfg(not(debug_assertions))\]$' "$d/crates/scp-ffi-uniffi/src/scp_ffi_uniffi.rs" || { echo "   FAIL — crate-level cfg fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "an install line after a crate-level #![cfg(...)] fails" "$d" "lacks a column-0"
+
   d="$base/indented"; make_fixture "$d"
   replace_install "$d/crates/scp-node/src/scp-node.rs" 'mod inner {\n    use scp_alloc as _;\n}'
   expect_fail_on "an install line nested in a module fails" "$d" "lacks a column-0"
