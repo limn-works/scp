@@ -494,11 +494,12 @@
         ///   `AttestationError.keyRejected` when `attestKey` and the key
         ///   probe's assertion both answer with `DCError.invalidKey`; this
         ///   method then discards the key ID.
-        ///   `AttestationError.serverUnavailable` when `attestKey`, or the key
-        ///   probe's assertion after an `attestKey` answer of
-        ///   `DCError.invalidKey`, answers with `DCError.serverUnavailable`;
-        ///   this method keeps the key, so a retry uses the same key, as
-        ///   `DCError.h` instructs.
+        ///   `AttestationError.serverUnavailable` when `attestKey` answers
+        ///   with `DCError.serverUnavailable`; this method keeps the key, so a
+        ///   retry uses the same key, as `DCError.h` instructs. Also when the
+        ///   key probe's assertion after an `attestKey` answer of
+        ///   `DCError.invalidKey` answers with `DCError.serverUnavailable`;
+        ///   this method then keeps the key.
         ///   `AttestationError.serviceError` when `generateKey` answers with
         ///   any error other than `DCError.featureUnsupported`,
         ///   `DCError.serverUnavailable` included, when `attestKey` or the key

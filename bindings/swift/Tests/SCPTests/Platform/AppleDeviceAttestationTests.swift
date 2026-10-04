@@ -1831,8 +1831,6 @@
         @Test("attest maps each other key probe answer to its SCP-ATTEST code and keeps the key unrecorded")
         func attestProbeKeepsKeyOnEveryOtherAnswer() async {
             let scripts = [
-                // A caller retries on SCP-ATTEST-9024, and the kept key lets
-                // that retry attest the same key.
                 FailureScript("probe serverUnavailable", ScriptedAppAttestService(supported: true, attestation: .invalidKey, assertion: .serverUnavailable), "SCP-ATTEST-9024", storedKeyId: scriptedKeyId),
                 FailureScript("probe featureUnsupported", ScriptedAppAttestService(supported: true, attestation: .invalidKey, assertion: .featureUnsupported), "SCP-ATTEST-9019", storedKeyId: scriptedKeyId),
                 FailureScript("probe error", ScriptedAppAttestService(supported: true, attestation: .invalidKey, assertion: .failure), "SCP-ATTEST-9001", storedKeyId: scriptedKeyId),
@@ -1889,6 +1887,30 @@
             // it makes has happened when this call returns.
             service.releaseHeldAssertion()
             #expect(defaults.string(forKey: keyIdDefaultsKey) == keyId, "a late probe answer discarded the key ID")
+        }
+
+        @Test("a key probe assertion that arrives after the time limit writes no attestation record")
+        func lateProbeAssertionWritesNoRecord() async {
+            let service = RecordingAppAttestService(
+                holdsFirstAssertion: true,
+                attestationResult: .failure(invalidKeyError)
+            )
+            let defaults = InMemoryUserDefaults()
+            let keyId = RecordingAppAttestService.generatedKeyId(1)
+            defaults.set(keyId, forKey: keyIdDefaultsKey)
+            let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .milliseconds(300))
+
+            #expect(await code(of: { () async throws(ScpError) -> Data in
+                try await adapter.attest(challenge: challenge, deviceId: deviceId)
+            }) == "SCP-ATTEST-9027")
+            #expect(service.isHoldingAssertion)
+            #expect(service.assertions == [RecordingAppAttestService.Call(keyId: keyId, clientDataHash: keyProbeInput)])
+
+            // The held completion handler runs on this thread, so every write
+            // it makes has happened when this call returns.
+            service.releaseHeldAssertion()
+            #expect(defaults.string(forKey: attestedKeyIdDefaultsKey) == nil, "a late probe assertion wrote the attestation record")
+            #expect(defaults.string(forKey: keyIdDefaultsKey) == keyId)
         }
 
         @Test("an attestKey invalidKey answer that arrives after the time limit starts no key probe")
