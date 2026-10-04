@@ -209,6 +209,16 @@ nothing:
                no assertion. Both now sit in a fenced block or name the block
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
+  matrix-group
+               Job rust-test-optional-features runs its commands on six legs,
+               two runners times three values of a matrix `group` axis, and each
+               step picks its legs with `if: matrix.group == '<g>'`. GitHub
+               runs a leg whose group no step names and reports it green over
+               no command, and it skips a step whose group the axis lacks on
+               every leg, so deleting `platform-testing` from the axis would
+               have dropped eight commands from every run while `ci` passed.
+               The check requires the groups the steps name to equal the axis
+               list and each group to run cargo in at least one step.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -4483,6 +4493,152 @@ def check_a_new_producer_reaches_the_napi_gate(doc: dict) -> None:
     )
 
 
+# A step's `if:` that selects one value of a matrix `group` axis, with or
+# without the `${{ … }}` wrapper GitHub accepts around a step condition.
+GROUP_CONDITION = re.compile(
+    r"^\s*(?:\$\{\{\s*)?matrix\.group\s*==\s*'([^']*)'\s*(?:\}\})?\s*$"
+)
+
+
+def step_runs_cargo(step: dict) -> bool:
+    """Whether a step's `run:` script holds a command line starting with cargo."""
+    return any(
+        line.startswith("cargo ") for line in logical_lines(step.get("run") or "")
+    )
+
+
+def matrix_group_gaps(doc: dict) -> list[str]:
+    """Return each disagreement between a matrix `group` axis and its steps.
+
+    CRITERION: in a job whose `strategy.matrix` carries a `group` axis, every step
+    whose `if:` mentions `matrix.group` reads exactly `matrix.group == '<g>'`; the
+    set of groups those conditions name equals the axis list; and each group has
+    at least one step so gated that runs a cargo command. A group with no step
+    runs a leg that passes over nothing, and a step naming a group the axis lacks
+    never runs on any leg, so its commands run nowhere while every leg passes.
+    A condition in any other shape (`!=`, `contains`, an `||` of two groups)
+    is reported rather than read, because this check could not say which legs
+    run it.
+    """
+    gaps = []
+    for job_id, job in sorted(doc["jobs"].items()):
+        matrix = (job.get("strategy") or {}).get("matrix") or {}
+        if not isinstance(matrix, dict) or "group" not in matrix:
+            continue
+        axis = matrix["group"]
+        if not isinstance(axis, list) or not all(isinstance(g, str) for g in axis):
+            gaps.append(f"{job_id}: matrix group {axis!r} is not a list of names")
+            continue
+        named: set[str] = set()
+        with_cargo: set[str] = set()
+        for index, step in enumerate(job.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            condition = str(step.get("if") or "")
+            if "matrix.group" not in condition:
+                continue
+            label = step.get("name") or f"step {index + 1}"
+            match = GROUP_CONDITION.match(condition)
+            if match is None:
+                gaps.append(
+                    f"{job_id}: {label!r} has `if: {condition}`, which is not "
+                    f"`matrix.group == '<g>'`"
+                )
+                continue
+            group = match.group(1)
+            named.add(group)
+            if group not in axis:
+                gaps.append(
+                    f"{job_id}: {label!r} names group {group!r}, which matrix group "
+                    f"{axis} lacks, so its commands run on no leg"
+                )
+            if step_runs_cargo(step):
+                with_cargo.add(group)
+        for group in axis:
+            if group not in named:
+                gaps.append(
+                    f"{job_id}: matrix group {group!r} has no step whose `if:` names "
+                    f"it, so its legs run no command"
+                )
+            elif group not in with_cargo:
+                gaps.append(
+                    f"{job_id}: matrix group {group!r} has no step running cargo"
+                )
+    return gaps
+
+
+def check_matrix_groups(path: Path, doc: dict) -> None:
+    if not any(
+        isinstance((job.get("strategy") or {}).get("matrix"), dict)
+        and "group" in job["strategy"]["matrix"]
+        for job in doc["jobs"].values()
+    ):
+        return
+    gaps = matrix_group_gaps(doc)
+    check(
+        f"{path.name}: every matrix group has a cargo step and every step's group "
+        f"is in its matrix",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def check_matrix_group_controls(doc: dict) -> None:
+    """Three mutants of the live job, each of which the check must report.
+
+    Each mutates rust-test-optional-features in ci.yml, the job whose split
+    prompted the check, so a control fails if that job loses its group axis as
+    well as if the reader stops working.
+    """
+    job_id = "rust-test-optional-features"
+    live = doc["jobs"].get(job_id) or {}
+    axis = ((live.get("strategy") or {}).get("matrix") or {}).get("group")
+    has_gated_step = any(
+        "matrix.group" in str(step.get("if") or "")
+        for step in live.get("steps") or []
+        if isinstance(step, dict)
+    )
+    check(
+        f"{job_id} carries the group axis and gated steps the controls mutate",
+        isinstance(axis, list) and "platform-testing" in axis and has_gated_step,
+        f"group axis {axis!r}, gated step present: {has_gated_step}",
+    )
+    if not (isinstance(axis, list) and "platform-testing" in axis and has_gated_step):
+        return
+
+    extra = copy.deepcopy(doc)
+    extra["jobs"][job_id]["strategy"]["matrix"]["group"].append("added-by-the-control")
+    gaps = matrix_group_gaps(extra)
+    check(
+        "a matrix group no step names is reported",
+        any("'added-by-the-control' has no step" in gap for gap in gaps),
+        f"a group with no step went unreported: {gaps}",
+    )
+
+    unknown = copy.deepcopy(doc)
+    gated = [
+        step
+        for step in unknown["jobs"][job_id]["steps"]
+        if "matrix.group" in str(step.get("if") or "")
+    ]
+    gated[0]["if"] = "matrix.group == 'absent-from-the-matrix'"
+    gaps = matrix_group_gaps(unknown)
+    check(
+        "a step gated on a group the matrix lacks is reported",
+        any("'absent-from-the-matrix', which matrix group" in gap for gap in gaps),
+        f"a step no leg runs went unreported: {gaps}",
+    )
+
+    dropped = copy.deepcopy(doc)
+    dropped["jobs"][job_id]["strategy"]["matrix"]["group"].remove("platform-testing")
+    gaps = matrix_group_gaps(dropped)
+    check(
+        "deleting platform-testing from the matrix list is reported",
+        any("names group 'platform-testing'" in gap for gap in gaps),
+        f"steps left without a leg went unreported: {gaps}",
+    )
+
+
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -4555,6 +4711,14 @@ def main() -> int:
     print("win-shell — every `run:` step a Windows runner can execute names a shell")
     for path, doc in documents:
         check_windows_shell(path, doc)
+
+    print(
+        "matrix-group — a job's `group` axis and its steps' `if:` groups agree, "
+        "and each group runs cargo"
+    )
+    for path, doc in documents:
+        check_matrix_groups(path, doc)
+    check_matrix_group_controls(workflow)
 
     print(
         "empty-input — a job publishing a -signed artifact rejects an empty "
