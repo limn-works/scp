@@ -31,7 +31,18 @@ Each constructor runs `PRAGMA cipher_memory_security = ON` before its
 pragma takes effect, and after that batch calls `require_memory_security`,
 which reads the pragma back and fails with `PoolsError::MemorySecurityOff`
 unless it returns `1`. A plain SQLite returns no row, so the readback also
-proves SQLCipher is the linked engine. `lookaside_use` reports a connection's
+proves SQLCipher is the linked engine.
+
+A page-cache buffer that a process hands SQLite with
+`sqlite3_config(SQLITE_CONFIG_PAGECACHE, ...)` before it starts reuses its
+slots the same way. After its first statement that reads a page, each
+constructor calls `require_no_page_cache_buffer`, which reads the
+`SQLITE_STATUS_PAGECACHE_USED` high-water mark with `sqlite3_status64` and
+fails with `PoolsError::PageCacheBufferUsed` unless it is 0. A custom page
+cache installed with `SQLITE_CONFIG_PCACHE2` cannot be read back after SQLite
+starts, so no check covers it.
+
+`lookaside_use` reports a connection's
 lookaside use, which is zero for a connection this crate opened.
 
 This is one of three crates that may use `unsafe` (`.docs/standards/rust.md`

@@ -90,10 +90,7 @@ impl AppleStorage {
         // Refuses unless SQLite's page-cache bulk block and this connection's
         // lookaside pool are both off (spec section 17.6).
         let conn = scp_sqlite_pools::open(&db_path).map_err(|e| {
-            PlatformError::StorageError(format!(
-                "failed to open database at {}: {e}",
-                db_path.display()
-            ))
+            PlatformError::StorageError(format!("{e} (database {})", db_path.display()))
         })?;
 
         // Apply `SQLCipher` encryption key as hex-encoded PRAGMA.
@@ -135,6 +132,10 @@ impl AppleStorage {
              ) WITHOUT ROWID;",
         )
         .map_err(|e| PlatformError::StorageError(format!("failed to create kv table: {e}")))?;
+        // The schema statement read a page, so the page-cache buffer check
+        // can see a `SQLITE_CONFIG_PAGECACHE` slot it took (spec §17.6).
+        scp_sqlite_pools::require_no_page_cache_buffer()
+            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         Ok(Self {
             conn: Mutex::new(conn),

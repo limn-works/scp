@@ -150,7 +150,7 @@ impl SqliteStorage {
         // block holding the key, a statement, a bound value, or a decrypted
         // page is freed through SQLCipher's allocator (spec section 17.6).
         let conn = scp_sqlite_pools::open(&db_path)
-            .map_err(|e| PlatformError::StorageError(format!("failed to open database: {e}")))?;
+            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         // Apply SQLCipher pragmas (spec section 17.6).
         // The hex key format is `PRAGMA key = "x'<hex>'"` — a double-quoted
@@ -198,6 +198,10 @@ impl SqliteStorage {
             ) WITHOUT ROWID;",
         )
         .map_err(|e| PlatformError::StorageError(format!("failed to create schema: {e}")))?;
+        // The schema statement read a page, so the page-cache buffer check
+        // can see a `SQLITE_CONFIG_PAGECACHE` slot it took (spec section 17.6).
+        scp_sqlite_pools::require_no_page_cache_buffer()
+            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         Ok(Self {
             conn: Mutex::new(conn),

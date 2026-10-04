@@ -78,8 +78,8 @@ impl SqliteBlobStore {
     ///
     /// Returns [`StorageError::Internal`] if the database cannot be opened.
     pub fn open_with_clock(path: &Path, clock: ClockFn) -> Result<Self, StorageError> {
-        let conn = scp_sqlite_pools::open(path)
-            .map_err(|e| StorageError::Internal(format!("sqlite open: {e}")))?;
+        let conn =
+            scp_sqlite_pools::open(path).map_err(|e| StorageError::Internal(e.to_string()))?;
         Self::init_connection(conn, clock)
     }
 
@@ -100,7 +100,7 @@ impl SqliteBlobStore {
     /// Returns [`StorageError::Internal`] if the database cannot be opened.
     pub fn in_memory_with_clock(clock: ClockFn) -> Result<Self, StorageError> {
         let conn = scp_sqlite_pools::open_in_memory()
-            .map_err(|e| StorageError::Internal(format!("sqlite open: {e}")))?;
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         Self::init_connection(conn, clock)
     }
 
@@ -146,6 +146,10 @@ impl SqliteBlobStore {
             CREATE INDEX IF NOT EXISTS idx_expiry ON blobs (expires_at);",
         )
         .map_err(|e| StorageError::Internal(format!("sqlite schema: {e}")))?;
+        // The schema statement read a page, so the page-cache buffer check
+        // can see a `SQLITE_CONFIG_PAGECACHE` slot it took (spec §17.6).
+        scp_sqlite_pools::require_no_page_cache_buffer()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

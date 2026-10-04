@@ -29,7 +29,16 @@
 //!   returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` proves the
 //!   pool is off for that connection.
 //!
-//! The crate keeps no state: every open makes both checks itself.
+//! A third reuse path needs no compile option: a page-cache buffer handed to
+//! `SQLite` with `sqlite3_config(SQLITE_CONFIG_PAGECACHE, ...)` before it
+//! starts. `pcache1Free` returns a slot of that buffer to `SQLite`'s own free
+//! list without calling `sqlite3_free`. After its first statement that reads a
+//! page, each constructor calls [`require_no_page_cache_buffer`], which reads
+//! the process's `SQLITE_STATUS_PAGECACHE_USED` high-water mark and refuses
+//! unless it is 0. A custom page cache (`SQLITE_CONFIG_PCACHE2`) cannot be
+//! read back once `SQLite` has started, so no check here covers it.
+//!
+//! The crate keeps no state: every open makes its checks itself.
 //!
 //! The pragma itself must run before the connection's `PRAGMA key` statement,
 //! because `SQLCipher` wipes only blocks freed after the pragma takes effect.
@@ -62,7 +71,7 @@ pub enum PoolsError {
         /// The `SQLite` result code the call returned.
         code: c_int,
     },
-    /// `sqlite3_db_status` did not return `SQLITE_OK`.
+    /// `sqlite3_db_status` or `sqlite3_status64` did not return `SQLITE_OK`.
     Status {
         /// The `SQLite` result code the call returned.
         code: c_int,
@@ -76,6 +85,14 @@ pub enum PoolsError {
     },
     /// `PRAGMA cipher_memory_security` could not be read.
     MemorySecurityUnreadable(rusqlite::Error),
+    /// A page-cache buffer configured with `SQLITE_CONFIG_PAGECACHE` has held
+    /// a page in this process, and `SQLite` returns its freed slots to its own
+    /// free list without the pragma wiping them.
+    PageCacheBufferUsed {
+        /// The `SQLITE_STATUS_PAGECACHE_USED` high-water mark: the most buffer
+        /// slots checked out at once since `SQLite` started.
+        high_water: i64,
+    },
 }
 
 impl fmt::Display for PoolsError {
@@ -92,7 +109,7 @@ impl fmt::Display for PoolsError {
                 "SQLite's lookaside pool cannot be turned off for this connection: \
                  sqlite3_db_config(SQLITE_DBCONFIG_LOOKASIDE) returned code {code}"
             ),
-            Self::Status { code } => write!(f, "sqlite3_db_status returned code {code}"),
+            Self::Status { code } => write!(f, "a SQLite status call returned code {code}"),
             Self::MemorySecurityOff {
                 reported: Some(value),
             } => write!(
@@ -107,6 +124,11 @@ impl fmt::Display for PoolsError {
             Self::MemorySecurityUnreadable(e) => {
                 write!(f, "failed to read PRAGMA cipher_memory_security: {e}")
             }
+            Self::PageCacheBufferUsed { high_water } => write!(
+                f,
+                "a SQLITE_CONFIG_PAGECACHE buffer has held pages in this process (high-water \
+                 mark {high_water}), so freed pages could keep decrypted plaintext unwiped"
+            ),
         }
     }
 }
@@ -118,7 +140,8 @@ impl std::error::Error for PoolsError {
             Self::PageCacheBulkPossible
             | Self::LookasideOn { .. }
             | Self::Status { .. }
-            | Self::MemorySecurityOff { .. } => None,
+            | Self::MemorySecurityOff { .. }
+            | Self::PageCacheBufferUsed { .. } => None,
         }
     }
 }
@@ -164,10 +187,41 @@ pub fn require_memory_security(conn: &Connection) -> Result<(), PoolsError> {
         .query_row("PRAGMA cipher_memory_security", [], |row| row.get(0))
         .optional()
         .map_err(PoolsError::MemorySecurityUnreadable)?;
+    require_reported_one(reported)
+}
+
+/// Accepts only the single value `1`; no row (`None`) means the engine is not
+/// `SQLCipher`.
+fn require_reported_one(reported: Option<String>) -> Result<(), PoolsError> {
     if reported.as_deref() == Some("1") {
         Ok(())
     } else {
         Err(PoolsError::MemorySecurityOff { reported })
+    }
+}
+
+/// Refuses when a `SQLITE_CONFIG_PAGECACHE` buffer has held a page in this
+/// process.
+///
+/// Each `SQLCipher` constructor calls this after its connection's first
+/// statement that reads a page (spec §17.6). The status is process-wide, so
+/// the call reads `SQLite`'s own counter and keeps no state.
+///
+/// # Errors
+///
+/// [`PoolsError::PageCacheBufferUsed`] when the
+/// `SQLITE_STATUS_PAGECACHE_USED` high-water mark is above 0, and
+/// [`PoolsError::Status`] when `sqlite3_status64` fails.
+pub fn require_no_page_cache_buffer() -> Result<(), PoolsError> {
+    require_no_buffer_slot_used(page_cache_used_high_water()?)
+}
+
+/// Only a high-water mark of 0 proves that no buffer slot ever held a page.
+const fn require_no_buffer_slot_used(high_water: i64) -> Result<(), PoolsError> {
+    if high_water == 0 {
+        Ok(())
+    } else {
+        Err(PoolsError::PageCacheBufferUsed { high_water })
     }
 }
 
@@ -254,6 +308,29 @@ fn turn_lookaside_off(conn: &Connection) -> Result<(), PoolsError> {
 }
 
 #[allow(unsafe_code)]
+fn page_cache_used_high_water() -> Result<i64, PoolsError> {
+    let mut current: i64 = 0;
+    let mut high_water: i64 = 0;
+    // SAFETY: both out-pointers point at local `i64`s (`sqlite3_int64`) that
+    // outlive the call, and a zero reset flag leaves the counters unchanged.
+    // `sqlite3_status64` reads process-wide counters under SQLite's own mutex
+    // and is thread-safe.
+    let code = unsafe {
+        ffi::sqlite3_status64(
+            ffi::SQLITE_STATUS_PAGECACHE_USED,
+            &raw mut current,
+            &raw mut high_water,
+            0,
+        )
+    };
+    if code == ffi::SQLITE_OK {
+        Ok(high_water)
+    } else {
+        Err(PoolsError::Status { code })
+    }
+}
+
+#[allow(unsafe_code)]
 fn status_high_water(conn: &Connection, op: c_int) -> Result<c_int, PoolsError> {
     let mut current: c_int = 0;
     let mut high_water: c_int = 0;
@@ -329,6 +406,42 @@ mod tests {
             ),
             "a connection without the pragma must be refused, got {result:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_security_readback_accepts_only_one() {
+        assert!(require_reported_one(Some("1".to_owned())).is_ok());
+        for reported in [None, Some("0".to_owned()), Some("ON".to_owned())] {
+            let result = require_reported_one(reported.clone());
+            assert!(
+                matches!(&result, Err(PoolsError::MemorySecurityOff { reported: r }) if *r == reported),
+                "{reported:?} must be refused, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_cache_buffer_check_accepts_only_zero() {
+        assert!(require_no_buffer_slot_used(0).is_ok());
+        for high_water in [1, 64, -1] {
+            assert!(
+                matches!(
+                    require_no_buffer_slot_used(high_water),
+                    Err(PoolsError::PageCacheBufferUsed { high_water: h }) if h == high_water
+                ),
+                "high-water mark {high_water} must be refused"
+            );
+        }
+    }
+
+    /// No page-cache buffer is configured in this test binary, so the real
+    /// counter reads 0 after a page has been read.
+    #[test]
+    fn page_cache_buffer_check_passes_without_a_buffer() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = open_in_memory()?;
+        conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")?;
+        require_no_page_cache_buffer()?;
         Ok(())
     }
 

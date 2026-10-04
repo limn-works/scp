@@ -147,8 +147,8 @@ impl CombinedNodeStorage {
         let db_path = dir.join("node.db");
         // Refuses unless SQLite's page-cache bulk block and this connection's
         // lookaside pool are both off (spec section 17.6).
-        let conn = scp_sqlite_pools::open(&db_path)
-            .map_err(|e| StorageError::Internal(format!("failed to open database: {e}")))?;
+        let conn =
+            scp_sqlite_pools::open(&db_path).map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Apply SQLCipher encryption key and hardening PRAGMAs.
         // Matches SqliteStorage settings for consistent security posture.
@@ -188,6 +188,10 @@ impl CombinedNodeStorage {
             ) WITHOUT ROWID;",
         )
         .map_err(|e| StorageError::Internal(format!("failed to create kv table: {e}")))?;
+        // The schema statement read a page, so the page-cache buffer check
+        // can see a `SQLITE_CONFIG_PAGECACHE` slot it took (spec section 17.6).
+        scp_sqlite_pools::require_no_page_cache_buffer()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Create the blobs table (BlobStorage trait) per spec section 17.7.
         conn.execute_batch(
