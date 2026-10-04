@@ -1294,6 +1294,7 @@ jobs:
   # The cache group buys the same time and deletes nothing: this job's own
   # artifacts, under its own feature resolution, restore on every later run. It
   # writes on a push to `main` because it is the only job that builds them.
+  #
   # Builds and tests the code that sits behind features `--workspace` never
   # activates. One job id, six legs: two runners times three groups of commands,
   # so the `ci` aggregate's `needs` names every leg through this one id. Each
