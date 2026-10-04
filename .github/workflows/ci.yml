@@ -161,7 +161,7 @@ env:
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
 # comment on job fuzz-nightly says more). Eleven groups per generation across the two
-# workflows, where the two together wrote thirty-six entries before. The four
+# workflows, where the two together wrote thirty-six entries before. The
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the
 # comment above job pyo3-module counts them.
 # `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
@@ -3056,7 +3056,6 @@ jobs:
           mkdir -p "$(dirname "$BINDINGS")"
           echo "// placeholder" > "$BINDINGS"
           ./gradlew -q :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=true
-          rm "$BINDINGS"
           # Gradle runs with cargo off PATH, so the `cargo metadata` fallback fails
           # and only the branch that reads CARGO_TARGET_DIR can print the path.
           no_cargo_path="$(dirname "$(command -v java)"):/usr/bin:/bin"
@@ -3064,6 +3063,17 @@ jobs:
             echo "::error::cargo is on $no_cargo_path, so the fallback could answer"
             exit 1
           fi
+          # `--dry-run` evaluates no onlyIf predicate, so this call executes the task.
+          # The onlyIf skip prints SKIPPED; without it the generator runs and fails,
+          # because cargo is off PATH.
+          skip_output=$(PATH=$no_cargo_path ./gradlew --console=plain \
+            :scp-kt:generateUniffiBindings -Pscp.uniffi.prebuiltBindings=true)
+          if ! grep -qF ":scp-kt:generateUniffiBindings SKIPPED" <<<"$skip_output"; then
+            echo "$skip_output"
+            echo "::error::generateUniffiBindings ran with scp.uniffi.prebuiltBindings=true"
+            exit 1
+          fi
+          rm "$BINDINGS"
           for value in relative/target "$RUNNER_TEMP/absolute-target"; do
             case $value in
               /*) dir=$value ;;
