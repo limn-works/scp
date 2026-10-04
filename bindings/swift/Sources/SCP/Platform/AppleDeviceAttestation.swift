@@ -914,9 +914,6 @@
 
         /// Record that Apple attested `keyId`.
         ///
-        /// A replacement key Apple attested becomes the stored key, which
-        /// retires the key it replaced.
-        ///
         /// Thread-safe: protected by `lock`.
         ///
         /// - Parameter keyId: A key ID whose `attestKey` call returned an
