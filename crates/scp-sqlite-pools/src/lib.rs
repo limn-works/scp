@@ -498,6 +498,29 @@ mod tests {
         assert!(std::error::Error::source(&e).is_some());
     }
 
+    /// A live prepared statement holds lookaside slots, so `SQLite` refuses
+    /// to free the pool with `SQLITE_BUSY` and the call reports it; once the
+    /// statement is finalized the same call succeeds.
+    #[test]
+    fn lookaside_in_use_is_refused_with_busy() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE t (x)")?;
+        let statement = conn.prepare("SELECT x FROM t WHERE x = ?1")?;
+        assert!(
+            status_high_water(&conn, ffi::SQLITE_DBSTATUS_LOOKASIDE_USED)? > 0,
+            "the plain connection must have used lookaside for this test to reach the busy path"
+        );
+        let refused = turn_lookaside_off(&conn);
+        assert!(
+            matches!(refused, Err(PoolsError::LookasideOn { code }) if code == ffi::SQLITE_BUSY),
+            "turning lookaside off under a live statement must fail with SQLITE_BUSY, got {refused:?}"
+        );
+        drop(statement);
+        conn.flush_prepared_statement_cache();
+        turn_lookaside_off(&conn)?;
+        Ok(())
+    }
+
     /// Runs only in the CI build that compiles `SQLite` with
     /// `-USQLITE_ENABLE_MEMORY_MANAGEMENT`: there the real compile-option
     /// check must refuse every open.
