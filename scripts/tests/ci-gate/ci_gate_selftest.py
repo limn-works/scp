@@ -223,8 +223,8 @@ nothing:
                there: without the key it would time builds that carry line
                tables.
   matrix-axis
-               Job rust-test-optional-features runs its commands on six legs,
-               two runners times three values of a matrix `group` axis, and job
+               Job rust-test-optional-features runs its commands on three
+               legs, one per value of a matrix `group` axis, and job
                rust-clippy runs on three values of a `leg` axis. GitHub runs a
                leg whose value no step names and reports it green over none of
                the gated commands, and it skips a step whose value the axis
@@ -733,6 +733,7 @@ RUST_ONLY_RUNS = {
     "rust-fmt": True,
     "rust-test": True,
     "rust-test-optional-features": True,
+    "rust-test-macos": True,
     "rust-test-napi-production": True,
     "scaffold-typescript-web-check": False,
     "swift-build-test": True,
@@ -5770,6 +5771,7 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "pyo3-module-macos",
         "rust-clippy",
         "rust-test",
+        "rust-test-macos",
         "rust-test-optional-features",
         "typescript-wasm-check",
         "xcframework",
@@ -5832,8 +5834,19 @@ def check_push_writer_mutants(doc: dict) -> None:
     # through its key, and rust-clippy one entry per `leg` value through a writing
     # step gated on that leg. A push matrix dropping a value leaves its entry
     # unwritten; a push matrix keeping every value leaves nothing to report.
-    # rust-test and rust-test-optional-features also write one rust-cache entry per
-    # `os` value, because `runs-on` reads that axis and rust-cache keys by platform.
+    # A job whose `runs-on` reads an `os` axis writes one rust-cache entry per `os`
+    # value, because rust-cache keys by platform. No job in ci.yml has such an axis
+    # (rust-test and rust-test-optional-features run on ubuntu-latest alone, and
+    # rust-test-macos on macos-latest alone), so the `os` cases give rust-test and
+    # rust-test-optional-features an `os` axis over both runners, read by
+    # `runs-on`, before narrowing it.
+    def with_os_axis(source: dict, job_id: str) -> dict:
+        widened = copy.deepcopy(source)
+        job = widened["jobs"][job_id]
+        job["strategy"]["matrix"]["os"] = ["ubuntu-latest", "macos-latest"]
+        job["runs-on"] = "${{ matrix.os }}"
+        return widened
+
     for job_id, axis, dropped_value, reported in (
         (
             "rust-test-optional-features",
@@ -5855,7 +5868,8 @@ def check_push_writer_mutants(doc: dict) -> None:
         ),
         ("rust-clippy", "leg", "examples", "only from matrix leg `leg == examples`"),
     ):
-        live_axis = doc["jobs"][job_id]["strategy"]["matrix"][axis]
+        base = with_os_axis(doc, job_id) if axis == "os" else doc
+        live_axis = base["jobs"][job_id]["strategy"]["matrix"][axis]
         check(
             f"{job_id}'s `{axis}` axis lists {dropped_value} for the push-matrix control",
             isinstance(live_axis, list) and dropped_value in live_axis,
@@ -5863,7 +5877,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         )
         every = json.dumps(live_axis)
         fewer = json.dumps([value for value in live_axis if value != dropped_value])
-        narrowed = copy.deepcopy(doc)
+        narrowed = copy.deepcopy(base)
         narrowed["jobs"][job_id]["strategy"]["matrix"][axis] = (
             f"${{{{ fromJSON(github.event_name == 'push' && '{fewer}' || '{every}') }}}}"
         )
@@ -5873,7 +5887,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             any(gap.startswith(f"{job_id} ") and reported in gap for gap in gaps),
             f"{gaps}",
         )
-        whole = copy.deepcopy(doc)
+        whole = copy.deepcopy(base)
         whole["jobs"][job_id]["strategy"]["matrix"][axis] = (
             f"${{{{ fromJSON(github.event_name == 'push' && '{every}' || '{every}') }}}}"
         )
@@ -5885,7 +5899,7 @@ def check_push_writer_mutants(doc: dict) -> None:
 
     # An actions/cache key splits by `runs-on` only when it names the platform.
     for key, split in (("deps-${{ runner.os }}-v1", True), ("deps-v1", False)):
-        cached = copy.deepcopy(doc)
+        cached = with_os_axis(doc, "rust-test")
         job = cached["jobs"]["rust-test"]
         job["strategy"]["matrix"]["os"] = (
             "${{ fromJSON(github.event_name == 'push' && '[\"ubuntu-latest\"]' "
