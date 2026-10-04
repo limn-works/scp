@@ -82,13 +82,13 @@
         /// that carries an attestation record, or `attestKey` answered
         /// `DCError.invalidKey` for a key with no record and the key probe's
         /// assertion with that key answered `DCError.invalidKey` too. For the
-        /// stored key, the adapter discards the key ID, its record and any
-        /// replacement key ID. For a replacement key, it discards the replacement key ID only, and the
-        /// stored key and its record stay.
+        /// stored key, the adapter discards the key ID and its record, and a
+        /// replacement key ID becomes the stored key ID. For a replacement
+        /// key, it discards the replacement key ID only, and the stored key
+        /// and its record stay.
         ///
         /// `DCError.h` lists an App Attest service rejecting the key as one
-        /// cause of `DCError.invalidKey`. A later
-        /// `attest(challenge:deviceId:)` generates a new key.
+        /// cause of `DCError.invalidKey`.
         case keyRejected(String)
         /// Apple answered `attestKey` or `generateAssertion`, the key probe's
         /// included, with `DCError.serverUnavailable`.
@@ -176,9 +176,7 @@
         /// attested key is persisted.
         ///
         /// `appAttestKeyId` keeps naming the attested key while a replacement
-        /// is stored, so an
-        /// `attestKey` failure on the replacement leaves `assertRequest` with
-        /// the key an earlier published attestation names. A replacement
+        /// is stored. A replacement
         /// becomes the stored key only when an `attestKey` call returns its
         /// attestation object, because only that call hands a caller an
         /// attestation that names the replacement.
@@ -211,13 +209,14 @@
     /// leads to the key probe instead: `probeKey(_:after:call:)` asks
     /// `generateAssertion` for an assertion with that key over the
     /// client data `K` of `09-security-model.md` §9.3.1, and discards the
-    /// assertion. Two answers discard a key ID (`SCP-ATTEST-9023`):
-    /// `generateAssertion` answering `DCError.invalidKey` for a key that
-    /// carries an attestation record, which discards the key ID and its
-    /// record, and the key probe's assertion answering `DCError.invalidKey`,
-    /// which discards the key ID `attestKey` named. A key probe assertion
-    /// that succeeds for a replacement key discards the replacement key ID
-    /// (`SCP-ATTEST-9021`).
+    /// assertion. Three answers discard a key ID: `generateAssertion`
+    /// answering `DCError.invalidKey` for a key that carries an attestation
+    /// record (`SCP-ATTEST-9023`), which discards the key ID and its record
+    /// and makes any replacement key ID the stored key ID; the key probe's
+    /// assertion answering `DCError.invalidKey` (`SCP-ATTEST-9023`), which
+    /// discards the key ID `attestKey` named; and a key probe assertion that
+    /// succeeds for a replacement key (`SCP-ATTEST-9021`), which discards the
+    /// replacement key ID.
     ///
     /// Attestation steps (per ADR-025 acceptance criterion 3):
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
@@ -624,7 +623,8 @@
         ///   the key.
         ///   `AttestationError.keyRejected` when `generateAssertion` answers
         ///   with `DCError.invalidKey` for a key that carries an attestation
-        ///   record; this method discards the key ID and its record.
+        ///   record; this method discards the key ID and its record, and
+        ///   makes any replacement key ID the stored key ID.
         ///   `AttestationError.serverUnavailable` when `generateAssertion`
         ///   answers with `DCError.serverUnavailable`; this method keeps the
         ///   key.
@@ -882,7 +882,7 @@
             forgetKeyId(keyId)
             return .keyRejected(
                 "App Attest rejected this device's key, and this adapter discarded its key "
-                    + "ID, so a later attest generates a new key: \(error.localizedDescription)"
+                    + "ID: \(error.localizedDescription)"
             )
         }
 
@@ -994,10 +994,11 @@
 
         /// Remove `keyId` when it is the replacement key ID, leaving the
         /// stored key and its record in place. When `keyId` is the stored key
-        /// ID, remove it, its attestation record and any replacement key ID,
-        /// so no replacement outlives the key it was generated to replace.
-        /// Remove nothing for any other key ID, which keeps a key ID stored
-        /// after `keyId` in place.
+        /// ID, remove it and its attestation record, and make any replacement
+        /// key ID the stored key ID, so the next `attest` hands that key to
+        /// `attestKey` again, as `DCError.h` asks of a retry after
+        /// `DCError.serverUnavailable`. Remove nothing for any other key ID,
+        /// which keeps a key ID stored after `keyId` in place.
         ///
         /// Thread-safe: protected by `lock`.
         ///
@@ -1010,9 +1011,13 @@
                 return
             }
             guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
-            defaults.removeObject(forKey: StorageKey.appAttestKeyId)
             defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
-            defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
+            if let replacementKeyId = defaults.string(forKey: StorageKey.replacementAppAttestKeyId) {
+                defaults.set(replacementKeyId, forKey: StorageKey.appAttestKeyId)
+                defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
+            } else {
+                defaults.removeObject(forKey: StorageKey.appAttestKeyId)
+            }
         }
     }
 

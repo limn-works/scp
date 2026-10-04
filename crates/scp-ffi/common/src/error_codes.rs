@@ -1255,8 +1255,9 @@ pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
 /// `generateAssertion` answered `DCError.invalidKey` for a key that carries
 /// an attestation record, or `attestKey` and the key probe's assertion both
 /// answered `DCError.invalidKey`. For the stored key, the Apple adapter
-/// discards the key ID and record; for a replacement key, it discards the
-/// replacement key ID and keeps the stored key and its record.
+/// discards the key ID and record, and a replacement key ID becomes the
+/// stored key ID; for a replacement key, it discards the replacement key ID
+/// and keeps the stored key and its record.
 pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
 /// App Attest `attestKey` or `generateAssertion` answered
 /// `DCError.serverUnavailable`.
