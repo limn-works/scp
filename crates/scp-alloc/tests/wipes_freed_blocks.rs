@@ -1,7 +1,8 @@
 //! `WipingAllocator` overwrites every block with zeros before the inner
 //! allocator frees it: a dropped `Vec`, the old block a growing `push` frees,
 //! the old block `shrink_to_fit` frees, a block whose start is not
-//! word-aligned (head bytes, whole words, and tail bytes), and a block whose
+//! word-aligned (head bytes, whole words, and tail bytes), a misaligned block
+//! shorter than the distance to its first word boundary, and a block whose
 //! size is an exact multiple of the word size.
 //!
 //! A test cannot read a block after it is freed without a use-after-free, so
@@ -190,6 +191,32 @@ fn misaligned_odd_size_block_is_wiped_head_words_and_tail() {
     unsafe { ptr.write_bytes(FILL, layout.size()) };
     // SAFETY: `ptr` came from `alloc` with `layout` and is freed once.
     assert_freed_wiped("misaligned odd size", ptr as usize, || unsafe {
+        std::alloc::dealloc(ptr, layout);
+    });
+}
+
+#[test]
+fn misaligned_block_shorter_than_its_head_is_wiped() {
+    let _turn = serial();
+    // 3 bytes starting one byte past a word boundary: on a 64-bit target the
+    // distance to the next boundary (7) exceeds the block, so the wipe must
+    // clamp its head to the 3 bytes the block holds and write no word.
+    let layout = Layout::from_size_align(3, 1).unwrap_or_else(|_| Layout::new::<u8>());
+    assert_eq!(layout.size(), 3);
+    MISALIGN_NEXT.with(|flag| flag.set(true));
+    // SAFETY: `layout` has nonzero size.
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    assert!(!ptr.is_null());
+    assert_eq!(MISALIGNED.load(Ordering::SeqCst), ptr as usize);
+    assert_eq!(
+        ptr.align_offset(align_of::<usize>()),
+        align_of::<usize>() - 1,
+        "the block must start one byte past a word boundary"
+    );
+    // SAFETY: `ptr` heads a live block of `layout.size()` bytes.
+    unsafe { ptr.write_bytes(FILL, layout.size()) };
+    // SAFETY: `ptr` came from `alloc` with `layout` and is freed once.
+    assert_freed_wiped("misaligned, shorter than its head", ptr as usize, || unsafe {
         std::alloc::dealloc(ptr, layout);
     });
 }
