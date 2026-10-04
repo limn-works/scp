@@ -576,8 +576,9 @@ jobs:
   # through `use scp_alloc as _;` at its crate root, over an unconditional
   # dependency edge, and no other non-test source defines a global allocator.
   # Every bin, cdylib and staticlib target must be classified SHIPPED or
-  # DEV_TOOLS, and SHIPPED must cover check-shipped-feature-graph.sh's ARTIFACTS,
-  # so a new artifact cannot ship unclassified. The fixture harness runs first
+  # DEV_TOOLS, and SHIPPED must hold every cdylib, staticlib and same-named bin
+  # of a package in check-shipped-feature-graph.sh's ARTIFACTS, so a new
+  # artifact cannot ship unclassified. The fixture harness runs first
   # and must pass. It reads `cargo metadata --no-deps` and compiles nothing, so
   # it restores no cache.
   wiping-allocator:
