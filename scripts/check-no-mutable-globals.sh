@@ -121,6 +121,9 @@ ALLOWLIST=(
     # Global allocator (Alec approved this one entry, 2026-10-04; §9.15 of 09-security-model.md)
     WIPING_ALLOCATOR                # why: the one `#[global_allocator]` in `crates/scp-alloc/src/lib.rs`, a zero-sized immutable `WipingAllocator<System>`; Rust admits one global allocator per artifact, and every shipped artifact links this one.
 
+    # SQLite pre-init configuration (Alec approved this one entry, 2026-10-04; §17.6 of 17-persistence-and-storage.md)
+    PAGE_CACHE_CONFIG_RESULT        # why: `OnceLock<c_int>` in `crates/scp-sqlite-pools/src/lib.rs` holding the return code of the one `sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0)` call; SQLite's configuration is process-wide and accepted only before SQLite initializes, so the result is a process fact, written once and read by every SQLCipher constructor to fail closed.
+
     # ID generators (safe — monotonic counters, no shared mutable state)
     EVENT_COUNTER                   # why: monotonic `AtomicU64` for webhook event IDs; no shared state, safe across instances.
     INSTANCE_ID_COUNTER             # why: monotonic `AtomicU64` used to assign each `*BridgeInstance` a unique u64 identifier at construction.
