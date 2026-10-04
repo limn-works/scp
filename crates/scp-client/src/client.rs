@@ -2260,3 +2260,118 @@ mod ingest_emit_tests {
         );
     }
 }
+
+/// The driver's receive path for a bare Add proposal (security-model spec
+/// §9.7.1, the receiver: range only, no clock). It lives inside the crate
+/// because no public driver API sends a bare proposal: the test reaches
+/// Alice's group to propose, and Bob receives through
+/// [`ScpClient::receive_message`].
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod received_proposal_tests {
+    use std::sync::Arc;
+
+    use scp_clock::{Clock, SystemClock, TestClock};
+    use scp_did::SigningKeyId;
+    use scp_mls::ScpCredential;
+    use scp_mls::group::{generate_key_package_with_context_params, propose_add_member_bare};
+
+    use super::ScpClient;
+    use crate::{LocalSigner, MemoryStorage, RelaySink};
+
+    const CTX: &str = "ctx-client-received-proposal-unit";
+    const ALICE: &str = "did:key:z6MkAliceClientProposalFixtureAAAAAAAAAAA";
+    const BOB: &str = "did:key:z6MkBobClientProposalFixtureBBBBBBBBBBBBBB";
+    const CAROL: &str = "did:key:z6MkCarolClientProposalFixtureCCCCCCCCCCC";
+
+    /// Accepts and drops every frame; this test delivers directly.
+    struct DroppingSink;
+
+    impl RelaySink for DroppingSink {
+        fn send(&self, _frame: Vec<u8>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn client(did: &str, clock: Arc<dyn Clock>) -> ScpClient {
+        ScpClient::new(
+            Arc::new(LocalSigner::active(did)),
+            Arc::new(MemoryStorage::new()),
+            clock,
+            Arc::new(DroppingSink),
+        )
+        .expect("construct client")
+    }
+
+    /// Bob's injected clock stands past Carol's `not_after` while the wall
+    /// clock stays inside her `Lifetime`. Bob receives Alice's bare Add
+    /// proposal of Carol without error, and nothing about his membership
+    /// changes, because a proposal changes no membership until a Commit.
+    #[test]
+    fn add_proposal_expired_under_receiver_clock_is_received() {
+        let real_now = SystemClock.now_secs();
+        let mut alice = client(ALICE, Arc::new(TestClock::new(real_now)));
+        alice.create_context(CTX).expect("Alice creates");
+        let bob_clock = Arc::new(TestClock::new(real_now));
+        let mut bob = client(BOB, Arc::clone(&bob_clock) as Arc<dyn Clock>);
+        let bob_kp = bob
+            .generate_key_package_for_join(CTX)
+            .expect("Bob key package");
+        let add_bob = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
+        bob.join_context_encrypted(
+            CTX,
+            &add_bob.welcome,
+            &add_bob.event_log,
+            &add_bob.wrapping_keys,
+        )
+        .expect("Bob joins");
+
+        // Carol's KeyPackage is minted under the wall clock.
+        let carol_credential = ScpCredential::new(CAROL.to_owned(), None, SigningKeyId::Active)
+            .expect("Carol's credential");
+        let (carol_bundle, _carol_signer, _carol_provider) =
+            generate_key_package_with_context_params(
+                &carol_credential,
+                Some(&[0xCC; 32]),
+                &SystemClock,
+            )
+            .expect("Carol's KeyPackage");
+        let carol_not_after = carol_bundle.key_package().life_time().not_after();
+        let proposal = propose_add_member_bare(
+            &mut alice
+                .contexts
+                .get_mut(CTX)
+                .expect("Alice's context")
+                .crypto
+                .mls_group,
+            carol_bundle.key_package(),
+        )
+        .expect("Alice proposes adding Carol");
+
+        // Bob's injected clock passes Carol's `not_after`; the wall clock
+        // does not.
+        bob_clock.set(carol_not_after + 1);
+        assert!(SystemClock.now_secs() < carol_not_after);
+        let epoch_before = bob.mls_epoch(CTX).expect("Bob's epoch");
+        let members_before = bob.member_dids(CTX).expect("Bob's members");
+
+        let output = bob
+            .receive_message(CTX, &proposal)
+            .expect("Bob receives the Add proposal");
+        assert!(!output.application, "a proposal is not application data");
+        assert!(
+            output.sender_key_distributions.is_empty(),
+            "a proposal produces no sender-key distribution"
+        );
+        assert_eq!(
+            bob.mls_epoch(CTX).expect("Bob's epoch"),
+            epoch_before,
+            "a proposal leaves Bob's epoch unchanged"
+        );
+        assert_eq!(
+            bob.member_dids(CTX).expect("Bob's members"),
+            members_before,
+            "a proposal leaves Bob's member set unchanged"
+        );
+    }
+}

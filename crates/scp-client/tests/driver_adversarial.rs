@@ -959,6 +959,87 @@ fn add_commit_expired_under_receiver_clock_merges() {
 }
 
 // ===========================================================================
+// 12c'. A member merges an add-Commit whose KeyPackage is not yet valid under
+//       the member's own clock (security-model spec §9.7.1, the receiver)
+// ===========================================================================
+
+#[test]
+fn add_commit_not_yet_valid_under_receiver_clock_merges() {
+    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_MARGIN_SECS;
+    let relay = Relay::new();
+    let real_now = SystemClock.now_secs();
+
+    let mut alice = relay.party_with(
+        Arc::new(LocalSigner::active(ALICE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    alice.client.create_context(CTX).expect("Alice creates");
+    let bob_clock = Arc::new(TestClock::new(real_now));
+    let mut bob = relay.party_with(
+        Arc::new(LocalSigner::active(BOB_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::clone(&bob_clock) as Arc<dyn Clock>,
+    );
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add_bob = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+    bob.client
+        .join_context_encrypted(
+            CTX,
+            &add_bob.welcome,
+            &add_bob.event_log,
+            &add_bob.wrapping_keys,
+        )
+        .expect("Bob joins");
+
+    // Carol mints her KeyPackage at the real present, so its `not_before`
+    // lies one margin before the wall clock.
+    let carol_not_before = real_now - KEY_PACKAGE_LIFETIME_MARGIN_SECS;
+    let mut carol = relay.party_with(
+        Arc::new(LocalSigner::active(CAROL_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    let carol_kp = carol
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Carol key package");
+    let add_carol = alice
+        .client
+        .add_member(CTX, &carol_kp)
+        .expect("Alice adds Carol");
+
+    // Bob's injected clock moves before Carol's `not_before`; the wall clock
+    // stays after it.
+    bob_clock.set(carol_not_before - 600);
+    assert!(bob_clock.now_secs() < carol_not_before);
+    assert!(carol_not_before < SystemClock.now_secs());
+
+    bob.client.receive_message(CTX, &add_carol.commit).expect(
+        "Bob merges the add-Carol Commit although Carol's KeyPackage is not yet valid under his clock",
+    );
+    assert_eq!(
+        bob.client.mls_epoch(CTX).expect("Bob's epoch"),
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        "Bob merged to Alice's epoch"
+    );
+    assert!(
+        bob.client
+            .member_dids(CTX)
+            .expect("Bob's members")
+            .iter()
+            .any(|d| d == CAROL_DID),
+        "Bob's membership holds Carol"
+    );
+}
+
+// ===========================================================================
 // 12d. The browser driver's add path enforces the adder's minimum remaining
 //      KeyPackage lifetime (security-model spec §9.7.1, the adder)
 // ===========================================================================

@@ -1464,6 +1464,32 @@ pub fn group_holding_carol_leaf_over_max_range() -> Result<(ScpMlsGroup, u64), M
     Ok((alice, over_long_not_after))
 }
 
+/// Test fixture: the local member of `group` proposes adding `key_package`.
+///
+/// It sends a bare Add proposal through openmls's `propose_add_member`, as
+/// any member of the group could, since SCP's own add path always commits.
+/// Returns the TLS-serialized proposal message.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed and
+/// [`MlsError::AddMemberFailed`] if openmls refuses the proposal or the
+/// proposal cannot be serialized.
+#[cfg(any(test, feature = "testing"))]
+pub fn propose_add_member_bare(
+    group: &mut ScpMlsGroup,
+    key_package: &KeyPackage,
+) -> Result<Vec<u8>, MlsError> {
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let (proposal, _proposal_ref) = g
+        .propose_add_member(&group.provider, signer, key_package)
+        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
+    proposal
+        .tls_serialize_detached()
+        .map_err(|e| MlsError::AddMemberFailed(format!("serializing the proposal: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
