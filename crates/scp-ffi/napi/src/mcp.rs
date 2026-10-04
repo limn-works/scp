@@ -477,7 +477,8 @@ impl Drop for StdioMcpTransport {
 /// Implements `ContextProvider` for one bridge instance. With a supervisor
 /// attached, the provider reads each context's role state and event log from
 /// the actor ([`live_role_state`] and `context_events`). With no supervisor
-/// attached, it reads the bridge's own per-context copy of both. It reads the
+/// attached, every role-state read fails, and it reads the event log from the
+/// bridge's per-context state. It reads the
 /// outlet registry from the bridge's per-context state in either case. A read
 /// that fails returns an error, never an empty roster, log or outlet list.
 struct McpNapiBridgeProvider {
@@ -503,35 +504,23 @@ impl McpNapiBridgeProvider {
     }
 }
 
-/// Reads `context_id`'s current role state for an MCP authorization.
+/// Reads `context_id`'s current role state from the context's supervisor
+/// actor, for an MCP authorization.
 ///
-/// With a supervisor attached, the answer is the actor's role state, never this
-/// bridge's copy (`UcanContextState.role_state`). Only the bridge's own join,
-/// leave and governance calls resync that copy. A change the actor applies from
-/// an inbound commit, such as another admin revoking this agent's
-/// `messages:read` or removing it, never reaches the copy by itself, so a gate
-/// reading the copy keeps authorizing the agent after the revocation. The
-/// `UniFFI` provider asks the actor on every read for the same reason.
-///
-/// The function writes nothing back to the copy. The MCP transport task and the
-/// notification pump call it concurrently with the bridge's own calls, so a
-/// write-back could replace a newer copy with the older snapshot this call
-/// read.
-///
-/// With no supervisor attached there is no actor and no inbound path, so the
-/// copy is the context's only role state and is read as it stands.
+/// The actor's role state carries every change the actor applied, an inbound
+/// commit that revokes this agent's `messages:read` or removes it included,
+/// so a revocation takes effect on the next read.
 ///
 /// # Errors
 ///
-/// Fails when the actor does not hold the context or cannot be asked, and,
-/// with no supervisor attached, when the bridge holds no copy of the context.
-/// The message for an absent context names whichever of the two held nothing.
-/// [`gate_role_state`] keeps those two failures apart for the access gate.
+/// Fails when no supervisor is attached, when the actor does not hold the
+/// context, and when the actor cannot be asked. [`gate_role_state`] keeps an
+/// absent context apart from a failed read for the access gate.
 fn live_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
 ) -> Result<scp_core::context::roles::ContextRoleState, String> {
-    held_role_state(bi, context_id)?.ok_or_else(|| absent_context_message(bi, context_id))
+    held_role_state(bi, context_id)?.ok_or_else(|| absent_context_message(context_id))
 }
 
 /// Reads `context_id`'s role state as [`live_role_state`] does, for an access
@@ -540,7 +529,7 @@ fn live_role_state(
 /// # Errors
 ///
 /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
-/// when the actor (with no supervisor, the bridge) holds no such context: the
+/// when the actor holds no such context: the
 /// agent holds no grant in a context this instance does not hold, so
 /// `resources/list` omits it. Returns
 /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
@@ -553,31 +542,25 @@ fn gate_role_state(
     use scp_mcp::server::AccessRefusal;
     match held_role_state(bi, context_id) {
         Ok(Some(role_state)) => Ok(role_state),
-        Ok(None) => Err(AccessRefusal::Denied(absent_context_message(
-            bi, context_id,
-        ))),
+        Ok(None) => Err(AccessRefusal::Denied(absent_context_message(context_id))),
         Err(e) => Err(AccessRefusal::Unreadable(e)),
     }
 }
 
-/// Names the holder that has no `context_id`: the supervisor when one is
-/// attached, otherwise this bridge.
-fn absent_context_message(bi: &NapiBridgeInstance, context_id: &str) -> String {
-    if bi.core.try_supervisor().is_some() {
-        format!("context '{context_id}' is not held by the supervisor")
-    } else {
-        format!("context '{context_id}' is not held by this bridge, and no supervisor is attached")
-    }
+/// The message for a `context_id` the supervisor does not hold.
+fn absent_context_message(context_id: &str) -> String {
+    format!("context '{context_id}' is not held by the supervisor")
 }
 
-/// Reads `context_id`'s current role state from the source [`live_role_state`]
-/// names, and separates the two outcomes that function merges: `Ok(None)` when
-/// the actor holds no such context (with no supervisor, when the bridge holds
-/// no copy), and `Err` when the read itself failed.
+/// Reads `context_id`'s current role state from the context's supervisor
+/// actor, and separates the two outcomes [`live_role_state`] merges:
+/// `Ok(None)` when the actor holds no such context, and `Err` when the read
+/// itself failed.
 ///
 /// # Errors
 ///
-/// Fails when the actor cannot be asked or does not answer: from a
+/// Fails when no supervisor is attached, and when the actor cannot be asked
+/// or does not answer: from a
 /// current-thread runtime, or when
 /// `Supervisor::get_role_state_checked`
 /// fails, which it does for a busy actor and for a context the crash watchdog
@@ -587,11 +570,9 @@ fn held_role_state(
     context_id: &str,
 ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
     let Some(supervisor) = bi.core.try_supervisor() else {
-        // The closure cannot fail, so an error from `with_context` means the
-        // bridge holds no copy of the context.
-        return Ok(
-            crate::runtime::with_context(bi, context_id, |rt| Ok(rt.role_state.clone())).ok(),
-        );
+        return Err(format!(
+            "cannot read the role state of context '{context_id}': no supervisor is attached"
+        ));
     };
     let supervisor = Arc::clone(supervisor);
     let id = context_id.to_owned();
@@ -676,8 +657,7 @@ impl ContextProvider for McpNapiBridgeProvider {
             // `context_join_on` do not. Every outlet registration runs
             // `ensure_registered` first, so a context the supervisor holds with
             // no entry here has had no outlet registered through this bridge,
-            // and its registry is empty. With no supervisor the entry is the
-            // context's only state, so `held_role_state` finds no context.
+            // and its registry is empty.
             return match held_role_state(&bi, context_id)? {
                 Some(_) => Ok(Vec::new()),
                 None => Err(format!(
@@ -915,10 +895,10 @@ fn mcp_server_bundle(
 /// lists no tools and refuses every `tools/call`. Attaching a supervisor or
 /// calling `resume()` later does not add subscriptions or `list_changed`
 /// notifications to a running server; stop it and serve again to get them.
-/// Authorization and `resources/list|read` read role state on every request,
-/// from the bridge's copy while no supervisor is attached and from the actor
-/// once one is, so attaching a supervisor changes which contexts a running
-/// server serves from the next request on.
+/// Authorization and `resources/list|read` read role state from the actor on
+/// every request and fail while no supervisor is attached, so attaching a
+/// supervisor changes which contexts a running server serves from the next
+/// request on.
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
     bi: &Arc<NapiBridgeInstance>,
@@ -2311,6 +2291,17 @@ mod tests {
         Arc<NapiBridgeInstance>,
         scp_mcp::server::McpServer<McpNapiBridgeProvider>,
     ) {
+        let (bi, server) = napi_mcp_fixture_without_supervisor();
+        register_supervised_context(&bi, SUB_CTX, AGENT_DID);
+        (bi, server)
+    }
+
+    /// [`napi_mcp_fixture`] with no supervisor attached: `SUB_CTX` has bridge
+    /// state and no actor.
+    fn napi_mcp_fixture_without_supervisor() -> (
+        Arc<NapiBridgeInstance>,
+        scp_mcp::server::McpServer<McpNapiBridgeProvider>,
+    ) {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
         crate::runtime::register_ffi_state(&bi, SUB_CTX, AGENT_DID, &[])
             .expect("registering context FFI state must succeed");
@@ -2321,6 +2312,28 @@ mod tests {
         };
         let server = scp_mcp::server::McpServer::new(provider);
         (bi, server)
+    }
+
+    /// Attaches a test supervisor to `bi` and creates `ctx_id` on it with
+    /// `creator` as its creator and `default_ceiling()` as its ceiling.
+    fn register_supervised_context(bi: &NapiBridgeInstance, ctx_id: &str, creator: &str) {
+        crate::runtime::init_supervisor_for_test_on(bi);
+        let supervisor = Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        let params = scp_core::context::ContextParams {
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .cloned()
+                .collect(),
+            ..scp_core::context::ContextParams::default()
+        };
+        crate::runtime()
+            .block_on(supervisor.create_context(
+                ctx_id.to_owned(),
+                params,
+                scp_did::DID(creator.to_owned()),
+                None,
+            ))
+            .expect("the supervisor creates the context");
     }
 
     /// The same fixture with a live event source wired, as
@@ -2334,6 +2347,7 @@ mod tests {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
         crate::runtime::register_ffi_state(&bi, SUB_CTX, AGENT_DID, &[])
             .expect("registering context FFI state must succeed");
+        register_supervised_context(&bi, SUB_CTX, AGENT_DID);
         let provider = McpNapiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: AGENT_DID.to_owned(),
@@ -2469,6 +2483,7 @@ mod tests {
         use scp_mcp::server::ContextProvider as _;
 
         let (bi, mut server) = napi_mcp_fixture();
+        let role_state = live_role_state(&bi, SUB_CTX).expect("the actor holds SUB_CTX");
         crate::runtime::with_context(&bi, SUB_CTX, |rt| {
             let registration = scp_core::context::outlets::OutletRegistration {
                 outlet_id: "send_message".to_owned(),
@@ -2497,7 +2512,7 @@ mod tests {
             };
             scp_core::context::outlets::register_outlet(
                 &mut rt.outlet_registry,
-                &rt.role_state,
+                &role_state,
                 registration,
                 AGENT_DID,
             )
@@ -2653,56 +2668,22 @@ mod tests {
     }
 
     /// With a supervisor attached, every MCP gate answers from the actor's
-    /// role state, not from the bridge's copy. The copy is resynced only by the
-    /// bridge's own join, leave and governance calls, so a revocation or
-    /// removal the actor applies from an inbound commit leaves the copy still
-    /// granting. Here the copy names the agent as a member and the actor holds
-    /// no such context — the state after the actor drops a context the agent
-    /// was removed from — so every gate must deny.
+    /// role state. Here the bridge holds state for the context and the actor
+    /// holds no such context, the state after the actor drops a context the
+    /// agent was removed from, so every gate must deny.
     #[test]
-    fn provider_gates_follow_the_actor_not_the_bridge_copy_napi() {
+    fn provider_gates_follow_the_actor_not_the_bridge_state_napi() {
         use scp_mcp::server::{ContextProvider as _, ResourceKind};
 
-        let (bi, _server) = napi_mcp_fixture();
+        let (bi, _server) = napi_mcp_fixture_without_supervisor();
         let provider = || McpNapiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: AGENT_DID.to_owned(),
             context_ids: vec![SUB_CTX.to_owned()],
         };
 
-        // No supervisor: the copy is the context's only role state, and a
-        // context the bridge holds no copy of is reported as such, not as one
-        // a supervisor lacks.
-        assert_eq!(
-            provider().active_context_ids().unwrap(),
-            vec![SUB_CTX.to_owned()]
-        );
-        let denial = provider()
-            .validate_resource_access("ctx-the-bridge-never-held", ResourceKind::Events)
-            .expect_err("a context the bridge holds no copy of must not be readable");
-        assert!(
-            matches!(
-                &denial,
-                scp_mcp::server::AccessRefusal::Denied(msg)
-                    if msg.contains("not held by this bridge, and no supervisor is attached")
-            ),
-            "with no supervisor the denial must name the bridge, got: {denial}"
-        );
-        assert!(
-            provider()
-                .validate_resource_access(SUB_CTX, ResourceKind::Events)
-                .is_ok()
-        );
-        assert!(provider().context_members(SUB_CTX).is_ok());
-        assert!(
-            provider()
-                .agent_role(SUB_CTX)
-                .expect("the role state reads")
-                .is_some()
-        );
-
-        // The actor now exists and does not hold the context; the copy still
-        // names the agent as a member.
+        // The actor exists and does not hold the context; the bridge still
+        // holds state for it.
         crate::runtime::init_supervisor_for_test_on(&bi);
         assert!(crate::runtime::supervisor(&bi).is_ok());
 
@@ -2717,7 +2698,7 @@ mod tests {
         ] {
             let denial = provider()
                 .validate_resource_access(SUB_CTX, kind)
-                .expect_err("the bridge copy must not grant what the actor does not");
+                .expect_err("the bridge state must not grant what the actor does not");
             assert!(
                 matches!(
                     &denial,
@@ -2772,9 +2753,10 @@ mod tests {
         );
     }
 
-    /// Registers `ctx_id` on the bridge with `copy_creator` as the copy's sole
-    /// member, and creates it on the actor with `actor_creator` as its creator,
-    /// so the bridge copy and the actor disagree about who is a member.
+    /// Registers `ctx_id` on the bridge with `copy_creator` as the bridge
+    /// state's creator, and creates it on the actor with `actor_creator` as its
+    /// creator and only member, so the bridge state and the actor disagree
+    /// about who created the context.
     fn setup_diverged_context(
         bi: &NapiBridgeInstance,
         ctx_id: &str,
@@ -2802,17 +2784,14 @@ mod tests {
             .unwrap();
     }
 
-    /// Every MCP gate answers from the actor's role state while the actor holds
-    /// the context, and the gates write nothing back to the bridge copy.
+    /// Every MCP gate answers from the actor's role state.
     ///
     /// `revoked` is the state after an inbound commit removed the agent: the
-    /// actor holds the context without the agent while the bridge copy still
-    /// names the agent as its member. `granted` is the reverse. A gate that read
-    /// the copy, or that let the copy decide, fails one of the two halves; a
-    /// gate that wrote the actor's snapshot back into the copy fails the final
-    /// assertions.
+    /// actor holds the context without the agent while the bridge state still
+    /// names the agent as the context's creator. `granted` is the reverse. A
+    /// gate that let the bridge state decide fails one of the two halves.
     #[test]
-    fn provider_gates_read_the_actor_role_state_without_writing_the_copy_napi() {
+    fn provider_gates_read_the_actor_role_state_napi() {
         use scp_mcp::server::{ContextProvider as _, ResourceKind};
 
         let agent = "did:dht:z6MkNapiLiveRoleAgent";
@@ -2822,11 +2801,6 @@ mod tests {
         let granted = "ctx-napi-live-role-granted";
         setup_diverged_context(&bi, revoked, agent, other);
         setup_diverged_context(&bi, granted, other, agent);
-        let copy_has_agent = |ctx: &str| {
-            crate::runtime::with_context(&bi, ctx, |rt| Ok(rt.role_state.members.contains(agent)))
-                .unwrap()
-        };
-        assert!(copy_has_agent(revoked) && !copy_has_agent(granted));
         let provider = |ctx: &str| McpNapiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: agent.to_owned(),
@@ -2915,9 +2889,6 @@ mod tests {
             matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("lacks messages:read")),
             "{denial}"
         );
-
-        // No write-back: each copy still holds what the bridge wrote into it.
-        assert!(copy_has_agent(revoked) && !copy_has_agent(granted));
     }
 
     /// A context the supervisor holds but no UCAN, event-log or outlet call has
@@ -3089,22 +3060,16 @@ mod tests {
         );
     }
 
-    /// A missing `Supervisor` degrades the subscription capability and must
-    /// not fail MCP serving outright.
+    /// A missing `Supervisor` degrades the subscription capability and does
+    /// not fail MCP server creation.
     ///
-    /// With no supervisor, `resources/list|read` are served from the FFI
-    /// bridge state alone, so refusing to serve over an unavailable optional
-    /// feature would be a regression. The NAPI server lists no tools with or
-    /// without a supervisor (see `napi_mcp_lists_no_tool_it_cannot_invoke`).
-    /// The test drives the production entry point, checks that
+    /// The test drives the production entry point and checks that
     /// `mcp_server_bundle`, the function that entry point builds its server
     /// with, returns the unwired bundle, whose server advertises
-    /// `resources.subscribe: false`, then reads `resources/list` through the
-    /// provider type that entry point builds over the same instance, so a
-    /// provider that served nothing without a supervisor fails here.
+    /// `resources.subscribe: false`.
     #[test]
-    fn missing_supervisor_degrades_subscriptions_not_the_whole_server_napi() {
-        let (bi, mut server) = napi_mcp_fixture();
+    fn missing_supervisor_degrades_subscriptions_not_server_creation_napi() {
+        let (bi, _server) = napi_mcp_fixture_without_supervisor();
         assert!(
             crate::runtime::supervisor(&bi).is_err(),
             "precondition: this instance has no supervisor attached"
@@ -3140,29 +3105,55 @@ mod tests {
             "McpServerForTransport::Unwired",
             "without a supervisor the served server must not advertise resources.subscribe"
         );
-        // Initialize the fixture server only so it answers `resources/list`.
-        // Its flag says nothing about the served server: the fixture builds
-        // with `McpServer::new`, which never advertises subscriptions.
+    }
+
+    /// With no supervisor attached, every role-state read the provider makes
+    /// fails, and the access gate reports the read as unreadable: the bridge
+    /// state holds no role state, so no gate decides from it.
+    #[test]
+    fn role_state_reads_fail_closed_without_a_supervisor_napi() {
+        use scp_mcp::server::{AccessRefusal, ContextProvider as _, ResourceKind};
+
+        let (bi, mut server) = napi_mcp_fixture_without_supervisor();
+        assert!(
+            bi.core.try_supervisor().is_none(),
+            "precondition: this instance has no supervisor attached"
+        );
+        let provider = McpNapiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: AGENT_DID.to_owned(),
+            context_ids: vec![SUB_CTX.to_owned()],
+        };
+
+        let err = live_role_state(&bi, SUB_CTX).expect_err("no supervisor, no role state");
+        assert!(err.contains("no supervisor is attached"), "{err}");
+        provider
+            .active_context_ids()
+            .expect_err("participation must not read as an empty list");
+        provider
+            .agent_role(SUB_CTX)
+            .expect_err("the role must not read as absent");
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            let refusal = provider
+                .validate_resource_access(SUB_CTX, kind)
+                .expect_err("no gate grants access without a supervisor");
+            assert!(
+                matches!(&refusal, AccessRefusal::Unreadable(msg) if msg.contains("no supervisor is attached")),
+                "{kind:?}: {refusal}"
+            );
+        }
+
         let _ = initialize_and_read_subscribe_flag(&mut server);
         let listed = server
             .handle_request(&mcp_request("resources/list", serde_json::json!({})))
-            .expect("resources/list must produce a response")
-            .result
-            .expect("resources/list must succeed without a supervisor");
-        let uris: Vec<&str> = listed["resources"]
-            .as_array()
-            .expect("resources must be an array")
-            .iter()
-            .filter_map(|r| r["uri"].as_str())
-            .collect();
-        assert_eq!(
-            uris,
-            [
-                "scp://ctx-subscribe-napi/events",
-                "scp://ctx-subscribe-napi/members",
-                "scp://ctx-subscribe-napi/tools",
-            ],
-            "a missing supervisor must leave resources/list serving the context"
+            .expect("resources/list must produce a response");
+        assert!(
+            listed.result.is_none() && listed.error.is_some(),
+            "resources/list must fail, not serve the context: {listed:?}"
         );
     }
 

@@ -216,7 +216,13 @@ impl NapiContextHandle {
         self.mode.clone()
     }
 
-    /// Returns the capability ceiling for this context.
+    /// Returns the capability ceiling this handle recorded when this bridge
+    /// built it.
+    ///
+    /// The list is a snapshot taken at registration, not a supervisor read. On
+    /// a context whose `ceilingPolicy` is `"governed"`, a governance
+    /// `ModifyCeiling` changes the supervisor's ceiling and leaves this list
+    /// unchanged.
     #[napi(getter)]
     #[must_use]
     pub fn ceiling(&self) -> Vec<String> {
@@ -292,17 +298,6 @@ impl NapiContextHandle {
 }
 
 impl NapiContextHandle {
-    /// Returns the current state string for validation checks.
-    pub(crate) fn current_state_str(&self) -> Result<String, ScpNapiError> {
-        self.state
-            .lock()
-            .map(|g| state_str(&g).to_owned())
-            .map_err(|_| ScpNapiError::Context {
-                message: "context state lock is poisoned".to_owned(),
-                code: codes::CTX_2012.to_owned(),
-            })
-    }
-
     /// Sets the state to Closed.
     pub(crate) fn set_closed(&self) -> Result<(), ScpNapiError> {
         *self.state.lock().map_err(|_| ScpNapiError::Context {
@@ -331,6 +326,7 @@ impl Drop for NapiContextHandle {
             token.cancel();
         }
         decrement_handle_count();
+        crate::runtime::untrack_context_handle(&self.bi, &self.context_id);
     }
 }
 
@@ -346,7 +342,7 @@ impl NapiContextHandle {
     ) -> Self {
         increment_handle_count();
         let instance_id = bi.instance_id();
-        Self {
+        let handle = Self {
             context_id,
             state: std::sync::Mutex::new(ContextState::Active),
             creator_did,
@@ -364,7 +360,9 @@ impl NapiContextHandle {
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bi: Arc::clone(bi),
             instance_id,
-        }
+        };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
+        handle
     }
 }
 
@@ -934,6 +932,7 @@ pub(crate) async fn context_create_on(
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     };
+    crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
     increment_handle_count();
     Ok(handle)
 }
@@ -1315,6 +1314,29 @@ pub(crate) async fn reserve_key_package_on(
     })
 }
 
+/// Tears down a committed Welcome join whose bridge state a concurrent close
+/// or leave removed, and returns the join's `CTX_2040` error.
+///
+/// The close that removed the state marked the id, and the join's readmit may
+/// have cleared that mark. No actor serves the id after the teardown, so this
+/// re-marks it, and `ensure_registered` refuses to rebuild UCAN state for it.
+async fn tear_down_vanished_join(
+    bi: &crate::runtime::NapiBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    context_id: &str,
+) -> ScpNapiError {
+    sup.discard_joined_context(context_id).await;
+    crate::runtime::release_context(bi, context_id);
+    ScpNapiError::Context {
+        message: format!(
+            "bridge state for context '{context_id}' vanished between the reversible \
+             registration and the committed join; the just-committed actor was torn down so \
+             no context stays live without bridge state"
+        ),
+        code: codes::CTX_2040.to_owned(),
+    }
+}
+
 /// Per-bridge-instance implementation of `context_join_from_welcome`.
 ///
 /// Completes the reserve → Welcome → join handshake begun by
@@ -1420,24 +1442,14 @@ pub(crate) async fn context_join_from_welcome_on(
     // `spawn_actor_from_welcome` consumes the single-use KeyPackage, and leaves
     // any pre-existing entry untouched (never roll back state we did not create).
     //
-    // FLAG-1: the caller no longer supplies a ceiling, so register with the
-    // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`, so
-    // the "detect a duplicate BEFORE consuming the single-use KeyPackage"
-    // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-    // ceiling is re-synced from the joined handle's signed params AFTER a
-    // successful spawn (see `sync_ceiling_from_params` below).
+    // FLAG-1: the caller supplies no ceiling, so register with an empty slice.
+    // The Occupied dedup is keyed on `context_id`, so the "detect a duplicate
+    // BEFORE consuming the single-use KeyPackage" crash-safety holds whatever
+    // the ceiling. The bridge state carries no role state and no membership:
+    // `spawn_actor_from_welcome` stores the AUTHENTICATED membership and
+    // ceiling in the spawned actor.
     crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
         .map_err(NapiError::from)?;
-    // Insert the joiner as a member of the freshly-registered role state. On the
-    // (practically unreachable) failure of this insert into state we just
-    // created, roll it back so a failed join leaves nothing behind.
-    if let Err(e) = crate::runtime::with_context(bi, &sealed.context_id, |st| {
-        st.role_state.members.insert(owning_did.clone());
-        Ok(())
-    }) {
-        crate::runtime::remove_context(bi, &sealed.context_id);
-        return Err(NapiError::from(e));
-    }
 
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(sealed.creator_did.clone()),
@@ -1468,32 +1480,28 @@ pub(crate) async fn context_join_from_welcome_on(
         }
     };
 
-    // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's signed
-    // params, overwriting the default ceiling used for the reversible precheck.
-    // The authoritative ceiling lives in the bundle the creator signed — never in
-    // caller input. This runs AFTER the irreversible commit; the FFI state was
-    // just registered (and not removed on this success path), so the sync targets
-    // a live entry.
-    //
-    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails ONLY
-    // if a concurrent close/leave removed the just-registered FFI state in the
-    // window since the spawn returned. A close/leave does NOT despawn the runtime
-    // actor, so returning `Err` here without tearing the actor down would strand a
-    // live, orphaned actor for a join that never fully materialized at the bridge.
-    // Compensate with the COMPLETE teardown (`discard_joined_context`): it removes
-    // the actor handle AND destroys the resident MLS group AND deletes the durable
-    // Class-S snapshot the join persisted — a bare `despawn_actor` would leave the
-    // crypto group and snapshot behind, resurrecting the context on restart and
-    // blocking a fresh re-join. Then purge residual bridge state and surface the
-    // error.
-    if let Err(e) = crate::runtime::sync_ceiling_from_params(
-        bi,
-        &sealed.context_id,
-        &core_handle.params().ceiling,
-    ) {
-        sup.discard_joined_context(&sealed.context_id).await;
-        crate::runtime::remove_context(bi, &sealed.context_id);
-        return Err(NapiError::from(e));
+    // The supervisor serves the id again, so a release mark a prior close left
+    // no longer applies. A close landing after this line re-marks the id, and
+    // the presence probe below catches it; the probe's teardown re-marks the
+    // id in either order.
+    crate::runtime::readmit_context(bi, &sealed.context_id);
+
+    // BLACK-2JF-01, post-irreversible-commit compensation: the presence probe
+    // below misses only when a concurrent close or leave removed the bridge
+    // state this join registered while the spawn ran or after it returned. A
+    // close on an older handle for the same context id reads no actor while
+    // the spawn runs, so `context_close_on` skips the dispatch and releases
+    // that state. A close or leave does not despawn the actor, so returning
+    // without a teardown would strand a live actor behind a handle with no
+    // bridge state. `discard_joined_context` removes the actor handle, destroys
+    // the resident MLS group, and deletes the durable snapshot the join
+    // persisted; a bare `despawn_actor` would leave the group and the snapshot
+    // behind, so a restart would restore the context and a fresh re-join would
+    // collide with it.
+    if !crate::runtime::ucan_registry(bi).contains_key(&sealed.context_id) {
+        return Err(NapiError::from(
+            tear_down_vanished_join(bi, &sup, &sealed.context_id).await,
+        ));
     }
 
     // Runtime join committed. Register the context in the known-contexts
@@ -1502,8 +1510,8 @@ pub(crate) async fn context_join_from_welcome_on(
     // idempotent (overwrites), so it is safe after the irreversible commit and
     // needs no rollback. The routing id is the joiner's derived §9.10.4
     // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
-    // move); the member is the JOINER, matching the role-state member inserted
-    // above.
+    // move); the member is the JOINER, the member `spawn_actor_from_welcome`
+    // recorded in the supervisor's role state.
     //
     // The relay URL comes from the handleless transport probe. On the NAPI
     // bridge the relay URL lives on a `NapiTransportManager` handle, not on the
@@ -1552,6 +1560,7 @@ pub(crate) async fn context_join_from_welcome_on(
         bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     };
+    crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
     increment_handle_count();
     Ok(handle)
 }
@@ -1693,36 +1702,105 @@ pub(crate) async fn context_close_on(
     identity_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
-    // Authorization is enforced by the ContextManager (which delegates to
-    // ttl::close_context checking the ContextClose capability). No bridge-layer
-    // auth check — the ContextManager is authoritative.
+    // The bridge runs no capability check of its own. On the `Active` path the
+    // supervisor's `CloseContext` dispatch below runs `ttl::close_context`,
+    // which checks the `ContextClose` capability; the terminal skip runs no
+    // capability check (see below).
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Context {
-            message: format!(
-                "cannot close context in {state_str:?} state — context must be active"
-            ),
-            code: codes::CTX_2017.to_owned(),
-        }
-        .into());
-    }
-
-    // Cancel the subscription task before closing so the background relay
-    // listener stops promptly.
-    if let Ok(token) = handle.subscription_cancel.lock() {
-        token.cancel();
-    }
-
-    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
-    let did = DID(identity_did.clone());
+    // Read the supervisor, not the handle's cached string. An absent actor
+    // (a completed TTL expiry) and a terminal state (`Closed`, `Expired`,
+    // `Tombstoned`) mean the close already happened: they skip the dispatch
+    // and fall through to the release below. Every other state refuses the
+    // close, whoever calls.
+    //
+    // The terminal skip runs no `ContextClose` check, because
+    // `ttl::close_context` runs inside the dispatch the skip removes, so any
+    // holder of the handle can release this bridge's `UcanContextState` once
+    // the supervisor reports no actor or a terminal state. The release marks
+    // the id, and `crate::runtime::ensure_registered` refuses to rebuild a
+    // marked id's revocation list and nonce tracker. This bridge keeps
+    // revocations in process memory, so a revocation recorded before the
+    // close does not survive a later readmit of the id, just as it does not
+    // survive a process restart.
+    //
+    // `Poisoned` and `MigratingOut` refuse because both can return to
+    // `Active` without an import (`clear_poison`, a cancelled migration), and
+    // a release before that return would leave the `Active` context with no
+    // revocation list on this bridge. `Closing` refuses so the release
+    // follows `contextFinalizeClose`, and the refusal names that call.
+    let close_already_happened =
+        match crate::runtime::read_live_context_state(bi, &handle.context_id)
+            .await
+            .map_err(NapiError::from)?
+        {
+            // The supervisor holds no actor for the id (a completed TTL
+            // expiry), or the actor reports a terminal state (a finalized
+            // close, an expiry, a migration tombstone): the close already
+            // happened.
+            // `read_live_context_state` reports an actor the supervisor still
+            // holds but this bridge could not reach as `ActorBusy`, and a
+            // context whose actor is mid-respawn or whose last respawn failed
+            // as `ActorCrashed`, rather than as `None`, so a saturated, wedged,
+            // or crashed context refuses the close instead of taking this arm.
+            None
+            | Some(
+                scp_core::context::ContextState::Closed
+                | scp_core::context::ContextState::Expired
+                | scp_core::context::ContextState::Tombstoned,
+            ) => true,
+            Some(scp_core::context::ContextState::Active) => false,
+            // `Closing` names its own successor call, because "context must be
+            // active" is unreachable from the closing window: the window ends
+            // at `Closed`, and only an import returns the id to `Active`.
+            Some(scp_core::context::ContextState::Closing) => {
+                return Err(ScpNapiError::Context {
+                    message: "cannot close context in 'closing' state -- the context is inside \
+                              its cooperative closing window; call contextFinalizeClose to reach \
+                              'closed', then close to release any state this bridge still holds \
+                              for the context"
+                        .to_owned(),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
+            Some(scp_core::context::ContextState::Poisoned) => {
+                return Err(ScpNapiError::Context {
+                    message: "cannot close context in 'poisoned' state -- the crash watchdog took \
+                              the context out of service and an operator's clear_poison returns \
+                              it to 'active'; this bridge keeps its revocation list and nonce \
+                              state for the context until a close runs against a live actor"
+                        .to_owned(),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
+            Some(other) => {
+                return Err(ScpNapiError::Context {
+                    message: format!(
+                        "cannot close context in '{}' state -- context must be active",
+                        crate::runtime::context_state_str(&other)
+                    ),
+                    code: codes::CTX_2017.to_owned(),
+                }
+                .into());
+            }
+        };
 
     // Route through the ADR-049 lifecycle dispatch surface
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
     // rather than calling a `ContextManager` method directly. The actor
     // mailbox wraps the delegated call in the 30s transport-timeout budget
     // and preserves byte-identical close semantics.
-    {
+    //
+    // A close that already happened (see the supervisor read above) skips the
+    // dispatch: either no actor serves the context, or the resident actor
+    // reports `Closed`, `Expired`, or `Tombstoned`, so the bridge only has to
+    // release its own state. `require_core_handle` sits inside the branch for the same
+    // reason — a despawned context needs no core handle to release bridge state,
+    // and demanding one would restore the leak this branch exists to close.
+    if !close_already_happened {
+        let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+        let did = DID(identity_did.clone());
         use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
         let sup = crate::runtime::supervisor(bi)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1747,10 +1825,24 @@ pub(crate) async fn context_close_on(
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     }
 
-    handle.set_closed().map_err(NapiError::from)?;
+    // Release UCAN state for this context, and mark the id so no later call
+    // rebuilds it empty, unless an import or restore returned the id to
+    // `Active` after the lifecycle read above. That check runs before the
+    // handle is written `Closed` and before its subscription is cancelled, so
+    // a close that reports the context stays open leaves the handle reading
+    // "active" with its subscription running.
+    if !crate::runtime::release_context_unless_readmitted(bi, &handle.context_id).await {
+        return Err(NapiError::from(ScpNapiError::Context {
+            message: "the context returned to Active through an import or restore while this close ran; the imported context stays open and keeps its state on this bridge".to_owned(),
+            code: codes::CTX_2017.to_owned(),
+        }));
+    }
 
-    // Clean up UCAN state for this context.
-    crate::runtime::remove_context(bi, &handle.context_id);
+    // Stop the background relay listener for this handle.
+    if let Ok(token) = handle.subscription_cancel.lock() {
+        token.cancel();
+    }
+    handle.set_closed().map_err(NapiError::from)?;
 
     // Clean up per-context bridge connector state and economy state via the
     // same NapiBridgeInstance's core (not the process-global bridge).
@@ -3494,7 +3586,6 @@ pub(crate) async fn context_execute_governance_action_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    let proposal_id_log = hex::encode(proposal_id);
 
     // Route through the ADR-049 governance dispatch surface.
     use scp_core::context::actor::commands::{ExecuteGovernanceActionPayload, GovernanceCommand};
@@ -3517,18 +3608,6 @@ pub(crate) async fn context_execute_governance_action_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-    // Re-sync local UCAN role state cache from ContextManager after any
-    // governance action that may have modified roles/membership (#560).
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            proposal_id = %proposal_id_log,
-            error = %e,
-            "failed to sync role state after governance action — \
-             local capability checks may be stale"
-        );
-    }
 
     // Sync FFI handle state for migration transitions (§5.11A).
     match &result {
@@ -3984,8 +4063,6 @@ pub(crate) async fn context_governance_propose_on(
         })
     })?;
 
-    let action_name = action.variant_name();
-
     use scp_core::context::actor::commands::{
         GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
     };
@@ -4033,15 +4110,6 @@ pub(crate) async fn context_governance_propose_on(
                 code: codes::CTX_2041.to_owned(),
             })
         })?;
-
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            action = action_name,
-            error = %e,
-            "failed to sync role state after governance proposal"
-        );
-    }
 
     let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
@@ -4105,14 +4173,6 @@ pub(crate) async fn context_governance_approve_on(
             })
         })?;
 
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance approval"
-        );
-    }
-
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
@@ -4167,14 +4227,6 @@ pub(crate) async fn context_governance_reject_on(
             })
         })?;
 
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance rejection"
-        );
-    }
-
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
@@ -4223,14 +4275,6 @@ pub(crate) async fn context_governance_withdraw_on(
                 code: codes::CTX_2044.to_owned(),
             })
         })?;
-
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance withdrawal"
-        );
-    }
 
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
@@ -4613,7 +4657,7 @@ pub(crate) async fn context_restore_on(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = LifecycleCommand::RestoreContext {
         payload: Box::new(RestoreContextPayload {
-            context_id,
+            context_id: context_id.clone(),
             params: scp_core::context::ContextParams::default(),
         }),
         reply: tx,
@@ -4636,7 +4680,9 @@ pub(crate) async fn context_restore_on(
                 message: format!("restore_context failed: {e}"),
                 code: codes::CTX_2064.to_owned(),
             })
-        })
+        })?;
+    crate::runtime::readmit_context(bi, &context_id);
+    Ok(())
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_restore_all`](crate::scp::Scp::context_restore_all).
@@ -4656,6 +4702,9 @@ pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Res
             code: codes::CTX_2065.to_owned(),
         })
     })?;
+    for context_id in &restored {
+        crate::runtime::readmit_context(bi, context_id);
+    }
 
     serde_json::to_string(&restored).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -5067,6 +5116,9 @@ pub(crate) async fn context_import_on(
     sup.import_context(export, &verifying_key, Some(local_pseudonym))
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // The supervisor serves the id again, so a release mark an earlier close
+    // left on this bridge instance no longer applies.
+    crate::runtime::readmit_context(bi, &context_id);
 
     // §9.10.4: emit a PseudonymAnnouncement so existing members learn this
     // importer's per-context routing ID. Encrypted contexts only — broadcast
@@ -5795,6 +5847,7 @@ mod tests {
             bi: Arc::clone(bi),
             instance_id: bi.instance_id(),
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
         (did, active_key, agent_key, handle)
     }
 
@@ -5958,6 +6011,7 @@ mod tests {
             bi: Arc::clone(&bi),
             instance_id: bi.instance_id(),
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
 
         let signer =
             super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Agent)
@@ -6108,6 +6162,11 @@ mod tests {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let joiner_did = register_in_memory_joiner(&bi).await;
         let ctx_id = "a".repeat(64);
+        // A close released this id before the join, and a handle from before
+        // the close is still alive, so the release mark must survive the
+        // failed join: only a committed spawn readmits the id.
+        let _closed_handle = active_handle_for(&bi, &ctx_id, "did:dht:z6MkNapiRollbackCreator");
+        crate::runtime::release_context(&bi, &ctx_id);
 
         // A well-formed 32-byte `enc` passes the bridge enc-length check, so the
         // failure is the runtime join itself (bogus reservation + ciphertext) —
@@ -6144,6 +6203,159 @@ mod tests {
         assert!(
             !bi.core.has_known_context(&ctx_id),
             "no known-context discovery entry may leak after a failed join"
+        );
+        assert!(
+            bi.released_contexts.contains_key(&ctx_id),
+            "a failed join must not clear the release mark a close left"
+        );
+    }
+
+    /// A close's release that lands after an import returned the id to
+    /// `Active` clears its own mark and removes nothing, so the imported
+    /// context keeps the revocations it recorded; a release against an id no
+    /// actor serves keeps the mark while a handle for the id lives.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let active = format!("napi-release-active-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiReleaseActiveCreator";
+        crate::runtime::create_supervisor_context_for_test(&bi, &active, creator)
+            .await
+            .expect("the supervisor creates the context");
+        crate::runtime::register_test_context(&bi, &active, creator);
+        crate::runtime::with_context(&bi, &active, |rt| {
+            rt.core
+                .revocation_list
+                .revoke("revoked-after-import".to_owned());
+            Ok(())
+        })
+        .expect("the Active context must have UCAN state");
+
+        assert!(
+            !crate::runtime::release_context_unless_readmitted(&bi, &active).await,
+            "a release on an Active context must report the readmit"
+        );
+        assert!(!bi.released_contexts.contains_key(&active));
+        assert!(
+            crate::runtime::with_context(&bi, &active, |rt| {
+                Ok(rt.core.revocation_list.is_revoked("revoked-after-import"))
+            })
+            .expect("the release must leave the Active context's UCAN state in place"),
+            "a revocation the Active context recorded must survive the release"
+        );
+
+        let absent = format!("napi-release-absent-{}", uuid::Uuid::new_v4());
+        let _absent_handle = active_handle_for(&bi, &absent, creator);
+        assert!(crate::runtime::release_context_unless_readmitted(&bi, &absent).await);
+        assert!(
+            bi.released_contexts.contains_key(&absent),
+            "a release on an id no actor serves must keep the mark"
+        );
+    }
+
+    /// A committed Welcome join whose bridge state a racing close removed
+    /// tears the join down and re-marks the id, even though the join's readmit
+    /// had cleared the close's mark, so `ensure_registered` builds no state
+    /// for an id no actor serves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vanished_join_teardown_re_marks_the_id_its_readmit_cleared() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-vanished-join-{}", uuid::Uuid::new_v4());
+        // A handle from before the close, so the mark has a handle to refuse.
+        let handle = active_handle_for(&bi, &ctx_id, "did:key:z6MkNapiVanishedJoinCreator");
+        crate::runtime::release_context(&bi, &ctx_id);
+        crate::runtime::readmit_context(&bi, &ctx_id);
+
+        let sup =
+            Arc::clone(crate::runtime::supervisor(&bi).expect("the supervisor is initialized"));
+        let err = super::tear_down_vanished_join(&bi, &sup, &ctx_id).await;
+        assert!(
+            matches!(err, crate::error::ScpNapiError::Context { ref code, .. } if code == codes::CTX_2040),
+            "the teardown must surface CTX_2040, got {err:?}"
+        );
+        assert!(
+            bi.released_contexts.contains_key(&ctx_id),
+            "the teardown must re-mark the id the join's readmit cleared"
+        );
+        assert!(
+            crate::runtime::ensure_registered(&bi, &handle).is_err(),
+            "no UCAN state may be rebuilt for a torn-down join"
+        );
+    }
+
+    /// A readmit that clears the release mark before the close's removal takes
+    /// the registry shard lock leaves the readmitted context's state in place;
+    /// while the mark stands, the removal takes the state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_removal_skips_state_a_readmit_already_claimed() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-release-race-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_test_context(&bi, &ctx_id, "did:key:z6MkNapiReleaseRace");
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            rt.core
+                .revocation_list
+                .revoke("revoked-after-readmit".to_owned());
+            Ok(())
+        })
+        .expect("the registered context must have UCAN state");
+
+        bi.released_contexts.insert(ctx_id.clone(), ());
+        crate::runtime::readmit_context(&bi, &ctx_id);
+        crate::runtime::remove_context_while_released(&bi, &ctx_id);
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |rt| {
+                Ok(rt.core.revocation_list.is_revoked("revoked-after-readmit"))
+            })
+            .expect("a readmitted context's UCAN state must survive the removal"),
+            "the readmitted context's revocation must survive the removal"
+        );
+
+        bi.released_contexts.insert(ctx_id.clone(), ());
+        crate::runtime::remove_context_while_released(&bi, &ctx_id);
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+            "the removal must take the state while the mark stands"
+        );
+    }
+
+    /// A release mark refuses a rebuild while any handle for the id lives,
+    /// and goes away when the last handle drops; a release with no live
+    /// handle leaves no mark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_mark_lasts_until_the_last_handle_for_the_id_drops() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-release-prune-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiReleasePrune";
+        let first = active_handle_for(&bi, &ctx_id, creator);
+        let second = active_handle_for(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::release_context(&bi, &ctx_id);
+        assert!(
+            bi.released_contexts.contains_key(&ctx_id),
+            "a live handle must keep the mark"
+        );
+
+        drop(first);
+        assert!(
+            crate::runtime::ensure_registered(&bi, &second).is_err(),
+            "the mark must refuse a rebuild while the second handle lives"
+        );
+
+        drop(second);
+        assert!(
+            !bi.released_contexts.contains_key(&ctx_id),
+            "the last handle's drop must drop the mark"
+        );
+        assert!(!bi.context_handles.contains_key(&ctx_id));
+
+        let unheld = format!("napi-release-unheld-{}", uuid::Uuid::new_v4());
+        crate::runtime::release_context(&bi, &unheld);
+        assert!(
+            !bi.released_contexts.contains_key(&unheld),
+            "a release with no live handle must leave no mark"
         );
     }
 
@@ -6542,6 +6754,7 @@ mod tests {
             bi: std::sync::Arc::clone(&bi),
             instance_id,
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
 
         // Initially None.
         assert!(
@@ -7644,6 +7857,236 @@ mod tests {
         );
     }
 
+    /// A close of a context whose actor the supervisor despawned succeeds
+    /// idempotently and releases the bridge's per-context UCAN state.
+    ///
+    /// `register_test_context` registers bridge state with no actor, the
+    /// state a completed TTL expiry leaves, and the handle's cached string
+    /// still reads `"active"`. The close already happened, so
+    /// `context_close_on` skips the supervisor dispatch and releases the
+    /// state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_after_the_supervisor_despawned_the_actor_releases_bridge_state() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-close-despawned-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiCloseDespawned";
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
+
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect("close of a despawned context must succeed idempotently");
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "close must release the bridge state for a despawned context"
+        );
+        assert_eq!(handle.state().expect("state"), "closed");
+
+        // A second close stays idempotent: no state to release, no error.
+        super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect("a repeated close must stay idempotent");
+    }
+
+    /// A close refuses a context the supervisor holds in its §5.9 cooperative
+    /// closing window and releases none of that context's bridge state.
+    ///
+    /// The `Closing` arm refuses before any capability read, so the outsider
+    /// this test uses gets the refusal the creator would, and the test proves
+    /// the state refusal, not a capability check.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write", "context:close"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+
+        // The creator's authorized close drives the supervisor into the
+        // cooperative window and releases the bridge state, so re-register the
+        // state: this case asks what a close does to a LIVE entry, not to an
+        // absent one.
+        super::context_close_on(&bi, &handle, identity.inner.did.clone())
+            .await
+            .expect("the creator's close should succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id, &identity.inner.did);
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closing),
+            "the creator's close must leave the supervisor inside the cooperative window"
+        );
+
+        let outsider = "did:key:z6MkNapiClosingWindowOutsider".to_owned();
+        let err = super::context_close_on(&bi, &handle, outsider)
+            .await
+            .expect_err("close must refuse a context inside its closing window");
+        assert!(
+            err.to_string()
+                .contains("cannot close context in 'closing'"),
+            "close reported: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must leave the bridge state registered"
+        );
+    }
+
+    /// A close refuses a context whose actor the supervisor still holds but
+    /// this bridge could not reach, and releases none of that context's bridge
+    /// state or the handle's cached string.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_context_whose_actor_this_bridge_cannot_reach() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-close-unreachable-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiCloseUnreachable";
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+            .await
+            .expect("the supervisor creates the context");
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor")
+            .test_make_actor_unreachable(&ctx_id);
+
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        let err = super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("a close must refuse a context whose actor did not answer");
+        assert!(
+            err.to_string().contains("SCP-CTX-2130"),
+            "the refusal must report the actor-busy code, got: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must leave the bridge state registered"
+        );
+        assert_eq!(
+            handle.state().expect("state"),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
+    }
+
+    /// A close refuses a context whose actor the crash watchdog is respawning,
+    /// and a context whose last respawn failed below the poison threshold, and
+    /// releases none of either context's bridge state.
+    ///
+    /// Neither context has a registered actor, and the supervisor classifies
+    /// both as crashed (ADR-049 §10).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let creator = "did:key:z6MkNapiCloseCrashed";
+
+        for mid_respawn in [true, false] {
+            let ctx_id = format!("napi-close-crashed-{}", uuid::Uuid::new_v4());
+            crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+                .await
+                .expect("the supervisor creates the context");
+            crate::runtime::register_test_context(&bi, &ctx_id, creator);
+
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+            if mid_respawn {
+                sup.test_hold_context_mid_respawn(&ctx_id).await;
+            } else {
+                sup.test_fail_context_respawn(&ctx_id).await;
+            }
+
+            let handle = active_handle_for(&bi, &ctx_id, creator);
+            let err = super::context_close_on(&bi, &handle, creator.to_owned())
+                .await
+                .expect_err("a close must refuse a context the watchdog has not recovered");
+            assert!(
+                err.to_string().contains("SCP-CTX-2135"),
+                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                 got: {err}"
+            );
+            assert!(
+                crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+                "a refused close must leave the bridge state registered (mid_respawn={mid_respawn})"
+            );
+            assert_eq!(
+                handle.state().expect("state"),
+                "active",
+                "a refused close must not write the handle's cached string"
+            );
+        }
+    }
+
+    /// A close of a poisoned context refuses and keeps the bridge state for
+    /// that id.
+    ///
+    /// The crash watchdog poisons a context once its actor exhausts the
+    /// respawn budget (ADR-049 §10) and despawns the actor, so the supervisor
+    /// reports `Poisoned` and no actor answers. `Poisoned` is not terminal:
+    /// `clear_poison` respawns the actor as `Active`, so a revocation list
+    /// released here would come back empty. The creator, who holds
+    /// `context:close`, gets the refusal.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-close-poisoned-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiClosePoisoned";
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+            .await
+            .expect("the supervisor creates the context");
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
+
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor")
+            .test_poison_context(&ctx_id)
+            .await;
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Poisoned),
+            "the fixture must leave the supervisor reporting Poisoned"
+        );
+
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        let err = super::context_close_on(&bi, &handle, creator.to_owned())
+            .await
+            .expect_err("close of a poisoned context must refuse");
+        assert!(
+            err.to_string()
+                .contains("cannot close context in 'poisoned' state"),
+            "unexpected refusal: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "a refused close must keep the bridge state for a poisoned context"
+        );
+        assert_eq!(
+            handle.state().expect("state"),
+            "active",
+            "a refused close must not write the handle's cached string"
+        );
+    }
+
     /// A rejected direct-execute leaves context membership/role state unchanged
     /// — the forgery cannot apply a phantom action as a side effect.
     #[cfg(feature = "testing")]
@@ -7661,27 +8104,26 @@ mod tests {
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id, creator);
 
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(!st.role_state.members.contains(victim));
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .await
+                .expect("live role state")
+                .members
+                .contains(victim)
+        );
 
         let fabricated = [0x11u8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
         assert!(result.is_err(), "forged direct-execute must be rejected");
 
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(
-                !st.role_state.members.contains(victim),
-                "rejected forgery must not have added the victim as a member"
-            );
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .await
+                .expect("live role state")
+                .members
+                .contains(victim),
+            "rejected forgery must not have added the victim as a member"
+        );
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
@@ -8605,6 +9047,7 @@ mod tests {
             bi: std::sync::Arc::clone(&bi),
             instance_id: bi.instance_id(),
         };
+        crate::runtime::track_context_handle(&handle.bi, &handle.context_id);
 
         let err = super::context_export_on(&bi, &handle)
             .await
@@ -8972,8 +9415,8 @@ mod tests {
     /// `messages:read` under another creator
     /// (`crate::runtime::narrow_bridge_copy_for_test`).
     ///
-    /// An edit that hands any of these calls the bridge copy's ceiling, role
-    /// state or creator fails it: the copy grants neither `outlet:call` nor
+    /// An edit that hands any of these calls the bridge copy's ceiling or
+    /// creator fails it: the copy grants neither `outlet:call` nor
     /// `role:assign`, and the tokens' root issuer is not the copy's creator.
     #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
