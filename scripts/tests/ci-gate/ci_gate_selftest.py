@@ -213,7 +213,9 @@ nothing:
                on every leg, so deleting `platform-testing` from the `group`
                axis would have dropped eight commands from every run while `ci`
                passed. For every axis a step gates on in that form, the check
-               requires the values the steps name to equal the axis list.
+               requires the values the steps name to equal the axis list, and
+               it reports a step gated in that form on an axis the job's matrix
+               does not define.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -4605,7 +4607,9 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
     is reported rather than read, because this check could not say which legs
     run it. A matrix carrying `include` or `exclude` is reported rather than
     read, because either one can add or remove an axis value's legs while the
-    axis list stays the same.
+    axis list stays the same. A step whose `if:` reads that form on an axis the
+    job's matrix does not define, as a key or inside an `include` entry, is
+    reported, because GitHub runs it on no leg.
     """
     gaps = []
     for job_id, job in sorted(doc["jobs"].items()):
@@ -4617,6 +4621,17 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
             for index, step in enumerate(job.get("steps") or [])
             if isinstance(step, dict)
         ]
+        defined = {key for key in matrix if key not in ("include", "exclude")}
+        for entry in matrix.get("include") or []:
+            if isinstance(entry, dict):
+                defined.update(entry)
+        for label, condition in steps:
+            match = AXIS_CONDITION.match(condition)
+            if match and match.group(1) not in defined:
+                gaps.append(
+                    f"{job_id}: {label!r} has `if: {condition}`, but the job's "
+                    f"matrix defines no axis {match.group(1)}, so it runs on no leg"
+                )
         read_axes = sorted(
             {
                 match.group(1)
@@ -4766,6 +4781,19 @@ def check_matrix_axis_controls(doc: dict) -> None:
                 f"a matrix whose legs {expander} changes went unreported: {gaps}",
             )
 
+        undefined = copy.deepcopy(doc)
+        gated(undefined)[0]["if"] = f"matrix.{axis_name}-misspelt == '{kept}'"
+        gaps = matrix_axis_gaps(undefined)
+        check(
+            f"a step gated on an axis the {job_id} matrix does not define is reported",
+            any(
+                f"{job_id}: " in gap
+                and f"matrix defines no axis {axis_name}-misspelt," in gap
+                for gap in gaps
+            ),
+            f"a step gated on an undefined axis went unreported: {gaps}",
+        )
+
         either = copy.deepcopy(doc)
         gated(either)[0]["if"] = (
             f"matrix.{axis_name} == '{kept}' || matrix.{axis_name} == '{dropped_value}'"
@@ -4784,6 +4812,29 @@ def check_matrix_axis_controls(doc: dict) -> None:
         "matrix_axis_gaps passes the live ci.yml and skips an axis no step gates on",
         not matrix_axis_gaps(doc) and not matrix_axis_gaps(ungated),
         f"gaps on ci.yml or on an ungated axis: {matrix_axis_gaps(doc)}",
+    )
+
+    no_matrix = {"jobs": {"j": {"steps": [{"name": "s", "if": "matrix.leg == 'a'"}]}}}
+    gaps = matrix_axis_gaps(no_matrix)
+    check(
+        "a step gated on a matrix axis in a job with no matrix is reported",
+        any("j: 's' has" in gap and "defines no axis leg," in gap for gap in gaps),
+        f"a step gated on an axis of an absent matrix went unreported: {gaps}",
+    )
+    include_axis = {
+        "jobs": {
+            "j": {
+                "strategy": {"matrix": {"include": [{"leg": "a"}]}},
+                "steps": [{"name": "s", "if": "matrix.leg == 'a'"}],
+            }
+        }
+    }
+    gaps = matrix_axis_gaps(include_axis)
+    check(
+        "a step gated on an axis an include entry defines is not reported as "
+        "an undefined axis",
+        not any("defines no axis" in gap for gap in gaps),
+        f"an axis an include entry defines was reported undefined: {gaps}",
     )
 
 
