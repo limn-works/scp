@@ -3,3 +3,15 @@
 # See: https://docs.rs/getrandom/0.3/getrandom/#webassembly-support
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+
+# Builds the bundled SQLCipher (libsqlite3-sys's build script reads this variable) with
+# SQLite's lookaside allocator off. SQLite reuses a lookaside slot without passing it
+# through SQLCipher's allocator, so `PRAGMA cipher_memory_security` never wipes it, and
+# the slot keeps a parsed key or a bound secret until the connection closes (spec §17.6,
+# and §9.15 of the security-model spec, freed heap memory). `force` makes this value win
+# over one set in the environment. Every SCP constructor of a SQLCipher connection reads
+# `PRAGMA compile_options` and fails closed when the library lacks the setting, so a
+# build this file does not reach (one started outside the repository, or one of a
+# published crate) cannot open storage with the pool on.
+[env]
+LIBSQLITE3_FLAGS = { value = "-DSQLITE_DEFAULT_LOOKASIDE=0,0", force = true }

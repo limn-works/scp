@@ -147,6 +147,8 @@ impl SqliteStorage {
         let db_path = dir.join("scp.db");
         let conn = Connection::open(&db_path)
             .map_err(|e| PlatformError::StorageError(format!("failed to open database: {e}")))?;
+        crate::sqlcipher_lookaside::require_lookaside_off(&conn)
+            .map_err(PlatformError::StorageError)?;
 
         // Apply SQLCipher pragmas (spec section 17.6).
         // The hex key format is `PRAGMA key = "x'<hex>'"` — a double-quoted
@@ -155,9 +157,11 @@ impl SqliteStorage {
         //
         // `cipher_memory_security` comes first: SQLCipher allocates with the C
         // library's `malloc`, which the wiping global allocator never sees, and
-        // the pragma makes SQLCipher wipe each block it frees from then on,
-        // including the blocks that parse the key statement after it (§17.6,
-        // and §9.15 of the security-model spec, freed heap memory).
+        // the pragma makes SQLCipher wipe each block its allocator frees from
+        // then on. The key statement's blocks reach that allocator only because
+        // the lookaside pool is off (checked above); the connection keeps no
+        // freed block unwiped (§17.6, and §9.15 of the security-model spec,
+        // freed heap memory).
         let mut hex_key = hex::encode(key);
         let mut pragma_sql = format!(
             "PRAGMA cipher_memory_security = ON;\n\

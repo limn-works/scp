@@ -114,9 +114,12 @@ impl SqliteBlobStore {
         //
         // rusqlite is built with `bundled-sqlcipher`, so this connection is a
         // SQLCipher connection too. `cipher_memory_security` makes SQLCipher
-        // wipe every block it frees; its `malloc` heap is outside the wiping
-        // global allocator (spec §17.6, and §9.15 of the security-model spec,
-        // freed heap memory).
+        // wipe every block its allocator frees; its `malloc` heap is outside
+        // the wiping global allocator. A block reaches that allocator only
+        // because the lookaside pool is off, which the check below confirms
+        // before the first other statement (spec §17.6, and §9.15 of the
+        // security-model spec, freed heap memory).
+        super::sqlcipher_lookaside::require_lookaside_off(&conn).map_err(StorageError::Internal)?;
         conn.execute_batch(
             "PRAGMA cipher_memory_security = ON;
              PRAGMA journal_mode = WAL;

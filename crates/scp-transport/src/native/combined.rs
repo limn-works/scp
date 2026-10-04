@@ -147,13 +147,15 @@ impl CombinedNodeStorage {
         let db_path = dir.join("node.db");
         let conn = Connection::open(&db_path)
             .map_err(|e| StorageError::Internal(format!("failed to open database: {e}")))?;
+        super::sqlcipher_lookaside::require_lookaside_off(&conn).map_err(StorageError::Internal)?;
 
         // Apply SQLCipher encryption key and hardening PRAGMAs.
         // Matches SqliteStorage settings for consistent security posture.
         // `cipher_memory_security` comes first so SQLCipher wipes every block
-        // it frees from then on, the key statement's included; its `malloc`
-        // heap is outside the wiping global allocator (spec §17.6, and §9.15
-        // of the security-model spec, freed heap memory).
+        // its allocator frees from then on; its `malloc` heap is outside the
+        // wiping global allocator. The key statement's blocks reach that
+        // allocator only because the lookaside pool is off (checked above)
+        // (spec §17.6, and §9.15 of the security-model spec, freed heap memory).
         let mut hex_key = hex::encode(key);
         let mut pragma_sql = format!(
             "PRAGMA cipher_memory_security = ON;\n\

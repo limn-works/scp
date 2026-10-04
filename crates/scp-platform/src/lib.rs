@@ -71,6 +71,8 @@ pub mod testing;
 // and the SqliteStorage passphrase constructor (`sqlite`).
 #[cfg(any(feature = "file", feature = "sqlite"))]
 pub mod kdf;
+#[cfg(any(feature = "sqlite", feature = "apple"))]
+pub(crate) mod sqlcipher_lookaside;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 // Versioned storage envelope + spec §17.3 key conventions. The single source of

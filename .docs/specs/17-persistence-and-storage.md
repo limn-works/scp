@@ -545,7 +545,7 @@ conn.execute_batch("
 ")?;
 ```
 
-Every SQLCipher connection MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. SQLCipher and its embedded SQLite allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. §9.15 lists the copies that neither wipe reaches, memory OpenSSL obtains from `malloc` among them.
+Every SQLCipher connection MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. SQLCipher and its embedded SQLite allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. The pragma wipes only blocks that SQLCipher's allocator frees, and SQLite's per-connection lookaside pool reuses its slots without freeing them through that allocator, so a slot keeps a parsed key, statement text, or a bound value until the connection closes. Every SQLCipher connection therefore MUST run with lookaside off: SCP builds the bundled SQLCipher with `-DSQLITE_DEFAULT_LOOKASIDE=0,0`, and each constructor of a SQLCipher connection reads `PRAGMA compile_options` before any other statement and fails with a typed error when that setting is absent. §9.15 lists the copies that neither wipe reaches, memory OpenSSL obtains from `malloc` among them.
 
 ### Browser Clients Run Storage In-Process
 
