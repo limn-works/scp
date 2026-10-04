@@ -2899,6 +2899,55 @@ jobs:
       # whatever the caller asked to build. It compiles no Rust, which is why it
       # belongs in this job rather than in `kotlin-test`.
       - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
+      # `kotlin-test` and `bridge-parity-kotlin` pass `scp.uniffi.prebuiltBindings=true`
+      # with the bindings present and an absolute `CARGO_TARGET_DIR`, so neither reaches
+      # the property's failure branches or a relative directory. This step runs those
+      # cases against scp-kt/build.gradle.kts. No step of this job generates the
+      # bindings, so scp.kt is absent until the step writes a placeholder.
+      - name: Check scp.uniffi.prebuiltBindings and CARGO_TARGET_DIR resolution
+        env:
+          BINDINGS: scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+        run: |
+          set -euo pipefail
+          expect_failure() {
+            local message=$1
+            shift
+            local output
+            if output=$(./gradlew "$@" 2>&1); then
+              echo "::error::./gradlew $* exited 0; it must fail with: $message"
+              exit 1
+            fi
+            if ! grep -qF -- "$message" <<<"$output"; then
+              echo "$output"
+              echo "::error::./gradlew $* failed without: $message"
+              exit 1
+            fi
+          }
+          if [ -e "$BINDINGS" ]; then
+            echo "::error::$BINDINGS exists before this step; the missing-file case needs it absent"
+            exit 1
+          fi
+          expect_failure "scp.uniffi.prebuiltBindings is true and" \
+            :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=true
+          expect_failure "scp.uniffi.prebuiltBindings is 'yes'; it takes true or false" \
+            :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=yes
+          ./gradlew -q :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=false
+          mkdir -p "$(dirname "$BINDINGS")"
+          echo "// placeholder" > "$BINDINGS"
+          ./gradlew -q :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=true
+          rm "$BINDINGS"
+          for value in relative/target "$RUNNER_TEMP/absolute-target"; do
+            case $value in
+              /*) dir=$value ;;
+              *) dir=$GITHUB_WORKSPACE/$value ;;
+            esac
+            want="-Djna.library.path=$dir/debug:$dir/release"
+            got=$(CARGO_TARGET_DIR=$value ./gradlew -q :scp-kt:printJnaLibraryPath | tail -n 1)
+            if [ "$got" != "$want" ]; then
+              echo "::error::CARGO_TARGET_DIR=$value gave '$got'; cargo uses '$want'"
+              exit 1
+            fi
+          done
       # `:scp-kt-android` declares detekt in its own build.gradle.kts and no job
       # invoked it, so every rule in ../detekt.yml — ForbiddenComment among them,
       # which is how this repository enforces its Kotlin stub policy — went

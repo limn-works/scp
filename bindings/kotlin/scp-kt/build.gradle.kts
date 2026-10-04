@@ -142,6 +142,16 @@ tasks.test {
     jvmArgumentProviders.add(JnaLibraryPath(cargoTargetDir))
 }
 
+// Prints the `-Djna.library.path` argument `JnaLibraryPath` gives the test JVM. The
+// `kotlin-lint` job in `.github/workflows/ci.yml` runs it with a relative and an
+// absolute `CARGO_TARGET_DIR` and compares the output with the directory cargo uses.
+tasks.register("printJnaLibraryPath") {
+    group = "help"
+    description = "Print the -Djna.library.path argument the scp-kt test JVM receives"
+    val argument = JnaLibraryPath(cargoTargetDir)
+    doLast { println(argument.asArguments().single()) }
+}
+
 detekt {
     config.setFrom("../detekt.yml")
     buildUponDefaultConfig = true
