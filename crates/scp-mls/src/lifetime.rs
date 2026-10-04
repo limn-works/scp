@@ -195,9 +195,10 @@ pub const KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS: u64 =
 /// [`KEY_PACKAGE_LIFETIME_MARGIN_SECS`], so a joiner that fetches its Welcome
 /// while the relay still holds the `InvitationBundle` finds its own
 /// `KeyPackage` current, and at least the relay maximum blob TTL
-/// (`MAX_BLOB_TTL`, 7 days, §9.18.11) plus the same margin, so openmls's
-/// receive-side `Lifetime` check refuses no Commit that an SCP relay delivers
-/// within its retention for an expired `not_after`; the residual-case list of
+/// (`MAX_BLOB_TTL`, 7 days, §9.18.11) plus the same margin, so no Commit that
+/// an SCP relay delivers within its retention carries a `KeyPackage` expired
+/// under a receiver whose clock runs at most one hour ahead of the adder's;
+/// the residual-case list of
 /// security-model spec §9.7.1 names every case in which that check still
 /// refuses a Commit. Neither bound lives in this crate: `scp-runtime`
 /// const-asserts the first against its invitation TTL, and `scp-client`

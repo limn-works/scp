@@ -70,7 +70,7 @@
 //!   openmls's check, and the residual-case list of security-model spec
 //!   §9.7.1 names every case in which it still refuses an add-Commit.
 //!   Page same-origin integrity (CSP/SRI/COOP/COEP) stays load-bearing for
-//!   every `Lifetime` decision, because a script that runs before this module
+//!   every add-side `Lifetime` decision, because a script that runs before this module
 //!   initializes shifts the captured clock too. The residual closes when
 //!   openmls exposes a receive-side lifetime policy SCP can set to skip the
 //!   current-time check, and lets the caller supply the clock
