@@ -1325,7 +1325,15 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// [`DhtMode::Disabled`] is valid for every reach) or any stage fails: storage
 /// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
-/// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
+/// TLS config, deploy, or serve.
+///
+/// After the shutdown signal, returns [`HostSiteError::Drain`] when the
+/// deployer's Supervisor does not drain within [`SELF_HOST_DRAIN_DEADLINE`]
+/// and [`HostSiteError::StorageClose`] when the MLS store refuses to close;
+/// in both cases the store keeps its connection and advisory lock. A failure
+/// after the deployer is built also returns one of those two variants,
+/// carrying the original error, when its teardown leaves the store open.
+/// Returns `Ok(())` when the shutdown drains and closes the store.
 ///
 /// On every build without the `testing` feature, returns
 /// [`HostSiteError::NodeBuild`] holding
@@ -1684,8 +1692,9 @@ where
         .await
     {
         release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
-        retire_deployer_after_failure(&deployer, &mls_store).await;
-        return Err(HostSiteError::Deploy(e));
+        return Err(
+            retire_deployer_after_failure(&deployer, &mls_store, HostSiteError::Deploy(e)).await,
+        );
     }
     tracing::info!(committed = asset_count, "self-host site deployed");
 
@@ -1719,8 +1728,7 @@ where
     )
     .await
     {
-        retire_deployer_after_failure(&deployer, &mls_store).await;
-        return Err(e);
+        return Err(retire_deployer_after_failure(&deployer, &mls_store, e).await);
     }
 
     // -- Run the refresh + NAT-renewal loops, await shutdown, and tear down. --
@@ -1763,11 +1771,37 @@ async fn retire_deployer(
     })
 }
 
-/// [`retire_deployer`] on a path already returning another error. That error
-/// is the one returned, so a close failure here is logged at error level.
-async fn retire_deployer_after_failure(deployer: &SelfHostDeployer, mls_store: &SqliteStorage) {
-    if let Err(e) = retire_deployer(deployer, mls_store).await {
-        tracing::error!(error = %e, "self-host deployer teardown after a failure");
+/// [`retire_deployer`] on a path failing with `cause`. Returns `cause` when
+/// the teardown succeeds, and the teardown error carrying `cause` when it
+/// fails (see [`teardown_outcome`]).
+async fn retire_deployer_after_failure(
+    deployer: &SelfHostDeployer,
+    mls_store: &SqliteStorage,
+    cause: HostSiteError,
+) -> HostSiteError {
+    teardown_outcome(retire_deployer(deployer, mls_store).await, cause)
+}
+
+/// Picks the error a failing path returns after it settles the MLS store.
+/// A successful teardown returns `cause`. A teardown that left the store
+/// open returns its own error with `cause` attached: a drain timeout as
+/// [`HostSiteError::Drain`] carrying `cause` in
+/// [`SelfHostError::DrainTimedOut`], and a refused close as
+/// [`HostSiteError::StorageClose`] naming `cause`.
+fn teardown_outcome(teardown: Result<(), HostSiteError>, cause: HostSiteError) -> HostSiteError {
+    match teardown {
+        Ok(()) => cause,
+        Err(HostSiteError::Drain(SelfHostError::DrainTimedOut {
+            deadline,
+            cause: None,
+        })) => HostSiteError::Drain(SelfHostError::DrainTimedOut {
+            deadline,
+            cause: Some(cause.to_string()),
+        }),
+        Err(HostSiteError::StorageClose(close)) => {
+            HostSiteError::StorageClose(format!("{close} (closing after: {cause})"))
+        }
+        Err(other) => other,
     }
 }
 
@@ -2520,14 +2554,14 @@ fn deployer_setup_failure(e: SelfHostError, mls_store: &SqliteStorage) -> HostSi
         // The drain timed out, so a tracked task may still write: leave the
         // store open.
         e @ SelfHostError::DrainTimedOut { .. } => HostSiteError::Drain(e),
-        e => {
-            // `start` drained any Supervisor it built before failing, so the
-            // store has no writer left.
-            if let Err(close) = mls_store.close() {
-                tracing::error!(error = %close, "MLS SQLite store did not close after a failed deployer setup");
-            }
-            HostSiteError::DeployerSetup(e.to_string())
-        }
+        // `start` drained any Supervisor it built before failing, so the
+        // store has no writer left.
+        e => teardown_outcome(
+            mls_store.close().map_err(|close| {
+                HostSiteError::StorageClose(format!("failed to close MLS SQLite storage: {close}"))
+            }),
+            HostSiteError::DeployerSetup(e.to_string()),
+        ),
     }
 }
 
@@ -2791,6 +2825,46 @@ mod tests {
             reopened.is_ok(),
             "the store must release its lock after a drained setup failure: {:?}",
             reopened.err()
+        );
+    }
+
+    /// A failing path returns its own error only when the teardown settles the
+    /// store; a drain timeout or refused close replaces it with the typed
+    /// teardown error carrying it, so the caller learns the store stays open.
+    #[test]
+    fn teardown_outcome_surfaces_a_store_left_open() {
+        let cause = || HostSiteError::Deploy(SelfHostError::CommitDeploy("x".to_owned()));
+
+        let err = teardown_outcome(Ok(()), cause());
+        assert!(
+            matches!(&err, HostSiteError::Deploy(SelfHostError::CommitDeploy(m)) if m == "x"),
+            "a settled teardown must return the original error, got {err:?}"
+        );
+
+        let timed_out = Err(HostSiteError::Drain(SelfHostError::DrainTimedOut {
+            deadline: SELF_HOST_DRAIN_DEADLINE,
+            cause: None,
+        }));
+        let err = teardown_outcome(timed_out, cause());
+        assert!(
+            matches!(
+                &err,
+                HostSiteError::Drain(SelfHostError::DrainTimedOut { deadline, cause: Some(c) })
+                    if *deadline == SELF_HOST_DRAIN_DEADLINE
+                        && c == "deploy error: failed to commit deploy: x"
+            ),
+            "a drain timeout must be Drain carrying the original error, got {err:?}"
+        );
+
+        let refused = Err(HostSiteError::StorageClose("refused".to_owned()));
+        let err = teardown_outcome(refused, cause());
+        assert!(
+            matches!(
+                &err,
+                HostSiteError::StorageClose(m)
+                    if m == "refused (closing after: deploy error: failed to commit deploy: x)"
+            ),
+            "a refused close must be StorageClose naming the original error, got {err:?}"
         );
     }
 
