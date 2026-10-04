@@ -3984,18 +3984,28 @@ def package_writers_off_push(doc: dict) -> list[str]:
 
     Job docker-image-cache exports the Docker layer cache that every run reads, so
     a pull request or merge group run that held this grant from the workflow on
-    `main` could overwrite what `main` reads.
+    `main` could overwrite what `main` reads. A job without its own `permissions:`
+    key holds the workflow-level `permissions:`, and `write-all` at either level
+    grants `packages: write`.
     """
+
+    def grants_package_write(permissions: object) -> bool:
+        if isinstance(permissions, str):
+            return permissions == "write-all"
+        return isinstance(permissions, dict) and permissions.get("packages") == "write"
+
     return sorted(
         job_id
         for job_id, job in doc["jobs"].items()
-        if (job.get("permissions") or {}).get("packages") == "write"
+        if grants_package_write(
+            job["permissions"] if "permissions" in job else doc.get("permissions")
+        )
         and " ".join(str(job.get("if") or "").split()) != "github.event_name == 'push'"
     )
 
 
 def check_package_writers_run_only_on_push(doc: dict) -> None:
-    """Only a push-only job holds `packages: write`; two mutants must be reported."""
+    """Only a push-only job holds `packages: write`; five mutants must be reported."""
     check(
         "every job holding `packages: write` runs only on a push",
         package_writers_off_push(doc) == [],
@@ -4014,6 +4024,49 @@ def check_package_writers_run_only_on_push(doc: dict) -> None:
         "a docker-image-cache job whose `if:` admits a pull request is reported",
         package_writers_off_push(widened) == ["docker-image-cache"],
         f"the widened condition went unreported: {package_writers_off_push(widened)}",
+    )
+    # Jobs without their own `permissions:` key hold the workflow-level block.
+    inheriting = sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if "permissions" not in job
+        and " ".join(str(job.get("if") or "").split()) != "github.event_name == 'push'"
+    )
+    check(
+        "ci.yml has jobs that hold the workflow-level `permissions:` block",
+        inheriting != [],
+        "no job holds the workflow-level block, so the two mutants below test nothing",
+    )
+    workflow_granted = copy.deepcopy(doc)
+    workflow_granted["permissions"] = {**doc["permissions"], "packages": "write"}
+    check(
+        "a workflow-level `packages: write` is reported on every job that holds it",
+        package_writers_off_push(workflow_granted) == inheriting,
+        f"the workflow-level grant went unreported: "
+        f"{package_writers_off_push(workflow_granted)}",
+    )
+    workflow_write_all = copy.deepcopy(doc)
+    workflow_write_all["permissions"] = "write-all"
+    check(
+        "a workflow-level `permissions: write-all` is reported on every job that holds it",
+        package_writers_off_push(workflow_write_all) == inheriting,
+        f"the workflow-level write-all went unreported: "
+        f"{package_writers_off_push(workflow_write_all)}",
+    )
+    job_write_all = copy.deepcopy(doc)
+    job_write_all["jobs"]["docker-image"]["permissions"] = "write-all"
+    check(
+        "a docker-image job with `permissions: write-all` is reported",
+        package_writers_off_push(job_write_all) == ["docker-image"],
+        f"the job-level write-all went unreported: {package_writers_off_push(job_write_all)}",
+    )
+    read_all = copy.deepcopy(doc)
+    read_all["permissions"] = "read-all"
+    read_all["jobs"]["docker-image"]["permissions"] = "read-all"
+    check(
+        "`permissions: read-all` at either level is not reported",
+        package_writers_off_push(read_all) == [],
+        f"a read-all grant was reported: {package_writers_off_push(read_all)}",
     )
 
 
