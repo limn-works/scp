@@ -21,7 +21,7 @@ env:
   RUST_BACKTRACE: 1
   # Builds every dev-profile and test-profile unit in this workflow with no debug
   # info, overriding the `debug = "line-tables-only"` that `[profile.dev]` in the root
-  # Cargo.toml sets for local builds. Without line tables each object file carries no
+  # Cargo.toml sets. Without line tables each object file carries no
   # DWARF sections, so the linker reads and writes less for every test binary and each
   # `target/debug` entry rust-cache saves and restores is smaller. Release
   # builds (`wasm-pack build`'s default `--release`) read `[profile.release]`, and
