@@ -102,7 +102,7 @@
     private let attestedKeyIdDefaultsKey = "dev.limn.scp.appAttest.attestedKeyId"
 
     /// The `UserDefaults` key `AppleDeviceAttestation` stores the ID of a key
-    /// generated to replace an attested key under, until Apple attests it.
+    /// generated to replace an attested key under.
     private let replacementKeyIdDefaultsKey = "dev.limn.scp.appAttest.replacementKeyId"
 
     /// A stored key ID other than any key ID a scripted `generateKey` answers
@@ -1942,6 +1942,52 @@
             #expect(defaults.string(forKey: keyIdDefaultsKey) == keyId)
         }
 
+        @Test("a late answer on a replacement key neither promotes nor discards it")
+        func lateReplacementAnswerChangesNoKeyId() async {
+            // Each case holds the answer that would end the call: attestKey's
+            // attestation object, which would promote the replacement, or the
+            // key probe's assertion or invalidKey, which would discard it.
+            let cases: [(label: String, service: RecordingAppAttestService, heldProbe: Bool)] = [
+                ("attestKey value", RecordingAppAttestService(holdsFirstAttestation: true), false),
+                ("probe assertion", RecordingAppAttestService(
+                    holdsFirstAssertion: true,
+                    attestationResult: .failure(invalidKeyError)
+                ), true),
+                ("probe invalidKey", RecordingAppAttestService(
+                    holdsFirstAssertion: true,
+                    attestationResult: .failure(invalidKeyError),
+                    assertionResult: .failure(invalidKeyError)
+                ), true)
+            ]
+            let replacementKeyId = "replacement-app-attest-key"
+            for (label, service, heldProbe) in cases {
+                let defaults = InMemoryUserDefaults()
+                defaults.set(storedKeyId, forKey: keyIdDefaultsKey)
+                defaults.set(storedKeyId, forKey: attestedKeyIdDefaultsKey)
+                defaults.set(replacementKeyId, forKey: replacementKeyIdDefaultsKey)
+                let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .milliseconds(300))
+
+                #expect(await code(of: { () async throws(ScpError) -> Data in
+                    try await adapter.attest(challenge: challenge, deviceId: deviceId)
+                }) == "SCP-ATTEST-9027", "\(label)")
+                #expect(service.attestations.map(\.keyId) == [replacementKeyId], "\(label)")
+
+                // The held completion handler runs on this thread, so every
+                // write it makes has happened when this call returns.
+                if heldProbe {
+                    #expect(service.isHoldingAssertion, "\(label)")
+                    service.releaseHeldAssertion()
+                } else {
+                    #expect(service.isHoldingAttestation, "\(label)")
+                    service.releaseHeldAttestation()
+                }
+                #expect(defaults.string(forKey: keyIdDefaultsKey) == storedKeyId, "\(label)")
+                #expect(defaults.string(forKey: attestedKeyIdDefaultsKey) == storedKeyId, "\(label)")
+                #expect(defaults.string(forKey: replacementKeyIdDefaultsKey) == replacementKeyId, "\(label)")
+                #expect(service.generatedKeyCount == 0, "\(label)")
+            }
+        }
+
         @Test("an attestKey invalidKey answer that arrives after the time limit starts no key probe")
         func lateInvalidKeyStartsNoProbe() async {
             let service = RecordingAppAttestService(
@@ -1974,8 +2020,8 @@
     /// record lands while the `attest` waits in the queue, and a failed
     /// replacement attestation leaves the attested key in place.
     ///
-    /// A key generated to replace an attested key is stored apart from it
-    /// until Apple attests it, so `assertRequest` keeps naming the key an
+    /// A key generated to replace an attested key is stored apart from it,
+    /// so `assertRequest` keeps naming the key an
     /// earlier published attestation names whatever the replacement's
     /// `attestKey` answers.
     struct AppAttestKeyReplacementTests {
@@ -2183,6 +2229,32 @@
             let attestation = try? await harness.adapter.attest(challenge: Data(repeating: 0x02, count: 32), deviceId: deviceId)
             #expect(attestation == nextAttestation)
             #expect(service.attestedKeyIds == [replacementKeyId, scriptedKeyId])
+            #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == scriptedKeyId)
+        }
+
+        @Test("rejecting the attested key discards a pending replacement with it, and the next attest generates a key")
+        func rejectedStoredKeyDiscardsReplacement() async {
+            // A replacement whose attestKey call failed is pending when
+            // Apple's service rejects the attested key it was meant to
+            // replace. No attestation names the replacement, so it does not
+            // become the stored key.
+            let replacementKeyId = "replacement-app-attest-key"
+            let service = ScriptedAppAttestService(supported: true, assertion: .invalidKey)
+            let harness = makeAdapter(service, storedKeyId: storedKeyId, attested: true)
+            harness.defaults.set(replacementKeyId, forKey: replacementKeyIdDefaultsKey)
+
+            await expectCode("SCP-ATTEST-9023", from: "assertRequest") { () async throws(ScpError) -> Data in
+                try await harness.adapter.assertRequest(requestHash: requestHash)
+            }
+            #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == nil)
+            #expect(harness.defaults.string(forKey: attestedKeyIdDefaultsKey) == nil)
+            #expect(harness.defaults.string(forKey: replacementKeyIdDefaultsKey) == nil)
+
+            #expect(await code(of: { () async throws(ScpError) -> Data in
+                try await harness.adapter.attest(challenge: challenge, deviceId: deviceId)
+            }) == "returned bytes")
+            #expect(service.keyGenerationCount == 1)
+            #expect(service.attestedKeyIds == [scriptedKeyId])
             #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == scriptedKeyId)
         }
     }

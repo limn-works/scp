@@ -82,8 +82,8 @@
         /// that carries an attestation record, or `attestKey` answered
         /// `DCError.invalidKey` for a key with no record and the key probe's
         /// assertion with that key answered `DCError.invalidKey` too. For the
-        /// stored key, the adapter discards the key ID and its record. For a
-        /// replacement key, it discards the replacement key ID only, and the
+        /// stored key, the adapter discards the key ID, its record and any
+        /// replacement key ID. For a replacement key, it discards the replacement key ID only, and the
         /// stored key and its record stay.
         ///
         /// `DCError.h` lists an App Attest service rejecting the key as one
@@ -99,8 +99,7 @@
         /// same value for the `clientDataHash` parameter", because "retrying
         /// with the same inputs helps to preserve the risk metric for a given
         /// device". `DCError.h` documents this code for `attestKey` only. The
-        /// adapter keeps the key after either call, because it discards a key
-        /// only when Apple's service rejects it.
+        /// adapter keeps the key after either call.
         case serverUnavailable(String)
         /// An internal invariant was violated.
         case internalError(String)
@@ -174,9 +173,10 @@
         static let attestedAppAttestKeyId = "dev.limn.scp.appAttest.attestedKeyId"
 
         /// `UserDefaults` key under which a key generated to replace an
-        /// attested key is persisted until Apple attests it.
+        /// attested key is persisted.
         ///
-        /// `appAttestKeyId` keeps naming the attested key until then, so an
+        /// `appAttestKeyId` keeps naming the attested key while a replacement
+        /// is stored, so an
         /// `attestKey` failure on the replacement leaves `assertRequest` with
         /// the key an earlier published attestation names. A replacement
         /// becomes the stored key only when an `attestKey` call returns its
@@ -195,8 +195,7 @@
     ///
     /// Uses `DCAppAttestService` to generate a Secure Enclave-backed P-256 key
     /// and obtain an Apple-signed attestation certificate. The key ID is
-    /// persisted in `UserDefaults`: assertions use the stored key, and an
-    /// attestation reuses it only while Apple has not attested it. When
+    /// persisted in `UserDefaults`, and assertions use the stored key. When
     /// `attestKey` returns an attestation object, the adapter records that
     /// key ID as attested, beside the key ID. Apple attests one key once, so
     /// an `attest` that reads a stored key carrying that record generates a
@@ -906,7 +905,7 @@
             return defaults.string(forKey: StorageKey.appAttestKeyId)
         }
 
-        /// Load a replacement App Attest key ID Apple has not attested yet.
+        /// Load the stored replacement App Attest key ID.
         ///
         /// Thread-safe: protected by `lock`.
         ///
@@ -999,15 +998,16 @@
             return defaults.string(forKey: StorageKey.attestedAppAttestKeyId) == keyId
         }
 
-        /// Remove a replacement App Attest key ID, or the stored key ID and
-        /// its attestation record, unless another key ID replaced it.
+        /// Remove `keyId` when it is the replacement key ID, leaving the
+        /// stored key and its record in place. When `keyId` is the stored key
+        /// ID, remove it, its attestation record and any replacement key ID,
+        /// so no replacement outlives the key it was generated to replace.
+        /// Remove nothing for any other key ID, which keeps a key ID stored
+        /// after `keyId` in place.
         ///
         /// Thread-safe: protected by `lock`.
         ///
         /// - Parameter keyId: A key ID Apple's App Attest service rejected.
-        ///   Removing only this value keeps a key ID stored after it in place,
-        ///   and removing a rejected replacement leaves the attested key it
-        ///   was meant to replace in place.
         private func forgetKeyId(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
@@ -1018,6 +1018,7 @@
             guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
             defaults.removeObject(forKey: StorageKey.appAttestKeyId)
             defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
+            defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
         }
     }
 
