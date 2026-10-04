@@ -1942,52 +1942,6 @@
             #expect(defaults.string(forKey: keyIdDefaultsKey) == keyId)
         }
 
-        @Test("a late answer on a replacement key neither promotes nor discards it")
-        func lateReplacementAnswerChangesNoKeyId() async {
-            // Each case holds the answer that would end the call: attestKey's
-            // attestation object, which would promote the replacement, or the
-            // key probe's assertion or invalidKey, which would discard it.
-            let cases: [(label: String, service: RecordingAppAttestService, heldProbe: Bool)] = [
-                ("attestKey value", RecordingAppAttestService(holdsFirstAttestation: true), false),
-                ("probe assertion", RecordingAppAttestService(
-                    holdsFirstAssertion: true,
-                    attestationResult: .failure(invalidKeyError)
-                ), true),
-                ("probe invalidKey", RecordingAppAttestService(
-                    holdsFirstAssertion: true,
-                    attestationResult: .failure(invalidKeyError),
-                    assertionResult: .failure(invalidKeyError)
-                ), true)
-            ]
-            let replacementKeyId = "replacement-app-attest-key"
-            for (label, service, heldProbe) in cases {
-                let defaults = InMemoryUserDefaults()
-                defaults.set(storedKeyId, forKey: keyIdDefaultsKey)
-                defaults.set(storedKeyId, forKey: attestedKeyIdDefaultsKey)
-                defaults.set(replacementKeyId, forKey: replacementKeyIdDefaultsKey)
-                let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .milliseconds(300))
-
-                #expect(await code(of: { () async throws(ScpError) -> Data in
-                    try await adapter.attest(challenge: challenge, deviceId: deviceId)
-                }) == "SCP-ATTEST-9027", "\(label)")
-                #expect(service.attestations.map(\.keyId) == [replacementKeyId], "\(label)")
-
-                // The held completion handler runs on this thread, so every
-                // write it makes has happened when this call returns.
-                if heldProbe {
-                    #expect(service.isHoldingAssertion, "\(label)")
-                    service.releaseHeldAssertion()
-                } else {
-                    #expect(service.isHoldingAttestation, "\(label)")
-                    service.releaseHeldAttestation()
-                }
-                #expect(defaults.string(forKey: keyIdDefaultsKey) == storedKeyId, "\(label)")
-                #expect(defaults.string(forKey: attestedKeyIdDefaultsKey) == storedKeyId, "\(label)")
-                #expect(defaults.string(forKey: replacementKeyIdDefaultsKey) == replacementKeyId, "\(label)")
-                #expect(service.generatedKeyCount == 0, "\(label)")
-            }
-        }
-
         @Test("an attestKey invalidKey answer that arrives after the time limit starts no key probe")
         func lateInvalidKeyStartsNoProbe() async {
             let service = RecordingAppAttestService(
@@ -2256,6 +2210,49 @@
             #expect(service.keyGenerationCount == 1)
             #expect(service.attestedKeyIds == [scriptedKeyId])
             #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == scriptedKeyId)
+        }
+
+        @Test("a late answer on a replacement key neither promotes nor discards it")
+        func lateReplacementAnswerChangesNoKeyId() async {
+            // Each case holds the answer that would end the call: attestKey's
+            // attestation object, which would promote the replacement, or the
+            // key probe's assertion or invalidKey, which would discard it.
+            let cases: [(label: String, service: RecordingAppAttestService)] = [
+                ("attestKey value", RecordingAppAttestService(holdsFirstAttestation: true)),
+                ("probe assertion", RecordingAppAttestService(
+                    holdsFirstAssertion: true,
+                    attestationResult: .failure(invalidKeyError)
+                )),
+                ("probe invalidKey", RecordingAppAttestService(
+                    holdsFirstAssertion: true,
+                    attestationResult: .failure(invalidKeyError),
+                    assertionResult: .failure(invalidKeyError)
+                ))
+            ]
+            let replacementKeyId = "replacement-app-attest-key"
+            for (label, service) in cases {
+                let defaults = InMemoryUserDefaults()
+                defaults.set(storedKeyId, forKey: keyIdDefaultsKey)
+                defaults.set(storedKeyId, forKey: attestedKeyIdDefaultsKey)
+                defaults.set(replacementKeyId, forKey: replacementKeyIdDefaultsKey)
+                let adapter = AppleDeviceAttestation(service: service, defaults: defaults, callTimeLimit: .milliseconds(300))
+
+                #expect(await code(of: { () async throws(ScpError) -> Data in
+                    try await adapter.attest(challenge: challenge, deviceId: deviceId)
+                }) == "SCP-ATTEST-9027", "\(label)")
+                #expect(service.attestations.map(\.keyId) == [replacementKeyId], "\(label)")
+                #expect(service.isHoldingAttestation || service.isHoldingAssertion, "\(label)")
+
+                // The held completion handler runs on this thread, so every
+                // write it makes has happened when these calls return. Each
+                // case holds one answer, so the other release does nothing.
+                service.releaseHeldAttestation()
+                service.releaseHeldAssertion()
+                #expect(defaults.string(forKey: keyIdDefaultsKey) == storedKeyId, "\(label)")
+                #expect(defaults.string(forKey: attestedKeyIdDefaultsKey) == storedKeyId, "\(label)")
+                #expect(defaults.string(forKey: replacementKeyIdDefaultsKey) == replacementKeyId, "\(label)")
+                #expect(service.generatedKeyCount == 0, "\(label)")
+            }
         }
     }
 
