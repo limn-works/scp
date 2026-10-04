@@ -1534,8 +1534,8 @@ pub(crate) async fn outlet_interface_accept_on(
 /// Per-bridge-instance implementation of [`Scp::outlet_interface_revoke`](crate::scp::Scp::outlet_interface_revoke).
 ///
 /// Carries no lifecycle gate: this one reads no context state and grants
-/// nothing. It builds an `InterfaceRevoked` event from the interface id and the
-/// clock and hands it back for the caller to distribute.
+/// nothing. It builds an `InterfaceRevoked` event and hands it back for the
+/// caller to distribute.
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_interface_revoke_on(
     bi: &crate::runtime::NapiBridgeInstance,

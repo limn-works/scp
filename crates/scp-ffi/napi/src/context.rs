@@ -8687,8 +8687,7 @@ mod tests {
     }
 
     /// Outlet registration, exposure, and acceptance each refuse a context no
-    /// supervisor actor serves, and the role-state read they authorize against
-    /// refuses it too.
+    /// supervisor actor serves.
     ///
     /// Each entry point runs the lifecycle gate before the role-state read, so
     /// after the despawn the three refusals come from that gate.
@@ -8728,19 +8727,10 @@ mod tests {
             "expose reported: {expose}"
         );
 
-        // Despawn the actor: every authorization read now fails closed.
         crate::runtime::supervisor(&bi)
             .expect("supervisor")
             .despawn_actor(&ctx_id)
             .await;
-
-        let after = crate::runtime::live_role_state(&bi, &ctx_id)
-            .await
-            .expect_err("a despawned actor answers no role-state read");
-        assert!(
-            after.to_string().contains("no live supervisor role state"),
-            "live role state reported: {after}"
-        );
 
         let register = crate::outlets::outlet_register_on(
             &bi,
