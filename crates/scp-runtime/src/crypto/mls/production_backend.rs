@@ -871,6 +871,29 @@ mod tests {
         assert_eq!(*parsed.mls_storage_entries, plain.mls_storage_entries);
     }
 
+    /// `RustCrypto::signature_key_gen` draws from the provider's long-lived
+    /// `ChaCha20Rng`, which `scp_mls::provider::OsRand` does not replace.
+    ///
+    /// The `expect` is the control for the `signature_key_gen` entry in this
+    /// crate's `clippy.toml`: it is unfulfilled, and the CI clippy run
+    /// (`-D warnings`) fails, when that entry stops disallowing the call.
+    #[test]
+    fn signature_key_gen_is_disallowed() {
+        use openmls_traits::crypto::OpenMlsCrypto;
+
+        let provider = InMemoryMlsProvider::default();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint: generates a signer from the long-lived seed on purpose"
+        )]
+        let (private, public) = provider
+            .crypto()
+            .signature_key_gen(SCP_CIPHERSUITE.signature_algorithm())
+            .unwrap();
+        assert_eq!(public.len(), 32);
+        assert!(!private.is_empty());
+    }
+
     /// A `ProductionMlsBackend` with the durable consumed-init-key store
     /// attached over a fresh in-memory `Storage`, so `join_from_welcome` is
     /// JOINABLE (it fails closed without a store). Use for any test that drives

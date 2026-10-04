@@ -28,9 +28,14 @@
 //!   unwiped; and it decodes every read through `serde_json`. SCP's own
 //!   encoders do not reach inside this store;
 //! - the `ChaCha20Rng` inside the wrapped `RustCrypto`. It stays in memory for
-//!   the provider's life, but nothing SCP reaches draws from it: among
-//!   `RustCrypto`'s methods only `signature_key_gen` does, and SCP creates
-//!   signers through `SignatureKeyPair::new`, which draws from `OsRng`;
+//!   the provider's life, and two kinds of draw reach its seed.
+//!   `OpenMlsCrypto::signature_key_gen` is one: the `disallowed-methods` ban
+//!   in `.clippy.toml` and `crates/scp-runtime/clippy.toml` forbids it, and
+//!   SCP creates signers through `SignatureKeyPair::new`, which draws from
+//!   `OsRng`. `OpenMlsRand::random_array` and `random_vec` are the other:
+//!   `RustCrypto` implements `OpenMlsRand` too, so `crypto()` exposes them.
+//!   No SCP code calls them through `crypto()` today, but nothing enforces
+//!   that yet;
 //! - HPKE encapsulation randomness. openmls draws it through `crypto()`, not
 //!   `rand()`: each `hpke_seal` builds an hpke-rs context whose
 //!   `HpkeRustCryptoPrng` seeds a `ChaCha20Rng` from the operating system for
@@ -171,5 +176,29 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, [0u8; 32]);
         assert_ne!(v, vec![0u8; 48]);
+    }
+
+    /// `RustCrypto::signature_key_gen` draws from the provider's long-lived
+    /// `ChaCha20Rng`, which `OsRand` does not replace.
+    ///
+    /// The `expect` is the control for the `signature_key_gen` entry in the
+    /// workspace `.clippy.toml`: it is unfulfilled, and the CI clippy run
+    /// (`-D warnings`) fails, when that entry stops disallowing the call.
+    #[test]
+    fn signature_key_gen_is_disallowed() {
+        use openmls_traits::crypto::OpenMlsCrypto;
+        use openmls_traits::types::SignatureScheme;
+
+        let provider = InMemoryMlsProvider::default();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint: generates a signer from the long-lived seed on purpose"
+        )]
+        let (private, public) = provider
+            .crypto()
+            .signature_key_gen(SignatureScheme::ED25519)
+            .unwrap();
+        assert_eq!(public.len(), 32);
+        assert!(!private.is_empty());
     }
 }
