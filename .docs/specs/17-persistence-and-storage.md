@@ -536,16 +536,16 @@ Only the first-initialization case — no `scp.db` and no `scp.salt` — generat
 // and PBKDF2-stretch them — a redundant second KDF over already-derived key
 // material. Raw-key syntax avoids that double-KDF.
 conn.execute_batch("
+    PRAGMA cipher_memory_security = ON;
     PRAGMA key = \"x'<derived_key>'\";
     PRAGMA cipher_page_size = 4096;
     PRAGMA kdf_iter = 256000;
     PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
     PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
-    PRAGMA cipher_memory_security = ON;
 ")?;
 ```
 
-Every SQLCipher connection MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. SQLCipher and its embedded SQLite allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. The pragma wipes only blocks that SQLCipher's allocator frees, and two SQLite pools reuse their slots without freeing them through that allocator. The per-connection lookaside pool keeps a parsed key, statement text, or a bound value in a slot until the connection closes. The page cache's bulk block, allocated once per cache, keeps the decrypted plaintext of a page that a rollback, truncation, or cache shrink dropped. Every SQLCipher connection therefore MUST run with both pools off:
+Every SQLCipher connection MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. The pragma MUST run before the `PRAGMA key` statement, in the same batch or an earlier one: SQLCipher wipes only blocks freed after the pragma takes effect, so a block that held the key's hex text and was freed while the key statement ran stays readable when the key statement comes first. After the batch that holds the key statement, each constructor MUST read `PRAGMA cipher_memory_security` back and MUST fail with its typed storage error unless the query returns the single value `1`. A plain SQLite returns no row for the pragma, so the readback also proves that SQLCipher is the linked engine. SQLCipher and its embedded SQLite allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. The pragma wipes only blocks that SQLCipher's allocator frees, and two SQLite pools reuse their slots without freeing them through that allocator. The per-connection lookaside pool keeps a parsed key, statement text, or a bound value in a slot until the connection closes. The page cache's bulk block, allocated once per cache, keeps the decrypted plaintext of a page that a rollback, truncation, or cache shrink dropped. Every SQLCipher connection therefore MUST run with both pools off:
 
 - **Page-cache bulk block.** SQLite allocates a page-cache bulk block only when it was compiled without `SQLITE_ENABLE_MEMORY_MANAGEMENT`; with that option every page cache shares one page group, and SQLite allocates no bulk block whatever the run-time configuration. Each constructor therefore calls `sqlite3_compileoption_used("ENABLE_MEMORY_MANAGEMENT")` before the connection's first statement, and refuses to open unless it returns 1 for the linked SQLite.
 - **Lookaside.** Each constructor calls `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)` on its connection before the connection's first statement. The call returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` proves the pool is off.
