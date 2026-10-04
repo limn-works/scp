@@ -635,40 +635,6 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
     None
 }
 
-/// Resolves the retained custody on a [`ContextHandle`] into a
-/// [`UniffiKeyCustody`] enum, for `ucan_mint`, which signs with a context
-/// creator's key and writes that creator's DID into `iss`.
-///
-/// `ucan_delegate` does NOT call this helper: a delegation signs with its own
-/// delegator's key, which [`ucan_delegate_impl`] reads from a DID-keyed
-/// identity custody registry instead.
-///
-/// Resolution order mirrors [`resolve_identity_custody`] (and the handle's own
-/// `resolve_uniffi_signing_key` / `sign_export_snapshot_via_custody`): the
-/// `ContextHandle`'s production callback custody (Secure Enclave / Android
-/// Keystore) first, then — only in `testing` builds — the
-/// retained in-memory custody. Returns `None` for an externally-loaded handle
-/// that retains no custody (all custody fields `None`), so the caller fails
-/// closed with [`codes::IDENT_1017`].
-///
-/// The returned `Arc<UniffiKeyCustody>` SHARES the custody instance the
-/// `ContextHandle` already holds (no second key store), keeping the handle's
-/// signing key and the resolved custody consistent. [`UniffiKeyCustody`]
-/// implements [`KeyCustody`], so the result is directly usable as
-/// `&impl KeyCustody` by `mint_ucan` / `delegate_ucan`.
-fn resolve_context_custody(handle: &ContextHandle) -> Option<Arc<UniffiKeyCustody>> {
-    if let Some(ref cc) = handle.callback_custody {
-        return Some(Arc::new(UniffiKeyCustody::Callback(Arc::clone(cc))));
-    }
-    #[cfg(feature = "testing")]
-    {
-        if let Some(ref imc) = handle.in_memory_custody {
-            return Some(Arc::new(UniffiKeyCustody::InMemory(Arc::clone(imc))));
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // CallbackKeyCustody — concrete adapter wrapping KeyCustodyProvider callback
 //
@@ -5564,6 +5530,7 @@ fn mcp_allowlist_lock_poisoned() -> ScpError {
 
 /// Inner implementation of [`Scp::ucan_mint`](crate::scp::Scp::ucan_mint).
 async fn ucan_mint_impl(
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
     handle: Arc<ContextHandle>,
     member_did: String,
     capabilities: Vec<String>,
@@ -5571,25 +5538,51 @@ async fn ucan_mint_impl(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            // Resolve the retained key custody (callback first, then in-memory
-            // in testing builds) and the signing key from the
-            // context handle. Externally-loaded handles retain no custody and
-            // fail closed with SCP-IDENT-1017.
-            let custody = resolve_context_custody(&handle).ok_or_else(|| ScpError::Identity {
-                msg: "UCAN minting requires retained signing custody — the context \
-                          creator identity has no retained custody (it was externally loaded)"
-                    .to_owned(),
-                code: codes::IDENT_1017.to_owned(),
-            })?;
-            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Identity {
-                msg: "UCAN minting requires retained signing custody — the context creator \
-                          identity has no active signing key"
-                    .to_owned(),
-                code: codes::IDENT_1017.to_owned(),
-            })?;
+            // The supervisor must report `Active` before this bridge issues a
+            // token for the context, because a context the supervisor stopped
+            // serving grants no new authority. The issuer is the context
+            // creator, and the ceiling bounds what a mint may grant. The gate
+            // returns both from the supervisor actor, so a `ModifyCeiling`
+            // governance action binds the very next mint, and a context no
+            // actor serves refuses. A ceiling this bridge recorded at
+            // registration would grant what the supervisor already withdrew.
+            let role_state = bi
+                .require_active_context_before_authz(
+                    &handle.context_id,
+                    "mint a UCAN in context",
+                    |msg| ScpError::Context {
+                        msg,
+                        code: codes::CTX_2023.to_owned(),
+                    },
+                )
+                .await?;
+            let creator_did = role_state.creator_did.clone();
+            let ceiling = Some(role_state.ceiling().to_ucan_string_set());
+
+            // Resolve the custody and the active signing key from THIS
+            // instance's identity registry under the live creator DID, never
+            // off the handle. The handle carries the custody of whoever built
+            // it, so signing with that custody while issuing as the live
+            // creator would mint a token whose `iss` names one principal and
+            // whose signature belongs to another. A `DashMap` reference guard
+            // is not `Send`, so this clones both values out before the next
+            // await.
+            let (custody, signing_key) = {
+                let entry = identity_custody_registry(&bi)
+                    .get(&creator_did)
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: format!(
+                            "UCAN minting requires retained signing custody — this bridge \
+                             instance hosts no identity for context creator '{creator_did}'"
+                        ),
+                        code: codes::IDENT_1017.to_owned(),
+                    })?;
+                let (custody, key) = entry.value();
+                (Arc::clone(custody), *key)
+            };
 
             let params = scp_core::crypto::ucan::mint::MintParams {
-                issuer_did: &handle.creator_did,
+                issuer_did: &creator_did,
                 issuer_key: &signing_key,
                 audience_did: &member_did,
                 context_id: &handle.context_id,
@@ -5600,13 +5593,11 @@ async fn ucan_mint_impl(
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
-                // Empty ceiling means the user passed `[]` — apply the default
-                // ceiling instead of `None` (which would mean unlimited). #1419.
-                ceiling: Some(if handle.ceiling_strings.is_empty() {
-                    scp_core::context::roles::default_ceiling().to_ucan_string_set()
-                } else {
-                    handle.ceiling_strings.iter().cloned().collect()
-                }),
+                // The supervisor's ceiling stands as the context declared it.
+                // `context_create` refuses an empty ceiling with
+                // `SCP-VALID-7005`, so no `default_ceiling()` fallback widens
+                // it here.
+                ceiling,
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(
@@ -5683,12 +5674,34 @@ async fn ucan_delegate_impl(
         let (custody, key) = entry.value();
         (Arc::clone(custody), *key)
     };
+    let bi = Arc::clone(bi);
 
     runtime()
         .spawn(async move {
             use scp_core::crypto::ucan::Attenuation;
             use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
             use scp_core::crypto::ucan::validate::parse_ucan;
+
+            // The supervisor must report `Active` before this bridge issues a
+            // token for the context, because a context the supervisor stopped
+            // serving grants no new authority. The ceiling bounds what a
+            // delegation may pass on. The gate returns it from the supervisor
+            // actor, so a `ModifyCeiling` governance action binds the very
+            // next delegation. `context_create` refuses an empty ceiling with
+            // `SCP-VALID-7005`, so no `default_ceiling()` fallback widens it.
+            let ceiling = Some(
+                bi.require_active_context_before_authz(
+                    &handle.context_id,
+                    "delegate a UCAN in context",
+                    |msg| ScpError::Context {
+                        msg,
+                        code: codes::CTX_2023.to_owned(),
+                    },
+                )
+                .await?
+                .ceiling()
+                .to_ucan_string_set(),
+            );
 
             // Parse the parent token.
             let parsed_parent = parse_ucan(&parent_token).map_err(|e| ScpError::Permission {
@@ -5719,15 +5732,6 @@ async fn ucan_delegate_impl(
                     }
                 })
                 .collect();
-
-            // Get ceiling from handle for delegation-time enforcement (#339).
-            // Empty ceiling means the user passed `[]` — apply the default
-            // ceiling instead of `None` (which would mean unlimited). #1419.
-            let ceiling = Some(if handle.ceiling_strings.is_empty() {
-                scp_core::context::roles::default_ceiling().to_ucan_string_set()
-            } else {
-                handle.ceiling_strings.iter().cloned().collect()
-            });
 
             let params = DelegateParams {
                 parent_token: &parsed_parent,
@@ -15607,6 +15611,26 @@ impl Scp {
                 }
                 let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
+                // The supervisor must report `Active` before this bridge touches
+                // the context's revocation list or nonce tracker, and the refusal
+                // withholds every answer about the context from a caller this call
+                // has not yet authorized.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "validate a UCAN in context",
+                        |msg| ScpError::Context {
+                            msg,
+                            code: codes::CTX_2023.to_owned(),
+                        },
+                    )
+                    .await?;
+                // ADR-016 step 8 compares the token's grants against the context's
+                // capability ceiling, and step 4 anchors the chain on the context
+                // creator. Both come from the supervisor actor, so a `ModifyCeiling`
+                // governance action binds the very next call.
+                let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
                 // Ensure UCAN state is registered for this context on this instance.
                 bi.ensure_ucan_registered(
                     &handle.context_id,
@@ -15633,8 +15657,8 @@ impl Scp {
                             nonce_tracker: &mut nonce_adapter,
                             revocation_checker: &revocation_checker,
                             proof_resolver: &proof_resolver,
-                            ceiling: &ucan_state.ceiling_strings,
-                            context_creator_did: &ucan_state.creator_did,
+                            ceiling: &ceiling_strings,
+                            context_creator_did: &role_state.creator_did,
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
@@ -15768,6 +15792,26 @@ impl Scp {
                 }
                 let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
+                // The supervisor must report `Active` before this bridge touches
+                // the context's revocation list or nonce tracker, and the refusal
+                // withholds every answer about the context from a caller this call
+                // has not yet authorized.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "evaluate a UCAN in context",
+                        |msg| ScpError::Context {
+                            msg,
+                            code: codes::CTX_2023.to_owned(),
+                        },
+                    )
+                    .await?;
+                // ADR-016 step 8 compares the token's grants against the context's
+                // capability ceiling, and step 4 anchors the chain on the context
+                // creator. Both come from the supervisor actor, so a `ModifyCeiling`
+                // governance action binds the very next call.
+                let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
                 // Ensure UCAN state is registered for this context on this instance.
                 bi.ensure_ucan_registered(
                     &handle.context_id,
@@ -15796,8 +15840,8 @@ impl Scp {
                             nonce_tracker: &mut nonce_adapter,
                             revocation_checker: &revocation_checker,
                             proof_resolver: &proof_resolver,
-                            ceiling: &ucan_state.ceiling_strings,
-                            context_creator_did: &ucan_state.creator_did,
+                            ceiling: &ceiling_strings,
+                            context_creator_did: &role_state.creator_did,
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
@@ -15848,7 +15892,14 @@ impl Scp {
                 })?;
             }
         }
-        ucan_mint_impl(handle, member_did, capabilities, proofs).await
+        ucan_mint_impl(
+            Arc::clone(&self.inner),
+            handle,
+            member_did,
+            capabilities,
+            proofs,
+        )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `ucan_revoke`.
@@ -15887,6 +15938,25 @@ impl Scp {
                 // Parse the token to extract the issuer DID for authorization.
                 let parsed = parse_ucan(&token).map_err(ScpError::from)?;
 
+                // The supervisor must report `Active` before this bridge touches
+                // the context's revocation list or nonce tracker, and the refusal
+                // withholds every answer about the context from a caller this call
+                // has not yet authorized.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "revoke a UCAN in context",
+                        |msg| ScpError::Context {
+                            msg,
+                            code: codes::CTX_2023.to_owned(),
+                        },
+                    )
+                    .await?;
+                // `revoke_ucan` admits a revoker who is either the token's issuer or
+                // the context creator, and that creator comes from the supervisor
+                // actor.
+                let creator_did = role_state.creator_did;
+
                 // Ensure UCAN state is registered for this context on this instance.
                 bi.ensure_ucan_registered(
                     &handle.context_id,
@@ -15898,7 +15968,7 @@ impl Scp {
                 bi.with_ucan_state(&handle.context_id, |ucan_state| {
                     let authorizer = BridgeRevocationAuthorizer {
                         issuer_did: parsed.payload.iss.clone(),
-                        creator_did: ucan_state.creator_did.clone(),
+                        creator_did: creator_did.clone(),
                     };
                     let distributor = BridgeRevocationDistributor;
                     let event_log_cell = RefCell::new(&mut ucan_state.event_log);
@@ -24978,13 +25048,75 @@ mod tests {
     // builds from compiling.
     // -----------------------------------------------------------------------
 
+    /// The ceiling `callback_context_handle` gives the supervisor actor when a
+    /// test needs no particular one.
+    const CALLBACK_SUPERVISOR_CEILING: &[&str] = &["messages:read", "messages:write"];
+
+    /// Registers `context_id` with `scp`'s supervisor under `creator_did` and
+    /// `ceiling`, so the live reads every UCAN entry point makes answer for it.
+    ///
+    /// Every UCAN entry point reads the context creator and the ceiling off
+    /// the per-context actor, so a synthetic `ContextHandle` alone no longer
+    /// carries a test past one. This helper gives the actor the same two values
+    /// a real `context_create` records.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ceiling` is empty (the supervisor refuses an empty ceiling
+    /// with `CeilingRequired`, so a fixture asking for one is broken), when an
+    /// entry does not parse, or when the creation fails.
+    async fn register_supervisor_context(
+        scp: &Arc<crate::scp::Scp>,
+        context_id: &str,
+        creator_did: &str,
+        ceiling: &[&str],
+    ) {
+        assert!(
+            !ceiling.is_empty(),
+            "a supervisor context needs a non-empty ceiling"
+        );
+        let params = scp_core::context::ContextParams {
+            ceiling: ceiling
+                .iter()
+                .map(|entry| {
+                    scp_core::context::roles::Capability::new(entry)
+                        .unwrap_or_else(|| panic!("test ceiling entry {entry:?} must parse"))
+                })
+                .collect(),
+            ..scp_core::context::ContextParams::default()
+        };
+        // `scp_test()` attaches no supervisor, so a fixture that never calls
+        // `context_create` has no actor to answer the live reads. Attach one
+        // here; the call is a no-op when the instance already carries one.
+        scp.inner
+            .init_context_manager_with_did("did:dht:z6MkUniffiTestBridge");
+        scp.inner
+            .context_manager_or_error()
+            .expect("test supervisor must be attached")
+            .create_context(
+                context_id.to_owned(),
+                params,
+                scp_did::DID(creator_did.to_owned()),
+                None,
+            )
+            .await
+            .expect("test supervisor context creation must succeed");
+    }
+
     /// Builds a `ContextHandle` carrying a real-Ed25519 [`ProdLikeCustody`]
     /// (modelling Secure Enclave / Android Keystore) and a freshly generated
     /// `#active` signing-key handle that lives in that custody's store — exactly
     /// the shape `context_create` produces for a platform-custody identity. The
     /// returned tuple yields the verifying key so signatures can be checked.
+    ///
+    /// The supervisor actor holds `supervisor_ceiling`. The handle's own
+    /// `ceiling_strings` copy holds `default_ceiling()`, which is wider, so a
+    /// UCAN entry point that read the handle copy, or the per-context UCAN
+    /// state registered from it, instead of the actor would grant what the
+    /// actor's ceiling withholds.
     async fn callback_context_handle(
         scp: &Arc<crate::scp::Scp>,
+        supervisor_ceiling: &[&str],
     ) -> (Arc<ContextHandle>, ed25519_dalek::VerifyingKey) {
         let callback_custody = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
         // Generate the `#active` key inside the callback store and capture its
@@ -25004,15 +25136,35 @@ mod tests {
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
             .expect("custody public key is a valid Ed25519 verifying key");
 
+        let context_id = format!("ctx-callback-{}", scp.instance_id());
+        let creator_did = "did:dht:z6MkCallbackCreator";
+
+        // `ucan_mint_impl` reads the context creator and the ceiling off the
+        // supervisor actor, and reads that creator's custody out of this
+        // instance's identity registry, so the fixture registers both. A
+        // `context_create` over callback custody records exactly these two
+        // entries.
+        register_identity_custody(
+            &scp.inner,
+            creator_did,
+            &Arc::new(UniffiKeyCustody::Callback(Arc::clone(&callback_custody))),
+            signing_key,
+        )
+        .expect("registering the context creator's custody must succeed");
+        register_supervisor_context(scp, &context_id, creator_did, supervisor_ceiling).await;
+
         let handle = Arc::new(ContextHandle {
-            context_id: "ctx-callback".to_owned(),
+            context_id,
             state: tokio::sync::Mutex::new(ContextState::Active),
-            creator_did: "did:dht:z6MkCallbackCreator".to_owned(),
+            creator_did: creator_did.to_owned(),
             #[cfg(feature = "testing")]
             in_memory_custody: None,
             callback_custody: Some(callback_custody),
             signing_key: Some(signing_key),
-            ceiling_strings: Vec::new(),
+            ceiling_strings: scp_core::context::roles::default_ceiling()
+                .to_ucan_string_set()
+                .into_iter()
+                .collect(),
             outlet_registry: tokio::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -25027,14 +25179,17 @@ mod tests {
 
     /// `ucan_mint` must work over callback custody (production path): the minted
     /// token's detached Ed25519 signature verifies against the custody's
-    /// `#active` public key. Pins that `ucan_mint_impl` is un-gated and resolves
-    /// custody via `resolve_context_custody` → `UniffiKeyCustody::Callback`.
+    /// `#active` public key. Pins that `ucan_mint_impl`, past its lifecycle
+    /// gate, signs through the `UniffiKeyCustody::Callback` entry this
+    /// instance's identity registry holds for the live context creator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_works_over_callback_custody() {
         let scp = scp_test();
-        let (handle, verifying_key) = callback_context_handle(&scp).await;
+        let (handle, verifying_key) =
+            callback_context_handle(&scp, CALLBACK_SUPERVISOR_CEILING).await;
 
         let token = ucan_mint_impl(
+            Arc::clone(&scp.inner),
             handle,
             "did:dht:z6MkCallbackMember".to_owned(),
             vec!["messages:write".to_owned()],
@@ -25117,13 +25272,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_delegate_works_over_callback_custody() {
         let scp = scp_test();
-        let (handle, _creator_key) = callback_context_handle(&scp).await;
+        let (handle, _creator_key) =
+            callback_context_handle(&scp, CALLBACK_SUPERVISOR_CEILING).await;
         let delegator_did = "did:dht:z6MkCallbackDelegator";
         let delegator_key = register_callback_identity(&scp, delegator_did).await;
 
         // Mint a parent token first (callback custody), then delegate from it —
         // both must route through a callback signing path.
         let parent = ucan_mint_impl(
+            Arc::clone(&scp.inner),
             Arc::clone(&handle),
             delegator_did.to_owned(),
             vec!["messages:write".to_owned()],
@@ -25162,7 +25319,8 @@ mod tests {
         use ed25519_dalek::Verifier;
 
         let scp = scp_test();
-        let (handle, creator_key) = callback_context_handle(&scp).await;
+        let (handle, creator_key) =
+            callback_context_handle(&scp, CALLBACK_SUPERVISOR_CEILING).await;
         let delegator_did = "did:dht:z6MkDistinctDelegator";
         assert_ne!(
             delegator_did, handle.creator_did,
@@ -25173,6 +25331,7 @@ mod tests {
         // A context creator mints a parent token whose audience is that
         // delegator, which is what lets that delegator sub-delegate from it.
         let parent = ucan_mint_impl(
+            Arc::clone(&scp.inner),
             Arc::clone(&handle),
             delegator_did.to_owned(),
             vec!["messages:write".to_owned()],
@@ -25373,12 +25532,23 @@ mod tests {
     // `SCP-IDENT-1001` that PyO3 and napi also return (see
     // `ucan_delegate_unregistered_delegator_returns_ident_1001`).
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_without_retained_custody_returns_ident_1017() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
+        // The actor answers for this context, and this instance's identity
+        // registry holds no entry for its creator, so the mint passes the
+        // lifecycle gate and fails at the custody lookup.
+        register_supervisor_context(
+            &scp,
+            &handle.context_id,
+            &handle.creator_did,
+            CALLBACK_SUPERVISOR_CEILING,
+        )
+        .await;
 
         let result = ucan_mint_impl(
+            Arc::clone(&scp.inner),
             handle,
             "did:dht:z6MkMember".to_owned(),
             vec!["messages:write".to_owned()],
@@ -25395,6 +25565,626 @@ mod tests {
         );
     }
 
+    /// `live_role_state` reports a context whose actor does not answer as
+    /// `ActorBusy` (`SCP-CTX-2130`), not as a context with no role state
+    /// (`SCP-CTX-2023`), so a caller retries a saturated context instead of
+    /// treating it as gone.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn live_role_state_reports_an_unreachable_actor_as_busy_not_absent() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        rt.block_on(scp.inner.live_role_state(&context_id))
+            .expect("the actor answers before the fault");
+        scp.inner
+            .context_manager_or_error()
+            .expect("the supervisor is initialized")
+            .test_make_actor_unreachable(&context_id);
+
+        let err = format!(
+            "{:?}",
+            rt.block_on(scp.inner.live_role_state(&context_id))
+                .expect_err("an unreachable actor must refuse")
+        );
+        assert!(
+            err.contains("SCP-CTX-2130") && !err.contains("no live supervisor role state"),
+            "an unreachable actor must read as busy, not absent: {err}"
+        );
+    }
+
+    /// The pre-authorization gate refuses every context the supervisor does not
+    /// report `Active` with one refusal: the withheld text and the caller's
+    /// code. It names neither the context id nor the fault.
+    ///
+    /// The supervisor reports a context it never created as absent, a poisoned
+    /// one as `Poisoned` (`SCP-CTX-2134`), one mid-respawn or past a failed
+    /// respawn as `ActorCrashed` (`SCP-CTX-2135`), and an unreachable mailbox
+    /// as `ActorBusy` (`SCP-CTX-2130`). A gate that passed any of those through
+    /// would tell a caller it has not yet authorized that the context exists
+    /// and what state it is in, which the outlet PRD's SCP-OUT-031 PR-2a note
+    /// forbids. The gate admits an `Active` context and returns the role state
+    /// the actor holds, so the refusals come from the faults and not from a gate
+    /// that refuses everything.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn pre_authz_gate_withholds_every_answer_about_the_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let caller_err = |msg: String| ScpError::Context {
+            msg,
+            code: codes::CTX_2023.to_owned(),
+        };
+        // `context_create` attaches the supervisor every fault below reads.
+        let live = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+
+        for fault in [
+            "absent",
+            "poisoned",
+            "mid_respawn",
+            "respawn_failed",
+            "unreachable",
+        ] {
+            let context_id = if fault == "absent" {
+                // The supervisor `live` attached never created this id.
+                scp_ffi_common::generate_context_id()
+            } else {
+                let handle = rt
+                    .block_on(
+                        scp.context_create(Arc::clone(&identity), encrypted_join_test_params()),
+                    )
+                    .expect("context_create should succeed");
+                handle.context_id()
+            };
+            let sup = scp
+                .inner
+                .context_manager_or_error()
+                .expect("supervisor")
+                .clone();
+            match fault {
+                "absent" => {}
+                "poisoned" => rt.block_on(sup.test_poison_context(&context_id)),
+                "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&context_id)),
+                "respawn_failed" => rt.block_on(sup.test_fail_context_respawn(&context_id)),
+                _ => sup.test_make_actor_unreachable(&context_id),
+            }
+
+            let err = rt
+                .block_on(scp.inner.require_active_context_before_authz(
+                    &context_id,
+                    "validate a UCAN in context",
+                    caller_err,
+                ))
+                .expect_err("the gate must refuse a context that does not read Active");
+            let ScpError::Context { msg, code } = &err else {
+                panic!("the refusal must be the caller's error variant ({fault}): {err:?}");
+            };
+            assert_eq!(
+                code,
+                codes::CTX_2023,
+                "the refusal must carry the caller's code ({fault})"
+            );
+            assert_eq!(
+                msg,
+                &format!(
+                    "cannot validate a UCAN in context: {}",
+                    scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                ),
+                "the refusal must be the withheld text alone ({fault})"
+            );
+            let debug = format!("{err:?}");
+            assert!(
+                !debug.contains(codes::CTX_2135)
+                    && !debug.contains(codes::CTX_2134)
+                    && !debug.contains(codes::CTX_2130)
+                    && !debug.contains(&context_id),
+                "the refusal must not disclose the fault or echo the id ({fault}): {debug}"
+            );
+        }
+
+        let admitted = rt
+            .block_on(scp.inner.require_active_context_before_authz(
+                &live.context_id(),
+                "validate a UCAN in context",
+                caller_err,
+            ))
+            .expect("the gate must admit an Active context");
+        assert_eq!(
+            admitted.creator_did,
+            identity.did(),
+            "the gate must return the supervisor's creator"
+        );
+        assert_eq!(
+            admitted.ceiling().to_ucan_string_set(),
+            std::collections::HashSet::from(["messages:read".to_owned()]),
+            "the gate must return the supervisor's ceiling"
+        );
+    }
+
+    /// An error from resolving the bridge's supervisor returns from the
+    /// pre-authorization gate as itself; the gate withholds only answers about
+    /// the context.
+    ///
+    /// A bridge with no supervisor attached answers `SCP-CTX-2000` "not yet
+    /// attached", and a suspended bridge answers `SCP-CTX-2000` "bridge is
+    /// suspended". Neither says anything about the context, and a caller acts
+    /// on each one differently (initialize, or resume), so folding either into
+    /// the withheld refusal would leave the caller unable to tell its own
+    /// bridge state from a context it may not see. After `resume` the gate
+    /// admits the same context, so the suspended refusal was the bridge state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_authz_gate_returns_bridge_errors_unchanged() {
+        let caller_err = |msg: String| ScpError::Context {
+            msg,
+            code: codes::CTX_2023.to_owned(),
+        };
+        let scp = scp_test();
+        let context_id = format!("ctx-bridge-errors-{}", scp.instance_id());
+        let creator = "did:dht:z6MkBridgeErrorsCreator";
+
+        let unattached = scp
+            .inner
+            .require_active_context_before_authz(
+                &context_id,
+                "validate a UCAN in context",
+                caller_err,
+            )
+            .await
+            .expect_err("a bridge with no supervisor must refuse");
+        assert!(
+            matches!(&unattached, ScpError::Context { msg, code }
+                if code == codes::CTX_2000
+                    && msg.contains("not yet attached")
+                    && !msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)),
+            "a bridge with no supervisor must return its own SCP-CTX-2000: {unattached:?}"
+        );
+
+        register_supervisor_context(&scp, &context_id, creator, CALLBACK_SUPERVISOR_CEILING).await;
+        scp.inner.core.suspend().expect("suspend");
+        let suspended = scp
+            .inner
+            .require_active_context_before_authz(
+                &context_id,
+                "validate a UCAN in context",
+                caller_err,
+            )
+            .await
+            .expect_err("a suspended bridge must refuse");
+        assert!(
+            matches!(&suspended, ScpError::Context { msg, code }
+                if code == codes::CTX_2000
+                    && msg.contains("bridge is suspended")
+                    && !msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)),
+            "a suspended bridge must return its own SCP-CTX-2000: {suspended:?}"
+        );
+
+        scp.inner.core.resume().await.expect("resume");
+        let admitted = scp
+            .inner
+            .require_active_context_before_authz(
+                &context_id,
+                "validate a UCAN in context",
+                caller_err,
+            )
+            .await
+            .expect("the resumed bridge must admit the Active context");
+        assert_eq!(admitted.creator_did, creator);
+    }
+
+    /// A mint grants no more than the ceiling the supervisor actor holds.
+    ///
+    /// The fixture gives the actor `messages:read` and nothing else, while the
+    /// handle's `ceiling_strings` copy holds `default_ceiling()`, which carries
+    /// `messages:write`. A mint of `messages:write` must fail against the
+    /// actor's ceiling; a mint that read the handle copy would succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
+        let scp = scp_test();
+        let (handle, _creator_key) = callback_context_handle(&scp, &["messages:read"]).await;
+        assert!(
+            handle.ceiling_strings.iter().any(|c| c == "messages:write"),
+            "precondition: the handle copy carries messages:write"
+        );
+        let actor_ceiling = scp
+            .inner
+            .live_role_state(&handle.context_id)
+            .await
+            .expect("the fixture registers a supervisor actor for the context")
+            .ceiling()
+            .to_ucan_string_set();
+        assert_eq!(
+            actor_ceiling,
+            std::collections::HashSet::from(["messages:read".to_owned()]),
+            "precondition: the actor's ceiling holds messages:read alone"
+        );
+
+        let err = ucan_mint_impl(
+            Arc::clone(&scp.inner),
+            Arc::clone(&handle),
+            "did:dht:z6MkCeilingMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect_err("a mint outside the supervisor's ceiling must fail");
+        assert!(
+            err.to_string().to_lowercase().contains("ceiling"),
+            "expected a ceiling refusal, got: {err}"
+        );
+
+        // The capability the actor does hold still mints, so the refusal above
+        // is the ceiling check and not a broken fixture.
+        ucan_mint_impl(
+            Arc::clone(&scp.inner),
+            handle,
+            "did:dht:z6MkCeilingMember".to_owned(),
+            vec!["messages:read".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint inside the supervisor's ceiling must succeed");
+    }
+
+    /// `ucan_validate`, `ucan_evaluate`, `ucan_delegate`, and `ucan_mint` follow
+    /// a supervisor ceiling that moves after this bridge registered the
+    /// context.
+    ///
+    /// `context_create` records `messages:write` in three places: the actor,
+    /// the handle's `ceiling_strings`, and (on the first UCAN call) the
+    /// per-context UCAN state. The test then replaces the actor with one whose
+    /// ceiling omits `messages:write`, which leaves both bridge copies as they
+    /// were. Every entry point must now refuse the `messages:write` token or
+    /// grant; an entry point that read either copy would still admit it.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_entry_points_follow_a_supervisor_ceiling_moved_after_registration() {
+        let rt = runtime();
+        let scp = scp_test();
+        let owner = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(
+                Arc::clone(&owner),
+                ContextParams {
+                    ceiling: vec!["messages:read".to_owned(), "messages:write".to_owned()],
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let token = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&handle),
+                holder.did(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("a mint inside the registered ceiling must succeed")
+            .encoded();
+        let cap = format!("scp:ctx:{context_id}/messages:write");
+        let evaluate = || {
+            rt.block_on(scp.ucan_evaluate(
+                Arc::clone(&handle),
+                token.clone(),
+                Some(cap.clone()),
+                holder.did(),
+                None,
+            ))
+            .expect("evaluate")
+            .within_ceiling
+        };
+        // `ucan_evaluate` records no nonce, so this probe leaves the token
+        // valid for the validation below, and it registers the per-context
+        // UCAN state from the handle copy.
+        assert!(
+            evaluate(),
+            "the registered ceiling admits messages:write before the move"
+        );
+
+        // Move the supervisor's ceiling: replace the actor with one whose
+        // ceiling omits messages:write, under the same id and creator.
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("supervisor")
+            .clone();
+        assert!(
+            rt.block_on(sup.despawn_actor(&context_id)),
+            "the context's actor must be registered before the move"
+        );
+        rt.block_on(sup.create_context(
+            context_id.clone(),
+            scp_core::context::ContextParams {
+                ceiling: vec![
+                    scp_core::context::roles::Capability::new("messages:read")
+                        .expect("messages:read parses"),
+                ],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID(owner.did()),
+            None,
+        ))
+        .expect("the narrowed actor must spawn");
+        assert!(
+            handle.ceiling_strings.iter().any(|c| c == "messages:write"),
+            "precondition: the handle copy still carries messages:write"
+        );
+        assert_eq!(
+            scp.inner.with_ucan_state(&context_id, |st| st
+                .ceiling_strings
+                .contains("messages:write")),
+            Some(true),
+            "precondition: the registered UCAN state still carries messages:write"
+        );
+
+        assert!(
+            !evaluate(),
+            "evaluate must report the moved supervisor ceiling"
+        );
+        let refusals = [
+            (
+                "validate",
+                rt.block_on(scp.ucan_validate(
+                    Arc::clone(&handle),
+                    token.clone(),
+                    cap.clone(),
+                    holder.did(),
+                    None,
+                )),
+            ),
+            (
+                "delegate",
+                rt.block_on(scp.ucan_delegate(
+                    Arc::clone(&handle),
+                    holder.did(),
+                    "did:dht:z6MkUniffiMovedCeilingDelegatee".to_owned(),
+                    token.clone(),
+                    vec![cap.clone()],
+                ))
+                .map(drop),
+            ),
+            (
+                "mint",
+                rt.block_on(scp.ucan_mint(
+                    Arc::clone(&handle),
+                    holder.did(),
+                    vec!["messages:write".to_owned()],
+                    None,
+                ))
+                .map(drop),
+            ),
+        ];
+        for (call, result) in refusals {
+            let err = result.expect_err("the moved supervisor ceiling must refuse");
+            assert!(
+                err.to_string().to_lowercase().contains("ceiling"),
+                "the {call} refusal must be the ceiling check: {err}"
+            );
+        }
+        rt.block_on(scp.ucan_mint(
+            Arc::clone(&handle),
+            holder.did(),
+            vec!["messages:read".to_owned()],
+            None,
+        ))
+        .expect("a mint inside the moved ceiling must succeed");
+    }
+
+    /// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` compare a token's
+    /// grants against the ceiling the supervisor holds for the handle's
+    /// context.
+    ///
+    /// One creator owns two contexts: `wide` holds `messages:write` and
+    /// `narrow` omits it. A `messages:write` token minted in `wide` passes each
+    /// call there and fails the ceiling check in `narrow`. An edit that hands
+    /// the core an empty, default, or other context's ceiling passes one of the
+    /// two halves and fails the other.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+        let rt = runtime();
+        let scp = scp_test();
+        let owner = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let context_with = |ceiling: &[&str]| {
+            rt.block_on(scp.context_create(
+                Arc::clone(&owner),
+                ContextParams {
+                    ceiling: ceiling.iter().map(|c| (*c).to_owned()).collect(),
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create should succeed")
+        };
+        let wide = context_with(&["messages:read", "messages:write"]);
+        let narrow = context_with(&["messages:read"]);
+
+        let token = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&wide),
+                holder.did(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("a mint inside the wide ceiling must succeed")
+            .encoded();
+
+        // Evaluate and validate take a full capability URI. The token's grant is
+        // scoped to the wide context, and every call names that grant, so the
+        // narrow context refuses at its ceiling rather than at a scope mismatch.
+        let cap = format!("scp:ctx:{}/messages:write", wide.context_id());
+
+        for (handle, inside) in [(&wide, true), (&narrow, false)] {
+            let evaluation = rt
+                .block_on(scp.ucan_evaluate(
+                    Arc::clone(handle),
+                    token.clone(),
+                    Some(cap.clone()),
+                    holder.did(),
+                    None,
+                ))
+                .expect("evaluate");
+            assert_eq!(
+                evaluation.within_ceiling, inside,
+                "evaluate must report the supervisor ceiling of the handle's context"
+            );
+            let delegation = rt
+                .block_on(scp.ucan_delegate(
+                    Arc::clone(handle),
+                    holder.did(),
+                    "did:dht:z6MkUniffiLiveCeilingDelegatee".to_owned(),
+                    token.clone(),
+                    vec![cap.clone()],
+                ))
+                .map(drop);
+            let validation = rt.block_on(scp.ucan_validate(
+                Arc::clone(handle),
+                token.clone(),
+                cap.clone(),
+                holder.did(),
+                None,
+            ));
+            if inside {
+                delegation.expect("a delegation inside the wide ceiling must succeed");
+                validation.expect("a validation inside the wide ceiling must succeed");
+            } else {
+                for (call, result) in [("delegation", delegation), ("validation", validation)] {
+                    let err = result.expect_err("the narrow supervisor ceiling must refuse");
+                    assert!(
+                        err.to_string().to_lowercase().contains("ceiling"),
+                        "the {call} refusal must be the ceiling check: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every UCAN entry point refuses once no actor serves the context, and the
+    /// refusal withholds the lifecycle state.
+    ///
+    /// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` previously read the
+    /// per-context UCAN state (or, for delegate, the handle) that this bridge
+    /// registered, which answers with the registration-time ceiling and creator
+    /// for the life of the process. A TTL expiry despawns the actor, and every
+    /// UCAN entry point then has to refuse rather than authorize against a
+    /// record the supervisor stopped serving. Each one refuses at
+    /// `require_active_context_before_authz`, before it touches the revocation
+    /// list or the nonce tracker, so each assertion below matches that gate's
+    /// text and the entry point's code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_authorization_sites_fail_closed_once_the_actor_is_despawned() {
+        let scp = scp_test();
+        let (handle, _creator_key) =
+            callback_context_handle(&scp, CALLBACK_SUPERVISOR_CEILING).await;
+        let delegator_did = "did:dht:z6MkDespawnDelegator";
+        let _delegator_key = register_callback_identity(&scp, delegator_did).await;
+
+        // Mint while the actor still serves the context, so the token below is
+        // well-formed and the refusals are the live read, not a parse failure.
+        let token = ucan_mint_impl(
+            Arc::clone(&scp.inner),
+            Arc::clone(&handle),
+            delegator_did.to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint against a live actor must succeed");
+        let capability = token
+            .data
+            .capabilities
+            .first()
+            .expect("the minted token carries its capability")
+            .clone();
+
+        scp.inner
+            .context_manager_or_error()
+            .expect("test supervisor must be attached")
+            .despawn_actor(&handle.context_id)
+            .await;
+
+        let validate = scp
+            .ucan_validate(
+                Arc::clone(&handle),
+                token.encoded.clone(),
+                capability.clone(),
+                delegator_did.to_owned(),
+                None,
+            )
+            .await
+            .expect_err("validate must refuse a context no actor serves");
+        let evaluate = scp
+            .ucan_evaluate(
+                Arc::clone(&handle),
+                token.encoded.clone(),
+                Some(capability),
+                delegator_did.to_owned(),
+                None,
+            )
+            .await
+            .expect_err("evaluate must refuse a context no actor serves");
+        let delegate = ucan_delegate_impl(
+            &scp.inner,
+            Arc::clone(&handle),
+            delegator_did.to_owned(),
+            "did:dht:z6MkDespawnDelegatee".to_owned(),
+            token.encoded.clone(),
+            vec!["messages:write".to_owned()],
+        )
+        .await
+        .expect_err("delegate must refuse a context no actor serves");
+        let mint = ucan_mint_impl(
+            Arc::clone(&scp.inner),
+            Arc::clone(&handle),
+            delegator_did.to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect_err("mint must refuse a context no actor serves");
+        let revoke = scp
+            .ucan_revoke(
+                Arc::clone(&handle),
+                token.encoded.clone(),
+                delegator_did.to_owned(),
+            )
+            .await
+            .expect_err("revoke must refuse a context no actor serves");
+        for (entry_point, err) in [
+            ("validate", &validate),
+            ("evaluate", &evaluate),
+            ("delegate", &delegate),
+            ("mint", &mint),
+            ("revoke", &revoke),
+        ] {
+            assert!(
+                matches!(err, ScpError::Context { msg, code }
+                    if code == codes::CTX_2023
+                        && msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)),
+                "{entry_point} must refuse at the lifecycle gate, got: {err:?}"
+            );
+        }
+    }
+
     /// A `delegator_did` that this bridge instance never registered must fail
     /// closed with `SCP-IDENT-1001`, matching what `PyO3`'s and napi's delegate
     /// paths return for that same registry miss. A context handle carrying full
@@ -25403,7 +26193,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_delegate_unregistered_delegator_returns_ident_1001() {
         let scp = scp_test();
-        let (handle, _creator_key) = callback_context_handle(&scp).await;
+        let (handle, _creator_key) =
+            callback_context_handle(&scp, CALLBACK_SUPERVISOR_CEILING).await;
 
         // This delegator registry lookup fires before any parent-token parsing.
         let result = ucan_delegate_impl(
