@@ -348,32 +348,42 @@ mod tests {
         assert_eq!(grace_store.len(), 0);
     }
 
-    /// An add-Commit whose `KeyPackage` has expired under the receiver's clock
-    /// merges: `process_commit` reads no clock, so a receiver whose clock
-    /// stands 100 days ahead of the wall clock, past Carol's `not_after`,
-    /// still advances its epoch and records the old epoch in the grace window
-    /// (security-model spec §9.7.1, the receiver).
+    /// An add-Commit whose `KeyPackage` keeps less than the add-side minimum
+    /// under the receiver's (wall) clock merges: `process_commit` checks a
+    /// received Add's `Lifetime` range only and applies no minimum, so the
+    /// receiver advances its epoch and records the old epoch in the grace
+    /// window (security-model spec §9.7.1, the receiver).
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn process_commit_merges_add_key_package_expired_under_receiver_clock() {
-        use crate::lifetime::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+    fn process_commit_merges_add_short_of_add_side_minimum() {
+        use crate::lifetime::{KEY_PACKAGE_LIFETIME_SECS, validate_key_package_lifetime_for_add};
+        const DAY: u64 = 24 * 60 * 60;
         let real_now = SystemClock.now_secs();
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
         let bob_epoch_before = bob_group.epoch().unwrap();
 
-        // Carol's KeyPackage keeps just over the add-side minimum under the
-        // real clock, so Alice may add her.
-        let carol_not_after = real_now + KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 600;
+        // Carol's KeyPackage expires one day after the wall clock, so
+        // openmls's own wall-clock check passes, and under the wall clock it
+        // is short of the add-side minimum.
+        let carol_not_after = real_now + DAY;
         let carol_clock = scp_clock::TestClock::new(carol_not_after - KEY_PACKAGE_LIFETIME_SECS);
         let (carol_kp_bundle, _s, _p) =
             generate_key_package(&test_credential("carol"), &carol_clock).unwrap();
+        let carol_lifetime = carol_kp_bundle.key_package().life_time();
+        assert_eq!(carol_lifetime.not_after(), carol_not_after);
+        assert!(
+            validate_key_package_lifetime_for_add(carol_lifetime, &SystemClock).is_err(),
+            "under the wall clock Carol must be short of the add-side minimum"
+        );
+
+        // Alice's clock stands seven days back, so Carol keeps eight days
+        // under it and Alice's add-side minimum holds.
+        let adder_clock = scp_clock::TestClock::new(real_now - 7 * DAY);
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        let add_carol = add_member(&mut alice_group, carol_kp, &adder_clock).unwrap();
         let commit_bytes = serialize_mls_message(&add_carol.commit).unwrap();
 
-        let receiver_clock = scp_clock::TestClock::new(real_now + 100 * 24 * 60 * 60);
-        assert!(receiver_clock.now_secs() > carol_not_after);
         process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before + 1);
         assert_eq!(grace_store.len(), 1);

@@ -1112,6 +1112,73 @@ mod tests {
         );
     }
 
+    /// Security-model spec §9.7.1, the receiver, on the native path: a
+    /// receiving backend whose injected clock stands past an added
+    /// `KeyPackage`'s `not_after` still merges the add Commit through
+    /// `process_commit`, because a receiver checks the received `Lifetime`'s
+    /// range only and reads no clock. The wall clock stays inside Carol's
+    /// `Lifetime`, so openmls's own wall-clock check passes and only an
+    /// injected-clock check on receive could refuse.
+    #[tokio::test]
+    async fn process_commit_merges_add_expired_under_receiver_injected_clock() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let mut alice = adder
+            .create_group(&test_credential("alice-recv-expired"), None)
+            .await
+            .unwrap();
+
+        // Bob joins with his backend clock at the real present.
+        let bob_clock = Arc::new(TestClock::new(real_now));
+        let bob_backend = ProductionMlsBackend::new(Arc::clone(&bob_clock) as Arc<dyn Clock>);
+        bob_backend.set_consumed_init_key_store(Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        )));
+        let bob_gen = bob_backend
+            .generate_key_package(&test_credential("bob-recv-expired"), None)
+            .await
+            .unwrap();
+        let bob_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+        let mut bob = bob_backend
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        let bob_epoch_before = bob.epoch().unwrap();
+
+        // Carol's KeyPackage is minted at `real_now`, so its `not_after` is
+        // `real_now + KEY_PACKAGE_LIFETIME_SECS`, and Alice adds her.
+        let carol_gen = ProductionMlsBackend::new(Arc::new(TestClock::new(real_now)))
+            .generate_key_package(&test_credential("carol-recv-expired"), None)
+            .await
+            .unwrap();
+        let carol_add = adder
+            .add_member_raw(&mut alice, &carol_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        // Bob's injected clock passes Carol's `not_after`; the wall clock
+        // does not.
+        let carol_not_after = real_now + KEY_PACKAGE_LIFETIME_SECS;
+        bob_clock.set(carol_not_after + 1);
+        assert!(SystemClock.now_secs() < carol_not_after);
+        bob_backend
+            .process_commit(&mut bob, &carol_add.commit)
+            .await
+            .expect("a receiver merges an Add expired under its own clock");
+        assert_eq!(bob.epoch().unwrap(), bob_epoch_before + 1);
+        assert_eq!(bob.members().unwrap().len(), 3, "Alice, Bob and Carol");
+    }
+
     /// The consumed-set key of the signer state's own `KeyPackage`, read from
     /// its `KeyPackageBundle` as `join_from_welcome` reads it, so it needs no
     /// openmls validation of a `KeyPackage` openmls's clock rejects.

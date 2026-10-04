@@ -1722,14 +1722,18 @@ mod tests {
         proposal.tls_serialize_detached().unwrap()
     }
 
-    /// Carol's `KeyPackage` (with a wrapping key) whose `not_after` lies
-    /// `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 600` seconds after the real
-    /// clock, so the add-side minimum passes under the real clock. Returns the
-    /// `KeyPackage` and its `not_after`.
+    /// Carol's `KeyPackage` (with a wrapping key) whose `not_after` lies one
+    /// day after the wall clock, so openmls's own wall-clock check passes, and
+    /// an adder clock seven days behind the wall clock, under which Carol keeps
+    /// eight days and the add-side minimum holds. Under the wall clock Carol
+    /// keeps less than the add-side minimum, which the function asserts: a
+    /// receiver that applied the adder's minimum would refuse this Add.
     #[allow(clippy::unwrap_used)]
-    fn carol_near_expiry_key_package() -> (KeyPackage, u64) {
-        use crate::lifetime::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
-        let not_after = SystemClock.now_secs() + KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 600;
+    fn carol_short_of_minimum_and_adder_clock() -> (KeyPackage, TestClock) {
+        use crate::lifetime::{KEY_PACKAGE_LIFETIME_SECS, validate_key_package_lifetime_for_add};
+        const DAY: u64 = 24 * 60 * 60;
+        let real_now = SystemClock.now_secs();
+        let not_after = real_now + DAY;
         let carol_clock = TestClock::new(not_after - KEY_PACKAGE_LIFETIME_SECS);
         let (bundle, _s, _p) = generate_key_package_with_wrapping_key(
             &test_credential("carol"),
@@ -1737,24 +1741,27 @@ mod tests {
             &carol_clock,
         )
         .unwrap();
-        assert_eq!(bundle.key_package().life_time().not_after(), not_after);
-        (bundle.key_package().clone(), not_after)
+        let kp = bundle.key_package().clone();
+        assert_eq!(kp.life_time().not_after(), not_after);
+        assert!(
+            validate_key_package_lifetime_for_add(kp.life_time(), &SystemClock).is_err(),
+            "under the wall clock Carol must be short of the add-side minimum"
+        );
+        (kp, TestClock::new(real_now - 7 * DAY))
     }
 
-    /// A receiver merges an Add whose `KeyPackage` `not_after` the receiver's
-    /// clock has passed. The receive functions take no clock, so the receiver
-    /// clock here only records that Carol's `KeyPackage` is expired under a
-    /// clock 100 days ahead of the wall clock; the commit still merges.
+    /// A receiver merges an Add whose `KeyPackage` keeps less than the
+    /// add-side minimum under the receiver's (wall) clock: the minimum binds
+    /// the adder only, and the receiver checks the range alone (security-model
+    /// spec §9.7.1, the receiver).
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn decrypt_with_sender_did_merges_add_commit_expired_under_receiver_clock() {
-        let receiver_clock = TestClock::new(SystemClock.now_secs() + 100 * 24 * 60 * 60);
+    fn decrypt_with_sender_did_merges_add_short_of_add_side_minimum() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let bob_epoch_before = bob_group.epoch().unwrap();
 
-        let (carol_kp, carol_not_after) = carol_near_expiry_key_package();
-        assert!(receiver_clock.now_secs() > carol_not_after);
-        let add_carol = add_member(&mut alice_group, carol_kp.into(), &SystemClock).unwrap();
+        let (carol_kp, adder_clock) = carol_short_of_minimum_and_adder_clock();
+        let add_carol = add_member(&mut alice_group, carol_kp.into(), &adder_clock).unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
 
         let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
@@ -1769,18 +1776,16 @@ mod tests {
     /// reports Carol.
     #[test]
     #[allow(clippy::unwrap_used, clippy::panic)]
-    fn decrypt_with_membership_changes_merges_add_commit_expired_under_receiver_clock() {
-        let receiver_clock = TestClock::new(SystemClock.now_secs() + 100 * 24 * 60 * 60);
+    fn decrypt_with_membership_changes_merges_add_short_of_add_side_minimum() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let bob_epoch_before = bob_group.epoch().unwrap();
 
-        let (carol_kp, carol_not_after) = carol_near_expiry_key_package();
-        assert!(receiver_clock.now_secs() > carol_not_after);
+        let (carol_kp, adder_clock) = carol_short_of_minimum_and_adder_clock();
         let add_carol = add_member_with_convergent_timestamp(
             &mut alice_group,
             carol_kp.into(),
-            &SystemClock,
-            SystemClock.now_secs(),
+            &adder_clock,
+            adder_clock.now_secs(),
         )
         .unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
@@ -1857,7 +1862,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn in_range_add_proposal_is_accepted() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let (carol_kp, _) = carol_near_expiry_key_package();
+        let (carol_kp, _) = carol_short_of_minimum_and_adder_clock();
         let bytes = raw_add_proposal(&mut alice_group, &carol_kp);
         let content = decrypt_with_sender_did(&mut bob_group, &bytes).unwrap();
         assert!(
@@ -1866,7 +1871,7 @@ mod tests {
         );
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
-        let (carol_kp, _) = carol_near_expiry_key_package();
+        let (carol_kp, _) = carol_short_of_minimum_and_adder_clock();
         let bytes = raw_add_proposal(&mut alice_group, &carol_kp);
         let change = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap();
         assert!(
