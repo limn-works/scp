@@ -1915,7 +1915,6 @@ where
 /// converted `ActorBusy`, `ActorCrashed`, or `ContextPoisoned` error when the
 /// context's actor is saturated, wedged, mid-respawn, or poisoned, so a caller
 /// never reads an actor that did not answer as an absent context.
-#[cfg(test)]
 pub(crate) fn live_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
