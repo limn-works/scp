@@ -2005,7 +2005,7 @@ jobs:
           # A missing or unreadable cache only makes buildkit warn and build every layer.
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
 
-  # Builds the same image on every push to `main` and exports its layer cache; the
+  # Builds the same image and exports its layer cache; the
   # comment on job `docker-image` above says why the export lives in this job alone.
   # Its `if:` reads the `rust` filter that selects job `docker-image`, the job that
   # reads the export, so a push that changes no Rust skips it.
