@@ -4381,15 +4381,11 @@ pub fn identity_verify_link_attestation(
 ///
 /// ADR-016 step 8 compares the token's grants against the ceiling in
 /// `role_state`, and the chain check anchors on `role_state.creator_did`. The
-/// caller passes the role state that
-/// [`UniffiBridgeInstance::require_active_context_before_authz`](crate::runtime::UniffiBridgeInstance::require_active_context_before_authz)
-/// returned, so both come from the supervisor actor. The per-context UCAN
-/// state supplies only the revocation list and the nonce tracker.
-#[allow(clippy::too_many_arguments)] // The outlet entry points' UCAN inputs, plus the gate's role state.
+/// per-context UCAN state supplies only the revocation list and the nonce
+/// tracker.
 pub(crate) fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-    handle: &ContextHandle,
-    role_state: &scp_core::context::roles::ContextRoleState,
+    (handle, role_state): (&ContextHandle, &scp_core::context::roles::ContextRoleState),
     outlet_id: &str,
     kind: scp_core::context::outlets::OutletKind,
     ucan_token: &str,
@@ -5201,6 +5197,46 @@ impl McpUniFfiBridgeProvider {
         }
     }
 
+    /// Reads `context_id`'s lifecycle state from the actor that holds it,
+    /// with `Supervisor::read_context_state_checked`, for the outlet access
+    /// gate (ADR-049 §10).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+    /// when no supervisor is attached, when no actor holds such a context, and
+    /// when the actor reports a state other than `Active`. The denial withholds
+    /// the state. Returns
+    /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
+    /// when the read itself fails.
+    fn gate_active_lifecycle(
+        bi: &crate::runtime::UniffiBridgeInstance,
+        context_id: &str,
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        let denied = || {
+            AccessRefusal::Denied(format!(
+                "context '{context_id}': {}",
+                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+            ))
+        };
+        let Some(sup) = bi.core.try_supervisor() else {
+            return Err(denied());
+        };
+        let sup = Arc::clone(sup);
+        let id = context_id.to_owned();
+        match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { sup.read_context_state_checked(&id).await })
+        }) {
+            Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
+            Ok(_) => Err(denied()),
+            Err(e) => Err(AccessRefusal::Unreadable(format!(
+                "lifecycle state of context '{context_id}' could not be read: {e}"
+            ))),
+        }
+    }
+
     /// Decides whether the agent may invoke `outlet_name` in `context_id`,
     /// given the context's current role state: the role-state capability
     /// check, then the UCAN check. The role-state check runs first because
@@ -5327,9 +5363,8 @@ impl McpUniFfiBridgeProvider {
 
         // ADR-016 step 8 compares the token's grants against the ceiling in
         // `role_state`, and the chain check anchors on its `creator_did`. The
-        // caller read `role_state` from the actor, so neither comes from the
-        // per-context UCAN state, which supplies only the revocation list and
-        // the nonce tracker.
+        // per-context UCAN state supplies only the revocation list and the
+        // nonce tracker.
         let ceiling_strings = role_state.ceiling().to_ucan_string_set();
         let agent_did = self.agent_did.clone();
         bi.with_ucan_state(context_id, |ucan_state| {
@@ -5491,12 +5526,15 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
-        // A dropped bridge instance, an unreadable role state, or a failed
-        // read inside `outlet_grant` is a failed read, which `tools/list`
-        // reports as an error instead of omitting the context's tools. A
-        // context no actor holds is a denial, which `tools/list` omits.
+        // A dropped bridge instance, an unreadable role state or lifecycle
+        // state, or a failed read inside `outlet_grant` is a failed read,
+        // which `tools/list` reports as an error instead of omitting the
+        // context's tools. A context no actor holds, or whose actor reports a
+        // lifecycle state other than `Active`, is a denial, which `tools/list`
+        // omits.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
         let role_state = Self::gate_role_state(&bi, context_id)?;
+        Self::gate_active_lifecycle(&bi, context_id)?;
         self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
     }
 
@@ -14159,8 +14197,7 @@ impl Scp {
                 // bridge UCAN registry, not in the runtime.
                 validate_outlet_ucan_uniffi(
                     &bi,
-                    &handle,
-                    &role_state,
+                    (&handle, &role_state),
                     &outlet_id,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -14458,8 +14495,7 @@ impl Scp {
                 // See spec §6.2, §8, ADR-016, and issue #319.
                 validate_outlet_ucan_uniffi(
                     &bi,
-                    &target_handle,
-                    &target_role_state,
+                    (&target_handle, &target_role_state),
                     &outlet_id,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -14955,8 +14991,7 @@ impl Scp {
                 // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
                 validate_outlet_ucan_uniffi(
                     &bi,
-                    &handle,
-                    &role_state,
+                    (&handle, &role_state),
                     &outlet_id_for_ucan,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -20792,8 +20827,9 @@ mod tests {
     /// snapshot that still reads `Active` after the supervisor despawns the
     /// actor, so it admitted an invocation into a context the supervisor had
     /// stopped serving. `outlet_invoke_cross_context_saga` carried no lifecycle
-    /// gate at all. The test drives one axis through each entry point, so the
-    /// code the refusal carries identifies which read refused.
+    /// gate at all. The test drives each axis of each entry point with the
+    /// other context live, so the code the refusal carries identifies which
+    /// read refused.
     #[test]
     #[cfg(feature = "testing")]
     fn cross_context_outlet_gates_read_the_supervisor_not_the_cached_handle_state() {
@@ -20880,6 +20916,57 @@ mod tests {
                 );
             }
             other => panic!("saga refusal must be an Outlet error, got: {other:?}"),
+        }
+
+        // Source axis, unary entry point.
+        let unary_source = rt
+            .block_on(scp.outlet_invoke_cross_context(
+                Arc::clone(&dead),
+                Arc::clone(&live),
+                "probe-outlet".to_owned(),
+                "{}".to_owned(),
+                Arc::clone(&identity),
+                "not-a-real-token".to_owned(),
+                1,
+                None,
+            ))
+            .expect_err("a source context no actor serves must refuse the unary invocation");
+        assert_withheld_outlet_refusal(&unary_source, codes::OUTLET_6010, &dead.context_id());
+
+        // Target axis, saga entry point.
+        let saga_target = rt
+            .block_on(scp.outlet_invoke_cross_context_saga(
+                Arc::clone(&live),
+                Arc::clone(&dead),
+                identity.did(),
+                "probe-outlet".to_owned(),
+                "{}".to_owned(),
+                "000102030405060708090a0b0c0d0e0f".to_owned(),
+                1,
+                1,
+                None,
+            ))
+            .expect_err("a target context no actor serves must refuse the saga");
+        assert_withheld_outlet_refusal(&saga_target, codes::OUTLET_6011, &dead.context_id());
+    }
+
+    /// Asserts that `err` is an outlet lifecycle-gate refusal with `code`
+    /// that withholds `context_id`.
+    #[cfg(feature = "testing")]
+    fn assert_withheld_outlet_refusal(err: &ScpError, code: &str, context_id: &str) {
+        match err {
+            ScpError::Outlet { code: c, msg } => {
+                assert_eq!(c, code, "refusal reported: {msg}");
+                assert!(
+                    msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+                    "refusal must come from the lifecycle gate: {msg}"
+                );
+                assert!(
+                    !msg.contains(context_id),
+                    "refusal must withhold the context id: {msg}"
+                );
+            }
+            other => panic!("refusal must be an Outlet error, got: {other:?}"),
         }
     }
 
@@ -25732,6 +25819,198 @@ mod tests {
             ran.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the replayed call runs no outlet"
+        );
+    }
+
+    /// The MCP outlet access gate reads the actor's lifecycle state. While the
+    /// context is `Active`, a probe passes. Once a close leaves the actor
+    /// resident in `Closing`, still holding its role state, a probe and a
+    /// `tools/call` are both denied with the withheld refusal, and no outlet
+    /// runs. A gate that read only the role state would admit both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn uniffi_validate_capability_denies_a_context_whose_actor_is_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        use scp_platform::traits::KeyCustody as _;
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let key = custody
+            .generate_keypair(scp_platform::traits::KeyType::Ed25519)
+            .await
+            .expect("keypair");
+        let mut public_key = [0_u8; 32];
+        public_key.copy_from_slice(
+            custody
+                .public_key(&key)
+                .await
+                .expect("public key")
+                .as_bytes(),
+        );
+        let issuer = scp_did::did_dht_from_public_key(&public_key).0;
+        let agent = "did:dht:z6MkAgentInClosingContext";
+
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+        bi.init_context_manager_with_did(&issuer);
+        let supervisor = bi
+            .context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone();
+        supervisor
+            .create_context(
+                "ctx-test".to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![
+                        scp_core::context::roles::Capability::MessagesRead,
+                        scp_core::context::roles::Capability::OutletCallAll,
+                        scp_core::context::roles::Capability::ContextClose,
+                    ],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID(issuer.clone()),
+                None,
+            )
+            .await
+            .expect("context creation must succeed");
+        supervisor
+            .test_insert_member("ctx-test", scp_did::DID(agent.to_owned()), "admin")
+            .await
+            .expect("the agent must be recorded as a member of the actor");
+        let handle = test_handle_with(
+            &scp,
+            &issuer,
+            vec!["messages:read".to_owned(), "outlet:call:*".to_owned()],
+        );
+        register_context_handle(&bi, &handle);
+        handle
+            .outlet_registry
+            .lock()
+            .expect("registry lock")
+            .insert(scp_core::context::outlets::OutletRegistration {
+                outlet_id: "calculator".to_owned(),
+                kind: scp_core::context::outlets::OutletKind::Action,
+                name: "Calculator".to_owned(),
+                description: "A simple calculator".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkOperator".into(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            });
+        let ran = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ran_in_handler = Arc::clone(&ran);
+        handle.outlet_handlers.lock().expect("handler lock").insert(
+            "calculator".to_owned(),
+            Arc::new(
+                move |input: serde_json::Value| -> Result<serde_json::Value, String> {
+                    ran_in_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!({"sum": input["a"]}))
+                },
+            ),
+        );
+
+        let capabilities = vec!["outlet:call:*".to_owned()];
+        let params = scp_core::crypto::ucan::mint::MintParams {
+            issuer_did: &issuer,
+            issuer_key: &key,
+            audience_did: agent,
+            context_id: "ctx-test",
+            capabilities: &capabilities,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let token =
+            scp_core::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_clock::SystemClock)
+                .await
+                .expect("mint");
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: agent.to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some(token.encoded),
+            agent_proof_tokens: None,
+        };
+        use scp_mcp::server::ContextProvider as _;
+        provider
+            .validate_capability(
+                "ctx-test",
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
+            .expect("a probe of an Active context with a valid token passes");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        supervisor
+            .dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+                payload: Box::new(CloseContextPayload {
+                    context_id: "ctx-test".to_owned(),
+                    params: scp_core::context::ContextParams::default(),
+                    initiator_did: scp_did::DID(issuer.clone()),
+                }),
+                reply: tx,
+            })
+            .await
+            .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            supervisor
+                .read_context_state_checked("ctx-test")
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert!(
+            supervisor
+                .get_role_state_checked("ctx-test")
+                .await
+                .expect("the resident actor answers")
+                .is_some(),
+            "the closing actor still holds its role state"
+        );
+
+        let is_withheld_denial = |refusal: &scp_mcp::server::AccessRefusal| {
+            matches!(
+                refusal,
+                scp_mcp::server::AccessRefusal::Denied(msg)
+                    if msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && !msg.to_lowercase().contains("closing")
+            )
+        };
+        let probe = provider
+            .validate_capability(
+                "ctx-test",
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
+            .expect_err("a probe of a closing context must be denied");
+        assert!(
+            is_withheld_denial(&probe),
+            "the probe denial must withhold the state: {probe}"
+        );
+        let invoked = provider.invoke_outlet("ctx-test", "calculator", serde_json::json!({"a": 1}));
+        assert!(
+            matches!(
+                &invoked,
+                Err(scp_mcp::server::OutletInvokeError::Refused(refusal)) if is_withheld_denial(refusal)
+            ),
+            "a call into a closing context must be denied by the lifecycle gate: {invoked:?}"
+        );
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a call into a closing context runs no outlet"
         );
     }
 

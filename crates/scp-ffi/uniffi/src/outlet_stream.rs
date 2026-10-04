@@ -502,8 +502,7 @@ pub(crate) async fn outlet_stream_open_impl(
     // re-present.
     crate::bridge::validate_outlet_ucan_uniffi(
         bi,
-        handle,
-        &role_state,
+        (handle, &role_state),
         &outlet_id,
         outlet_kind,
         &ucan_token,
@@ -1321,8 +1320,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     let operator_did = registration.operator_did.0.clone();
     validate_outlet_ucan_uniffi(
         bi,
-        target_handle,
-        &target_role_state,
+        (target_handle, &target_role_state),
         &outlet_registration_id,
         outlet_kind,
         &ucan_token,
