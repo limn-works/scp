@@ -43,20 +43,29 @@
 //!   a buffer slot out for the pager's scratch space, and the connection's
 //!   first statement reads the database's pages into slots, so a check made
 //!   after either would leave that connection's pages in slots `SQLite` reuses
-//!   unwiped. The throwaway connection holds none of the database's data.
+//!   unwiped.
+//!
+//! The throwaway connection is the one `SQLCipher` connection exempt from the
+//! requirements above and from the pragma: it sets no key, keeps its
+//! lookaside pool, and is never passed to [`require_memory_security`]. It
+//! opens no database SCP stores data in and holds no data, so no block it
+//! frees and no slot it leaves holds a secret.
 //!
 //! The crate keeps no state: every open makes its checks itself.
 //!
 //! These checks read `SQLite`'s state, and code in the same process can change
 //! that state. While no code in the process reconfigures `SQLite`, they show
-//! the three paths off. Code in the same process that reconfigures `SQLite` is
-//! one limit of every check here and of the readback below, in three forms:
-//! installing a custom page cache with `SQLITE_CONFIG_PCACHE2` before `SQLite`
-//! starts, which `SQLite` offers no way to read back; replacing the allocator
-//! with `SQLITE_CONFIG_MALLOC` after `sqlite3_shutdown`, after which freed
-//! blocks go unwiped while the readback still returns `1`; and resetting the
-//! `SQLITE_STATUS_PAGECACHE_USED` high-water mark, after which a buffer that
-//! has held pages reads 0.
+//! the three paths off. Code in the same process that reconfigures `SQLite`,
+//! by any call, is one limit of every check here and of the readback below.
+//! Its forms include installing a custom page cache with
+//! `SQLITE_CONFIG_PCACHE2` before `SQLite` starts, which `SQLite` offers no way
+//! to read back; replacing the allocator with `SQLITE_CONFIG_MALLOC` after
+//! `sqlite3_shutdown`, after which freed blocks go unwiped while the readback
+//! still returns `1`; resetting the `SQLITE_STATUS_PAGECACHE_USED` high-water
+//! mark, after which a buffer that has held pages reads 0; and installing a
+//! page-cache buffer or custom page cache after `sqlite3_shutdown`, between an
+//! open's page-cache buffer check and its connection, after which that
+//! connection keeps its pages there although the check read 0.
 //!
 //! The pragma itself must run before the connection's `PRAGMA key` statement,
 //! because `SQLCipher` wipes only blocks freed after the pragma takes effect.

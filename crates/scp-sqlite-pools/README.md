@@ -41,15 +41,19 @@ reads the `SQLITE_STATUS_PAGECACHE_USED` high-water mark with
 `sqlite3_status64`, and fails with `PoolsError::PageCacheBufferUsed` unless it
 is 0. The check precedes the caller's open because opening a connection already
 checks a buffer slot out for the pager's scratch space, and its first statement
-reads the database's pages into slots.
+reads the database's pages into slots. The throwaway connection is the one
+SQLCipher connection exempt from these requirements and from the pragma: it
+opens no database SCP stores data in and holds no data.
 
 These checks and the readback read SQLite's state, so they hold only while no
-code in the same process reconfigures SQLite. That limit takes three forms:
+code in the same process reconfigures SQLite, by any call. Its forms include
 installing a custom page cache with `SQLITE_CONFIG_PCACHE2` before SQLite
 starts, which cannot be read back; replacing the allocator with
 `SQLITE_CONFIG_MALLOC` after `sqlite3_shutdown`, after which freed blocks go
-unwiped while the readback still returns `1`; and resetting the
-`SQLITE_STATUS_PAGECACHE_USED` high-water mark.
+unwiped while the readback still returns `1`; resetting the
+`SQLITE_STATUS_PAGECACHE_USED` high-water mark; and installing a page-cache
+buffer or custom page cache after `sqlite3_shutdown`, between an open's
+page-cache buffer check and its connection.
 
 `lookaside_use` reports a connection's
 lookaside use, which is zero for a connection this crate opened.
