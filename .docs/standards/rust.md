@@ -191,9 +191,10 @@ against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36.
 #![forbid(unsafe_code)]
 ```
 
-Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace, with two exceptions, and each exception documents every `unsafe` block with a `// SAFETY:` comment explaining the invariant:
+Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace, with three exceptions, and each exception documents every `unsafe` block with a `// SAFETY:` comment explaining the invariant:
 - an FFI bridge crate that requires unsafe (e.g., cbindgen C ABI);
-- `crates/scp-alloc`, the wiping global allocator, whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its `GlobalAlloc` implementation and on the wipe routine that implementation calls.
+- `crates/scp-alloc`, the wiping global allocator, whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its `GlobalAlloc` implementation and on the wipe routine that implementation calls;
+- `crates/scp-sqlite-pools`, which turns SQLite's lookaside pool and page-cache bulk block off for every SQLCipher connection (§17.6 of the persistence spec), whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its calls into SQLite's C API (`sqlite3_config`, `sqlite3_db_config`, `sqlite3_db_status`).
 
 `crates/scp-alloc/src/lib.rs` holds the workspace's one `#[global_allocator]` static. The crate root of each shipped binary and cdylib (`scp-node`, `scp-relay`, `scp-ffi`, `scp-ffi-napi`, `scp-ffi-uniffi`, and `scp-client-wasm`) links that static with `use scp_alloc as _;` and defines no global allocator of its own, because §9.15 of the security-model spec (freed heap memory) requires every shipped artifact to wipe each heap block before freeing it.
 
