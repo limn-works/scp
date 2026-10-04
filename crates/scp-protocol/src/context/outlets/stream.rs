@@ -1125,16 +1125,26 @@ pub fn compute_chunk_interior_hash(left_hash: &[u8; 32], right_hash: &[u8; 32]) 
 /// Propagates the first JCS canonicalization error encountered while
 /// hashing leaves.
 pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 32], String> {
-    if chunks.is_empty() {
-        return Ok([0u8; 32]);
-    }
-
     // Layer 0: leaf hashes.
-    let mut current: Vec<[u8; 32]> = chunks
+    let leaves: Vec<[u8; 32]> = chunks
         .iter()
         .map(compute_chunk_leaf_hash)
         .collect::<Result<Vec<_>, String>>()?;
+    Ok(fold_chunk_leaf_hashes(leaves))
+}
 
+/// Folds an ordered list of chunk leaf hashes into the RFC 6962 §2.1
+/// manifest root, level by level, as step 2 and step 3 of
+/// [`compute_chunk_manifest_root`] describe. An empty list yields the
+/// all-zero sentinel `[0u8; 32]`, and a single leaf hash is returned as the
+/// root.
+///
+/// [`compute_chunk_manifest_root`] hashes each chunk and calls this fold.
+/// The frontier property test calls it directly over every prefix of one
+/// precomputed leaf list, so the test hashes each chunk once per case
+/// instead of once per prefix.
+fn fold_chunk_leaf_hashes(leaves: Vec<[u8; 32]>) -> [u8; 32] {
+    let mut current = leaves;
     while current.len() > 1 {
         let mut next: Vec<[u8; 32]> = Vec::with_capacity(current.len().div_ceil(2));
         // `as_chunks::<2>` splits the level into fixed-size pairs plus the
@@ -1155,9 +1165,9 @@ pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 
         current = next;
     }
 
-    // current.len() == 1 by the loop invariant + the early return on
-    // empty input; index 0 is safe.
-    Ok(current[0])
+    // The loop leaves exactly one hash for a non-empty input and leaves an
+    // empty input untouched, which maps to the all-zero sentinel.
+    current.first().copied().unwrap_or([0u8; 32])
 }
 
 // ---------------------------------------------------------------------------
@@ -3024,8 +3034,11 @@ mod tests {
     }
 
     proptest::proptest! {
-        // Deterministic: proptest uses a fixed default RNG seed unless the
-        // PROPTEST_SEED env var overrides it, so CI runs are reproducible.
+        // proptest 1.10.0 seeds this test's RNG from the operating system on
+        // every run, because its default `Config::rng_seed` is
+        // `RngSeed::Random`. Setting `PROPTEST_RNG_SEED=<u64>` fixes the seed.
+        // A failing run saves its input under `proptest-regressions/`, and
+        // later runs replay that input first.
 
         /// For random chunk sequences (length 0..=257, mixed @types, mixed
         /// sequence numbers) and a random cancel-ack ceiling, the frontier's
@@ -3060,11 +3073,19 @@ mod tests {
 
             // The running root must also match the oracle at EVERY prefix,
             // not just at the end — the pump reads the root at close but the
-            // frontier must be correct incrementally.
+            // frontier must be correct incrementally. The prefix oracle folds
+            // a prefix of leaf hashes computed once per case, because calling
+            // `compute_chunk_manifest_root` per prefix re-hashed every chunk
+            // n(n+1)/2 times. The full-length assertion above still checks
+            // `compute_chunk_manifest_root` itself.
+            let leaves: Vec<[u8; 32]> = chunks
+                .iter()
+                .map(|c| compute_chunk_leaf_hash(c).unwrap())
+                .collect();
             let mut f = MerkleFrontier::with_ceiling(ceiling);
             for (i, c) in chunks.iter().enumerate() {
                 f.push(c).unwrap();
-                let prefix_oracle = compute_chunk_manifest_root(&chunks[..=i]).unwrap();
+                let prefix_oracle = fold_chunk_leaf_hashes(leaves[..=i].to_vec());
                 proptest::prop_assert_eq!(
                     f.root(),
                     prefix_oracle,
