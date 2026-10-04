@@ -210,9 +210,9 @@ nothing:
                job's `env:` therefore gives that job a key no other member of
                its `shared-key` group computes, so that job restores no entry
                its group saved and compiles the group's ~650 dependencies from
-               scratch. A `CARGO_PROFILE_*` key in one step's `env:` leaves the
-               key alone, but cargo then compiles that step's units under a
-               profile the restored entry does not hold and rebuilds each one.
+               scratch. A `CARGO_PROFILE_*` key in the `env:` of a step that runs
+               cargo makes cargo compile that step's units under a profile the
+               restored entry does not hold and rebuild each one.
                Dropping the workflow-level key returns CI's dev-profile builds
                to the root Cargo.toml's `line-tables-only` without any check
                noticing.
