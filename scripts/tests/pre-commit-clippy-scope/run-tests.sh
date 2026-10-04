@@ -275,6 +275,17 @@ g commit -q -m "delete a relay module" >/dev/null
 assert_clippy "a commit that only deletes a .rs file in scp-relay lints scp-relay" \
     "cargo clippy -p scp-relay $TAIL"
 
+# Case 6b: a commit that only replaces a .rs file with a symlink stages a type change (`T`),
+# and the crate then compiles the symlink's target.
+new_repo "$WORK/typechange"
+rm crates/scp-relay/src/extra.rs
+ln -s main.rs crates/scp-relay/src/extra.rs
+git add crates/scp-relay/src/extra.rs
+: > "$LOG"
+g commit -q -m "replace a relay module with a symlink" >/dev/null
+assert_clippy "a commit that only replaces a .rs file in scp-relay with a symlink lints scp-relay" \
+    "cargo clippy -p scp-relay $TAIL"
+
 # Case 7: a commit that only renames a .rs file out of scp-relay into the fuzz workspace.
 new_repo "$WORK/rename"
 mkdir -p fuzz/src

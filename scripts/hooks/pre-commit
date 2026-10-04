@@ -3,9 +3,10 @@
 # Auto-formats staged files and re-stages them. Lint errors block the commit.
 set -euo pipefail
 
-# The filter counts deleted paths too, and `--no-renames` lists a renamed file as a deletion
-# plus an addition, so a commit that only deletes or moves files still runs the hook.
-if git diff --cached --quiet --no-renames --diff-filter=ACMD; then exit 0; fi
+# The filter counts deleted paths and type changes too (`T`: a file replaced by a symlink, or
+# the reverse), and `--no-renames` lists a renamed file as a deletion plus an addition, so a
+# commit that only deletes, moves, or changes the type of files still runs the hook.
+if git diff --cached --quiet --no-renames --diff-filter=ACMDT; then exit 0; fi
 
 # ── Which files this commit changes, for the language steps ──
 #
@@ -21,9 +22,10 @@ if git diff --cached --quiet --no-renames --diff-filter=ACMD; then exit 0; fi
 # The staged set still decides the early exit above, so the toolchain check below runs on
 # every commit that stages a file, merge or not.
 #
-# The list also holds deleted paths, and `--no-renames` lists a renamed file as its deleted
-# old path plus its added new path. A commit that deletes a `.rs` file or moves one out of a
-# crate changes what that crate compiles, so the clippy scope below has to see the crate.
+# The list also holds deleted and type-changed paths, and `--no-renames` lists a renamed file
+# as its deleted old path plus its added new path. A commit that deletes a `.rs` file, moves
+# one out of a crate, or replaces one with a symlink changes what that crate compiles, so the
+# clippy scope below has to see the crate.
 #
 # `changed_paths` prints the list NUL-separated (`git diff -z`). Without `-z`, git wraps a
 # path holding a non-ASCII byte in double quotes with octal escapes, and word splitting
@@ -36,10 +38,10 @@ changed_paths() {
   if [ -f "$MERGE_HEAD_FILE" ]; then
     while IFS= read -r merged_head; do
       [ -z "$merged_head" ] && continue
-      git diff --cached -z --name-only --no-renames --diff-filter=ACMD "$merged_head"
+      git diff --cached -z --name-only --no-renames --diff-filter=ACMDT "$merged_head"
     done < "$MERGE_HEAD_FILE"
   else
-    git diff --cached -z --name-only --no-renames --diff-filter=ACMD
+    git diff --cached -z --name-only --no-renames --diff-filter=ACMDT
   fi
 }
 
