@@ -1381,6 +1381,25 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // construction.md M2: a create with no ceiling or a null one omits
+            // a required field; an empty one is an invalid field value. The
+            // UniFFI create path reaches this arm with `Empty` through the
+            // `ContextCreationError` translation below.
+            CE::CeilingRequired(declared) => Self::Validation {
+                msg: format!("{e}"),
+                code: match declared {
+                    scp_core::context::CeilingDeclaration::Absent
+                    | scp_core::context::CeilingDeclaration::Null => codes::VALID_7004,
+                    scp_core::context::CeilingDeclaration::Empty => codes::VALID_7005,
+                }
+                .to_owned(),
+            },
+            // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
+            // `ContextError::ActorBusy` doc states producers and retry behaviour.
+            CE::ActorBusy(_) => Self::Context {
+                msg: format!("{e}"),
+                code: codes::CTX_2130.to_owned(),
+            },
             // ADR-049 §10: actor poisoned (exceeded the respawn budget).
             // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
             // Swift / Kotlin caller can detect "dormant, needs operator
@@ -1476,6 +1495,14 @@ impl From<scp_core::context::ContextError> for ScpError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
+        // construction.md M2: the runtime's empty-ceiling rejection keeps its
+        // own validation code; every other creation failure is SCP-CTX-2002.
+        if let scp_core::context::builder::ContextCreationError::StateTransition(
+            inner @ scp_core::context::ContextError::CeilingRequired(_),
+        ) = e
+        {
+            return inner.into();
+        }
         Self::Context {
             msg: format!("context creation failed: {e} — check context parameters and identity"),
             code: codes::CTX_2002.to_owned(),
@@ -1897,7 +1924,8 @@ pub struct ContextParams {
     /// See spec §5.14.
     pub mode: ContextMode,
     /// Capability ceiling — maximum capabilities any participant can hold.
-    /// Empty list means no ceiling restriction.
+    /// Required and non-empty (construction.md M2): an empty list fails the
+    /// create with `SCP-VALID-7005`.
     pub ceiling: Vec<String>,
     /// Ceiling mutability policy — `Immutable` (default) or `Governed`.
     /// See spec §5.3.
@@ -19556,7 +19584,8 @@ mod tests {
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            // A create must declare a non-empty ceiling (construction.md M2).
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: CeilingPolicy::Immutable,
             governance: GovernanceModel::SingleAdmin,
             memory_scope: MemoryScope::Ephemeral,
@@ -23459,6 +23488,54 @@ mod tests {
             ScpError::Context { code, .. } => code,
             other => panic!("expected ScpError::Context, got {other:?}"),
         }
+    }
+
+    /// ADR-049 §10: `ContextError::ActorBusy` must surface the dedicated
+    /// SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001, as the
+    /// NAPI and `PyO3` translators do. The code reaches Swift and Kotlin only
+    /// where the failing operation routes its error through this translator.
+    #[test]
+    fn actor_busy_surfaces_ctx_2130() {
+        let err: ScpError = scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2130);
+    }
+
+    /// construction.md M2: a create that declared no usable ceiling surfaces
+    /// as a validation error, not a context error: an absent or null ceiling
+    /// with `SCP-VALID-7004`, an empty one with `SCP-VALID-7005`.
+    #[test]
+    fn ceiling_required_surfaces_valid_7004_or_7005() {
+        use scp_core::context::CeilingDeclaration as D;
+        for (declared, expected) in [
+            (D::Absent, codes::VALID_7004),
+            (D::Null, codes::VALID_7004),
+            (D::Empty, codes::VALID_7005),
+        ] {
+            let err: ScpError = scp_core::context::ContextError::CeilingRequired(declared).into();
+            match err {
+                ScpError::Validation { code, .. } => assert_eq!(code, expected, "{declared:?}"),
+                other => panic!("expected ScpError::Validation, got {other:?}"),
+            }
+        }
+    }
+
+    /// construction.md M2: the core's empty-ceiling rejection, which reaches
+    /// the bridge wrapped in `ContextCreationError::StateTransition`, keeps
+    /// `SCP-VALID-7005`; every other creation failure keeps `SCP-CTX-2002`.
+    #[test]
+    fn creation_ceiling_required_keeps_valid_7005() {
+        use scp_core::context::builder::ContextCreationError as CCE;
+        let err: ScpError = CCE::StateTransition(scp_core::context::ContextError::CeilingRequired(
+            scp_core::context::CeilingDeclaration::Empty,
+        ))
+        .into();
+        match err {
+            ScpError::Validation { code, .. } => assert_eq!(code, codes::VALID_7005),
+            other => panic!("expected ScpError::Validation, got {other:?}"),
+        }
+        let err: ScpError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingImmutable).into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
     }
 
     /// ADR-049 §10: a poisoned context must surface the dedicated

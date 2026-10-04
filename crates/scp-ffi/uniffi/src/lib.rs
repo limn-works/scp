@@ -809,7 +809,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,
@@ -872,7 +872,7 @@ mod tests {
 
         let params = bridge::ContextParams {
             mode: bridge::ContextMode::Encrypted,
-            ceiling: Vec::new(),
+            ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,

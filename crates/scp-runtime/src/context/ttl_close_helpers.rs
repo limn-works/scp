@@ -925,9 +925,9 @@ pub async fn finalize_close(
     // freed when `PerContextState` drops — but a closed actor STAYS registered (its
     // `state` is NOT dropped here), so without an explicit dispose the crypto would
     // linger live. `dispose_secrets` runs OpenMLS `destroy_group`, which eagerly
-    // frees the group NOW; the Ed25519 signer is freed, NOT zeroized
-    // (`SignatureKeyPair` has no `Zeroize`, scp-mls #82) — same as a bare drop,
-    // just eager; the sender key zeroizes on its own drop. Full scope retains keys
+    // frees the group NOW; the Ed25519 signer zeroizes on drop
+    // (`SignatureKeyPair` holds its private key in `SecretVLBytes`) — same as a
+    // bare drop, just eager; the sender key zeroizes on its own drop. Full scope retains keys
     // (readable after close), so it is
     // skipped. A broadcast context carries no `ContextCryptoState`
     // (`crypto_mut() == None`), a clean no-op there.
@@ -1071,10 +1071,12 @@ fn persist_state_best_effort<'d, 'c>(
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
-        Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
+        Ok(crypto_state) => {
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
+        }
         Err(e) => {
             snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = Vec::new();
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,

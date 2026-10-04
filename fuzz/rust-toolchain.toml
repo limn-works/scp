@@ -11,11 +11,14 @@
 #     compiler cargo resolved is not a nightly, naming `RUSTUP_TOOLCHAIN` as the thing that
 #     overrides this file when it is set.
 #
-# THE PINNED DATE is the last nightly the fuzz crate compiles on. Nightlies after
-# 2026-05-03 tightened the `pub(crate)` re-export rules (E0365) and reject openmls 0.8.1's
-# `pub use crate::ciphersuite::signature::*` at prelude.rs:16. Unpin to `nightly` once
-# openmls publishes a fix, or once `crates/scp-runtime` moves to a version that re-exports
-# under the new rules.
+# THE CHANNEL is a dated nightly, so a local run and CI compile on the same compiler; an
+# undated `nightly` resolves to whatever each machine installed last. The date is
+# 2026-09-28 (rustc 1.101.0-nightly d080e7dff 2026-09-27), the nightly on which
+# `cd fuzz && cargo check` was last run and passed. openmls 0.9.0's prelude still
+# glob-re-exports its `pub(crate) use signature::*`, as 0.8.1's did. Some nightlies after
+# 2026-05-03 rejected that re-export (E0365); this one accepts it again, and a later
+# nightly that tightens E0365 again would break this build. Move the date only to a
+# nightly on which `cd fuzz && cargo check` passes.
 #
 # A command run from the repository root resolves the STABLE pin instead, because rustup
 # applies the toolchain file of the directory the command runs in, and cargo-fuzz refuses
@@ -33,5 +36,5 @@
 # the channel below in one job and passes it on the command line, where an explicit
 # `+toolchain` sets `RUSTUP_TOOLCHAIN` for the command and everything it spawns.
 [toolchain]
-channel = "nightly-2026-05-03"
+channel = "nightly-2026-09-28"
 components = ["rust-analyzer"]

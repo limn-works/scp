@@ -21,7 +21,6 @@ derives the version from that file:
 | `cargo`, `rustup` | natively, for any command run inside the repository; rustup installs the `channel`, `components`, and `targets` the file names on first use |
 | `Dockerfile` | copies the file into the builder image before the first cargo command; the base tag names a Debian release only |
 | `templates/personal-relay/README.md` | its `COPY . .` brings the file into the image, for the same reason |
-| the CI workflows | their `dtolnay/rust-toolchain@stable` steps select no version — that action reads no toolchain file — so each one installs rustup's `stable` and runs `rustup default stable`, and rustup then applies `rust-toolchain.toml` as a directory override, which beats the default |
 
 `fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs, because
 cargo-fuzz does not run on stable. rustup applies the toolchain file of the directory a
@@ -93,13 +92,13 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
-| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
-| `python` | `python-test` runs `maturin develop --release`, and `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
-| `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-optional-features`, `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --profile ci-bridge`, `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, and `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
+| `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
 | `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
-| `kotlin` | `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing` |
-| `swift` | `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`, which calls `cargo build` |
+| `kotlin` | `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `bridge-parity-kotlin` downloads both uploads |
+| `swift` | `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, which calls `cargo build`, and `pyo3-module-macos` runs `maturin develop --profile ci-bridge`; `swift-build-test` downloads the XCFramework and `bridge-parity-swift` downloads both |
 
 Rather than list the pin in seven filters, the `changes` job declares one `toolchain`
 filter and ORs it into every lane's output, so the workflow names each file that filter
@@ -192,7 +191,11 @@ against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36.
 #![forbid(unsafe_code)]
 ```
 
-Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace. If an FFI bridge crate requires unsafe (e.g., cbindgen C ABI), it is the sole exception and must document every `unsafe` block with a `// SAFETY:` comment explaining the invariant.
+Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace, with two exceptions, and each exception documents every `unsafe` block with a `// SAFETY:` comment explaining the invariant:
+- an FFI bridge crate that requires unsafe (e.g., cbindgen C ABI);
+- `crates/scp-alloc`, the wiping global allocator, whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its `GlobalAlloc` implementation and on the wipe routine that implementation calls.
+
+`crates/scp-alloc/src/lib.rs` holds the workspace's one `#[global_allocator]` static. The crate root of each shipped binary and cdylib (`scp-node`, `scp-relay`, `scp-ffi`, `scp-ffi-napi`, `scp-ffi-uniffi`, and `scp-client-wasm`) links that static with `use scp_alloc as _;` and defines no global allocator of its own, because §9.15 of the security-model spec (freed heap memory) requires every shipped artifact to wipe each heap block before freeing it.
 
 Additional enforced rules:
 - No `unwrap()` or `expect()` in library code — use `?` with typed errors
@@ -290,8 +293,12 @@ proptest! {
 
 SCP uses cargo-fuzz (libFuzzer) for parser safety and security invariant testing at trust
 boundaries. The fuzz crate lives at `fuzz/` (repo root) — a **standalone crate, not a
-workspace member**. All `cargo fuzz` commands require the one nightly that `fuzz/rust-toolchain.toml` pins —
-nightlies after that date reject openmls 0.8.1's prelude re-export (E0365):
+workspace member**. Every `cargo fuzz` command runs from inside `fuzz/`, on the dated nightly
+that `fuzz/rust-toolchain.toml` pins, because some nightlies reject openmls 0.9.0's prelude
+glob re-export (E0365). The exception is `.github/workflows/fuzz.yml`, whose `cargo fuzz`
+commands run from the repository root with `--fuzz-dir fuzz` and name that same nightly
+explicitly as `cargo +<channel>`, the channel its `toolchain` job reads from
+`fuzz/rust-toolchain.toml`:
 
 ```sh
 cd fuzz && cargo fuzz list          # list all 27 targets
@@ -505,7 +512,8 @@ Every push to a PR branch. Target: < 3 minutes.
 |-----|---------|---------|
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
 | clippy | ubuntu-latest | The five `cargo clippy` commands the CI Commands section above gives: the workspace sweep, the optional-transport lint, and the three commands that lint the PostgreSQL and S3 blob backends |
-| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives. |
+| test | ubuntu-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives, among its other optional-feature commands. That job splits its commands into three matrix groups: of those three commands, `transport` runs the scp-transport one and `node-relay` runs the scp-node and scp-relay ones, and `platform-testing` runs none of them. |
+| test (macOS) | macos-latest | Job `rust-test-macos` in `.github/workflows/ci.yml` tests scp-transport and scp-platform. |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
 | doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
@@ -514,7 +522,7 @@ Unit tests and conformance macro suites (`transport_conformance!()`, `storage_co
 
 ### Tier 2 — Merge Gate
 
-Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+Merge queue entry. Target: < 10 minutes. Required to merge.
 
 | Job | Runs on | Command |
 |-----|---------|---------|

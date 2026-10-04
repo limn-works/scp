@@ -62,6 +62,15 @@ describe("type definitions", () => {
     expect(params.ceiling).toHaveLength(2);
   });
 
+  it("ContextParams rejects an omitted ceiling at compile time", () => {
+    // Type-level: the typecheck fails if `ceiling` becomes optional again,
+    // because the directive below would then be unused. The real-addon test
+    // in real-napi.test.ts checks the runtime rejection.
+    // @ts-expect-error `ceiling` is required (construction.md M2).
+    const params: ContextParams = { mode: "Encrypted" };
+    expect(params.ceiling).toBeUndefined();
+  });
+
   it("ContextParams accepts all optional fields", () => {
     const params: ContextParams = {
       ceiling: ["messages:read"],

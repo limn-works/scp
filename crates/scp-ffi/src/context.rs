@@ -248,12 +248,11 @@ impl PyContextHandle {
 
 /// Context creation parameters, constructed from a Python dict.
 ///
-/// The dict may contain any of these keys (all optional):
-/// - `ceiling` -- list of capability strings. Omitting this key, or passing
-///   `None`, declares no ceiling and gets `default_ceiling()`. Passing `[]`
-///   declares a ceiling that grants nothing, and the supervisor creates the
-///   context under that deny-all ceiling rather than reading the empty list as
-///   an omission.
+/// The dict carries a required `ceiling` and any of the optional keys below:
+/// - `ceiling` -- required non-empty list of capability strings
+///   (construction.md M2). Omitting this key or passing `None` raises
+///   `ValidationError` with `SCP-VALID-7004`, and passing `[]` raises it with
+///   `SCP-VALID-7005`; no default ceiling is substituted.
 /// - `roles` -- dict mapping role names to lists of capability strings
 /// - `outlets` -- list of outlet name strings
 /// - `ttl` -- float (seconds) or `None`
@@ -265,16 +264,20 @@ impl PyContextHandle {
 /// - `template_id` -- optional string: template identifier (spec §5.14)
 /// - `economic_policy` -- optional JSON string: economic policy (spec §19)
 ///
-/// Unrecognized keys are silently ignored. Missing keys use protocol defaults.
+/// Unrecognized keys are silently ignored. A missing optional key uses its
+/// protocol default.
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyContextParams {
     /// Capability ceiling -- maximum capabilities any participant can hold.
     ///
-    /// This field holds the ceiling the context runs under, so
-    /// `from_py_dict` has already resolved an absent declaration to
-    /// `default_ceiling()` and an empty list stands for a deny-all ceiling.
-    /// No later stage substitutes a default into it.
+    /// This field holds the ceiling the context runs under, and no later
+    /// stage substitutes a default into it. `from_py_dict` rejects an absent,
+    /// `None`, or empty declaration. `from_core_params`, which builds a Welcome
+    /// joiner's params, copies the joined context's signed ceiling as it is:
+    /// the runtime rejects an empty ceiling on a local create (see
+    /// `ContextError::CeilingRequired`), but a joiner does not re-check the
+    /// ceiling another member's software created the context with.
     ceiling: Vec<String>,
     /// Role definitions mapping role names to capability lists.
     roles: HashMap<String, Vec<String>>,
@@ -323,15 +326,17 @@ impl PyContextParams {
     ///
     /// # Arguments
     ///
-    /// * `params` -- A Python dict with optional keys: `ceiling`, `roles`,
-    ///   `outlets`, `ttl`, `memory_scope`, `governance`, `mode`,
-    ///   `ceiling_policy`, `promotion_policy`, `template_id`,
-    ///   `economic_policy`.
+    /// * `params` -- A Python dict with a required non-empty `ceiling` list
+    ///   and optional keys `roles`, `outlets`, `ttl`, `memory_scope`,
+    ///   `governance`, `mode`, `ceiling_policy`, `promotion_policy`,
+    ///   `template_id`, `economic_policy`.
     ///
     /// # Errors
     ///
-    /// Returns `TypeError` if a value has an unexpected type, or `ValueError`
-    /// if a value is out of the valid set.
+    /// Returns `ValidationError` (`SCP-VALID-7004` if `ceiling` is absent or
+    /// `None`, `SCP-VALID-7005` if it is empty), `TypeError` if a value has an
+    /// unexpected type, or
+    /// `ValueError` if a value is out of the valid set.
     #[new]
     fn new(params: &Bound<'_, PyDict>) -> PyResult<Self> {
         Self::from_py_dict(params)
@@ -475,6 +480,33 @@ impl PyContextParams {
     }
 }
 
+/// The Python exception for a failed supervisor call named `op`.
+///
+/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130`, as the
+/// NAPI and `UniFFI` bridges report it (its doc states producers and retry
+/// behaviour); every other variant raises the uncoded `RuntimeError` this
+/// call site raised before.
+fn busy_or(op: &str, e: &scp_core::context::ContextError) -> PyErr {
+    actor_busy_error(op, e).map_or_else(
+        || PyRuntimeError::new_err(format!("{op} failed: {e}")),
+        PyErr::from,
+    )
+}
+
+/// The `SCP-CTX-2130` error [`busy_or`] raises for `ContextError::ActorBusy`,
+/// or `None` for every other variant.
+fn actor_busy_error(
+    op: &str,
+    e: &scp_core::context::ContextError,
+) -> Option<crate::error::ScpPyError> {
+    matches!(e, scp_core::context::ContextError::ActorBusy(_)).then(|| {
+        crate::error::ScpPyError::ContextError {
+            message: format!("{op} failed: {e}"),
+            code: codes::CTX_2130.to_owned(),
+        }
+    })
+}
+
 /// Valid template ID strings accepted from the Python bridge layer.
 ///
 /// These correspond to the `TemplateId` variants in scp-core, using the
@@ -504,18 +536,38 @@ impl PyContextParams {
     /// implemented by a parallel subagent) and uses `PyO3` extraction directly.
     #[allow(clippy::too_many_lines)] // Flat field-by-field extraction with validation.
     fn from_py_dict(dict: &Bound<'_, PyDict>) -> PyResult<Self> {
-        // ceiling: list[str] (default: `default_ceiling()`).
+        // ceiling: list[str], required and non-empty (construction.md M2).
         //
-        // An absent key and a `None` value both mean "this caller declared no
-        // ceiling", and `default_ceiling`'s own doc comment states that every
-        // FFI bridge applies it "when no explicit ceiling is provided". A
-        // supplied list stands as written, so an empty list declares a ceiling
-        // that grants nothing rather than reading as an absent key — a caller
-        // that writes `ceiling=[]` means a deny-all context and gets one.
+        // An absent key or a `None` value declares no ceiling, which would
+        // leave the context's security boundary to a default nobody chose; an
+        // empty list declares a context no member can use. All three raise
+        // `ContextError::CeilingRequired` (`ValidationError`; SCP-VALID-7004
+        // for an absent key or `None`, SCP-VALID-7005 for an empty list)
+        // before any context state exists. A non-empty list stands as written.
+        let ceiling_required = |declared| -> PyErr {
+            crate::error::ScpPyError::from(scp_core::context::ContextError::CeilingRequired(
+                declared,
+            ))
+            .into()
+        };
         let ceiling: Vec<String> = match dict.get_item("ceiling")? {
             Some(val) if !val.is_none() => val.extract()?,
-            Some(_) | None => default_ceiling_strings(),
+            Some(_) => {
+                return Err(ceiling_required(
+                    scp_core::context::CeilingDeclaration::Null,
+                ));
+            }
+            None => {
+                return Err(ceiling_required(
+                    scp_core::context::CeilingDeclaration::Absent,
+                ));
+            }
         };
+        if ceiling.is_empty() {
+            return Err(ceiling_required(
+                scp_core::context::CeilingDeclaration::Empty,
+            ));
+        }
 
         // roles: dict[str, list[str]] (default: empty)
         let roles: HashMap<String, Vec<String>> = match dict.get_item("roles")? {
@@ -1545,22 +1597,16 @@ fn build_core_context_params(
         governance_voters: None,
     };
 
-    // `PyContextParams::from_py_dict` already resolved an absent ceiling to
-    // `default_ceiling()`, so `py_params.ceiling` holds the ceiling this
-    // context runs under and this function passes it through unchanged.
-    // Substituting a default HERE would read an explicitly empty list as an
-    // absent one, and a caller that wrote `ceiling=[]` to build a deny-all
-    // context would silently receive eleven capabilities.
+    // `PyContextParams::from_py_dict` already rejected an absent, `None`, or
+    // empty ceiling, so `py_params.ceiling` holds the non-empty ceiling the
+    // caller declared and this function passes it through unchanged.
     build_context_params(&common).map_err(PyRuntimeError::new_err)
 }
 
-/// `default_ceiling()` rendered as the `{resource}:{action}` capability strings
-/// a Python caller supplies.
-///
-/// `PyContextParams` carries a caller's vocabulary, and
-/// `build_core_context_params` hands that vocabulary to the shared parser, so a
-/// default this bridge substitutes has to arrive in the same form a caller
-/// would have written.
+/// `default_ceiling()` rendered as the capability strings a Python caller
+/// writes in `ceiling`. Test fixtures use it to declare every capability in
+/// `default_ceiling()`; `context_create` substitutes no default ceiling.
+#[cfg(test)]
 pub(crate) fn default_ceiling_strings() -> Vec<String> {
     scp_core::context::roles::default_ceiling()
         .iter()
@@ -2473,7 +2519,15 @@ impl crate::scp::PyScp {
             rt.block_on(async move {
                 sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
                     .await
-                    .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+                    .map_err(|e| match e {
+                        // The core's empty-ceiling rejection stays typed so
+                        // it surfaces with its validation code
+                        // (construction.md M2).
+                        scp_core::context::builder::ContextCreationError::StateTransition(
+                            inner @ scp_core::context::ContextError::CeilingRequired(_),
+                        ) => inner,
+                        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
+                    })?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
@@ -2490,7 +2544,14 @@ impl crate::scp::PyScp {
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
-                PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
+                match e {
+                    scp_core::context::ContextError::CeilingRequired(_) => {
+                        PyErr::from(crate::error::ScpPyError::from(e))
+                    }
+                    other => PyRuntimeError::new_err(format!(
+                        "ContextManager create_context failed: {other}"
+                    )),
+                }
             })?;
         }
 
@@ -2823,7 +2884,7 @@ impl crate::scp::PyScp {
         let owning = scp_did::DID(owning_did.to_owned());
         let (reservation_id, kp_public) = rt
             .block_on(async move { sup.reserve_key_package(owning).await })
-            .map_err(|e| PyRuntimeError::new_err(format!("reserve_key_package failed: {e}")))?;
+            .map_err(|e| busy_or("reserve_key_package", &e))?;
         Ok((reservation_id.to_string(), kp_public))
     }
 
@@ -3014,9 +3075,7 @@ impl crate::scp::PyScp {
                 Ok(handle) => handle,
                 Err(e) => {
                     crate::runtime::remove_context(bi, &sealed.context_id);
-                    return Err(PyRuntimeError::new_err(format!(
-                        "context_join_from_welcome failed: {e}"
-                    )));
+                    return Err(busy_or("context_join_from_welcome", &e));
                 }
             };
 
@@ -3108,9 +3167,10 @@ impl crate::scp::PyScp {
     /// invitations are not yet implemented).
     ///
     /// The invite routes through the actor governance gate, which requires the
-    /// inviter to hold the `governance:propose` capability (a normally-created
-    /// `SingleAdmin` context grants its admin that capability at genesis, so it
-    /// works out of the box; a custom ceiling must grant it).
+    /// inviter to hold the `governance:propose` capability. The creator of a
+    /// `SingleAdmin` context holds the admin role, which grants every
+    /// capability in the context's declared ceiling, so the creator can invite
+    /// only when that ceiling includes `governance:propose`.
     ///
     /// # Arguments
     ///
@@ -3166,8 +3226,7 @@ impl crate::scp::PyScp {
         // `.zeroize()` call — is what triggers the wipe here.
         drop(signing_key);
 
-        let outcome =
-            outcome.map_err(|e| PyRuntimeError::new_err(format!("invite_member failed: {e}")))?;
+        let outcome = outcome.map_err(|e| busy_or("invite_member", &e))?;
         Ok(PyInviteMemberOutcome::from_outcome(outcome))
     }
 
@@ -6340,6 +6399,7 @@ mod tests {
         let params = Python::with_gil(|py| {
             let dict = PyDict::new(py);
             dict.set_item("mode", mode).unwrap();
+            dict.set_item("ceiling", vec!["messages:read"]).unwrap();
             // A broadcast context supports only the `full` memory scope, so the
             // supervisor refuses to create one with the `ephemeral` default.
             if mode == "broadcast" {
@@ -6475,6 +6535,7 @@ mod tests {
         let encrypted_err = Python::with_gil(|py| {
             let dict = PyDict::new(py);
             dict.set_item("mode", "encrypted").unwrap();
+            dict.set_item("ceiling", vec!["messages:read"]).unwrap();
             scp.context_create("did:dht:z6MkNoSuchCreateCreatorEnc", &dict)
                 .expect_err("encrypted create without creator key material must hard-fail")
                 .to_string()
@@ -6491,6 +6552,7 @@ mod tests {
             dict.set_item("mode", "broadcast").unwrap();
             // Broadcast contexts require MemoryScope::Full (spec §5.14).
             dict.set_item("memory_scope", "full").unwrap();
+            dict.set_item("ceiling", vec!["messages:read"]).unwrap();
             scp.context_create("did:dht:z6MkNoSuchCreateCreatorBcast", &dict)
                 .expect("broadcast create must succeed without pseudonym derivation")
         });
@@ -6788,6 +6850,24 @@ mod tests {
             let creator_did = creator.did().to_owned();
             let params = PyDict::new(py);
             params.set_item("mode", "encrypted").unwrap();
+            params
+                .set_item(
+                    "ceiling",
+                    vec![
+                        "messages:read",
+                        "messages:write",
+                        "outlet:register",
+                        "outlet:query:*",
+                        "outlet:call:*",
+                        "role:assign",
+                        "member:invite",
+                        "member:remove",
+                        "governance:propose",
+                        "governance:vote",
+                        "context:close",
+                    ],
+                )
+                .unwrap();
             params.set_item("governance", "single_admin").unwrap();
             let _handle = scp
                 .context_create(&creator_did, &params)
@@ -6862,6 +6942,24 @@ mod tests {
 
             let params = PyDict::new(py);
             params.set_item("mode", "encrypted").unwrap();
+            params
+                .set_item(
+                    "ceiling",
+                    vec![
+                        "messages:read",
+                        "messages:write",
+                        "outlet:register",
+                        "outlet:query:*",
+                        "outlet:call:*",
+                        "role:assign",
+                        "member:invite",
+                        "member:remove",
+                        "governance:propose",
+                        "governance:vote",
+                        "context:close",
+                    ],
+                )
+                .unwrap();
             let handle = scp
                 .context_create(&creator_did, &params)
                 .expect("encrypted context_create with a custodied creator succeeds");
@@ -7690,7 +7788,10 @@ mod tests {
         let rt = crate::runtime().unwrap();
         rt.block_on(sup.create_context(
             ctx_id.clone(),
-            scp_core::context::ContextParams::default(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
             scp_did::DID(creator.to_owned()),
             None,
         ))
@@ -7933,8 +8034,8 @@ mod tests {
         let bi = __bi();
         let context_id = format!("{prefix}{}", "0".repeat(56));
         crate::runtime::init_context_manager_for_test(&bi);
-        // Both copies carry the ceiling `context_create` gives a caller who
-        // declared none; the close fixture needs the creator's `context:close`.
+        // Both copies carry every capability in `default_ceiling()`; the close
+        // fixture needs the creator's `context:close`.
         let ceiling = super::default_ceiling_strings();
         crate::runtime::register_context(&bi, &context_id, creator_did, &ceiling)
             .expect("fixture registration");
@@ -7958,6 +8059,8 @@ mod tests {
     ) -> PyContextHandle {
         let params = Python::with_gil(|py| {
             let dict = PyDict::new(py);
+            dict.set_item("ceiling", super::default_ceiling_strings())
+                .unwrap();
             PyContextParams::from_py_dict(&dict).unwrap()
         });
         let handle =
@@ -8206,7 +8309,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Ceiling: an absent declaration and an empty one are different
+    // Ceiling: required and non-empty (construction.md M2)
     // -------------------------------------------------------------------
 
     /// Build a `PyContextParams` from a Python dict, so a case exercises the
@@ -8221,72 +8324,104 @@ mod tests {
         })
     }
 
-    /// A dict carrying no `ceiling` key declares no ceiling, and
-    /// `default_ceiling`'s doc comment states that every FFI bridge applies
-    /// that default "when no explicit ceiling is provided".
+    /// `busy_or` raises `SCP-CTX-2130` for `ContextError::ActorBusy` and keeps
+    /// the uncoded `RuntimeError` for every other variant, on the
+    /// `reserve_key_package`, `context_join_from_welcome` and `invite_member`
+    /// failure paths.
     #[test]
-    fn absent_ceiling_gets_the_documented_default() {
+    fn busy_or_raises_ctx_2130_only_for_actor_busy() {
+        use scp_core::context::ContextError;
+        match super::actor_busy_error(
+            "reserve_key_package",
+            &ContextError::ActorBusy("key-package actor".to_owned()),
+        ) {
+            Some(crate::error::ScpPyError::ContextError { message, code }) => {
+                assert_eq!(code, codes::CTX_2130);
+                assert!(
+                    message.starts_with("reserve_key_package failed: "),
+                    "{message}"
+                );
+            }
+            other => panic!("expected an SCP-CTX-2130 ContextError, got {other:?}"),
+        }
+        assert!(
+            super::actor_busy_error(
+                "context_join_from_welcome",
+                &ContextError::MembershipFailed("bad welcome".to_owned()),
+            )
+            .is_none(),
+            "a non-busy failure keeps the uncoded RuntimeError"
+        );
+        pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let dict = PyDict::new(py);
-            let parsed = PyContextParams::from_py_dict(&dict).unwrap();
-
-            let expected: HashSet<String> = scp_core::context::roles::default_ceiling()
-                .iter()
-                .map(|cap| cap.name().into_owned())
-                .collect();
-            let actual: HashSet<String> = parsed.ceiling.iter().cloned().collect();
-            assert_eq!(actual, expected, "an absent ceiling gets default_ceiling()");
-
-            let core = super::build_core_context_params(&parsed).unwrap();
-            assert_eq!(
-                core.ceiling.len(),
-                expected.len(),
-                "the supervisor receives the same default, parsed back into capabilities"
+            let busy = super::busy_or("invite_member", &ContextError::ActorBusy("c".to_owned()));
+            assert!(
+                busy.is_instance_of::<crate::error::ContextError>(py),
+                "ActorBusy raises ContextError, got {busy}"
+            );
+            assert!(busy.to_string().contains(codes::CTX_2130), "{busy}");
+            let other = super::busy_or(
+                "invite_member",
+                &ContextError::MembershipFailed("x".to_owned()),
+            );
+            assert!(
+                other.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "a non-busy failure raises RuntimeError, got {other}"
             );
         });
     }
 
-    /// A `ceiling` key holding Python `None` declares no ceiling, exactly as an
-    /// absent key does, because a Python caller spells "unset" that way.
-    #[test]
-    fn none_ceiling_gets_the_documented_default() {
+    /// Asserts `result` is the `ValidationError` carrying `code` and naming
+    /// `detail`.
+    fn assert_ceiling_required<T>(result: PyResult<T>, code: &str, detail: &str) {
+        let Err(err) = result else {
+            panic!("expected {code} naming {detail:?}, got Ok");
+        };
         Python::with_gil(|py| {
-            let dict = PyDict::new(py);
-            dict.set_item("ceiling", py.None()).unwrap();
-            let parsed = PyContextParams::from_py_dict(&dict).unwrap();
-
-            assert_eq!(
-                parsed.ceiling.len(),
-                scp_core::context::roles::default_ceiling().iter().count(),
-                "a None ceiling gets default_ceiling()"
+            assert!(
+                err.is_instance_of::<crate::error::ValidationError>(py),
+                "expected ValidationError, got {err}"
             );
         });
+        let text = err.to_string();
+        assert!(
+            text.contains(code) && text.contains(detail),
+            "expected {code} naming {detail:?}, got: {text}"
+        );
     }
 
-    /// An empty list declares a ceiling that grants nothing. Reading it as an
-    /// absent declaration would hand a caller who asked for a deny-all context
-    /// the eleven capabilities `default_ceiling()` carries.
+    /// A dict carrying no `ceiling` key rejects as a missing required field
+    /// (`SCP-VALID-7004`): no default is substituted.
     #[test]
-    fn empty_ceiling_list_stays_empty() {
-        Python::with_gil(|py| {
+    fn absent_ceiling_rejects() {
+        pyo3::prepare_freethreaded_python();
+        assert_ceiling_required(
+            params_from_dict(&[]),
+            codes::VALID_7004,
+            "no `ceiling` was declared",
+        );
+    }
+
+    /// A `ceiling` key holding Python `None` rejects as a missing required
+    /// field (`SCP-VALID-7004`), exactly as an absent key does.
+    #[test]
+    fn none_ceiling_rejects() {
+        pyo3::prepare_freethreaded_python();
+        let result =
+            Python::with_gil(|py| params_from_dict(&[("ceiling", py.None().into_bound(py))]));
+        assert_ceiling_required(result, codes::VALID_7004, "`ceiling` is null or None");
+    }
+
+    /// An empty list rejects as an invalid field value (`SCP-VALID-7005`): it
+    /// describes a context no member can use.
+    #[test]
+    fn empty_ceiling_list_rejects() {
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
             let empty: Vec<String> = Vec::new();
-            let parsed =
-                params_from_dict(&[("ceiling", empty.into_pyobject(py).unwrap().into_any())])
-                    .unwrap();
-
-            assert!(
-                parsed.ceiling.is_empty(),
-                "an explicitly empty ceiling declares a deny-all context, got {:?}",
-                parsed.ceiling
-            );
-
-            let core = super::build_core_context_params(&parsed).unwrap();
-            assert!(
-                core.ceiling.is_empty(),
-                "the supervisor receives that deny-all ceiling, got {:?}",
-                core.ceiling
-            );
+            params_from_dict(&[("ceiling", empty.into_pyobject(py).unwrap().into_any())])
         });
+        assert_ceiling_required(result, codes::VALID_7005, "`ceiling` is an empty list");
     }
 
     /// A supplied ceiling stands as written: no default is unioned into it.
@@ -8311,8 +8446,9 @@ mod tests {
     }
 
     /// `default_ceiling_strings` renders capabilities in the vocabulary the
-    /// shared parser accepts, so the default this bridge substitutes survives
-    /// the round trip into `ContextParams`.
+    /// shared parser accepts, so a fixture that declares every capability in
+    /// `default_ceiling()` through it gets exactly those capabilities in
+    /// `ContextParams`.
     #[test]
     fn default_ceiling_strings_round_trip_through_the_parser() {
         let strings = super::default_ceiling_strings();
@@ -8341,73 +8477,79 @@ mod tests {
         );
     }
 
-    /// Creates a context through `context_create` with `ceiling` set to
-    /// `ceiling` (or no `ceiling` key when `None`), then reads the role state
-    /// the SUPERVISOR holds for it through `get_role_state_checked`, and
-    /// returns that role state's ceiling and whether it grants the creator
-    /// `messages:write`. No bridge copy is read.
+    /// `context_create` rejects a dict whose ceiling is absent or `None` with
+    /// `SCP-VALID-7004` and one whose ceiling is an empty list with
+    /// `SCP-VALID-7005`, and creates a context whose
+    /// supervisor-held role state carries a non-empty declared ceiling as
+    /// written. The accepted case proves the check does not reject every
+    /// create. No bridge copy is read.
+    #[test]
     #[cfg(feature = "testing")]
-    fn supervisor_ceiling_of_created_context(
-        ceiling: Option<Vec<String>>,
-    ) -> (scp_core::context::roles::CapabilityCeiling, bool) {
+    fn context_create_rejects_an_absent_none_or_empty_ceiling() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
         Python::with_gil(|py| {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
             let creator = scp.identity_create(py, "in_memory", None).unwrap();
             let creator_did = creator.did().to_owned();
-            let params = PyDict::new(py);
-            params.set_item("mode", "encrypted").unwrap();
-            params.set_item("governance", "single_admin").unwrap();
-            if let Some(ceiling) = ceiling {
-                params.set_item("ceiling", ceiling).unwrap();
+            let params_with = |ceiling: Option<Bound<'_, PyAny>>| {
+                let params = PyDict::new(py);
+                params.set_item("mode", "encrypted").unwrap();
+                params.set_item("governance", "single_admin").unwrap();
+                if let Some(ceiling) = ceiling {
+                    params.set_item("ceiling", ceiling).unwrap();
+                }
+                params
+            };
+            let empty: Vec<String> = Vec::new();
+            for (ceiling, code, detail) in [
+                (None, codes::VALID_7004, "no `ceiling` was declared"),
+                (
+                    Some(py.None().into_bound(py)),
+                    codes::VALID_7004,
+                    "`ceiling` is null or None",
+                ),
+                (
+                    Some(empty.into_pyobject(py).unwrap().into_any()),
+                    codes::VALID_7005,
+                    "`ceiling` is an empty list",
+                ),
+            ] {
+                assert_ceiling_required(
+                    scp.context_create(&creator_did, &params_with(ceiling)),
+                    code,
+                    detail,
+                );
             }
+
+            let declared = vec!["messages:write".to_owned()];
             let handle = scp
-                .context_create(&creator_did, &params)
-                .expect("context_create succeeds");
+                .context_create(
+                    &creator_did,
+                    &params_with(Some(declared.into_pyobject(py).unwrap().into_any())),
+                )
+                .expect("a non-empty ceiling creates the context");
             let sup = Arc::clone(crate::runtime::supervisor(&scp.inner).unwrap());
             let role_state = crate::runtime()
                 .unwrap()
                 .block_on(sup.get_role_state_checked(&handle.context_id))
                 .expect("the supervisor answers the role-state read")
                 .expect("the supervisor serves the created context");
-            let grants_write = role_state.member_has_capability(
-                &creator_did,
-                &scp_core::context::roles::Capability::MessagesWrite,
+            assert_eq!(
+                role_state.ceiling(),
+                &scp_core::context::roles::CapabilityCeiling::new([
+                    scp_core::context::roles::Capability::MessagesWrite
+                ]),
+                "the supervisor holds the declared ceiling as written"
             );
-            (role_state.ceiling().clone(), grants_write)
-        })
-    }
-
-    /// The supervisor holds a `ceiling=[]` context at an empty ceiling, so
-    /// its role state grants the creator nothing, and holds a context that
-    /// declared no ceiling at `default_ceiling()`, which grants the creator
-    /// `messages:write`. The default case is what makes the deny-all case
-    /// mean something: a create path that dropped every ceiling entry would
-    /// pass the first half and fail the second.
-    #[test]
-    #[cfg(feature = "testing")]
-    fn supervisor_holds_an_empty_ceiling_as_deny_all_and_an_absent_one_as_the_default() {
-        let (deny_all, deny_all_grants) = supervisor_ceiling_of_created_context(Some(Vec::new()));
-        assert!(
-            deny_all.is_empty(),
-            "a `[]` context must hold an empty ceiling in the supervisor, got: {deny_all:?}"
-        );
-        assert!(
-            !deny_all_grants,
-            "the supervisor must grant nothing in a `[]` context"
-        );
-
-        let (declared_none, default_grants) = supervisor_ceiling_of_created_context(None);
-        assert_eq!(
-            declared_none,
-            scp_core::context::roles::default_ceiling(),
-            "a context that declared no ceiling runs under default_ceiling()"
-        );
-        assert!(
-            default_grants,
-            "the creator holds messages:write under default_ceiling()"
-        );
+            assert!(
+                role_state.member_has_capability(
+                    &creator_did,
+                    &scp_core::context::roles::Capability::MessagesWrite,
+                ),
+                "the supervisor grants the creator the declared messages:write"
+            );
+        });
     }
 
     #[test]
@@ -8970,7 +9112,10 @@ class SignOnlyCustody:
             let sup = Arc::clone(sup);
             rt.block_on(sup.create_context(
                 ctx_id.clone(),
-                scp_core::context::ContextParams::default(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
                 scp_did::DID(creator.clone()),
                 None,
             ))

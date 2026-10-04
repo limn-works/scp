@@ -541,10 +541,12 @@ fn handle_flush_snapshot_actor<'d>(
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
-        Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
+        Ok(crypto_state) => {
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
+        }
         Err(e) => {
             snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = Vec::new();
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -580,8 +582,8 @@ fn handle_flush_snapshot_actor<'d>(
 ///
 /// Per-actor body of the relocated sweep. Destroys this actor's
 /// per-context sender keys + MLS group + event log (in that order so
-/// secrets are released before structure tears down; the `SenderKey`s
-/// zeroize on drop, the MLS group/signer is freed — not zeroized, #82).
+/// secrets are released before structure tears down; the `SenderKey`s,
+/// the MLS Ed25519 signer, and the MLS provider-storage values zeroize on drop).
 /// Mirrors the
 /// per-context body of `shutdown_all_contexts_legacy`.
 ///
@@ -621,9 +623,9 @@ fn handle_shutdown_self_actor(
     // The reason to dispose explicitly here is EAGER release: this close leaves
     // the `PerContextState` alive (a later respawn rehydrates it), so nothing else
     // frees the crypto until the state eventually drops — `dispose_secrets`
-    // (OpenMLS `destroy_group`) releases it NOW. The Ed25519 signer is FREED, not
-    // zeroized (`SignatureKeyPair` has no `Zeroize`, scp-mls #82) — same as a bare
-    // drop, just eager.
+    // (OpenMLS `destroy_group`) releases it NOW. The Ed25519 signer zeroizes on
+    // drop (`SignatureKeyPair` holds its private key in `SecretVLBytes`) — same as
+    // a bare drop, just eager.
     // A broadcast context carries no `ContextCryptoState` (`crypto_mut() == None`)
     // so this is a clean no-op there. NOT marked `mutated`: shutdown must not
     // persist an emptied crypto over the durable snapshot (a later respawn

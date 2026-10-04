@@ -323,9 +323,10 @@ if (!scpAvailable) {
         // Encrypted SingleAdmin context: the creator can invite unilaterally.
         // The invite is routed through the actor's governance gate, which checks
         // the proposer's `governance:propose` capability before auto-executing —
-        // that is the ONLY capability enforced for the invite (a normally-created
-        // SingleAdmin context grants it at genesis); the ceiling below keeps the
-        // default SingleAdmin capability set. Mirrors the PyO3 reference
+        // that is the ONLY capability enforced for the invite. The SingleAdmin
+        // creator holds every capability in the declared ceiling, so the ceiling
+        // below declares `governance:propose`; a ceiling without it cannot
+        // invite. Mirrors the PyO3 reference
         // `test_invite_member_seals_for_single_admin_context`.
         const ctx = await scp.contextCreate(
           creator,
