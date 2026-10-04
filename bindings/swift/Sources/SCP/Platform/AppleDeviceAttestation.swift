@@ -45,18 +45,20 @@
         /// stored one or because the adapter discarded a rejected key's ID
         /// (`keyRejected`); call `attest` first.
         case keyNotFound
-        /// Apple already attested the stored App Attest key. Either the key
-        /// carries this adapter's attestation record, so
-        /// `attest(challenge:deviceId:)` called no App Attest method, or
-        /// `attestKey` answered `DCError.invalidKey` for a key with no record
-        /// and the key probe's assertion with that key succeeded, so the
-        /// adapter wrote the record.
+        /// Apple already attested the key `attest(challenge:deviceId:)`
+        /// named, although this adapter held no attestation record for it:
+        /// `attestKey` answered `DCError.invalidKey` and the key probe's
+        /// assertion with that key succeeded.
         ///
         /// Apple attests one key once: `DCError.h` lists a call to
         /// `attestKey:clientDataHash:completionHandler:` for a key already
-        /// attested as one cause of `DCError.invalidKey`. The adapter keeps
-        /// the key and its record, so `assertRequest(requestHash:)` keeps
-        /// asserting with the attested key.
+        /// attested as one cause of `DCError.invalidKey`. For the stored key,
+        /// the adapter keeps the key and records it as attested, so a later
+        /// `attest` generates a replacement key. For a replacement key, the
+        /// adapter discards the replacement key ID and writes no record,
+        /// because it holds no record that any call returned an attestation
+        /// naming that key, and `assertRequest(requestHash:)` keeps asserting
+        /// with the stored key.
         case keyAlreadyAttested(String)
         /// Apple answered the `generateAssertion` call of
         /// `assertRequest(requestHash:)` with `DCError.invalidKey` for a stored
@@ -74,12 +76,15 @@
         /// record cannot tell these apart, so the adapter keeps the key and
         /// asserts neither cause. The case name names the first cause only.
         case keyNotAttested(String)
-        /// Apple's App Attest service rejected the stored key, and the
-        /// adapter discarded its key ID and record. Either `generateAssertion`
-        /// answered `DCError.invalidKey` for a stored key that carries an
-        /// attestation record, or `attestKey` answered `DCError.invalidKey`
-        /// for a key with no record and the key probe's assertion with that
-        /// key answered `DCError.invalidKey` too.
+        /// Apple's App Attest service rejected the key an App Attest call
+        /// named, and the adapter discarded that key ID. Either
+        /// `generateAssertion` answered `DCError.invalidKey` for a stored key
+        /// that carries an attestation record, or `attestKey` answered
+        /// `DCError.invalidKey` for a key with no record and the key probe's
+        /// assertion with that key answered `DCError.invalidKey` too. For the
+        /// stored key, the adapter discards the key ID and its record. For a
+        /// replacement key, it discards the replacement key ID only, and the
+        /// stored key and its record stay.
         ///
         /// `DCError.h` lists an App Attest service rejecting the key as one
         /// cause of `DCError.invalidKey`. A later
@@ -161,11 +166,23 @@
         /// persisted.
         ///
         /// Apple attests one key once, so this record is what makes `attest`
-        /// call no App Attest method for the stored key, and it tells apart
-        /// the two conditions `generateAssertion` answers `DCError.invalidKey`
-        /// for. It holds a key ID rather than a flag, so a stale value cannot
-        /// describe a key ID that replaced the one it names.
+        /// generate a replacement key rather than hand the stored key to
+        /// `attestKey`, and it tells apart the two conditions
+        /// `generateAssertion` answers `DCError.invalidKey` for. It holds a
+        /// key ID rather than a flag, so a stale value cannot describe a key
+        /// ID that replaced the one it names.
         static let attestedAppAttestKeyId = "dev.limn.scp.appAttest.attestedKeyId"
+
+        /// `UserDefaults` key under which a key generated to replace an
+        /// attested key is persisted until Apple attests it.
+        ///
+        /// `appAttestKeyId` keeps naming the attested key until then, so an
+        /// `attestKey` failure on the replacement leaves `assertRequest` with
+        /// the key an earlier published attestation names. A replacement
+        /// becomes the stored key only when an `attestKey` call returns its
+        /// attestation object, because only that call hands a caller an
+        /// attestation that names the replacement.
+        static let replacementAppAttestKeyId = "dev.limn.scp.appAttest.replacementKeyId"
     }
 
     // ---------------------------------------------------------------------------
@@ -178,11 +195,14 @@
     ///
     /// Uses `DCAppAttestService` to generate a Secure Enclave-backed P-256 key
     /// and obtain an Apple-signed attestation certificate. The key ID is
-    /// persisted in `UserDefaults` so subsequent calls reuse the same key.
-    /// When `attestKey` returns an attestation object, the adapter records
-    /// that key ID as attested, beside the key ID. Apple attests one key
-    /// once, so an `attest` that reads a stored key carrying that record
-    /// throws `SCP-ATTEST-9021` and calls no App Attest method.
+    /// persisted in `UserDefaults`: assertions use the stored key, and an
+    /// attestation reuses it only while Apple has not attested it. When
+    /// `attestKey` returns an attestation object, the adapter records that
+    /// key ID as attested, beside the key ID. Apple attests one key once, so
+    /// an `attest` that reads a stored key carrying that record generates a
+    /// replacement key and attests it. The replacement is stored apart from
+    /// the attested key, and it becomes the stored key only when an
+    /// `attestKey` call returns its attestation object.
     ///
     /// ## Key lifecycle on error (ADR-025 acceptance criterion 3)
     ///
@@ -192,10 +212,13 @@
     /// leads to the key probe instead: `probeKey(_:after:call:)` asks
     /// `generateAssertion` for an assertion with that key over the
     /// client data `K` of `09-security-model.md` §9.3.1, and discards the
-    /// assertion. Two answers discard the key ID and its record
-    /// (`SCP-ATTEST-9023`): `generateAssertion` answering
-    /// `DCError.invalidKey` for a key that carries an attestation record,
-    /// and the key probe's assertion answering `DCError.invalidKey`.
+    /// assertion. Two answers discard a key ID (`SCP-ATTEST-9023`):
+    /// `generateAssertion` answering `DCError.invalidKey` for a key that
+    /// carries an attestation record, which discards the key ID and its
+    /// record, and the key probe's assertion answering `DCError.invalidKey`,
+    /// which discards the key ID `attestKey` named. A key probe assertion
+    /// that succeeds for a replacement key discards the replacement key ID
+    /// (`SCP-ATTEST-9021`).
     ///
     /// Attestation steps (per ADR-025 acceptance criterion 3):
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
@@ -246,13 +269,12 @@
     /// for no other call.
     ///
     /// One serialized call is the whole of one `attest` (`generateKey`, when
-    /// no key ID is stored, then `attestKey`, then the key probe's
+    /// neither a replacement key ID nor a stored key ID without an
+    /// attestation record is stored, then `attestKey`, then the key probe's
     /// `generateAssertion` when `attestKey` answers `DCError.invalidKey`) or
     /// one `assertRequest` (`generateAssertion`). It ends at the first of
-    /// four events: its key-ID read ends it without an App Attest call, with `SCP-ATTEST-9020`
-    /// when an `assertRequest` reads no stored key ID and with
-    /// `SCP-ATTEST-9021` when an `attest` reads a stored key that carries an
-    /// attestation record; Apple's
+    /// four events: its key-ID read ends it without an App Attest call, with
+    /// `SCP-ATTEST-9020`, when an `assertRequest` reads no stored key ID; Apple's
     /// answers end it (every answer from its App Attest methods except a
     /// `generateKey` answer that carries a key ID and no error, which leads
     /// to `attestKey`, and an `attestKey` answer of `DCError.invalidKey`,
@@ -446,17 +468,19 @@
         ///
         /// On a real device with App Attest available:
         /// 1. Checks that `challenge` is 32 bytes, before any App Attest call.
-        /// 2. Retrieves or generates the App Attest key ID. A stored key that
-        ///    carries an attestation record ends the call here with
-        ///    `AttestationError.keyAlreadyAttested`, before any App Attest
-        ///    call.
+        /// 2. Retrieves a stored replacement key ID, or the stored key ID while
+        ///    it carries no attestation record, or generates and stores a new
+        ///    key. A key generated while the stored key carries an attestation
+        ///    record is stored as the replacement, and it becomes the stored
+        ///    key only after `attestKey` returns its attestation object.
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)` with
         ///    `challenge` as `clientDataHash`, unchanged. When it answers
         ///    `DCError.invalidKey`, runs the key probe
         ///    `probeKey(_:after:call:)` inside the same serialized call and
         ///    throws the case the probe's answer gives.
-        /// 4. Records the key ID as attested and returns the raw CBOR
-        ///    attestation object Apple signed.
+        /// 4. Records the key ID as attested, which makes a replacement key
+        ///    the stored key, and returns the raw CBOR attestation object
+        ///    Apple signed.
         ///
         /// ADR-025 acceptance criterion 3 has the Rust core pass the binding
         /// digest `D` of `09-security-model.md` §9.3.1 as `challenge`. This
@@ -481,15 +505,15 @@
         ///   `AttestationError.invalidClientDataHash` when App Attest is supported
         ///   and `challenge` is not 32 bytes; this method then generates no
         ///   key and calls no App Attest method.
-        ///   `AttestationError.keyAlreadyAttested` when the stored key carries
-        ///   an attestation record; this method then calls no App Attest
-        ///   method and keeps the key and its record. Also when `attestKey`
-        ///   answers with `DCError.invalidKey` and the key probe's assertion
-        ///   succeeds; this method then keeps the key and records it as
-        ///   attested.
+        ///   `AttestationError.keyAlreadyAttested` when `attestKey` answers
+        ///   with `DCError.invalidKey` and the key probe's assertion succeeds;
+        ///   for the stored key, this method then keeps the key and records it
+        ///   as attested, and for a replacement key it discards the
+        ///   replacement key ID and keeps the stored key and its record.
         ///   `AttestationError.keyRejected` when `attestKey` and the key
         ///   probe's assertion both answer with `DCError.invalidKey`; this
-        ///   method then discards the key ID.
+        ///   method then discards the key ID `attestKey` named, and for a
+        ///   replacement key it keeps the stored key and its record.
         ///   `AttestationError.serverUnavailable` when `attestKey` answers
         ///   with `DCError.serverUnavailable`; this method keeps the key, so a
         ///   retry uses the same key, as `DCError.h` instructs. Also when the
@@ -504,8 +528,8 @@
         ///   outstanding.
         ///   `AttestationError.internalError` when `generateKey`, `attestKey`
         ///   or the key probe's assertion answers with neither a value nor an
-        ///   error. After `attestKey` answers, every case but `keyRejected`
-        ///   keeps the key.
+        ///   error. After `attestKey` answers, every case keeps the key except
+        ///   `keyRejected`, and `keyAlreadyAttested` for a replacement key.
         ///   `AttestationError.timedOut` when `generateKey`, `attestKey` and
         ///   the key probe's assertion together take longer than
         ///   `appAttestCallTimeLimit`.
@@ -532,16 +556,19 @@
             // and concurrent first calls generate one key while every
             // preceding call ended with Apple's answer.
             let outcome = await callSerializer.run(timeLimit: callTimeLimit) { [self] call in
-                if let keyId = loadKeyId() {
-                    // Apple attests one key once, so a key this adapter
-                    // recorded as attested goes to no App Attest call.
-                    if isKeyAttested(keyId) {
-                        call.end(with: .failure(.keyAlreadyAttested(
-                            "App Attest already attested the stored key, and Apple attests one key once, "
-                                + "so this adapter called no App Attest method"
-                        )))
-                        return
+                // Apple attests one key once, so a key this adapter recorded
+                // as attested goes to no `attestKey` call: a stored
+                // replacement key goes first, then the stored key while it
+                // carries no record, and otherwise `generateKey` produces a
+                // key, which `storeKeyId` stores as the replacement while the
+                // stored key carries a record.
+                if let replacementKeyId = loadReplacementKeyId() {
+                    call.issue {
+                        requestAttestation(keyId: replacementKeyId, challenge: challenge, call: call)
                     }
+                    return
+                }
+                if let keyId = loadKeyId(), !isKeyAttested(keyId) {
                     call.issue {
                         requestAttestation(keyId: keyId, challenge: challenge, call: call)
                     }
@@ -667,9 +694,10 @@
         /// limit or the caller's cancellation ended `call` reaches no caller.
         ///
         /// The attestation record is written only when Apple's answer ends
-        /// `call`: here when the attestation object reaches the caller, and
-        /// in `probeKey(_:after:call:)` when the key probe shows Apple
-        /// attested the key. An answer of `DCError.invalidKey` does not end
+        /// `call`: here when the attestation object reaches the caller, which
+        /// also makes a replacement key the stored key, and in
+        /// `probeKey(_:after:call:)` when the key probe shows Apple attested
+        /// the stored key. An answer of `DCError.invalidKey` does not end
         /// `call`; it hands the key probe to `issue(_:)`, which starts the
         /// probe only while `call` is open.
         private func requestAttestation(keyId: String, challenge: Data, call: AppAttestCall) {
@@ -791,7 +819,8 @@
         ///
         /// | Probe answer | Case | Key |
         /// | --- | --- | --- |
-        /// | an assertion | `keyAlreadyAttested` | kept, recorded as attested |
+        /// | an assertion, stored key | `keyAlreadyAttested` | kept, recorded as attested |
+        /// | an assertion, replacement key | `keyAlreadyAttested` | discarded, no record |
         /// | `invalidKey` | `keyRejected` | discarded |
         /// | `serverUnavailable` | `serverUnavailable` | kept |
         /// | `featureUnsupported` | `unsupported` | kept |
@@ -802,6 +831,12 @@
         /// that led to it, and its answer writes the record or discards the
         /// key ID only when that answer ends `call`, so an answer that
         /// arrives after the time limit or a cancellation writes neither.
+        ///
+        /// A replacement key Apple already attested is discarded, because this
+        /// adapter holds no record that the `attestKey` call Apple answered
+        /// returned its attestation object to a caller, and promoting that key
+        /// would move `assertRequest` off the key an earlier published
+        /// attestation names, onto a key no published attestation may name.
         private func probeKey(_ keyId: String, after attestError: Error, call: AppAttestCall) {
             service.generateAssertion(keyId, clientDataHash: Self.keyProbeClientDataHash) { [self] assertion, probeError in
                 call.end {
@@ -826,6 +861,14 @@
                         }
                     }
                     if assertion != nil {
+                        if forgetReplacementKeyId(keyId) {
+                            return .failure(.keyAlreadyAttested(
+                                "attestKey answered DCError.invalidKey and an assertion with the replacement key "
+                                    + "succeeded; this adapter holds no record that a caller received an attestation "
+                                    + "naming that key, so it discarded the replacement key and kept the stored key: "
+                                    + attestError.localizedDescription
+                            ))
+                        }
                         markKeyAttested(keyId)
                         return .failure(.keyAlreadyAttested(
                             "attestKey answered DCError.invalidKey and an assertion with the stored key succeeded; "
@@ -863,7 +906,27 @@
             return defaults.string(forKey: StorageKey.appAttestKeyId)
         }
 
-        /// Persist an App Attest key ID to `UserDefaults`.
+        /// Load a replacement App Attest key ID Apple has not attested yet.
+        ///
+        /// Thread-safe: protected by `lock`.
+        ///
+        /// - Returns: The stored replacement key ID, or `nil` if none is
+        ///   stored.
+        private func loadReplacementKeyId() -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return defaults.string(forKey: StorageKey.replacementAppAttestKeyId)
+        }
+
+        /// Persist a freshly generated App Attest key ID to `UserDefaults`.
+        ///
+        /// While the stored key carries an attestation record, this method
+        /// stores the new key ID as the replacement and leaves the attested key
+        /// and its record in place, so `assertRequest` keeps asserting with the
+        /// attested key until `markKeyAttested(_:)` promotes the replacement.
+        /// Otherwise it stores the new key ID as the stored key and removes any
+        /// attestation record and replacement key ID, which keeps a record
+        /// left by a previous key from describing this one.
         ///
         /// Thread-safe: protected by `lock`.
         ///
@@ -872,23 +935,55 @@
         private func storeKeyId(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
+            let stored = defaults.string(forKey: StorageKey.appAttestKeyId)
+            if let stored, defaults.string(forKey: StorageKey.attestedAppAttestKeyId) == stored {
+                defaults.set(keyId, forKey: StorageKey.replacementAppAttestKeyId)
+                return
+            }
             defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
+            defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
+            defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
         }
 
         /// Record that Apple attested `keyId`.
+        ///
+        /// A replacement key Apple attested becomes the stored key, which
+        /// retires the key it replaced.
         ///
         /// Thread-safe: protected by `lock`.
         ///
         /// - Parameter keyId: A key ID whose `attestKey` call returned an
         ///   attestation object, or whose key probe assertion succeeded after
         ///   `attestKey` answered `DCError.invalidKey`. The record is written
-        ///   only while `keyId` is still the stored key ID, so it never names
-        ///   a key ID this adapter no longer stores.
+        ///   only while `keyId` is still the replacement or the stored key
+        ///   ID, so it never names a key ID this adapter no longer stores.
         private func markKeyAttested(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
-            guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
+            if defaults.string(forKey: StorageKey.replacementAppAttestKeyId) == keyId {
+                defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
+                defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
+            } else if defaults.string(forKey: StorageKey.appAttestKeyId) != keyId {
+                return
+            }
             defaults.set(keyId, forKey: StorageKey.attestedAppAttestKeyId)
+        }
+
+        /// Remove `keyId` when it is the stored replacement key ID, and report
+        /// whether it was.
+        ///
+        /// Thread-safe: protected by `lock`.
+        ///
+        /// - Parameter keyId: A key ID Apple attested although this adapter
+        ///   holds no record that a call returned its attestation object.
+        /// - Returns: `true` when `keyId` was the replacement key ID and this
+        ///   method removed it.
+        private func forgetReplacementKeyId(_ keyId: String) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard defaults.string(forKey: StorageKey.replacementAppAttestKeyId) == keyId else { return false }
+            defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
+            return true
         }
 
         /// Report whether Apple attested `keyId`.
@@ -904,16 +999,22 @@
             return defaults.string(forKey: StorageKey.attestedAppAttestKeyId) == keyId
         }
 
-        /// Remove the stored App Attest key ID and its attestation record,
-        /// unless another key ID replaced it.
+        /// Remove a replacement App Attest key ID, or the stored key ID and
+        /// its attestation record, unless another key ID replaced it.
         ///
         /// Thread-safe: protected by `lock`.
         ///
         /// - Parameter keyId: A key ID Apple's App Attest service rejected.
-        ///   Removing only this value keeps a key ID stored after it in place.
+        ///   Removing only this value keeps a key ID stored after it in place,
+        ///   and removing a rejected replacement leaves the attested key it
+        ///   was meant to replace in place.
         private func forgetKeyId(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
+            if defaults.string(forKey: StorageKey.replacementAppAttestKeyId) == keyId {
+                defaults.removeObject(forKey: StorageKey.replacementAppAttestKeyId)
+                return
+            }
             guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
             defaults.removeObject(forKey: StorageKey.appAttestKeyId)
             defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
@@ -981,8 +1082,7 @@
     ///
     /// **Bound and cancellation** (ADR-025 acceptance criterion 3): a running
     /// call ends at the first of its key-ID read ending it without an App
-    /// Attest call (an `assertRequest` that finds no stored key ID, or an
-    /// `attest` that finds a stored key carrying an attestation record),
+    /// Attest call (an `assertRequest` that finds no stored key ID),
     /// Apple's answer, `timeLimit`, or the caller's cancellation, and the
     /// serializer then starts the next queued call.
     /// `AppAttestCall` discards whatever Apple answers after that. A caller
@@ -1007,9 +1107,8 @@
         /// Wait for every call this serializer accepted earlier to end, then
         /// run one call: `start` hands it to App Attest, and the call ends at
         /// the first of `start` ending it without App Attest (an
-        /// `assertRequest` that reads no stored key ID, or an `attest` that
-        /// reads a stored key carrying an attestation record), Apple's
-        /// answer, `timeLimit`, or the caller's cancellation.
+        /// `assertRequest` that reads no stored key ID), Apple's answer,
+        /// `timeLimit`, or the caller's cancellation.
         ///
         /// - Parameter start: Starts the call's App Attest work and ends the
         ///   `AppAttestCall` it receives, from Apple's completion handlers or,
@@ -1074,8 +1173,7 @@
     /// One App Attest call the serializer runs, which ends exactly once.
     ///
     /// A key-ID read that ends the call without an App Attest call (no stored
-    /// key ID in `assertRequest`, or a stored key carrying an attestation
-    /// record in `attest`), Apple's answer, the time limit and the caller's
+    /// key ID in `assertRequest`), Apple's answer, the time limit and the caller's
     /// cancellation each try to end the call; the first one ends it, and
     /// each later one does nothing. Apple's answer ends the call through
     /// `end(_:)`, whose body writes the attestation record or discards a key
