@@ -203,6 +203,18 @@ nothing:
                no assertion. Both now sit in a fenced block or name the block
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
+  profile-env  ci.yml sets `CARGO_PROFILE_DEV_DEBUG: "0"` in its workflow-level
+               `env:` to drop debug info from every dev and test build in CI.
+               Swatinem/rust-cache hashes every `CARGO*` environment variable
+               its step sees into its cache key. A `CARGO_PROFILE_*` key in one
+               job's `env:` therefore gives that job a key no other member of
+               its `shared-key` group computes, so that job restores no entry
+               its group saved and compiles the group's ~650 dependencies from
+               scratch. A `CARGO_PROFILE_*` key in one step's `env:` leaves the
+               key alone, but cargo then compiles that step's units under a
+               profile the restored entry does not hold and rebuilds each one.
+               Dropping the workflow-level key returns every CI build to the
+               root Cargo.toml's `line-tables-only` without any check noticing.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -3969,6 +3981,94 @@ def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
             )
 
 
+# The workflow-level key check_profile_env_is_workflow_level requires, and the value
+# that key must carry. See the `profile-env` entry in this file's docstring.
+WORKFLOW_PROFILE_KEY = "CARGO_PROFILE_DEV_DEBUG"
+WORKFLOW_PROFILE_VALUE = "0"
+CARGO_PROFILE_PREFIX = "CARGO_PROFILE_"
+
+
+def profile_env_gaps(doc: dict) -> list[str]:
+    """Return each way ci.yml's `CARGO_PROFILE_*` environment breaks the rule.
+
+    CRITERION: the workflow-level `env:` sets WORKFLOW_PROFILE_KEY to
+    WORKFLOW_PROFILE_VALUE, and no job-level or step-level `env:` sets any key
+    starting with CARGO_PROFILE_PREFIX.
+
+    WHY: rust-cache hashes every `CARGO*` variable into its key, so a
+    `CARGO_PROFILE_*` value that differs between jobs splits a `shared-key`
+    group into entries no other member restores.
+    """
+    gaps: list[str] = []
+    workflow_env = doc.get("env") or {}
+    value = workflow_env.get(WORKFLOW_PROFILE_KEY)
+    if value is None or str(value) != WORKFLOW_PROFILE_VALUE:
+        gaps.append(
+            f"workflow env: {WORKFLOW_PROFILE_KEY}={value!r}, "
+            f"expected {WORKFLOW_PROFILE_VALUE!r}"
+        )
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        for key in sorted(job.get("env") or {}):
+            if str(key).startswith(CARGO_PROFILE_PREFIX):
+                gaps.append(f"job {job_id}: env sets {key}")
+        for index, step in enumerate(job.get("steps") or []):
+            for key in sorted(step.get("env") or {}):
+                if str(key).startswith(CARGO_PROFILE_PREFIX):
+                    label = step.get("name") or f"step {index}"
+                    gaps.append(f"job {job_id}, {label}: env sets {key}")
+    return gaps
+
+
+def check_profile_env_is_workflow_level(doc: dict) -> None:
+    gaps = profile_env_gaps(doc)
+    check(
+        f"ci.yml: {WORKFLOW_PROFILE_KEY} is set at workflow level and no job or "
+        f"step sets a {CARGO_PROFILE_PREFIX}* key",
+        not gaps,
+        f"{gaps}: a per-job value splits a rust-cache group, and a missing "
+        f"workflow-level value restores debug info to every CI build",
+    )
+    # Controls: each mutation below breaks one half of the rule and must be reported.
+    job_id = next(job_id for job_id, job in doc["jobs"].items() if job.get("steps"))
+    mutated = copy.deepcopy(doc)
+    mutated["jobs"][job_id].setdefault("env", {})[WORKFLOW_PROFILE_KEY] = "1"
+    check(
+        f'a job-level {WORKFLOW_PROFILE_KEY}: "1" on {job_id} is reported',
+        any(
+            gap == f"job {job_id}: env sets {WORKFLOW_PROFILE_KEY}"
+            for gap in profile_env_gaps(mutated)
+        ),
+        f"a ci.yml setting {WORKFLOW_PROFILE_KEY} on job {job_id} went unreported",
+    )
+    mutated = copy.deepcopy(doc)
+    mutated["jobs"][job_id]["steps"][0].setdefault("env", {})[
+        "CARGO_PROFILE_TEST_OPT_LEVEL"
+    ] = "1"
+    check(
+        f"a step-level CARGO_PROFILE_TEST_OPT_LEVEL on {job_id} is reported",
+        any(
+            gap.startswith(f"job {job_id}, ")
+            and gap.endswith("env sets CARGO_PROFILE_TEST_OPT_LEVEL")
+            for gap in profile_env_gaps(mutated)
+        ),
+        f"a ci.yml setting a CARGO_PROFILE_* key on a step of {job_id} went unreported",
+    )
+    mutated = copy.deepcopy(doc)
+    (mutated.get("env") or {}).pop(WORKFLOW_PROFILE_KEY, None)
+    check(
+        f"removing the workflow-level {WORKFLOW_PROFILE_KEY} is reported",
+        any(gap.startswith("workflow env: ") for gap in profile_env_gaps(mutated)),
+        f"a ci.yml without a workflow-level {WORKFLOW_PROFILE_KEY} went unreported",
+    )
+    mutated = copy.deepcopy(doc)
+    mutated.setdefault("env", {})[WORKFLOW_PROFILE_KEY] = "2"
+    check(
+        f'a workflow-level {WORKFLOW_PROFILE_KEY}: "2" is reported',
+        any(gap.startswith("workflow env: ") for gap in profile_env_gaps(mutated)),
+        f"a ci.yml setting {WORKFLOW_PROFILE_KEY} to 2 went unreported",
+    )
+
+
 def check_xcframework_outputs_are_verified(doc: dict) -> None:
     """Run the xcframework job's verify step against each uploaded path gone or stale.
 
@@ -4240,6 +4340,9 @@ def main() -> int:
 
     print("retention — a downloaded artifact outlives the re-run window")
     check_shared_uploads_outlive_the_rerun_window(workflow)
+
+    print("profile-env — CARGO_PROFILE_* is set for the whole workflow or not at all")
+    check_profile_env_is_workflow_level(workflow)
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
