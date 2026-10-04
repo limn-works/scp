@@ -19,6 +19,29 @@ env:
   # cache group.
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # Builds every dev-profile and test-profile unit in this workflow with no debug
+  # info, overriding the `debug = "line-tables-only"` that `[profile.dev]` in the root
+  # Cargo.toml sets. Without line tables each object file carries no
+  # DWARF sections, so the linker reads and writes less for every test binary and each
+  # `target/debug` entry rust-cache saves and restores is smaller. Release
+  # builds (`wasm-pack build`'s default `--release`) read `[profile.release]`, and
+  # the four bridge producers' `--profile ci-bridge` builds read
+  # `[profile.ci-bridge]`, which inherits `[profile.release]`; both ignore every
+  # `CARGO_PROFILE_DEV_*` variable.
+  #
+  # TRADE-OFF: a `RUST_BACKTRACE` frame prints a symbol name without `file:line`. A
+  # panic or failed assert still prints its `file:line`, because rustc embeds that
+  # through `std::panic::Location` at compile time and reads no debug info for it.
+  #
+  # This key and every other `CARGO_PROFILE_*` key belong here and in no job-level or
+  # step-level `env:`. rust-cache hashes every `CARGO*` variable into its cache key,
+  # so a value set in one job would split that job from the others in its cache group
+  # (see "Cargo cache groups" below). A value set on one step would compile that
+  # step's units under a profile the restored entry does not hold, so cargo would
+  # rebuild them. Check `profile-env` in scripts/tests/ci-gate/ci_gate_selftest.py
+  # rejects a missing workflow-level key and any job-level or step-level one, in this
+  # file and in compile-timings.yml.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
 #
@@ -726,6 +749,12 @@ jobs:
       # cases commit through the real hook in throwaway repositories with `cargo` stubbed.
       - name: Run pre-commit merge cases
         run: bash scripts/tests/pre-commit-merge/run-tests.sh
+      # The hook lints the workspace members `scripts/pre-commit-clippy-scope.py` selects;
+      # its module docstring states the rule. These cases commit through the real hook with
+      # `cargo` stubbed and compare each recorded `cargo clippy` command with the one that
+      # rule requires.
+      - name: Run pre-commit clippy scope cases
+        run: bash scripts/tests/pre-commit-clippy-scope/run-tests.sh
       # The compile-steps check reads every workflow file with PyYAML, which
       # `actions/setup-python` does not ship, so the step before it installs the library.
       # The check holds every `Swatinem/rust-cache` step to the group shape the header
