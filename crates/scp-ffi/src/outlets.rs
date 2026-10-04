@@ -323,9 +323,8 @@ fn outlet_register_impl(
         signature: vec![],
     };
 
-    // The gate runs after the input validation above, so a malformed
-    // registration reports its own validation code whatever state the context
-    // is in, and it runs before the FFI shard lock is taken.
+    // The gate runs after the input validation above and before the FFI shard
+    // lock is taken.
     //
     // `register_outlet` checks whether the registrant it receives holds
     // `outlet:register`, and this entry point passes the context creator
@@ -2010,6 +2009,7 @@ impl crate::scp::PyScp {
     ///
     /// Raises `ContextError` if the context is not connected to the runtime
     /// or if registration fails.
+    /// Raises `ContextError` (`SCP-OUTLET-6003`) if the context is not `Active`.
     ///
     /// See ADR-013 §4.
     #[pyo3(name = "outlet_register")]
@@ -2049,6 +2049,7 @@ impl crate::scp::PyScp {
     /// or lacks the required outlet invocation capability.
     /// Raises `ContextError` if the economy pre-check, budget, payment escrow,
     /// hard rate limit, or underlying outlet dispatch fails.
+    /// Raises `ContextError` (`SCP-OUTLET-6005`) if the context is not `Active`.
     ///
     /// See ADR-013 §4, SCP-212, spec §6.2, §8, §19.5, §19.7, ADR-016, #319.
     #[pyo3(name = "outlet_invoke")]
@@ -2095,6 +2096,7 @@ impl crate::scp::PyScp {
     ///
     /// Raises `ContextError` if the context is not connected or the outlet
     /// is not found.
+    /// Raises `ContextError` (`SCP-OUTLET-6007`) if the context is not `Active`.
     ///
     /// See ADR-013 §4.
     #[pyo3(name = "outlet_verify")]
@@ -2119,6 +2121,8 @@ impl crate::scp::PyScp {
     /// or lacks the required outlet invocation capability.
     /// Raises `ContextError` if either context is not connected, the outlet is
     /// not found, chain depth is exceeded, or the interface is not approved.
+    /// Raises `ContextError` (`SCP-OUTLET-6010` source, `SCP-OUTLET-6011`
+    /// target) if either context is not `Active`.
     #[pyo3(name = "outlet_invoke_cross_context")]
     #[pyo3(signature = (source_context_id, target_context_id, outlet_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
@@ -2284,6 +2288,7 @@ impl crate::scp::PyScp {
     ///
     /// Raises `ContextError` if the context is not connected, the outlet is
     /// not found, or the per-caller session cap is exceeded.
+    /// Raises `ContextError` (`SCP-OUTLET-6014`) if the context is not `Active`.
     #[pyo3(name = "outlet_session_create", signature = (context_id, outlet_id, source_context_id, ttl_seconds=None))]
     pub fn outlet_session_create(
         &self,
@@ -2307,6 +2312,7 @@ impl crate::scp::PyScp {
     /// Raises `UcanError` if the UCAN token is invalid.
     /// Raises `ContextError` if the session is not found, has expired, or the
     /// invoker lacks capability.
+    /// Raises `ContextError` (`SCP-OUTLET-6017`) if the context is not `Active`.
     #[pyo3(name = "outlet_session_invoke")]
     #[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value)]
@@ -2351,6 +2357,7 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Raises `OutletError` if the caller is not an admin or the outlet is not found.
+    /// Raises `ContextError` (`SCP-OUTLET-6030`) if the context is not `Active`.
     #[pyo3(name = "outlet_interface_expose", signature = (context_id, outlet_id, target_context_id, rate_limit_json=None))]
     pub fn outlet_interface_expose(
         &self,
@@ -2375,6 +2382,7 @@ impl crate::scp::PyScp {
     ///
     /// Raises `OutletError` if the caller is not an admin or the interface's
     /// target context does not match `context_id`.
+    /// Raises `ContextError` (`SCP-OUTLET-6032`) if the context is not `Active`.
     #[pyo3(name = "outlet_interface_accept")]
     pub fn outlet_interface_accept(
         &self,

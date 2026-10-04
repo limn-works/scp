@@ -1115,10 +1115,7 @@ fn outlet_stream_compute_caveats_binding_impl(
 // ---------------------------------------------------------------------------
 // Cross-context streaming saga (§5.4.5, §6.2.4, SCP-OUT-047) — open / poll /
 // recover. The streaming ANALOG of the unary cross-context saga export in
-// `outlets.rs`, sharing its `active_outlet_role_state`,
-// `enforce_caller_principal_binding`, `validate_outlet_ucan`, and
-// `map_saga_error` verbatim, and the SAME `BridgeStreamExecutor` / `resolve_stream_signer` /
-// `BridgeStreamRevocationChecker` this module already defines.
+// `outlets.rs`.
 // ---------------------------------------------------------------------------
 
 /// The control-plane "no active cross-context streaming saga" rejection for an
@@ -1234,8 +1231,8 @@ fn outlet_streaming_saga_open_impl(
     // state is read from the per-context supervisor actor through
     // `crate::outlets::active_outlet_role_state`. Checked BEFORE the
     // caller-principal binding and the saga drive, so a non-active context is
-    // rejected before any escrow debit or receiver hand-out. Codes match
-    // NAPI/UniFFI: `OUTLET_6010` (caller axis) / `OUTLET_6011` (target axis). A
+    // rejected before any escrow debit or receiver hand-out. Codes:
+    // `OUTLET_6010` (caller axis) / `OUTLET_6011` (target axis). A
     // context no actor serves is treated as non-active. Both gates run before
     // the caller-principal binding, so both withhold the lifecycle state. The
     // target role state answers the UCAN validation, and each role state's
@@ -1669,6 +1666,7 @@ impl crate::scp::PyScp {
     /// Raises `UcanError` if authorization fails. Raises `ContextError`
     /// carrying a `SCP-OUTLET-NNNN` code if the open is rejected (admission
     /// caps, escrow, caveats binding, node pump ceiling, or a §7.3.8 caveat).
+    /// Raises `ContextError` (`SCP-OUTLET-6005`) if the context is not `Active`.
     #[pyo3(name = "outlet_stream_open")]
     #[pyo3(signature = (
         context_id, outlet_id, input, caller_did, ucan_token,
