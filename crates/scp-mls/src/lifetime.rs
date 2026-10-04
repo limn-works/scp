@@ -94,9 +94,12 @@
 //!   range-only and reads no clock. SCP carries no openmls patch, so
 //!   openmls's receive-side clock check still runs; the adder's
 //!   [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] and
-//!   [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`] bound it, and the
-//!   residual-case list of security-model spec §9.7.1 names every case in
-//!   which it still refuses a Commit.
+//!   [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`] bound it, and security-model
+//!   spec §9.7.1 states every condition under which it still refuses a
+//!   Commit: on the `not_after` side, publication delay + relay hold + local
+//!   processing latency + receiver clock lead reaching 7 days + 1 hour; on
+//!   the `not_before` side, a receiver clock more than 3,300 s behind the
+//!   adder's that has not reached `not_before`.
 //! - Welcome tree leaves, range only: [`crate::group::join_group_from_bytes`]
 //!   builds the staged Welcome through
 //!   `StagedWelcome::build_from_welcome(...)?.skip_lifetime_validation().build()`,
@@ -197,12 +200,15 @@ pub const KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS: u64 =
 /// [`KEY_PACKAGE_LIFETIME_MARGIN_SECS`], so a joiner that fetches its Welcome
 /// while the relay still holds the `InvitationBundle` finds its own
 /// `KeyPackage` current, and at least the relay maximum blob TTL
-/// (`MAX_BLOB_TTL`, 7 days, §9.18.11) plus the same margin, so no Commit that
-/// an SCP relay delivers within its retention carries a `KeyPackage` expired
-/// under a receiver whose clock runs at most one hour ahead of the adder's;
-/// the residual-case list of
-/// security-model spec §9.7.1 names every case in which that check still
-/// refuses a Commit. Neither bound lives in this crate: `scp-runtime`
+/// (`MAX_BLOB_TTL`, 7 days, §9.18.11) plus the same margin, so a Commit that
+/// the adder publishes when it checks the `KeyPackage`, and that a receiver
+/// processes when an SCP relay delivers it within its retention, carries no
+/// `KeyPackage` expired under that receiver's clock while the receiver's
+/// clock runs at most one hour ahead of the adder's. Security-model spec
+/// §9.7.1 states every condition under which openmls's receive-side check
+/// still refuses a Commit: delays add up, and a refusal on the `not_after`
+/// side needs publication delay + relay hold + local processing latency +
+/// receiver clock lead to reach 7 days + 1 hour. Neither bound lives in this crate: `scp-runtime`
 /// const-asserts the first against its invitation TTL, and `scp-client`
 /// const-asserts the second against `scp_relay_client::MAX_BLOB_TTL`.
 pub const KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS: u64 =

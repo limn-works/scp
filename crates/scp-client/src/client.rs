@@ -120,12 +120,14 @@ const _: fn() = || {
 };
 
 // Security-model spec §9.18.7: the adder's minimum remaining KeyPackage
-// lifetime covers the relay maximum blob TTL plus the lifetime margin, so no
-// add-Commit an SCP relay delivers within its retention carries a KeyPackage
-// expired under a receiver whose clock runs at most one hour ahead of the
-// adder's; §9.7.1 lists the residual cases, in which openmls's receive-side
-// wall-clock `Lifetime` check still refuses the Commit. This crate sees both scp-mls and
-// scp-relay-client. `u64::from` is not const, so the widening is `as`.
+// lifetime covers the relay maximum blob TTL plus the lifetime margin, so an
+// add-Commit that the adder publishes when it checks the KeyPackage, and that
+// a receiver processes when an SCP relay delivers it within its retention,
+// carries no KeyPackage expired under that receiver's clock while the
+// receiver's clock runs at most one hour ahead of the adder's. §9.7.1 states
+// every condition under which openmls's receive-side wall-clock `Lifetime`
+// check still refuses the Commit, including delays that add up. This crate
+// sees both scp-mls and scp-relay-client. `u64::from` is not const, so the widening is `as`.
 const _: () = assert!(
     scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
         >= scp_relay_client::MAX_BLOB_TTL as u64 + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS

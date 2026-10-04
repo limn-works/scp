@@ -69,9 +69,9 @@
 //!   check, which reads no clock; openmls's own check is the only clock check
 //!   there, so a `Date.now()` override can only add rejections and can make an
 //!   honest add-Commit fail. The adder's minimum remaining lifetime and
-//!   minimum `not_before` age bound
-//!   openmls's check, and the residual-case list of security-model spec
-//!   §9.7.1 names every case in which it still refuses an add-Commit.
+//!   minimum `not_before` age bound openmls's check, and security-model spec
+//!   §9.7.1 states every condition under which it still refuses an
+//!   add-Commit, including delays that add up to 7 days + 1 hour.
 //!   Page same-origin integrity (CSP/SRI/COOP/COEP) stays load-bearing for
 //!   every add-side `Lifetime` decision, because a script that runs before this module
 //!   initializes shifts the captured clock too. The residual closes when

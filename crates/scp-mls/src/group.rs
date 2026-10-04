@@ -643,11 +643,13 @@ pub fn add_member(
     // and enforce the RFC 9420 maximum-range bound openmls's `validate` never
     // applies. This is additive hardening — it never replaces openmls's check.
     // Security-model spec §9.7.1, the adder: also require the minimum remaining
-    // lifetime and the minimum `not_before` age, so no Commit a relay delivers within its retention carries a
-    // KeyPackage expired under a receiver whose clock runs at most one hour
-    // ahead of this adder's, and every receiver whose clock runs at most
-    // 3,300 s behind it has reached `not_before` (openmls checks a received
-    // Add against the receiver's wall clock; §9.7.1 lists the residual cases).
+    // lifetime and the minimum `not_before` age. A Commit published at this
+    // check, and processed when a relay delivers it within its retention,
+    // then carries no KeyPackage expired under a receiver whose clock runs at
+    // most one hour ahead of this adder's, and every receiver whose clock
+    // runs at most 3,300 s behind it has reached `not_before` (openmls checks
+    // a received Add against the receiver's wall clock; §9.7.1 states every
+    // condition under which it still refuses the Commit).
     validate_key_package_lifetime_for_add(verified_key_package.life_time(), clock)?;
 
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;

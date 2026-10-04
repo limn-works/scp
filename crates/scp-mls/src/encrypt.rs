@@ -72,9 +72,12 @@ use crate::wrapping_extension::extract_wrapping_key;
 /// reject an Add by its own clock; SCP's own receive-side check is range-only
 /// (`validate_received_key_package_lifetime_range`). SCP carries no openmls
 /// patch: the adder's `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` and
-/// `KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS` bound openmls's check, and the residual-case list of §9.7.1 names every case in
-/// which it still refuses a Commit, each surfacing here as
-/// [`MlsError::DecryptionFailed`].
+/// `KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS` bound openmls's check, and §9.7.1
+/// states every condition under which it still refuses a Commit (on the
+/// `not_after` side, publication delay + relay hold + local processing
+/// latency + receiver clock lead reaching 7 days + 1 hour; on the
+/// `not_before` side, a receiver clock more than 3,300 s behind the adder's),
+/// each refusal surfacing here as [`MlsError::DecryptionFailed`].
 ///
 /// Future path (ADR-057 Prerequisite 1, the future-path bullet under the
 /// residual bullet): once openmls takes a receive-side lifetime policy or a
