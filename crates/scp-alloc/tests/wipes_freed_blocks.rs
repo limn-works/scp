@@ -216,9 +216,13 @@ fn misaligned_block_shorter_than_its_head_is_wiped() {
     // SAFETY: `ptr` heads a live block of `layout.size()` bytes.
     unsafe { ptr.write_bytes(FILL, layout.size()) };
     // SAFETY: `ptr` came from `alloc` with `layout` and is freed once.
-    assert_freed_wiped("misaligned, shorter than its head", ptr as usize, || unsafe {
-        std::alloc::dealloc(ptr, layout);
-    });
+    assert_freed_wiped(
+        "misaligned, shorter than its head",
+        ptr as usize,
+        || unsafe {
+            std::alloc::dealloc(ptr, layout);
+        },
+    );
 }
 
 #[test]
