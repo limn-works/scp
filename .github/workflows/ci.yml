@@ -2755,6 +2755,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+        # A push to `main` skips this job, and the push-writers check in
+        # scripts/tests/ci-gate/ci_gate_selftest.py rejects a cache writer a push skips.
+        with:
+          no-cache: true
       - name: Download NAPI native addon
         uses: actions/download-artifact@v4
         with:
@@ -2948,6 +2952,10 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+        # A push to `main` skips this job, and the push-writers check in
+        # scripts/tests/ci-gate/ci_gate_selftest.py rejects a cache writer a push skips.
+        with:
+          no-cache: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -3311,6 +3319,10 @@ jobs:
         with:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
+        # A push to `main` skips this job, and the push-writers check in
+        # scripts/tests/ci-gate/ci_gate_selftest.py rejects a cache writer a push skips.
+        with:
+          no-cache: true
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
@@ -3701,10 +3713,6 @@ jobs:
   # own `if:` condition against a `changes` job's filter outputs. A job that
   # was supposed to run and did not report success fails this gate.
   #
-  # A push to `main` runs only the jobs that write a cache another run restores,
-  # and the jobs those need. Every other job's `if:` reads
-  # `github.event_name != 'push'`: the merge queue already ran it on the same
-  # commit, and a push run takes macOS runners from pull-request runs.
   # scripts/tests/ci-gate/ci_gate_selftest.py reports a cache writer, or a job a
   # writer needs, that a push would skip.
   ci:

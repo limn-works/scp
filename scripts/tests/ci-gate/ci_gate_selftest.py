@@ -213,10 +213,7 @@ nothing:
                any letter case, or reading `toJSON(secrets)`, outside a job
                declaring `environment: docker-cache`.
   push-writers
-               A push to `main` runs only the jobs that write a cache another
-               run restores, and the jobs those need, because the merge queue
-               already ran every other job on the same commit. A writer that a
-               push skips leaves its rust-cache, bridge-artifact, Gradle or
+               A writer that a push skips leaves its rust-cache, bridge-artifact, Gradle or
                layer-cache entry stale with nothing going red, since the `ci`
                aggregate evaluates that writer's own `if:`; a push-only skip
                that leaks into a pull_request or merge_group run removes a gate
@@ -609,9 +606,7 @@ EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 # Jobs whose `if:` is `github.event_name == 'push'`.
 PUSH_ONLY_JOBS = ("docker-image-cache",)
 
-# Jobs whose `if:` is `github.event_name != 'push'` alone. A push to `main` runs
-# only the jobs that write a cache another run restores, and the jobs those need,
-# because the merge queue already ran every other job on the same commit. None of
+# Jobs whose `if:` is `github.event_name != 'push'` alone. None of
 # these writes a cache, so each runs on every pull_request and merge_group run and
 # skips on every push.
 NOT_ON_PUSH_JOBS = (
@@ -647,7 +642,7 @@ NOT_ON_PUSH_JOBS = (
 )
 
 # Jobs a `changes` filter output selects whose `if:` also reads
-# `github.event_name != 'push' && …`, for the reason NOT_ON_PUSH_JOBS gives. The
+# `github.event_name != 'push' && …`. The
 # filter jobs absent from this list write a cache on a push to `main` and run there
 # whenever their filters select them.
 NOT_ON_PUSH_FILTER_JOBS = (
@@ -4954,7 +4949,9 @@ def cache_write(step: dict) -> str | None:
     `actions/cache` or `actions/cache/save` step, a `gradle/actions/setup-gradle`
     step that neither disables its cache nor sets `cache-read-only` to the literal
     true (it writes on the default branch by default), a step exporting a layer
-    cache through `cache-to`, and a setup action given a `cache:` input. An input
+    cache through `cache-to`, an `oven-sh/setup-bun` step that does not set
+    `no-cache` to the literal true (it caches the bun executable by default), and
+    a setup action given a `cache:` input. An input
     written as an expression counts as writing, so an unreadable input errs toward
     holding the job on push rather than toward skipping a writer.
     """
@@ -4975,6 +4972,10 @@ def cache_write(step: dict) -> str | None:
         if literal("cache-disabled") == "true" or literal("cache-read-only") == "true":
             return None
         return "the Gradle user-home cache"
+    if action == "oven-sh/setup-bun":
+        if literal("no-cache") == "true":
+            return None
+        return "the setup-bun executable cache"
     if "cache-to" in inputs:
         return f"layer cache `{inputs['cache-to']}`"
     if action.startswith("actions/setup-") and inputs.get("cache"):
@@ -5114,6 +5115,13 @@ def scenario_disagreements(doc: dict) -> list[str]:
     return found
 
 
+def skipped_writers(doc: dict) -> list[str]:
+    """Return each job NOT_ON_PUSH_JOBS or NOT_ON_PUSH_FILTER_JOBS lists that writes a cache."""
+    writers = cache_writers(doc)
+    skipped = set(writers) & (set(NOT_ON_PUSH_JOBS) | set(NOT_ON_PUSH_FILTER_JOBS))
+    return [f"{job_id} writes {', '.join(writers[job_id])}" for job_id in sorted(skipped)]
+
+
 def check_push_runs_every_cache_writer(doc: dict) -> None:
     writers = cache_writers(doc)
     # The detector has to find the writers this workflow holds today, or the gap
@@ -5136,14 +5144,17 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         check(f"{job_id} is read as a cache writer", job_id in writers, f"{writers}")
     gaps = push_writer_gaps(doc)
     check("ci.yml: a push to `main` runs every cache writer", not gaps, "; ".join(gaps))
-    skipped_writers = sorted(
-        set(writers) & (set(NOT_ON_PUSH_JOBS) | set(NOT_ON_PUSH_FILTER_JOBS))
-    )
-    check(
-        "no job SCENARIOS skips on push writes a cache",
-        not skipped_writers,
-        f"{skipped_writers} write {[writers[job] for job in skipped_writers]}",
-    )
+    for step, expected in (
+        ({"uses": "oven-sh/setup-bun@v2"}, True),
+        ({"uses": "oven-sh/setup-bun@v2", "with": {"no-cache": "false"}}, True),
+        ({"uses": "oven-sh/setup-bun@v2", "with": {"no-cache": True}}, False),
+    ):
+        check(
+            f"cache_write({step}) {'writes' if expected else 'writes nothing'}",
+            (cache_write(step) is not None) is expected,
+        )
+    skipped = skipped_writers(doc)
+    check("no job SCENARIOS skips on push writes a cache", not skipped, "; ".join(skipped))
     disagreements = scenario_disagreements(doc)
     check(
         "every scenario's answer matches the job's own `if:`",
@@ -5182,6 +5193,67 @@ def check_push_writer_mutants(doc: dict) -> None:
         "a push matrix without the writing shard is reported",
         any("rust-test saves" in gap for gap in gaps),
         f"{gaps}",
+    )
+
+    partial = copy.deepcopy(doc)
+    pyo3 = partial["jobs"]["pyo3-module"]
+    pyo3["if"] = pyo3["if"].replace(
+        "needs.changes.outputs.python == 'true' ||",
+        "(github.event_name != 'push' && needs.changes.outputs.python == 'true') ||",
+    )
+    gaps = push_writer_gaps(partial)
+    check(
+        "a push guard on one clause of writer pyo3-module is reported",
+        any(
+            gap.startswith("pyo3-module writes") and "skips it where a merge_group run" in gap
+            for gap in gaps
+        ),
+        f"{gaps}",
+    )
+
+    push_shards = "${{ fromJSON(github.event_name == 'push' && '[1, 5]' || '[1, 2, 3, 4]') }}"
+    for label, key, value, reported in (
+        (
+            "a writer matrix that is one expression",
+            None,
+            "${{ fromJSON(inputs.matrix) }}",
+            "through a matrix this check cannot read",
+        ),
+        (
+            "a writer matrix key no pattern reads",
+            "shard",
+            "${{ fromJSON(inputs.shards) }}",
+            "matrix `shard` is an expression this check cannot read",
+        ),
+        (
+            "a push matrix leg outside every other event's legs",
+            "shard",
+            push_shards,
+            "rust-test's matrix `shard` runs [1, 5] on push",
+        ),
+    ):
+        changed = copy.deepcopy(doc)
+        strategy = changed["jobs"]["rust-test"]["strategy"]
+        if key is None:
+            strategy["matrix"] = value
+        else:
+            strategy["matrix"][key] = value
+        gaps = push_writer_gaps(changed)
+        check(f"{label} is reported", any(reported in gap for gap in gaps), f"{gaps}")
+    check(
+        "the unmutated rust-test matrix is read without a gap",
+        not any(gap.startswith("rust-test") for gap in push_writer_gaps(doc)),
+        f"{push_writer_gaps(doc)}",
+    )
+
+    writing = copy.deepcopy(doc)
+    writing["jobs"]["error-codes"].setdefault("steps", []).append(
+        {"uses": "oven-sh/setup-bun@v2"}
+    )
+    check(
+        "a cache write in a job NOT_ON_PUSH_JOBS lists is reported",
+        any(found.startswith("error-codes writes") for found in skipped_writers(writing)),
+        f"{skipped_writers(writing)}",
     )
 
     draft = copy.deepcopy(doc)
@@ -5270,17 +5342,21 @@ def check_aggregate_grammar() -> None:
     for expression, event, skipped_ok in (
         ("github.event_name != 'push' && needs.changes.outputs.rust == 'true'", "push", True),
         ("github.event_name != 'push' && needs.changes.outputs.rust == 'true'", "merge_group", False),
+        # With rust true, python false and the event pull_request, `&&` binding
+        # tighter than `||` selects this job; `||` binding tighter, or a
+        # left-to-right reading, skips it.
         (
-            "needs.changes.outputs.python == 'true' || "
-            "needs.changes.outputs.rust == 'true' && github.event_name == 'push'",
-            "pull_request",
-            True,
-        ),
-        (
-            "(needs.changes.outputs.python == 'true' || "
-            "needs.changes.outputs.rust == 'true') && github.event_name != 'push'",
+            "needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true' && github.event_name == 'push'",
             "pull_request",
             False,
+        ),
+        # The parentheses turn the case above into a skip.
+        (
+            "(needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true') && github.event_name == 'push'",
+            "pull_request",
+            True,
         ),
     ):
         code, out = run_one_job_aggregate(expression, event)
@@ -5689,9 +5765,8 @@ def main() -> int:
     code, out = run_aggregate(needs, docs_push.event)
     check("push event, a pull-request-only job skipped -> exit 0", code == 0, out)
 
-    print("push-skips — a push skips every job but the cache writers, and only a push")
-    # A push to `main` runs only the jobs that write a cache another run restores,
-    # and the jobs those need. SCENARIOS states which jobs those are, so an
+    print("push-skips")
+    # SCENARIOS states which jobs a push runs, so an
     # aggregate given that skipped set must pass, every writer reported skipped
     # must fail it, and a push-only skip reported on a pull_request or merge_group
     # run must fail it. Each failing case names the job, so a verdict reached for
