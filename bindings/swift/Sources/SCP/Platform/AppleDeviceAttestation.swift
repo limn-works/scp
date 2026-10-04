@@ -82,10 +82,9 @@
         /// that carries an attestation record, or `attestKey` answered
         /// `DCError.invalidKey` for a key with no record and the key probe's
         /// assertion with that key answered `DCError.invalidKey` too. For the
-        /// stored key, the adapter discards the key ID and its record, and a
-        /// replacement key ID becomes the stored key ID. For a replacement
-        /// key, it discards the replacement key ID only, and the stored key
-        /// and its record stay.
+        /// stored key, the adapter discards the key ID and its record. For a
+        /// replacement key, it discards the replacement key ID only, and the
+        /// stored key and its record stay.
         ///
         /// `DCError.h` lists an App Attest service rejecting the key as one
         /// cause of `DCError.invalidKey`.
@@ -192,10 +191,7 @@
     /// and obtain an Apple-signed attestation certificate. The key ID is
     /// persisted in `UserDefaults`, and assertions use the stored key. When
     /// `attestKey` returns an attestation object, the adapter records that
-    /// key ID as attested, beside the key ID. Apple attests one key once, so
-    /// an `attest` that reads a stored key carrying that record generates a
-    /// replacement key and attests it. The replacement is stored apart from
-    /// the attested key.
+    /// key ID as attested, beside the key ID.
     ///
     /// ## Key lifecycle on error (ADR-025 acceptance criterion 3)
     ///
@@ -205,14 +201,7 @@
     /// leads to the key probe instead: `probeKey(_:after:call:)` asks
     /// `generateAssertion` for an assertion with that key over the
     /// client data `K` of `09-security-model.md` §9.3.1, and discards the
-    /// assertion. Three answers discard a key ID: `generateAssertion`
-    /// answering `DCError.invalidKey` for a key that carries an attestation
-    /// record (`SCP-ATTEST-9023`), which discards the key ID and its record
-    /// and makes any replacement key ID the stored key ID; the key probe's
-    /// assertion answering `DCError.invalidKey` (`SCP-ATTEST-9023`), which
-    /// discards the key ID `attestKey` named; and a key probe assertion that
-    /// succeeds for a replacement key (`SCP-ATTEST-9021`), which discards the
-    /// replacement key ID.
+    /// assertion.
     ///
     /// Attestation steps (per ADR-025 acceptance criterion 3):
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
