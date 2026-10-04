@@ -241,9 +241,14 @@ async fn live_poll_next_drains_to_terminal() {
     // open-time UCAN signature check resolves the issuer key.
     seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
 
-    // Context owned by the creator; ceiling admits the Action outlet stem.
+    // Context owned by the creator; ceiling admits the Action outlet stem and
+    // the registration the creator performs below. `outlet_register_on` reads
+    // the ceiling off the supervisor actor, so a capability this list omits is
+    // one the registration no longer has; the bridge-local role-state copy it
+    // used to read carried `default_ceiling()` and admitted the call whatever
+    // this list said.
     let params = serde_json::json!({
-        "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+        "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
         "governance": "single_admin",
         "memoryScope": "ephemeral",
     })
@@ -885,8 +890,11 @@ mod streaming_vectors_live {
 
         seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
 
+        // The ceiling admits the registration the creator performs below.
+        // `outlet_register_on` reads it off the supervisor actor, so a
+        // capability this list omits is one the registration no longer has.
         let params = serde_json::json!({
-            "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+            "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
             "governance": "single_admin",
             "memoryScope": "ephemeral",
         })
@@ -1346,15 +1354,15 @@ mod xctx_streaming_saga_tests {
             .expect("context_create should succeed")
     }
 
-    /// Drives `context_id` to a real non-active (`Closed`) lifecycle state through
-    /// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
-    /// dispatch the bridge's close uses — so a subsequent
-    /// `supervisor.read_context_state(context_id)` returns a non-`Active` state.
-    /// That authoritative state (NOT the bridge-cached handle state) is what the
-    /// streaming-saga open's active-state guard now reads. `initiator_did` must be
-    /// the creator of a context created with a `ContextClose`-bearing ceiling (see
-    /// `create_closeable_saga_context`).
-    async fn drive_context_closed(
+    /// Drives `context_id` to the `Closing` lifecycle state through the
+    /// supervisor's `LifecycleCommand::CloseContext` dispatch, the command the
+    /// bridge's close sends, and asserts that
+    /// `supervisor.read_context_state(context_id)` then returns
+    /// `Some(ContextState::Closing)`: the actor stays resident, so the gate under
+    /// test answers from a real non-`Active` state rather than from an absent
+    /// actor. `initiator_did` must be the creator of a context created with a
+    /// `ContextClose`-bearing ceiling (see `create_closeable_saga_context`).
+    async fn drive_context_closing(
         bi: &std::sync::Arc<NapiBridgeInstance>,
         context_id: &str,
         initiator_did: &str,
@@ -1380,6 +1388,28 @@ mod xctx_streaming_saga_tests {
         rx.await
             .expect("close reply channel should not drop")
             .expect("close should succeed");
+        assert_eq!(
+            supervisor.read_context_state(context_id).await,
+            Some(scp_core::context::ContextState::Closing),
+            "the close dispatch must leave a resident actor in Closing"
+        );
+    }
+
+    /// Asserts `msg` is the withheld refusal: the shared withheld text, and
+    /// neither the lifecycle state nor the context id.
+    fn assert_withheld(msg: &str, context_id: &str) {
+        assert!(
+            msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "expected the withheld refusal, got: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("closing"),
+            "the refusal must not name the lifecycle state: {msg}"
+        );
+        assert!(
+            !msg.contains(context_id),
+            "the refusal must not name the context id: {msg}"
+        );
     }
 
     /// (LIFECYCLE) A money-moving streaming-saga OPEN against a NON-active source
@@ -1388,11 +1418,11 @@ mod xctx_streaming_saga_tests {
     /// guard — BEFORE any input validation, UCAN check, or saga drive, so no saga
     /// is started and no receiver is handed out.
     ///
-    /// The context is driven to a REAL `Closed` state through the actual
-    /// supervisor close path; the guard reads the AUTHORITATIVE actor state via
-    /// `read_context_state` (NOT the lagging FFI `NapiContextHandle::state()`
-    /// cache), so this genuinely exercises the authoritative read that closes the
-    /// Closing-cache money gap.
+    /// The context is driven to `Closing` through the supervisor close path
+    /// ([`drive_context_closing`] asserts the state). The guard reads the actor
+    /// state through `require_active_context_before_authz`, not the
+    /// `NapiContextHandle::state()` cache, which still reads `Active`, and
+    /// reports the withheld refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_saga_open_rejects_non_active_context() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -1407,23 +1437,11 @@ mod xctx_streaming_saga_tests {
             scp_ffi_common::outlet_id::generate_outlet_id("xctx_streaming_non_active_probe");
 
         // --- source (caller) context non-active → OUTLET_6010 ---------------
-        // Drive the CALLER context to a REAL Closed state through the supervisor;
-        // the authoritative guard must reject it.
+        // Drive the CALLER context to Closing through the supervisor; the guard
+        // must reject it.
         let handle_a = create_closeable_saga_context(&bi, &owner_identity).await;
         let handle_b = create_closeable_saga_context(&bi, &owner_identity).await;
-        drive_context_closed(&bi, &handle_a.context_id(), &hosted_caller).await;
-
-        // Precondition: the authoritative supervisor state is non-active. This is
-        // what the guard reads — proving the test drives a REAL Closing/Closed
-        // context, not the FFI cache.
-        assert_ne!(
-            crate::runtime::supervisor(&bi)
-                .expect("supervisor")
-                .read_context_state(&handle_a.context_id())
-                .await,
-            Some(scp_core::context::ContextState::Active),
-            "the caller context must be authoritatively non-active before the open"
-        );
+        drive_context_closing(&bi, &handle_a.context_id(), &hosted_caller).await;
 
         let err = Box::pin(outlet_streaming_saga_open_on(
             &bi,
@@ -1448,6 +1466,7 @@ mod xctx_streaming_saga_tests {
             msg.contains(codes::OUTLET_6010),
             "expected caller-axis SCP-OUTLET-6010, got: {msg}"
         );
+        assert_withheld(&msg, &handle_a.context_id());
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
@@ -1458,7 +1477,7 @@ mod xctx_streaming_saga_tests {
         // only the target axis is non-active.
         let handle_c = create_closeable_saga_context(&bi, &owner_identity).await;
         let handle_d = create_closeable_saga_context(&bi, &owner_identity).await;
-        drive_context_closed(&bi, &handle_d.context_id(), &hosted_caller).await;
+        drive_context_closing(&bi, &handle_d.context_id(), &hosted_caller).await;
 
         let err = Box::pin(outlet_streaming_saga_open_on(
             &bi,
@@ -1483,6 +1502,7 @@ mod xctx_streaming_saga_tests {
             msg.contains(codes::OUTLET_6011),
             "expected target-axis SCP-OUTLET-6011, got: {msg}"
         );
+        assert_withheld(&msg, &handle_d.context_id());
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
