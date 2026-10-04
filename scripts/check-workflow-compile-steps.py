@@ -32,6 +32,10 @@ CHECK 1 — every `Swatinem/rust-cache` step names its group and says whether it
   A `shared-key` holding `${{ matrix.<axis> }}` counts as one group per value of that
   axis, the keys GitHub expands it to on the job's legs, so a templated writer and a
   literal writer of one expanded key count as two writers of that group.
+  A writer in a matrix job fails when legs that `shared-key`, `runs-on` and a
+  `matrix.<axis> == <value>` term in `save-if` do not tell apart would save one key:
+  an axis none of the three names, two `include` entries `save-if` leaves writing on
+  one runner, or a matrix holding list axes beside `include` or `exclude`.
 
 CHECK 2 — every uniffi-bindgen step reads the library out of the directory its own
 `cargo run` writes.
@@ -59,6 +63,7 @@ directory other than the repository's, which the cases under
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from collections import defaultdict
@@ -176,6 +181,11 @@ def check_workflows(workflows_dir: Path) -> list[str]:
 
 
 MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
+# `matrix.<axis> == <value>` inside a `save-if` expression: the writing legs hold that
+# one value of the axis.
+MATRIX_PIN = re.compile(
+    r"matrix\.([A-Za-z0-9_-]+)\s*==\s*('[^']*'|\"[^\"]*\"|[^\s)&|}]+)"
+)
 
 
 def expand_matrix_key(where: str, key: str, job: dict) -> tuple[list[str], list[str]]:
@@ -220,6 +230,70 @@ def expand_matrix_key(where: str, key: str, job: dict) -> tuple[list[str], list[
     return list(dict.fromkeys(keys)), []
 
 
+def check_writer_legs(where: str, key: str, save_if: object, job: dict) -> list[str]:
+    """Failures for a writer step that more than one matrix leg runs under one key.
+
+    GitHub runs the step on every leg of the job's matrix. An axis is told apart
+    when the `shared-key` or `runs-on` templates it, or when `save-if` holds
+    `matrix.<axis> == <value>`, which leaves one value of that axis writing; every
+    other axis makes several legs save one key. On a matrix built only from
+    `include`, each entry is a leg, and the entries `save-if` leaves writing must
+    differ in an axis `runs-on` templates. A matrix holding both list axes and
+    `include` or `exclude` is reported, because this check cannot say which legs
+    the step runs on.
+    """
+    matrix = (job.get("strategy") or {}).get("matrix")
+    if not isinstance(matrix, dict):
+        return []
+    save_if_text = save_if if isinstance(save_if, str) else ""
+    runs_on = job.get("runs-on")
+    runs_on_axes = set(
+        MATRIX_REFERENCE.findall(runs_on if isinstance(runs_on, str) else "")
+    )
+    pins = {
+        m.group(1): m.group(2).strip("'\"") for m in MATRIX_PIN.finditer(save_if_text)
+    }
+    told_apart = set(MATRIX_REFERENCE.findall(key)) | runs_on_axes | set(pins)
+    axes = [k for k in matrix if k not in ("include", "exclude")]
+    expanders = [k for k in ("include", "exclude") if k in matrix]
+    if axes and expanders:
+        return [
+            (
+                f"{where}: the writer of cache group {key!r} sits in a `strategy.matrix` "
+                f"carrying {' and '.join(expanders)}, so this check cannot say how many "
+                f"legs save that key"
+            )
+        ]
+    if axes:
+        return [
+            f"{where}: the writer of cache group {key!r} runs on every value of matrix "
+            f"axis {axis!r}, which neither the `shared-key`, `runs-on` nor a "
+            f"`matrix.{axis} ==` term in `save-if` names, so legs differing only in that "
+            f"axis save one key"
+            for axis in axes
+            if axis not in told_apart
+        ]
+    entries = matrix.get("include")
+    if not isinstance(entries, list):
+        return []
+    writing = [
+        e
+        for e in entries
+        if isinstance(e, dict)
+        and all(json.dumps(e.get(a)).strip('"') == v for a, v in pins.items())
+    ]
+    runners = [tuple(str(e.get(a)) for a in sorted(runs_on_axes)) for e in writing]
+    if len(runners) != len(set(runners)):
+        return [
+            (
+                f"{where}: the writer of cache group {key!r} runs on {len(writing)} "
+                f"`include` entries that `save-if` leaves writing on one runner, so "
+                f"several legs save one key"
+            )
+        ]
+    return []
+
+
 def check_cache_step(
     where: str, step: dict, job: dict, producers: dict[str, list[str]]
 ) -> list[str]:
@@ -254,6 +328,8 @@ def check_cache_step(
         return failures
     for key in keys:
         producers[key].append(where)
+    if not key_failures:
+        failures.extend(check_writer_legs(where, shared_key, save_if, job))
     if not (isinstance(save_if, str) and DEFAULT_BRANCH_REF in save_if):
         failures.append(
             f"{where}: the writer of cache group {shared_key!r} has save-if {save_if!r}, "

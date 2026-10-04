@@ -1,0 +1,15 @@
+name: Bad
+on: push
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: fuzz_a
+          - target: fuzz_b
+    steps:
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz-run
+          save-if: ${{ github.ref == 'refs/heads/main' }}
