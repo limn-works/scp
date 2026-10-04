@@ -92,7 +92,7 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
-| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-optional-features`, `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
 | `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --profile ci-bridge`, `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, and `bridge-parity-kotlin` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
 | `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
@@ -527,7 +527,7 @@ Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
 | Job | Runs on | Command |
 |-----|---------|---------|
 | All Tier 1 jobs | (same as above) | (same as above) |
-| harness meta-tests | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2` |
+| harness meta-tests | ubuntu-latest, macos-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2` |
 | phase integration | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2 -E 'test(phase_integration)'` |
 
 Harness meta-tests cover §16.13.1–10: InMemoryRelay, InMemoryTransport, SimulatedClock, NetworkTopology, ScenarioBuilder, determinism, ProtocolRepository, MlsStorageBridge, assertion library, and preset scenario validation. Phase integration runs the current phase's end-to-end test (P1 in Phase 1, P2 in Phase 2, etc.).
