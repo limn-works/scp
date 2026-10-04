@@ -163,19 +163,14 @@
         /// `UserDefaults` key under which the ID of a key Apple attested is
         /// persisted.
         ///
-        /// Apple attests one key once, so this record is what makes `attest`
-        /// generate a replacement key rather than hand the stored key to
-        /// `attestKey`, and it tells apart the two conditions
-        /// `generateAssertion` answers `DCError.invalidKey` for. It holds a
-        /// key ID rather than a flag, so a stale value cannot describe a key
-        /// ID that replaced the one it names.
+        /// It tells apart the two conditions `generateAssertion` answers
+        /// `DCError.invalidKey` for. It holds a key ID rather than a flag, so
+        /// a stale value cannot describe a key ID that replaced the one it
+        /// names.
         static let attestedAppAttestKeyId = "dev.limn.scp.appAttest.attestedKeyId"
 
         /// `UserDefaults` key under which a key generated to replace an
         /// attested key is persisted.
-        ///
-        /// `appAttestKeyId` keeps naming the attested key while a replacement
-        /// is stored.
         static let replacementAppAttestKeyId = "dev.limn.scp.appAttest.replacementKeyId"
     }
 
@@ -1154,12 +1149,7 @@
     /// each later one does nothing. Apple's answer ends the call through
     /// `end(_:)`, whose body writes the attestation record or discards a key
     /// ID only when that answer is the first end, and before the caller
-    /// resumes, so a late answer writes neither. The
-    /// adapter stores a key ID and hands App Attest a method only inside
-    /// `issue(_:)`, which runs nothing once the call ended. An end that
-    /// arrives while an `issue(_:)` body runs takes effect, and resumes the
-    /// caller, when that body returns, so every key ID a call stores and every
-    /// App Attest method it starts comes before the call ends. The key-ID
+    /// resumes, so a late answer writes neither. The key-ID
     /// read runs outside `issue(_:)`: an end that arrives during it takes
     /// effect at once, and the `issue(_:)` after the read then starts nothing.
     private final class AppAttestCall: Sendable {
