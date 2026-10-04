@@ -250,14 +250,37 @@ listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
 // regenerated after any change to the UniFFI bridge (crates/scp-ffi/uniffi/).
 //
 // See ADR-021 (UniFFI Bridge) and .docs/scaffold/kotlin.md.
+//
+// Cargo features
+// --------------
+// `-Pscp.uniffi.cargoFeatures=<comma list>` names the cargo features the generator
+// passes to `cargo build` for the scp-ffi-uniffi cdylib and for uniffi-bindgen. A
+// build that does not pass the property builds the crate with its default features,
+// which are its production features. The `testing` feature compiles the in-memory
+// custody arm and the `signed_at_override` parity affordance, both security
+// nullifiers that §17.17.2 of the persistence spec requires absent from a shipped
+// artifact, and `release.yml` publishes the JAR and AAR this project builds. So
+// `testing` reaches a build only when the caller names it: `:scp-kt:test` refuses to
+// run without it (see `uniffiTestGuard` below), and no release-workflow Gradle line
+// may pass it, which `scripts/check-shipped-feature-graph.sh` asserts. That gate also
+// pins every line below that reads this property, names a cargo feature flag, or
+// invokes the generator, so an edit to any of them fails it until the gate's
+// declarations change in the same review.
 // ---------------------------------------------------------------------------
+val uniffiCargoFeatures: String = providers.gradleProperty("scp.uniffi.cargoFeatures").getOrElse("")
+if (!Regex("([A-Za-z0-9_/-]+(,[A-Za-z0-9_/-]+)*)?").matches(uniffiCargoFeatures)) {
+    throw GradleException(
+        "scp.uniffi.cargoFeatures is '$uniffiCargoFeatures'; it takes a comma-separated list of cargo feature names",
+    )
+}
+val uniffiFeatureArgs = if (uniffiCargoFeatures.isEmpty()) emptyList() else listOf("--features=$uniffiCargoFeatures")
+val uniffiPrebuiltBindings: String = providers.gradleProperty("scp.uniffi.prebuiltBindings").getOrElse("false")
+
 tasks.register<Exec>("generateUniffiBindings") {
     group = "codegen"
     description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
     workingDir = rootProject.projectDir.parentFile.parentFile
-    // The `testing` feature gates the in-memory custody arm and the `signed_at_override`
-    // parity affordance.
-    commandLine("./scripts/generate-uniffi-kotlin.sh", "--features=testing")
+    commandLine(listOf("./scripts/generate-uniffi-kotlin.sh") + uniffiFeatureArgs)
     // `-Pscp.uniffi.prebuiltBindings=true` skips this task and compiles the bindings
     // already in `uniffiBindingsDir`. The `kotlin-test` and `bridge-parity-kotlin` jobs
     // in `.github/workflows/ci.yml` set it: `kotlin-test` generates the bindings and the
@@ -268,8 +291,7 @@ tasks.register<Exec>("generateUniffiBindings") {
     // checks for the generated file while this task is configured and fails the build
     // without it, rather than letting `compileKotlin` run over an empty bindings
     // directory. Any value but `true` or `false` fails too.
-    val prebuiltBindings =
-        providers.gradleProperty("scp.uniffi.prebuiltBindings").getOrElse("false")
+    val prebuiltBindings = uniffiPrebuiltBindings
     when (prebuiltBindings) {
         "false" -> Unit
         "true" -> {
@@ -288,6 +310,36 @@ tasks.register<Exec>("generateUniffiBindings") {
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))
     outputs.dir(uniffiBindingsDir)
+}
+
+// Prints the command `generateUniffiBindings` runs. The `kotlin-lint` job in
+// `.github/workflows/ci.yml` runs it with and without `scp.uniffi.cargoFeatures` and
+// compares the output with the expected command, so a default that adds a feature
+// fails that job.
+tasks.register("printUniffiGeneratorCommand") {
+    group = "help"
+    description = "Print the command generateUniffiBindings runs"
+    val command = tasks.named<Exec>("generateUniffiBindings").map { it.commandLine.joinToString(" ") }
+    doLast { println(command.get()) }
+}
+
+// uniffiTestGuard: `:scp-kt:test` loads the cdylib under cargo's target directory
+// (see `JnaLibraryPath` above), and its real-FFI suites create identities with the
+// in-memory custody arm, which only a `testing` build compiles. When this build
+// generates the bindings, it builds that cdylib too, so a test run without
+// `testing` in `scp.uniffi.cargoFeatures` would load a production library and fail
+// suite by suite with SCP-IDENT-1008. This check fails the build before any task
+// runs instead. With `scp.uniffi.prebuiltBindings=true` another step built the
+// library, and that step names its own features: the `kotlin-test` job in
+// `.github/workflows/ci.yml` builds it with `--features testing`.
+gradle.taskGraph.whenReady {
+    val testTask = tasks.test.get()
+    if (hasTask(testTask) && uniffiPrebuiltBindings != "true" && "testing" !in uniffiCargoFeatures.split(",")) {
+        throw GradleException(
+            "${testTask.path} needs a cdylib built with the testing feature; " +
+                "pass -Pscp.uniffi.cargoFeatures=testing",
+        )
+    }
 }
 
 // Without this dependency, a developer who edits the UniFFI bridge and forgets
