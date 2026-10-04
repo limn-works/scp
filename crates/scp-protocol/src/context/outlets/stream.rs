@@ -3074,10 +3074,8 @@ mod tests {
             // The running root must also match the oracle at EVERY prefix,
             // not just at the end — the pump reads the root at close but the
             // frontier must be correct incrementally. The prefix oracle folds
-            // a prefix of leaf hashes computed once per case, because calling
-            // `compute_chunk_manifest_root` per prefix re-hashed every chunk
-            // n(n+1)/2 times. The full-length assertion above still checks
-            // `compute_chunk_manifest_root` itself.
+            // a prefix of leaf hashes computed once per case. The full-length
+            // assertion above still checks `compute_chunk_manifest_root` itself.
             let leaves: Vec<[u8; 32]> = chunks
                 .iter()
                 .map(|c| compute_chunk_leaf_hash(c).unwrap())
