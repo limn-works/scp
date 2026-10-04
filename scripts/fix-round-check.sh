@@ -77,17 +77,7 @@
 #      203 ms from queue to scan finished for a 16 KB binary, and 0 further assessments
 #      on later execs of the same bytes. That cost per binary is small, but the link step
 #      is not, and a workspace nextest links dozens. On 2026-09-11 that queue reached 31
-#      minutes per item and a fix round died inside it. Thirteen jobs of
-#      `.github/workflows/ci.yml` run one of those three commands on the pushed head.
-#      Ten name the command themselves: `rust-test`, `rust-test-optional-features`,
-#      `rust-test-napi-production`, `rust-build-pyo3-production`,
-#      `rust-build-uniffi-production`, `rust-doc` (which runs `cargo test --workspace
-#      --doc`), `fail-closed-pre-rotation`, `fuzz-build`, and `napi-addon` and
-#      `kotlin-test` (which run `cargo build -p scp-ffi-napi` and
-#      `cargo build -p scp-ffi-uniffi` on an artifact-cache miss to produce the library
-#      they upload). Three more reach a cargo build through another program:
-#      `pyo3-module` and `pyo3-module-macos` run `maturin develop`, and `xcframework`
-#      runs `bindings/swift/build-xcframework.sh`, which runs `cargo build` twice.
+#      minutes per item and a fix round died inside it.
 #   2. `cargo clippy`, in every form. The compile step runs `cargo check`, which reports
 #      no clippy lint at all, so a `clippy::needless_borrow` in the file this round edited
 #      passes here and fails in the `rust-clippy` job. That job is the merge gate, and it

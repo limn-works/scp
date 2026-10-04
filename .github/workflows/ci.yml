@@ -2944,7 +2944,7 @@ jobs:
             want="-Djna.library.path=$dir/debug:$dir/release"
             got=$(CARGO_TARGET_DIR=$value ./gradlew -q :scp-kt:printJnaLibraryPath | tail -n 1)
             if [ "$got" != "$want" ]; then
-              echo "::error::CARGO_TARGET_DIR=$value gave '$got'; cargo uses '$want'"
+              echo "::error::CARGO_TARGET_DIR=$value gave '$got', not '$want'"
               exit 1
             fi
           done

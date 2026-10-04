@@ -144,7 +144,7 @@ tasks.test {
 
 // Prints the `-Djna.library.path` argument `JnaLibraryPath` gives the test JVM. The
 // `kotlin-lint` job in `.github/workflows/ci.yml` runs it with a relative and an
-// absolute `CARGO_TARGET_DIR` and compares the output with the directory cargo uses.
+// absolute `CARGO_TARGET_DIR` and compares the output with the expected path.
 tasks.register("printJnaLibraryPath") {
     group = "help"
     description = "Print the -Djna.library.path argument the scp-kt test JVM receives"
@@ -256,17 +256,9 @@ tasks.register<Exec>("generateUniffiBindings") {
     group = "codegen"
     description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
     workingDir = rootProject.projectDir.parentFile.parentFile
-    // Extra cargo features passed alongside the default `testing` feature
-    // (which gates the in-memory custody arm and the `signed_at_override` parity
-    // affordance), as `-Pscp.uniffi.extraFeatures=<list>`.
-    val extraFeatures = providers.gradleProperty("scp.uniffi.extraFeatures").getOrElse("")
-    val featuresArg =
-        if (extraFeatures.isEmpty()) {
-            "--features=testing"
-        } else {
-            "--features=testing,$extraFeatures"
-        }
-    commandLine("./scripts/generate-uniffi-kotlin.sh", featuresArg)
+    // The `testing` feature gates the in-memory custody arm and the `signed_at_override`
+    // parity affordance.
+    commandLine("./scripts/generate-uniffi-kotlin.sh", "--features=testing")
     // `-Pscp.uniffi.prebuiltBindings=true` skips this task and compiles the bindings
     // already in `uniffiBindingsDir`. The `kotlin-test` and `bridge-parity-kotlin` jobs
     // in `.github/workflows/ci.yml` set it: `kotlin-test` generates the bindings and the
