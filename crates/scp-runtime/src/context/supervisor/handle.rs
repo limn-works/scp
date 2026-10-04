@@ -21,7 +21,7 @@
 //! upgraded `Arc` when the operation ends, so an actor never keeps its
 //! Supervisor alive and the Supervisor → actor hierarchy holds no reference
 //! cycle (Decision 2). A failed upgrade means every owner dropped the
-//! Supervisor; the method returns [`ContextError::SupervisorShutDown`].
+//! Supervisor.
 //!
 //! # `&OwnedIdentityDid` parameters
 //!
@@ -163,9 +163,11 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting epoch;
-    /// the live receive seams surface it via `?` and abort the operation (it is
-    /// NEVER log-and-dropped).
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on a non-monotonic or overshooting epoch; the live receive seams surface
+    /// it via `?` and abort the operation (it is NEVER log-and-dropped).
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
     pub(in crate::context) fn check_and_advance_sender_epoch(
         &self,
         ctx: &[u8; 32],
@@ -183,8 +185,11 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting
-    /// `(epoch, sequence)`; the recv seam surfaces it via `?` (never dropped).
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on a non-monotonic or overshooting `(epoch, sequence)`; the recv seam
+    /// surfaces it via `?` (never dropped). [`ContextError::SupervisorShutDown`]
+    /// when the Supervisor has dropped.
     pub(in crate::context) fn check_and_advance_recv_sequence(
         &self,
         ctx: &[u8; 32],
@@ -236,8 +241,11 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// Propagates [`FloorAdvanceError`] on an Inv-3 regression
-    /// ([`MergePolicy::RejectRegression`]) or an overshoot (RejectRegression only).
+    /// [`ContextError::CryptoFailed`] (converted from
+    /// [`FloorAdvanceError`](crate::context::supervisor::floors::FloorAdvanceError))
+    /// on an Inv-3 regression ([`MergePolicy::RejectRegression`]) or an overshoot
+    /// (RejectRegression only). [`ContextError::SupervisorShutDown`] when the
+    /// Supervisor has dropped.
     pub(in crate::context) fn validate_and_merge_all_floors(
         &self,
         ctx: &[u8; 32],
@@ -659,6 +667,10 @@ impl SupervisorHandle {
     /// Async because the gauge sweep mailboxes each per-context actor for
     /// its receive-buffer length (ADR-049 Phase 2A finalization — DashMap
     /// removal).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
     pub(crate) async fn update_context_gauges(&self) -> Result<(), ContextError> {
         let supervisor = self.upgrade()?;
         crate::context::manager_methods::update_context_gauges(&supervisor).await;
@@ -666,8 +678,12 @@ impl SupervisorHandle {
     }
 
     /// Persist the per-context state and broadcast snapshot for
-    /// `context_id` if persistence is configured. Best-effort —
-    /// errors are logged, not propagated.
+    /// `context_id` if persistence is configured. A persistence failure is
+    /// not propagated.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
     pub(crate) async fn persist_context_and_broadcast(
         &self,
         context_id: &str,
