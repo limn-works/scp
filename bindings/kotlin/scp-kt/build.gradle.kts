@@ -78,25 +78,40 @@ val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
 // directory builds the cdylib outside this checkout. Asking `cargo metadata` gets the
 // directory cargo actually used. The provider runs only when a task reads it, so
 // the lint and docs jobs, which install no Rust toolchain, never invoke cargo.
+//
+// A set `CARGO_TARGET_DIR` is read directly instead. Cargo gives that variable
+// precedence over every other source and resolves a relative value against the
+// directory it runs in, which for the `cargo metadata` call below is the repository
+// root, so the answer is the one cargo would give. The `kotlin-test` job in
+// `.github/workflows/ci.yml` sets it because on an artifact-cache hit that job installs
+// no Rust toolchain, and a `cargo metadata` there would make rustup install the
+// pinned channel with every target `rust-toolchain.toml` lists.
+val workspaceRoot: File = rootProject.projectDir.parentFile.parentFile
 val cargoTargetDir: Provider<String> =
     providers
-        .exec {
-            workingDir = rootProject.projectDir.parentFile.parentFile
-            commandLine(
-                "cargo",
-                "metadata",
-                "--manifest-path",
-                "crates/scp-ffi/uniffi/Cargo.toml",
-                "--format-version",
-                "1",
-                "--no-deps",
-            )
-        }.standardOutput.asText
-        .map { json ->
-            val metadata = groovy.json.JsonSlurper().parseText(json) as Map<*, *>
-            metadata["target_directory"] as? String
-                ?: throw GradleException("cargo metadata named no target_directory")
-        }
+        .environmentVariable("CARGO_TARGET_DIR")
+        .filter { value -> value.isNotEmpty() }
+        .map { value -> workspaceRoot.resolve(value).path }
+        .orElse(
+            providers
+                .exec {
+                    workingDir = workspaceRoot
+                    commandLine(
+                        "cargo",
+                        "metadata",
+                        "--manifest-path",
+                        "crates/scp-ffi/uniffi/Cargo.toml",
+                        "--format-version",
+                        "1",
+                        "--no-deps",
+                    )
+                }.standardOutput.asText
+                .map { json ->
+                    val metadata = groovy.json.JsonSlurper().parseText(json) as Map<*, *>
+                    metadata["target_directory"] as? String
+                        ?: throw GradleException("cargo metadata named no target_directory")
+                },
+        )
 
 // Passes `-Djna.library.path` to the test JVM. A named class with an `@Input`
 // property, rather than a lambda, lets Gradle fingerprint the argument for
@@ -232,11 +247,8 @@ tasks.register<Exec>("generateUniffiBindings") {
     description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
     workingDir = rootProject.projectDir.parentFile.parentFile
     // Extra cargo features passed alongside the default `testing` feature
-    // (which now gates the in-memory custody arm). The bridge-parity CI job
-    // sets `-Pscp.uniffi.extraFeatures=testing` so the regenerated cdylib keeps
-    // the `signed_at_override` parity affordance (`#[cfg(feature = "testing")]`).
-    // Production consumers leave it unset so the testing surface is not linked
-    // into release binaries.
+    // (which gates the in-memory custody arm and the `signed_at_override` parity
+    // affordance), as `-Pscp.uniffi.extraFeatures=<list>`.
     val extraFeatures = providers.gradleProperty("scp.uniffi.extraFeatures").getOrElse("")
     val featuresArg =
         if (extraFeatures.isEmpty()) {
@@ -245,6 +257,33 @@ tasks.register<Exec>("generateUniffiBindings") {
             "--features=testing,$extraFeatures"
         }
     commandLine("./scripts/generate-uniffi-kotlin.sh", featuresArg)
+    // `-Pscp.uniffi.prebuiltBindings=true` skips this task and compiles the bindings
+    // already in `uniffiBindingsDir`. The `kotlin-test` and `bridge-parity-kotlin` jobs
+    // in `.github/workflows/ci.yml` set it: `kotlin-test` generates the bindings and the
+    // cdylib once, or restores both from its artifact cache, and uploads them, and
+    // `bridge-parity-kotlin` downloads them. Running this task there would rebuild the
+    // crate, which needs a Rust toolchain neither job installs on a cache hit or on
+    // download. Both jobs place the bindings before Gradle starts, so the property
+    // checks for the generated file while this task is configured and fails the build
+    // without it, rather than letting `compileKotlin` run over an empty bindings
+    // directory. Any value but `true` or `false` fails too.
+    val prebuiltBindings =
+        providers.gradleProperty("scp.uniffi.prebuiltBindings").getOrElse("false")
+    when (prebuiltBindings) {
+        "false" -> Unit
+        "true" -> {
+            val generatedBindings = uniffiBindingsDir.resolve("uniffi/scp/scp.kt")
+            if (!generatedBindings.isFile) {
+                throw GradleException(
+                    "scp.uniffi.prebuiltBindings is true and $generatedBindings does not exist",
+                )
+            }
+        }
+        else -> throw GradleException(
+            "scp.uniffi.prebuiltBindings is '$prebuiltBindings'; it takes true or false",
+        )
+    }
+    onlyIf("scp.uniffi.prebuiltBindings is not true") { prebuiltBindings != "true" }
     // Invalidate on any Rust change under the uniffi crate so stale bindings never compile.
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))

@@ -79,15 +79,15 @@
 #      is not, and a workspace nextest links dozens. On 2026-09-11 that queue reached 31
 #      minutes per item and a fix round died inside it. Thirteen jobs of
 #      `.github/workflows/ci.yml` run one of those three commands on the pushed head.
-#      Eleven name the command themselves: `rust-test`, `rust-test-optional-features`,
+#      Ten name the command themselves: `rust-test`, `rust-test-optional-features`,
 #      `rust-test-napi-production`, `rust-build-pyo3-production`,
 #      `rust-build-uniffi-production`, `rust-doc` (which runs `cargo test --workspace
-#      --doc`), `fail-closed-pre-rotation`, `kotlin-test` and `typescript-check` (each of
-#      which runs `cargo build -p scp-ffi-uniffi` or `cargo build -p scp-ffi-napi` to
-#      produce the library its own lane loads), `bridge-parity` and
-#      `bridge-parity-kotlin`. Two more reach a cargo command through a script:
-#      `swift-build-test` and `bridge-parity-swift` each run
-#      `bindings/swift/build-xcframework.sh`, which runs `cargo build` twice.
+#      --doc`), `fail-closed-pre-rotation`, `fuzz-build`, and `napi-addon` and
+#      `kotlin-test` (which run `cargo build -p scp-ffi-napi` and
+#      `cargo build -p scp-ffi-uniffi` on an artifact-cache miss to produce the library
+#      they upload). Three more reach a cargo build through another program:
+#      `pyo3-module` and `pyo3-module-macos` run `maturin develop`, and `xcframework`
+#      runs `bindings/swift/build-xcframework.sh`, which runs `cargo build` twice.
 #   2. `cargo clippy`, in every form. The compile step runs `cargo check`, which reports
 #      no clippy lint at all, so a `clippy::needless_borrow` in the file this round edited
 #      passes here and fails in the `rust-clippy` job. That job is the merge gate, and it
@@ -526,7 +526,7 @@ UNRUN_LANES=(
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
     ".github/|scripts/tests/ci-gate/run-tests.sh, which the ci-workflow-selftest job of .github/workflows/ci.yml runs and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest, toolchain-wiring and workflow-compile-steps jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
-    "scripts/|the twelve suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in a job of .github/workflows/ci.yml and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the kotlin-test and bridge-parity-kotlin jobs start to generate the Kotlin bindings they build, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
+    "scripts/|the twelve suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py and scripts/tests/call-invariants/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, and scripts/tests/ci-gate/run-tests.sh and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in a job of .github/workflows/ci.yml and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the kotlin-test job starts to generate the Kotlin bindings it tests and uploads to bridge-parity-kotlin, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
 if [[ $changed_rc -eq 0 ]]; then
