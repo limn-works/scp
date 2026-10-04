@@ -3521,9 +3521,7 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
 /// (`xctx_streaming_saga_open_rejects_non_active_context`), read from each
 /// context's supervisor actor through the outlet lifecycle gate.
 ///
-/// Before the gate existed, a `Closing` / `Expired` / `MigratingOut` context refused a
-/// streaming saga and admitted a unary one, so one bridge answered one
-/// lifecycle question two ways. Removing either check makes the call fall
+/// Removing either check makes the call fall
 /// through to a `SagaAborted` from the saga drive instead, failing the code
 /// assertions below.
 #[test]

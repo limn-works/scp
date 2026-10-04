@@ -197,13 +197,9 @@ impl PySagaResult {
 /// context's supervisor actor reports `Active`, and refuses with `code`, the
 /// entry point's own error code, otherwise.
 ///
-/// A `Closing`, `Expired`, `MigratingOut`,
-/// `Tombstoned` or `Poisoned` context, a context no actor serves, and an actor
-/// that did not answer refuse with the same withheld text, because
-/// [`crate::runtime::active_role_state_before_authz`] withholds the lifecycle
-/// state from a caller it has not yet authorized. A suspended bridge, a bridge
-/// with no supervisor attached and a failed sync-to-async bridge return that
-/// function's error unchanged.
+/// A suspended bridge, a bridge with no supervisor attached and a failed
+/// sync-to-async bridge return the error of
+/// [`crate::runtime::active_role_state_before_authz`] unchanged.
 pub(crate) fn active_outlet_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1376,8 +1372,7 @@ fn outlet_invoke_cross_context_saga_impl(
 
     // Lifecycle gate: both contexts MUST be Active, read from each context's
     // supervisor actor. The streaming twin (`outlet_streaming_saga_open_impl`)
-    // gates on the same two reads with the same two codes, so a Closing,
-    // Expired or MigratingOut context refuses both sagas alike. A context no
+    // gates on the same two reads with the same two codes. A context no
     // actor serves counts as non-active. Both gates run before the
     // caller-principal binding, so both withhold the lifecycle state, and each
     // role state's creator names the key that context signs under below.
@@ -1637,9 +1632,6 @@ fn outlet_session_invoke_impl(
     }
     let input_json = py_dict_to_json(input)?;
 
-    // A session survives across invocations, so the role state that admitted
-    // the first call can lose the capability before the tenth; this gate reads
-    // the role state on every invocation, so it refuses the tenth.
     let role_state = active_outlet_role_state(
         bi,
         context_id,
@@ -3415,13 +3407,11 @@ mod tests {
         crate::runtime::remove_context(bi, &ctx_id);
     }
 
-    /// Every single-context outlet entry point that decides authorization
-    /// refuses a context whose supervisor actor is gone, with the entry point's
-    /// own code and a refusal that withholds the lifecycle state.
+    /// Seven single-context outlet entry points refuse a context whose
+    /// supervisor actor is gone, with the entry point's own code and a refusal
+    /// that withholds the lifecycle state.
     ///
-    /// None of the seven carried a lifecycle gate, while their NAPI and
-    /// `UniFFI` twins refused a `Closing`, `Expired`, or `MigratingOut` context and a
-    /// context no actor serves. A TTL expiry despawns the actor, and the
+    /// None of the seven carried a lifecycle gate. A TTL expiry despawns the actor, and the
     /// bridge's FFI state for the context stays registered until a close
     /// releases it, so `with_context` alone admitted each call. Each assertion
     /// pins the entry point's code, so dropping any one gate turns this test
