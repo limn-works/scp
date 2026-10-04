@@ -4046,7 +4046,22 @@ impl Scp {
     // MCP
     // -------------------------------------------------------------------
 
-    /// Per-instance equivalent of the free-function `mcp_server_create`.
+    /// Starts an MCP server over this instance's contexts on the `stdio` or
+    /// `sse` transport.
+    ///
+    /// A server started while no supervisor is attached, or while the instance
+    /// is suspended, has no resource subscriptions for its whole life: it
+    /// advertises `resources.subscribe`, `resources.listChanged` and
+    /// `tools.listChanged` as false, rejects `resources/subscribe`, and sends
+    /// no `list_changed` notification. With or without a supervisor, this
+    /// server lists no tools and refuses every `tools/call`. Attaching a
+    /// supervisor or calling `resume()` later does not add subscriptions or
+    /// `list_changed` notifications to a running server; stop it and serve
+    /// again to get them. Authorization and `resources/list|read` read role
+    /// state on every request, from the bridge's copy while no supervisor is
+    /// attached and from the actor once one is, so attaching a supervisor
+    /// changes which contexts a running server serves from the next request
+    /// on.
     #[napi(js_name = "mcpServerCreate")]
     pub async fn mcp_server_create(
         &self,
@@ -4072,12 +4087,27 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+    /// `auth_token` is sent as `Authorization: Bearer <token>` on the `GET`
+    /// and on every POST, or `None` for a server that runs no bearer check; an
+    /// SCP SSE server always runs one (ADR-015). The transport has no TLS, so a
+    /// token is sent only to a loopback host.
     #[napi(js_name = "mcpClientConnectSse")]
-    pub async fn mcp_client_connect_sse(&self, url: String) -> napi::Result<NapiMcpClientHandle> {
-        crate::mcp::mcp_client_connect_sse_on(&self.inner, url).await
+    pub async fn mcp_client_connect_sse(
+        &self,
+        url: String,
+        auth_token: Option<String>,
+    ) -> napi::Result<NapiMcpClientHandle> {
+        crate::mcp::mcp_client_connect_sse_on(&self.inner, url, auth_token).await
     }
 
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
+    ///
+    /// A stdio client's server process group is killed, or an SSE client's
+    /// sockets are shut down, before this returns. A call still waiting
+    /// behind an in-flight call on the handle fails once it reaches the
+    /// client, on either transport, and sends no request. A connect still
+    /// waiting for its server to answer `initialize` (stdio or SSE) has no
+    /// handle yet, so no disconnect, and no instance shutdown, ends it.
     #[napi(js_name = "mcpClientDisconnect")]
     pub async fn mcp_client_disconnect(&self, handle: &NapiMcpClientHandle) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);

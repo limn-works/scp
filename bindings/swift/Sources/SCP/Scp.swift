@@ -862,8 +862,8 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/mcpClientConnectSse`` on ``inner``.
-    func mcpClientConnectSse(url: String) async throws -> String {
-        try await inner.mcpClientConnectSse(url: url)
+    func mcpClientConnectSse(url: String, authToken: String?) async throws -> String {
+        try await inner.mcpClientConnectSse(url: url, authToken: authToken)
     }
 
     /// Forwards to ``Scp/mcpClientConnectStdio`` on ``inner``.
