@@ -1533,7 +1533,7 @@ jobs:
   # and Linux. scp-platform links SQLCipher against CommonCrypto on Apple
   # targets, and its SQLite storage takes an `fs2` advisory file lock, whose
   # semantics differ between the two kernels. Every other crate's tests run on
-  # Linux only, in jobs rust-test and rust-test-optional-features.
+  # Linux only.
   #
   # The scp-transport commands are the transport group's commands from job
   # rust-test-optional-features, without its `startup::tests` run: that run
