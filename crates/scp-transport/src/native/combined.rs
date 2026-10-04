@@ -151,19 +151,28 @@ impl CombinedNodeStorage {
         let conn =
             scp_sqlite_pools::open(&db_path).map_err(|e| StorageError::Internal(e.to_string()))?;
 
+        // `cipher_memory_security` runs alone and is read back before the key
+        // statement, so SQLCipher wipes every block its allocator frees from
+        // then on and a refusal comes before SQLite frees a block holding the
+        // key's hex text; its `malloc` heap is outside the wiping global
+        // allocator. While no code in the process reconfigures SQLite, `1`
+        // shows memory security is on and that SQLCipher is the linked engine.
+        // The key statement's blocks and the decrypted pages reach that
+        // allocator only because SQLite's reuse paths are off (checked by the
+        // open above) (spec §17.6, and §9.15 of the security-model spec, freed
+        // heap memory).
+        conn.execute_batch("PRAGMA cipher_memory_security = ON;")
+            .map_err(|e| {
+                StorageError::Internal(format!("failed to set cipher_memory_security: {e}"))
+            })?;
+        scp_sqlite_pools::require_memory_security(&conn)
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         // Apply SQLCipher encryption key and hardening PRAGMAs.
         // Matches SqliteStorage settings for consistent security posture.
-        // `cipher_memory_security` comes first so SQLCipher wipes every block
-        // its allocator frees from then on; its `malloc` heap is outside the
-        // wiping global allocator. The key statement's blocks and the decrypted
-        // pages reach that allocator only because SQLite's reuse paths are off
-        // (checked by the open above), which holds while no code in the
-        // process reconfigures SQLite (spec §17.6, and §9.15 of the
-        // security-model spec, freed heap memory).
         let mut hex_key = hex::encode(key);
         let mut pragma_sql = format!(
-            "PRAGMA cipher_memory_security = ON;\n\
-             PRAGMA key = \"x'{hex_key}'\";\n\
+            "PRAGMA key = \"x'{hex_key}'\";\n\
              PRAGMA cipher_page_size = 4096;\n\
              PRAGMA kdf_iter = 256000;\n\
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\
@@ -173,11 +182,6 @@ impl CombinedNodeStorage {
         let result = conn.execute_batch(&pragma_sql);
         pragma_sql.zeroize();
         result.map_err(|e| StorageError::Internal(format!("failed to set encryption key: {e}")))?;
-        // Read the pragma back: while no code in the process reconfigures
-        // SQLite, `1` shows memory security is on and that SQLCipher is the
-        // linked engine (spec §17.6).
-        scp_sqlite_pools::require_memory_security(&conn)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Enable WAL mode for concurrent reads.
         conn.execute_batch("PRAGMA journal_mode = WAL;")

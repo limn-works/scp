@@ -121,17 +121,20 @@ impl SqliteBlobStore {
         // which `scp_sqlite_pools` checked before handing the connection over;
         // that holds while no code in the process reconfigures SQLite (spec
         // §17.6, and §9.15 of the security-model spec, freed heap memory).
+        //
+        // The pragma runs alone and is read back before `journal_mode = WAL`,
+        // the connection's first statement that reads a page: while no code in
+        // the process reconfigures SQLite, `1` shows memory security is on and
+        // that SQLCipher is the linked engine.
+        conn.execute_batch("PRAGMA cipher_memory_security = ON;")
+            .map_err(|e| StorageError::Internal(format!("sqlite pragma: {e}")))?;
+        scp_sqlite_pools::require_memory_security(&conn)
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         conn.execute_batch(
-            "PRAGMA cipher_memory_security = ON;
-             PRAGMA journal_mode = WAL;
+            "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
         )
         .map_err(|e| StorageError::Internal(format!("sqlite pragma: {e}")))?;
-        // Read the pragma back: while no code in the process reconfigures
-        // SQLite, `1` shows memory security is on and that SQLCipher is the
-        // linked engine (spec §17.6).
-        scp_sqlite_pools::require_memory_security(&conn)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS blobs (

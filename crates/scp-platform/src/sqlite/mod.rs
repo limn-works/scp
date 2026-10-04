@@ -155,23 +155,32 @@ impl SqliteStorage {
         let conn = scp_sqlite_pools::open(&db_path)
             .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
+        // `cipher_memory_security` runs alone and is read back before the key
+        // statement: SQLCipher allocates with the C library's `malloc`, which
+        // the wiping global allocator never sees, and the pragma makes
+        // SQLCipher wipe each block its allocator frees from then on. A
+        // refusal after the key statement would come after SQLite had freed
+        // blocks holding the key's hex text unwiped. While no code in the
+        // process reconfigures SQLite, `1` shows memory security is on and that
+        // SQLCipher is the linked engine. The key statement's blocks and the
+        // decrypted pages reach SQLCipher's allocator only because SQLite's
+        // reuse paths are off (checked by the open above), so the connection
+        // keeps no freed block unwiped (§17.6, and §9.15 of the security-model
+        // spec, freed heap memory).
+        conn.execute_batch("PRAGMA cipher_memory_security = ON;")
+            .map_err(|e| {
+                PlatformError::StorageError(format!("failed to set cipher_memory_security: {e}"))
+            })?;
+        scp_sqlite_pools::require_memory_security(&conn)
+            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
+
         // Apply SQLCipher pragmas (spec section 17.6).
         // The hex key format is `PRAGMA key = "x'<hex>'"` — a double-quoted
         // string containing `x'...'`. This tells SQLCipher to interpret the
         // value as raw hex key bytes rather than a passphrase.
-        //
-        // `cipher_memory_security` comes first: SQLCipher allocates with the C
-        // library's `malloc`, which the wiping global allocator never sees, and
-        // the pragma makes SQLCipher wipe each block its allocator frees from
-        // then on. The key statement's blocks and the decrypted pages reach
-        // that allocator only because SQLite's reuse paths are off (checked by
-        // the open above); while no code in the process reconfigures SQLite,
-        // the connection keeps no freed block unwiped (§17.6, and §9.15 of the
-        // security-model spec, freed heap memory).
         let mut hex_key = hex::encode(key);
         let mut pragma_sql = format!(
-            "PRAGMA cipher_memory_security = ON;\n\
-             PRAGMA key = \"x'{hex_key}'\";\n\
+            "PRAGMA key = \"x'{hex_key}'\";\n\
              PRAGMA cipher_page_size = 4096;\n\
              PRAGMA kdf_iter = 256000;\n\
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\
@@ -185,11 +194,6 @@ impl SqliteStorage {
         result.map_err(|e| {
             PlatformError::StorageError(format!("failed to set SQLCipher pragmas: {e}"))
         })?;
-        // Read the pragma back: while no code in the process reconfigures
-        // SQLite, `1` shows memory security is on and that SQLCipher is the
-        // linked engine (spec section 17.6).
-        scp_sqlite_pools::require_memory_security(&conn)
-            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         // Enable WAL mode for concurrent readers.
         conn.pragma_update(None, "journal_mode", "WAL")

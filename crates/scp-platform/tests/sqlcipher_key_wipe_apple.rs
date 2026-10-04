@@ -17,6 +17,11 @@
 //! sits under `SQLCipher`'s allocator wrapper and sees each block after any
 //! wipe. `SQLCipher` keeps memory security process-wide and never turns it off
 //! once on, so this file holds one test and runs in a process of its own.
+//!
+//! The test counts freed blocks before it checks that `AppleStorage::open`
+//! succeeded, so a constructor that refuses because memory security is off
+//! must also have freed no block holding the key: its readback must come
+//! before the key statement (spec §17.6).
 
 #![cfg(feature = "apple")]
 #![allow(clippy::unwrap_used, clippy::expect_used, unsafe_code)]
@@ -53,12 +58,18 @@ fn apple_storage_frees_no_block_holding_the_key() {
     );
 
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let storage = AppleStorage::open(dir.path(), KEY).expect("AppleStorage::open should succeed");
-    drop(storage);
+    let opened = AppleStorage::open(dir.path(), KEY);
+    let refusal = opened.as_ref().err().map(|e| format!("{e:?}"));
+    drop(opened);
 
     assert_eq!(
         freed_blocks::take_matching_frees(),
         0,
-        "AppleStorage::open freed a SQLite block that still holds the key's hex text"
+        "AppleStorage::open freed a SQLite block that still holds the key's hex text \
+         (refusal: {refusal:?})"
+    );
+    assert!(
+        refusal.is_none(),
+        "AppleStorage::open should succeed, got {refusal:?}"
     );
 }

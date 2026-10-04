@@ -18,6 +18,11 @@
 //! wipe. `SQLCipher` keeps memory security process-wide and never turns it off
 //! once on, so this file holds one test and runs in a process of its own.
 //!
+//! The test counts freed blocks before it checks that `CombinedNodeStorage::open`
+//! succeeded, so a constructor that refuses because memory security is off
+//! must also have freed no block holding the key: its readback must come
+//! before the key statement (spec §17.6).
+//!
 //! `open` and `open_with_clock` share one connection initializer, so this
 //! covers both.
 
@@ -56,13 +61,18 @@ fn combined_node_storage_frees_no_block_holding_the_key() {
     );
 
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let storage = CombinedNodeStorage::open(dir.path(), KEY)
-        .expect("CombinedNodeStorage::open should succeed");
-    drop(storage);
+    let opened = CombinedNodeStorage::open(dir.path(), KEY);
+    let refusal = opened.as_ref().err().map(|e| format!("{e:?}"));
+    drop(opened);
 
     assert_eq!(
         freed_blocks::take_matching_frees(),
         0,
-        "CombinedNodeStorage::open freed a SQLite block that still holds the key's hex text"
+        "CombinedNodeStorage::open freed a SQLite block that still holds the key's hex text \
+         (refusal: {refusal:?})"
+    );
+    assert!(
+        refusal.is_none(),
+        "CombinedNodeStorage::open should succeed, got {refusal:?}"
     );
 }
