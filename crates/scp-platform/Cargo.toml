@@ -133,7 +133,7 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = tru
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
-# Opens every SQLCipher connection with SQLite's lookaside pool and page-cache
+# Opens this crate's SQLCipher connections with SQLite's lookaside pool and page-cache
 # bulk block off (spec section 17.6).
 scp-sqlite-pools = { path = "../scp-sqlite-pools", version = "=0.1.0-beta.2", optional = true }
 hex = { workspace = true, optional = true }

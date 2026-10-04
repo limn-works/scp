@@ -30,6 +30,13 @@
 //!   pool is off for that connection.
 //!
 //! The crate keeps no state: every open makes both checks itself.
+//!
+//! The pragma itself must run before the connection's `PRAGMA key` statement,
+//! because `SQLCipher` wipes only blocks freed after the pragma takes effect.
+//! After the batch that holds the key statement, each constructor calls
+//! [`require_memory_security`], which reads the pragma back and refuses unless
+//! it returns `1`; a plain `SQLite` returns no row, so the readback also
+//! proves `SQLCipher` is the linked engine.
 
 #![deny(unsafe_code)]
 
@@ -38,7 +45,7 @@ use std::fmt;
 use std::path::Path;
 use std::ptr;
 
-use rusqlite::{Connection, ffi};
+use rusqlite::{Connection, OptionalExtension, ffi};
 
 /// Why a `SQLCipher` connection cannot be opened with both pools off.
 #[derive(Debug)]
@@ -60,6 +67,15 @@ pub enum PoolsError {
         /// The `SQLite` result code the call returned.
         code: c_int,
     },
+    /// `PRAGMA cipher_memory_security` did not read back as `1`. `None` means
+    /// the pragma returned no row, which a plain `SQLite` without `SQLCipher`
+    /// does.
+    MemorySecurityOff {
+        /// The value the pragma returned, if any.
+        reported: Option<String>,
+    },
+    /// `PRAGMA cipher_memory_security` could not be read.
+    MemorySecurityUnreadable(rusqlite::Error),
 }
 
 impl fmt::Display for PoolsError {
@@ -77,6 +93,20 @@ impl fmt::Display for PoolsError {
                  sqlite3_db_config(SQLITE_DBCONFIG_LOOKASIDE) returned code {code}"
             ),
             Self::Status { code } => write!(f, "sqlite3_db_status returned code {code}"),
+            Self::MemorySecurityOff {
+                reported: Some(value),
+            } => write!(
+                f,
+                "SQLCipher's memory security is off: PRAGMA cipher_memory_security returned \
+                 {value:?}, not \"1\""
+            ),
+            Self::MemorySecurityOff { reported: None } => f.write_str(
+                "PRAGMA cipher_memory_security returned no row, so the linked engine is not \
+                 SQLCipher",
+            ),
+            Self::MemorySecurityUnreadable(e) => {
+                write!(f, "failed to read PRAGMA cipher_memory_security: {e}")
+            }
         }
     }
 }
@@ -84,8 +114,11 @@ impl fmt::Display for PoolsError {
 impl std::error::Error for PoolsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Open(e) => Some(e),
-            Self::PageCacheBulkPossible | Self::LookasideOn { .. } | Self::Status { .. } => None,
+            Self::Open(e) | Self::MemorySecurityUnreadable(e) => Some(e),
+            Self::PageCacheBulkPossible
+            | Self::LookasideOn { .. }
+            | Self::Status { .. }
+            | Self::MemorySecurityOff { .. } => None,
         }
     }
 }
@@ -115,6 +148,27 @@ pub fn open_in_memory() -> Result<Connection, PoolsError> {
         memory_management_compile_option(),
         Connection::open_in_memory,
     )
+}
+
+/// Reads `PRAGMA cipher_memory_security` back on `conn` and refuses unless it
+/// returns `1`. Each `SQLCipher` constructor calls this after the batch that
+/// holds its key statement (spec §17.6).
+///
+/// # Errors
+///
+/// [`PoolsError::MemorySecurityOff`] when the pragma returns anything but `1`
+/// or no row, and [`PoolsError::MemorySecurityUnreadable`] when the query
+/// fails.
+pub fn require_memory_security(conn: &Connection) -> Result<(), PoolsError> {
+    let reported: Option<String> = conn
+        .query_row("PRAGMA cipher_memory_security", [], |row| row.get(0))
+        .optional()
+        .map_err(PoolsError::MemorySecurityUnreadable)?;
+    if reported.as_deref() == Some("1") {
+        Ok(())
+    } else {
+        Err(PoolsError::MemorySecurityOff { reported })
+    }
 }
 
 /// How much a connection's lookaside pool has served since it opened.
@@ -261,18 +315,45 @@ mod tests {
         );
     }
 
-    /// With the option present, the same path opens and turns lookaside off.
+    /// A connection on which no constructor ran the pragma is refused. The
+    /// pragma is process-wide and can only be turned on, so nothing in this
+    /// test binary turns it on.
     #[test]
-    fn open_with_memory_management_opens_with_lookaside_off() -> Result<(), PoolsError> {
-        let conn = open_checked(1, Connection::open_in_memory)?;
-        conn.execute_batch("CREATE TABLE t (v BLOB NOT NULL); INSERT INTO t VALUES (x'00');")
-            .map_err(PoolsError::Open)?;
-        assert_eq!(
-            lookaside_use(&conn)?,
-            LookasideUse {
-                slots_high_water: 0,
-                hits: 0
-            }
+    fn require_memory_security_refuses_a_connection_without_the_pragma() -> Result<(), PoolsError> {
+        let conn = open_in_memory()?;
+        let result = require_memory_security(&conn);
+        assert!(
+            matches!(
+                &result,
+                Err(PoolsError::MemorySecurityOff { reported: Some(value) }) if value == "0"
+            ),
+            "a connection without the pragma must be refused, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Runs only in the CI build that compiles `SQLite` with
+    /// `-USQLITE_ENABLE_MEMORY_MANAGEMENT`: there the real compile-option
+    /// check must refuse every open.
+    #[test]
+    #[ignore = "needs LIBSQLITE3_FLAGS=-USQLITE_ENABLE_MEMORY_MANAGEMENT"]
+    fn open_refuses_a_sqlite_built_without_memory_management() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pools.db");
+        let file = open(&path);
+        assert!(
+            matches!(file, Err(PoolsError::PageCacheBulkPossible)),
+            "open must refuse a SQLite compiled without ENABLE_MEMORY_MANAGEMENT, got {file:?}"
+        );
+        assert!(
+            !path.exists(),
+            "the refusal must come before the file opens"
+        );
+        let memory = open_in_memory();
+        assert!(
+            matches!(memory, Err(PoolsError::PageCacheBulkPossible)),
+            "open_in_memory must refuse a SQLite compiled without ENABLE_MEMORY_MANAGEMENT, \
+             got {memory:?}"
         );
         Ok(())
     }

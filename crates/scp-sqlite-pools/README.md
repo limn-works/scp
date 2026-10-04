@@ -20,11 +20,19 @@ the connection's first statement, and keeps no state between opens:
   `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)` and fails
   unless that returns `SQLITE_OK`.
 
-`open(path)` and `open_in_memory()` are the only ways SCP opens a SQLCipher
-connection; each SQLCipher constructor in `scp-platform` and `scp-transport`
-calls one and maps `PoolsError` into its own storage error. `lookaside_use`
-reports a connection's lookaside use, which is zero for a connection this crate
-opened.
+`open(path)` and `open_in_memory()` are the only ways SCP's Rust crates open a
+SQLCipher connection; each SQLCipher constructor in `scp-platform` and
+`scp-transport` calls one and maps `PoolsError` into its own storage error.
+The connections that the Android and Swift SDKs open in host code do not go
+through this crate.
+
+Each constructor runs `PRAGMA cipher_memory_security = ON` before its
+`PRAGMA key` statement, because SQLCipher wipes only blocks freed after the
+pragma takes effect, and after that batch calls `require_memory_security`,
+which reads the pragma back and fails with `PoolsError::MemorySecurityOff`
+unless it returns `1`. A plain SQLite returns no row, so the readback also
+proves SQLCipher is the linked engine. `lookaside_use` reports a connection's
+lookaside use, which is zero for a connection this crate opened.
 
 This is one of three crates that may use `unsafe` (`.docs/standards/rust.md`
 §Safety Rules): its root sets `#![deny(unsafe_code)]`, and the only unsafe

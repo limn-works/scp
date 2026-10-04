@@ -118,6 +118,10 @@ impl AppleStorage {
         result.map_err(|e| {
             PlatformError::StorageError(format!("failed to apply `SQLCipher` pragmas: {e}"))
         })?;
+        // Read the pragma back: `1` proves memory security is on and that
+        // `SQLCipher` is the linked engine (spec §17.6).
+        scp_sqlite_pools::require_memory_security(&conn)
+            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         // Enable WAL mode for concurrent read access.
         conn.execute_batch("PRAGMA journal_mode = WAL;")

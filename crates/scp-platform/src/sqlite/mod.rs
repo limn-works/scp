@@ -181,6 +181,10 @@ impl SqliteStorage {
         result.map_err(|e| {
             PlatformError::StorageError(format!("failed to set SQLCipher pragmas: {e}"))
         })?;
+        // Read the pragma back: `1` proves memory security is on and that
+        // SQLCipher is the linked engine (spec section 17.6).
+        scp_sqlite_pools::require_memory_security(&conn)
+            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         // Enable WAL mode for concurrent readers.
         conn.pragma_update(None, "journal_mode", "WAL")

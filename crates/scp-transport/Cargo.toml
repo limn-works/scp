@@ -72,7 +72,7 @@ lru = { workspace = true }
 rand = { workspace = true }
 subtle = "2"
 rusqlite = { workspace = true, optional = true }
-# Opens every SQLCipher connection with SQLite's lookaside pool and page-cache
+# Opens this crate's SQLCipher connections with SQLite's lookaside pool and page-cache
 # bulk block off (spec section 17.6).
 scp-sqlite-pools = { path = "../scp-sqlite-pools", version = "=0.1.0-beta.2", optional = true }
 redb = { workspace = true, optional = true }

@@ -171,6 +171,10 @@ impl CombinedNodeStorage {
         let result = conn.execute_batch(&pragma_sql);
         pragma_sql.zeroize();
         result.map_err(|e| StorageError::Internal(format!("failed to set encryption key: {e}")))?;
+        // Read the pragma back: `1` proves memory security is on and that
+        // SQLCipher is the linked engine (spec §17.6).
+        scp_sqlite_pools::require_memory_security(&conn)
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Enable WAL mode for concurrent reads.
         conn.execute_batch("PRAGMA journal_mode = WAL;")
