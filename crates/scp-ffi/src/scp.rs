@@ -292,22 +292,17 @@ impl PyScp {
     /// Delegates to [`PyBridgeInstance::shutdown`] via the
     /// [`BridgeInstanceCore`] trait: fires the cancellation token, drains
     /// the `JoinSet` inside the `timeout_millis` budget, then runs
-    /// typed-field cleanup. A second call is a no-op from the Python
-    /// caller's perspective (the underlying `ShutdownError::AlreadyShutDown`
-    /// is swallowed — idempotency is expected).
+    /// typed-field cleanup.
     ///
     /// The timeout unit is **milliseconds** — unified across all Rust
     /// bridges so the Python, TypeScript, Swift, and Kotlin SDKs can
-    /// share a single conversion surface. Pass 0 for a best-effort
-    /// immediate shutdown (tasks not yet cancelled are aborted without
-    /// waiting).
+    /// share a single conversion surface.
     ///
     /// # Errors
     ///
     /// Raises `ContextError` if the tokio runtime is unavailable, and
     /// `ValidationError` with `SCP-STORAGE-8005` when the durable store still
-    /// holds its advisory lock after the call: the Supervisor drain did not
-    /// finish before the deadline, or the store refused to close.
+    /// holds its advisory lock after the call.
     pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {
         let timeout = Duration::from_millis(timeout_millis);
         let rt = crate::runtime()?;
@@ -406,6 +401,13 @@ mod sdk_shutdown_tests {
             matches!(&refused, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
             "{refused:?}"
         );
+        let repeat = sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }));
+        assert!(
+            matches!(&repeat, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
+            "{repeat:?}"
+        );
     }
 
     #[test]
@@ -417,7 +419,12 @@ mod sdk_shutdown_tests {
             }))
             .is_ok()
         );
-        assert!(sdk_shutdown(Err(ShutdownError::AlreadyShutDown)).is_ok());
+        assert!(
+            sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }))
+            .is_ok()
+        );
     }
 }
 

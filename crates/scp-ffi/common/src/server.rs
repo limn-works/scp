@@ -993,7 +993,7 @@ impl InstanceBorrower for RunningNode {
 /// forget while still obtaining an `Arc<RunningNode>` for its handle type.
 ///
 /// Registration is what makes `SCP.shutdown()` stop a node before
-/// `bridge_specific_shutdown` closes this instance's `SQLCipher` handle and
+/// the durable store closer closes this instance's `SQLCipher` handle and
 /// drops an advisory `flock(2)` on `{dir}/scp.db.lock`. See
 /// [`InstanceBorrower`] for what that release corrupts when a node outlives
 /// it, and [`CoreFields::register_borrower`] for how a registration races a
@@ -1544,7 +1544,7 @@ mod tests {
         );
         assert!(
             instance.node_stopped_before_close(),
-            "a node must already be stopped when bridge_specific_shutdown releases \
+            "a node must already be stopped when the durable store closer releases \
              an advisory SQLCipher lock, otherwise a live writer outlives that lock"
         );
 

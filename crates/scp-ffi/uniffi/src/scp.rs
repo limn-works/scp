@@ -76,8 +76,10 @@ impl Scp {
     ///
     /// FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
     /// opened — bad key/passphrase, permission denied, corrupt file, or a
-    /// salt-sidecar fail-closed condition — this returns `ScpError::Context`
-    /// rather than silently degrading to in-memory storage. Surfaces to Swift
+    /// salt-sidecar fail-closed condition — this returns
+    /// `ScpError::Validation` with `SCP-STORAGE-8004`, or with
+    /// `SCP-STORAGE-8005` when another store holds the directory's advisory
+    /// lock, rather than silently degrading to in-memory storage. Surfaces to Swift
     /// as `throws` and Kotlin as a thrown exception.
     #[uniffi::constructor]
     #[allow(clippy::needless_pass_by_value)]
@@ -134,9 +136,7 @@ impl Scp {
     ///
     /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
     /// then clears registries and runs shutdown hooks. Permanent — a
-    /// shut-down instance cannot be reused. A second call is a no-op from
-    /// the caller's perspective (the underlying
-    /// `ShutdownError::AlreadyShutDown` is swallowed).
+    /// shut-down instance cannot be reused.
     ///
     /// The unit is **milliseconds** — unified across all Rust bridges
     /// so the Swift and Kotlin SDKs can share a single conversion
@@ -145,9 +145,7 @@ impl Scp {
     /// # Errors
     ///
     /// Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
-    /// durable store still holds its advisory lock after the call: the
-    /// Supervisor drain did not finish before the deadline, or the store
-    /// refused to close.
+    /// durable store still holds its advisory lock after the call.
     pub async fn shutdown(&self, timeout_millis: u64) -> Result<(), ScpError> {
         let timeout = Duration::from_millis(timeout_millis);
         sdk_shutdown(self.inner.shutdown(timeout).await)
@@ -216,6 +214,13 @@ mod sdk_shutdown_tests {
             matches!(&refused, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
             "{refused:?}"
         );
+        let repeat = sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }));
+        assert!(
+            matches!(&repeat, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
+            "{repeat:?}"
+        );
     }
 
     #[test]
@@ -227,7 +232,12 @@ mod sdk_shutdown_tests {
             }))
             .is_ok()
         );
-        assert!(sdk_shutdown(Err(ShutdownError::AlreadyShutDown)).is_ok());
+        assert!(
+            sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }))
+            .is_ok()
+        );
     }
 }
 

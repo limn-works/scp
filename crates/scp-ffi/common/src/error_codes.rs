@@ -1188,9 +1188,11 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 /// wait for the lock and does not fall back to another backend.
 ///
 /// Also returned by an SDK `shutdown` that left the instance's own store
-/// holding its lock: the Supervisor drain did not finish before the deadline
-/// (`ShutdownOutcome::TimedOut` with `durable_store_open`), or the store
-/// refused to close (`ShutdownError::DurableStoreClose`). A reopen of the
+/// holding its lock: the Supervisor drain did not finish
+/// (`ShutdownOutcome::TimedOut` with `durable_store_open`), the store refused
+/// to close (`ShutdownError::DurableStoreClose`), or an earlier shutdown had
+/// not closed it (`ShutdownError::AlreadyShutDown` with
+/// `durable_store_open`). A reopen of the
 /// directory then fails with this code until the store is released.
 pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
 

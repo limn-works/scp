@@ -120,7 +120,7 @@ def test_suspend_resume_shutdown_lifecycle() -> None:
 
 
 def test_shutdown_is_idempotent() -> None:
-    """A second `shutdown()` call is a documented no-op."""
+    """A second `shutdown()` on an in-memory instance does not raise."""
     scp = SCP({"type": "in_memory"})
     scp.shutdown(1000)
     scp.shutdown(1000)  # Must not raise.

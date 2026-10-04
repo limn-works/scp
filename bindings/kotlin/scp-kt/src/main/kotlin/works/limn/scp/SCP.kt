@@ -173,9 +173,9 @@ class SCP internal constructor(
     /**
      * Shuts down this instance with a graceful deadline.
      *
-     * Awaits in-flight tasks up to [timeout], aborts any remaining
-     * tasks, then runs typed-field cleanup. A second call is a no-op
-     * (AlreadyShutDown is swallowed at the SDK surface).
+     * Awaits in-flight tasks up to [timeout], then runs typed-field
+     * cleanup. Throws `ScpException.Validation` with `SCP-STORAGE-8005`
+     * when the durable store still holds its advisory lock after the call.
      *
      * Converted to unsigned milliseconds for the UniFFI boundary after
      * the #1549 Phase 4 timeout unit unification — sub-millisecond
@@ -184,7 +184,7 @@ class SCP internal constructor(
      *
      * [timeout] defaults to 5 seconds — the same default the PyO3 and
      * NAPI SDK wrappers carry. Callers that need an explicit deadline
-     * (e.g. abort immediately with `Duration.ZERO`, or wait
+     * (e.g. `Duration.ZERO`, or wait
      * effectively-forever with a large `Duration.ofHours(n)`) pass the
      * argument explicitly. See PR #1690 retro api-design MODERATE.
      *

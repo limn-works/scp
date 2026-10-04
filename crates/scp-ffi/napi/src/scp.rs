@@ -331,6 +331,11 @@ impl Scp {
     /// semantics (last tuple element flags lossless conversion, which
     /// we intentionally ignore — any bigint beyond `u64::MAX` is
     /// clamped to "effectively unbounded").
+    ///
+    /// # Errors
+    ///
+    /// Throws a validation error with `SCP-STORAGE-8005` when the durable
+    /// store still holds its advisory lock after the call.
     #[napi]
     pub async fn shutdown(
         &self,
@@ -5340,6 +5345,13 @@ mod sdk_shutdown_tests {
         .map(NapiError::from)
         .expect("a store that refused to close must not report success");
         assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
+        let err = sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }))
+        .err()
+        .map(NapiError::from)
+        .expect("a repeat shutdown that finds the store still locked must not report success");
+        assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
     }
 
     #[test]
@@ -5351,7 +5363,12 @@ mod sdk_shutdown_tests {
             }))
             .is_ok()
         );
-        assert!(sdk_shutdown(Err(ShutdownError::AlreadyShutDown)).is_ok());
+        assert!(
+            sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }))
+            .is_ok()
+        );
     }
 }
 

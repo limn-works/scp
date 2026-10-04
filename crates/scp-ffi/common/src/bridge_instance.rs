@@ -124,9 +124,8 @@ fn next_instance_id() -> u64 {
 /// A bridge instance owns exactly one storage backend, chosen at construction
 /// (`SCP.with_storage({...})`). `start_node_local` hands a node a clone of that
 /// backend's `Arc`, so an instance and a node write through one handle.
-/// Each bridge's `bridge_specific_shutdown` then calls
-/// `ProtocolRepoVariant::close`, which reaches
-/// [`scp_platform::sqlite::SqliteStorage::close`] and drops an advisory
+/// Each bridge's [`BridgeInstanceCore::durable_store_closer`] then reaches
+/// [`scp_platform::sqlite::SqliteStorage::close`], which drops an advisory
 /// `flock(2)` on `{dir}/scp.db.lock`. That lock is what stops a second process
 /// from opening one `SQLCipher` database while a first writer still holds it,
 /// so releasing it while a node keeps writing invites split-brain writes and
@@ -297,6 +296,12 @@ pub struct CoreFields {
     /// all subsequent bridge operations should return an error immediately.
     /// A shut-down instance cannot be resumed.
     shutdown: AtomicBool,
+
+    /// Turns true once a [`DurableStoreCloser`] run by
+    /// [`CoreFields::shutdown_core_async`] has closed the durable store, so a
+    /// later shutdown call can report whether the store still holds its
+    /// advisory lock.
+    durable_store_released: Arc<tokio::sync::watch::Sender<bool>>,
 
     /// Whether this instance is currently suspended.
     ///
@@ -628,6 +633,7 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            durable_store_released: Arc::new(tokio::sync::watch::Sender::new(false)),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
@@ -714,6 +720,7 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            durable_store_released: Arc::new(tokio::sync::watch::Sender::new(false)),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
@@ -1176,8 +1183,8 @@ impl CoreFields {
     /// registrations by stopping them on arrival.
     ///
     /// [`BridgeInstanceCore::shutdown`] calls this first, so a node stops
-    /// writing before [`BridgeInstanceCore::bridge_specific_shutdown`] closes
-    /// a `SQLCipher` handle and drops an advisory `flock(2)`.
+    /// writing before the [`DurableStoreCloser`] closes a `SQLCipher` handle
+    /// and drops an advisory `flock(2)`.
     ///
     /// Idempotent: a second call finds an empty entry list and stops nothing.
     /// Logs how many borrowers a caller had left running, which tells an
@@ -2463,9 +2470,10 @@ impl CoreFields {
     /// # Errors
     ///
     /// - [`ShutdownError::AlreadyShutDown`] — the instance has already been
-    ///   shut down. The caller is expected to treat this as a harmless
-    ///   lifecycle observation (no additional work to do). `store_closer`
-    ///   is dropped unrun: the shutdown that won owns the close.
+    ///   shut down, and this call runs no cleanup. When `store_closer` is
+    ///   given, the call waits up to `timeout` for an earlier shutdown to
+    ///   close the durable store, and `durable_store_open` reports whether
+    ///   the store still holds its advisory lock when the call returns.
     /// - [`ShutdownError::DurableStoreClose`] — the drain finished in time but
     ///   the store refused to close; it keeps its connection and lock.
     pub async fn shutdown_core_async(
@@ -2477,8 +2485,26 @@ impl CoreFields {
         // swaps this flag; whichever call wins is the one that runs
         // cleanup.
         if self.shutdown.swap(true, Ordering::SeqCst) {
-            return Err(ShutdownError::AlreadyShutDown);
+            let durable_store_open = match store_closer {
+                None => false,
+                Some(_) => {
+                    let mut released = self.durable_store_released.subscribe();
+                    !matches!(
+                        tokio::time::timeout(timeout, released.wait_for(|closed| *closed)).await,
+                        Ok(Ok(_))
+                    )
+                }
+            };
+            return Err(ShutdownError::AlreadyShutDown { durable_store_open });
         }
+        let store_closer = store_closer.map(|close| -> DurableStoreCloser {
+            let released = Arc::clone(&self.durable_store_released);
+            Box::new(move || {
+                close()?;
+                released.send_replace(true);
+                Ok(())
+            })
+        });
 
         // Signal cooperating tasks to exit. Cheap and idempotent.
         self.cancel.cancel();
@@ -2769,14 +2795,14 @@ fn combine_shutdown_outcome(
 /// this decides whether the caller sees success or an error.
 ///
 /// Returns `Ok(())` when no durable store is left holding its advisory lock:
-/// [`ShutdownOutcome::GracefulWithin`], a `TimedOut` whose
-/// `durable_store_open` is false, and [`ShutdownError::AlreadyShutDown`].
+/// [`ShutdownOutcome::GracefulWithin`], and a `TimedOut` or
+/// [`ShutdownError::AlreadyShutDown`] whose `durable_store_open` is false.
 ///
 /// # Errors
 ///
 /// Returns the message of the [`crate::error_codes::STORAGE_8005`] error each
 /// bridge raises when the durable store still holds its advisory lock: a
-/// `TimedOut` with `durable_store_open` set, or
+/// `TimedOut` or `AlreadyShutDown` with `durable_store_open` set, or
 /// [`ShutdownError::DurableStoreClose`].
 pub fn sdk_shutdown_result(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), String> {
     match result {
@@ -2787,14 +2813,18 @@ pub fn sdk_shutdown_result(result: Result<ShutdownOutcome, ShutdownError>) -> Re
                 ..
             },
         )
-        | Err(ShutdownError::AlreadyShutDown) => Ok(()),
+        | Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: false,
+        }) => Ok(()),
         Ok(ShutdownOutcome::TimedOut {
             durable_store_open: true,
             ..
+        })
+        | Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
         }) => Err(
-            "shutdown did not finish draining the Supervisor before its deadline: the durable \
-             store stays open and keeps its advisory lock, so a reopen of the same directory \
-             fails until the store is released"
+            "shutdown left the durable store open: it keeps its advisory lock, so a reopen of \
+             the same directory fails until the store is released"
                 .to_owned(),
         ),
         Err(e @ ShutdownError::DurableStoreClose(_)) => Err(format!(
@@ -2968,9 +2998,9 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// [`CoreFields::stop_borrowers`] runs before anything else, and this
     /// ordering lives here rather than in each bridge so no bridge can drift
     /// out of it. A node that `start_node_local` started writes through a
-    /// clone of this instance's storage `Arc`, while
-    /// `bridge_specific_shutdown` closes that same `SQLCipher` handle and
-    /// drops an advisory `flock(2)` on `{dir}/scp.db.lock`. Releasing that
+    /// clone of this instance's storage `Arc`, while the
+    /// [`DurableStoreCloser`] closes that same `SQLCipher` handle and drops
+    /// an advisory `flock(2)` on `{dir}/scp.db.lock`. Releasing that
     /// lock while a node still writes invites split-brain writes and WAL
     /// corruption (red-hat RED-1002), so every borrower stops first. See
     /// [`InstanceBorrower`].
@@ -2993,9 +3023,10 @@ pub trait BridgeInstanceCore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`ShutdownError::AlreadyShutDown`] on a second call.
+    /// Returns [`ShutdownError::AlreadyShutDown`] on a second call, and
+    /// [`ShutdownError::DurableStoreClose`] when the store refuses to close.
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        // Stop every borrower BEFORE any release: `bridge_specific_shutdown`
+        // Stop every borrower BEFORE any release: the durable store closer
         // closes this instance's `SQLCipher` handle, and a node started on
         // that handle must not still be writing when it does.
         self.core().stop_borrowers();
@@ -3230,8 +3261,6 @@ pub enum ShutdownOutcome {
     },
     /// The deadline expired before the bridge's own tasks or the
     /// Supervisor's tracked tasks finished, or the Supervisor drain panicked.
-    /// The bridge's `JoinSet` was aborted; the Supervisor's tracked tasks
-    /// never are.
     TimedOut {
         /// Number of the bridge's own `JoinSet` tasks that were aborted
         /// because the shutdown deadline was reached (tasks that had already
@@ -3256,11 +3285,15 @@ pub enum ShutdownOutcome {
 /// Error produced by [`CoreFields::shutdown_core_async`].
 #[derive(Debug, thiserror::Error)]
 pub enum ShutdownError {
-    /// The instance has already been shut down; a second call is a no-op
-    /// from the caller's perspective but is surfaced so the caller can
+    /// The instance has already been shut down; surfaced so the caller can
     /// distinguish "I did the work" from "someone else already did."
     #[error("bridge instance has already been shut down")]
-    AlreadyShutDown,
+    AlreadyShutDown {
+        /// True when the call was given a [`DurableStoreCloser`] and no
+        /// shutdown had closed the durable store by the time the call
+        /// returned: the store still holds its advisory lock.
+        durable_store_open: bool,
+    },
     /// The Supervisor drained in time, but the durable store refused to
     /// close. The store keeps its connection and advisory lock, so a reopen
     /// of the same directory fails until the process releases it.
@@ -5183,7 +5216,12 @@ mod tests {
             .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap_err();
-        assert!(matches!(err, ShutdownError::AlreadyShutDown));
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5197,7 +5235,12 @@ mod tests {
             .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap_err();
-        assert!(matches!(err, ShutdownError::AlreadyShutDown));
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -5448,6 +5491,145 @@ mod tests {
         drop(std::fs::remove_dir_all(&dir));
     }
 
+    /// A closer that only reports whether it ran.
+    fn recording_closer(
+        result: Result<(), scp_platform::PlatformError>,
+        ran: &Arc<AtomicBool>,
+    ) -> Option<DurableStoreCloser> {
+        let ran = Arc::clone(ran);
+        Some(Box::new(move || {
+            ran.store(true, Ordering::SeqCst);
+            result
+        }))
+    }
+
+    /// A repeat shutdown reports the store released only after an earlier
+    /// shutdown's closer closed it, and never runs its own closer.
+    #[tokio::test]
+    async fn repeat_shutdown_reports_whether_the_store_still_holds_its_lock() {
+        let unused = Arc::new(AtomicBool::new(false));
+
+        let closed = CoreFields::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        closed
+            .shutdown_core_async(Duration::from_secs(1), recording_closer(Ok(()), &ran))
+            .await
+            .unwrap();
+        assert!(ran.load(Ordering::SeqCst));
+        let err = closed
+            .shutdown_core_async(Duration::ZERO, recording_closer(Ok(()), &unused))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }
+        ));
+
+        let refused = CoreFields::new();
+        let close_err = scp_platform::PlatformError::StorageError("close refused".to_owned());
+        let first = refused
+            .shutdown_core_async(
+                Duration::from_secs(1),
+                recording_closer(Err(close_err), &ran),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(first, ShutdownError::DurableStoreClose(_)));
+        let err = refused
+            .shutdown_core_async(Duration::from_millis(20), recording_closer(Ok(()), &unused))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+
+        // The sync path never closes the durable store.
+        let sync = CoreFields::new();
+        sync.shutdown();
+        let err = sync
+            .shutdown_core_async(Duration::ZERO, recording_closer(Ok(()), &unused))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+        assert!(
+            !unused.load(Ordering::SeqCst),
+            "a losing call runs no closer"
+        );
+    }
+
+    /// A shutdown that loses the race to one still closing the store reports
+    /// the store open when its own timeout passes first, and released when
+    /// the winner's close lands within that timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_shutdown_waits_for_the_winner_to_close_the_store() {
+        let instance = Arc::new(CoreFields::new());
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let closer: DurableStoreCloser = Box::new(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        let winner = {
+            let instance = Arc::clone(&instance);
+            tokio::spawn(async move {
+                instance
+                    .shutdown_core_async(Duration::from_secs(10), Some(closer))
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let unused = Arc::new(AtomicBool::new(false));
+        let err = instance
+            .shutdown_core_async(Duration::from_millis(20), recording_closer(Ok(()), &unused))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+
+        let loser = {
+            let instance = Arc::clone(&instance);
+            let unused = Arc::clone(&unused);
+            tokio::spawn(async move {
+                instance
+                    .shutdown_core_async(Duration::from_secs(10), recording_closer(Ok(()), &unused))
+                    .await
+            })
+        };
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            loser.await.unwrap(),
+            Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            })
+        ));
+        assert!(matches!(
+            winner.await.unwrap(),
+            Ok(ShutdownOutcome::GracefulWithin { .. })
+        ));
+        assert!(
+            !unused.load(Ordering::SeqCst),
+            "a losing call runs no closer"
+        );
+    }
+
     /// The SDK surface reports success only when no durable store is left
     /// holding its lock, and an error for each way the store can stay locked.
     #[test]
@@ -5464,9 +5646,16 @@ mod tests {
         };
         assert_eq!(sdk_shutdown_result(Ok(timed_out_store_closed)), Ok(()));
         assert_eq!(
-            sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown)),
+            sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            })),
             Ok(())
         );
+        let msg = sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }))
+        .unwrap_err();
+        assert!(msg.contains("keeps its advisory lock"), "{msg}");
 
         let timed_out_store_open = ShutdownOutcome::TimedOut {
             aborted_tasks: 0,

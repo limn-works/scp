@@ -3352,10 +3352,6 @@ mod tests {
         );
     }
 
-    /// Build a dedicated current-thread tokio runtime so the async `Storage`
-    /// trait methods can be driven from a sync `#[test]` without depending on
-    /// the bridge's shared global runtime (which may not be initialized in a
-    /// unit-test process).
     /// `from_open_failure` keeps the lock-still-held condition apart from
     /// every other open failure, and `code()` names each one's registered
     /// code (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes).
@@ -3422,6 +3418,10 @@ mod tests {
         drop(bi);
     }
 
+    /// Build a dedicated current-thread tokio runtime so the async `Storage`
+    /// trait methods can be driven from a sync `#[test]` without depending on
+    /// the bridge's shared global runtime (which may not be initialized in a
+    /// unit-test process).
     fn test_rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

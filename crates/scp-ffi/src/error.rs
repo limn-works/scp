@@ -641,9 +641,12 @@ impl From<scp_core::context::ContextError> for ScpPyError {
 impl From<scp_core::context::builder::ContextCreationError> for ScpPyError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
         // The core's empty-ceiling rejection keeps its own validation code
-        // (construction.md M2), the one the parser's rejection carries.
+        // (construction.md M2), the one the parser's rejection carries, and a
+        // create refused because Supervisor shutdown began keeps SCP-CTX-2138
+        // (ADR-049 Decision 16).
         if let scp_core::context::builder::ContextCreationError::StateTransition(
-            inner @ scp_core::context::ContextError::CeilingRequired(_),
+            inner @ (scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_)),
         ) = e
         {
             return inner.into();
@@ -1187,6 +1190,16 @@ mod tests {
         let err: ScpPyError =
             scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpPyError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpPyError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::CeilingImmutable,
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
     }
 
     /// Spec §17.6 "One Writer per Durable Directory": a held lock and a closed

@@ -559,7 +559,7 @@ class SCP:
         if math.isinf(timeout) and timeout > 0:
             return u64_max
         if not math.isfinite(timeout) or timeout <= 0:
-            # NaN, negative, negative-infinity, or zero → immediate abort.
+            # NaN, negative, negative-infinity, or zero → 0 ms.
             return 0
         if timeout * 1000 > u64_max:
             return u64_max
@@ -568,13 +568,11 @@ class SCP:
     async def shutdown(self, timeout: float = 5.0) -> None:
         """Shut down this instance with a graceful deadline.
 
-        Drains in-flight tasks within ``timeout`` seconds, aborts any
-        stragglers, then runs typed-field cleanup. A second call is a
-        no-op (the underlying :class:`ShutdownError::AlreadyShutDown` is
-        swallowed at the SDK surface).
+        Drains in-flight tasks within ``timeout`` seconds, then runs
+        typed-field cleanup.
 
         ``timeout`` is clamped defensively: ``NaN`` and negative values
-        map to ``0`` (abort immediately); ``math.inf`` or values that
+        map to ``0``; ``math.inf`` or values that
         would overflow ``u64`` milliseconds map to ``0xFFFFFFFF_FFFFFFFF``
         (effectively unbounded). Finite in-range values are rounded to
         the nearest millisecond (``round()`` rather than ``int()``
@@ -594,6 +592,8 @@ class SCP:
             (float — fractional seconds are preserved to millisecond
             resolution before crossing the FFI boundary).
         :raises ContextError: If the tokio runtime is unavailable.
+        :raises ValidationError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call.
         """
         millis = self._shutdown_millis(timeout)
         await asyncio.to_thread(self._native.shutdown, millis)
