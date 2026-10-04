@@ -55,16 +55,14 @@ bought with a deadlock.
 `ScpViewModel` has only a zero-argument constructor, because a Java subclass calls `super()`, and
 it builds its cleanup scope as `CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)`.
 Each cleanup coroutine is launched with `CoroutineStart.UNDISPATCHED`, which starts it on the
-thread that calls `onCleared()` or `trackContext`, and `Dispatchers.Unconfined` keeps it there only
-until the first `leave` suspends into `withContext(ioDispatcher)`. From then on, the coroutine
-resumes on the bridge's `ioDispatcher`. `Dispatchers.Unconfined` alone does not guarantee the
-start on the calling thread: a default-start launch from a caller already inside an unconfined
-coroutine, such as an `onCleanupFailure` override that retries through `trackContext`, is queued on
-that thread's unconfined event loop until the caller suspends. A test gives `CoroutineBridge` a
-`StandardTestDispatcher` as that `ioDispatcher`, so `advanceUntilIdle()` on the same scheduler runs
-every `leave` and every resumption between them. A cleanup scope hardwired to `Dispatchers.IO`
-would leave the test racing an IO thread that may not have enqueued its continuation yet when
-`advanceUntilIdle()` returns.
+thread that calls `onCleared()` or `trackContext`. `Dispatchers.Unconfined` alone does not
+guarantee the start on the calling thread: a default-start launch from a caller already inside an
+unconfined coroutine, such as an `onCleanupFailure` override that retries through `trackContext`,
+is queued on that thread's unconfined event loop until the caller suspends. A test gives
+`CoroutineBridge` a `StandardTestDispatcher` as its `ioDispatcher`, so `advanceUntilIdle()` on the
+same scheduler runs every `leave` and every resumption between them. A cleanup scope hardwired to
+`Dispatchers.IO` would leave the test racing an IO thread that may not have enqueued its
+continuation yet when `advanceUntilIdle()` returns.
 
 ## Make a deadlock fail instead of hang
 
