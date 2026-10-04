@@ -1302,6 +1302,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         mode: ContextMode::Broadcast,
         // Broadcast contexts only support `MemoryScope::Full`.
         memory_scope: scp_protocol::context::params::MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
         ..ContextParams::default()
     };
     sup.create_context(
@@ -1416,12 +1417,12 @@ fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error()
 
     // A populated crypto blob is durable — the spawn may proceed.
     assert!(
-        welcome_snapshot_crypto_is_durable(&Ok(vec![0x01, 0x02, 0x03])),
+        welcome_snapshot_crypto_is_durable(&Ok(zeroize::Zeroizing::new(vec![0x01, 0x02, 0x03]))),
         "a non-empty crypto export is durable"
     );
     // An EMPTY blob is the keyless-snapshot signal — NOT durable, fail closed.
     assert!(
-        !welcome_snapshot_crypto_is_durable(&Ok(Vec::new())),
+        !welcome_snapshot_crypto_is_durable(&Ok(zeroize::Zeroizing::default())),
         "an empty crypto export must fail closed (a joiner cannot reconnect-derive)"
     );
     // An ERRORED export is likewise not durable — fail closed.

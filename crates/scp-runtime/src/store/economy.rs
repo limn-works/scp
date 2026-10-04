@@ -117,7 +117,7 @@ impl<S: Storage> ProtocolRepository<S> {
         credentials: &[u8],
     ) -> Result<(), StoreError> {
         let key = adapter_credential_key(did, adapter_id)?;
-        self.store_value_zeroize(&key, &credentials.to_vec()).await
+        self.store_value_zeroize(&key, credentials).await
     }
 
     /// Loads adapter credentials for an identity and adapter.
@@ -302,7 +302,7 @@ impl<S: Storage> ProtocolRepository<S> {
         ucan: &[u8],
     ) -> Result<(), StoreError> {
         let key = spending_ucan_key(context_id, token_id)?;
-        self.store_value_zeroize(&key, &ucan.to_vec()).await
+        self.store_value_zeroize(&key, ucan).await
     }
 
     /// Loads a spending UCAN from a context.

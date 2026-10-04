@@ -62,7 +62,7 @@ cd bindings/swift
 swift test
 ```
 
-Requires Swift 6.2. macOS ships 6.1 -- install 6.2 via [swift.org](https://swift.org/download/) or use `swift-actions/setup-swift@v2` in CI.
+Requires Swift 6.2 or later; Xcode 26 ships it, and [swift.org](https://swift.org/download/) has standalone toolchains. CI runs the Swift jobs on the toolchain the `macos-latest` runner image ships.
 
 ## Feature Flags
 

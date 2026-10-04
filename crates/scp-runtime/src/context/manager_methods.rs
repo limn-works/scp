@@ -308,7 +308,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         needs_reconnect: ctx.epoch.needs_reconnect,
         // MLS crypto state is populated in `persist_context_snapshot`
         // where the crypto provider is available. Initialized empty here.
-        mls_crypto_state: Vec::new(),
+        mls_crypto_state: crate::context::state::MlsCryptoState::default(),
         migration_state: ctx.migration_state.clone(),
         access_key_store: ctx.access.access_key_store.clone(),
         consequence_rules: ctx.governance.consequence_rules.clone(),
