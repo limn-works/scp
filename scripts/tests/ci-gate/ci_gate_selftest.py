@@ -5071,6 +5071,9 @@ SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?")
 # A matrix axis a cache key expands, so that each value of the axis writes its own
 # entry: `shared-key: transport-optional-${{ matrix.group }}`.
 KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}")
+# A key that names the runner's platform, so each runner writes its own entry.
+# Swatinem/rust-cache puts the platform into every key without the text naming it.
+KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b")
 
 
 def push_writer_gaps(doc: dict) -> list[str]:
@@ -5080,8 +5083,9 @@ def push_writer_gaps(doc: dict) -> list[str]:
     a merge_group run with the same filter outputs runs it, and some push runs it at
     all; a matrix leg that a writing step's `save-if` or `if:` names exists on push;
     and every value that every other event runs on an axis a writing step's cache
-    key expands (`shared-key` or `key` holding `${{ matrix.<axis> }}`) also runs on
-    push, because each such value names its own entry. A cache SHARED_KEY_CACHES
+    key expands (`shared-key` or `key` holding `${{ matrix.<axis> }}`, or, for a
+    rust-cache step or a key holding `runner.os` or `runner.arch`, an axis the job's
+    `runs-on` names) also runs on push, because each such value names its own entry. A cache SHARED_KEY_CACHES
     names needs only that some push runs some job writing it.
 
     WHY: rust-cache and `actions/cache/save` write only on `refs/heads/main`, so a
@@ -5183,7 +5187,11 @@ def push_writer_gaps(doc: dict) -> list[str]:
                         f"{on_push[key]} alone"
                     )
             key_text = f"{inputs.get('shared-key', '')} {inputs.get('key', '')}"
-            for key in sorted(set(KEY_MATRIX_AXIS.findall(key_text))):
+            key_axes = set(KEY_MATRIX_AXIS.findall(key_text))
+            action = str(step.get("uses") or "").split("@", 1)[0]
+            if action == "Swatinem/rust-cache" or KEY_RUNNER.search(key_text):
+                key_axes |= set(KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or "")))
+            for key in sorted(key_axes):
                 if key not in on_push:
                     continue
                 pushed_values = set(map(str, on_push[key]))
@@ -5406,12 +5414,26 @@ def check_push_writer_mutants(doc: dict) -> None:
     # through its key, and rust-clippy one entry per `leg` value through a writing
     # step gated on that leg. A push matrix dropping a value leaves its entry
     # unwritten; a push matrix keeping every value leaves nothing to report.
+    # rust-test and rust-test-optional-features also write one rust-cache entry per
+    # `os` value, because `runs-on` reads that axis and rust-cache keys by platform.
     for job_id, axis, dropped_value, reported in (
         (
             "rust-test-optional-features",
             "group",
             "node-relay",
             "one entry per value of matrix `group`, and a push never runs ['node-relay']",
+        ),
+        (
+            "rust-test",
+            "os",
+            "macos-latest",
+            "one entry per value of matrix `os`, and a push never runs ['macos-latest']",
+        ),
+        (
+            "rust-test-optional-features",
+            "os",
+            "macos-latest",
+            "one entry per value of matrix `os`, and a push never runs ['macos-latest']",
         ),
         ("rust-clippy", "leg", "examples", "only from matrix leg `leg == examples`"),
     ):
@@ -5441,6 +5463,28 @@ def check_push_writer_mutants(doc: dict) -> None:
             f"a push matrix keeping every {job_id} `{axis}` value is not reported",
             not any(gap.startswith(f"{job_id} ") for gap in push_writer_gaps(whole)),
             f"{push_writer_gaps(whole)}",
+        )
+
+    # An actions/cache key splits by `runs-on` only when it names the platform.
+    for key, split in (("deps-${{ runner.os }}-v1", True), ("deps-v1", False)):
+        cached = copy.deepcopy(doc)
+        job = cached["jobs"]["rust-test"]
+        job["strategy"]["matrix"]["os"] = (
+            "${{ fromJSON(github.event_name == 'push' && '[\"ubuntu-latest\"]' "
+            "|| '[\"ubuntu-latest\", \"macos-latest\"]') }}"
+        )
+        job["steps"] = [
+            {"uses": "actions/cache@v4", "with": {"path": "deps", "key": key}}
+            if str(step.get("uses", "")).startswith("Swatinem/rust-cache")
+            else step
+            for step in job["steps"]
+        ]
+        gaps = push_writer_gaps(cached)
+        check(
+            f"an actions/cache key `{key}` on a push matrix dropping macos-latest is "
+            f"{'reported' if split else 'not reported'}",
+            any("matrix `os`" in gap for gap in gaps) is split,
+            f"{gaps}",
         )
 
     partial = copy.deepcopy(doc)
