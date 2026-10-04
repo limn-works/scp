@@ -62,6 +62,10 @@ class ScpViewModelTest {
     @AfterEach
     fun tearDown() {
         Dispatchers.resetMain()
+        assertTrue(
+            stubBindings.leaveHoldTimeouts.isEmpty(),
+            "the hold on leave never opened for handles ${stubBindings.leaveHoldTimeouts}",
+        )
     }
 
     @Test
@@ -421,10 +425,32 @@ class ScpViewModelTest {
         )
     }
 
+    @Test
+    fun `a held leave whose latch opens records no hold timeout`() {
+        stubBindings.leaveHoldTimeoutMs = 1L
+        stubBindings.holdLeave(1L).countDown()
+
+        stubBindings.contextLeave(1L, 1L)
+
+        assertEquals(listOf(1L), stubBindings.leaveCalledHandles.toList())
+        assertTrue(stubBindings.leaveHoldTimeouts.isEmpty(), "an opened hold recorded a timeout")
+    }
+
+    @Test
+    fun `a held leave whose latch never opens records a hold timeout`() {
+        stubBindings.leaveHoldTimeoutMs = 1L
+        stubBindings.holdLeave(1L)
+
+        stubBindings.contextLeave(1L, 1L)
+
+        assertEquals(setOf(1L), stubBindings.leaveHoldTimeouts.toSet())
+        // This case forces the timeout tearDown rejects; clear it so tearDown checks the rest.
+        stubBindings.leaveHoldTimeouts.clear()
+    }
 }
 
 private const val OVERLAP_WINDOW_MS = 200L
-private const val LEAVE_HOLD_TIMEOUT_S = 5L
+private const val LEAVE_HOLD_TIMEOUT_MS = 5_000L
 
 /** Records how many [onCleanupFailure] calls run at once; parks the first until released. */
 private class OverlapProbeViewModel : ScpViewModel() {
@@ -567,10 +593,20 @@ internal class TestNativeBindings : NativeBindings {
     fun holdLeave(contextHandle: Long): CountDownLatch =
         CountDownLatch(1).also { leaveHolds[contextHandle] = it }
 
+    /** How long a held `leave` waits for its latch before it gives up and runs. */
+    @Volatile var leaveHoldTimeoutMs = LEAVE_HOLD_TIMEOUT_MS
+
+    /**
+     * Handles whose held `leave` gave up waiting. A timeout is recorded here rather than thrown,
+     * because [ScpViewModel] catches whatever `leave` throws and hands it to
+     * [ScpViewModel.onCleanupFailure]; [ScpViewModelTest.tearDown] asserts this set is empty.
+     */
+    val leaveHoldTimeouts: MutableSet<Long> = ConcurrentHashMap.newKeySet()
+
     override fun contextLeave(contextHandle: Long, identityHandle: Long) {
         leaveHolds[contextHandle]?.let { hold ->
-            check(hold.await(LEAVE_HOLD_TIMEOUT_S, TimeUnit.SECONDS)) {
-                "the hold on leave for handle $contextHandle never opened"
+            if (!hold.await(leaveHoldTimeoutMs, TimeUnit.MILLISECONDS)) {
+                leaveHoldTimeouts.add(contextHandle)
             }
         }
         leaveCalledHandles.add(contextHandle)
