@@ -97,7 +97,7 @@ uuid = { workspace = true }
 jsonschema = { workspace = true, features = ["resolve-http", "resolve-file"] }
 lru = { workspace = true }
 tracing = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 subtle = { workspace = true }
 unicode-normalization = { workspace = true }
 metrics = { workspace = true }

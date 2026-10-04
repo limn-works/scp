@@ -219,6 +219,15 @@ nothing:
                compile-timings.yml runs the cargo invocations `rust-test` runs
                to measure their compile, so the same rule holds there: without
                the key it would time builds that carry line tables.
+  package-writers
+               Job docker-image-cache writes the Docker layer cache to the
+               ghcr.io tag `buildcache:docker-image` with the `docker-cache`
+               environment's `GHCR_CACHE_TOKEN`, and job docker-image reads it.
+               The check reports any job or workflow-level `permissions:` block
+               holding `packages: write` or `write-all`, and any step, job key,
+               or workflow-level `env:` reading `secrets.GHCR_CACHE_TOKEN` in
+               any letter case, or reading `toJSON(secrets)`, outside a job
+               declaring `environment: docker-cache`.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -601,6 +610,9 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # scripts/fix-round-check.sh names.
 EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 
+# Jobs whose `if:` is `github.event_name == 'push'`.
+PUSH_ONLY_JOBS = ("docker-image-cache",)
+
 # Jobs a `changes` filter output selects.
 RUST_ONLY_RUNS = {
     "bridge-parity": True,
@@ -654,31 +666,41 @@ SCENARIOS = {
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=RUST_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
         filters=DOCS_ONLY,
         event="pull_request",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=DOCS_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, push": Scenario(
         name="docs-only, push",
         filters=DOCS_ONLY,
         event="push",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
+        runs=DOCS_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        | dict.fromkeys(PUSH_ONLY_JOBS, True),
     ),
     "rust-only, merge_group": Scenario(
         name="rust-only, merge_group",
         filters=RUST_ONLY,
         event="merge_group",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
+        runs=RUST_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "python-only, pull_request": Scenario(
         name="python-only, pull_request",
         filters=PYTHON_ONLY,
         event="pull_request",
-        runs=PYTHON_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=PYTHON_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
 }
 
@@ -4074,13 +4096,657 @@ def check_profile_env_is_workflow_level(doc: dict, name: str) -> None:
     )
 
 
+def package_write_holders(doc: dict) -> list[str]:
+    """Return `workflow` and every job id whose own `permissions:` grants package write.
+
+    Job docker-image-cache writes the Docker layer cache tag with the `docker-cache`
+    environment's token, so no `GITHUB_TOKEN` in this workflow needs
+    `packages: write`. `write-all` grants `packages: write`.
+    """
+
+    def grants_package_write(permissions: object) -> bool:
+        if isinstance(permissions, str):
+            return permissions == "write-all"
+        return isinstance(permissions, dict) and permissions.get("packages") == "write"
+
+    holders = ["workflow"] if grants_package_write(doc.get("permissions")) else []
+    return holders + sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if grants_package_write(job.get("permissions"))
+    )
+
+
+# GitHub matches secret names and expression property names without regard to case,
+# and `toJSON(secrets)` hands a step every secret its job can read.
+CACHE_TOKEN_READ = re.compile(
+    r"secrets\s*(\.\s*GHCR_CACHE_TOKEN\b|\[\s*['\"]GHCR_CACHE_TOKEN['\"]\s*\])"
+    r"|toJSON\s*\(\s*secrets\s*\)",
+    re.IGNORECASE,
+)
+
+
+def cache_token_reads_outside_environment(doc: dict) -> list[str]:
+    """Return every reader of `secrets.GHCR_CACHE_TOKEN` outside a `docker-cache` job.
+
+    A reader is a step, a job-level key other than `steps:`, or the workflow-level
+    `env:`; the workflow-level `env:` reaches every job, so it is always reported.
+    """
+
+    def reads(value: object) -> bool:
+        return bool(CACHE_TOKEN_READ.search(json.dumps(value)))
+
+    found = ["workflow.env"] if reads(doc.get("env")) else []
+    for job_id, job in doc["jobs"].items():
+        environment = job.get("environment")
+        if isinstance(environment, dict):
+            environment = environment.get("name")
+        if environment == "docker-cache":
+            continue
+        found += [
+            f"{job_id}.{key}"
+            for key, value in job.items()
+            if key != "steps" and reads(value)
+        ]
+        found += [
+            f"{job_id}.steps[{index}]"
+            for index, step in enumerate(job.get("steps") or [])
+            if reads(step)
+        ]
+    return found
+
+
+def check_package_write_and_cache_token(doc: dict) -> None:
+    """No block grants `packages: write`; the cache token is read only in `docker-cache`."""
+    check(
+        "no job and no workflow-level block holds `packages: write` or `write-all`",
+        package_write_holders(doc) == [],
+        f"blocks granting package write: {package_write_holders(doc)}",
+    )
+    check(
+        "every reader of `secrets.GHCR_CACHE_TOKEN` is in a job declaring "
+        "`environment: docker-cache`",
+        cache_token_reads_outside_environment(doc) == [],
+        f"readers outside the environment: {cache_token_reads_outside_environment(doc)}",
+    )
+    write_mutants = (
+        (
+            "a docker-image-cache job granted `packages: write` is reported",
+            lambda d: d["jobs"]["docker-image-cache"]["permissions"].update(
+                packages="write"
+            ),
+            ["docker-image-cache"],
+        ),
+        (
+            "a docker-image job with `permissions: write-all` is reported",
+            lambda d: d["jobs"]["docker-image"].update(permissions="write-all"),
+            ["docker-image"],
+        ),
+        (
+            "a workflow-level `packages: write` is reported",
+            lambda d: d["permissions"].update(packages="write"),
+            ["workflow"],
+        ),
+        (
+            "a workflow-level `permissions: write-all` is reported",
+            lambda d: d.update(permissions="write-all"),
+            ["workflow"],
+        ),
+        (
+            "`permissions: read-all` at both levels is not reported",
+            lambda d: (
+                d.update(permissions="read-all"),
+                d["jobs"]["docker-image"].update(permissions="read-all"),
+            ),
+            [],
+        ),
+    )
+    for name, mutate, expected in write_mutants:
+        mutant = copy.deepcopy(doc)
+        mutate(mutant)
+        check(
+            name,
+            package_write_holders(mutant) == expected,
+            f"reported {package_write_holders(mutant)}, expected {expected}",
+        )
+    image_steps = len(doc["jobs"]["docker-image"]["steps"])
+    cache_readers = [
+        f"docker-image-cache.steps[{index}]"
+        for index, step in enumerate(doc["jobs"]["docker-image-cache"]["steps"])
+        if CACHE_TOKEN_READ.search(json.dumps(step))
+    ]
+    check(
+        "a docker-image-cache step reads `secrets.GHCR_CACHE_TOKEN`, so the two "
+        "environment mutants below have a reader to expose",
+        cache_readers != [],
+        "no docker-image-cache step reads the token",
+    )
+    login = {
+        "uses": "docker/login-action@v3",
+        "with": {"password": "${{ secrets.GHCR_CACHE_TOKEN }}"},
+    }
+    token_mutants = (
+        (
+            "a docker-image-cache job without `environment:` is reported",
+            lambda d: d["jobs"]["docker-image-cache"].pop("environment"),
+            cache_readers,
+        ),
+        (
+            "a docker-image-cache job in another environment is reported",
+            lambda d: d["jobs"]["docker-image-cache"].update(environment="production"),
+            cache_readers,
+        ),
+        (
+            "`environment: {name: docker-cache}` is accepted",
+            lambda d: d["jobs"]["docker-image-cache"].update(
+                environment={"name": "docker-cache"}
+            ),
+            [],
+        ),
+        (
+            "a docker-image step reading the token is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(login),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image job-level `env:` reading the token by index is reported",
+            lambda d: d["jobs"]["docker-image"].update(
+                env={"T": "${{ secrets['GHCR_CACHE_TOKEN'] }}"}
+            ),
+            ["docker-image.env"],
+        ),
+        (
+            "a docker-image step reading the token in lowercase is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"with": {"password": "${{ secrets.ghcr_cache_token }}"}}
+            ),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image step reading `toJSON(secrets)` is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"run": "echo '${{ toJSON(secrets) }}'"}
+            ),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image step reading another secret is not reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"with": {"password": "${{ secrets.GHCR_CACHE_TOKEN_OLD }}"}}
+            ),
+            [],
+        ),
+        (
+            "a workflow-level `env:` reading the token is reported",
+            lambda d: d.setdefault("env", {}).update(
+                T="${{ secrets.GHCR_CACHE_TOKEN }}"
+            ),
+            ["workflow.env"],
+        ),
+    )
+    for name, mutate, expected in token_mutants:
+        mutant = copy.deepcopy(doc)
+        mutate(mutant)
+        found = cache_token_reads_outside_environment(mutant)
+        check(name, found == expected, f"reported {found}, expected {expected}")
+
+
+# Each entry is (text the restore key must carry, the input that text stands for).
+# The file patterns are `hashFiles` arguments; the expressions are `${{ }}` contexts.
+ARTIFACT_KEY_FILE_INPUTS = (
+    ("rust-toolchain.toml", "the compiler version"),
+    ("Cargo.lock", "every dependency version"),
+    ("**/Cargo.toml", "every manifest's features, profiles and inheritance"),
+    (".cargo/**", "the repository's cargo config"),
+    ("crates/**", "the sources of every crate a bridge reaches"),
+)
+# The build input outside crates/ that one producer reads, keyed by job id.
+ARTIFACT_KEY_JOB_FILE_INPUTS = {
+    "pyo3-module": (("bindings/python/pyproject.toml", "the [tool.maturin] features"),),
+    "pyo3-module-macos": (
+        ("bindings/python/pyproject.toml", "the [tool.maturin] features"),
+    ),
+    "xcframework": (
+        ("bindings/swift/build-xcframework.sh", "the script that runs the build"),
+    ),
+}
+ARTIFACT_KEY_EXPRESSION_INPUTS = (
+    ("runner.os", "the runner OS"),
+    ("runner.arch", "the runner architecture"),
+    ("github.job", "the producer's job id"),
+    ("steps.artifact-inputs.outputs.digest", "the job definition and tool versions"),
+)
+ARTIFACT_KEY_VERSION = re.compile(r"^bridge-artifact-v\d+-")
+HASH_FILES_CALL = re.compile(r"hashFiles\(([^)]*)\)")
+
+
+def step_paths(step: dict) -> list[str]:
+    return str((step.get("with") or {}).get("path") or "").split()
+
+
+def bridge_producers(doc: dict) -> list[str]:
+    """Return every ci.yml job that uploads an artifact another job downloads."""
+    return sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if any(
+            str(step.get("uses") or "").startswith("actions/upload-artifact")
+            and artifact_consumers(doc, (step.get("with") or {}).get("name"))
+            for step in job.get("steps") or []
+        )
+    )
+
+
+def artifact_cache_key_gaps(doc: dict) -> list[str]:
+    """Return one line per input a bridge producer's artifact cache key omits.
+
+    CRITERION: every ci.yml job that uploads an artifact another ci.yml job downloads
+    restores that artifact with `actions/cache/restore` under a key that names the
+    version literal, each file pattern in ARTIFACT_KEY_FILE_INPUTS and the job's
+    entries in ARTIFACT_KEY_JOB_FILE_INPUTS inside a `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
+    digest that key reads in a step before the restore that hashes the job's own
+    definition out of ci.yml; restores, saves and uploads one path list; and saves under the key it
+    restored.
+
+    WHY: on a key hit the producer skips its build and uploads what an earlier run
+    built. A key that omits one input restores that earlier build after the input
+    changes, and every consumer then tests a stale binary and passes.
+    """
+    gaps: list[str] = []
+    for job_id in bridge_producers(doc):
+        steps = [
+            step for step in doc["jobs"][job_id]["steps"] if isinstance(step, dict)
+        ]
+        uploads = [
+            step
+            for step in steps
+            if str(step.get("uses") or "").startswith("actions/upload-artifact")
+            and artifact_consumers(doc, (step.get("with") or {}).get("name"))
+        ]
+        restores = [
+            step
+            for step in steps
+            if str(step.get("uses") or "").startswith("actions/cache/restore")
+        ]
+        if len(restores) != 1:
+            gaps.append(
+                f"{job_id}: {len(restores)} actions/cache/restore steps, want 1"
+            )
+            continue
+        restore = restores[0]
+        key = str((restore.get("with") or {}).get("key") or "")
+        hashed = {
+            argument.strip().strip("'\"")
+            for call in HASH_FILES_CALL.findall(key)
+            for argument in call.split(",")
+        }
+        if not ARTIFACT_KEY_VERSION.search(key):
+            gaps.append(
+                f"{job_id}: key carries no bridge-artifact-v<N> version literal"
+            )
+        for pattern, meaning in (
+            ARTIFACT_KEY_FILE_INPUTS + ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ())
+        ):
+            if pattern not in hashed:
+                gaps.append(f"{job_id}: key hashes no {pattern} ({meaning})")
+        expressions = re.findall(r"\$\{\{\s*([^}]*?)\s*\}\}", key)
+        for context, meaning in ARTIFACT_KEY_EXPRESSION_INPUTS:
+            if context not in expressions:
+                gaps.append(f"{job_id}: key reads no {context} ({meaning})")
+        digest = next(
+            (step for step in steps if step.get("id") == "artifact-inputs"), None
+        )
+        digest_run = str((digest or {}).get("run") or "")
+        if digest is not None and steps.index(digest) > steps.index(restore):
+            gaps.append(
+                f"{job_id}: the artifact-inputs step runs after the restore that reads its digest"
+            )
+        if (
+            "GITHUB_JOB" not in digest_run
+            or ".github/workflows/ci.yml" not in digest_run
+        ):
+            gaps.append(
+                f"{job_id}: no artifact-inputs step hashes the job's definition in ci.yml"
+            )
+        saves = [
+            step
+            for step in steps
+            if str(step.get("uses") or "").startswith("actions/cache/save")
+        ]
+        restore_id = restore.get("id")
+        if len(saves) != 1:
+            gaps.append(f"{job_id}: {len(saves)} actions/cache/save steps, want 1")
+        else:
+            saved_key = str((saves[0].get("with") or {}).get("key") or "")
+            if saved_key not in (
+                key,
+                f"${{{{ steps.{restore_id}.outputs.cache-primary-key }}}}",
+            ):
+                gaps.append(
+                    f"{job_id}: the save key {saved_key!r} is not the restore key"
+                )
+            if step_paths(saves[0]) != step_paths(restore):
+                gaps.append(f"{job_id}: the save and the restore name different paths")
+        for upload in uploads:
+            if step_paths(upload) != step_paths(restore):
+                gaps.append(
+                    f"{job_id}: the restore paths {step_paths(restore)} are not the "
+                    f"upload paths {step_paths(upload)}"
+                )
+    return gaps
+
+
+def without_key_input(key: str, text: str) -> str:
+    """Return `key` with one input removed: a hashFiles argument, a context, or the version."""
+    if text == "version":
+        return ARTIFACT_KEY_VERSION.sub("bridge-artifact-", key)
+    quoted = f"'{text}'"
+    if quoted in key:
+        return (
+            key.replace(f"{quoted}, ", "")
+            .replace(f", {quoted}", "")
+            .replace(quoted, "")
+        )
+    return re.sub(r"\$\{\{\s*" + re.escape(text) + r"\s*\}\}-?", "", key)
+
+
+def check_artifact_cache_keys(doc: dict) -> None:
+    gaps = artifact_cache_key_gaps(doc)
+    check(
+        "ci.yml: every bridge producer keys its artifact cache on every input",
+        not gaps,
+        f"{gaps}; a key missing an input restores a stale artifact after that input "
+        f"changes",
+    )
+    producers = bridge_producers(doc)
+    check(
+        "ci.yml: the artifact cache check reads all four bridge producers",
+        {"napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
+        <= set(producers),
+        f"found {producers}",
+    )
+    # Control: each producer, with each input removed from its key in turn, is reported.
+    for job_id in producers:
+        removable = (
+            [pattern for pattern, _ in ARTIFACT_KEY_FILE_INPUTS]
+            + [pattern for pattern, _ in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ())]
+            + [context for context, _ in ARTIFACT_KEY_EXPRESSION_INPUTS]
+            + ["version"]
+        )
+        for index, step in enumerate(doc["jobs"][job_id]["steps"]):
+            if not str(step.get("uses") or "").startswith("actions/cache/restore"):
+                continue
+            for text in removable:
+                mutated = copy.deepcopy(doc)
+                inputs = mutated["jobs"][job_id]["steps"][index]["with"]
+                stripped = without_key_input(inputs["key"], text)
+                inputs["key"] = stripped
+                named = "bridge-artifact-v<N>" if text == "version" else text
+                check(
+                    f"{job_id}: a key without {text} is reported",
+                    stripped != step["with"]["key"]
+                    and any(
+                        gap.startswith(f"{job_id}: ") and named in gap
+                        for gap in artifact_cache_key_gaps(mutated)
+                    ),
+                    f"a ci.yml whose {job_id} key omits {text} went unreported",
+                )
+        # Control: the artifact-inputs step moved after the restore is reported.
+        mutated = copy.deepcopy(doc)
+        moved = mutated["jobs"][job_id]["steps"]
+        digest_index = next(
+            i for i, s in enumerate(moved) if s.get("id") == "artifact-inputs"
+        )
+        moved.append(moved.pop(digest_index))
+        check(
+            f"{job_id}: an artifact-inputs step after the restore is reported",
+            any(
+                gap == f"{job_id}: the artifact-inputs step runs after the restore "
+                "that reads its digest"
+                for gap in artifact_cache_key_gaps(mutated)
+            ),
+            f"a ci.yml whose {job_id} computes its digest after the restore went "
+            f"unreported",
+        )
+
+
+ARTIFACT_INPUT_TOOLS = (
+    "git",
+    "python",
+    "maturin",
+    "ldd",
+    "cc",
+    "dpkg-query",
+    "xcodebuild",
+    "xcrun",
+)
+# A line the harness adds to the workflow-level env: block, which every build inherits.
+ARTIFACT_ENV_PROBE = "  RUSTFLAGS: -C debug-assertions=on\n"
+
+
+def run_artifact_inputs_step(
+    step: dict,
+    job_id: str,
+    failing: str | None,
+    *,
+    script: str | None = None,
+    workflow: str | None = None,
+    image_os: str | None = "stub-image",
+    image_version: str | None = "stub-build",
+) -> tuple[int, str]:
+    """Run an artifact-inputs step with every tool stubbed and `failing` exiting 1.
+
+    `script` replaces the step's own `run:` text, `workflow` the ci.yml the step
+    reads, and `image_os=None` and `image_version=None` leave ImageOS and
+    ImageVersion unset. Return the exit code and what
+    the step wrote to GITHUB_OUTPUT.
+    """
+    with tempfile.TemporaryDirectory() as root:
+        tree = Path(root, "tree")
+        (tree / ".github/workflows").mkdir(parents=True)
+        (tree / ".github/workflows/ci.yml").write_text(
+            WORKFLOW.read_text() if workflow is None else workflow
+        )
+        (tree / ".venv/bin").mkdir(parents=True)
+        (tree / ".venv/bin/activate").write_text("")
+        stubs = Path(root, "stubs")
+        stubs.mkdir()
+        for tool in ARTIFACT_INPUT_TOOLS:
+            body = "exit 1" if tool == failing else f"echo {tool}-stub"
+            (stubs / tool).write_text(f"#!/bin/sh\n{body}\n")
+            (stubs / tool).chmod(0o755)
+        runner_temp = Path(root, "runner-temp")
+        runner_temp.mkdir()
+        output = Path(root, "github-output")
+        output.write_text("")
+        script_file = Path(root, "step.sh")
+        script_file.write_text(str(step.get("run") or "") if script is None else script)
+        env = {
+            **os.environ,
+            "PATH": f"{stubs}{os.pathsep}{os.environ.get('PATH', '')}",
+            "GITHUB_JOB": job_id,
+            "GITHUB_OUTPUT": str(output),
+            "RUNNER_TEMP": str(runner_temp),
+        }
+        env.pop("ImageOS", None)
+        env.pop("ImageVersion", None)
+        if image_os is not None:
+            env["ImageOS"] = image_os
+        if image_version is not None:
+            env["ImageVersion"] = image_version
+        # GitHub runs a step that names no `shell:` under `bash -e {0}`, and a step
+        # that names `shell: bash` under `bash --noprofile --norc -eo pipefail {0}`.
+        if step.get("shell") == "bash":
+            shell = ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+        else:
+            shell = ["bash", "-e"]
+        code = subprocess.run(
+            [*shell, str(script_file)],
+            cwd=tree,
+            env=env,
+            capture_output=True,
+            check=False,
+        ).returncode
+        return code, output.read_text()
+
+
+def check_artifact_input_digests_fail_closed(doc: dict) -> None:
+    """Run each producer's artifact-inputs step with each tool it calls failing.
+
+    CRITERION: each bridge producer's `artifact-inputs` step exits non-zero when any
+    command in ARTIFACT_INPUT_TOOLS whose output it hashes fails or when ImageOS or
+    ImageVersion is unset, exits 0 and writes a digest when every command succeeds, and writes a
+    different digest when the workflow-level env: block changes, at its top or below
+    the column-0 comments that follow it, or when the job's own definition changes
+    below a comment indented as a job key.
+
+    WHY: a tool that fails puts nothing into the digest, so the key stops encoding
+    that tool's version, and a later change to the tool restores an artifact the
+    earlier version built. The same holds for the runner image name and build and
+    for the workflow env every build inherits.
+    """
+    workflow = WORKFLOW.read_text()
+    probed = workflow.replace("\nenv:\n", f"\nenv:\n{ARTIFACT_ENV_PROBE}", 1)
+    # YAML keeps env: open across the column-0 comments below it, so a variable
+    # written just above `jobs:` is still inherited by every build.
+    probed_low = workflow.replace("\njobs:\n", f"\n{ARTIFACT_ENV_PROBE}jobs:\n", 1)
+    for job_id in bridge_producers(doc):
+        steps = doc["jobs"][job_id]["steps"]
+        step = next((s for s in steps if s.get("id") == "artifact-inputs"), None) or {}
+        script = str(step.get("run") or "")
+        tools = [
+            tool
+            for tool in ARTIFACT_INPUT_TOOLS
+            if re.search(rf"^\s*{re.escape(tool)}\b", script, re.MULTILINE)
+        ]
+        code, output = run_artifact_inputs_step(step, job_id, None)
+        check(
+            f"{job_id}: the artifact-inputs step writes a digest when every tool runs",
+            bool(tools)
+            and code == 0
+            and re.fullmatch(r"digest=[0-9a-f]{64}\n", output) is not None,
+            f"exit {code}, output {output!r}, tools {tools}",
+        )
+        for tool in tools:
+            code, _ = run_artifact_inputs_step(step, job_id, tool)
+            check(
+                f"{job_id}: the artifact-inputs step fails when {tool} fails",
+                code != 0,
+                f"the step hashed a failed {tool} and exited 0",
+            )
+            # Control: the harness adds no pipefail of its own, so a piped tool's
+            # failure is caught only by the step's own `set -o pipefail`.
+            if re.search(rf"^\s*{re.escape(tool)}\b[^\n]*\|", script, re.MULTILINE):
+                unpiped = script.replace("set -euo pipefail", "set -eu")
+                code, _ = run_artifact_inputs_step(step, job_id, tool, script=unpiped)
+                check(
+                    f"{job_id}: without the step's pipefail a failed {tool} passes "
+                    f"the harness",
+                    unpiped != script and code == 0,
+                    f"the harness failed a step without pipefail on {tool} "
+                    f"(exit {code}), so it supplies the pipefail the check credits "
+                    f"to the step",
+                )
+        code, _ = run_artifact_inputs_step(step, job_id, None, image_os=None)
+        check(
+            f"{job_id}: the artifact-inputs step fails when ImageOS is unset",
+            code != 0,
+            "the step hashed a missing runner image name and exited 0",
+        )
+        code, _ = run_artifact_inputs_step(step, job_id, None, image_version=None)
+        check(
+            f"{job_id}: the artifact-inputs step fails when ImageVersion is unset",
+            code != 0,
+            "the step hashed a missing runner image build and exited 0",
+        )
+        _, other_build = run_artifact_inputs_step(
+            step, job_id, None, image_version="other-build"
+        )
+        check(
+            f"{job_id}: a different runner image build changes the digest",
+            other_build != output,
+            f"changing ImageVersion left the digest at {output!r}",
+        )
+        _, probed_output = run_artifact_inputs_step(step, job_id, None, workflow=probed)
+        check(
+            f"{job_id}: a change to the workflow-level env changes the digest",
+            probed != workflow and probed_output != output,
+            f"adding {ARTIFACT_ENV_PROBE.strip()!r} to the workflow env left the "
+            f"digest at {output!r}",
+        )
+        _, low_output = run_artifact_inputs_step(step, job_id, None, workflow=probed_low)
+        check(
+            f"{job_id}: an env variable below the comments after env: changes the digest",
+            probed_low != workflow and low_output != output,
+            f"adding {ARTIFACT_ENV_PROBE.strip()!r} above jobs: left the digest at "
+            f"{output!r}",
+        )
+        # A job key written below a comment at job-key indent is still part of the
+        # job, so two values of that key must give two digests.
+        header = f"\n  {job_id}:\n"
+        job_probes = [
+            workflow.replace(
+                header, f"{header}  # probe\n    continue-on-error: {value}\n", 1
+            )
+            for value in ("false", "true")
+        ]
+        job_outputs = [
+            run_artifact_inputs_step(step, job_id, None, workflow=w)[1]
+            for w in job_probes
+        ]
+        check(
+            f"{job_id}: a job key below a job-indent comment changes the digest",
+            job_probes[0] != workflow and job_outputs[0] != job_outputs[1],
+            f"changing a key below a comment in job {job_id} left the digest at "
+            f"{job_outputs[0]!r}",
+        )
+        # Control: extraction that stops at any column-0 or job-indent line, comments
+        # included, misses both probes above.
+        comment_stop = script.replace("/^[^ #]/", "/^[^ ]/").replace(
+            "/^  [^ #]/", "/^  [^ ]/"
+        )
+        _, stop_plain = run_artifact_inputs_step(step, job_id, None, script=comment_stop)
+        _, stop_low = run_artifact_inputs_step(
+            step, job_id, None, script=comment_stop, workflow=probed_low
+        )
+        stop_jobs = [
+            run_artifact_inputs_step(
+                step, job_id, None, script=comment_stop, workflow=w
+            )[1]
+            for w in job_probes
+        ]
+        check(
+            f"{job_id}: a step whose extraction stops at a comment is reported",
+            comment_stop != script
+            and stop_low == stop_plain
+            and stop_jobs[0] == stop_jobs[1],
+            "extraction that stops at a comment still saw a variable or job key "
+            "written below one",
+        )
+        # Control: the step with its workflow-env line removed is reported.
+        without_env = "\n".join(
+            line for line in script.splitlines() if '"$workflow_env"' not in line
+        )
+        _, plain = run_artifact_inputs_step(step, job_id, None, script=without_env)
+        _, plain_probed = run_artifact_inputs_step(
+            step, job_id, None, script=without_env, workflow=probed
+        )
+        check(
+            f"{job_id}: a step that hashes no workflow env is reported",
+            without_env != script and plain == plain_probed,
+            "removing the workflow env from the digest still changed the digest",
+        )
+
+
 def check_xcframework_outputs_are_verified(doc: dict) -> None:
     """Run the xcframework job's verify step against each uploaded path gone or stale.
 
     CRITERION: for every path the `swift-xcframework-dev` upload lists, the step
     before that upload exits non-zero when the path is absent or holds nothing
     newer than the marker the build step touches, and exits 0 when every path is
-    fresh.
+    fresh. On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step
+    exits non-zero when an untracked path is absent and exits 0 when every path is
+    present.
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
     nothing. The upload lists the tracked ScpBindings.swift, so the checkout always
@@ -4096,13 +4762,14 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
     paths = (steps[upload]["with"]["path"]).split()
     now = 1_000_000_000
 
-    def run_with(missing: str | None, stale: str | None) -> int:
+    def run_with(missing: str | None, stale: str | None, hit: bool = False) -> int:
         with tempfile.TemporaryDirectory() as root:
             runner_temp = Path(root, "runner-temp")
             runner_temp.mkdir()
-            marker = runner_temp / "xcframework-build-start"
-            marker.touch()
-            os.utime(marker, (now, now))
+            if not hit:
+                marker = runner_temp / "xcframework-build-start"
+                marker.touch()
+                os.utime(marker, (now, now))
             for path in paths:
                 if path == missing:
                     continue
@@ -4110,10 +4777,13 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
                 file = target / "content" if target.suffix != ".swift" else target
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.touch()
-                stamp = now - 100 if path == stale else now + 100
+                stamp = now - 100 if path == stale or hit else now + 100
                 for entry in {file, target}:
                     os.utime(entry, (stamp, stamp))
             env = {**os.environ, "RUNNER_TEMP": str(runner_temp)}
+            env.pop("ARTIFACT_CACHE_HIT", None)
+            if hit:
+                env["ARTIFACT_CACHE_HIT"] = "true"
             return subprocess.run(
                 ["bash", "-c", script],
                 cwd=Path(root, "tree"),
@@ -4137,6 +4807,20 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
             f"xcframework: a {path} older than the build fails the producer",
             run_with(None, path) != 0,
             f"the verify step before the upload passes over a stale {path}",
+        )
+    check(
+        "xcframework: on a cache hit the verify step passes when the restore wrote "
+        "every output",
+        run_with(None, None, hit=True) == 0,
+        "the verify step rejects a cache hit that restored every uploaded path",
+    )
+    # The checkout supplies the tracked ScpBindings.swift, so CI cannot reach a hit
+    # that lacks it.
+    for path in (p for p in paths if not p.endswith("ScpBindings.swift")):
+        check(
+            f"xcframework: on a cache hit a missing {path} fails the producer",
+            run_with(path, None, hit=True) != 0,
+            f"the verify step passes a cache hit without {path}",
         )
 
 
@@ -4352,8 +5036,22 @@ def main() -> int:
         yaml.safe_load(COMPILE_TIMINGS.read_text()), "compile-timings.yml"
     )
 
+    print(
+        "artifact-key — a bridge producer reuses an artifact only for unchanged inputs"
+    )
+    check_artifact_cache_keys(workflow)
+
+    print(
+        "artifact-digest — an artifact-inputs step fails when a hashed input is "
+        "missing and hashes the workflow env"
+    )
+    check_artifact_input_digests_fail_closed(workflow)
+
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
+
+    print("package-writers — no `packages: write`; the cache token stays in docker-cache")
+    check_package_write_and_cache_token(workflow)
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)

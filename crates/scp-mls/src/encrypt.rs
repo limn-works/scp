@@ -330,17 +330,36 @@ pub fn decrypt_with_sender_did(
     ciphertext: &[u8],
     clock: &dyn Clock,
 ) -> Result<DecryptedContent, MlsError> {
+    let protocol_message = parse_protocol_message(group, ciphertext)?;
+    decrypt_protocol_message_with_sender_did(group, protocol_message, clock)
+}
+
+/// Parses inbound bytes into the `ProtocolMessage` the decrypt step consumes.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed and
+/// [`MlsError::DecryptionFailed`] if the bytes are not an MLS protocol message.
+fn parse_protocol_message(
+    group: &ScpMlsGroup,
+    ciphertext: &[u8],
+) -> Result<ProtocolMessage, MlsError> {
     if group.group.is_none() {
         return Err(MlsError::GroupDestroyed);
     }
-
-    let message_in = MlsMessageIn::tls_deserialize(&mut &*ciphertext)
-        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?;
-
-    let protocol_message = message_in
+    MlsMessageIn::tls_deserialize(&mut &*ciphertext)
+        .map_err(|e| MlsError::DecryptionFailed(format!("deserializing ciphertext: {e}")))?
         .try_into_protocol_message()
-        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
+        .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))
+}
 
+/// The decrypt step of [`decrypt_with_sender_did`], on an already parsed
+/// message; its errors are that function's errors.
+fn decrypt_protocol_message_with_sender_did(
+    group: &mut ScpMlsGroup,
+    protocol_message: ProtocolMessage,
+    clock: &dyn Clock,
+) -> Result<DecryptedContent, MlsError> {
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     // Rejects a self-authored echo before the sender lookup below.
     let processed = process_inbound(g, &group.provider, protocol_message)?;
@@ -409,6 +428,71 @@ pub fn decrypt_with_sender_did(
             Err(MlsError::CannotDecryptOwnMessage)
         }
     }
+}
+
+/// Processes an inbound message that must be a Commit, refusing any other
+/// content type before decrypting it.
+///
+/// The content type is read from the parsed `ProtocolMessage`: a
+/// `PrivateMessage` carries `content_type` in the clear (RFC 9420 §6.3), and a
+/// `PublicMessage` carries it in its `FramedContent` (RFC 9420 §6).
+///
+/// Decrypting a `PrivateMessage` consumes the sender's ratchet generation and
+/// deletes its key (the content type picks the application or handshake
+/// ratchet, RFC 9420 §6.3.1). This function refuses a non-Commit before
+/// decrypting it, so a refused application message or Proposal still decrypts
+/// afterwards through [`decrypt_with_sender_did`]. A relay or other
+/// non-member cannot relabel a message past the check: a `PrivateMessage`'s
+/// `content_type` is bound into its `SenderDataAAD` (RFC 9420 §6.3.2), so a
+/// message it relabels as a Commit fails at sender-data decryption, before
+/// any ratchet generation is spent. A member holds the epoch's
+/// `sender_data_secret`, so it can re-encrypt the sender data under the new
+/// label and spend the claimed sender's handshake-ratchet generation, as it
+/// can through any decrypt path (RFC 9420 §6.3.2). The relabelled message's
+/// application-ratchet key is never spent.
+///
+/// A Commit then gets the checks [`decrypt_with_sender_did`] runs: the
+/// `catch_unwind` guard around openmls's `process_message`, the mapping of the local member's own
+/// echoed message to [`MlsError::CannotDecryptOwnMessage`], and, before the
+/// merge, the injected-clock and maximum-range check on every Add proposal's
+/// `KeyPackage` `Lifetime`.
+///
+/// Both [`crate::ratchet::process_commit`] and the runtime backend's
+/// `process_commit` call this function.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed,
+/// [`MlsError::DecryptionFailed`] if the bytes are not an MLS protocol message,
+/// [`MlsError::CommitProcessingFailed`] if the message is an application
+/// message or a Proposal, and the errors of [`decrypt_with_sender_did`]
+/// otherwise. On every error raised before the merge the group's epoch is
+/// unchanged; a storage error from openmls's `merge_staged_commit` can leave
+/// the group partly merged, so the caller treats the group as unusable.
+pub fn decrypt_commit(
+    group: &mut ScpMlsGroup,
+    commit_bytes: &[u8],
+    clock: &dyn Clock,
+) -> Result<(), MlsError> {
+    let protocol_message = parse_protocol_message(group, commit_bytes)?;
+    let content_type = protocol_message.content_type();
+    if content_type != ContentType::Commit {
+        return Err(MlsError::CommitProcessingFailed(format!(
+            "message is not a Commit (content type {content_type:?})"
+        )));
+    }
+
+    // Unreachable after the content-type check above: the AEAD authenticates
+    // the content type for a PrivateMessage, and the signature and membership
+    // tag do for a PublicMessage. Kept as a typed refusal rather than a panic.
+    let DecryptedContent::Commit { .. } =
+        decrypt_protocol_message_with_sender_did(group, protocol_message, clock)?
+    else {
+        return Err(MlsError::CommitProcessingFailed(
+            "message is not a Commit".to_string(),
+        ));
+    };
+    Ok(())
 }
 
 /// The membership changes an existing member observes when it processes an
