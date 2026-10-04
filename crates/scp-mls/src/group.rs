@@ -21,7 +21,8 @@ use crate::convergent_timestamp::encode_convergent_timestamp_aad;
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
 use crate::lifetime::{
-    key_package_lifetime, validate_key_package_lifetime, validate_tree_leaf_lifetimes,
+    key_package_lifetime, validate_key_package_lifetime, validate_own_join_leaf_lifetime,
+    validate_tree_leaf_lifetime_ranges,
 };
 use openmls::group::GroupContext;
 use openmls::messages::group_info::GroupInfo;
@@ -550,10 +551,9 @@ fn create_group_inner(
     // Create the MLS group with the creator as the sole member. The creator's
     // own `LeafNode` `Lifetime` was routed through the injected `Clock` via the
     // `.lifetime(...)` call on the create-config builder above (ADR-057
-    // §Prereq-1). On the receive side, `join_group_from_bytes` validates every
-    // KeyPackage-sourced Welcome tree leaf against the injected clock, and
-    // switches openmls's own check on those leaves off — see the module docs in
-    // `crate::lifetime`.
+    // §Prereq-1). On the receive side, `join_group_from_bytes` switches
+    // openmls's tree-leaf lifetime check off and bounds each KeyPackage-sourced
+    // tree leaf to the maximum range — see `crate::lifetime`.
     let group = MlsGroup::new(
         &provider,
         &signer,
@@ -1156,9 +1156,10 @@ fn generate_key_package_inner(
     // receive side, add_member / key_package_in_did / the staged-commit Add
     // paths re-validate accepted `Lifetime`s against the injected clock, with
     // openmls's internal `Lifetime::validate` also running on them, and
-    // `join_group_from_bytes` validates every KeyPackage-sourced Welcome tree
-    // leaf against it as the only check on those leaves (see `crate::lifetime`
-    // module docs).
+    // `join_group_from_bytes` checks only the range of every other member's
+    // KeyPackage-sourced Welcome tree leaf, against no clock, and checks the
+    // joiner's own leaf against `own_clock` (see `crate::lifetime` module
+    // docs).
     let key_package_bundle = builder
         .key_package_lifetime(key_package_lifetime(clock))
         .build(SCP_CIPHERSUITE, &provider, &signer, credential_with_key)
@@ -1180,9 +1181,9 @@ fn generate_key_package_inner(
 /// * `provider` - The MLS provider that holds the new member's key material
 ///   (from [`generate_key_package`]).
 /// * `signer` - The new member's signing key pair (from [`generate_key_package`]).
-/// * `clock` - The injected hardened [`Clock`]. Every KeyPackage-sourced leaf
-///   of the joined tree is validated against it before the group is adopted
-///   (see [`join_group_from_bytes`]).
+/// * `own_clock` - The injected clock. It reaches only the joiner's own leaf;
+///   other members' tree leaves are checked for range only (see
+///   [`join_group_from_bytes`]).
 ///
 /// # Returns
 ///
@@ -1190,20 +1191,29 @@ fn generate_key_package_inner(
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::WelcomeProcessingFailed`] if the Welcome message
-/// cannot be processed.
-/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if a KeyPackage-sourced tree
-/// leaf's `Lifetime` fails validation against `clock`.
+/// The same cases as [`join_group_from_bytes`], plus a serialization failure:
+///
+/// - [`MlsError::WelcomeProcessingFailed`] if the Welcome message cannot be
+///   serialized, deserialized or processed, or if the joined group's own leaf
+///   is missing or not KeyPackage-sourced.
+/// - [`MlsError::KeyPackageLifetimeInvalid`] if the joiner's own `KeyPackage`
+///   `Lifetime` is expired or not yet valid under `own_clock`, or its range is
+///   empty, inverted or over the maximum.
+/// - [`MlsError::TreeLeafLifetimeRangeInvalid`] if another member's
+///   KeyPackage-sourced tree leaf has an empty or inverted range (`not_after`
+///   not later than `not_before`) or a range over the maximum.
+///
+/// On every error the joined group is dropped and never adopted.
 pub fn join_group(
     welcome: &MlsMessageOut,
     provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
-    clock: &dyn Clock,
+    own_clock: &dyn Clock,
 ) -> Result<ScpMlsGroup, MlsError> {
     let serialized = welcome
         .tls_serialize_detached()
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("serializing welcome: {e}")))?;
-    join_group_from_bytes(&serialized, provider, signer, clock)
+    join_group_from_bytes(&serialized, provider, signer, own_clock)
 }
 
 /// Joins a group from TLS-serialized Welcome bytes.
@@ -1218,11 +1228,10 @@ pub fn join_group(
 /// * `provider` - The MLS provider holding the key package's private state
 ///   (from [`generate_key_package`]).
 /// * `signer` - The new member's signing key pair (from [`generate_key_package`]).
-/// * `clock` - The injected hardened [`Clock`]. After `StagedWelcome::into_group`
-///   and before the group is wrapped, every leaf of the joined tree whose source
-///   is `LeafNodeSource::KeyPackage` is validated against it, together with the
-///   RFC 9420 maximum-range bound (ADR-057 §Prereq-1). `Update`- and
-///   `Commit`-sourced leaves carry no `Lifetime` and are skipped.
+/// * `own_clock` - The injected clock. It reaches only the joiner's own leaf,
+///   whose `KeyPackage` `Lifetime` must be current under it. Other members'
+///   tree leaves are checked for range only and read no clock (ADR-057
+///   §Prereq-1).
 ///
 /// # Returns
 ///
@@ -1230,16 +1239,28 @@ pub fn join_group(
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::WelcomeProcessingFailed`] if the Welcome message
-/// cannot be deserialized or processed.
-/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if a KeyPackage-sourced tree
-/// leaf's `Lifetime` is expired, not yet valid, or over-long under `clock`; the
-/// joined group is dropped and never adopted.
+/// Each variant names one party's leaf (ADR-057 §Prereq-1):
+///
+/// - [`MlsError::WelcomeProcessingFailed`] if the Welcome message cannot be
+///   deserialized or processed, or if the joined group's own leaf is missing
+///   or not KeyPackage-sourced.
+/// - [`MlsError::KeyPackageLifetimeInvalid`] if the joiner's own `KeyPackage`
+///   `Lifetime` is expired or not yet valid under `own_clock`, or its range is
+///   empty, inverted or over the maximum. The own leaf is checked first and
+///   never yields the tree-leaf variant.
+/// - [`MlsError::TreeLeafLifetimeRangeInvalid`] if another member's
+///   KeyPackage-sourced tree leaf has an empty or inverted range (`not_after`
+///   not later than `not_before`) or a range over
+///   [`KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`](crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS).
+///   Another member's expired or not-yet-valid tree leaf is accepted (RFC 9420
+///   §7.3).
+///
+/// On every error the joined group is dropped and never adopted.
 pub fn join_group_from_bytes(
     welcome_bytes: &[u8],
     provider: InMemoryMlsProvider,
     signer: SignatureKeyPair,
-    clock: &dyn Clock,
+    own_clock: &dyn Clock,
 ) -> Result<ScpMlsGroup, MlsError> {
     let welcome_in = MlsMessageIn::tls_deserialize(&mut &*welcome_bytes)
         .map_err(|e| MlsError::WelcomeProcessingFailed(format!("deserializing welcome: {e}")))?;
@@ -1272,10 +1293,11 @@ pub fn join_group_from_bytes(
         .build();
 
     // openmls's own tree-leaf `Lifetime` check reads openmls's clock (wasm:
-    // `web_time`'s `Date.now()`), so it is switched off here and
-    // `validate_tree_leaf_lifetimes` below is the only tree-leaf lifetime check,
-    // against the injected clock (ADR-057 §Prereq-1). The skip covers only that
-    // check; openmls still runs the rest of its leaf validation.
+    // `web_time`'s `Date.now()`) and rejects an expired leaf, which would let
+    // one passive member block every later join. It is switched off here,
+    // because RFC 9420 §7.3 only recommends that check for a received tree
+    // (ADR-057 §Prereq-1). The skip covers only that check; openmls still runs
+    // the rest of its leaf validation.
     let staged_welcome = StagedWelcome::build_from_welcome(&provider, &join_config, welcome)
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?
         .skip_lifetime_validation()
@@ -1286,13 +1308,18 @@ pub fn join_group_from_bytes(
         .into_group(&provider)
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
 
-    // SECURITY (ADR-057 §Prereq-1): validate every KeyPackage-sourced tree
-    // leaf's `Lifetime` against the injected hardened clock, with the RFC 9420
-    // maximum-range bound, before the group is adopted. This is the only
-    // tree-leaf lifetime check on the Welcome path. On failure the `MlsGroup`
-    // and the provider it wrote into are dropped here and the caller never
-    // receives a group.
-    validate_tree_leaf_lifetimes(&group, clock)?;
+    // SECURITY (ADR-057 §Prereq-1): the joiner's own `KeyPackage` must be
+    // current under the injected clock and within the maximum range. This is
+    // the only leaf `own_clock` reaches. It runs here, not in each caller, so
+    // no join path can adopt a group whose own `KeyPackage` is invalid, and
+    // any fault in the own leaf is reported as `KeyPackageLifetimeInvalid`.
+    validate_own_join_leaf_lifetime(&group, own_clock)?;
+    // SECURITY (ADR-057 §Prereq-1, RFC 9420 §7.2): bound every other member's
+    // KeyPackage-sourced tree leaf's `Lifetime` to the maximum range before
+    // the group is adopted; `TreeLeafLifetimeRangeInvalid` names only such a
+    // leaf. On either failure the `MlsGroup` and the provider it wrote into
+    // are dropped here and the caller never receives a group.
+    validate_tree_leaf_lifetime_ranges(&group)?;
 
     Ok(ScpMlsGroup {
         group: Some(group),
@@ -1302,41 +1329,125 @@ pub fn join_group_from_bytes(
     })
 }
 
+/// Test-fixture credential for `name`, with a fixture-specific DID suffix.
+#[cfg(any(test, feature = "testing"))]
+fn fixture_credential(name: &str, suffix: &str) -> Result<ScpCredential, MlsError> {
+    ScpCredential::new(
+        format!("did:dht:z6Mk{name}{suffix}"),
+        None,
+        scp_did::SigningKeyId::Active,
+    )
+}
+
 /// Test fixture: Alice's group holding Carol, whose leaf is `KeyPackage`-sourced
-/// and expires at `real_now + 600`. Every clock reads `real_now` except the one
-/// that mints Carol's `KeyPackage`.
+/// and already expired under the real clock. Returns Alice's group and the
+/// `not_after` of Carol's leaf.
 ///
-/// Carol is the member whose leaf carries a `Lifetime` into a later joiner's
-/// tree: openmls's `add_members` commits with an `UpdatePath`, which turns
-/// Alice's own leaf `Commit`-sourced, while Carol never commits, so her leaf
-/// keeps `LeafNodeSource::KeyPackage`.
+/// Carol creates the group from a clock set `KEY_PACKAGE_LIFETIME_SECS + 60`
+/// seconds before the real clock, so her creator leaf expired 60 seconds ago.
+/// She adds Alice with `add_members_without_update`, so her leaf keeps
+/// `LeafNodeSource::KeyPackage` and that `Lifetime`, and she never commits
+/// again. Alice joins from Carol's Welcome. openmls checks no `Lifetime` when
+/// it creates a group or builds a path-less commit, and `join_group` checks
+/// only a tree leaf's range, so the expired leaf needs no wait. openmls does
+/// check every Add proposal's `Lifetime` against the real clock, so an expired
+/// leaf cannot enter a tree through an Add. When a test adds Bob to the
+/// returned group through [`add_member`], Alice's leaf turns `Commit`-sourced
+/// and Carol's expired leaf stays in the Welcome's tree.
+///
+/// # Errors
+///
+/// Returns the [`MlsError`] from creating the group, minting Alice's
+/// `KeyPackage`, adding her, or joining her.
+#[cfg(any(test, feature = "testing"))]
+pub fn group_holding_carol_leaf_expired() -> Result<(ScpMlsGroup, u64), MlsError> {
+    use crate::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+    use scp_clock::{SystemClock, TestClock};
+
+    let suffix = "ExpiredLeaf";
+    let carol_clock = TestClock::new(
+        SystemClock
+            .now_secs()
+            .saturating_sub(KEY_PACKAGE_LIFETIME_SECS + 60),
+    );
+    let carol_not_after = key_package_lifetime(&carol_clock).not_after();
+    let mut carol = create_group(&fixture_credential("Carol", suffix)?, &carol_clock)?;
+    let (alice_bundle, alice_signer, alice_provider) =
+        generate_key_package(&fixture_credential("Alice", suffix)?, &SystemClock)?;
+    let welcome = {
+        let signer = carol.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        let g = carol.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+        let (_commit, welcome, _group_info) = g
+            .add_members_without_update(
+                &carol.provider,
+                signer,
+                &[alice_bundle.key_package().clone()],
+            )
+            .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
+        g.merge_pending_commit(&carol.provider)
+            .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
+        welcome
+    };
+    let alice = join_group(&welcome, alice_provider, alice_signer, &SystemClock)?;
+    Ok((alice, carol_not_after))
+}
+
+/// Test fixture: Alice's group holding Carol, whose leaf range is over the maximum.
+///
+/// Carol's `KeyPackage`-sourced leaf is current, but its `Lifetime` range
+/// exceeds
+/// [`KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`](crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS)
+/// by one hour. Returns Alice's group and the `not_after` of Carol's leaf.
+///
+/// openmls accepts the over-range `KeyPackage`, because its `validate` never
+/// checks the range. SCP's [`add_member`] would reject it, so Alice adds Carol
+/// through openmls's `add_members` directly, as a non-SCP member of the group
+/// could. It reads [`SystemClock`](scp_clock::SystemClock) itself, as
+/// [`group_holding_carol_leaf_expired`] does, because openmls checks Carol's
+/// `Lifetime` against the real clock when it builds the commit.
 ///
 /// # Errors
 ///
 /// Returns the [`MlsError`] from creating the group, minting Carol's
 /// `KeyPackage`, or adding her.
 #[cfg(any(test, feature = "testing"))]
-pub fn group_holding_carol_leaf_expiring_soon(real_now: u64) -> Result<ScpMlsGroup, MlsError> {
-    use crate::lifetime::KEY_PACKAGE_LIFETIME_SECS;
-    let credential = |name: &str| {
-        ScpCredential::new(
-            format!("did:dht:z6Mk{name}ExpiringLeaf"),
-            None,
-            scp_did::SigningKeyId::Active,
-        )
+pub fn group_holding_carol_leaf_over_max_range() -> Result<(ScpMlsGroup, u64), MlsError> {
+    use crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+    use scp_clock::SystemClock;
+
+    let real_now = SystemClock.now_secs();
+
+    let suffix = "OverRangeLeaf";
+    let carol_provider = InMemoryMlsProvider::default();
+    let carol_signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
+        .map_err(|e| MlsError::KeyPackageGenerationFailed(e.to_string()))?;
+    let carol_cwk = CredentialWithKey {
+        credential: BasicCredential::new(fixture_credential("Carol", suffix)?.to_bytes()?).into(),
+        signature_key: carol_signer.to_public_vec().into(),
     };
-    let now_clock = scp_clock::TestClock::new(real_now);
-    let mut alice = create_group(&credential("Alice")?, &now_clock)?;
-    let (carol_bundle, _carol_signer, _carol_provider) = generate_key_package(
-        &credential("Carol")?,
-        &scp_clock::TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600),
+    let over_long_not_after = real_now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 3600;
+    let carol_bundle = KeyPackage::builder()
+        .key_package_lifetime(Lifetime::init(real_now - 3600, over_long_not_after))
+        .build(SCP_CIPHERSUITE, &carol_provider, &carol_signer, carol_cwk)
+        .map_err(|e| MlsError::KeyPackageGenerationFailed(e.to_string()))?;
+
+    let mut alice = create_group(
+        &fixture_credential("Alice", suffix)?,
+        &scp_clock::TestClock::new(real_now),
     )?;
-    add_member(
-        &mut alice,
-        carol_bundle.key_package().clone().into(),
-        &now_clock,
-    )?;
-    Ok(alice)
+    {
+        let signer = alice.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        let g = alice.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+        g.add_members(
+            &alice.provider,
+            signer,
+            &[carol_bundle.key_package().clone()],
+        )
+        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
+        g.merge_pending_commit(&alice.provider)
+            .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
+    }
+    Ok((alice, over_long_not_after))
 }
 
 #[cfg(test)]
@@ -1896,164 +2007,364 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ADR-057 §Prereq-1: Welcome tree-leaf lifetimes bracketed on join
+    // ADR-057 §Prereq-1: Welcome tree leaves keep only the range bound
     // -----------------------------------------------------------------------
     //
-    // Every clock is seeded from `SystemClock.now_secs()` so openmls's own
-    // real-clock `Lifetime::validate` on the tree leaves passes and only SCP's
-    // injected-clock check can reject.
+    // `join_group` reads no clock for another member's tree leaf: an expired
+    // or not-yet-valid KeyPackage-sourced leaf joins, and only an empty,
+    // inverted or over-range leaf is rejected, with
+    // `TreeLeafLifetimeRangeInvalid`.
 
-    /// [`group_holding_carol_leaf_expiring_soon`] with Bob then added through
-    /// a `KeyPackage` minted at `real_now`. Returns the Welcome and Bob's join
-    /// material.
-    #[allow(clippy::unwrap_used)]
-    fn welcome_with_carol_leaf_expiring_soon(
-        real_now: u64,
-    ) -> (MlsMessageOut, SignatureKeyPair, InMemoryMlsProvider) {
-        let now_clock = scp_clock::TestClock::new(real_now);
-        let mut alice = group_holding_carol_leaf_expiring_soon(real_now).unwrap();
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The `Lifetime`s of every KeyPackage-sourced leaf in `group`'s tree.
+    fn key_package_leaf_lifetimes(group: &ScpMlsGroup) -> Result<Vec<Lifetime>, MlsError> {
+        let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+        Ok(g.treesync()
+            .full_leaves()
+            .filter_map(|(_index, leaf)| match leaf.leaf_node_source() {
+                openmls::treesync::LeafNodeSource::KeyPackage(lifetime) => Some(*lifetime),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The Welcome of `creator`'s path-less add of a `KeyPackage` minted on the
+    /// real clock, and the joiner's material. A path-less commit keeps the
+    /// creator's leaf `KeyPackage`-sourced in the Welcome's tree.
+    fn welcome_without_update(
+        creator: &mut ScpMlsGroup,
+        joiner: &str,
+    ) -> Result<(MlsMessageOut, SignatureKeyPair, InMemoryMlsProvider), Box<dyn std::error::Error>>
+    {
+        let (bundle, signer, provider) =
+            generate_key_package(&test_credential(joiner), &SystemClock)?;
+        let creator_signer = creator.signer.as_ref().ok_or("creator signer")?;
+        let g = creator.group.as_mut().ok_or("creator group")?;
+        let (_commit, welcome, _group_info) = g.add_members_without_update(
+            &creator.provider,
+            creator_signer,
+            &[bundle.key_package().clone()],
+        )?;
+        g.merge_pending_commit(&creator.provider)?;
+        Ok((welcome, signer, provider))
+    }
+
+    /// Carol never commits, so her expired KeyPackage-sourced leaf stays in
+    /// the tree Bob receives; Bob joins anyway (RFC 9420 §7.3 only recommends
+    /// the current-time check on a received tree).
+    #[test]
+    fn join_accepts_welcome_whose_never_committing_member_leaf_expired() -> TestResult {
+        let (mut alice, carol_not_after) = group_holding_carol_leaf_expired()?;
         let (bob_bundle, bob_signer, bob_provider) =
-            generate_key_package(&test_credential("bob"), &now_clock).unwrap();
-        let add = add_member(
-            &mut alice,
-            bob_bundle.key_package().clone().into(),
-            &now_clock,
-        )
-        .unwrap();
-        (add.welcome, bob_signer, bob_provider)
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
-    fn join_rejects_welcome_whose_tree_leaf_is_expired_under_injected_clock() {
-        let real_now = SystemClock.now_secs();
-        let (welcome, bob_signer, bob_provider) = welcome_with_carol_leaf_expiring_soon(real_now);
-        let bob_clock = scp_clock::TestClock::new(real_now + 1200);
-        let err = join_group(&welcome, bob_provider, bob_signer, &bob_clock)
-            .err()
-            .expect("join must reject a Welcome whose tree holds an expired leaf");
-        match err {
-            MlsError::KeyPackageLifetimeInvalid { not_after, now, .. } => {
-                // `not_after == real_now + 600` names Carol's leaf; Bob's own
-                // leaf expires at `real_now + KEY_PACKAGE_LIFETIME_SECS`.
-                assert_eq!(not_after, real_now + 600, "the rejected leaf is Carol's");
-                assert_eq!(now, real_now + 1200, "validated against the injected clock");
-            }
-            other => panic!("expected KeyPackageLifetimeInvalid, got {other:?}"),
-        }
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn join_accepts_welcome_whose_tree_leaves_are_valid_under_injected_clock() {
-        let real_now = SystemClock.now_secs();
-        let (welcome, bob_signer, bob_provider) = welcome_with_carol_leaf_expiring_soon(real_now);
-        let bob_clock = scp_clock::TestClock::new(real_now);
-        let bob = join_group(&welcome, bob_provider, bob_signer, &bob_clock).unwrap();
-        assert_eq!(bob.members().unwrap().len(), 3);
-    }
-
-    /// `validate_tree_leaf_lifetimes` is the only Welcome tree-leaf lifetime
-    /// check: a leaf that is valid under the injected clock joins even when
-    /// openmls's own clock (the real one here) would call it not yet valid.
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn join_accepts_tree_leaf_valid_under_injected_clock_but_not_yet_valid_under_real_clock() {
-        let real_now = SystemClock.now_secs();
-        let one_day = 24 * 60 * 60;
-        let future_clock = scp_clock::TestClock::new(real_now + one_day);
-
-        // Alice's own leaf is KeyPackage-sourced, with a `Lifetime` built from a
-        // clock one day ahead: its not_before lies after the real clock's now,
-        // so openmls's real-clock check calls it not yet valid, and the
-        // injected clock one day ahead calls it valid.
-        let mut alice = create_group(&test_credential("alice"), &future_clock).unwrap();
-
-        let (bob_bundle, bob_signer, bob_provider) =
-            generate_key_package(&test_credential("bob"), &SystemClock).unwrap();
-        // Alice adds Bob without an UpdatePath, so her leaf keeps its
-        // KeyPackage source (and its future `Lifetime`) in the Welcome's tree.
-        // SCP's `add_member` commits through `add_members`, whose UpdatePath
-        // makes her leaf Commit-sourced and takes it out of the lifetime check;
-        // a non-SCP member of the group can commit without a path.
-        let welcome = {
-            let signer = alice.signer.as_ref().unwrap();
-            let g = alice.group.as_mut().unwrap();
-            let (_commit, welcome, _group_info) = g
-                .add_members_without_update(
-                    &alice.provider,
-                    signer,
-                    &[bob_bundle.key_package().clone()],
-                )
-                .unwrap();
-            g.merge_pending_commit(&alice.provider).unwrap();
-            welcome
-        };
-
-        // Bob's injected clock is one day ahead, inside Alice's and Bob's
-        // `Lifetime`s, so every KeyPackage-sourced leaf is valid under it.
-        let bob = join_group(&welcome, bob_provider, bob_signer, &future_clock).unwrap();
-        assert_eq!(bob.members().unwrap().len(), 2);
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
-    fn join_rejects_welcome_whose_tree_leaf_exceeds_max_lifetime_range() {
-        use crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
-        let real_now = SystemClock.now_secs();
-
-        // Carol's KeyPackage carries a temporally valid but over-long Lifetime,
-        // which openmls accepts (its `validate` never checks the range). SCP's
-        // `add_member` would reject it, so Alice adds Carol through openmls
-        // directly, as a non-SCP member of the group could.
-        let carol_provider = InMemoryMlsProvider::default();
-        let carol_signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
-        let cwk = CredentialWithKey {
-            credential: BasicCredential::new(test_credential("carol").to_bytes().unwrap()).into(),
-            signature_key: carol_signer.to_public_vec().into(),
-        };
-        let over_long_not_after = real_now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 3600;
-        let carol_bundle = KeyPackage::builder()
-            .key_package_lifetime(Lifetime::init(real_now - 3600, over_long_not_after))
-            .build(SCP_CIPHERSUITE, &carol_provider, &carol_signer, cwk)
-            .unwrap();
-
-        let mut alice = create_group(&test_credential("alice"), &SystemClock).unwrap();
-        {
-            let signer = alice.signer.as_ref().unwrap();
-            let g = alice.group.as_mut().unwrap();
-            g.add_members(
-                &alice.provider,
-                signer,
-                &[carol_bundle.key_package().clone()],
-            )
-            .unwrap();
-            g.merge_pending_commit(&alice.provider).unwrap();
-        }
-
-        let (bob_bundle, bob_signer, bob_provider) =
-            generate_key_package(&test_credential("bob"), &SystemClock).unwrap();
+            generate_key_package(&test_credential("bob"), &SystemClock)?;
         let add = add_member(
             &mut alice,
             bob_bundle.key_package().clone().into(),
             &SystemClock,
-        )
-        .unwrap();
+        )?;
 
-        let err = join_group(
-            &add.welcome,
-            bob_provider,
-            bob_signer,
-            &scp_clock::TestClock::new(real_now),
-        )
-        .err()
-        .expect("join must reject a Welcome whose tree holds an over-long leaf Lifetime");
-        match err {
-            MlsError::KeyPackageLifetimeInvalid { not_after, .. } => assert_eq!(
-                not_after, over_long_not_after,
-                "the rejected leaf is Carol's over-long one"
+        let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock)?;
+
+        assert_eq!(bob.members()?.len(), 3);
+        let expired = key_package_leaf_lifetimes(&bob)?
+            .iter()
+            .filter(|lifetime| lifetime.not_after() == carol_not_after)
+            .count();
+        assert_eq!(
+            expired, 1,
+            "Carol's leaf is in Bob's tree, KeyPackage-sourced"
+        );
+        assert!(
+            carol_not_after < SystemClock.now_secs(),
+            "Carol's leaf expired before Bob joined"
+        );
+        Ok(())
+    }
+
+    /// The creator's own leaf, minted on a clock older than one `Lifetime`,
+    /// stays KeyPackage-sourced through a path-less add and has expired.
+    #[test]
+    fn join_accepts_welcome_whose_creator_leaf_expired_under_real_clock() -> TestResult {
+        use crate::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+        let old_clock =
+            scp_clock::TestClock::new(SystemClock.now_secs() - KEY_PACKAGE_LIFETIME_SECS - 10);
+        let mut alice = create_group(&test_credential("alice"), &old_clock)?;
+        let (welcome, bob_signer, bob_provider) = welcome_without_update(&mut alice, "bob")?;
+
+        let bob = join_group(&welcome, bob_provider, bob_signer, &SystemClock)?;
+
+        assert_eq!(bob.members()?.len(), 2);
+        assert!(
+            key_package_leaf_lifetimes(&bob)?
+                .iter()
+                .any(|lifetime| lifetime.not_after() < SystemClock.now_secs()),
+            "the Welcome's tree holds an expired KeyPackage-sourced leaf"
+        );
+        Ok(())
+    }
+
+    /// Alice's creator leaf is minted on a clock one day ahead, so its
+    /// `not_before` lies after the real clock's now; Bob joins.
+    #[test]
+    fn join_accepts_welcome_whose_tree_leaf_is_not_yet_valid() -> TestResult {
+        let one_day = 24 * 60 * 60;
+        let future_clock = scp_clock::TestClock::new(SystemClock.now_secs() + one_day);
+        let mut alice = create_group(&test_credential("alice"), &future_clock)?;
+        let (welcome, bob_signer, bob_provider) = welcome_without_update(&mut alice, "bob")?;
+
+        let bob = join_group(&welcome, bob_provider, bob_signer, &SystemClock)?;
+
+        assert_eq!(bob.members()?.len(), 2);
+        assert!(
+            key_package_leaf_lifetimes(&bob)?
+                .iter()
+                .any(|lifetime| lifetime.not_before() > SystemClock.now_secs()),
+            "the Welcome's tree holds a not-yet-valid KeyPackage-sourced leaf"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn join_accepts_welcome_whose_tree_leaves_are_current() -> TestResult {
+        let mut alice = create_group(&test_credential("alice"), &SystemClock)?;
+        let (welcome, bob_signer, bob_provider) = welcome_without_update(&mut alice, "bob")?;
+        let bob = join_group(&welcome, bob_provider, bob_signer, &SystemClock)?;
+        assert_eq!(bob.members()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn join_rejects_welcome_whose_tree_leaf_exceeds_max_lifetime_range() -> TestResult {
+        let (mut alice, over_long_not_after) = group_holding_carol_leaf_over_max_range()?;
+        let (bob_bundle, bob_signer, bob_provider) =
+            generate_key_package(&test_credential("bob"), &SystemClock)?;
+        let add = add_member(
+            &mut alice,
+            bob_bundle.key_package().clone().into(),
+            &SystemClock,
+        )?;
+
+        let result = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock);
+
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::TreeLeafLifetimeRangeInvalid { leaf_index: 1, not_after, .. })
+                    if not_after == over_long_not_after
             ),
-            other => panic!("expected KeyPackageLifetimeInvalid, got {other:?}"),
-        }
+            "the over-range leaf is Carol's (leaf 1), got {:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    /// Bob joins from a Welcome whose creator leaf, Alice's, carries
+    /// `Lifetime::init(not_before, not_after)` and stays KeyPackage-sourced.
+    fn join_with_creator_lifetime(
+        not_before: u64,
+        not_after: u64,
+    ) -> Result<Result<ScpMlsGroup, MlsError>, Box<dyn std::error::Error>> {
+        let provider = InMemoryMlsProvider::default();
+        let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())?;
+        let credential_with_key = CredentialWithKey {
+            credential: BasicCredential::new(test_credential("alice").to_bytes()?).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(SCP_CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
+            .lifetime(Lifetime::init(not_before, not_after))
+            .max_past_epochs(2)
+            .build();
+        let group = MlsGroup::new(&provider, &signer, &config, credential_with_key)?;
+        let mut alice = ScpMlsGroup {
+            group: Some(group),
+            provider,
+            signer: Some(signer),
+            destroyed: false,
+        };
+        let (welcome, bob_signer, bob_provider) = welcome_without_update(&mut alice, "bob")?;
+        Ok(join_group(&welcome, bob_provider, bob_signer, &SystemClock))
+    }
+
+    /// A creator leaf whose `not_after` precedes its `not_before` is malformed
+    /// and is rejected, although a saturating range would read 0.
+    #[test]
+    fn join_rejects_welcome_whose_tree_leaf_lifetime_is_inverted() -> TestResult {
+        let now = SystemClock.now_secs();
+        let (inverted_not_before, inverted_not_after) = (now + 60, now - 60);
+
+        let result = join_with_creator_lifetime(inverted_not_before, inverted_not_after)?;
+
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::TreeLeafLifetimeRangeInvalid { leaf_index: 0, not_before, not_after })
+                    if not_before == inverted_not_before && not_after == inverted_not_after
+            ),
+            "the inverted leaf is Alice's (leaf 0), got {:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    /// A creator leaf whose `not_after` equals its `not_before` contains no
+    /// instant (`not_before <= now < not_after` admits none) and is rejected.
+    #[test]
+    fn join_rejects_welcome_whose_tree_leaf_lifetime_is_zero_length() -> TestResult {
+        let now = SystemClock.now_secs();
+
+        let result = join_with_creator_lifetime(now, now)?;
+
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::TreeLeafLifetimeRangeInvalid { leaf_index: 0, not_before, not_after })
+                    if not_before == now && not_after == now
+            ),
+            "the zero-length leaf is Alice's (leaf 0), got {:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-057 §Prereq-1: the joiner's own KeyPackage must be current
+    // -----------------------------------------------------------------------
+
+    /// Bob joins Alice's group from a `KeyPackage` minted on the real clock.
+    fn bob_joined() -> Result<(ScpMlsGroup, ScpMlsGroup), Box<dyn std::error::Error>> {
+        let mut alice = create_group(&test_credential("alice"), &SystemClock)?;
+        let (bob_bundle, bob_signer, bob_provider) =
+            generate_key_package(&test_credential("bob"), &SystemClock)?;
+        let add = add_member(
+            &mut alice,
+            bob_bundle.key_package().clone().into(),
+            &SystemClock,
+        )?;
+        let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock)?;
+        Ok((alice, bob))
+    }
+
+    /// A Welcome for Bob, with Bob's provider and signer and the `Lifetime`
+    /// of his `KeyPackage`, minted on the real clock.
+    struct BobWelcome {
+        welcome: MlsMessageOut,
+        provider: InMemoryMlsProvider,
+        signer: SignatureKeyPair,
+        lifetime: Lifetime,
+    }
+
+    fn welcome_for_bob() -> Result<BobWelcome, Box<dyn std::error::Error>> {
+        let mut alice = create_group(&test_credential("alice"), &SystemClock)?;
+        let (bob_bundle, bob_signer, bob_provider) =
+            generate_key_package(&test_credential("bob"), &SystemClock)?;
+        let add = add_member(
+            &mut alice,
+            bob_bundle.key_package().clone().into(),
+            &SystemClock,
+        )?;
+        Ok(BobWelcome {
+            welcome: add.welcome,
+            provider: bob_provider,
+            signer: bob_signer,
+            lifetime: *bob_bundle.key_package().life_time(),
+        })
+    }
+
+    /// A joiner clock past Bob's `not_after` makes `join_group` itself reject
+    /// the join, although every other leaf of the tree is checked for range
+    /// only.
+    #[test]
+    fn own_join_leaf_lifetime_rejects_expired_key_package() -> TestResult {
+        let bob = welcome_for_bob()?;
+        let late = scp_clock::TestClock::new(bob.lifetime.not_after());
+
+        let result = join_group(&bob.welcome, bob.provider, bob.signer, &late).map(|_| ());
+
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::KeyPackageLifetimeInvalid { not_after, now, .. }) if not_after <= now
+            ),
+            "expected an expired own KeyPackage, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn own_join_leaf_lifetime_rejects_not_yet_valid_key_package() -> TestResult {
+        let bob = welcome_for_bob()?;
+        let early = scp_clock::TestClock::new(bob.lifetime.not_before() - 1);
+
+        let result = join_group(&bob.welcome, bob.provider, bob.signer, &early).map(|_| ());
+
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::KeyPackageLifetimeInvalid { not_before, now, .. }) if now < not_before
+            ),
+            "expected a not-yet-valid own KeyPackage, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Bob's own `KeyPackage` is current but its range is over the maximum.
+    /// The error names Bob's own `KeyPackage`, `KeyPackageLifetimeInvalid`,
+    /// never `TreeLeafLifetimeRangeInvalid`, which names another member's leaf.
+    /// SCP's `add_member` would reject the over-range `KeyPackage`, so Alice
+    /// adds Bob through openmls's `add_members` directly, as in
+    /// `group_holding_carol_leaf_over_max_range`.
+    #[test]
+    fn join_rejects_own_over_range_key_package_as_key_package_lifetime_invalid() -> TestResult {
+        use crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+        let real_now = SystemClock.now_secs();
+        let bob_provider = InMemoryMlsProvider::default();
+        let bob_signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())?;
+        let bob_cwk = CredentialWithKey {
+            credential: BasicCredential::new(test_credential("bob").to_bytes()?).into(),
+            signature_key: bob_signer.to_public_vec().into(),
+        };
+        let over_long_not_after = real_now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 3600;
+        let bob_bundle = KeyPackage::builder()
+            .key_package_lifetime(Lifetime::init(real_now - 3600, over_long_not_after))
+            .build(SCP_CIPHERSUITE, &bob_provider, &bob_signer, bob_cwk)?;
+        let mut alice = create_group(&test_credential("alice"), &SystemClock)?;
+        let alice_signer = alice.signer.as_ref().ok_or("alice signer")?;
+        let g = alice.group.as_mut().ok_or("alice group")?;
+        let (_commit, welcome, _group_info) = g.add_members(
+            &alice.provider,
+            alice_signer,
+            &[bob_bundle.key_package().clone()],
+        )?;
+        g.merge_pending_commit(&alice.provider)?;
+
+        let result = join_group(&welcome, bob_provider, bob_signer, &SystemClock).map(|_| ());
+
+        assert!(
+            matches!(
+                result,
+                Err(MlsError::KeyPackageLifetimeInvalid { not_after, .. })
+                    if not_after == over_long_not_after
+            ),
+            "expected the own over-range KeyPackage as KeyPackageLifetimeInvalid, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Alice's add commits with a path, so her own leaf is Commit-sourced and
+    /// carries no `Lifetime`.
+    #[test]
+    fn own_join_leaf_lifetime_rejects_leaf_not_key_package_sourced() -> TestResult {
+        let (alice, _bob) = bob_joined()?;
+
+        let result = crate::lifetime::validate_own_join_leaf_lifetime(alice.inner()?, &SystemClock);
+
+        assert!(
+            matches!(result, Err(MlsError::WelcomeProcessingFailed(ref msg)) if msg.contains("not KeyPackage-sourced")),
+            "expected a non-KeyPackage own leaf rejection, got {result:?}"
+        );
+        Ok(())
     }
 }
