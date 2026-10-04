@@ -1552,6 +1552,11 @@ def no_cargo_gradle_calls(job: dict) -> list[str]:
     ]
 
 
+def passes_no_daemon(line: str) -> bool:
+    """Report whether one `./gradlew` command line passes --no-daemon."""
+    return "--no-daemon" in line.split()
+
+
 def check_no_cargo_gradle_calls_skip_the_daemon(jobs: dict) -> None:
     """kotlin-lint's cargo-free Gradle calls run without the shared daemon.
 
@@ -1571,15 +1576,20 @@ def check_no_cargo_gradle_calls_skip_the_daemon(jobs: dict) -> None:
     for line in calls:
         check(
             f"kotlin-lint: {line[:58]} passes --no-daemon",
-            "--no-daemon" in line.split(),
+            passes_no_daemon(line),
             "a reused daemon can resolve cargo against the PATH it started with",
         )
         stripped = " ".join(t for t in line.split() if t != "--no-daemon")
         check(
             f"kotlin-lint: {line[:40]} with --no-daemon removed -> reported",
-            "--no-daemon" not in stripped.split(),
+            not passes_no_daemon(stripped),
             "the predicate accepted a call that reuses the daemon",
         )
+    check(
+        "passes_no_daemon rejects a token that only starts with --no-daemon",
+        not passes_no_daemon("./gradlew --no-daemon-x detekt"),
+        "the predicate matched a prefix rather than the whole flag",
+    )
 
 
 def check_workspace_and_rustdoc_readers(documents: list[tuple[Path, dict]]) -> None:
