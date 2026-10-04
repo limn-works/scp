@@ -109,9 +109,9 @@ impl SupervisorHandle {
     }
 
     /// Spawns `future` onto the Supervisor's task tracker (ADR-049 Decision
-    /// 16). An actor uses this for any detached task whose future holds the
-    /// handle or the actor's dependencies, so `shutdown_all_contexts` waits
-    /// for it.
+    /// 16). An actor uses this for any detached task that can write through
+    /// the store, so `shutdown_all_contexts` waits for it. A future that holds
+    /// the handle or the actor's dependencies is an indicator of such a task.
     ///
     /// # Errors
     ///

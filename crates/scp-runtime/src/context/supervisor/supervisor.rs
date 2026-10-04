@@ -1147,25 +1147,61 @@ impl SpawnPermit<'_> {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.tracker.spawn(tracked_task_marker().scope((), future))
+        spawn_marked(self.tracker, future)
     }
 }
 
-/// The task-local marker every task spawned onto the Supervisor's tracker
-/// runs inside, so [`Supervisor::spawn_tracked_on`] can tell a tracked caller
-/// from an outside one (ADR-049 Decision 16, item 2). It carries no value,
-/// only presence, and is set per task, never shared between Supervisors.
-fn tracked_task_marker() -> &'static tokio::task::LocalKey<()> {
+/// Spawns onto the Supervisor's task tracker for one operation that began
+/// before shutdown, such as a streaming open that starts its pump and its
+/// seal task (ADR-049 Decision 16, item 2). Issued by
+/// [`Supervisor::tracked_spawner`]. It holds a tracker token, so the tracker
+/// is not empty while the spawner lives: the drain waits for the operation
+/// that holds it and for every task spawned through it.
+pub(in crate::context) struct TrackedSpawner {
+    tracker: tokio_util::task::TaskTracker,
+    _token: tokio_util::task::task_tracker::TaskTrackerToken,
+}
+
+impl TrackedSpawner {
+    /// Spawns `future` onto the Supervisor's task tracker, marked as a
+    /// tracked task (see [`tracked_task_marker`]).
+    pub(in crate::context) fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        spawn_marked(&self.tracker, future)
+    }
+}
+
+/// The task-local every task spawned onto a Supervisor's tracker runs inside.
+/// It holds a clone of that tracker, so [`Supervisor::spawn_tracked_on`] can
+/// tell a task tracked by this Supervisor from any other caller (ADR-049
+/// Decision 16, item 2).
+fn tracked_task_marker() -> &'static tokio::task::LocalKey<tokio_util::task::TaskTracker> {
     tokio::task_local! {
-        static TRACKED_TASK: ();
+        static TRACKED_TASK: tokio_util::task::TaskTracker;
     }
     &TRACKED_TASK
 }
 
-/// Whether the calling code runs inside a task spawned onto a Supervisor's
-/// tracker.
-fn in_tracked_task() -> bool {
-    tracked_task_marker().try_with(|()| ()).is_ok()
+/// Spawns `future` onto `tracker` inside the [`tracked_task_marker`] scope.
+fn spawn_marked<F>(
+    tracker: &tokio_util::task::TaskTracker,
+    future: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tracker.spawn(tracked_task_marker().scope(tracker.clone(), future))
+}
+
+/// Whether the calling code runs inside a task spawned onto `tracker`.
+fn in_tracked_task(tracker: &tokio_util::task::TaskTracker) -> bool {
+    tracked_task_marker()
+        .try_with(|own| tokio_util::task::TaskTracker::ptr_eq(own, tracker))
+        .unwrap_or(false)
 }
 
 /// Flat, named-field request for
@@ -6836,6 +6872,17 @@ impl Supervisor {
             PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage, SigningKeyBytes,
         };
 
+        // Taken before any reserve, so a saga refused by shutdown has staged
+        // and debited nothing. The pump and the seal task spawn through it onto
+        // the tracker, so the drain waits for both (ADR-049 Decision 16).
+        let spawner = self
+            .tracked_spawner("start cross-context streaming saga")
+            .map_err(|refused| SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: refused.to_string(),
+            })?;
+
         let caller_hex = hex::encode(caller_context_id);
         let target_hex = hex::encode(target_context_id);
 
@@ -7146,6 +7193,7 @@ impl Supervisor {
             pump_semaphore,
             caveat_post_input_check,
             counter_reservation,
+            &|task| drop(spawner.spawn(task)),
         )
         .await;
         let mut handle = match open_result {
@@ -7228,40 +7276,22 @@ impl Supervisor {
         // durably folds it into B's frontier (StreamCaptureAppend), and seals at
         // close (CommitBStreamSettle).
         // The task spawns on the tracker so shutdown waits for its seal
-        // (ADR-049 Decision 16). The permit is taken BEFORE the seal future is
-        // built, so a refusal leaves the escrow ticket here: the hold is then
-        // reversed by `release_stream_escrow`.
-        let refused = match self.spawn_permit("spawn streaming saga seal task") {
-            Ok(permit) => {
-                let seal = crate::context::outlets::invoke::run_streaming_saga_seal_task(
-                    Arc::downgrade(self),
-                    target_hex.clone(),
-                    saga_id.clone(),
-                    SigningKeyBytes::from_signing_key(signing_keys.target),
-                    inner_rx,
-                    outer_tx,
-                    escrow_ticket,
-                    descriptor,
-                    output_schema,
-                    aggregate_schema,
-                    a_event_log,
-                );
-                permit.spawn(seal);
-                None
-            }
-            Err(refused) => Some((refused, escrow_ticket)),
-        };
-        if let Some((refused, escrow_ticket)) = refused {
-            self.release_stream_escrow(escrow_ticket, &target_hex, &caller_did)
-                .await;
-            self.abort_staged_streaming_saga(&saga_id, &target_hex)
-                .await;
-            return Err(SagaError::Aborted {
-                reason: SagaAbortReason::Rejected,
-                code: 13067,
-                message: refused.to_string(),
-            });
-        }
+        // (ADR-049 Decision 16).
+        drop(spawner.spawn(
+            crate::context::outlets::invoke::run_streaming_saga_seal_task(
+                Arc::downgrade(self),
+                target_hex.clone(),
+                saga_id.clone(),
+                SigningKeyBytes::from_signing_key(signing_keys.target),
+                inner_rx,
+                outer_tx,
+                escrow_ticket,
+                descriptor,
+                output_schema,
+                aggregate_schema,
+                a_event_log,
+            ),
+        ));
 
         // AC1 — return the receiver PROMPTLY (the journal is `Committing`; the
         // seal reaches `Committed` at stream-close, off the mailbox).
@@ -10934,8 +10964,7 @@ impl Supervisor {
     /// the supervisor spawned to exit (ADR-049 Decision 16, supervisor task
     /// drain; local cleanup only).
     ///
-    /// In order: sets the closed flag, so every later spawn through the task
-    /// tracker fails with [`ContextError::SupervisorShutDown`]; destroys each
+    /// In order: sets the closed flag; destroys each
     /// context's sender keys, MLS group, and event log through its actor
     /// (release secrets before tearing down structure; `SenderKey`s, the MLS
     /// group's signer, and its provider-storage values zeroize on drop) and
@@ -11035,7 +11064,7 @@ impl Supervisor {
             .spawn_gate
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *gate && !in_tracked_task() {
+        if *gate && !in_tracked_task(&self.task_tracker) {
             return Err(ContextError::SupervisorShutDown(format!(
                 "{operation} refused: the supervisor starts no task for a caller \
                  outside its tracker once shutdown_all_contexts has begun"
@@ -11043,11 +11072,45 @@ impl Supervisor {
         }
         // The read guard is held across the spawn, so shutdown cannot set the
         // flag between the check and the spawn.
-        let handle = self
-            .task_tracker
-            .spawn_on(tracked_task_marker().scope((), future), runtime);
+        let handle = self.task_tracker.spawn_on(
+            tracked_task_marker().scope(self.task_tracker.clone(), future),
+            runtime,
+        );
         drop(gate);
         Ok(handle)
+    }
+
+    /// Issues a [`TrackedSpawner`] for an operation that spawns tasks after
+    /// `.await`s of its own, under the rule [`Self::spawn_tracked_on`]
+    /// follows: refused once the closed flag is set, unless the caller is
+    /// itself a task on this Supervisor's tracker.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] once the closed flag is set and the
+    /// caller is not a task on this Supervisor's tracker.
+    pub(in crate::context) fn tracked_spawner(
+        &self,
+        operation: &str,
+    ) -> Result<TrackedSpawner, ContextError> {
+        let gate = self
+            .spawn_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *gate && !in_tracked_task(&self.task_tracker) {
+            return Err(ContextError::SupervisorShutDown(format!(
+                "{operation} refused: the supervisor starts no operation for a caller \
+                 outside its tracker once shutdown_all_contexts has begun"
+            )));
+        }
+        // The token is taken under the read guard, and the drain sets the flag
+        // before it waits, so the drain counts the token.
+        let spawner = TrackedSpawner {
+            tracker: self.task_tracker.clone(),
+            _token: self.task_tracker.token(),
+        };
+        drop(gate);
+        Ok(spawner)
     }
 
     /// Sets the closed flag (ADR-049 Decision 16, step 2). Blocks only until
@@ -11105,7 +11168,7 @@ impl Supervisor {
     /// async; **callers MUST be inside a tokio runtime**.
     ///
     /// Blocks the calling thread for at most
-    /// `lifecycle_helpers::SYNC_SHUTDOWN_DRAIN_DEADLINE`.
+    /// `lifecycle_helpers::SYNC_SHUTDOWN_DRAIN_BOUND`.
     ///
     /// # Errors
     ///
@@ -13087,7 +13150,10 @@ impl Supervisor {
     /// to the ticket's `Drop` refund, because that refund spawns through
     /// [`Self::spawn_tracked_on`], which refuses a caller outside the tracker
     /// once shutdown has begun (ADR-049 Decision 16, item 2). A failed
-    /// reversal logs at error and the hold stays debited.
+    /// reversal logs at error and the hold stays debited. The ticket is
+    /// consumed before the reversal is sent, so a caller that drops this
+    /// future mid-reversal leaves at most one reversal queued, never a second
+    /// refund from the ticket's `Drop`.
     pub(in crate::context) async fn release_stream_escrow(
         &self,
         ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
@@ -13095,6 +13161,7 @@ impl Supervisor {
         member_did: &DID,
     ) {
         let reserved = ticket.reserved();
+        ticket.consume();
         // The mailbox future is boxed so it does not enlarge the state machine
         // of each streaming open that awaits this helper.
         if reserved.value() > 0
@@ -13110,7 +13177,6 @@ impl Supervisor {
                  the hold stays debited"
             );
         }
-        ticket.consume();
     }
 
     /// Invoke a outlet under the full economy pipeline (actor model).
@@ -13281,6 +13347,14 @@ impl Supervisor {
     {
         use crate::context::outlets::dispatch;
 
+        // Taken before the reserve, so an open refused by shutdown has debited
+        // nothing. The pump spawns through it onto the tracker, so the drain
+        // waits for the pump and its close-time settlement (ADR-049 Decision
+        // 16). The refusal maps as any other reserve-time supervisor fault.
+        let spawner = self.tracked_spawner("open outlet stream").map_err(|err| {
+            crate::context::outlets_helpers::reserve_error_to_open_rejection(&err)
+        })?;
+
         // Phase 1 — the shared, sink-agnostic pre-pump prologue (reserve →
         // escrow guard → §7.3.8 hook → `ContextParams` caps/timing →
         // admission/semaphore). `caveat_binding` is borrowed (not moved) so it
@@ -13348,6 +13422,7 @@ impl Supervisor {
             pump_semaphore,
             caveat_post_input_check,
             counter_reservation,
+            &|task| drop(spawner.spawn(task)),
         )
         .await;
 
@@ -19897,6 +19972,79 @@ mod tests {
         );
     }
 
+    /// ADR-049 Decision 16, item 2 — the tracked-caller exception admits only
+    /// a task on the same Supervisor's tracker, and a spawner issued before
+    /// close keeps the drain waiting for every task it spawns after close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_exception_is_per_supervisor_and_spawner_holds_the_drain() {
+        let a = supervisor_with_providers();
+        let b = supervisor_with_providers();
+        let runtime = tokio::runtime::Handle::current();
+
+        b.close_spawn_gate();
+        assert!(
+            matches!(
+                b.tracked_spawner("outside caller after close"),
+                Err(ContextError::SupervisorShutDown(_))
+            ),
+            "a closed gate refuses a spawner to a caller outside the tracker"
+        );
+
+        // A task on A's tracker is outside B's tracker.
+        let b_in_a = Arc::clone(&b);
+        let a_runtime = runtime.clone();
+        let (onto_b, spawner_on_b) = a
+            .spawn_tracked("task of A", async move {
+                (
+                    b_in_a
+                        .spawn_tracked_on("A's task onto B", async {}, &a_runtime)
+                        .map(drop),
+                    b_in_a.tracked_spawner("A's task onto B").map(drop),
+                )
+            })
+            .expect("A's gate is open")
+            .await
+            .expect("the task of A does not panic");
+        assert!(
+            matches!(onto_b, Err(ContextError::SupervisorShutDown(_))),
+            "B's closed gate refuses spawn_tracked_on from a task tracked by A"
+        );
+        assert!(
+            matches!(spawner_on_b, Err(ContextError::SupervisorShutDown(_))),
+            "B's closed gate refuses a spawner to a task tracked by A"
+        );
+
+        let spawner = a
+            .tracked_spawner("operation begun before close")
+            .expect("an open gate issues a spawner");
+        a.close_spawn_gate();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let a_in_child = Arc::clone(&a);
+        let child = spawner.spawn(async move {
+            let nested = a_in_child.tracked_spawner("nested").map(drop);
+            let _ = release_rx.await;
+            nested
+        });
+        drop(spawner);
+
+        let drain_supervisor = Arc::clone(&a);
+        let drain = tokio::spawn(async move { drain_supervisor.await_tracked_tasks().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !drain.is_finished(),
+            "the drain waits for a task spawned after close through an earlier spawner"
+        );
+        release_tx.send(()).expect("the child is still waiting");
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("the drain finishes once its last task exits")
+            .expect("the drain does not panic");
+        child
+            .await
+            .expect("the child does not panic")
+            .expect("a closed gate issues a spawner to a task on the same tracker");
+    }
+
     /// After `shutdown_all_contexts` returns and the owner drops its handle,
     /// nothing keeps the Supervisor alive (ADR-049 Decision 16): every
     /// supervisor-spawned task holds a `Weak` and the tracker wait has seen
@@ -19953,7 +20101,7 @@ mod tests {
             .key_package_store_for(&DID("did:dht:z6MkLateKp".to_owned()))
             .await;
         assert!(
-            kp.is_err(),
+            matches!(kp, Err(ContextError::SupervisorShutDown(_))),
             "a key-package actor spawn after shutdown must be refused"
         );
     }
@@ -20601,6 +20749,50 @@ mod tests {
             .await
             .expect("spawn registers the live context");
         hex::encode(ctx_id_bytes)
+    }
+
+    /// A caller that drops `release_stream_escrow` once the reversal is queued
+    /// gets no second refund from the ticket's `Drop`.
+    #[tokio::test]
+    async fn release_stream_escrow_dropped_mid_reversal_does_not_refund_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingRefundSink(AtomicUsize);
+        impl crate::context::outlets::dispatch::StreamEscrowRefundSink for CountingRefundSink {
+            fn refund(
+                &self,
+                _context_id: &str,
+                _member_did: &DID,
+                _amount: scp_protocol::economy::types::Amount,
+            ) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let supervisor = supervisor_with_providers();
+        let context_id = spawn_live_context(&supervisor, [0x5e; 32]).await;
+        let member = DID("did:example:live-admin".to_owned());
+        let sink = Arc::new(CountingRefundSink(AtomicUsize::new(0)));
+        let ticket = crate::context::outlets::dispatch::StreamEscrowTicket::new(
+            Arc::clone(&sink) as Arc<dyn crate::context::outlets::dispatch::StreamEscrowRefundSink>,
+            context_id.clone(),
+            member.clone(),
+            scp_protocol::economy::types::Amount::new(50),
+        );
+
+        // One poll queues the reversal and parks on the actor's reply, which
+        // this single-threaded runtime cannot deliver mid-poll; the future is
+        // then dropped.
+        let release = supervisor.release_stream_escrow(ticket, &context_id, &member);
+        assert!(
+            futures::FutureExt::now_or_never(release).is_none(),
+            "the reversal waits for the actor's reply"
+        );
+        assert_eq!(
+            sink.0.load(Ordering::SeqCst),
+            0,
+            "a dropped release must not refund the hold a second time"
+        );
     }
 
     /// Build a VALIDLY-signed full-scope export for `context_id` whose
@@ -32768,6 +32960,8 @@ mod open_outlet_stream_tests {
     /// billing split (billed 3×10, refund 50−30=20) AND that the close-time
     /// settlement ran on the actor (its receipt capture is observed, proving the
     /// preceding escrow refund + cumulative-counter release also executed).
+    /// The closed flag is set after the open, so the settlement also proves
+    /// the pump runs on the Supervisor's tracker (ADR-049 Decision 16).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_outlet_stream_reserve_pump_settle_end_to_end() {
         let captured = Arc::new(AtomicUsize::new(0));
@@ -32902,6 +33096,11 @@ mod open_outlet_stream_tests {
 
         let mut rx = handle.receiver().expect("receiver");
         let summary_rx = handle.close_summary().expect("close summary");
+
+        // ADR-049 Decision 16 — shutdown begins while the stream runs. The
+        // pump runs on the tracker, so its close-time settlement below is
+        // admitted through the closed gate.
+        supervisor.close_spawn_gate();
 
         // Grant credit via the handle (exercise the control surface).
         let grant = OutletStreamCredit {
@@ -34922,11 +35121,11 @@ mod streaming_saga_tests {
         drop(invoked);
     }
 
-    /// ADR-049 Decision 16 — a seal spawn refused because shutdown has begun
-    /// reverses the open-time escrow hold before the typed abort. The
+    /// ADR-049 Decision 16 — a streaming saga started after shutdown has begun
+    /// is refused before it debits any escrow or stages any saga. The
     /// open-gate case is `xctx_streaming_saga_paid_drive_ac1_ac3_ac5_ac6`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn xctx_streaming_saga_seal_spawn_refused_by_shutdown_reverses_escrow() {
+    async fn xctx_streaming_saga_refused_by_shutdown_debits_nothing() {
         let captured = Arc::new(AtomicUsize::new(0));
         let invoked = Arc::new(AtomicUsize::new(0));
         let storage = Arc::new(InMemoryStorage::new());
@@ -34978,11 +35177,11 @@ mod streaming_saga_tests {
             message,
         }) = result
         else {
-            panic!("a seal spawn refused by shutdown must abort the saga");
+            panic!("a streaming saga started after shutdown began must abort");
         };
         assert!(
-            message.contains("spawn streaming saga seal task"),
-            "the abort comes from the refused seal spawn, not an earlier step: {message}"
+            message.contains("start cross-context streaming saga refused"),
+            "the abort comes from the shutdown refusal: {message}"
         );
         assert_eq!(reason, SagaAbortReason::Rejected);
         assert_eq!(code, 13067);
@@ -34991,7 +35190,12 @@ mod streaming_saga_tests {
         assert_eq!(
             ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
             Amount::new(SS_GRANTED),
-            "the open-time escrow hold is reversed when the seal spawn is refused"
+            "a refused saga debits no escrow"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "a refused saga never runs the executor"
         );
         assert!(
             journal
@@ -34999,7 +35203,7 @@ mod streaming_saga_tests {
                 .await
                 .expect("load_unresolved")
                 .is_empty(),
-            "the refused saga is resolved Aborted"
+            "a refused saga stages nothing"
         );
     }
 

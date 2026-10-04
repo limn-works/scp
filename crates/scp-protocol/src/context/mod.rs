@@ -813,8 +813,8 @@ pub enum ContextError {
     ///
     /// Returned when `shutdown_all_contexts` has set the Supervisor's closed
     /// flag and a caller then tries to spawn a task through the Supervisor's
-    /// task tracker (an actor respawn, a key-package actor, a streaming
-    /// task), and when an actor or a supervisor-spawned task finds
+    /// task tracker (an actor respawn, a key-package actor), and when an
+    /// actor or a supervisor-spawned task finds
     /// that its `Weak<Supervisor>` back-reference no longer upgrades. The
     /// operation did not run. The payload names the refused operation.
     ///

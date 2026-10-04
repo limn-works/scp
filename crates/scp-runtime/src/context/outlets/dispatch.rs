@@ -2059,10 +2059,11 @@ fn spawn_pump_task(
     // it drops when the task body returns (normal/terminal/cancel-ack) or
     // when the task panics and its stack unwinds.
     pump_permit: tokio::sync::OwnedSemaphorePermit,
+    spawn_pump: &(dyn Fn(StreamTask) + Send + Sync),
 ) {
     let stream_credit_stall = Duration::from_secs(u64::from(stream_credit_stall_secs));
     let stream_cancel_ack = Duration::from_secs(u64::from(stream_cancel_ack_secs));
-    tokio::spawn(async move {
+    spawn_pump(Box::pin(async move {
         // Bind the permit for the whole task body so it drops on every
         // exit path (return, terminal-break, or panic-unwind).
         let _pump_permit = pump_permit;
@@ -2101,8 +2102,14 @@ fn spawn_pump_task(
                  stream closed"
             );
         }
-    });
+    }));
 }
+
+/// A streaming task handed to the spawner of [`open_stream_session`].
+///
+/// The Supervisor's open paths spawn it onto the Supervisor's task tracker,
+/// so shutdown waits for it (ADR-049 Decision 16).
+pub type StreamTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 /// Maps a synchronous [`invoke_outlet`] open failure to its correct
 /// [`OpenStreamRejection`] class (#2196 error-masking fix).
@@ -2229,6 +2236,9 @@ pub async fn open_stream_session<E>(
     // close-time release. A failure here rolls back admission + drops the
     // pump permit so no capacity is stranded by a rejected open.
     counter_reservation: Option<StreamCounterReservation>,
+    // Starts the pump task. The Supervisor's open paths spawn it onto the
+    // Supervisor's task tracker (ADR-049 Decision 16).
+    spawn_pump: &(dyn Fn(StreamTask) + Send + Sync),
 ) -> Result<StreamSessionHandle, OpenStreamRejection>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -2539,6 +2549,7 @@ where
             counter_reserve: counter_reserve.clone(),
         },
         pump_permit,
+        spawn_pump,
     );
 
     Ok(StreamSessionHandle {
@@ -3992,6 +4003,7 @@ mod tests {
                 counter_reserve: CounterReserveSettlement::zero(),
             },
             permit,
+            &|task| drop(tokio::spawn(task)),
         );
 
         // Send one Data chunk — the pump's signing path will panic.

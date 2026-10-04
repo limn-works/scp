@@ -211,6 +211,7 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
         pump_semaphore,
         None,
         None,
+        &|task| drop(tokio::spawn(task)),
     )
     .await
     .expect("open_stream_session accepts a well-formed open");
