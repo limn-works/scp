@@ -27580,9 +27580,7 @@ mod tests {
 
         // `ucan_mint_impl` reads the context creator and the ceiling off the
         // supervisor actor, and reads that creator's custody out of this
-        // instance's identity registry, so the fixture registers both. A
-        // `context_create` over callback custody records exactly these two
-        // entries.
+        // instance's identity registry, so the fixture registers both.
         register_identity_custody(
             &scp.inner,
             creator_did,
