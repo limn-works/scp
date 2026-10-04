@@ -7,6 +7,10 @@
 //! this file holds exactly one test and runs in a process of its own: a probe
 //! connection reads the setting as off, the production constructor runs, and
 //! the probe reads it as on.
+//!
+//! The keyed constructors are covered by `sqlcipher_key_wipe_*` tests, which
+//! check that no freed block keeps the key. The blob store runs no key
+//! statement, so this file checks the setting itself.
 
 #![cfg(feature = "sqlite-blob")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
