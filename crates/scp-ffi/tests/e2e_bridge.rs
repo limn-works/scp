@@ -1474,8 +1474,7 @@ fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> St
 /// `ttl::close_context` moves the context from `Active` to `Closing`, and the
 /// per-context actor stays alive reporting `Closing` (close is non-terminal for
 /// the actor; ADR-049 §10), so a subsequent
-/// `supervisor.read_context_state(context_id)` returns `Some(Closing)`, a
-/// non-`Active` answer every outlet lifecycle gate refuses. `initiator_did`
+/// `supervisor.read_context_state(context_id)` returns `Some(Closing)`. `initiator_did`
 /// must be the creator of a context created with a `ContextClose`-bearing
 /// ceiling (see `create_closeable_test_context`).
 fn drive_context_closing(bi: &PyBridgeInstance, context_id: &str, initiator_did: &str) {
@@ -3517,9 +3516,8 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
 }
 
 /// The UNARY cross-context saga refuses a non-active caller context and a
-/// non-active target context with the same two codes its streaming twin uses
-/// (`xctx_streaming_saga_open_rejects_non_active_context`), read from each
-/// context's supervisor actor through the outlet lifecycle gate.
+/// non-active target context, read from each context's supervisor actor
+/// through the outlet lifecycle gate.
 ///
 /// Removing either check makes the call fall
 /// through to a `SagaAborted` from the saga drive instead, failing the code
@@ -3921,5 +3919,160 @@ fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
             None,
         )
         .expect("the supervisor ceiling carries outlet_call, so the UCAN validates");
+    });
+}
+
+/// Overwrites the bridge copy `FfiBridgeState.creator_did` of `context_id` with
+/// `bridge_creator`, so the bridge copy and the supervisor name different
+/// creators.
+fn split_bridge_copy_creator(bi: &PyBridgeInstance, context_id: &str, bridge_creator: &str) {
+    runtime::with_context(bi, context_id, |state| {
+        bridge_creator.clone_into(&mut state.creator_did);
+        Ok(())
+    })
+    .expect("the context has a bridge copy");
+}
+
+/// The outlet UCAN validation anchors the delegation chain on the creator the
+/// SUPERVISOR holds, not the bridge copy `FfiBridgeState.creator_did`.
+///
+/// The fixture mints the invocation UCAN as `owner`, the supervisor's creator,
+/// then overwrites the bridge copy's creator with a DID that issued nothing. A
+/// validation anchored on the bridge copy refuses the token at the root-issuer
+/// check, which this test forbids.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn session_invoke_anchors_the_ucan_on_the_supervisor_creator_not_the_bridge_copy() {
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let owner = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let (ctx_id, outlet_id, ucan) =
+            supervisor_only_member_context(py, &scp, &owner, &invoker, true);
+        split_bridge_copy_creator(
+            scp.bridge_instance(),
+            &ctx_id,
+            "did:dht:z6MkOutletAnchorBridgeCopyCreator",
+        );
+
+        let session_id = scp
+            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .expect("session creation");
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        scp.outlet_session_invoke(
+            py,
+            &ctx_id,
+            &session_id,
+            &input.as_borrowed(),
+            &invoker,
+            &ucan,
+            None,
+        )
+        .expect("the token's issuer is the supervisor's creator, so the UCAN validates");
+    });
+}
+
+/// The unary cross-context saga signs with the keys of the creators the
+/// SUPERVISOR holds for the caller and target contexts, not the bridge copies.
+///
+/// The fixture overwrites both bridge copies' creators with DIDs this instance
+/// holds no key for. A saga that took either signer from a bridge copy refuses
+/// at key export, so this test requires the saga to reach `Committed`.
+#[test]
+fn xctx_saga_signs_as_the_supervisor_creators_not_the_bridge_copies() {
+    Python::with_gil(|py| {
+        let (scp, ctx_a, ctx_b, owner, outlet_id) = establish_xctx_saga_commit_preconditions(py);
+        let bi = scp.bridge_instance();
+        split_bridge_copy_creator(bi, &ctx_a, "did:dht:z6MkSagaCallerBridgeCopyCreator");
+        split_bridge_copy_creator(bi, &ctx_b, "did:dht:z6MkSagaTargetBridgeCopyCreator");
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        // Prepare-B enforces a five-minute skew tolerance, so the timestamp is now.
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let result = scp
+            .outlet_invoke_cross_context_saga(
+                &ctx_a,
+                &ctx_b,
+                &owner,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                now_ms,
+                1,
+                None,
+            )
+            .expect("both signers are the supervisor's creator, so the saga commits");
+        assert!(
+            result.receipt.is_some(),
+            "a committed saga carries a receipt"
+        );
+    });
+}
+
+/// The cross-context streaming saga open signs with the keys of the creators
+/// the SUPERVISOR holds for the caller and target contexts, not the bridge
+/// copies.
+///
+/// The fixture overwrites both bridge copies' creators with DIDs this instance
+/// holds no key for. An open that took either signer from a bridge copy
+/// refuses at key export, so this test requires the open to return a saga id.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+fn xctx_streaming_saga_open_signs_as_the_supervisor_creators_not_the_bridge_copies() {
+    Python::with_gil(|py| {
+        let (scp, ctx_a, ctx_b, invoker, outlet_id, ucan, release_tx) =
+            establish_xctx_streaming_saga_preconditions(py);
+        let bi = scp.bridge_instance();
+        split_bridge_copy_creator(bi, &ctx_a, "did:dht:z6MkStreamCallerBridgeCopyCreator");
+        split_bridge_copy_creator(bi, &ctx_b, "did:dht:z6MkStreamTargetBridgeCopyCreator");
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let saga_id = scp
+            .outlet_streaming_saga_open(
+                &ctx_a,
+                &ctx_b,
+                &invoker,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                now_ms,
+                1,
+                &ucan,
+                None,
+                None,
+                None,
+                Some(1),
+            )
+            .expect("both signers are the supervisor's creator, so the open succeeds");
+        assert!(
+            !saga_id.is_empty(),
+            "an opened streaming saga carries an id"
+        );
+        release_tx
+            .send(())
+            .expect("release the blocked target handler");
     });
 }

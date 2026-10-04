@@ -1012,10 +1012,7 @@ fn outlet_invoke_cross_context_impl(
     let input_json = py_dict_to_json(input)?;
 
     // Lifecycle gate: both contexts MUST be Active, read from each context's
-    // supervisor actor. The saga sibling
-    // (`outlet_invoke_cross_context_saga_impl`) and the streaming sibling
-    // (`outlet_streaming_saga_open_impl`) gate on these same two reads with the
-    // same two codes. A context no actor serves refuses as non-active, so the
+    // supervisor actor. A context no actor serves refuses as non-active, so the
     // gate fails closed. Both gates run before the caller is authorized, so
     // both withhold the lifecycle state. The source role state answers the
     // source-capability check below and the target role state answers the
@@ -1206,12 +1203,10 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// §6.2.4 "Signer authorization": the receipt key MUST be the one authorized
 /// to act for `target_context_id`).
 ///
-/// The entry points that gate on [`active_outlet_role_state`] take the creator
-/// from the role state that gate returns. Recovery runs no lifecycle gate, so
-/// this function reads the role state itself. The creator DID comes from the
-/// supervisor rather than from a bridge copy because this call chooses the
-/// authority the receipt signs as, and a context no actor serves must refuse
-/// to sign rather than sign as the creator a bridge copy recorded.
+/// The creator DID comes from the supervisor rather than from a bridge copy
+/// because this call chooses the authority the receipt signs as, and a context
+/// no actor serves must refuse to sign rather than sign as the creator a bridge
+/// copy recorded.
 ///
 /// # Errors
 ///
@@ -1371,9 +1366,7 @@ fn outlet_invoke_cross_context_saga_impl(
     let tokio_rt = crate::runtime()?;
 
     // Lifecycle gate: both contexts MUST be Active, read from each context's
-    // supervisor actor. The streaming twin (`outlet_streaming_saga_open_impl`)
-    // gates on the same two reads with the same two codes. A context no
-    // actor serves counts as non-active. Both gates run before the
+    // supervisor actor. A context no actor serves counts as non-active. Both gates run before the
     // caller-principal binding, so both withhold the lifecycle state, and each
     // role state's creator names the key that context signs under below.
     let caller_role = active_outlet_role_state(
@@ -3050,16 +3043,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Every authorization read reaches the supervisor actor
-    //
-    // Each test below makes the supervisor's role state DIFFER from what a
-    // bridge-local copy carried, then asserts the entry point follows the
-    // supervisor. `register_context` receives an EMPTY ceiling argument, and a
-    // bridge copy built from that argument held `default_ceiling()` and named
-    // the registering DID as creator — so a narrower supervisor ceiling, a
+    // `register_context` receives an EMPTY ceiling argument, and a bridge copy
+    // built from that argument held `default_ceiling()` and named the
+    // registering DID as creator — so a narrower supervisor ceiling, a
     // supervisor-only member, or an absent supervisor role state each split the
-    // two answers apart. Reverting a call site to the copy fails the test that
-    // covers it.
+    // two answers apart.
     // ------------------------------------------------------------------
 
     /// Builds a `PyScp` whose context exists in the supervisor with
@@ -3087,8 +3075,7 @@ mod tests {
         (scp, ctx_id)
     }
 
-    /// Builds a `PyScp` whose context has FFI state but NO supervisor actor, so
-    /// every lifecycle gate and every live read fails closed.
+    /// Builds a `PyScp` whose context has FFI state but NO supervisor actor.
     fn scp_without_supervisor_context(prefix: &str, creator: &str) -> (crate::scp::PyScp, String) {
         crate::init_runtime().ok();
         let scp = crate::scp::PyScp::new_in_memory_for_test();
@@ -3174,8 +3161,7 @@ mod tests {
     /// `outlet_stream_open` gates on the live lifecycle before the UCAN
     /// pipeline reads the role state, so a context no actor serves refuses with
     /// the withheld text and `SCP-OUTLET-6005`, the same answer a `Closing` or
-    /// `Expired` context gets. Reaching `validate_outlet_ucan` first told an
-    /// unauthorized caller that no actor serves the context, and named it.
+    /// `Expired` context gets.
     #[test]
     fn stream_open_withholds_an_absent_actor_before_authorization() {
         let creator = "did:dht:z6MkStreamOpenNoActor";
@@ -3246,8 +3232,7 @@ mod tests {
 
     /// `outlet_interface_expose` reads the lifecycle state, the roles, and the
     /// creator from the supervisor, so a context no supervisor actor serves
-    /// refuses at the lifecycle gate with `SCP-OUTLET-6030`, the code its NAPI
-    /// and `UniFFI` twins report.
+    /// refuses at the lifecycle gate with `SCP-OUTLET-6030`.
     #[test]
     fn interface_expose_refuses_without_supervisor_role_state() {
         let creator = "did:dht:z6MkExposeNoActor";
@@ -3267,8 +3252,7 @@ mod tests {
 
     /// `outlet_interface_accept` reads the lifecycle state, the roles, and the
     /// creator from the supervisor, so a context no supervisor actor serves
-    /// refuses at the lifecycle gate with `SCP-OUTLET-6032`, the code its NAPI
-    /// and `UniFFI` twins report.
+    /// refuses at the lifecycle gate with `SCP-OUTLET-6032`.
     #[test]
     fn interface_accept_refuses_without_supervisor_role_state() {
         let creator = "did:dht:z6MkAcceptNoActor";
@@ -3509,8 +3493,7 @@ mod tests {
     }
 
     /// Registers FFI state for a second context on `scp` and creates NO
-    /// supervisor actor for it, so every live read against that id fails closed
-    /// while the other context in the same test stays live.
+    /// supervisor actor for it.
     fn register_context_without_supervisor(
         scp: &crate::scp::PyScp,
         prefix: &str,
@@ -3524,7 +3507,7 @@ mod tests {
     /// The unary `outlet_invoke_cross_context` gates its SOURCE axis on the
     /// source context's supervisor actor. It carried no lifecycle gate at all,
     /// so a source context the supervisor had stopped serving reached the UCAN
-    /// pipeline; the saga sibling and both twin bridges refused the same call.
+    /// pipeline.
     #[test]
     fn cross_context_invoke_refuses_a_source_context_no_actor_serves() {
         let creator = "did:dht:z6MkXctxUnarySourceNoActor";
