@@ -212,10 +212,8 @@ nothing:
                gated commands, and it skips a step whose value the axis lacks
                on every leg, so deleting `platform-testing` from the `group`
                axis would have dropped eight commands from every run while `ci`
-               passed. For every axis a step gates on in that form, the check
-               requires the values the steps name to equal the axis list, and
-               it reports a step gated in that form on an axis the job's matrix
-               does not define.
+               passed. The check reports a step gated in that form on an axis
+               the job's matrix does not define.
   package-writers
                Job docker-image-cache writes the Docker layer cache to the
                ghcr.io tag `buildcache:docker-image` with the `docker-cache`
