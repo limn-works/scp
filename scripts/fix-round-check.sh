@@ -82,12 +82,9 @@
 #      These name the command themselves: `rust-test`, `rust-test-optional-features`,
 #      `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`,
 #      `rust-build-uniffi-production`, `rust-doc` (which runs `cargo test --workspace
-#      --doc`), `fail-closed-pre-rotation`, `kotlin-test` and `typescript-check` (each of
-#      which runs `cargo build -p scp-ffi-uniffi` or `cargo build -p scp-ffi-napi` to
-#      produce the library its own lane loads), `bridge-parity` and
-#      `bridge-parity-kotlin`. Two more reach a cargo command through a script:
-#      `swift-build-test` and `bridge-parity-swift` each run
-#      `bindings/swift/build-xcframework.sh`, which runs `cargo build` twice.
+#      --doc`), `fail-closed-pre-rotation`, `napi-addon`, `kotlin-test`, `fuzz-build` and
+#      `bridge-parity-kotlin`. `xcframework` reaches a cargo command through a script: it
+#      runs `bindings/swift/build-xcframework.sh`, which runs `cargo build`.
 #   2. `cargo clippy`, in every form. The compile step runs `cargo check`, which reports
 #      no clippy lint at all, so a `clippy::needless_borrow` in the file this round edited
 #      passes here and fails in the `rust-clippy` job. That job is the merge gate, and it
