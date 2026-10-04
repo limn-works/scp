@@ -39,8 +39,10 @@ CHECK 2 — every uniffi-bindgen step reads the library out of the directory its
   The criterion: for every `run:` command of the form
   `cargo run [flags] --bin uniffi-bindgen -- generate … --library <path>`, the directory
   cargo writes for those flags — `target/<triple>/<profile>/` when `--target` is passed,
-  `target/<profile>/` otherwise, where `<profile>` is `release` under `--release` and
-  `debug` otherwise — is a prefix of `<path>`.
+  `target/<profile>/` otherwise, where `<profile>` is `release` under `--release`, the
+  profile's own name under `--profile <name>` (`debug` for `dev` and `test`, `release`
+  for `bench`), and `debug` otherwise —
+  is a prefix of `<path>`.
 
   Why: cargo shares no artifact between two target directories. When the `--library`
   path sits in a directory the `cargo run` does not write, one of two things is true:
@@ -87,7 +89,7 @@ def profile_directory(flags: str) -> str:
     if profile is None:
         return "debug"
     name = profile.group("name")
-    return "debug" if name == "dev" else name
+    return {"dev": "debug", "test": "debug", "bench": "release"}.get(name, name)
 
 
 def written_directory(flags: str) -> str:

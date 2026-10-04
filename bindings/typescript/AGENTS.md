@@ -9,7 +9,7 @@ Use bun, never npm or npx. Follow `.docs/standards/typescript.md`. Biome handles
 
 ## Testing against the real addon
 
-`bun run check`, `bun run lint`, and a single-file `bun test` are not enough. The real-napi tests skip themselves when no built `.node` exists, and some failures appear only when every test file runs in one process. Before you push a bridge-facing change, build the addon as the TypeScript job in `.github/workflows/ci.yml` does (`cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing`, then copy the library to `node_modules/@limn-works/scp-ts-napi-<platform>/index.node` with a one-line `package.json`), and run the whole `bun test` suite. The release build takes minutes, so run it from the main session rather than a worktree subagent.
+`bun run check`, `bun run lint`, and a single-file `bun test` are not enough. The real-napi tests skip themselves when no built `.node` exists, and some failures appear only when every test file runs in one process. Before you push a bridge-facing change, build the addon (`cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing`, then copy the library to `node_modules/@limn-works/scp-ts-napi-<platform>/index.node` with a one-line `package.json`), and run the whole `bun test` suite. The release build takes minutes, so run it from the main session rather than a worktree subagent.
 
 ## Code that also runs in a browser
 

@@ -94,12 +94,12 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
 | `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
-| `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --release`, `napi-addon` runs `cargo build -p scp-ffi-napi --release`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev`, and `bridge-parity-kotlin` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
-| `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --release` and `pyo3-module` runs `maturin develop --release`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
+| `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --profile ci-bridge`, `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, and `bridge-parity-kotlin` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
+| `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
 | `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
-| `kotlin` | `kotlin-test` and `bridge-parity-kotlin` run `cargo build -p scp-ffi-uniffi --features testing`, and `pyo3-module` runs `maturin develop --release`, whose upload `bridge-parity-kotlin` downloads |
-| `swift` | `xcframework` runs `bindings/swift/build-xcframework.sh --dev`, which calls `cargo build`, and `pyo3-module-macos` runs `maturin develop --release`; `swift-build-test` downloads the XCFramework and `bridge-parity-swift` downloads both |
+| `kotlin` | `kotlin-test` and `bridge-parity-kotlin` run `cargo build -p scp-ffi-uniffi --features testing`, and `pyo3-module` runs `maturin develop --profile ci-bridge`, whose upload `bridge-parity-kotlin` downloads |
+| `swift` | `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, which calls `cargo build`, and `pyo3-module-macos` runs `maturin develop --profile ci-bridge`; `swift-build-test` downloads the XCFramework and `bridge-parity-swift` downloads both |
 
 Rather than list the pin in seven filters, the `changes` job declares one `toolchain`
 filter and ORs it into every lane's output, so the workflow names each file that filter
