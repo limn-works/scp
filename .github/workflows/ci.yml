@@ -1966,9 +1966,9 @@ jobs:
   # reports a downloaded artifact kept for fewer days.
   #
   # REUSE ACROSS RUNS. Each producer restores its artifact files from `actions/cache`
-  # under a key built from every input that can change those files, and skips the
-  # toolchain, cargo-cache and build steps when the key hits. The upload runs either
-  # way, so consumers download the same artifact name and path on a hit and on a miss.
+  # under the key below, and skips the toolchain, cargo-cache and build steps when the
+  # key hits. The upload runs either way, so consumers download the same artifact name
+  # and path on a hit and on a miss.
   # The key holds:
   #
   #   * a literal `bridge-artifact-v1`; raising the number makes every producer miss
@@ -1982,11 +1982,13 @@ jobs:
   #     `[tool.maturin]` features in bindings/python/pyproject.toml for the two PyO3
   #     jobs, and bindings/swift/build-xcframework.sh for job xcframework;
   #   * a digest the `artifact-inputs` step computes over the job's own definition in
-  #     this file (its build command and feature list), the list of tracked paths
-  #     under crates/ (`hashFiles` hashes contents alone, so a renamed file changes
-  #     no file hash), the runner image name, and the versions of the tools the
-  #     build runs outside cargo: Python and maturin for the PyO3 jobs, glibc on
-  #     Linux, and Xcode and its macOS SDK on macOS.
+  #     this file (its build command and feature list), the workflow-level `env:`
+  #     block every build inherits, the list of tracked paths under crates/
+  #     (`hashFiles` hashes contents alone, so a renamed file changes no file hash),
+  #     the runner image name, and the versions of the tools the build runs outside
+  #     cargo: Python and maturin for the PyO3 jobs, glibc and the C compiler on
+  #     Linux, the libssl-dev package napi-addon links against, and Xcode and its
+  #     macOS SDK on macOS.
   #
   # The cache holds the uploaded files alone, never `target/`. A run triggered by a
   # push to `main` or by a pull request saves on a miss. A merge-queue run does not
@@ -1996,9 +1998,7 @@ jobs:
   # can place an artifact that `main` or another pull request restores. A run that
   # misses on all four producers saves four entries, which totalled about 102 MB in
   # run 37154692160, against the 10 GB repository cap the cache section at the top of
-  # this file counts. No workflow
-  # under .github/workflows/ restores a `bridge-artifact-` key, so nothing a release
-  # publishes passes through this cache. scripts/tests/ci-gate/ci_gate_selftest.py
+  # this file counts. scripts/tests/ci-gate/ci_gate_selftest.py
   # reports a producer whose key drops one of the file inputs above.
   pyo3-module:
     needs: changes
@@ -2056,15 +2056,19 @@ jobs:
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
           source .venv/bin/activate
           inputs="$RUNNER_TEMP/artifact-inputs"
           {
             printf '%s\n' "$job_definition"
+            printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:-unset}"
+            echo "image=${ImageOS:?ImageOS is unset}"
             python -VV
             maturin --version
             ldd --version 2>&1 | sed -n 1p
+            cc --version | sed -n 1p
           } > "$inputs"
           digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -2158,12 +2162,17 @@ jobs:
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
           inputs="$RUNNER_TEMP/artifact-inputs"
           {
             printf '%s\n' "$job_definition"
+            printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:-unset}"
+            echo "image=${ImageOS:?ImageOS is unset}"
             ldd --version 2>&1 | sed -n 1p
+            cc --version | sed -n 1p
+            dpkg-query -W -f='${Version}\n' libssl-dev
           } > "$inputs"
           digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -2236,11 +2245,14 @@ jobs:
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
           inputs="$RUNNER_TEMP/artifact-inputs"
           {
             printf '%s\n' "$job_definition"
+            printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:-unset}"
+            echo "image=${ImageOS:?ImageOS is unset}"
             xcodebuild -version
             xcrun --sdk macosx --show-sdk-version
           } > "$inputs"
@@ -2367,12 +2379,15 @@ jobs:
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
           source .venv/bin/activate
           inputs="$RUNNER_TEMP/artifact-inputs"
           {
             printf '%s\n' "$job_definition"
+            printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:-unset}"
+            echo "image=${ImageOS:?ImageOS is unset}"
             python -VV
             maturin --version
             xcodebuild -version

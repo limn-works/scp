@@ -4173,20 +4173,41 @@ def check_artifact_cache_keys(doc: dict) -> None:
                 )
 
 
-ARTIFACT_INPUT_TOOLS = ("git", "python", "maturin", "ldd", "xcodebuild", "xcrun")
+ARTIFACT_INPUT_TOOLS = (
+    "git",
+    "python",
+    "maturin",
+    "ldd",
+    "cc",
+    "dpkg-query",
+    "xcodebuild",
+    "xcrun",
+)
+# A line the harness adds to the workflow-level env: block, which every build inherits.
+ARTIFACT_ENV_PROBE = "  RUSTFLAGS: -C debug-assertions=on\n"
 
 
 def run_artifact_inputs_step(
-    script: str, job_id: str, failing: str | None
+    step: dict,
+    job_id: str,
+    failing: str | None,
+    *,
+    script: str | None = None,
+    workflow: str | None = None,
+    image_os: str | None = "stub-image",
 ) -> tuple[int, str]:
     """Run an artifact-inputs step with every tool stubbed and `failing` exiting 1.
 
-    Return the exit code and what the step wrote to GITHUB_OUTPUT.
+    `script` replaces the step's own `run:` text, `workflow` the ci.yml the step
+    reads, and `image_os=None` leaves ImageOS unset. Return the exit code and what
+    the step wrote to GITHUB_OUTPUT.
     """
     with tempfile.TemporaryDirectory() as root:
         tree = Path(root, "tree")
         (tree / ".github/workflows").mkdir(parents=True)
-        (tree / ".github/workflows/ci.yml").write_text(WORKFLOW.read_text())
+        (tree / ".github/workflows/ci.yml").write_text(
+            WORKFLOW.read_text() if workflow is None else workflow
+        )
         (tree / ".venv/bin").mkdir(parents=True)
         (tree / ".venv/bin/activate").write_text("")
         stubs = Path(root, "stubs")
@@ -4200,7 +4221,7 @@ def run_artifact_inputs_step(
         output = Path(root, "github-output")
         output.write_text("")
         script_file = Path(root, "step.sh")
-        script_file.write_text(script)
+        script_file.write_text(str(step.get("run") or "") if script is None else script)
         env = {
             **os.environ,
             "PATH": f"{stubs}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -4208,8 +4229,15 @@ def run_artifact_inputs_step(
             "GITHUB_OUTPUT": str(output),
             "RUNNER_TEMP": str(runner_temp),
         }
-        # The shell GitHub runs a `run:` step under on Linux and macOS runners.
-        shell = ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+        env.pop("ImageOS", None)
+        if image_os is not None:
+            env["ImageOS"] = image_os
+        # GitHub runs a step that names no `shell:` under `bash -e {0}`, and a step
+        # that names `shell: bash` under `bash --noprofile --norc -eo pipefail {0}`.
+        if step.get("shell") == "bash":
+            shell = ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+        else:
+            shell = ["bash", "-e"]
         code = subprocess.run(
             [*shell, str(script_file)],
             cwd=tree,
@@ -4224,23 +4252,27 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
     """Run each producer's artifact-inputs step with each tool it calls failing.
 
     CRITERION: each bridge producer's `artifact-inputs` step exits non-zero when any
-    command in ARTIFACT_INPUT_TOOLS whose output it hashes fails, and exits 0 and
-    writes a digest when every command succeeds.
+    command in ARTIFACT_INPUT_TOOLS whose output it hashes fails or when ImageOS is
+    unset, exits 0 and writes a digest when every command succeeds, and writes a
+    different digest when the workflow-level env: block changes.
 
     WHY: a tool that fails puts nothing into the digest, so the key stops encoding
     that tool's version, and a later change to the tool restores an artifact the
-    earlier version built.
+    earlier version built. The same holds for the runner image name and for the
+    workflow env every build inherits.
     """
+    workflow = WORKFLOW.read_text()
+    probed = workflow.replace("\nenv:\n", f"\nenv:\n{ARTIFACT_ENV_PROBE}", 1)
     for job_id in bridge_producers(doc):
         steps = doc["jobs"][job_id]["steps"]
-        step = next((s for s in steps if s.get("id") == "artifact-inputs"), None)
-        script = str((step or {}).get("run") or "")
+        step = next((s for s in steps if s.get("id") == "artifact-inputs"), None) or {}
+        script = str(step.get("run") or "")
         tools = [
             tool
             for tool in ARTIFACT_INPUT_TOOLS
-            if re.search(rf"^\s*{tool}\b", script, re.MULTILINE)
+            if re.search(rf"^\s*{re.escape(tool)}\b", script, re.MULTILINE)
         ]
-        code, output = run_artifact_inputs_step(script, job_id, None)
+        code, output = run_artifact_inputs_step(step, job_id, None)
         check(
             f"{job_id}: the artifact-inputs step writes a digest when every tool runs",
             bool(tools)
@@ -4249,12 +4281,51 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
             f"exit {code}, output {output!r}, tools {tools}",
         )
         for tool in tools:
-            code, _ = run_artifact_inputs_step(script, job_id, tool)
+            code, _ = run_artifact_inputs_step(step, job_id, tool)
             check(
                 f"{job_id}: the artifact-inputs step fails when {tool} fails",
                 code != 0,
                 f"the step hashed a failed {tool} and exited 0",
             )
+            # Control: the harness adds no pipefail of its own, so a piped tool's
+            # failure is caught only by the step's own `set -o pipefail`.
+            if re.search(rf"^\s*{re.escape(tool)}\b[^\n]*\|", script, re.MULTILINE):
+                unpiped = script.replace("set -euo pipefail", "set -eu")
+                code, _ = run_artifact_inputs_step(step, job_id, tool, script=unpiped)
+                check(
+                    f"{job_id}: without the step's pipefail a failed {tool} passes "
+                    f"the harness",
+                    unpiped != script and code == 0,
+                    f"the harness failed a step without pipefail on {tool} "
+                    f"(exit {code}), so it supplies the pipefail the check credits "
+                    f"to the step",
+                )
+        code, _ = run_artifact_inputs_step(step, job_id, None, image_os=None)
+        check(
+            f"{job_id}: the artifact-inputs step fails when ImageOS is unset",
+            code != 0,
+            "the step hashed a missing runner image name and exited 0",
+        )
+        _, probed_output = run_artifact_inputs_step(step, job_id, None, workflow=probed)
+        check(
+            f"{job_id}: a change to the workflow-level env changes the digest",
+            probed != workflow and probed_output != output,
+            f"adding {ARTIFACT_ENV_PROBE.strip()!r} to the workflow env left the "
+            f"digest at {output!r}",
+        )
+        # Control: the step with its workflow-env line removed is reported.
+        without_env = "\n".join(
+            line for line in script.splitlines() if '"$workflow_env"' not in line
+        )
+        _, plain = run_artifact_inputs_step(step, job_id, None, script=without_env)
+        _, plain_probed = run_artifact_inputs_step(
+            step, job_id, None, script=without_env, workflow=probed
+        )
+        check(
+            f"{job_id}: a step that hashes no workflow env is reported",
+            without_env != script and plain == plain_probed,
+            "removing the workflow env from the digest still changed the digest",
+        )
 
 
 def check_xcframework_outputs_are_verified(doc: dict) -> None:
@@ -4551,7 +4622,10 @@ def main() -> int:
     )
     check_artifact_cache_keys(workflow)
 
-    print("artifact-digest — an artifact-inputs step fails when a hashed tool fails")
+    print(
+        "artifact-digest — an artifact-inputs step fails when a hashed input is "
+        "missing and hashes the workflow env"
+    )
     check_artifact_input_digests_fail_closed(workflow)
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
