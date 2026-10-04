@@ -188,10 +188,8 @@ private nonisolated struct KeyMetadata: Codable {
 ///
 /// ADR-025, the Apple platform adapter, requires this class to conform to the
 /// UniFFI `KeyCustodyProvider` callback interface in
-/// `crates/scp-ffi/uniffi/src/lib.rs`. This class does not conform yet: its
-/// methods throw `PlatformError`, while that callback interface declares
-/// `ScpError` as its error type. Acceptance criterion 4 of ADR-025 records
-/// this gap.
+/// `crates/scp-ffi/uniffi/src/lib.rs`. This class does not conform yet.
+/// Acceptance criterion 4 of ADR-025 records this gap.
 ///
 /// ## Key storage
 ///
