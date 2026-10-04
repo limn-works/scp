@@ -577,15 +577,16 @@ impl<S: Storage> ApplicationNode<S> {
     /// connection handlers drain naturally -- they are not cancelled.
     ///
     /// The tier re-evaluation task is stopped **and joined**: on a multi-thread
-    /// runtime this blocks until that task's future has been dropped, which
-    /// releases the `DidMethod`/`KeyCustody` `Arc` clones the republish path
-    /// captured. That makes teardown deterministic — after `shutdown()` returns,
-    /// the custody backend's `SqliteStorage` advisory lock is free, so a caller
-    /// can immediately re-open the same storage path (e.g. a node restart over a
-    /// persisted identity) without racing the background task's teardown. Absent
-    /// this join the task could still hold the custody handle for a short,
-    /// nondeterministic window after `shutdown()` returned, intermittently
-    /// failing the next open with an advisory-lock conflict. See
+    /// runtime this blocks on the task's `JoinHandle`, which tokio completes
+    /// only after the task's future has been dropped, so the
+    /// `DidMethod`/`KeyCustody` `Arc` clones the republish path captured are
+    /// released before this returns. That makes teardown deterministic — after
+    /// `shutdown()` returns, the custody backend's `SqliteStorage` advisory lock
+    /// is free, so a caller can immediately re-open the same storage path (e.g.
+    /// a node restart over a persisted identity) without racing the background
+    /// task's teardown. Absent this join the task could still hold the custody
+    /// handle for a short, nondeterministic window after `shutdown()` returned,
+    /// intermittently failing the next open with an advisory-lock conflict. See
     /// [`TierReEvalHandle::stop_and_wait`].
     ///
     /// See SCP-245: "Ensure graceful shutdown of dev API listener alongside
@@ -2220,25 +2221,28 @@ const TIER_REEVALUATION_INTERVAL: Duration = Duration::from_mins(30);
 /// network change events. When the tier changes, it updates the DID
 /// document with the new relay address and logs at INFO level (§10.12.1).
 struct TierReEvalHandle {
-    /// Handle to the background task. Retained so the task is not detached
-    /// and can be awaited for clean shutdown if needed.
-    task: tokio::task::JoinHandle<()>,
+    /// The background task, joined for deterministic teardown.
+    ///
+    /// Tokio completes a `JoinHandle` only after the task's future has been
+    /// dropped, on every exit path (normal return, cancellation, panic, abort).
+    /// Awaiting it therefore blocks until every `Arc` the future captured,
+    /// including the `DidMethod`/`KeyCustody` clones held by the republish path,
+    /// has been released. That is what makes
+    /// [`shutdown`](ApplicationNode::shutdown) drop the custody handle (and its
+    /// `SqliteStorage` advisory lock) before the caller re-opens the same
+    /// storage path, e.g. on a node restart.
+    ///
+    /// A value the future owns is no such witness: a sender moved into a local
+    /// of the task body drops when the body returns, before the runtime drops
+    /// the future and its captures, so a waiter on it can wake while the custody
+    /// handle is still held.
+    ///
+    /// Behind a `std::sync::Mutex` so it is takeable through the shared `&self`
+    /// shutdown path; `None` after the first stop-and-wait or abort, so a second
+    /// call is a no-op.
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cancellation token: send `true` to stop the background task.
     cancel_tx: tokio::sync::watch::Sender<bool>,
-    /// Completion signal for deterministic teardown.
-    ///
-    /// The spawned task moves the paired [`oneshot::Sender`](tokio::sync::oneshot::Sender)
-    /// into its future; the sender is dropped only when that future is dropped
-    /// (i.e. when the task has fully unwound after cancellation). Awaiting this
-    /// receiver therefore blocks until the task future — and every `Arc` it
-    /// captured, including the `DidMethod`/`KeyCustody` clones held by the
-    /// republish path — has been released. This is what makes
-    /// [`shutdown`](ApplicationNode::shutdown) deterministically drop the
-    /// custody handle (and its `SqliteStorage` advisory lock) before the caller
-    /// re-opens the same storage path, e.g. on a node restart. Behind a
-    /// `std::sync::Mutex` so it is takeable through the shared `&self` shutdown
-    /// path; `None` after the first stop-and-wait so a second call is a no-op.
-    done_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl TierReEvalHandle {
@@ -2260,7 +2264,7 @@ impl TierReEvalHandle {
     ///
     /// On a multi-thread runtime this bridges the sync→async boundary with
     /// [`tokio::task::block_in_place`] + [`Handle::block_on`](tokio::runtime::Handle::block_on),
-    /// awaiting the completion oneshot so teardown is deterministic. The cancel
+    /// awaiting the task's `JoinHandle` so teardown is deterministic. The cancel
     /// signal makes the task return promptly (it is parked in a `select!` that
     /// includes the cancel watch), so the wait is bounded by the task's current
     /// poll, not by the 30-minute re-evaluation interval.
@@ -2269,16 +2273,11 @@ impl TierReEvalHandle {
     /// outside a runtime, so both are handled by falling back to a best-effort
     /// `abort()` + cancel signal — exactly the prior fire-and-forget behaviour,
     /// only reached on runtimes where a synchronous join is impossible.
-    /// Idempotent: the completion receiver is consumed on the first call, so a
-    /// second invocation only re-sends the (harmless) cancel signal.
+    /// Idempotent: the `JoinHandle` is consumed on the first call, so a second
+    /// invocation only re-sends the (harmless) cancel signal.
     fn stop_and_wait(&self) {
         let _ = self.cancel_tx.send(true);
-        let Some(done_rx) = self
-            .done_rx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        else {
+        let Some(task) = self.take_task() else {
             // Already waited once; the task future has already been awaited to
             // completion (or a prior fallback aborted it). Nothing to join.
             return;
@@ -2290,13 +2289,17 @@ impl TierReEvalHandle {
                 // before this returns. Multi-thread runtime only — the flavor is
                 // checked above; current_thread / no-runtime fall back to abort
                 // below instead of panicking.
-                tokio::task::block_in_place(|| {
-                    // Awaiting the completion oneshot resolves (with `Err` —
-                    // the sender was dropped, not sent) exactly when the task
-                    // future is dropped. That is the signal we need: the
-                    // future's captured `Arc`s are gone.
-                    let _ = handle.block_on(done_rx); // ci-allow: block-on: awaits the tier-task completion oneshot so the captured DidMethod/custody Arcs drop before shutdown() returns
+                let joined = tokio::task::block_in_place(|| {
+                    // The JoinHandle resolves only after the runtime has
+                    // dropped the task future, so the future's captured `Arc`s
+                    // are gone when this returns.
+                    handle.block_on(task) // ci-allow: block-on: joins the tier task so the captured DidMethod/custody Arcs drop before shutdown() returns
                 }); // ci-allow: block-on: deterministic node teardown — multi-thread-checked sync→async join releasing the custody Arc before storage re-open
+                if let Err(e) = joined {
+                    // Teardown still completed (the future is dropped either
+                    // way), but a panic in the task is a defect to surface.
+                    tracing::error!(error = %e, "tier re-evaluation task ended abnormally");
+                }
             }
             _ => {
                 // A current_thread runtime cannot `block_in_place`, and outside
@@ -2304,22 +2307,28 @@ impl TierReEvalHandle {
                 // best-effort abort so the task is still torn down (its future
                 // is dropped on the next runtime turn), matching the prior
                 // fire-and-forget semantics on these runtimes.
-                self.task.abort();
+                task.abort();
             }
         }
+    }
+
+    /// Takes the task's `JoinHandle`, leaving `None` so later calls are no-ops.
+    fn take_task(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
 impl Drop for TierReEvalHandle {
     fn drop(&mut self) {
-        // Send the cancel signal so the task exits cleanly. If send fails
-        // (already sent), abort as a safety net to prevent busy-spin when the
-        // watch sender is dropped without sending `true`. `shutdown()` already
-        // calls `stop_and_wait()`, so by the time a node is dropped the task is
-        // typically gone; this remains the backstop for nodes dropped without
-        // an explicit shutdown.
-        if self.cancel_tx.send(true).is_err() {
-            self.task.abort();
+        // Backstop for a node dropped without an explicit `shutdown()`: dropping
+        // a `JoinHandle` detaches the task rather than stopping it, so abort it.
+        // After `stop_and_wait()` the handle is already taken and this is a
+        // no-op.
+        if let Some(task) = self.take_task() {
+            task.abort();
         }
     }
 }
@@ -2537,18 +2546,10 @@ fn spawn_tier_reevaluation(
     reevaluation_interval: Duration,
 ) -> TierReEvalHandle {
     let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-    // Completion signal: the sender is moved into the task future and never
-    // `send`s — it serves purely as a drop witness. When the future is dropped
-    // (after cancellation unwinds the loop), `_done_tx` drops too, closing the
-    // oneshot. `stop_and_wait` awaits the receiver, which resolves at exactly
-    // that moment, guaranteeing every `Arc` the future captured (the
-    // `publisher`/`DidMethod`/custody clones) is released before teardown
-    // returns. See `TierReEvalHandle::done_rx`.
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    // Teardown joins this task's `JoinHandle`, which completes only after the
+    // runtime has dropped the future and the `publisher`/`DidMethod`/custody
+    // clones it captured. See `TierReEvalHandle::task`.
     let task = tokio::spawn(async move {
-        // Held for the lifetime of the task future; dropped with it. The `move`
-        // closure captures it even though it is never read.
-        let _done_tx = done_tx;
         loop {
             let trigger_reason = tokio::select! {
                 () = tokio::time::sleep(reevaluation_interval) => {
@@ -2616,9 +2617,8 @@ fn spawn_tier_reevaluation(
         }
     });
     TierReEvalHandle {
-        task,
+        task: std::sync::Mutex::new(Some(task)),
         cancel_tx,
-        done_rx: std::sync::Mutex::new(Some(done_rx)),
     }
 }
 
@@ -6325,6 +6325,150 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    /// `DidPublisher` double whose `Drop` takes a deliberate delay before
+    /// recording that it ran. The tier task's captured `NodePublisher` is the
+    /// only owner, so the flag flips only once the task future has been dropped
+    /// and that drop has finished — the moment `stop_and_wait` must wait for.
+    struct SlowDropPublisher {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// Long enough that a waiter woken before the task future is dropped
+    /// observes the flag still unset.
+    const SLOW_DROP_DELAY: Duration = Duration::from_millis(300);
+
+    impl Drop for SlowDropPublisher {
+        fn drop(&mut self) {
+            std::thread::sleep(SLOW_DROP_DELAY);
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl DidPublisher for SlowDropPublisher {
+        fn publish<'a>(
+            &'a self,
+            _auth: PublishAuthorization,
+            _identity: &'a ScpIdentity,
+            _document: &'a DidDocument,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// NAT strategy that reports it was entered, then panics, so a test can
+    /// drive the tier task down its panic path at a known point.
+    struct PanickingNatStrategy {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl NatStrategy for PanickingNatStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            let entered = self
+                .entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(tx) = entered {
+                let _ = tx.send(());
+            }
+            panic!("tier re-evaluation test double panics on purpose");
+        }
+    }
+
+    fn slow_drop_tier_task(
+        strategy: Arc<dyn NatStrategy>,
+        interval: Duration,
+    ) -> (TierReEvalHandle, Arc<std::sync::atomic::AtomicBool>) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publisher = Arc::new(SlowDropPublisher {
+            dropped: Arc::clone(&dropped),
+        });
+        let document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: "did:dht:slowdrop".to_owned(),
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            also_known_as: vec![],
+            service: vec![],
+        };
+        let handle = spawn_tier_reevaluation(
+            strategy,
+            None,
+            NodePublisher::from_dyn(publisher as Arc<dyn DidPublisher>),
+            ScpIdentity {
+                identity_key: scp_platform::KeyHandle::new(1),
+                active_signing_key: scp_platform::KeyHandle::new(2),
+                agent_signing_key: None,
+                pre_rotation_commitment: [0u8; 32],
+                did: "did:dht:slowdrop".to_owned(),
+            },
+            LiveSlot::new(NodePublishedState {
+                document,
+                relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                record: None,
+            }),
+            32891,
+            None,
+            interval,
+        );
+        (handle, dropped)
+    }
+
+    /// `stop_and_wait` returns only after the cancelled task's future, and the
+    /// publisher it captured, has been dropped. A waiter woken any earlier lets
+    /// a node restart reopen custody storage while the old task still holds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stop_and_wait_returns_after_cancelled_task_drops_its_captures() {
+        let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        }]));
+        // The periodic branch never fires, so the task is parked in its
+        // `select!` when the cancel signal arrives.
+        let (handle, dropped) = slow_drop_tier_task(strategy, Duration::from_hours(1));
+
+        handle.stop_and_wait();
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_wait returned before the tier task's captured publisher was dropped"
+        );
+    }
+
+    /// The same guarantee on the panic path: a task that panicked has its future
+    /// dropped by the runtime, and `stop_and_wait` waits for that drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stop_and_wait_returns_after_panicked_task_drops_its_captures() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let strategy = Arc::new(PanickingNatStrategy {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+        });
+        let (handle, dropped) = slow_drop_tier_task(strategy, Duration::from_millis(1));
+
+        entered_rx
+            .await
+            .expect("tier task reaches the panicking strategy");
+        handle.stop_and_wait();
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_wait returned before the panicked tier task's captured publisher was dropped"
+        );
     }
 
     #[tokio::test]
