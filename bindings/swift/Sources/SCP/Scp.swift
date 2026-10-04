@@ -466,10 +466,10 @@ public extension SCP {
     /// (governed-context invitations are not yet implemented).
     ///
     /// The invite routes through the actor governance gate, which requires the
-    /// inviter to hold the `governance:propose` capability. A normally-created
-    /// `SingleAdmin` context grants its admin that capability at genesis, so it
-    /// works out of the box; a context with a custom ceiling must grant
-    /// `governance:propose` to the inviter.
+    /// inviter to hold the `governance:propose` capability. The creator of a
+    /// `SingleAdmin` context holds the admin role, which grants every
+    /// capability in the context's ceiling, so the creator can invite only
+    /// when that ceiling includes `governance:propose`.
     ///
     /// ```swift
     /// let outcome = try await scp.inviteMember(

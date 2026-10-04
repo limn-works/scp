@@ -20,7 +20,7 @@
 //! # Pre-rotation custody — a shipped build creates no identity at all
 //!
 //! [`DidMethod::create`] commits a mandatory pre-rotation commitment (the
-//! identity spec §9.7.4.1 §3, which makes that commitment mandatory at
+//! security-model spec §9.7.4.1 item 5(a), which makes that commitment mandatory at
 //! creation), so every path named above — and this module — needs a
 //! `scp_platform::PreRotationCustody` backend. No such
 //! backend ships. The tree holds one implementation, `InMemoryPreRotationCustody`.
@@ -343,7 +343,7 @@ impl Identity {
 /// # Pre-rotation custody — FAILS CLOSED in production (ADR-062 §Decision 6)
 ///
 /// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
-/// §3 — mandatory, not optional), which requires a
+/// item 5(a) — mandatory, not optional), which requires a
 /// [`PreRotationCustody`](scp_platform::PreRotationCustody) backend. The only
 /// implementation that exists today is `scp_platform::testing::InMemoryPreRotationCustody`,
 /// a §17.17.2 security nullifier now gated to the test harness (`testing`) only.
@@ -389,7 +389,8 @@ where
         tracing::warn!(
             did = %identity.did,
             "identity created with a process-local in-memory PreRotationCustody — \
-             Layer-2 DID migration (recovery from `#0` compromise via spec §9.7.4.1) \
+             Layer-2 DID migration (the reveal that spec §9.7.4.1 item 4 says recovers \
+             a root compromise) \
              is not durable across process restart until a persistent pre-rotation \
              backend ships."
         );

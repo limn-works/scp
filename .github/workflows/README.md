@@ -66,7 +66,7 @@ The `docs-swift` artifact name is the same regardless of which workflow produces
 
 ### Runner pinning
 
-The `swift-xcframework` job and (formerly) the `swift-docs` job are pinned to `macos-26`. This is required because `Package.swift` declares `swift-tools-version: 6.2`, which needs Swift 6.2. The `macos-latest` runner (macOS 15) only ships Swift 6.1.
+The `swift-xcframework` job and (formerly) the `swift-docs` job are pinned to `macos-26`, because `Package.swift` declares `swift-tools-version: 6.2`, which needs Swift 6.2 or later, and the macOS 26 image ships it. A pin keeps the job on such an image whatever `macos-latest` later points to.
 
 ### Publishing
 
@@ -115,7 +115,7 @@ The `build-matrix.yml` workflow builds release artifacts for all SDK targets:
 | Job | What it builds | Platforms |
 |-----|---------------|-----------|
 | `rust` | `libscp_core`, `libscp_ffi` | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
-| `python-wheels` | maturin-built wheels | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
+| `python-wheels` | maturin-built wheels | Linux (x86_64, aarch64), macOS universal2, Windows (x86_64) |
 | `python-sdist` | Source distribution | Platform-independent |
 | `typescript-napi` | napi-rs native addon | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
 | `swift-xcframework` | XCFramework + DocC docs | macOS universal2, iOS arm64, iOS Simulator |

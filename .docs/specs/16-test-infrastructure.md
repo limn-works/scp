@@ -1241,9 +1241,21 @@ macro_rules! push_conformance {
             }
 
             #[tokio::test]
-            async fn handle_notification_returns_wake() {
-                // Register, handle_notification with test payload,
-                // verify WakeSignal is returned.
+            async fn handle_notification_returns_fixed_wake() {
+                // Calls check_fixed_wake_signal, a public function of
+                // this module, which asserts the contract below.
+                // The adapter accepts at least one permitted wake payload:
+                // the APNs payload {"aps":{"content-available":1}}
+                // (ADR-025 criterion 4), the FCM payload
+                // {"data": {"scp": "1"}} (ADR-027), or the relay payload
+                // { "scp": 1 } (§10.7.1 step 5). It returns a non-empty
+                // WakeSignal for it. Every other payload the adapter
+                // accepts (another permitted payload, a permitted payload
+                // with trailing whitespace, or a payload carrying a context
+                // ID or sender) yields a byte-identical WakeSignal; the
+                // adapter may reject any of them instead. A signal that
+                // varied with the payload would hand the caller whatever
+                // a relay put in it, which §10.7 forbids.
             }
         }
     };
@@ -1571,7 +1583,7 @@ No §16.13 meta-tests run at this tier — they exercise the simulation harness 
 
 ### 16.15.2 Tier 2 — Merge Gate
 
-**Trigger:** Merge queue entry or push to `main`.
+**Trigger:** Merge queue entry.
 **Target:** < 10 minutes.
 **Purpose:** Required to merge. Exercises the harness and protocol integration.
 

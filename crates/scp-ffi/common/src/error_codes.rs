@@ -279,7 +279,7 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and `scp-node`
 /// when a production identity-creation path is invoked on a shipped (no-`testing`)
 /// build. Every identity commits a pre-rotation commitment at creation (spec
-/// §9.7.4.1 §3 — mandatory), which requires a `PreRotationCustody` backend; the
+/// §9.7.4.1 item 5(a)), which requires a `PreRotationCustody` backend; the
 /// only implementation that exists today is the in-memory test nullifier
 /// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062
 /// §Decision 6). Rather than silently mint the nullifier (which would ship a
@@ -535,6 +535,11 @@ pub const CTX_2095: &str = "SCP-CTX-2095";
 ///
 /// Maps from `ContextError::NotPseudonymousContext`.
 pub const CTX_2096: &str = "SCP-CTX-2096";
+/// Actor busy (ADR-049 §10).
+///
+/// Maps from `ContextError::ActorBusy` in each bridge's error translator; that
+/// variant's doc states its producers and retry behaviour.
+pub const CTX_2130: &str = "SCP-CTX-2130";
 /// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
 ///
 /// No longer respawned; the context is dormant until an operator clears the
@@ -1178,7 +1183,13 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------
 
-/// Device attestation provider call failed (Play Integrity API error).
+/// Device attestation provider call failed.
+///
+/// The Android adapter throws it when a Play Integrity token request fails,
+/// and the Apple adapter throws it when Apple's App Attest service answers
+/// with an error that no narrower `SCP-ATTEST-` code names, or when the
+/// caller's task is cancelled while its App Attest call is queued or waiting
+/// for Apple's answer.
 pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
 
 /// Attestation signature verification requires raw JSON, which is absent.
@@ -1210,6 +1221,73 @@ pub const ATTEST_9017: &str = "SCP-ATTEST-9017";
 
 /// Cryptographic-class verification method not verifiable via browser fetch.
 pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
+
+// Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
+// from its UniFFI `DeviceAttestationProvider` callback methods
+// (`AttestationError.scpError`). Each of these nine codes belongs to one of
+// the ten `AttestationError` cases; the tenth case, `serviceError`, reuses
+// `ATTEST_9001`.
+
+/// Apple App Attest is unsupported on this device.
+///
+/// `DCAppAttestService.isSupported` is `false`, or an App Attest call answered
+/// with `DCError.featureUnsupported`.
+pub const ATTEST_9019: &str = "SCP-ATTEST-9019";
+/// No App Attest key ID is stored, so no assertion is possible.
+pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
+/// Apple already attested this App Attest key.
+///
+/// The stored key carries the Apple adapter's attestation record, and Apple
+/// attests one key once, so `attest` calls no App Attest method.
+pub const ATTEST_9021: &str = "SCP-ATTEST-9021";
+/// Apple refused an assertion with a stored App Attest key that carries no
+/// attestation record.
+///
+/// `generateAssertion` answered `DCError.invalidKey` for a key that carries
+/// no attestation record, which names either an unattested key or a rejected
+/// key whose record was never written; the Apple adapter keeps the key.
+pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
+/// Apple's App Attest service rejected this device's key.
+///
+/// `generateAssertion` answered `DCError.invalidKey` for a key that carries
+/// an attestation record; the Apple adapter discards the key ID and record.
+pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
+/// App Attest `attestKey` or `generateAssertion` answered
+/// `DCError.serverUnavailable`.
+///
+/// The Apple adapter keeps the key for a retry. A `generateKey` answer of
+/// `DCError.serverUnavailable` gives `SCP-ATTEST-9001`.
+pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
+/// The App Attest adapter reached a state no caller input produces.
+///
+/// Apple's service answered a completion handler with neither a value nor an
+/// error.
+pub const ATTEST_9025: &str = "SCP-ATTEST-9025";
+/// The attestation challenge or the assertion request hash is not 32 bytes.
+///
+/// ADR-025 acceptance criterion 3 has the Rust core pass the 32-byte binding
+/// digest `D` of `09-security-model.md` §9.3.1 as `challenge` and the 32-byte
+/// assertion digest `A` as `request_hash`, and the Apple adapter hands each to
+/// App Attest as `clientDataHash` unchanged. On a device that supports App
+/// Attest, the Apple adapter throws this code for either input when it is not
+/// 32 bytes, before it generates a key or calls App Attest; on a device that
+/// does not, it throws `SCP-ATTEST-9019` first.
+pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
+/// Apple App Attest did not answer one serialized call within 25 seconds.
+///
+/// ADR-025 acceptance criterion 3 bounds each call the Apple adapter's call
+/// serializer runs, the whole of one `attest` or one `assert_request`, at 25
+/// seconds from the call's start, below the runtime's 30-second actor
+/// `HANDLER_TIMEOUT`. Time the call spends queued behind earlier calls counts
+/// against no bound, so a queued caller's whole wait can pass 30 seconds.
+/// When the bound expires, the waiting
+/// `attest` or `assert_request` throws this code, the serializer starts the
+/// next queued call, and an answer Apple gives later is discarded: it stores
+/// no key ID, writes no attestation record, discards no key ID, and reaches
+/// no caller. `SCP-ATTEST-9025` names a completion
+/// handler that answered with neither a value nor an error, a different
+/// condition.
+pub const ATTEST_9027: &str = "SCP-ATTEST-9027";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)

@@ -963,6 +963,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
         // lives in the shared OpenMLS storage and the restore leg reinstates it.
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)
@@ -1181,6 +1182,7 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
         sup1.register_local_did(creator.clone()).await.unwrap();
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)

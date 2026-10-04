@@ -4589,9 +4589,9 @@ impl Supervisor {
             if self.actors.contains_key(&ctx_id_str) {
                 // Losing duplicate birth: this `state` never becomes a live
                 // actor, so dispose its seeded crypto (#2148 F6) — `destroy_group`
-                // eagerly frees the group (the OpenMLS signer is freed, NOT
-                // zeroized — #82). `state` drops on the very next line regardless,
-                // so this is defense-in-depth / forward-compat with #82, matching
+                // releases the group (the OpenMLS signer zeroizes on drop).
+                // `state` drops on the very next line, so the call is equivalent
+                // to that drop, matching
                 // the close-seam teardown. A no-op for a broadcast /
                 // never-seeded state.
                 // #2199: rollback path — no attestation is built here, so discard
@@ -5463,8 +5463,8 @@ impl Supervisor {
     /// [`Self::spawn_actor_from_welcome`] materialized after the irreversible
     /// KeyPackage consume: it drops the actor handle (whose owned
     /// `PerContextState` holds the MLS crypto — #2148 birth-into-actor — so the
-    /// sender key ZEROIZES and the group/signer is FREED (not zeroized — #82)
-    /// when the actor task ends) AND deletes the persisted Class-S snapshot
+    /// sender key, the group's signer, and the group's provider-storage values
+    /// ZEROIZE on drop when the actor task ends) AND deletes the persisted Class-S snapshot
     /// (`delete_context`).
     ///
     /// The FFI bridges call this as the compensating teardown when a
@@ -5496,8 +5496,8 @@ impl Supervisor {
         //    the joiner's MLS crypto is OWNED by the actor's `PerContextState`
         //    (born owned at the WELCOME seam, never provider-resident), so
         //    dropping the actor handle closes its mailbox — the actor task ends
-        //    and its state drops: the sender key ZEROIZES (`ZeroizeOnDrop`) and
-        //    the group/signer is FREED (not zeroized — #82). There is no
+        //    and its state drops: the sender key ZEROIZES (`ZeroizeOnDrop`), the
+        //    group's signer and its provider-storage values zeroize on drop. There is no
         //    provider map to also destroy (the deleted `destroy_mls_group` arm).
         let removed = self.actors.remove(context_id).is_some();
         let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
@@ -5511,8 +5511,8 @@ impl Supervisor {
         }
         // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
         //    discarded welcome-join is permanently gone (its actor-owned crypto
-        //    freed on the handle drop above — `SenderKey`s zeroize, the MLS
-        //    group/signer is freed but not zeroized (#82); its durable snapshot
+        //    freed on the handle drop above — `SenderKey`s, the MLS group's
+        //    signer, and its provider-storage values zeroize on drop; its durable snapshot
         //    deleted), so
         //    the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
@@ -10778,8 +10778,8 @@ impl Supervisor {
     ///
     /// Destroys per-context sender keys + MLS groups + event logs in
     /// that order (release secrets before tearing down structure;
-    /// `SenderKey`s zeroize, the MLS group/signer is freed — not
-    /// zeroized, #82),
+    /// `SenderKey`s, the MLS group's signer, and its provider-storage values
+    /// zeroize on drop),
     /// removes the contexts from the supervisor's registry, clears the
     /// standing-context tracking + local-DID registry + per-identity
     /// wrapping keys, and aborts background tasks (TTL timers,
@@ -13375,7 +13375,12 @@ impl Supervisor {
     /// Returns
     /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
     /// if the supervisor's providers are not wired or context creation
-    /// fails. A dropped reply channel maps to
+    /// fails, and
+    /// [`ContextCreationError::StateTransition`](scp_protocol::context::builder::ContextCreationError::StateTransition)
+    /// wrapping
+    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+    /// when `params.ceiling` is empty (construction.md M2); the context is
+    /// not created. A dropped reply channel maps to
     /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed).
     pub async fn create_context(
         self: &Arc<Self>,
@@ -14328,8 +14333,8 @@ impl Supervisor {
                     //     cost is the already-burned single-use KeyPackage (the same
                     //     accepted cost as any post-consume failure). The rejected
                     //     `joined_group` is dropped here, which FREES its key material
-                    //     (MlsGroup secrets + Ed25519 signer `Vec<u8>` + MemoryStorage)
-                    //     but does NOT zeroize the signer (upstream #82); disposing
+                    //     (MlsGroup secrets + Ed25519 signer + MemoryStorage), and the
+                    //     signer's private key zeroizes on drop; disposing
                     //     explicitly here would be inert since it drops immediately —
                     //     nothing half-installed to roll back. Passing verifies
                     //     that `build_welcome_joiner_state` below only ever builds
@@ -14357,9 +14362,9 @@ impl Supervisor {
                     //    local `owned` binding until it is seeded onto `state` at 2b; a
                     //    failure on any early-return between here and the spawn DROPS it
                     //    with `state` (the `SenderKey` zeroizes via `ZeroizeOnDrop`; the
-                    //    `ScpMlsGroup`'s signer is FREED — never zeroized — on both the
-                    //    bare drop and the explicit `dispose_secrets`/`destroy_group`
-                    //    rollback branches, since `SignatureKeyPair` has no `Zeroize`, #82).
+                    //    `ScpMlsGroup`'s signer zeroizes on both the bare drop and the
+                    //    explicit `dispose_secrets`/`destroy_group` rollback branches,
+                    //    since `SignatureKeyPair` holds its private key in `SecretVLBytes`).
                     //    Double-birth / durable-divergence is guarded by the whole
                     //    entrypoint running under the global `bootstrap_spawn_lock`
                     //    together with Precheck A (live-actor) + Precheck D (durable
@@ -14372,12 +14377,12 @@ impl Supervisor {
                     // 3. Build the Welcome-derived PerContextState (EMPTY encrypted mode).
                     //    On failure, dispose `owned` FIRST (#2148 F6) — it is the live
                     //    owner of the born crypto here (not yet seeded onto `state`). A
-                    //    bare drop already frees the joined group's in-memory storage and
-                    //    the Ed25519 signer's `Vec<u8>`; `dispose_secrets`
-                    //    (`destroy_group`) frees the same material eagerly (signer freed,
-                    //    NOT zeroized — #82; the `SenderKey` zeroizes on its own drop).
+                    //    bare drop already zeroizes the joined group's provider-storage
+                    //    values and the Ed25519 signer; `dispose_secrets` (`destroy_group`)
+                    //    releases the same material eagerly (the `SenderKey` zeroizes on
+                    //    its own drop).
                     //    On this branch `owned` drops immediately after, so the dispose is
-                    //    defense-in-depth / forward-compat. Nothing is provider-resident
+                    //    equivalent to that drop. Nothing is provider-resident
                     //    and no durable snapshot exists yet, so there is nothing else to
                     //    tear down.
                     let mut state = match Self::build_welcome_joiner_state(
@@ -14404,8 +14409,8 @@ impl Supervisor {
                     //     SOLE crypto authority — the durability check (3b) and the
                     //     fail-closed persist (4) read the export off `state`. Every
                     //     early-return below now DROPS the seeded crypto with `state`
-                    //     (the `SenderKey` zeroizes; the MLS group/signer is freed, not
-                    //     zeroized — #82), so no provider teardown is needed and a retry
+                    //     (the `SenderKey` and the MLS group's signer zeroize on drop), so
+                    //     no provider teardown is needed and a retry
                     //     re-drives a fresh Welcome.
                     state.seed_encrypted_crypto_from_owned(owned);
 
@@ -14426,9 +14431,10 @@ impl Supervisor {
                     //     `Active` too. On a transition failure dispose the seeded `state`
                     //     FIRST (#2148 F6): `state` owns the born crypto here.
                     //     `dispose_secrets` (`destroy_group`) eagerly frees the group NOW;
-                    //     the signer is freed, NOT zeroized (#82) — same as the bare drop
+                    //     the signer zeroizes on drop — same as the bare drop
                     //     that follows this early return (the `SenderKey` zeroizes on its
-                    //     own drop), so this is defense-in-depth. Nothing is persisted or
+                    //     own drop), so the call is equivalent to that drop. Nothing is
+                    //     persisted or
                     //     registered yet.
                     if let Err(e) =
                         handle.transition_to(&scp_protocol::context::ContextState::Active)
@@ -14454,9 +14460,10 @@ impl Supervisor {
                     //     snapshot WOULD carry. Check it here, BEFORE persisting: on a
                     //     non-durable export dispose the seeded `state` FIRST (#2148 F6) —
                     //     `state` owns the born crypto. `dispose_secrets` (`destroy_group`)
-                    //     eagerly frees the group NOW; the signer is freed, NOT zeroized
-                    //     (#82) — same as the bare drop that follows this early return (the
-                    //     `SenderKey` zeroizes on its own drop), so this is defense-in-depth.
+                    //     eagerly frees the group NOW; the signer zeroizes on drop — same
+                    //     as the bare drop that follows this early return (the
+                    //     `SenderKey` zeroizes on its own drop), so the call is equivalent to
+                    //     that drop.
                     //     Nothing has been persisted yet, so there is no durable snapshot to
                     //     delete (strictly cleaner than persist-then-delete, same
                     //     fail-closed guarantee).
@@ -14516,9 +14523,8 @@ impl Supervisor {
                     //    so a crash after this point rehydrates a fully-keyed context. A
                     //    persist failure deletes any partial durable snapshot and returns
                     //    `Err`; before the early return, dispose the seeded `state`'s
-                    //    crypto (#2148 F6) — `destroy_group` eagerly frees the group (the
-                    //    OpenMLS signer is freed, NOT zeroized — #82; same as the bare drop
-                    //    that follows) — never a live half-keyed actor and never an
+                    //    crypto — the call is equivalent to the bare drop that follows —
+                    //    never a live half-keyed actor and never an
                     //    orphaned/clobbered durable snapshot.
                     if let Err(e) = crate::context::messaging_helpers::persist_state_fail_closed(
                         &state,
@@ -14539,7 +14545,7 @@ impl Supervisor {
                     //    (e.g. a racing duplicate registration) delete the durable snapshot
                     //    so no orphaned durable state survives the `Err`; `spawn_actor_with_state`
                     //    consumes `state`, and its dup-registration reject arm disposes the
-                    //    seeded crypto (eager free; signer freed, not zeroized — #82) before
+                    //    seeded crypto (eager free; the signer zeroizes on drop) before
                     //    dropping it — it never returns to any provider. IMPORTANT: this path PERSISTS at
                     //    step 4 BEFORE it registers here, so durable double-birth correctness
                     //    rests on the whole entrypoint running under the global
@@ -14575,11 +14581,10 @@ impl Supervisor {
                     // The timed future is CANCELLED at the elapse, dropping any in-flight
                     // seeded `state` (and with it the owned crypto). This outer arm cannot
                     // reach into the cancelled future to `dispose_secrets`, so the born
-                    // crypto is bare-dropped here: the `SenderKey` zeroizes on drop, but
-                    // the OpenMLS Ed25519 signer's secret bytes linger un-zeroized in the
-                    // freed group storage until overwritten — an accepted best-effort gap
-                    // on this rare cancellation path, identical to a crash's residency
-                    // (#2148 F6; scp-mls #82: `SignatureKeyPair` has no `Zeroize`). There
+                    // crypto is bare-dropped here: the `SenderKey` and the OpenMLS Ed25519
+                    // signer zeroize on drop (`SignatureKeyPair` holds its private key in
+                    // `SecretVLBytes`), and the group's provider-storage values zeroize
+                    // on drop. There
                     // is no provider-resident crypto to tear down (#2148 birth-into-actor).
                     // Delete any persisted snapshot: an idempotent `let _ =` no-op when the
                     // elapse landed before step 4 ran, so it is safe regardless of how far
@@ -14825,7 +14830,9 @@ impl Supervisor {
     /// when the config carries a bilateral peer (see above). Otherwise
     /// propagates
     /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
-    /// from [`Self::create_context`].
+    /// from [`Self::create_context`], including the
+    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+    /// rejection of an empty ceiling.
     pub async fn create(
         self: &Arc<Self>,
         context_id: String,
@@ -17273,7 +17280,7 @@ mod tests {
         ext: &scp_protocol::context::ScpContextExtension,
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, scp_protocol::context::builder::ReceiveFloor)>,
-    ) -> Result<Vec<u8>, ContextError> {
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ContextError> {
         let (wpub, wsec) = crypto.wrapping_keypair_snapshot();
         let state = take_into_actor(crypto, ctx, ext);
         state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
@@ -19617,7 +19624,7 @@ mod tests {
         let result: Result<(), ContextError> = handle
             .send(|reply| {
                 ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-                    mls_state: Vec::new(),
+                    mls_state: zeroize::Zeroizing::default(),
                     reply,
                 })
             })
@@ -19679,7 +19686,7 @@ mod tests {
         let result: Result<(), ContextError> = handle
             .send(|reply| {
                 ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-                    mls_state: Vec::new(),
+                    mls_state: zeroize::Zeroizing::default(),
                     reply,
                 })
             })
@@ -19770,7 +19777,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
-            mls_crypto_state: Vec::new(),
+            mls_crypto_state: crate::context::state::MlsCryptoState::default(),
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
             consequence_rules: Vec::new(),
@@ -21501,7 +21508,10 @@ mod tests {
             let result = sup
                 .create_context(
                     ctx_id.to_owned(),
-                    scp_protocol::context::ContextParams::default(),
+                    scp_protocol::context::ContextParams {
+                        ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                        ..scp_protocol::context::ContextParams::default()
+                    },
                     DID(creator.to_owned()),
                     None,
                 )
@@ -21534,7 +21544,10 @@ mod tests {
         let handle = sup
             .create_context(
                 ctx_id.to_owned(),
-                scp_protocol::context::ContextParams::default(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..scp_protocol::context::ContextParams::default()
+                },
                 DID(creator.to_owned()),
                 None,
             )
@@ -22019,7 +22032,13 @@ mod tests {
         let sup = Arc::new(Supervisor::for_query_shim());
         let id = hex::encode([0xC1u8; 32]);
         poison_crash_window(&sup, &id);
-        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (cmd, rx) = reply_order_create(
+            &id,
+            ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..ContextParams::default()
+            },
+        );
         let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
         assert!(reply.is_err(), "a create without providers fails");
         assert!(
@@ -22036,7 +22055,13 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
         let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
         poison_crash_window(&sup, &id);
-        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (cmd, rx) = reply_order_create(
+            &id,
+            ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..ContextParams::default()
+            },
+        );
         let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
         assert!(reply.is_err(), "a create over a closed snapshot is refused");
         assert!(
@@ -22049,7 +22074,13 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
         let sup = supervisor_with_clock_and_persistence(clock, Box::new(ErringLoadPersistence));
         poison_crash_window(&sup, &id);
-        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (cmd, rx) = reply_order_create(
+            &id,
+            ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..ContextParams::default()
+            },
+        );
         let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
         assert!(
             reply.is_err(),
@@ -22068,6 +22099,7 @@ mod tests {
         poison_crash_window(&sup, &id);
         let params = ContextParams {
             min_protocol_version: Some((9, 0)),
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         let (cmd, rx) = reply_order_create(&id, params);
@@ -22386,14 +22418,16 @@ mod tests {
         // Capture the live crypto state INCLUDING the registry floor (=5) into
         // the persisted snapshot, exactly as `build_snapshot_for_persist` does
         // (floors sourced from the authoritative registry).
-        snap.mls_crypto_state = actor_export(
-            &crypto,
-            &ctx_id_bytes,
-            &ctx_extension,
-            sup.export_sender_key_epochs(&ctx_id_bytes),
-            sup.export_recv_sequence_floors(&ctx_id_bytes),
-        )
-        .unwrap();
+        snap.mls_crypto_state = crate::context::state::MlsCryptoState(
+            actor_export(
+                &crypto,
+                &ctx_id_bytes,
+                &ctx_extension,
+                sup.export_sender_key_epochs(&ctx_id_bytes),
+                sup.export_recv_sequence_floors(&ctx_id_bytes),
+            )
+            .unwrap(),
+        );
         assert!(
             !snap.mls_crypto_state.is_empty(),
             "snapshot must carry crypto state so the floor guard runs on respawn"
@@ -22658,8 +22692,8 @@ mod tests {
         );
 
         // #2148 (ADR-049 birth-into-actor): rollback = the owned material is
-        // dropped on the Err path (the `SenderKey` zeroizes; the MLS group/signer
-        // is freed, not zeroized — #82) and never seeded onto an actor. The
+        // dropped on the Err path (the `SenderKey` and the MLS group's signer
+        // zeroize on drop) and never seeded onto an actor. The
         // provider holds NO per-context state (the `contexts` map and the
         // `context_crypto_present` residency probe are deleted), so there is no
         // provider residency to assert — the floor-registry state above is the
@@ -23420,7 +23454,10 @@ mod tests {
         let created = sup
             .create_context(
                 context_id.clone(),
-                scp_protocol::context::ContextParams::default(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..scp_protocol::context::ContextParams::default()
+                },
                 creator,
                 None,
             )

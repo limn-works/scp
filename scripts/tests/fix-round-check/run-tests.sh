@@ -114,13 +114,49 @@
 #     Case 22 answers `cargo metadata` with an object holding no package list and asserts
 #     that the summary names the feature set the compile step could not read, because a
 #     run that activates a narrower feature set than the merge gate resolves and prints
-#     `compile ok` says nothing about the modules it skipped.
+#     `compile ok` says nothing about the modules it skipped. The same run cannot read
+#     which package has an example target, so case 22 also asserts that the
+#     `scripts/check-examples-compile.sh` assertion 1 line and its source-scan line each
+#     name the changed package and say the run could not read the targets.
 #
-#     Case 23 reads every `scripts/` program a job of `.github/workflows/ci.yml` starts,
-#     subtracts the runner's own GATES array, and asserts that the `scripts/` entry of
-#     UNRUN_LANES names every path that remains. The subtraction is the lane's own
-#     criterion: the lane discloses a command CI runs that no step of the run starts, and
-#     a path in GATES is a command the run does start. That entry is what a fix agent
+#     Case 22b changes scp-clock, scp-transport and scp-ffi under a metadata answer in
+#     which only scp-transport owns an example, and scp-transport reaches scp-clock through
+#     a dev-dependency. It asserts that the examples-gate assertion 1 line names scp-clock
+#     and scp-transport and not scp-ffi, which no example compiles; that the assertion 2
+#     line names all three packages; that the assertion 1 source-scan line names scp-ffi, whose
+#     `examples/` holds a helper and no target, and scp-transport and not scp-clock, and
+#     that it and header item 8 name `scripts/check-examples-compile.sh` as the one
+#     statement of the scan's rules instead of restating them; and that no gate-edit line
+#     appears on a branch that left the gate alone. A run that drops any of the three lines, the
+#     dependency walk or the reachability filter reports green over a change the
+#     rust-clippy job turns red.
+#
+#     Case 22c changes only `scripts/check-examples-compile.sh` and asserts that the
+#     summary names that gate as unrun over this repository's workspace, and that it prints
+#     neither assertion line, because the run compiled no crate. GATES_NOT_RUN keeps the
+#     run from starting that gate, so without this line an edit to it reads as covered.
+#     A second fixture adds `scripts/check-fixture-unstarted.sh` to its copy of
+#     GATES_NOT_RUN, edits it and `scripts/check-resolved-rustc.sh`, and asserts a line for
+#     the added gate and none for the toolchain precondition the run starts, so the line
+#     covers every unstarted GATES_NOT_RUN entry rather than one hardcoded path.
+#
+#     Case 22d asserts that every GATES_NOT_RUN path the runner never starts with `bash`
+#     appears in the header's DOES-NOT-RUN list, and that the list names `cargo package
+#     --list`, which the examples gate runs in the rust-clippy job. A NOT CHECKED line the
+#     list has no entry for names a command the header never told the reader about.
+#
+#     Case 23 reads every `scripts/` program a job of `.github/workflows/ci.yml` starts
+#     with `bash`, `python3`, `python3.12`, `python3.12 -m pytest` or a `./` path, on a
+#     one-line `run:` step or inside a `run: |` block, subtracts the runner's own GATES
+#     and GATES_NOT_RUN arrays, and asserts that the `scripts/` entry of UNRUN_LANES names
+#     every path that remains. The subtraction is the lane's own criterion: the lane
+#     discloses a command CI runs that no step of the run starts or names. A path in GATES
+#     is a command the run does start. A path in GATES_NOT_RUN is one the run either starts
+#     as its toolchain precondition or names in the header's DOES-NOT-RUN list, and case
+#     22d fails when an unstarted GATES_NOT_RUN path is missing from that list, and case
+#     22c fails when a branch edits an unstarted GATES_NOT_RUN path and the run prints no
+#     NOT CHECKED line naming it, so the GATES_NOT_RUN subtraction holds only while cases
+#     22c and 22d do. That entry is what a fix agent
 #     editing an enforcement gate acts on, and a suite absent from it is a red CI job the
 #     runner's output gave the agent no reason to expect. Two further assertions hold the
 #     case's two inputs non-empty, because an empty lane line matches no suite name and an
@@ -1141,6 +1177,205 @@ else
     report "case 22 names the feature set it could not read" 1 "the output holds no NOT CHECKED line for the sibling feature set: $(tail -n 5 "$FIXTURE22.harness/out.txt")"
 fi
 
+# Case 22's metadata answer holds no package list, so the run cannot tell which compiled
+# package has an example target and names every one of them, saying why.
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 over the example targets that compile scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
+    report "case 22 names the examples gate over every package when it cannot read targets" 0 ""
+else
+    report "case 22 names the examples gate over every package when it cannot read targets" 1 "the output holds no qualified NOT CHECKED line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 source scan over scp-clock (this run could not read their targets' "$FIXTURE22.harness/out.txt"; then
+    report "case 22 names the examples source scan over every package when it cannot read targets" 0 ""
+else
+    report "case 22 names the examples source scan over every package when it cannot read targets" 1 "the output holds no qualified source-scan line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
+fi
+
+# ── Case 22b: the examples gate over the packages each of its assertions reads ──────
+#
+# `scripts/check-examples-compile.sh` assertion 1 lints every `example` target, one at a
+# time, with clippy under `-D warnings`, which this runner does not run. Each example
+# compiles against its package's dependency graph, so a changed package with no example
+# of its own still reaches that gate through a dependent's example. Cargo builds a
+# dev-dependency only for the package declaring it, so the walk takes dev edges from the
+# example owner alone. The fixture changes three packages. Its metadata answer gives an
+# example target to scp-transport, which reaches scp-clock through its own dev-dependency
+# on scp-ffi-napi, and scp-ffi-napi dev-depends on scp-ffi, which no example compiles. The
+# assertion 1 line must name scp-clock and scp-transport and must not name scp-ffi.
+# Assertion 2 runs `cargo package --list` on every workspace package, so its line must
+# name all three, scp-ffi included.
+#
+# The mutations it kills: deleting the assertion 1 entry leaves a change to an example
+# reported green here and red in the rust-clippy job; dropping the dependency walk leaves
+# scp-clock out; dropping the reachability filter, or following dev edges below the
+# example owner, names scp-ffi; deleting the assertion 2 entry, or filtering it by
+# reachability, leaves scp-ffi's change unnamed.
+FIXTURE22B="$WORK/example-targets"
+build_fixture "$FIXTURE22B"
+fixture_commit "$FIXTURE22B" crates/scp-clock/src/lib.rs
+fixture_commit "$FIXTURE22B" crates/scp-transport/src/lib.rs
+fixture_commit "$FIXTURE22B" crates/scp-ffi/src/lib.rs
+mkdir -p "$FIXTURE22B/crates/scp-ffi/examples/support"
+fixture_commit "$FIXTURE22B" crates/scp-ffi/examples/support/helpers.rs
+HARNESS22B="$FIXTURE22B.harness"
+write_stubs "$HARNESS22B" "$PIN_CHANNEL" 0 0 ""
+cat > "$HARNESS22B/metadata.json" <<'JSON'
+{"version":1,"target_directory":"/stub-target-dir","packages":[
+ {"name":"scp-clock","dependencies":[],"targets":[{"name":"scp_clock","kind":["lib"]}]},
+ {"name":"scp-ffi","dependencies":[{"name":"scp-clock","kind":null}],"targets":[{"name":"scp_ffi","kind":["lib"]}]},
+ {"name":"scp-ffi-napi","dependencies":[{"name":"scp-clock","kind":null},{"name":"serde","kind":null},{"name":"scp-ffi","kind":"dev"}],"targets":[{"name":"scp_ffi_napi","kind":["lib"]}]},
+ {"name":"scp-transport","dependencies":[{"name":"scp-ffi-napi","kind":"dev"}],"targets":[{"name":"scp_transport","kind":["lib"]},{"name":"relay","kind":["example"]}]}
+]}
+JSON
+PATH="$HARNESS22B/bin:$PATH" bash "$FIXTURE22B/scripts/fix-round-check.sh" > "$HARNESS22B/out.txt" 2>&1
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 over the example targets that compile scp-clock, scp-transport:' "$HARNESS22B/out.txt"; then
+    report "case 22b names the examples gate over the packages an example compiles" 0 ""
+else
+    report "case 22b names the examples gate over the packages an example compiles" 1 "the output holds no NOT CHECKED line naming scp-clock and scp-transport alone: $(tail -n 6 "$HARNESS22B/out.txt")"
+fi
+if grep -F 'check-examples-compile.sh assertion 1 over the example targets that compile' "$HARNESS22B/out.txt" | grep -qF 'scp-ffi'; then
+    report "case 22b names no package that no example compiles" 1 "$(grep -F 'check-examples-compile.sh' "$HARNESS22B/out.txt")"
+else
+    report "case 22b names no package that no example compiles" 0 ""
+fi
+A2_LINE=$(grep -F 'NOT CHECKED — scripts/check-examples-compile.sh assertion 2 over ' "$HARNESS22B/out.txt")
+if [[ $A2_LINE == *scp-clock* && $A2_LINE == *scp-ffi* && $A2_LINE == *scp-transport* ]]; then
+    report "case 22b names every changed package for the published-file assertion" 0 ""
+else
+    report "case 22b names every changed package for the published-file assertion" 1 "the assertion 2 line reads: ${A2_LINE:-<absent>}"
+fi
+# Assertion 1's source scan reads every .rs file under examples/ in every package, with
+# or without an example target, so its line must name scp-ffi, whose examples/ holds a
+# helper and no target, and scp-transport, which owns a target, and must not name
+# scp-clock, which has neither. The mutations it kills: seeding the scan line from the
+# reachability walk leaves scp-ffi out and names scp-clock; seeding it from target owners
+# alone leaves scp-ffi out; naming every compiled package names scp-clock.
+SCAN_LINE=$(grep -F 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 source scan over ' "$HARNESS22B/out.txt")
+if [[ $SCAN_LINE == *'source scan over scp-ffi, scp-transport:'* ]]; then
+    report "case 22b names the source scan over each package with an example target or examples/" 0 ""
+else
+    report "case 22b names the source scan over each package with an example target or examples/" 1 "the source-scan line reads: ${SCAN_LINE:-<absent>}"
+fi
+# The source-scan line and header item 8 do not restate the scan's rules: each names
+# scripts/check-examples-compile.sh as the one statement of them, so a rule the gate
+# gains or drops leaves both texts true. scan_points_to_gate passes a text that carries
+# that pointer with the gate path as its subject, bare or in backticks, and fails one
+# that drops the pointer or names another file as its subject, even when the gate path
+# stands elsewhere in the text.
+scan_points_to_gate() {
+    [[ $1 == *'scripts/check-examples-compile.sh is the one statement of the rules that scan applies'* \
+        || $1 == *'`scripts/check-examples-compile.sh` is the one statement of the rules that scan applies'* ]]
+}
+# Item 8's text, comment markers stripped and its lines joined with single spaces.
+HEADER8=$(awk '/^#   8\./ { on = 1 } /^# USAGE/ { on = 0 } on' "$REPO_ROOT/scripts/fix-round-check.sh" \
+    | sed -E 's/^#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')
+if scan_points_to_gate "$SCAN_LINE" && scan_points_to_gate "$HEADER8" \
+    && ! scan_points_to_gate "${SCAN_LINE/is the one statement/is one statement}" \
+    && ! scan_points_to_gate "${HEADER8/is the one statement/is one statement}" \
+    && ! scan_points_to_gate "${SCAN_LINE//scripts\/check-examples-compile.sh/the gate}" \
+    && ! scan_points_to_gate "${SCAN_LINE/scripts\/check-examples-compile.sh is the one/LESSON.md is the one}" \
+    && ! scan_points_to_gate "${HEADER8/scripts\/check-examples-compile.sh\` is the one/LESSON.md\` is the one}"; then
+    report "case 22b points the source-scan line and header item 8 to the examples gate for its rules" 0 ""
+else
+    report "case 22b points the source-scan line and header item 8 to the examples gate for its rules" 1 "the source-scan line reads: ${SCAN_LINE:-<absent>}; header item 8 reads: ${HEADER8:-<absent>}"
+fi
+if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over this repository' "$HARNESS22B/out.txt"; then
+    report "case 22b names no unrun gate edit on a branch that left the gate alone" 1 "$(grep -F 'check-examples-compile.sh over this repository' "$HARNESS22B/out.txt")"
+else
+    report "case 22b names no unrun gate edit on a branch that left the gate alone" 0 ""
+fi
+
+# ── Case 22c: a branch that edits the examples gate alone ───────────────────────────
+#
+# GATES_NOT_RUN lists scripts/check-examples-compile.sh, so no run starts it, and a
+# branch that edits only that script derives no crate. The fixture suite the scripts/
+# lane names runs the gate over throwaway workspaces, so without its own line the edit
+# reads as covered while the rust-clippy job runs the gate over every workspace package.
+#
+# The mutation it kills: deleting the CHANGED loop after GATES_NOT_RUN leaves this run
+# with no line naming the gate it never ran. The run compiles no crate, so header item 8
+# says it prints neither assertion line; moving either line out of the branch that
+# compiles a crate turns the second check red.
+FIXTURE22C="$WORK/examples-gate-edit"
+build_fixture "$FIXTURE22C"
+fixture_commit "$FIXTURE22C" scripts/check-examples-compile.sh
+run_fixture "$FIXTURE22C"
+if grep -qF "NOT CHECKED — scripts/check-examples-compile.sh over this repository's workspace: this branch changed that gate" "$FIXTURE22C.harness/out.txt"; then
+    report "case 22c names the examples gate an edit left unrun" 0 ""
+else
+    report "case 22c names the examples gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited gate: $(tail -n 6 "$FIXTURE22C.harness/out.txt")"
+fi
+if grep -qE 'NOT CHECKED — scripts/check-examples-compile\.sh assertion [12] ' "$FIXTURE22C.harness/out.txt"; then
+    report "case 22c prints no examples-gate assertion line on a run that compiled no crate" 1 "$(grep -F 'check-examples-compile.sh assertion' "$FIXTURE22C.harness/out.txt")"
+else
+    report "case 22c prints no examples-gate assertion line on a run that compiled no crate" 0 ""
+fi
+
+# The CHANGED loop reads GATES_NOT_RUN rather than one path, so a second unstarted entry
+# gets the same line. This fixture adds `scripts/check-fixture-unstarted.sh` to its copy
+# of that array, holds the file, and commits an edit to it and to the toolchain
+# precondition. The mutation it kills: matching one literal path in that loop leaves the
+# added entry without a line. Dropping the precondition skip prints a line claiming the
+# run never started a gate it started first.
+FIXTURE22E="$WORK/unstarted-gate-edit"
+build_fixture "$FIXTURE22E"
+sed -i.bak 's|^    scripts/check-examples-compile.sh$|&\
+    scripts/check-fixture-unstarted.sh|' "$FIXTURE22E/scripts/fix-round-check.sh"
+rm -f "$FIXTURE22E/scripts/fix-round-check.sh.bak"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FIXTURE22E/scripts/check-fixture-unstarted.sh"
+git -C "$FIXTURE22E" add -A
+git -C "$FIXTURE22E" -c user.email=fix-round-check@example.invalid -c user.name='fix-round-check tests' \
+    commit -q --no-gpg-sign --no-verify -m 'fixture unstarted gate'
+git -C "$FIXTURE22E" update-ref refs/remotes/origin/main HEAD
+printf '# committed edit\n' >> "$FIXTURE22E/scripts/check-fixture-unstarted.sh"
+printf '# committed edit\n' >> "$FIXTURE22E/scripts/check-resolved-rustc.sh"
+git -C "$FIXTURE22E" add -A
+git -C "$FIXTURE22E" -c user.email=fix-round-check@example.invalid -c user.name='fix-round-check tests' \
+    commit -q --no-gpg-sign --no-verify -m 'fixture edit'
+run_fixture "$FIXTURE22E"
+if ! sed -n '/^GATES_NOT_RUN=(/,/^)/p' "$FIXTURE22E/scripts/fix-round-check.sh" | grep -qF 'scripts/check-fixture-unstarted.sh'; then
+    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 1 "the fixture's GATES_NOT_RUN gained no scripts/check-fixture-unstarted.sh entry, so this case tested nothing"
+elif grep -qF "NOT CHECKED — scripts/check-fixture-unstarted.sh over this repository's workspace: this branch changed that gate, and this run never starts it" "$FIXTURE22E.harness/out.txt"; then
+    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 0 ""
+else
+    report "case 22c names any unstarted GATES_NOT_RUN gate an edit left unrun" 1 "the output holds no NOT CHECKED line for the edited fixture gate: $(tail -n 8 "$FIXTURE22E.harness/out.txt")"
+fi
+if grep -qF 'NOT CHECKED — scripts/check-resolved-rustc.sh over this repository' "$FIXTURE22E.harness/out.txt"; then
+    report "case 22c claims no unrun edit for the toolchain precondition the run starts" 1 "$(grep -F 'check-resolved-rustc.sh over this repository' "$FIXTURE22E.harness/out.txt")"
+else
+    report "case 22c claims no unrun edit for the toolchain precondition the run starts" 0 ""
+fi
+if grep -q '^  UNCLASSIFIED' "$FIXTURE22E.harness/out.txt"; then
+    report "case 22c classifies the gate its fixture added" 1 "$(grep '^  UNCLASSIFIED' "$FIXTURE22E.harness/out.txt")"
+else
+    report "case 22c classifies the gate its fixture added" 0 ""
+fi
+
+# ── Case 22d: the DOES-NOT-RUN header names every gate the run never starts ──────────
+#
+# The header's DOES-NOT-RUN list is what a reader consults for the CI commands a green run
+# leaves unproven, and a NOT CHECKED line the list has no entry for is a command the reader
+# was never told about. Every GATES_NOT_RUN entry the script does not start as a `bash`
+# command must appear between the list's heading and `# USAGE`. Deleting item 8 turns this
+# case red; so does adding a compiling gate to GATES_NOT_RUN without a list entry.
+HEADER_LIST=$(sed -n '/^# WHAT THIS SCRIPT DOES NOT RUN/,/^# USAGE/p' "$SCRIPT")
+NOT_RUN_PATHS=$(sed -n '/^GATES_NOT_RUN=(/,/^)/p' "$SCRIPT" | grep -oE '^ *scripts/[^ ]+' | tr -d ' ')
+HEADER_MISSING=""
+while IFS= read -r gate; do
+    [[ -n $gate ]] || continue
+    grep -qE "^[^#]*bash $gate" "$SCRIPT" && continue
+    [[ $HEADER_LIST == *"$gate"* ]] || HEADER_MISSING+=" $gate"
+done <<< "$NOT_RUN_PATHS"
+if [[ -n $HEADER_LIST && -n $NOT_RUN_PATHS && -z $HEADER_MISSING ]]; then
+    report "case 22d names every unstarted GATES_NOT_RUN gate in the DOES-NOT-RUN list" 0 ""
+else
+    report "case 22d names every unstarted GATES_NOT_RUN gate in the DOES-NOT-RUN list" 1 "header list read ${#HEADER_LIST} bytes, GATES_NOT_RUN read: ${NOT_RUN_PATHS:-<none>}; missing:${HEADER_MISSING:-<none>}"
+fi
+if [[ $HEADER_LIST == *'cargo package --list'* ]]; then
+    report "case 22d names cargo package --list in the DOES-NOT-RUN list" 0 ""
+else
+    report "case 22d names cargo package --list in the DOES-NOT-RUN list" 1 "the DOES-NOT-RUN list names no cargo package --list, which the examples gate runs in the rust-clippy job"
+fi
+
 # ── Case 23: the scripts/ lane against the suites CI runs over that directory ────────
 #
 # The `scripts/` entry of UNRUN_LANES is a hand-written enumeration, and a fix agent that
@@ -1149,23 +1384,48 @@ fi
 # to reject is the fixture suite that entry names. A suite the entry omits is a red CI job
 # the output gave the agent no reason to expect.
 #
-# This case reads every `scripts/` program that a job of `.github/workflows/ci.yml` starts
-# with `bash` or with `python3.12 -m pytest`, subtracts the ones the runner's own GATES
-# array starts, and fails when the entry names fewer than what remains. Adding a suite to
-# CI without adding it there turns this case red rather than going unnoticed.
+# This case reads every `scripts/` program that `.github/workflows/ci.yml` starts with
+# `bash`, `python3`, `python3.12`, `python3.12 -m pytest` or a `./` path, wherever the
+# start sits: on a one-line `run:` step or on any line of a `run: |` block. It subtracts
+# the paths the runner's GATES and GATES_NOT_RUN arrays name, and fails when the entry
+# names fewer than what remains. Adding a suite to CI without adding it there turns this
+# case red rather than going unnoticed, whichever form of `run:` step starts it.
 #
 # THE SUBTRACTION IS THE CRITERION, and it is the lane's own: `scripts/fix-round-check.sh`
 # admits an entry for a command CI runs that no step of the run starts. A path in GATES is
-# a command the run does start, so the lane owes the reader nothing about it; every other
-# path CI starts under `scripts/` is one the run leaves unread and the lane has to name.
-# Reading the GATES array off the script rather than filtering on a `scripts/test…` name
-# keeps this case closed: a suite a later round files under any other directory name still
-# has to appear in the lane.
+# a command the run does start, so the lane owes the reader nothing about it. A path in
+# GATES_NOT_RUN is one the run either starts as its toolchain precondition or names in its
+# DOES-NOT-RUN list, which case 22d holds, so the lane owes the reader nothing about it
+# either. Every other path CI starts under `scripts/` is one the run leaves unread and the
+# lane has to name. Reading both arrays off the script rather than filtering on a
+# `scripts/test…` name keeps this case closed: a suite a later round files under any other
+# directory name still has to appear in the lane.
+ci_script_starts() {
+    grep -oE '(bash +|python3(\.12)?( +-m +pytest)? +|\./)scripts/[^ "]+' | grep -oE 'scripts/[^ "]+$' | sort -u
+}
+# The extractor's own check, on a fixture holding each start form this case claims to
+# read. A narrower pattern, such as one anchored on `run:`, drops the start inside the
+# `run: |` block and turns this assertion red.
+CI_STARTS_FIXTURE=$(ci_script_starts <<'YAML'
+      - run: bash scripts/one-line.sh
+      - run: |
+          cargo clippy --workspace
+          bash scripts/in-block.sh
+      - run: python3.12 -m pytest scripts/tests/pytest-dir/ -v
+      - run: python3 scripts/plain-python.py .github/workflows/ci.yml
+      - run: ./scripts/dot-slash.sh --skip-build
+YAML
+)
+CI_STARTS_WANT=$(printf '%s\n' scripts/dot-slash.sh scripts/in-block.sh scripts/one-line.sh scripts/plain-python.py scripts/tests/pytest-dir/ | sort -u)
+if [[ $CI_STARTS_FIXTURE == "$CI_STARTS_WANT" ]]; then
+    report "case 23 reads a scripts/ start in every run-step form" 0 ""
+else
+    report "case 23 reads a scripts/ start in every run-step form" 1 "wanted: $(echo $CI_STARTS_WANT); read: $(echo $CI_STARTS_FIXTURE)"
+fi
 LANE_LINE=$(sed -n '/^UNRUN_LANES=(/,/^)/p' "$SCRIPT" | grep -F '"scripts/|')
 LANE_SUITES=$(comm -23 \
-    <(grep -oE 'run: *(bash|python3\.12 -m pytest) +scripts/[^ ]+' "$REPO_ROOT/.github/workflows/ci.yml" |
-        sed -E 's/^.* //' | sort -u) \
-    <(gate_paths | sort -u))
+    <(ci_script_starts < "$REPO_ROOT/.github/workflows/ci.yml") \
+    <({ gate_paths; printf '%s\n' "$NOT_RUN_PATHS"; } | sort -u))
 LANE_SUITE_COUNT=$(printf '%s' "$LANE_SUITES" | grep -c . || true)
 LANE_MISSING=""
 while IFS= read -r suite; do
@@ -1182,9 +1442,9 @@ else
 fi
 # The two inputs the assertion above reads, each asserted non-empty, because an empty one
 # makes that assertion pass over nothing: an empty LANE_LINE matches no suite name, and an
-# empty suite list gives the loop no iteration. A renamed UNRUN_LANES array, a reworded
-# `run:` step in the workflow and a renamed GATES array each empty one of the two, and
-# each would otherwise leave this case green while reading no lane at all.
+# empty suite list gives the loop no iteration. A renamed UNRUN_LANES array empties the
+# first, and a reworded `run:` step in the workflow that the extractor no longer reads
+# empties the second; each would otherwise leave this case green while reading nothing.
 if [[ -n $LANE_LINE ]]; then
     report "case 23 found the scripts/ entry it reads" 0 ""
 else
@@ -1193,7 +1453,7 @@ fi
 if [[ $LANE_SUITE_COUNT -gt 0 ]]; then
     report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 0 ""
 else
-    report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 1 "subtracting the GATES array from the scripts/ programs .github/workflows/ci.yml starts left no path, so the assertion above iterated over nothing and could not fail"
+    report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 1 "subtracting the GATES and GATES_NOT_RUN arrays from the scripts/ programs .github/workflows/ci.yml starts left no path, so the assertion above iterated over nothing and could not fail"
 fi
 
 # ── Case 24: a caller-named run in a checkout that resolves no origin/main ───────────
@@ -1254,8 +1514,9 @@ fi
 #
 # The case reads both sides: every suite that qualifies has to appear in the entry, and
 # every suite the entry names has to qualify. It iterates LANE_SUITES, the set case 23
-# above reads out of `.github/workflows/ci.yml` and subtracts the GATES array from, so a
-# suite CI gains reaches this case too and a gate the run itself starts stays out of it —
+# above reads out of `.github/workflows/ci.yml` and subtracts the GATES and GATES_NOT_RUN
+# arrays from, so a suite CI gains reaches this case too and a gate the run itself starts
+# or names in its DOES-NOT-RUN list stays out of it —
 # the `.github/` entry names those three gates in its own trailing sentence, as programs
 # the run did start.
 #

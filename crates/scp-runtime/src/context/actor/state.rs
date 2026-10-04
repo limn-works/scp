@@ -2187,16 +2187,14 @@ impl ContextCryptoState {
     /// expiry) the context's crypto must be released while the `PerContextState`
     /// stays alive (the actor is NOT dropped), so nothing would otherwise free
     /// the material. Each [`ScpMlsGroup`] owns its OWN in-memory OpenMLS provider
-    /// (`InMemoryMlsProvider`), so a bare drop DOES free that storage — but it
-    /// does NOT zeroize the Ed25519 signer (OpenMLS `SignatureKeyPair` implements
-    /// no `Zeroize`; `scp-mls` `EagerDropSigner` / issue #82).
-    /// [`scp_mls::group::destroy_group`] eagerly FREES the signer's `Vec<u8>`
-    /// (via `EagerDropSigner::take`) but does NOT overwrite it — signer
-    /// zeroization stays open upstream (#82). This is NOT a shared persistent
-    /// store. This method:
+    /// (`InMemoryMlsProvider`), so a bare drop zeroizes that storage's values, and the
+    /// Ed25519 signer zeroizes on drop (OpenMLS `SignatureKeyPair` holds its
+    /// private key in `SecretVLBytes`). [`scp_mls::group::destroy_group`] drops
+    /// the signer eagerly, so it is zeroized NOW rather than when the state
+    /// drops. This is NOT a shared persistent store. This method:
     ///
-    /// - runs `destroy_group` on the MLS group (eagerly frees the signer bytes —
-    ///   not zeroized, #82 — and drops the in-memory OpenMLS state), then nulls
+    /// - runs `destroy_group` on the MLS group (eagerly drops the signer, which
+    ///   zeroizes its private key, and zeroizes the provider storage), then nulls
     ///   the handle;
     /// - drops the local `sender_key` and the whole `sender_key_store`, whose
     ///   `SenderKey`s zeroize on drop (`ZeroizeOnDrop`);
@@ -2240,8 +2238,7 @@ impl ContextCryptoState {
             // teardown or the idempotent `Err(MlsError::GroupDestroyed)` on a
             // retry — BOTH mean the group is gone. There is no partial-failure
             // branch, so an MLS group present at entry is verifiably destroyed
-            // here (subject to the #82 signer-not-zeroized-only-freed caveat
-            // documented above).
+            // here, and its signer's private key zeroized.
             let _ = scp_mls::group::destroy_group(group);
         }
         self.mls_group = None;
@@ -2373,9 +2370,9 @@ impl PerContextState {
     /// failed-persist creation-rollback branches (#2148 F6) so the crypto is
     /// eagerly freed via `destroy_group` — consistent with the close/TTL
     /// teardown seam. On these rollback branches the owner drops on the very
-    /// next line regardless, so this is defense-in-depth / forward-compat with
-    /// #82 (destroy_group frees but does NOT zeroize the Ed25519 signer today;
-    /// if upstream ever adds `Zeroize` this path would then zeroize it).
+    /// next line regardless, so this is defense-in-depth (`destroy_group` drops
+    /// the Ed25519 signer, whose private key zeroizes on drop, a line earlier
+    /// than the bare drop would).
     ///
     /// # Returns — the OBSERVED disposal outcome (#2199)
     ///
@@ -3105,12 +3102,12 @@ impl PerContextState {
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
         wrapping_public_key: [u8; 32],
         wrapping_secret_key: &[u8],
-    ) -> Result<Vec<u8>, ContextError> {
+    ) -> Result<Zeroizing<Vec<u8>>, ContextError> {
         let ContextModeState::Encrypted(crypto) = &self.mode else {
-            return Ok(Vec::new());
+            return Ok(Zeroizing::default());
         };
         let Some(mls_group) = crypto.mls_group.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(Zeroizing::default());
         };
 
         // Extract the MLS group and signer, both required for restore.
@@ -3124,36 +3121,26 @@ impl PerContextState {
 
         let group_id = group.group_id().as_slice().to_vec();
 
-        // SECURITY: Wrapped in Zeroizing so the Ed25519 private key bytes are
-        // zeroed if an early `?` return occurs before the snapshot is built.
-        let mut signer_bytes = Zeroizing::new(
-            rmp_serde::to_vec_named(signer)
-                .map_err(|e| ContextError::CryptoFailed(format!("signer serialization: {e}")))?,
-        );
-
-        // Extract the raw key-value pairs from the OpenMLS MemoryStorage.
-        let mls_storage_entries = {
-            use openmls_traits::OpenMlsProvider as _;
-            let values =
-                mls_group.provider().storage().values.read().map_err(|e| {
-                    ContextError::CryptoFailed(format!("storage lock poisoned: {e}"))
-                })?;
-            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        };
-
         // Collect sender key store entries for this context.
         let ctx_id_hex = hex::encode(self.context_id);
-        let sender_key_entries: Vec<(String, SenderKey)> = crypto
-            .sender_key_store
-            .get_all(&ctx_id_hex)
-            .into_iter()
-            .collect();
+        let sender_key_entries: Zeroizing<Vec<(String, SenderKey)>> = Zeroizing::new(
+            crypto
+                .sender_key_store
+                .get_all(&ctx_id_hex)
+                .into_iter()
+                .collect(),
+        );
 
         let local_sender_key = crypto.sender_key.clone().ok_or_else(|| {
             ContextError::CryptoFailed("no sender key for this context".to_string())
         })?;
 
-        let mut snapshot = MlsCryptoSnapshot {
+        // Both come back in types that wipe on drop.
+        let (signer_bytes, mls_storage_entries) =
+            scp_mls::snapshot::capture_signer_and_storage(mls_group.provider(), signer)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let snapshot = MlsCryptoSnapshot {
             mls_storage_entries,
             local_sender_key,
             sender_key_entries,
@@ -3175,31 +3162,29 @@ impl PerContextState {
                 .into_iter()
                 .map(|(did, rf)| (did, rf.epoch, rf.sequence))
                 .collect(),
-            signer_bytes: std::mem::take(&mut signer_bytes),
+            signer_bytes,
             group_id,
             wrapping_public_key,
-            wrapping_secret_key: wrapping_secret_key.to_vec(),
+            wrapping_secret_key: Zeroizing::new(wrapping_secret_key.to_vec()),
         };
 
-        let result = rmp_serde::to_vec_named(&snapshot)
-            .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")));
-
-        // SECURITY: zeroize sensitive key material in the intermediate snapshot
-        // (the `Drop` impl is the backstop). The serialized blob is the caller's
-        // responsibility (Storage encrypts at rest per §17.5).
-        snapshot.zeroize_secrets();
-
-        result
+        // One exactly-sized buffer, wiped on drop: the blob carries the signer,
+        // the provider's HPKE and epoch secrets, and the wrapping secret. The
+        // snapshot's secret fields wipe themselves when it drops; the blob
+        // stays in `Zeroizing` through `ContextSnapshot::mls_crypto_state` to
+        // the storage call (Storage encrypts at rest per §17.5).
+        scp_mls::secret_msgpack::encode_named(&snapshot)
+            .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")))
     }
 
     /// Destroys the MLS group for this context (creation rollback).
     ///
     /// #2148 (birth-into-actor): the provider's `destroy_mls_group` is DELETED;
     /// this actor-owned method is the sole group-teardown path. It eagerly frees
-    /// the group (via `destroy_group`; the Ed25519 signer is freed, NOT zeroized —
-    /// #82) + nulls the GROUP handle (`crypto.mls_group = None`); the sibling crypto material
-    /// (`sender_key`, `sender_key_store`, `member_wrapping_keys`, epoch/sequence)
-    /// stays RESIDENT and its old `sender_key` is NOT zeroized.
+    /// the group (via `destroy_group`; the Ed25519 signer zeroizes on drop) and
+    /// nulls the GROUP handle (`crypto.mls_group = None`); the sibling crypto
+    /// material (`sender_key`, `sender_key_store`, `member_wrapping_keys`,
+    /// epoch/sequence) stays RESIDENT and its old `sender_key` is NOT zeroized.
     ///
     /// # Disposal-hygiene contract for the caller (atomic core)
     ///
@@ -4326,8 +4311,9 @@ mod crypto_ops_golden {
     }
 
     /// Apply a public MLS Commit (as produced by `advance_epoch` / `remove_member`)
-    /// to an encrypted actor's group, mirroring the real deliver path
-    /// (`scp_mls::ratchet::process_commit`).
+    /// to an encrypted actor's group through `scp_mls::ratchet::process_commit`,
+    /// which runs the same `decrypt_with_sender_did` path as the backend's
+    /// `process_commit`.
     fn process_commit_on_actor(
         state: &mut PerContextState,
         commit_bytes: &[u8],
@@ -4336,7 +4322,7 @@ mod crypto_ops_golden {
         match &mut state.mode {
             ContextModeState::Encrypted(c) => {
                 let group = c.mls_group.as_mut().expect("group present");
-                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace)
+                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace, &SystemClock)
             }
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
         }
@@ -4803,6 +4789,59 @@ mod crypto_ops_golden {
             restored.local_sender_key_epoch(),
             orig_epoch,
             "restored local sender-key epoch must match the original"
+        );
+    }
+
+    /// `MlsCryptoSnapshot`'s `Zeroizing` fields encode exactly as the plain
+    /// fields they replaced: the exported blob decodes into the plain-field
+    /// layout and re-encodes to the same bytes, and those bytes decode back
+    /// into the wiping type.
+    #[test]
+    fn crypto_snapshot_encodes_like_plain_fields() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Plain {
+            mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+            local_sender_key: SenderKey,
+            sender_key_entries: Vec<(String, SenderKey)>,
+            sender_key_epochs: Vec<(String, u64)>,
+            sender_key_epoch: u64,
+            send_sequence: u64,
+            member_wrapping_keys: Vec<(String, [u8; 32])>,
+            signer_bytes: Vec<u8>,
+            group_id: Vec<u8>,
+            recv_sequence_tracker: Vec<(String, u64, u64)>,
+            wrapping_public_key: [u8; 32],
+            wrapping_secret_key: Vec<u8>,
+        }
+        let (alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
+        // A peer's sender key, so `sender_key_entries` is not empty.
+        alice_a.set_sender_key_unchecked(
+            BOB,
+            scp_protocol::crypto::sender_keys::generate_sender_key(),
+        );
+        let (wpub, wsec) = alice_p.wrapping_keypair_snapshot();
+        let blob = alice_a
+            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+            .unwrap();
+
+        let plain: Plain = rmp_serde::from_slice(&blob).unwrap();
+        assert!(!plain.mls_storage_entries.is_empty());
+        assert!(!plain.sender_key_entries.is_empty());
+        assert_eq!(plain.wrapping_secret_key, wsec.to_vec());
+        let plain_bytes = rmp_serde::to_vec_named(&plain).unwrap();
+        assert_eq!(*blob, plain_bytes);
+
+        let wiping: MlsCryptoSnapshot = rmp_serde::from_slice(&plain_bytes).unwrap();
+        assert_eq!(*wiping.signer_bytes, plain.signer_bytes);
+        assert_eq!(*wiping.mls_storage_entries, plain.mls_storage_entries);
+        assert_eq!(*wiping.wrapping_secret_key, plain.wrapping_secret_key);
+        assert_eq!(
+            wiping.local_sender_key.as_bytes(),
+            plain.local_sender_key.as_bytes()
+        );
+        assert_eq!(
+            wiping.sender_key_entries.len(),
+            plain.sender_key_entries.len()
         );
     }
 

@@ -47,7 +47,7 @@ use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 
 use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
-use crate::{ApplicationNode, PublicSurface, projection};
+use crate::{ApplicationNode, NodeError, PublicSurface, projection};
 
 /// A single static asset to publish: HTTP path, content type, and body bytes.
 ///
@@ -375,6 +375,13 @@ impl SelfHostDeployer {
             // scope is `Ephemeral`, which `create_context` rejects for
             // broadcast mode.
             memory_scope: scp_core::context::params::MemoryScope::Full,
+            // A create must declare a non-empty ceiling (construction.md M2);
+            // the site's author publishes content and its subscribers read
+            // it, so the ceiling is messaging only.
+            ceiling: vec![
+                scp_core::context::roles::Capability::MessagesRead,
+                scp_core::context::roles::Capability::MessagesWrite,
+            ],
             ..Default::default()
         };
         supervisor
@@ -463,8 +470,7 @@ impl SelfHostDeployer {
 ///
 /// The async resolution is bridged to the sync `KeyResolver` signature with a
 /// runtime-FLAVOR-aware match, mirroring the repo's other async→sync bridges
-/// ([`ApplicationNode`]'s `stop_and_wait` and the supervisor's
-/// `try_consume_hard_rate_limit_from_any_context`):
+/// (the supervisor's `try_consume_hard_rate_limit_from_any_context`):
 /// - **No ambient runtime** (a bare sync caller / `block_on`-driven entry):
 ///   `handle.block_on` drives the resolve directly.
 /// - **Multi-thread runtime:** [`block_in_place`](tokio::task::block_in_place)
@@ -526,7 +532,7 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
                 tokio::runtime::RuntimeFlavor::MultiThread => {
                     let outcome = tokio::task::block_in_place(|| {
                         handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
-                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
+                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors try_consume_hard_rate_limit_from_any_context)
                     let doc = outcome.ok().flatten()?;
                     scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
                 }
@@ -879,8 +885,16 @@ pub struct HostSiteReady {
 /// config (share the address out-of-band) — never an error. [`DhtMode::Memory`]
 /// is the test-harness-only analog and is not a shipped option.
 ///
-/// See the runnable example at `crates/scp-node/examples/website.rs` and the
-/// guide `.docs/guides/self-hosting-a-website-on-scp.md`.
+/// See the example at `crates/scp-node/examples/website.rs` and the guide
+/// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
+/// `PreRotationCustody` backend exists, [`host_site`] and [`host_site_until`]
+/// fail on every build without the `testing` feature whenever the resolved
+/// `storage_path` directory holds no persisted identity, a first deployment
+/// included: they return [`HostSiteError::NodeBuild`] holding
+/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value,
+/// and the example exits 1 with it. A
+/// `testing` build creates the identity only through the test-harness
+/// `InMemoryPreRotationCustody` stand-in.
 pub struct HostSiteConfig {
     // --- Required (irreducible; no whole-struct Default — M4) ---
     /// How the hosted site is reached from the outside (addressing XOR).
@@ -1057,18 +1071,25 @@ pub enum HostSiteError {
     /// The DID method (DHT client) could not be constructed.
     #[error("DID method error: {0}")]
     DidMethod(String),
-    /// The application node failed to build.
+    /// The application node failed to build. Carries the typed [`NodeError`],
+    /// so a caller matches `NodeBuild(NodeError::Identity(
+    /// IdentityError::NoPreRotationBackend))` to detect a missing pre-rotation
+    /// custody backend without reading the message text. The `NodeError` text is
+    /// in this variant's Display and not returned from `source()`, so a
+    /// chain-walking reporter prints it once.
     #[error("node build error: {0}")]
-    NodeBuild(String),
+    NodeBuild(NodeError),
     /// The site assets could not be loaded from the site directory.
     #[error("load assets error: {0}")]
     LoadAssets(String),
     /// The self-signed TLS configuration could not be built.
     #[error("TLS config error: {0}")]
     Tls(String),
-    /// The site deploy (publish + commit) failed.
+    /// The site deploy (publish + commit) failed. The `SelfHostError` text is
+    /// in this variant's Display and not returned from `source()`, so a
+    /// chain-walking reporter prints it once.
     #[error("deploy error: {0}")]
-    Deploy(#[from] SelfHostError),
+    Deploy(SelfHostError),
     /// The deployer setup (loopback supervisor / broadcast group) failed.
     #[error("deployer setup error: {0}")]
     DeployerSetup(String),
@@ -1171,9 +1192,15 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// shutdown.
 ///
 /// See [`HostSiteConfig`] for configuration (including the local-demo vs
-/// public-hosting distinction), the runnable example at
+/// public-hosting distinction), the example at
 /// `crates/scp-node/examples/website.rs`, and the guide
-/// `.docs/guides/self-hosting-a-website-on-scp.md`.
+/// `.docs/guides/self-hosting-a-website-on-scp.md`. Until a production
+/// `PreRotationCustody` backend exists, this function fails on every build
+/// without the `testing` feature whenever the resolved `storage_path`
+/// directory holds no persisted identity, a first deployment included (see
+/// `# Errors`), and the example exits 1 with that error. A `testing` build
+/// creates the identity only through the test-harness
+/// `InMemoryPreRotationCustody` stand-in.
 ///
 /// The default [`DhtMode::Disabled`] publishes nothing to the network (fail-safe).
 /// To make the site publicly reachable, opt in with [`DhtMode::Production`],
@@ -1192,6 +1219,13 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
 /// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
+///
+/// On every build without the `testing` feature, returns
+/// [`HostSiteError::NodeBuild`] holding
+/// `NodeError::Identity(IdentityError::NoPreRotationBackend)` as a typed value
+/// whenever the resolved `storage_path` directory holds no persisted
+/// identity, because no production `PreRotationCustody` backend exists to
+/// create one.
 pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
     host_site_until(config, async {
         scp_transport::startup::shutdown_signal().await;
@@ -1327,8 +1361,9 @@ where
             tracing::info!(
                 "DhtMode::Disabled — DHT layer off: the DID document is NOT published (no address \
                  disclosed, fail-closed on publish) and the DHT resolution arm returns Ok(None). \
-                 DID resolution composes the relay layer around the off DHT arm (the fail-safe \
-                 default; set DhtMode::Production to host publicly)"
+                 The relay layer is a NoOpRelayQuerier until SCP-RELAYRES-006, so resolution \
+                 answers from the cache alone (the fail-safe default; set DhtMode::Production \
+                 to host publicly)"
             );
             let did_method = build_disabled_did_method(cache);
             let key_resolver = build_shared_cache_key_resolver(
@@ -1975,9 +2010,12 @@ pub fn build_memory_did_method(
 /// disclosed) and resolve contributes an honest `Ok(None)` — never a fabricated
 /// or in-memory answer (ADR-062 §Decision 1, A2). The method shares the node's
 /// [`DidCache`] with the co-located resolver but carries no signer (it never
-/// publishes). DID resolution still runs: the
-/// [`DualLayerResolver`](scp_identity::DualLayerResolver) composes the
-/// relay layer around the off DHT arm.
+/// publishes). The [`DualLayerResolver`](scp_identity::DualLayerResolver)
+/// composes the relay layer around the off DHT arm, but the relay layer
+/// `host_site` wires is a
+/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier) that also
+/// answers `Ok(None)` until SCP-RELAYRES-006, so resolution answers from the
+/// cache alone.
 #[must_use]
 pub fn build_disabled_did_method(
     cache: Arc<DidCache>,
@@ -2279,7 +2317,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
             // `Node::start` establishes the inbound port mapping during NAT tier
             // selection and CAN still fail afterward, so release best-effort.
             release_self_host_mappings(upnp_mapper, natpmp_mapper, http_addr.port()).await;
-            Err(HostSiteError::NodeBuild(e.to_string()))
+            Err(HostSiteError::NodeBuild(e))
         }
     }
 }
@@ -2500,6 +2538,94 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
+    /// detects a missing pre-rotation backend by pattern, and the same pattern
+    /// rejects every other node-build failure. `NodeBuild` and `Deploy` each
+    /// print their wrapped error once, in Display, and return no `source()`.
+    #[test]
+    fn node_build_error_keeps_typed_no_pre_rotation_backend() {
+        let is_missing_backend = |e: &HostSiteError| {
+            matches!(
+                e,
+                HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend))
+            )
+        };
+        let missing =
+            HostSiteError::NodeBuild(NodeError::Identity(IdentityError::NoPreRotationBackend));
+        assert!(is_missing_backend(&missing));
+        // The NodeError text is in Display only; returning it from `source()`
+        // as well would print it twice in a chain-walking reporter.
+        assert!(
+            std::error::Error::source(&missing).is_none(),
+            "NodeBuild must not return its NodeError from source(), Display already carries it"
+        );
+        assert!(
+            missing
+                .to_string()
+                .starts_with("node build error: identity error: no production pre-rotation"),
+            "Display keeps the message text: {missing}"
+        );
+
+        // `Deploy` wraps a typed error the same way and follows the same rule.
+        let deploy = HostSiteError::Deploy(SelfHostError::CommitDeploy("x".to_owned()));
+        assert!(
+            std::error::Error::source(&deploy).is_none(),
+            "Deploy must not return its SelfHostError from source(), Display already carries it"
+        );
+        assert_eq!(
+            deploy.to_string(),
+            "deploy error: failed to commit deploy: x"
+        );
+
+        let other = HostSiteError::NodeBuild(NodeError::Nat("no tier".to_owned()));
+        assert!(!is_missing_backend(&other));
+        let other_config = HostSiteError::InvalidConfig("x".to_owned());
+        assert!(!is_missing_backend(&other_config));
+    }
+
+    /// On a build without `testing`, `host_site_until` over an empty storage
+    /// directory returns `HostSiteError::NodeBuild(NodeError::Identity(
+    /// IdentityError::NoPreRotationBackend))`, the typed value the rustdoc,
+    /// `examples/website.rs`, and the deploying guide promise an embedder can
+    /// match. The name carries `pre_rotation_severance` so the CI lane that
+    /// runs `-p scp-node --lib -E 'test(pre_rotation_severance)'` without
+    /// `testing` selects it.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn pre_rotation_severance_host_site_returns_typed_node_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_dir = tmp.path().join("storage");
+        let site_dir = tmp.path().join("site");
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        std::fs::create_dir_all(&site_dir).expect("create site dir");
+        std::fs::write(site_dir.join("index.html"), "<html></html>").expect("write index");
+
+        let config = HostSiteConfig {
+            tls: TlsMode::Plaintext,
+            site_dir: Some(site_dir),
+            port: 0,
+            storage_path: Some(storage_dir),
+            ..HostSiteConfig::defaults(Reach::Local)
+        };
+        // A shutdown that never fires: a regression that builds the node would
+        // serve until the timeout below and fail instead of hanging.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_mins(1),
+            host_site_until(config, std::future::pending::<()>()),
+        )
+        .await
+        .expect("host_site_until must fail closed, not serve");
+        match outcome {
+            Err(HostSiteError::NodeBuild(NodeError::Identity(
+                IdentityError::NoPreRotationBackend,
+            ))) => {}
+            other => panic!(
+                "expected NodeBuild(Identity(NoPreRotationBackend)) on a build without \
+                 `testing`, got: {other:?}"
+            ),
+        }
+    }
 
     // -----------------------------------------------------------------------
     // HostSiteConfig shape + reach/tls lowering (`lower_host_site_reach_tls`)

@@ -9266,8 +9266,6 @@ public func FfiConverterTypeCheckpoint_lower(_ value: Checkpoint) -> RustBuffer 
 /**
  * Context creation parameters.
  *
- * All fields are optional and fall back to protocol defaults when omitted.
- *
  * See ADR-008 (Context Lifecycle) and spec §5 (Contexts).
  */
 public struct ContextParams {
@@ -9278,7 +9276,8 @@ public struct ContextParams {
     public var mode: ContextMode
     /**
      * Capability ceiling — maximum capabilities any participant can hold.
-     * Empty list means no ceiling restriction.
+     * Required and non-empty (construction.md M2): an empty list fails the
+     * create with `SCP-VALID-7005`.
      */
     public var ceiling: [String]
     /**
@@ -9355,7 +9354,8 @@ public struct ContextParams {
          */mode: ContextMode, 
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
-         * Empty list means no ceiling restriction.
+         * Required and non-empty (construction.md M2): an empty list fails the
+         * create with `SCP-VALID-7005`.
          */ceiling: [String], 
         /**
          * Ceiling mutability policy — `Immutable` (default) or `Governed`.
@@ -14556,7 +14556,9 @@ extension StorageConfig: Equatable, Hashable {}
  * Swift SDK: `DCAppAttestService` (App Attest on iOS 14+ / macOS 11+).
  * Kotlin SDK: Play Integrity API on Android.
  *
- * Implemented by Swift/Kotlin code and injected into the Rust engine.
+ * The Swift SDK's `AppleDeviceAttestation` conforms to this callback
+ * interface. No Rust code holds or calls it yet, so nothing injects an
+ * implementation into the Rust engine.
  *
  * # SAFETY: Thread execution context
  *
@@ -14573,19 +14575,36 @@ public protocol DeviceAttestationProvider: AnyObject, Sendable {
     /**
      * Generate a cryptographic attestation for this device.
      *
-     * `challenge` — server-provided challenge bytes (SHA-256 digested with
-     * `device_id` before submission to the platform attestation service).
-     * `device_id` — stable identifier for this device instance.
+     * `challenge` — Apple: the 32-byte binding digest `D` of
+     * `09-security-model.md` §9.3.1, which the Swift adapter hands App
+     * Attest as `clientDataHash` unchanged. When App Attest is supported,
+     * the adapter rejects a `challenge` that is not 32 bytes with
+     * `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3); when it is not
+     * supported, the adapter throws `SCP-ATTEST-9019` before it reads the
+     * length. Android: ADR-027, the Android platform adapter, states
+     * what it binds.
+     * `device_id` — stable identifier for this device instance. The Swift
+     * adapter does not read it.
      *
-     * Returns the platform attestation object bytes (Apple: CBOR-encoded
-     * attestation; Android: Play Integrity token bytes).
+     * Returns the platform attestation bytes. Apple: the raw CBOR attestation
+     * object Apple signed (ADR-025 acceptance criterion 3). Android: the Play
+     * Integrity token bytes.
      */
     func attest(challenge: Data, deviceId: Data) async throws  -> Data
     
     /**
      * Generate a per-request assertion proving key possession.
      *
-     * `request_hash` — SHA-256 hash of the request data being asserted.
+     * `request_hash` — the assertion digest
+     * `A = SHA-256("SCP-DEVICE-ASSERTION-V1:" ‖ BE32(len(m)) ‖ m)` of
+     * `09-security-model.md` §9.3.1 over the caller's request bytes `m`,
+     * never `SHA-256(m)` and never `m` itself. The domain separator keeps
+     * every `A` distinct from every attestation binding digest `D`. The
+     * Swift adapter hands `A` to App Attest as `clientDataHash` unchanged.
+     * When App Attest is supported, the adapter rejects an `A` that is not
+     * 32 bytes with `SCP-ATTEST-9026` (ADR-025 acceptance criterion 3);
+     * when it is not supported, the adapter throws `SCP-ATTEST-9019`
+     * before it reads the length.
      *
      * Returns the platform assertion object bytes (Apple: CBOR assertion;
      * Android: integrity verdict).
@@ -15608,7 +15627,12 @@ public protocol PushProvider: AnyObject, Sendable {
     /**
      * Handle an incoming push notification `payload`.
      *
-     * Returns wake signal bytes indicating which context has new messages.
+     * An implementation returns fixed wake signal bytes that do not depend on
+     * `payload` and copy no byte of it. §10.7 of the infrastructure spec
+     * states: "Push payloads MUST contain a wake signal and nothing else. No
+     * context ID, no sender identifier, no message preview, no metadata of any
+     * kind." A wake signal built from the received bytes would hand the caller
+     * whatever a relay put in them. No Rust code calls this method yet.
      */
     func handleNotification(payload: Data) async throws  -> Data
     
@@ -18414,10 +18438,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 20129) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 17302) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_assert_request() != 50940) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 52852) {
@@ -18459,7 +18483,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_register_push() != 31432) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 49354) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_pushprovider_handle_notification() != 50826) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_storageprovider_get() != 34518) {

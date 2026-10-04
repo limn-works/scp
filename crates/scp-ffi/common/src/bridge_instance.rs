@@ -4260,55 +4260,115 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn suspend_cancels_in_flight_reconnect_dial() {
-        // #1696 regression: a `suspend()` firing while
-        // `reconnect_transport_if_pending` is mid-dial must cancel the
-        // reconnect so the half-connected adapter is dropped before
-        // `NativeRelayAdapter` construction completes — preventing the
-        // socket leak that motivated #1696. We can't directly observe
-        // an OS-level socket handle in a unit test, but we can prove
-        // the cancellation path fires and aborts the loop: the dial
-        // target is unreachable so the future is "in-flight" until
-        // connect timeout, giving us a window to cancel.
-        use std::time::Duration;
+    /// Polls `reconnect` exactly once and asserts it is still pending.
+    ///
+    /// `reconnect_transport_if_pending` runs synchronously from entry
+    /// through the `is_shutdown()` check, the reconnect-cancel token
+    /// snapshot and the dial spawns until it parks in its collect
+    /// `select!`. A pending first poll therefore proves the reconnect is
+    /// in flight past the shutdown check, holding the token that a later
+    /// `suspend()` / `shutdown()` cancels. The first poll is pending only
+    /// while a dial is still outstanding, so callers dial
+    /// [`stalling_relay_url`].
+    async fn poll_reconnect_into_dial<F>(reconnect: &mut std::pin::Pin<&mut F>)
+    where
+        F: std::future::Future<Output = Result<(), LifecycleError>>,
+    {
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(reconnect.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "reconnect must park in its dial phase on the first poll, got {first:?}"
+        );
+    }
 
-        let instance = std::sync::Arc::new(CoreFields::with_supervisor(test_supervisor()));
-        // Reserved TEST-NET-1 address (RFC 5737) with a closed port —
-        // `connect_sourced` stalls until the profile's handshake timeout.
-        let unreachable = "ws://192.0.2.1:1/".to_owned();
-        instance.add_relay_url(unreachable.clone());
+    /// Binds a loopback listener that never accepts and returns it with
+    /// its `ws://` URL. A loopback `ws://` URL passes relay URL
+    /// validation, the kernel completes the TCP handshake from the listen
+    /// backlog, and the WebSocket handshake response never arrives, so a
+    /// reconnect dial to the URL stays outstanding until
+    /// `RECONNECT_PER_URL_TIMEOUT` while the listener is alive.
+    async fn stalling_relay_url() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        (listener, url)
+    }
 
-        let instance_clone = std::sync::Arc::clone(&instance);
-        let reconnect_handle =
-            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
-
-        // Give the reconnect a moment to enter the dial. Spawn order
-        // does not guarantee the future has polled through `.await`
-        // yet, so sleep a short tick before firing suspend.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Fire suspend — rotates the reconnect-cancel token and
-        // cancels the in-flight dial.
-        instance.suspend().unwrap();
-
-        // The reconnect must wake on cancellation promptly — with a
-        // generous upper bound to tolerate slow CI runners. The
-        // production handshake timeout would be on the order of
-        // seconds, so anything inside ~1s proves the cancellation
-        // actually fired rather than the dial naturally timing out.
-        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
-            .await
-            .unwrap()
-            .unwrap();
-
+    /// Asserts `result` is the error the mid-dial cancel branch of
+    /// `reconnect_transport_if_pending` returns: `ReconnectFailed` with an
+    /// empty `url` and the "while dials were in flight" reason. A per-URL
+    /// dial failure carries the URL, and the cancel check before install
+    /// carries a "before install" reason, so both fail this assertion.
+    fn assert_cancelled_mid_dial(result: &Result<(), LifecycleError>) {
         assert!(
             matches!(
-                reconnect_result,
-                Err(LifecycleError::ReconnectFailed { .. })
+                result,
+                Err(LifecycleError::ReconnectFailed { url, reason })
+                    if url.is_empty() && reason.contains("while dials were in flight")
             ),
-            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
+            "reconnect must end through the mid-dial cancel branch \
+             (ReconnectFailed, empty url, \"while dials were in flight\"), got {result:?}"
         );
+    }
+
+    #[test]
+    fn assert_cancelled_mid_dial_accepts_only_the_mid_dial_cancel_error() {
+        let failed = |url: &str, reason: &str| -> Result<(), LifecycleError> {
+            Err(LifecycleError::ReconnectFailed {
+                url: url.to_owned(),
+                reason: reason.to_owned(),
+            })
+        };
+        assert_cancelled_mid_dial(&failed(
+            "",
+            "reconnect suspended during reconnect — caller invoked suspend()/shutdown() while dials were in flight",
+        ));
+        let rejected = [
+            // Per-URL dial failure.
+            failed("ws://192.0.2.1:1/", "connect timeout after 5s"),
+            // Cancel check before install.
+            failed(
+                "",
+                "reconnect suspended during reconnect — caller invoked suspend()/shutdown() before install",
+            ),
+            // Spawned dial task panicked.
+            failed("", "spawned reconnect task panicked: boom"),
+            Ok(()),
+        ];
+        for result in rejected {
+            assert!(
+                std::panic::catch_unwind(|| assert_cancelled_mid_dial(&result)).is_err(),
+                "assert_cancelled_mid_dial must reject {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suspend_cancels_in_flight_reconnect_dial() {
+        // A `suspend()` firing while `reconnect_transport_if_pending` is
+        // mid-dial must cancel the reconnect.
+        use std::time::Duration;
+
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        let (_relay, url) = stalling_relay_url().await;
+        instance.add_relay_url(url);
+
+        let reconnect = instance.reconnect_transport_if_pending();
+        tokio::pin!(reconnect);
+        poll_reconnect_into_dial(&mut reconnect).await;
+
+        // Fire suspend: cancels the token the reconnect snapshotted and
+        // rotates in a fresh one.
+        instance.suspend().unwrap();
+
+        // The collect `select!` is biased toward the cancel branch, so
+        // the next poll takes it even if a dial has already finished.
+        // The bound only guards against a hang.
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect)
+            .await
+            .unwrap();
+
+        assert_cancelled_mid_dial(&reconnect_result);
         assert!(
             !instance.has_transport(),
             "suspend must leave transport cleared after the cancelled reconnect"
@@ -4317,34 +4377,30 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_in_flight_reconnect_dial() {
-        // #1696: `shutdown()` must also cancel a pending reconnect.
-        // Same dynamics as the suspend variant — uses the same TEST-NET-1
-        // unreachable target to keep the dial in-flight.
+        // `shutdown()` must also cancel a pending reconnect. Same dynamics
+        // as the suspend variant. `shutdown()` reaches `block_in_place`
+        // through `shutdown_all_contexts_sync`, so this test needs the
+        // multi-thread runtime.
         use std::time::Duration;
 
-        let instance = std::sync::Arc::new(CoreFields::with_supervisor(test_supervisor()));
-        let unreachable = "ws://192.0.2.1:1/".to_owned();
-        instance.add_relay_url(unreachable);
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        let (_relay, url) = stalling_relay_url().await;
+        instance.add_relay_url(url);
 
-        let instance_clone = std::sync::Arc::clone(&instance);
-        let reconnect_handle =
-            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
+        let reconnect = instance.reconnect_transport_if_pending();
+        tokio::pin!(reconnect);
+        // Shutting down before the reconnect passes its `is_shutdown()`
+        // check would make it return `AlreadyShutDown` instead of
+        // exercising cancellation; the pending first poll rules that out.
+        poll_reconnect_into_dial(&mut reconnect).await;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
         instance.shutdown();
 
-        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect)
             .await
-            .unwrap()
             .unwrap();
 
-        assert!(
-            matches!(
-                reconnect_result,
-                Err(LifecycleError::ReconnectFailed { .. })
-            ),
-            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
-        );
+        assert_cancelled_mid_dial(&reconnect_result);
     }
 
     #[tokio::test]
@@ -4777,7 +4833,10 @@ mod tests {
         assert!(instance.is_shutdown());
     }
 
-    #[tokio::test]
+    // `start_paused` makes the runtime clock jump to the 500 ms drain
+    // deadline once the sleeping task is the only one left, so the test
+    // reaches `TimedOut` without waiting on wall-clock time.
+    #[tokio::test(start_paused = true)]
     async fn shutdown_core_async_times_out_with_long_task() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         {
@@ -4787,15 +4846,6 @@ mod tests {
                 tokio::time::sleep(Duration::from_mins(1)).await;
             });
         }
-        // Review feedback (test-quality, review-round-N): the original
-        // 100 ms budget was flaky on slow CI runners — `drain_under_deadline`
-        // uses `std::time::Instant::now()` (wall-clock), so
-        // `tokio::time::pause()` would not help here. Raising the budget
-        // to 500 ms keeps the test's intent (a sub-second deadline on a
-        // task that sleeps for a full minute) while tolerating scheduler
-        // jitter. If CI flakiness recurs, bump further — the test's
-        // correctness signal is the `TimedOut` outcome, not the wall-
-        // clock bound.
         let outcome = instance
             .shutdown_core_async(Duration::from_millis(500))
             .await
@@ -4840,41 +4890,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// Drain deadline for [`shutdown_core_async_counts_panicked_tasks`].
+    const SLOW_PANIC_DEADLINE: Duration = Duration::from_millis(100);
+    /// Wall-clock time one panicking task holds the runtime thread before it
+    /// panics. It exceeds [`SLOW_PANIC_DEADLINE`] on purpose.
+    const SLOW_PANIC_STALL: Duration = Duration::from_millis(300);
+
+    // `drain_under_deadline` bounds the drain with `tokio::time::timeout`,
+    // which reads the runtime clock. On a real clock, wall time that a task
+    // spends holding the only runtime thread counts against the deadline. A
+    // panicking task holds that thread while the panic hook runs, and with
+    // `RUST_BACKTRACE=1` (set in `.github/workflows/ci.yml`) the default hook
+    // captures and symbolizes a backtrace, which took over 2 s on a loaded CI
+    // runner. The time driver then fired the deadline before the clean task's
+    // `yield_now` returned, so shutdown aborted that task and reported
+    // `TimedOut { aborted_tasks: 1, panicked_tasks: 2 }`. That outcome is
+    // correct shutdown behaviour for a deadline that has passed, so the defect
+    // was the test's assumption that panicking takes less than the deadline.
+    //
+    // `start_paused` freezes the runtime clock: it moves only when every task
+    // is idle, and no task in this test ever waits on time, so the deadline
+    // cannot fire before the drain completes. `SLOW_PANIC_STALL` blocks the
+    // thread for longer than the deadline to stand in for a slow panic hook;
+    // on a real clock this test fails every run with the outcome above.
+    #[tokio::test(start_paused = true)]
     #[allow(clippy::panic)]
     async fn shutdown_core_async_counts_panicked_tasks() {
-        // Spawn a task that panics quickly — the drain should observe it
-        // and surface the count in `GracefulWithin.panicked_tasks`.
+        // The drain must count the two panicking tasks in
+        // `GracefulWithin.panicked_tasks` and must not count the clean task.
         let instance = CoreFields::with_supervisor(test_supervisor());
         {
             let mut tasks = instance.task_handle().await;
             tasks.spawn(async move {
+                std::thread::sleep(SLOW_PANIC_STALL);
                 panic!("intentional panic — shutdown_core_async_counts_panicked_tasks");
             });
             tasks.spawn(async move {
                 panic!("intentional panic #2");
             });
             tasks.spawn(async move {
-                // This one exits cleanly — must not be counted as panicked.
-                //
-                // Uses `yield_now()` (one scheduler round-trip, then a clean
-                // exit) rather than a real-time `sleep`. A `sleep` here made
-                // the test flaky: the clean task then had to wait on the timer
-                // wheel to complete, and `drain_under_deadline` gates the
-                // outcome on a wall-clock deadline. Under CI scheduler
-                // starvation the drain could lose that race, flipping the
-                // outcome from `GracefulWithin` to `TimedOut` and blowing the
-                // `unreachable!` below — even though the panicked count itself
-                // is always correct. `yield_now()` completes without ever
-                // touching the timer wheel, so the drain finishes in a couple
-                // of poll cycles and never approaches the (generous) deadline,
-                // making the `GracefulWithin` outcome deterministic while still
-                // exercising a genuine clean-exit task the drain must not count.
+                // This task exits cleanly after one scheduler round-trip, so
+                // it is still unfinished when the panicking tasks complete.
                 tokio::task::yield_now().await;
             });
         }
         let outcome = instance
-            .shutdown_core_async(Duration::from_secs(2))
+            .shutdown_core_async(SLOW_PANIC_DEADLINE)
             .await
             .unwrap();
         let ShutdownOutcome::GracefulWithin { panicked_tasks, .. } = outcome else {

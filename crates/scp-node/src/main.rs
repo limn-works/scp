@@ -4,15 +4,23 @@
 //!
 //! 1. **Full node** (default): Starts an [`ApplicationNode`] with DID identity,
 //!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade). Uses
-//!    persistent `SQLite` storage by default (`SQLCipher` encrypted).
+//!    persistent `SQLite` storage by default (`SQLCipher` encrypted), and asks
+//!    for a newly generated identity on every run, so a shipped build logs
+//!    `no production pre-rotation custody backend available`
+//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
-//! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
-//!    subsystems — nothing persists across restarts.
+//! 3. **Ephemeral** (`--ephemeral`, `testing` builds only): Runs a full node
+//!    with all in-memory subsystems — nothing persists across restarts. A
+//!    shipped build exits 1 on `--ephemeral`.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
 //!    (no DNS name required) — opens an inbound public port, publishes the host's
 //!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
-//!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP).
+//!    (`SCP_NODE_SELF_HOST_PLAINTEXT=1` for plain HTTP). A shipped build
+//!    starts only from a storage directory that already holds an identity;
+//!    given a directory that holds none it logs `self-host mode failed` with
+//!    `no production pre-rotation custody backend available`
+//!    (`IdentityError::NoPreRotationBackend`) and exits 1.
 //!
 //! Configuration is read from CLI flags and environment variables.
 
@@ -61,9 +69,13 @@ struct CliConfig {
 /// Accepts:
 ///   `--relay-only`       — relay-only mode
 ///   `--health`           — TCP health probe
-///   `--ephemeral`        — all in-memory subsystems
-///   `--storage-path <p>` — `SQLite` database directory
-///   `--help`             — print usage and exit
+///   `--ephemeral`        — all in-memory subsystems (`testing` builds only;
+///                          a shipped build exits 1)
+///   `--self-host`        — host a static site on SCP (also `SCP_NODE_SELF_HOST`)
+///   `--site-dir <p>`     — static site directory for `--self-host` (also
+///                          `SCP_NODE_SITE_DIR`)
+///   `--storage-path <p>` — `SQLite` database directory (also `SCP_STORAGE_PATH`)
+///   `--help`, `-h`       — print usage and exit
 fn parse_args() -> CliConfig {
     let args: Vec<String> = env::args().collect();
 
@@ -126,6 +138,52 @@ fn parse_cli_from(
     }
 }
 
+/// Returns the error to print when the configuration selects more than one run
+/// mode, or `None` when it selects at most one.
+///
+/// `--relay-only`, `--self-host` (or `SCP_NODE_SELF_HOST`), and `--ephemeral`
+/// each select a run mode, and [`main`] dispatches on the first one it finds.
+/// Without this check a second mode flag is silently ignored: a shipped binary
+/// given `--self-host --ephemeral` would run a DHT-publishing self-host node
+/// instead of refusing `--ephemeral`. Two mode flags therefore fail closed
+/// (`.docs/prds/self-host-binary.json` SHB-001, the exactly-one-run-mode
+/// acceptance criterion).
+fn conflicting_modes(config: &CliConfig) -> Option<String> {
+    let selected: Vec<&str> = [
+        (config.relay_only, "--relay-only"),
+        (config.self_host, "--self-host (or SCP_NODE_SELF_HOST)"),
+        (config.ephemeral, "--ephemeral"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    (selected.len() > 1).then(|| {
+        format!(
+            "ERROR: {} each select a run mode; select exactly one.",
+            selected.join(" and ")
+        )
+    })
+}
+
+/// The refusal a shipped build prints for `--ephemeral`.
+const EPHEMERAL_UNAVAILABLE: &str = "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
+     available in this build. A shipped build creates no identity in any mode \
+     (no production pre-rotation custody backend available): the persistent full \
+     node exits 1 on every run, and \
+     --self-host starts only from a storage directory that already holds an \
+     identity. Build with --features testing to run --ephemeral.";
+
+/// Returns the refusal to print when the configuration selects a run mode this
+/// build does not compile, or `None` otherwise. `ephemeral_compiled` is
+/// `cfg!(feature = "testing")` in [`main`].
+///
+/// [`main`] calls this before the `--health` probe, so a shipped build exits 1
+/// on `--ephemeral --health` instead of probing `SCP_NODE_BIND_ADDR` for a mode
+/// it cannot run (ADR-062 §Decision 1).
+fn unavailable_mode(config: &CliConfig, ephemeral_compiled: bool) -> Option<&'static str> {
+    (config.ephemeral && !ephemeral_compiled).then_some(EPHEMERAL_UNAVAILABLE)
+}
+
 /// Prints usage information and exits with code 0.
 fn print_help() -> ! {
     eprintln!(
@@ -137,13 +195,18 @@ USAGE:
 
 OPTIONS:
     --relay-only            Run as a bare relay server only (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems (no persistence)
+    --ephemeral             Use in-memory storage for all subsystems (no persistence).
+                            Testing builds only: a shipped binary exits 1
     --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
                             publishes the host's IP to the DHT by default
                             (`SCP_NODE_DHT_MODE=disabled` skips publication).
                             Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1
                             for plain HTTP). See the loud startup banner for the full warning.
+                            A shipped binary starts only from a storage directory that
+                            already holds an identity; otherwise it logs 'self-host mode
+                            failed' ('no production pre-rotation custody backend
+                            available') and exits 1
     --site-dir <PATH>       Directory of static files to host in --self-host mode
                             (must contain index.html). Default: embedded site.
                             Also configurable via SCP_NODE_SITE_DIR env var
@@ -154,7 +217,9 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
     SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only
-                               or --self-host)
+                               or --self-host). Full node mode is the default; a
+                               shipped binary's full node logs 'no production
+                               pre-rotation custody backend available' and exits 1
     SCP_NODE_SELF_HOST         Set to '1' to enable self-host mode (same as --self-host)
     SCP_NODE_SITE_DIR          Static site directory for self-host mode (same as --site-dir)
     SCP_NODE_SELF_HOST_PORT    HTTP/site port for self-host mode (default: 8443)
@@ -365,7 +430,7 @@ async fn run_full_node_ephemeral() {
     eprintln!(
         "WARNING: Ephemeral mode — ALL subsystems use in-memory implementations.\n\
          Private keys, storage, and DID documents will be LOST on restart.\n\
-         Use persistent mode (default, without --ephemeral) for production."
+         This mode exists only in testing builds; a shipped build refuses --ephemeral."
     );
     tracing::warn!(
         "using InMemoryKeyCustody — private keys exist only in memory and are \
@@ -475,7 +540,10 @@ fn validate_storage_path_or_exit(dir: &std::path::Path) {
     }
 }
 
-/// Runs the full node with persistent `SQLite` storage (production default).
+/// Runs the full node with persistent `SQLite` storage (the default mode). A
+/// shipped build logs `no production pre-rotation custody backend available`
+/// (`IdentityError::NoPreRotationBackend`) and exits 1, because the node asks for
+/// a newly generated identity on every run.
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Parse the blob backend before anything below creates the storage
     // directory, the storage key, or a store, so a backend this build cannot
@@ -514,9 +582,9 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
     // the production DHT, which would publish the host's address to the network.
     match parse_dht_mode_or_exit() {
-        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
-        // node (it exits with guidance to use `--self-host`); this arm exists
-        // only to keep the match exhaustive and fails closed if ever reached.
+        // `parse_dht_mode_or_exit` returns `Disabled` for `SCP_NODE_DHT_MODE=disabled`,
+        // which only `--self-host` honours; the full relay node must publish its
+        // DID, so this arm exits with guidance to use `--self-host`.
         scp_node::DhtMode::Disabled => {
             tracing::error!(
                 "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
@@ -597,8 +665,8 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
     // nullifier) is a test-harness value compiled only under `testing`. The
     // non-publishing `DhtMode::Disabled` value belongs to the `--self-host`
     // path (`host_site`), which resolves via the relay layer without publishing;
-    // a relay node with no published DID cannot be found, so it is not offered
-    // here. (The library-level `NodeConfig`/`HostSiteConfig::defaults` fail-safe
+    // a relay node with no published DID cannot be found, so the full node
+    // rejects it in its own match. (The library-level `NodeConfig`/`HostSiteConfig::defaults` fail-safe
     // is `Disabled` per ADR-062 §Decision 1; this binary default is the operator
     // running a public server.)
     let raw = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
@@ -650,7 +718,7 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
 /// describes the cleartext exposure instead.
 ///
 /// `publishes_dht` reflects whether `SCP_NODE_DHT_MODE` resolves to `production`
-/// (publish) vs `memory` (no publish). Under `memory` the host's address is NOT
+/// (publish) vs `disabled` (no publish). Under `disabled` the host's address is NOT
 /// published to the DHT, so the IP<->DID disclosure line is replaced with a line
 /// stating the node is reachable but not DHT-discoverable.
 fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
@@ -783,9 +851,9 @@ const EPHEMERAL_STORE: &str = "in memory";
 /// Opens an inbound TCP port to the public internet (via NAT-PMP/UPnP when the
 /// `upnp` feature is built). Whether the host's address is published to the
 /// Mainline DHT is governed independently by `SCP_NODE_DHT_MODE`:
-/// `production` (the default) publishes; `memory` does NOT publish — the node is
+/// `production` (the default) publishes; `disabled` does NOT publish — the node is
 /// still reachable on the opened port, the address is just not DHT-discoverable
-/// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
+/// (share it out-of-band). `disabled` is valid with NAT probing on or off. See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     exit_on_ignored_cloud_backend("--self-host", SELF_HOST_STORE);
@@ -793,9 +861,9 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
 
-    // -- DHT mode: production pkarr by default; memory for "reachable but not
+    // -- DHT mode: production pkarr by default; disabled for "reachable but not
     //    DHT-discoverable" hosting. Parsed BEFORE the banner so the banner can
-    //    state the actual disclosure posture (memory = address NOT published). --
+    //    state the actual disclosure posture (disabled = address NOT published). --
     let dht_mode = parse_dht_mode_or_exit();
     let publishes_dht = matches!(dht_mode, scp_node::DhtMode::Production);
 
@@ -1040,10 +1108,12 @@ async fn run_node_with<
         (TlsMode::Acme { email: None }, None)
     };
 
-    // `Domain` is a publishing reach, so M2 requires `DhtMode::Production`
-    // (advisory in P1 — dropped before lowering, so no runtime behavior
-    // change). `run_node_with` is generic over `S: EncryptedStorage`, so the
-    // production `Node::start` (not `start_for_testing`) is the correct entry.
+    // `Domain` is a publishing reach: `DhtMode::Production` makes `Node::start`
+    // publish through `did_method` and fail the start if that publish fails.
+    // The caller's DHT mode already chose `did_method` (the Pkarr client, or
+    // the in-memory client in a `testing` build). `run_node_with` is generic
+    // over `S: EncryptedStorage`, so the production `Node::start` (not
+    // `start_for_testing`) is the correct entry.
     let node = match Node::start(NodeConfig {
         tls,
         dns_provider,
@@ -1142,6 +1212,16 @@ async fn main() {
         print_help();
     }
 
+    if let Some(error) = conflicting_modes(&config) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
+    if let Some(error) = unavailable_mode(&config, cfg!(feature = "testing")) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     // --health: probe the appropriate bind address and exit.
     if config.health {
         let addr: SocketAddr = if config.relay_only {
@@ -1175,16 +1255,13 @@ async fn main() {
         // Ephemeral mode wires in-memory subsystems (incl. the §17.17.3 in-memory
         // DHT nullifier), so it is compiled only under the `testing` feature
         // (ADR-062 §Decision 1). A shipped binary reached with `--ephemeral`
-        // fails closed rather than silently running a nullifier-backed node.
+        // fails closed at `unavailable_mode` above, before the `--health`
+        // probe; this arm refuses again rather than fall through to exit 0.
         #[cfg(feature = "testing")]
         run_full_node_ephemeral().await;
         #[cfg(not(feature = "testing"))]
         {
-            eprintln!(
-                "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. Run without --ephemeral for a persistent node, or set \
-                 SCP_NODE_DHT_MODE=disabled for a non-publishing node."
-            );
+            eprintln!("{EPHEMERAL_UNAVAILABLE}");
             std::process::exit(1);
         }
     } else {
@@ -1425,6 +1502,109 @@ mod tests {
         );
     }
 
+    /// Two or three run-mode selections fail closed instead of one silently
+    /// winning, and the error names each selector: `--ephemeral` beside
+    /// `--self-host`, the `SCP_NODE_SELF_HOST` fallback, or `--relay-only` is
+    /// refused, as is `--relay-only` beside self-host and all three together
+    /// (SHB-001, the exactly-one-run-mode acceptance criterion).
+    #[test]
+    fn two_run_modes_are_refused() {
+        for (args, env_self_host, named) in [
+            (
+                &["--self-host", "--ephemeral"][..],
+                false,
+                &["--self-host", "--ephemeral"][..],
+            ),
+            (
+                &["--ephemeral"][..],
+                true,
+                &["SCP_NODE_SELF_HOST", "--ephemeral"][..],
+            ),
+            (
+                &["--relay-only", "--ephemeral"][..],
+                false,
+                &["--relay-only", "--ephemeral"][..],
+            ),
+            (
+                &["--relay-only", "--self-host"][..],
+                false,
+                &["--relay-only", "--self-host"][..],
+            ),
+            (
+                &["--relay-only"][..],
+                true,
+                &["--relay-only", "SCP_NODE_SELF_HOST"][..],
+            ),
+            (
+                &["--relay-only", "--self-host", "--ephemeral"][..],
+                false,
+                &["--relay-only", "--self-host", "--ephemeral"][..],
+            ),
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), env_self_host, None, None);
+            let error = conflicting_modes(&cfg);
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|e| named.iter().all(|n| e.contains(n))),
+                "{args:?} (env {env_self_host}) must be refused naming each of {named:?}: {error:?}"
+            );
+        }
+    }
+
+    /// Zero or one run-mode selection passes.
+    #[test]
+    fn one_run_mode_is_accepted() {
+        for (args, env_self_host) in [
+            (&[][..], false),
+            (&["--ephemeral"][..], false),
+            (&["--relay-only"][..], false),
+            (&["--self-host"][..], false),
+            (&[][..], true),
+            (&["--self-host"][..], true),
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), env_self_host, None, None);
+            assert_eq!(
+                conflicting_modes(&cfg),
+                None,
+                "{args:?} (env {env_self_host})"
+            );
+        }
+    }
+
+    /// `--ephemeral` is refused, alone or beside `--health`, exactly when the
+    /// build does not compile it; every other mode passes in either build.
+    #[test]
+    fn ephemeral_is_refused_only_where_it_is_not_compiled() {
+        for args in [&["--ephemeral"][..], &["--ephemeral", "--health"][..]] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), false, None, None);
+            assert_eq!(
+                unavailable_mode(&cfg, false),
+                Some(EPHEMERAL_UNAVAILABLE),
+                "{args:?}"
+            );
+            assert_eq!(unavailable_mode(&cfg, true), None, "{args:?}");
+        }
+        for args in [
+            &[][..],
+            &["--health"][..],
+            &["--relay-only"][..],
+            &["--self-host"][..],
+        ] {
+            let mut full = vec!["scp-node"];
+            full.extend_from_slice(args);
+            let cfg = parse_cli_from(&argv(&full), false, None, None);
+            assert_eq!(unavailable_mode(&cfg, false), None, "{args:?}");
+            assert_eq!(unavailable_mode(&cfg, true), None, "{args:?}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Self-host disclosure banner content (`self_host_banner`)
     //
@@ -1494,34 +1674,37 @@ mod tests {
         );
     }
 
-    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=memory`), the banner must NOT
+    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=disabled`), the banner must NOT
     /// claim the host's IP is published — it must instead state the node is
     /// reachable but not DHT-discoverable. This is the banner half of the M2
-    /// correction: `memory` (no publish) is a valid self-host mode that opens the
-    /// port without disclosing the address to the DHT.
+    /// correction: `disabled` (no publish) is a valid self-host mode that opens the
+    /// port without disclosing the address to the DHT. ADR-062, capability
+    /// injection, moved the former `memory` value behind the `testing` feature, so
+    /// `disabled` is the no-publish value a shipped binary accepts here.
     #[test]
-    fn self_host_banner_memory_mode_states_no_publish() {
+    fn self_host_banner_no_publish_mode_states_no_publish() {
         let port = 8443u16;
-        let memory = self_host_banner(port, false, false);
+        let no_publish = self_host_banner(port, false, false);
 
         // The port is still opened, so the public-internet exposure stands.
         assert!(
-            memory.contains("PUBLIC INTERNET"),
-            "memory-mode banner must still disclose public-internet port exposure"
+            no_publish.contains("PUBLIC INTERNET"),
+            "no-publish banner must still disclose public-internet port exposure"
         );
         // But the IP<->identity DHT publication line must be GONE.
         assert!(
-            !memory.contains("PUBLIC IP will be published"),
-            "memory-mode banner must NOT claim the public IP is published to the DHT"
+            !no_publish.contains("PUBLIC IP will be published"),
+            "no-publish banner must NOT claim the public IP is published to the DHT"
         );
         assert!(
-            !memory.contains("IP<->identity disclosure"),
-            "memory-mode banner must NOT claim an IP<->identity disclosure"
+            !no_publish.contains("IP<->identity disclosure"),
+            "no-publish banner must NOT claim an IP<->identity disclosure"
         );
         // And it must state the no-publish / not-discoverable posture.
         assert!(
-            memory.contains("DHT publishing is OFF") && memory.contains("NOT DHT-discoverable"),
-            "memory-mode banner must state the address is not published and not DHT-discoverable"
+            no_publish.contains("DHT publishing is OFF")
+                && no_publish.contains("NOT DHT-discoverable"),
+            "no-publish banner must state the address is not published and not DHT-discoverable"
         );
     }
 }

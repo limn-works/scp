@@ -104,7 +104,15 @@ class SCP internal constructor(
      * thread pool that does not happen-before the coroutine that invoked
      * [shutdown].
      */
-    private val isShutdown: AtomicBoolean = AtomicBoolean(false)
+    private val shutdownRecorded: AtomicBoolean = AtomicBoolean(false)
+
+    /**
+     * `true` once a [shutdown] call's FFI teardown has returned without throwing, the same
+     * contract as `Relay.isShutdown` and `Node.isShutdown`. Internal so that ScpShutdownTest
+     * can check that a failed teardown leaves it false and a cancelled caller still sets it.
+     */
+    internal val isShutdown: Boolean
+        get() = shutdownRecorded.get()
 
     /**
      * Constructs a fresh [SCP] with an explicit storage configuration.
@@ -188,13 +196,15 @@ class SCP internal constructor(
         timeout: Duration = 5.seconds,
     ) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
-        bridge.ffiCallSuspend { inner.shutdown(timeoutMillis = millis) }
-        // Record shutdown AFTER the FFI call returns so that a failed
-        // shutdown does not silence the finalizer warning — a caller
-        // who sees an exception here should know the instance is still
-        // live and still worth a second [shutdown] attempt. SetRelease
-        // orders the flip after the FFI mutation, matching Atomic default.
-        isShutdown.set(true)
+        bridge.ffiCallSuspend {
+            inner.shutdown(timeoutMillis = millis)
+            // Record shutdown as soon as the FFI call returns, inside the bridge block: an
+            // engine failure throws before this line, so a failed shutdown does not silence
+            // the finalizer warning, while a cancellation the bridge raises after a finished
+            // teardown (its trailing ensureActive, or resuming a cancelled caller) cannot
+            // leave a torn-down instance recorded as live.
+            shutdownRecorded.set(true)
+        }
     }
 
     /**
@@ -221,7 +231,7 @@ class SCP internal constructor(
      */
     @Suppress("ProtectedMemberInFinalClass", "Unused")
     protected fun finalize() {
-        if (!isShutdown.get()) {
+        if (!isShutdown) {
             Logger.getLogger("works.limn.scp.SCP").log(
                 Level.WARNING,
                 "SCP instance (id={0}) was garbage-collected without a shutdown() call. " +
@@ -866,10 +876,10 @@ class SCP internal constructor(
      *
      * The invite routes through the actor's capability-checked governance gate,
      * which requires the inviter to hold the `governance:propose` capability
-     * (that is the ONLY capability the invite gate enforces). A normally-created
-     * `SingleAdmin` context grants its admin `governance:propose` at genesis, so
-     * it works out of the box; a context with a custom ceiling must grant
-     * `governance:propose` to the inviter. The inviter's `#active` signing key
+     * (that is the ONLY capability the invite gate enforces). The creator of a
+     * `SingleAdmin` context holds the admin role, which grants every capability
+     * in the context's ceiling, so the creator can invite only when that
+     * ceiling includes `governance:propose`. The inviter's `#active` signing key
      * is resolved from its retained local custody (never crossing the FFI as raw
      * bytes) and wiped immediately after the invite is produced.
      *

@@ -637,7 +637,7 @@ impl SupervisorHandle {
     pub(in crate::context) async fn dispatch_prepare_for_replace(
         &self,
         context_id: &str,
-        mls_state: Vec<u8>,
+        mls_state: zeroize::Zeroizing<Vec<u8>>,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{ContextCommand, LifecycleControlCommand};
 
