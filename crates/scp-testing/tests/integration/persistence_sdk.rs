@@ -432,7 +432,8 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// AC5: Drain, then close: the same directory reopens on the first try
+// ADR-049 Decision 16 (Verification); spec §17.6: drain, then close, then
+// reopen the same directory on the first attempt
 // ---------------------------------------------------------------------------
 
 /// Builds a supervisor whose persistence writes through `storage`, the same
