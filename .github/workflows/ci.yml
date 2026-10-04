@@ -2007,10 +2007,11 @@ jobs:
 
   # Builds the same image on every push to `main` and exports its layer cache; the
   # comment on job `docker-image` above says why the export lives in this job alone.
-  # Its `if:` reads only the event, so a push that changes no Rust still builds here.
+  # Its `if:` reads the `rust` filter that selects job `docker-image`, the job that
+  # reads the export, so a push that changes no Rust skips it.
   docker-image-cache:
     needs: changes
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image (cache export)
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -2162,15 +2163,12 @@ jobs:
   # reports a producer whose key drops one of the file inputs above.
   pyo3-module:
     needs: changes
-    # The union of the three consumers' conditions: python-test reads
-    # `python || rust`, bridge-parity reads `python || typescript || rust`, and
-    # bridge-parity-kotlin reads `python || kotlin || rust`. GitHub skips a job whose
-    # `needs` holds a skipped job, so a producer selected by anything narrower than
-    # that union would turn a consumer that was supposed to run into a skip. The `ci`
-    # aggregator evaluates that consumer's own `if:`, finds it true, and fails the run
-    # on the skip; the needs-condition check in
-    # scripts/tests/ci-gate/ci_gate_selftest.py reports the narrowed union before any
-    # pull request reaches that failure.
+    # GitHub skips a job whose `needs` holds a skipped job, so a producer selected by
+    # anything narrower than the union of its consumers' conditions would turn a
+    # consumer that was supposed to run into a skip. The `ci` aggregator evaluates
+    # that consumer's own `if:`, finds it true, and fails the run on the skip; the
+    # needs-condition check in scripts/tests/ci-gate/ci_gate_selftest.py reports the
+    # narrowed union before any pull request reaches that failure.
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||
@@ -2284,8 +2282,7 @@ jobs:
 
   napi-addon:
     needs: changes
-    # The union of typescript-check (`typescript || rust`) and bridge-parity
-    # (`python || typescript || rust`). Dropping the `python` clause would skip this
+    # Dropping the `python` clause would skip this
     # job on a change confined to bindings/python and skip bridge-parity with it, so
     # the `ci` aggregator, which reads bridge-parity's own `if:` as true, would fail
     # every such pull request.
@@ -2379,8 +2376,6 @@ jobs:
 
   xcframework:
     needs: changes
-    # The union of swift-build-test (`swift || rust`) and bridge-parity-swift
-    # (`python || swift || rust`).
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
@@ -2505,7 +2500,7 @@ jobs:
 
   pyo3-module-macos:
     needs: changes
-    # bridge-parity-swift is the only consumer, and this job repeats its condition.
+    # bridge-parity-swift is the only consumer.
     # An Ubuntu build cannot serve it: a Python extension module is a native shared
     # object, and the one job pyo3-module publishes is an ELF `.so` built against
     # glibc for x86_64.

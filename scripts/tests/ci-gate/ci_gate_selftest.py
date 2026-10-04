@@ -605,8 +605,9 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # scripts/fix-round-check.sh names.
 EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 
-# Jobs whose `if:` is `github.event_name == 'push'`.
-PUSH_ONLY_JOBS = ("docker-image-cache",)
+# Jobs a `changes` filter output selects whose `if:` also reads
+# `github.event_name == 'push' && …`.
+PUSH_ONLY_FILTER_JOBS = ("docker-image-cache",)
 
 # Jobs whose `if:` is `github.event_name != 'push'` alone. None of
 # these writes a cache, so each runs on every pull_request and merge_group run and
@@ -670,12 +671,10 @@ def on_event(filter_runs: dict[str, bool], event: str) -> dict[str, bool]:
     """Every conditional job's answer for one event, from the filter jobs' answers."""
     push = event == "push"
     runs = dict(filter_runs)
-    if push:
-        runs |= dict.fromkeys(NOT_ON_PUSH_FILTER_JOBS, False)
+    runs |= dict.fromkeys(NOT_ON_PUSH_FILTER_JOBS if push else PUSH_ONLY_FILTER_JOBS, False)
     return (
         runs
         | dict.fromkeys(EVENT_ONLY_JOBS, event == "pull_request")
-        | dict.fromkeys(PUSH_ONLY_JOBS, push)
         | dict.fromkeys(NOT_ON_PUSH_JOBS, not push)
     )
 
@@ -686,6 +685,7 @@ RUST_ONLY_RUNS = {
     "bridge-parity-kotlin": True,
     "bridge-parity-swift": True,
     "docker-image": True,
+    "docker-image-cache": True,
     "fuzz-build": False,
     "kotlin-lint": False,
     "kotlin-test": True,
@@ -5408,6 +5408,21 @@ def check_push_writer_mutants(doc: dict) -> None:
                 for found in scenario_disagreements(dropped)
             ),
             f"{scenario_disagreements(dropped)}",
+        )
+
+    for condition, scenario in (
+        ("github.event_name == 'push'", "docs-only, push"),
+        ("needs.changes.outputs.rust == 'true'", "rust-only, pull_request"),
+    ):
+        widened = copy.deepcopy(doc)
+        widened["jobs"]["docker-image-cache"]["if"] = condition
+        check(
+            f"docker-image-cache on `{condition}` alone disagrees with SCENARIOS",
+            any(
+                f"{scenario}: docker-image-cache runs" in found
+                for found in scenario_disagreements(widened)
+            ),
+            f"{scenario_disagreements(widened)}",
         )
 
 
