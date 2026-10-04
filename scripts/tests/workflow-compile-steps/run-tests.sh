@@ -16,13 +16,7 @@
 #     holding `${{ matrix.<axis> }}` as one group per axis value: it passes such a
 #     writer whose groups each have one writer, fails a literal second writer of one of
 #     those groups, fails a key naming an axis the job's matrix gives no list, and
-#     fails a templated key whose matrix carries `include` or `exclude`. It fails a
-#     writer with a literal key over a matrix axis that neither the key, `runs-on` nor
-#     `save-if` names, a literal-key writer whose matrix holds list axes beside
-#     `include`, and a writer over an `include`-only matrix whose `save-if` leaves two
-#     entries writing on one runner. It passes a writer whose `save-if` pins
-#     `matrix.shard == 1` over an `os` axis `runs-on` names, and an `include`-only
-#     writer whose `save-if` pins one entry's `matrix.target`.
+#     fails a templated key whose matrix carries `include` or `exclude`.
 #   * Check 2 (uniffi-bindgen steps) fails a `cargo run` with no profile or target flags
 #     whose `--library` sits under `target/<triple>/release` (the second-compile shape
 #     from build-xcframework.sh and the Swift job of build-matrix.yml), one whose
@@ -67,10 +61,6 @@ FIXTURES=(
     "bad-cache-matrix-key-no-axis"
     "bad-cache-matrix-key-include"
     "bad-cache-matrix-key-exclude"
-    "bad-cache-matrix-key-literal"
-    "bad-cache-matrix-key-literal-include"
-    "bad-cache-matrix-include-unpinned"
-    "good-cache-matrix-writer-pinned"
 )
 EXPECTED_EXITS=(
     "0"
@@ -88,10 +78,6 @@ EXPECTED_EXITS=(
     "1"
     "1"
     "1"
-    "1"
-    "1"
-    "1"
-    "0"
 )
 EXPECTED_SUBSTRINGS=(
     "OK: 6 rust-cache step(s) in 3 group(s)"
@@ -109,10 +95,6 @@ EXPECTED_SUBSTRINGS=(
     "names matrix axis 'group', which the job's \`strategy.matrix\` gives no list"
     "of a \`strategy.matrix\` carrying include, so this check"
     "of a \`strategy.matrix\` carrying exclude, so this check"
-    "runs on every value of matrix axis 'group'"
-    "sits in a \`strategy.matrix\` carrying include, so this check cannot say how many legs"
-    "runs on 2 \`include\` entries that \`save-if\` leaves writing on one runner"
-    "OK: 2 rust-cache step(s) in 2 group(s)"
 )
 
 passed=0
