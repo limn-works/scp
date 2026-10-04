@@ -205,12 +205,12 @@ nothing:
                `--features` on any Markdown line no shell fence encloses.
   package-writers
                Job docker-image-cache writes the Docker layer cache to the
-               ghcr.io tag `buildcache:docker-image`, and job docker-image reads
-               it, so any job holding `packages: write` whose `if:` admits a
-               pull request or merge group run could overwrite what `main`
-               reads. The check reports such a job, reading a job's own
-               `permissions:` or, when it has none, the workflow-level block,
-               and counts `write-all` at either level as `packages: write`.
+               ghcr.io tag `buildcache:docker-image` with the `docker-cache`
+               environment's `GHCR_CACHE_TOKEN`, and job docker-image reads it.
+               The check reports any job or workflow-level `permissions:` block
+               holding `packages: write` or `write-all`, and any step, job key,
+               or workflow-level `env:` reading `secrets.GHCR_CACHE_TOKEN`
+               outside a job declaring `environment: docker-cache`.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -592,9 +592,7 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # scripts/fix-round-check.sh names.
 EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 
-# Jobs whose `if:` is `github.event_name == 'push'`. Job docker-image-cache holds
-# `packages: write` to export the Docker layer cache, and
-# check_package_writers_run_only_on_push requires that grant to stay push-only.
+# Jobs whose `if:` is `github.event_name == 'push'`.
 PUSH_ONLY_JOBS = ("docker-image-cache",)
 
 # Jobs a `changes` filter output selects.
@@ -650,35 +648,40 @@ SCENARIOS = {
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        runs=RUST_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
         | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
         filters=DOCS_ONLY,
         event="pull_request",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        runs=DOCS_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
         | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, push": Scenario(
         name="docs-only, push",
         filters=DOCS_ONLY,
         event="push",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        runs=DOCS_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, False)
         | dict.fromkeys(PUSH_ONLY_JOBS, True),
     ),
     "rust-only, merge_group": Scenario(
         name="rust-only, merge_group",
         filters=RUST_ONLY,
         event="merge_group",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        runs=RUST_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, False)
         | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "python-only, pull_request": Scenario(
         name="python-only, pull_request",
         filters=PYTHON_ONLY,
         event="pull_request",
-        runs=PYTHON_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        runs=PYTHON_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
         | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
 }
@@ -3987,14 +3990,12 @@ def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
             )
 
 
-def package_writers_off_push(doc: dict) -> list[str]:
-    """Return every job holding `packages: write` whose `if:` is not push-only.
+def package_write_holders(doc: dict) -> list[str]:
+    """Return `workflow` and every job id whose own `permissions:` grants package write.
 
-    Job docker-image-cache exports the Docker layer cache that every run reads, so
-    a pull request or merge group run that held this grant from the workflow on
-    `main` could overwrite what `main` reads. A job without its own `permissions:`
-    key holds the workflow-level `permissions:`, and `write-all` at either level
-    grants `packages: write`.
+    Job docker-image-cache writes the Docker layer cache tag with the `docker-cache`
+    environment's token, so no `GITHUB_TOKEN` in this workflow needs
+    `packages: write`. `write-all` grants `packages: write`.
     """
 
     def grants_package_write(permissions: object) -> bool:
@@ -4002,80 +4003,161 @@ def package_writers_off_push(doc: dict) -> list[str]:
             return permissions == "write-all"
         return isinstance(permissions, dict) and permissions.get("packages") == "write"
 
-    return sorted(
+    holders = ["workflow"] if grants_package_write(doc.get("permissions")) else []
+    return holders + sorted(
         job_id
         for job_id, job in doc["jobs"].items()
-        if grants_package_write(
-            job["permissions"] if "permissions" in job else doc.get("permissions")
+        if grants_package_write(job.get("permissions"))
+    )
+
+
+CACHE_TOKEN_READ = re.compile(
+    r"secrets\s*(\.\s*GHCR_CACHE_TOKEN\b|\[\s*['\"]GHCR_CACHE_TOKEN['\"]\s*\])"
+)
+
+
+def cache_token_reads_outside_environment(doc: dict) -> list[str]:
+    """Return every reader of `secrets.GHCR_CACHE_TOKEN` outside a `docker-cache` job.
+
+    A reader is a step, a job-level key other than `steps:`, or the workflow-level
+    `env:`; the workflow-level `env:` reaches every job, so it is always reported.
+    """
+
+    def reads(value: object) -> bool:
+        return bool(CACHE_TOKEN_READ.search(json.dumps(value)))
+
+    found = ["workflow.env"] if reads(doc.get("env")) else []
+    for job_id, job in doc["jobs"].items():
+        environment = job.get("environment")
+        if isinstance(environment, dict):
+            environment = environment.get("name")
+        if environment == "docker-cache":
+            continue
+        found += [
+            f"{job_id}.{key}"
+            for key, value in job.items()
+            if key != "steps" and reads(value)
+        ]
+        found += [
+            f"{job_id}.steps[{index}]"
+            for index, step in enumerate(job.get("steps") or [])
+            if reads(step)
+        ]
+    return found
+
+
+def check_package_write_and_cache_token(doc: dict) -> None:
+    """No block grants `packages: write`; the cache token is read only in `docker-cache`."""
+    check(
+        "no job and no workflow-level block holds `packages: write` or `write-all`",
+        package_write_holders(doc) == [],
+        f"blocks granting package write: {package_write_holders(doc)}",
+    )
+    check(
+        "every reader of `secrets.GHCR_CACHE_TOKEN` is in a job declaring "
+        "`environment: docker-cache`",
+        cache_token_reads_outside_environment(doc) == [],
+        f"readers outside the environment: {cache_token_reads_outside_environment(doc)}",
+    )
+    write_mutants = (
+        (
+            "a docker-image-cache job granted `packages: write` is reported",
+            lambda d: d["jobs"]["docker-image-cache"]["permissions"].update(
+                packages="write"
+            ),
+            ["docker-image-cache"],
+        ),
+        (
+            "a docker-image job with `permissions: write-all` is reported",
+            lambda d: d["jobs"]["docker-image"].update(permissions="write-all"),
+            ["docker-image"],
+        ),
+        (
+            "a workflow-level `packages: write` is reported",
+            lambda d: d["permissions"].update(packages="write"),
+            ["workflow"],
+        ),
+        (
+            "a workflow-level `permissions: write-all` is reported",
+            lambda d: d.update(permissions="write-all"),
+            ["workflow"],
+        ),
+        (
+            "`permissions: read-all` at both levels is not reported",
+            lambda d: (
+                d.update(permissions="read-all"),
+                d["jobs"]["docker-image"].update(permissions="read-all"),
+            ),
+            [],
+        ),
+    )
+    for name, mutate, expected in write_mutants:
+        mutant = copy.deepcopy(doc)
+        mutate(mutant)
+        check(
+            name,
+            package_write_holders(mutant) == expected,
+            f"reported {package_write_holders(mutant)}, expected {expected}",
         )
-        and " ".join(str(job.get("if") or "").split()) != "github.event_name == 'push'"
-    )
-
-
-def check_package_writers_run_only_on_push(doc: dict) -> None:
-    """Only a push-only job holds `packages: write`; five mutants must be reported."""
+    image_steps = len(doc["jobs"]["docker-image"]["steps"])
+    cache_readers = [
+        f"docker-image-cache.steps[{index}]"
+        for index, step in enumerate(doc["jobs"]["docker-image-cache"]["steps"])
+        if CACHE_TOKEN_READ.search(json.dumps(step))
+    ]
     check(
-        "every job holding `packages: write` runs only on a push",
-        package_writers_off_push(doc) == [],
-        f"jobs holding `packages: write` off a push: {package_writers_off_push(doc)}",
+        "a docker-image-cache step reads `secrets.GHCR_CACHE_TOKEN`, so the two "
+        "environment mutants below have a reader to expose",
+        cache_readers != [],
+        "no docker-image-cache step reads the token",
     )
-    granted = copy.deepcopy(doc)
-    granted["jobs"]["docker-image"]["permissions"]["packages"] = "write"
-    check(
-        "a docker-image job granted `packages: write` is reported",
-        package_writers_off_push(granted) == ["docker-image"],
-        f"the grant went unreported: {package_writers_off_push(granted)}",
+    login = {
+        "uses": "docker/login-action@v3",
+        "with": {"password": "${{ secrets.GHCR_CACHE_TOKEN }}"},
+    }
+    token_mutants = (
+        (
+            "a docker-image-cache job without `environment:` is reported",
+            lambda d: d["jobs"]["docker-image-cache"].pop("environment"),
+            cache_readers,
+        ),
+        (
+            "a docker-image-cache job in another environment is reported",
+            lambda d: d["jobs"]["docker-image-cache"].update(environment="production"),
+            cache_readers,
+        ),
+        (
+            "`environment: {name: docker-cache}` is accepted",
+            lambda d: d["jobs"]["docker-image-cache"].update(
+                environment={"name": "docker-cache"}
+            ),
+            [],
+        ),
+        (
+            "a docker-image step reading the token is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(login),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image job-level `env:` reading the token by index is reported",
+            lambda d: d["jobs"]["docker-image"].update(
+                env={"T": "${{ secrets['GHCR_CACHE_TOKEN'] }}"}
+            ),
+            ["docker-image.env"],
+        ),
+        (
+            "a workflow-level `env:` reading the token is reported",
+            lambda d: d.setdefault("env", {}).update(
+                T="${{ secrets.GHCR_CACHE_TOKEN }}"
+            ),
+            ["workflow.env"],
+        ),
     )
-    widened = copy.deepcopy(doc)
-    widened["jobs"]["docker-image-cache"]["if"] = "needs.changes.outputs.rust == 'true'"
-    check(
-        "a docker-image-cache job whose `if:` admits a pull request is reported",
-        package_writers_off_push(widened) == ["docker-image-cache"],
-        f"the widened condition went unreported: {package_writers_off_push(widened)}",
-    )
-    # Jobs without their own `permissions:` key hold the workflow-level block.
-    inheriting = sorted(
-        job_id
-        for job_id, job in doc["jobs"].items()
-        if "permissions" not in job
-        and " ".join(str(job.get("if") or "").split()) != "github.event_name == 'push'"
-    )
-    check(
-        "ci.yml has jobs that hold the workflow-level `permissions:` block",
-        inheriting != [],
-        "no job holds the workflow-level block, so the two mutants below test nothing",
-    )
-    workflow_granted = copy.deepcopy(doc)
-    workflow_granted["permissions"] = {**doc["permissions"], "packages": "write"}
-    check(
-        "a workflow-level `packages: write` is reported on every job that holds it",
-        package_writers_off_push(workflow_granted) == inheriting,
-        f"the workflow-level grant went unreported: "
-        f"{package_writers_off_push(workflow_granted)}",
-    )
-    workflow_write_all = copy.deepcopy(doc)
-    workflow_write_all["permissions"] = "write-all"
-    check(
-        "a workflow-level `permissions: write-all` is reported on every job that holds it",
-        package_writers_off_push(workflow_write_all) == inheriting,
-        f"the workflow-level write-all went unreported: "
-        f"{package_writers_off_push(workflow_write_all)}",
-    )
-    job_write_all = copy.deepcopy(doc)
-    job_write_all["jobs"]["docker-image"]["permissions"] = "write-all"
-    check(
-        "a docker-image job with `permissions: write-all` is reported",
-        package_writers_off_push(job_write_all) == ["docker-image"],
-        f"the job-level write-all went unreported: {package_writers_off_push(job_write_all)}",
-    )
-    read_all = copy.deepcopy(doc)
-    read_all["permissions"] = "read-all"
-    read_all["jobs"]["docker-image"]["permissions"] = "read-all"
-    check(
-        "`permissions: read-all` at either level is not reported",
-        package_writers_off_push(read_all) == [],
-        f"a read-all grant was reported: {package_writers_off_push(read_all)}",
-    )
+    for name, mutate, expected in token_mutants:
+        mutant = copy.deepcopy(doc)
+        mutate(mutant)
+        found = cache_token_reads_outside_environment(mutant)
+        check(name, found == expected, f"reported {found}, expected {expected}")
 
 
 # Each entry is (text the restore key must carry, the input that text stands for).
@@ -4831,8 +4913,8 @@ def main() -> int:
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
 
-    print("package-writers — only a push-only job holds `packages: write`")
-    check_package_writers_run_only_on_push(workflow)
+    print("package-writers — no `packages: write`; the cache token stays in docker-cache")
+    check_package_write_and_cache_token(workflow)
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)

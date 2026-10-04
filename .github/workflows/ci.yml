@@ -1852,14 +1852,28 @@ jobs:
   # the buildkit blobs, which only this job reads, were evicted first: a main run found
   # the cache manifest but none of its blobs and rebuilt from `WORKDIR` down, and a pull
   # request run an hour after a main export failed with `blob sha256:…: not found` on the
-  # cook layer and recompiled every dependency. A registry is outside that cap.
+  # cook layer and recompiled every dependency. The repository's Actions cache, measured
+  # for this change, held 10.68 GB against that 10 GB limit. A registry is outside that
+  # cap.
+  #
+  # The Actions cache has one advantage the registry lacks: GitHub scopes its entries
+  # by branch, so a pull-request branch cannot write an entry `main` reads. A registry
+  # tag has no such scoping, which is why the export needs the main-only token below.
+  #
+  # Move the layer cache back to the Actions cache when either holds:
+  # (a) the repository's Actions cache total, read from
+  #     `gh api repos/{owner}/{repo}/actions/cache/usage`, plus the size of the Docker
+  #     layer export stays under the repository's cache limit, because other changes
+  #     shrank the Rust cache entries or GitHub raised the limit;
+  # (b) the main-only token arrangement can no longer be kept: the token cannot be
+  #     renewed, or the `docker-cache` environment loses its rule that admits only
+  #     branch `main`.
   #
   # WHO CAN WRITE THE CACHE. This job holds `packages: read` and builds without
-  # exporting. Job `docker-image-cache` runs only on a push to `main`, holds
-  # `packages: write`, and is the only job that exports. The split leaves one
-  # exposure open: a pull request from a branch of this repository runs its own copy
-  # of this file, which can grant itself `packages: write` and export to the tag every
-  # later run reads through `cache-from`.
+  # exporting. Job `docker-image-cache`, the only job that exports, declares
+  # environment `docker-cache`, whose deployment rule admits only branch `main`, and
+  # logs in with that environment's `GHCR_CACHE_TOKEN`, a classic token holding only
+  # `write:packages`; no job in this file holds `packages: write`.
   docker-image:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1914,9 +1928,10 @@ jobs:
     name: Docker / relay and node image (cache export)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment: docker-cache
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
       # Job `docker-image`'s copy of this step says why it is conditional.
       - name: Free disk space when the runner is short of it
@@ -1934,7 +1949,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_CACHE_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
           context: .
