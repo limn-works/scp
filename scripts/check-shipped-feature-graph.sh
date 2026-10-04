@@ -192,6 +192,7 @@ cd "$REPO_ROOT"
 # this allowlist is the hand-maintained set of what is PERMITTED.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
+scp-alloc/default
 scp-client-wasm/default
 scp-client/default
 scp-clock/default
