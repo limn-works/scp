@@ -525,7 +525,9 @@ impl NodeMlsFactory {
     /// * `local_did` - The local member's DID (must be a valid `did:dht:z...`).
     /// * `clock` - The injected hardened [`Clock`] (ADR-057 §Prereq-1). Shared
     ///   with the constructed [`ProductionMlsBackend`] so a node has exactly one
-    ///   hardened clock governing every `KeyPackage` / group-leaf `Lifetime`.
+    ///   hardened clock governing every `KeyPackage` / group-leaf `Lifetime`
+    ///   check SCP runs against a clock; another member's Welcome tree leaf is
+    ///   checked for range only and reads no clock.
     #[must_use]
     pub fn new(local_did: String, clock: Arc<dyn Clock>) -> Self {
         Self::with_backends(

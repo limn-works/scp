@@ -34,23 +34,24 @@
 //!   `Lifetime` SCP *mints* is built via `scp_mls::lifetime::key_package_lifetime`
 //!   from the injected hardened clock (`Lifetime::init` with explicit bounds),
 //!   never openmls's `Lifetime::default()`. See `scp-mls/src/group.rs`.
-//! - **The receive/accept side is bracketed.** Every `Lifetime` SCP *accepts*
-//!   is additionally re-validated against the injected hardened clock
+//! - **The receive/accept side is bracketed.** Every `Lifetime` SCP *accepts*,
+//!   except another member's leaf in a Welcome's ratchet tree (below), is
+//!   additionally re-validated against the injected hardened clock
 //!   (`scp_mls::lifetime::validate_key_package_lifetime`) wherever openmls
 //!   exposes the accepted `Lifetime` — post-`KeyPackageIn::validate`
 //!   (add-member / key-package-DID) and pre-merge on staged-commit Add proposals
 //!   — and the RFC 9420 maximum-range bound openmls never enforces is added
 //!   there too.
-//! - **Welcome tree leaves: one check, against this module's clock (V3).**
-//!   openmls 0.9.0 exposes `MlsGroup::treesync()`, so `treesync().full_leaves()`
-//!   with `leaf_node_source()` reaches every joined-tree leaf's
-//!   `LeafNodeSource::KeyPackage(Lifetime)`. `scp_mls::group::join_group_from_bytes`
-//!   switches openmls's own tree-leaf `Lifetime` check off
-//!   (`skip_lifetime_validation`) and validates every KeyPackage-sourced leaf
-//!   against the injected hardened clock, with the maximum-range bound, after
-//!   `into_group` and before the group is adopted. A `Date.now()` override
-//!   made after this module initializes plays no part in a Welcome's
-//!   `Lifetime` decision; one made before it shifts the captured clock too.
+//! - **Welcome tree leaves: no clock (V3).**
+//!   `scp_mls::group::join_group_from_bytes` switches openmls's tree-leaf
+//!   `Lifetime` check off (`skip_lifetime_validation`) and checks only each
+//!   KeyPackage-sourced leaf's range: it rejects a leaf whose `not_after` is
+//!   not later than its `not_before` or whose range exceeds the maximum. No
+//!   clock, neither this module's nor `Date.now()`, takes part in the decision
+//!   on another member's tree leaf. The joiner's own `KeyPackage` must still be
+//!   current: `scp_client::ScpClient::join_context_encrypted` passes this
+//!   module's clock to `join_group_from_bytes`, which checks the joiner's own
+//!   leaf's `Lifetime` against it before it returns a group.
 //! - **Residual: openmls's internal check still runs on two paths.** openmls
 //!   0.9.0's internal checks call `Lifetime::validate`, never
 //!   `validate_with_time` with a caller's time, so its own check inside
@@ -63,8 +64,8 @@
 //!   cannot get a forged `Lifetime` accepted. Page same-origin integrity
 //!   (CSP/SRI/COOP/COEP) stays load-bearing for every `Lifetime` decision,
 //!   because a script that runs before this module initializes shifts the
-//!   captured clock too. The residual closes when openmls lets the caller supply the
-//!   clock that `KeyPackageIn::validate` and `process_message` read.
+//!   captured clock too. The residual closes when openmls lets the caller
+//!   supply the clock that `KeyPackageIn::validate` and `process_message` read.
 
 use scp_clock::Clock;
 
