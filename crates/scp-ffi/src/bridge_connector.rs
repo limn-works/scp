@@ -772,10 +772,11 @@ pub fn py_bridge_derive_credential_key(
             code: codes::CRYPTO_4012.to_string(),
         })?;
 
-    // SAFETY: `.to_vec()` creates an unzeroized copy of the derived key
-    // material. This is unavoidable at the FFI boundary — PyO3 requires
-    // `Vec<u8>` for bytes returns and Python's GC controls the lifetime.
-    // The `Zeroizing<[u8; 32]>` source is zeroized on drop.
+    // PyO3 requires `Vec<u8>` for a bytes return, so `.to_vec()` copies the
+    // derived key; the wiping global allocator zeroes that `Vec` when PyO3
+    // frees it after building the Python `bytes`. The `bytes` copy lives on
+    // Python's heap, which security model spec §9.15 (freed heap memory)
+    // lists as a limit. The `Zeroizing<[u8; 32]>` source is zeroized on drop.
     Ok(derived.to_vec())
 }
 
@@ -792,10 +793,11 @@ pub fn py_bridge_derive_credential_key(
 #[pyo3(name = "bridge_generate_credential_key")]
 pub fn py_bridge_generate_credential_key() -> Vec<u8> {
     let key = generate_bridge_credential_key();
-    // SAFETY: `.to_vec()` creates an unzeroized copy of the generated key
-    // material. This is unavoidable at the FFI boundary — PyO3 requires
-    // `Vec<u8>` for bytes returns and Python's GC controls the lifetime.
-    // The `Zeroizing<[u8; 32]>` source is zeroized on drop.
+    // PyO3 requires `Vec<u8>` for a bytes return, so `.to_vec()` copies the
+    // generated key; the wiping global allocator zeroes that `Vec` when PyO3
+    // frees it after building the Python `bytes`. The `bytes` copy lives on
+    // Python's heap, which security model spec §9.15 (freed heap memory)
+    // lists as a limit. The `Zeroizing<[u8; 32]>` source is zeroized on drop.
     key.to_vec()
 }
 

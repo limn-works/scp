@@ -5521,8 +5521,9 @@ impl Supervisor {
         // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
         //    discarded welcome-join is permanently gone (its actor-owned crypto
         //    freed on the handle drop above — `SenderKey`s, the MLS group's
-        //    signer, and its provider-storage values zeroize on drop; its durable snapshot
-        //    deleted), so
+        //    signer, and its provider-storage values zeroize on drop, and
+        //    security model spec §9.15 lists the copies no wipe reaches; its
+        //    durable snapshot deleted), so
         //    the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
         //    transient safety argument.

@@ -674,7 +674,8 @@ Dependencies flow strictly upward. No crate may depend on a crate at a *higher* 
 
 ```
 Layer 0 ─ scp-alloc                 Wiping global allocator (09-security-model.md §9.15). Wasm-safe leaf;
-           │                          no dependencies. Only the shipped binaries and cdylibs depend on it.
+           │                          no dependencies. Only the shipped binaries and cdylibs, and the
+           │                          relay template and scaffold outside the workspace, depend on it.
            │  scp-clock               Clock port (wall-clock time). Wasm-safe leaf.
            │  scp-crypto             P-256 signature verification. Wasm-safe leaf.
            │  scp-did                Identity data model (identifier, SigningKeyId, key state,

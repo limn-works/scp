@@ -62,6 +62,10 @@
 // The uniffi::include_scaffolding! macro expands unsafe extern "C" declarations.
 #![allow(unsafe_code)]
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};

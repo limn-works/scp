@@ -547,8 +547,9 @@ impl ScpClient {
         // `PersistedPendingJoin::mls_blob`, which is `Zeroizing` too.
         let mls_blob = serialize_pending_join(&provider, &signer, self.signer.did(), context_id)?;
         // One exactly-sized buffer, wiped on drop, so no outgrown encoding
-        // buffer holding the signer or the wrapping secret is freed unwiped
-        // (security model spec §9.15 step 2).
+        // buffer holding the signer or the wrapping secret is ever freed, even
+        // in an application that links this crate without the wiping global
+        // allocator (security model spec §9.15 step 2 and freed heap memory).
         let mut pending_blob = scp_mls::secret_msgpack::encode_named(&PersistedPendingJoin {
             mls_blob,
             wrapping_public,

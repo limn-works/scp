@@ -535,17 +535,50 @@ Only the first-initialization case — no `scp.db` and no `scp.salt` — generat
 // (`'<derived_key>'`) would instead treat the 64 hex characters as a passphrase
 // and PBKDF2-stretch them — a redundant second KDF over already-derived key
 // material. Raw-key syntax avoids that double-KDF.
+//
+// `conn` comes from an open that has already run the compile-option,
+// page-cache buffer probe, and lookaside checks below.
+
+// Step 1: the memory-security pragma, in a statement of its own.
+conn.execute_batch("PRAGMA cipher_memory_security = ON;")?;
+
+// Step 2: the readback, before the key statement. Anything other than the
+// single value `1` (a plain SQLite returns no row) refuses the open.
+let on: Option<String> = conn
+    .query_row("PRAGMA cipher_memory_security;", [], |row| row.get(0))
+    .optional()?;
+if on.as_deref() != Some("1") {
+    return Err(StorageError::MemorySecurityOff);
+}
+
+// Step 3: the key batch.
 conn.execute_batch("
     PRAGMA key = \"x'<derived_key>'\";
     PRAGMA cipher_page_size = 4096;
     PRAGMA kdf_iter = 256000;
     PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
     PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
-    PRAGMA cipher_memory_security = ON;
 ")?;
 ```
 
-Every SQLCipher connection MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. SQLCipher and its embedded SQLite allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. §9.15 lists the copies that neither wipe reaches, memory OpenSSL obtains from `malloc` among them.
+Every SQLCipher connection that opens a database SCP stores data in MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. Each constructor MUST run the pragma in a statement of its own, then read `PRAGMA cipher_memory_security` back, and MUST fail with its typed storage error unless the query returns the single value `1`, all before the `PRAGMA key` statement runs; a constructor whose connection runs no key statement does both before any statement that reads a page. SQLCipher wipes only blocks freed after the pragma takes effect, so a block that held the key's hex text and was freed while the key statement ran stays readable when the key statement comes first, and a refusal made after the key statement comes after SQLite has already freed such a block unwiped. A plain SQLite returns no row for the pragma, so the readback also proves that SQLCipher is the linked engine. SQLCipher, its embedded SQLite, and SQLCipher's crypto provider (OpenSSL, or CommonCrypto on Apple targets) allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. The pragma wipes only blocks that SQLCipher's allocator frees, and two SQLite pools reuse their slots without freeing them through that allocator. The per-connection lookaside pool keeps a parsed key, statement text, or a bound value in a slot until the connection closes. The page cache's bulk block, allocated once per cache, keeps the decrypted plaintext of a page that a rollback, truncation, or cache shrink dropped. A page-cache buffer that a process hands SQLite with `sqlite3_config(SQLITE_CONFIG_PAGECACHE, buf, sz, n)` before SQLite starts does the same: SQLite serves pages from its slots and returns a freed slot to its own free list without calling `sqlite3_free`. Every such connection therefore MUST run with both pools off and with no page held in a page-cache buffer slot:
+
+- **Page-cache bulk block.** SQLite allocates a page-cache bulk block only when it was compiled without `SQLITE_ENABLE_MEMORY_MANAGEMENT`; with that option every page cache shares one page group, and SQLite allocates no bulk block. Each constructor therefore calls `sqlite3_compileoption_used("ENABLE_MEMORY_MANAGEMENT")` before the connection's first statement, and refuses to open unless it returns 1 for the linked SQLite.
+- **Lookaside.** Each constructor calls `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)` on its connection before the connection's first statement. The call returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` proves the pool is off.
+- **Page-cache buffer.** Before it opens its connection, each constructor opens a throwaway in-memory connection, sets its page size with `PRAGMA page_size = 512`, runs one statement on it that writes a page, closes it, and calls `sqlite3_status64(SQLITE_STATUS_PAGECACHE_USED, &current, &high_water, 0)`. SQLite counts a page-cache buffer slot in that status only while a slot is checked out, and the high-water mark keeps the largest count since SQLite started, so a configured buffer has served the throwaway connection by then and a high-water mark of 0 shows that no buffer slot has held a page in this process. The check runs before the constructor's own connection opens because opening a connection already checks a buffer slot out, and the connection's first statement reads the database's pages into slots; a check made after either would leave that connection's pages in slots that return to SQLite's free list unwiped. SQLite asks a page-cache buffer only for blocks of at least one page of the asking connection's page size: a cached page with its header, or a scratch block of one page or of one page plus 8 bytes. 512 bytes is the smallest page size SQLite allows, and the throwaway connection's statement asks for a 512-byte scratch page. It therefore draws a slot from every buffer whose slots could serve any connection, unless every slot is already in use, and then the high-water mark is already above 0. A buffer whose slots are smaller than 512 bytes passes the check and never holds a page. The constructor keeps no state between calls and fails when the high-water mark is above 0.
+
+A constructor whose compile-option check does not return 1 MUST fail with its typed storage error and open no connection. A constructor whose lookaside call does not return `SQLITE_OK` MUST close the connection before any statement runs on it and fail with its typed storage error. A constructor whose page-cache buffer high-water mark is above 0 MUST fail with its typed storage error before it opens its connection.
+
+The throwaway in-memory connection of the page-cache buffer check is the one SQLCipher connection these requirements exempt: it sets no key and no pragma, and its lookaside pool stays on. It opens no database SCP stores data in and holds no data, so no block it frees and no slot it leaves holds a secret.
+
+The readback and the three checks read SQLite's state, and code in the same process can change that state. While no code in the process reconfigures SQLite, the readback proves that the pragma is on and the three checks prove that the linked SQLite allocates no bulk block, that the connection has no lookaside pool, and that no page-cache buffer slot has held a page in this process. Code in the same process that reconfigures SQLite, by any call, is one limit of all four. Its forms include:
+
+- installing a custom page cache with `sqlite3_config(SQLITE_CONFIG_PCACHE2, ...)` before SQLite starts, which SQLite offers no way to read back;
+- calling `sqlite3_shutdown` and then `sqlite3_config(SQLITE_CONFIG_MALLOC, ...)` with an allocator that does not wipe: SQLCipher installs its wiping allocator wrapper only once per process, so after that reconfiguration freed blocks go unwiped while the readback still returns `1`;
+- resetting the `SQLITE_STATUS_PAGECACHE_USED` high-water mark with `sqlite3_status(SQLITE_STATUS_PAGECACHE_USED, &current, &high_water, 1)`, after which a buffer that has held pages reads 0;
+- calling `sqlite3_shutdown` and then installing a page-cache buffer with `SQLITE_CONFIG_PAGECACHE` or a custom page cache with `SQLITE_CONFIG_PCACHE2` after a constructor's page-cache buffer check and before its open, after which the constructor's connection keeps its pages in that buffer or cache although the check read 0.
+
+§9.15 lists the copies that neither wipe reaches, memory SQLCipher's crypto provider obtains from `malloc` among them.
 
 ### Browser Clients Run Storage In-Process
 

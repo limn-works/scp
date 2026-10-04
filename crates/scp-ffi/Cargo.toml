@@ -62,6 +62,9 @@ testing = [
 outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
+# Links the wiping global allocator every shipped artifact installs
+# (09-security-model.md §9.15, freed heap memory).
+scp-alloc = { path = "../scp-alloc" }
 async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async", "multiple-pymethods"] }
 tokio = { workspace = true }

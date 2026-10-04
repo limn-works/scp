@@ -77,8 +77,9 @@ pub const MAX_EPOCH_ADVANCE: u64 = 1000;
 /// Sender keys are used to encrypt messages before MLS group encryption,
 /// enabling per-relationship blocking. See ADR-007.
 ///
-/// Key material is zeroized on drop to prevent sensitive bytes from
-/// persisting in freed memory. Clone is retained for API compatibility
+/// Key material is zeroized on drop, wherever the value lives, a stack slot
+/// included; the wiping global allocator of security model spec §9.15 (freed
+/// heap memory) reaches freed heap blocks only. Clone is retained for API compatibility
 /// (e.g. `SenderKeyStore::get_all`).
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SenderKey([u8; 32]);

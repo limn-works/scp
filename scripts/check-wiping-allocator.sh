@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+#
+# check-wiping-allocator.sh — every shipped SCP binary and cdylib links the one
+# wiping global allocator, and nothing else defines a global allocator
+# (09-security-model.md §9.15, freed heap memory; rust.md §Safety Rules).
+#
+# WHAT THIS PROVES
+# ----------------
+# 1. Every `bin`, `cdylib` and `staticlib` target `cargo metadata` reports for a
+#    workspace member is classified, either in SHIPPED or in DEV_TOOLS with a
+#    reason. An unclassified target fails, so a new artifact cannot ship without
+#    someone deciding whether it installs the allocator. A SHIPPED or DEV_TOOLS
+#    entry that names no real target fails too.
+# 2. Every cdylib and staticlib target of a package in
+#    check-shipped-feature-graph.sh's ARTIFACTS list is in SHIPPED, and so is
+#    every bin target of such a package whose name equals the package name (the
+#    binary `cargo install <package>` and the Docker image ship). Only another
+#    bin target may be a DEV_TOOLS entry, so neither a shipped library nor the
+#    package's own binary can be filed as a build-time tool.
+# 3. Each SHIPPED target's crate root carries `use scp_alloc as _;` at column 0,
+#    at item level (outside every `{}`, `()` and `[]`, so not inside a module,
+#    a function or a `macro_rules!` body), outside every comment and string
+#    literal, with no attribute (`#[cfg(...)]`, `#[cfg_attr(...)]`, anything) on
+#    the lines above it. rustc loads a dependency only when the crate names it, so
+#    this line is what links scp-alloc's `#[global_allocator]` static into the
+#    artifact.
+# 4. Each SHIPPED package depends on `scp-alloc` as a normal, non-optional
+#    dependency with no target restriction, so no feature or target selection
+#    can drop it.
+# 5. `crates/scp-alloc/src/lib.rs` holds exactly one `#[global_allocator]`,
+#    on the static `WIPING_ALLOCATOR: WipingAllocator =
+#    WipingAllocator::new(std::alloc::System);`, and no source file of
+#    scp-alloc contains `cfg`, so no build of a crate that links it can leave
+#    the allocator out or swap its type.
+# 6. No other Rust file carries `#[global_allocator]`, except a file under a
+#    `tests/` directory: an integration test is its own binary, never shipped,
+#    and may install an inspecting allocator (as scp-alloc's and scp-mls's wipe
+#    tests do) provided it does not name `scp_alloc`. The files scanned are the
+#    `*.rs` files `git ls-files` lists, and the listing must hold
+#    `crates/scp-alloc/src/lib.rs`, so a listing that reads the wrong files
+#    fails instead of scanning nothing.
+#
+# A metadata document with no non-empty `packages` array fails before any
+# check runs, because every check would otherwise pass over an empty list.
+#
+# The script runs under macOS's bash 3.2 as well as bash 5: every expansion
+# of an array that may be empty uses `${arr[@]+"${arr[@]}"}`, which bash 3.2
+# requires under `set -u`. On bash 3.2 `$?` inside an EXIT trap reads 0 after
+# a `set -u` death, so the trap cannot take the status from it: each deliberate
+# exit records its status in `exit_code` first, and every other way out of the
+# script, a death included, exits 1.
+#
+# What this does not prove: that a built artifact contains the allocator. The
+# `use` line, the dependency edge and the uncfg'd static together make that a
+# consequence of how rustc links, and scp-alloc's own test proves the wipe.
+#
+# Usage:
+#   scripts/check-wiping-allocator.sh              # fixtures, then the real tree
+#   scripts/check-wiping-allocator.sh --self-test  # fixtures only
+#
+# Exit codes: 0 pass, 1 a check failed, 2 invocation error.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# Closed lists. Each entry is `<package>:<target name>`.
+# ---------------------------------------------------------------------------
+SHIPPED=(
+  "scp-node:scp-node"                # Docker image and crates.io binary
+  "scp-relay:scp-relay"              # Docker image ENTRYPOINT and release binary
+  "scp-ffi:_scp_core"                # PyO3 wheel
+  "scp-ffi-napi:scp_ffi_napi"        # npm `index.node`
+  "scp-ffi-uniffi:scp_ffi_uniffi"    # XCFramework (staticlib), Android and JVM (cdylib)
+  "scp-client-wasm:scp_client_wasm"  # wasm-pack module for @limn-works/scp-ts-wasm
+)
+
+# `<package>:<target name>|<reason>`
+DEV_TOOLS=(
+  "scp-ffi-uniffi:uniffi-bindgen|code generator run at build time to emit Swift and Kotlin bindings; never shipped"
+)
+
+INSTALL_LINE='use scp_alloc as _;'
+ALLOC_LIB_REL="crates/scp-alloc/src/lib.rs"
+ALLOC_SRC_REL="crates/scp-alloc/src"
+STATIC_LINE='static WIPING_ALLOCATOR: WipingAllocator = WipingAllocator::new(std::alloc::System);'
+FEATURE_GRAPH_REL="scripts/check-shipped-feature-graph.sh"
+# `#[cfg(...)]`, `#[cfg_attr(...)]`, `#![cfg(...)]` and `cfg!(...)`.
+CFG_PATTERN='#!?\[[[:space:]]*cfg|cfg!'
+GLOBAL_ALLOC_PATTERN='#!?\[[[:space:]]*global_allocator'
+
+failures=0
+fail() {
+  echo "   FAIL — $*"
+  failures=$((failures + 1))
+}
+
+shipped_has() { # <pkg:target>
+  local entry
+  for entry in ${SHIPPED[@]+"${SHIPPED[@]}"}; do [[ "$entry" == "$1" ]] && return 0; done
+  return 1
+}
+
+dev_tool_has() { # <pkg:target>
+  local entry
+  for entry in ${DEV_TOOLS[@]+"${DEV_TOOLS[@]}"}; do [[ "${entry%%|*}" == "$1" ]] && return 0; done
+  return 1
+}
+
+# Packages named in the ARTIFACTS=( ... ) array of the feature-graph gate.
+artifact_packages() { # <feature-graph script>
+  awk '
+    /^ARTIFACTS=\(/ { inside = 1; next }
+    inside && /^\)/ { inside = 0 }
+    inside && /^[[:space:]]*"/ {
+      line = $0
+      sub(/^[[:space:]]*"/, "", line)
+      sub(/\|.*/, "", line)
+      print line
+    }
+  ' "$1" | sort -u
+}
+
+# Artifact targets as `<package>\t<target>\t<src_path>` lines.
+artifact_targets() { # <metadata json>
+  jq -r '.packages[] as $p | $p.targets[]
+    | select(any(.kind[]; . == "bin" or . == "cdylib" or . == "staticlib"))
+    | [$p.name, .name, .src_path] | @tsv' "$1"
+}
+
+# Artifact targets as `<package>\t<target>\t<kind,kind,...>` lines.
+artifact_target_kinds() { # <metadata json>
+  jq -r '.packages[] as $p | $p.targets[]
+    | select(any(.kind[]; . == "bin" or . == "cdylib" or . == "staticlib"))
+    | [$p.name, .name, (.kind | join(","))] | @tsv' "$1"
+}
+
+# 0 when `use scp_alloc as _;` sits at column 0, at item level, outside any
+# comment or string literal, and no attribute applies to it. Comments (`//` to
+# end of line, and `/* ... */` across lines, nested as Rust nests them) and
+# string literals (`"..."` with its escapes, `r"..."` and `r#"..."#` with any
+# number of `#`, each across lines) are stripped first, and a character literal
+# such as `'"'` is skipped so it opens no string. An install line inside a
+# comment or a string is therefore not one. Item level means the count of open
+# `{`, `(` and `[` is zero where the line starts, so an install line inside a
+# `mod`, a function or a `macro_rules!` body does not count. An attribute is
+# tracked by its bracket depth until its closing `]`, so a `#[cfg(...)]` spread
+# over several lines still applies to the item after it. An outer attribute
+# (`#[...]`) or a crate-level `#![cfg...]` before the install line, with only
+# blank, comment or string-only lines between them, fails the check.
+root_installs_allocator() { # <file>
+  awk -v want="$INSTALL_LINE" -v q="'" '
+    function ident(ch) { return ch ~ /[A-Za-z0-9_]/ }
+    # Drops comments and string-literal contents from <line>, carrying the
+    # open-comment depth (block) and open-string state (instr: 0 none, 1 a
+    # "..." string, 2 a raw string closed by a quote and rawh hashes) across
+    # lines.
+    function strip_comments(line,    out, i, j, h, c, two, n) {
+      out = ""
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        two = substr(line, i, 2)
+        if (block > 0) {
+          if (two == "/*") { block++; i++ } else if (two == "*/") { block--; i++ }
+          continue
+        }
+        if (instr == 1) {
+          if (c == "\\") { i++ } else if (c == "\"") { instr = 0; out = out "\"" }
+          continue
+        }
+        if (instr == 2) {
+          if (c == "\"" && substr(line, i + 1, rawh) == substr(hashes, 1, rawh)) {
+            instr = 0; i += rawh; out = out "\""
+          }
+          continue
+        }
+        if (two == "//") break
+        if (two == "/*") { block = 1; i++; continue }
+        if (c == "\"") { instr = 1; out = out "\""; continue }
+        if (c == "r" && (i == 1 || !ident(substr(line, i - 1, 1)) || (substr(line, i - 1, 1) == "b" && (i == 2 || !ident(substr(line, i - 2, 1)))))) {
+          j = i + 1; h = 0
+          while (substr(line, j, 1) == "#") { j++; h++ }
+          if (substr(line, j, 1) == "\"") { instr = 2; rawh = h; i = j; out = out "\""; continue }
+        }
+        if (c == q) {
+          if (substr(line, i + 1, 1) == "\\") {
+            j = index(substr(line, i + 3), q)
+            if (j > 0) { i = i + 2 + j; continue }
+          } else if (substr(line, i + 2, 1) == q) {
+            i += 2; continue
+          }
+        }
+        out = out c
+      }
+      return out
+    }
+    function bracket_delta(s,    opens, closes) {
+      opens = gsub(/\[/, "[", s)
+      closes = gsub(/\]/, "]", s)
+      return opens - closes
+    }
+    function nest_delta(s,    opens, closes) {
+      opens = gsub(/[[{(]/, "x", s)
+      closes = gsub(/[]})]/, "x", s)
+      return opens - closes
+    }
+    BEGIN { hashes = "################################################################" }
+    {
+      code = strip_comments($0)
+      at_item_level = (nest == 0)
+      nest += nest_delta(code)
+      if (nest < 0) nest = 0
+      trimmed = code
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", trimmed)
+      if (trimmed == "") next
+      if (depth > 0) {
+        depth += bracket_delta(code)
+        if (depth < 0) depth = 0
+        next
+      }
+      if (trimmed ~ /^#\[/ || trimmed ~ /^#!\[[[:space:]]*cfg/) {
+        pending = 1
+        depth = bracket_delta(code)
+        if (depth < 0) depth = 0
+        next
+      }
+      if (trimmed ~ /^#!\[/) {
+        depth = bracket_delta(code)
+        if (depth < 0) depth = 0
+        next
+      }
+      if ($0 == want && code == want && at_item_level) {
+        if (pending) { bad = 1 } else { ok = 1 }
+      }
+      pending = 0
+    }
+    END { exit (ok && !bad) ? 0 : 1 }
+  ' "$1"
+}
+
+# Lines of <path> (a file, or every file under a directory) that match the
+# extended regex <pattern> and are not `//` comment lines, as `file:line:text`
+# (or `line:text` for a single file). Prose naming an attribute is not one.
+code_lines_matching() { # <pattern> <path>
+  grep -rnHE "$1" "$2" 2>/dev/null | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true
+}
+
+# Rust sources to scan for `#[global_allocator]`, relative to <root>, which is
+# a git work tree (the real repository, or a fixture the self-test commits to
+# its own index).
+rust_sources() { # <root>
+  git -C "$1" ls-files -- '*.rs'
+}
+
+# ---------------------------------------------------------------------------
+# The checks. <root> is a repository tree, <metadata> a `cargo metadata
+# --no-deps --format-version 1` document for it.
+# ---------------------------------------------------------------------------
+run_checks() { # <root> <metadata json>
+  local root="$1" metadata="$2"
+  local pkg target src key entry rel
+
+  echo ">> cargo metadata lists the workspace's packages"
+  if ! jq -e '(.packages | type) == "array" and (.packages | length) > 0' "$metadata" >/dev/null 2>&1; then
+    fail "cargo metadata holds no non-empty packages array, so no target can be checked"
+    return 1
+  fi
+
+  echo ">> every bin, cdylib and staticlib target is classified"
+  local seen=()
+  while IFS=$'\t' read -r pkg target src; do
+    key="$pkg:$target"
+    seen+=("$key")
+    if ! shipped_has "$key" && ! dev_tool_has "$key"; then
+      fail "$key is a bin/cdylib/staticlib target in neither SHIPPED nor DEV_TOOLS of $0"
+    fi
+  done < <(artifact_targets "$metadata")
+  for entry in ${SHIPPED[@]+"${SHIPPED[@]}"} ${DEV_TOOLS[@]+"${DEV_TOOLS[@]%%|*}"}; do
+    local found=0 s
+    for s in ${seen[@]+"${seen[@]}"}; do [[ "$s" == "$entry" ]] && found=1; done
+    [[ "$found" -eq 1 ]] || fail "$entry is listed but cargo metadata reports no such bin/cdylib/staticlib target"
+  done
+
+  echo ">> every cdylib, staticlib and same-named bin of a shipped-feature-graph ARTIFACTS package is SHIPPED"
+  if [[ ! -f "$root/$FEATURE_GRAPH_REL" ]]; then
+    fail "$FEATURE_GRAPH_REL is missing, so the ARTIFACTS cross-check cannot run"
+  else
+    local artifact_pkg kinds
+    while IFS= read -r artifact_pkg; do
+      [[ -n "$artifact_pkg" ]] || continue
+      while IFS=$'\t' read -r pkg target kinds; do
+        [[ "$pkg" == "$artifact_pkg" ]] || continue
+        key="$pkg:$target"
+        case ",$kinds," in
+          *,cdylib,* | *,staticlib,*)
+            shipped_has "$key" \
+              || fail "$key is a library artifact ($kinds) of ARTIFACTS package $pkg but is not in SHIPPED; only a bin target may be a DEV_TOOLS entry"
+            ;;
+          *,bin,*)
+            if [[ "$target" == "$pkg" ]]; then
+              shipped_has "$key" \
+                || fail "$key is the bin named like ARTIFACTS package $pkg but is not in SHIPPED; only another bin target may be a DEV_TOOLS entry"
+            fi
+            ;;
+        esac
+      done < <(artifact_target_kinds "$metadata")
+    done < <(artifact_packages "$root/$FEATURE_GRAPH_REL")
+  fi
+
+  echo ">> every SHIPPED crate root links scp-alloc, with no attribute on the line"
+  while IFS=$'\t' read -r pkg target src; do
+    key="$pkg:$target"
+    shipped_has "$key" || continue
+    if [[ ! -f "$src" ]]; then
+      fail "$key: crate root $src does not exist"
+    elif ! root_installs_allocator "$src"; then
+      fail "$key: $src lacks a column-0 \`$INSTALL_LINE\` free of any attribute above it"
+    fi
+  done < <(artifact_targets "$metadata")
+
+  echo ">> every SHIPPED package depends on scp-alloc unconditionally"
+  local shipped_pkg
+  for shipped_pkg in $(printf '%s\n' ${SHIPPED[@]+"${SHIPPED[@]%%:*}"} | sort -u); do
+    local edges
+    edges=$(jq -r --arg p "$shipped_pkg" '.packages[] | select(.name == $p) | .dependencies[]
+      | select(.name == "scp-alloc" and .kind == null and (.optional | not) and .target == null)
+      | .name' "$metadata" | wc -l | tr -d ' ')
+    [[ "$edges" -ge 1 ]] || fail "$shipped_pkg: no normal, non-optional, untargeted dependency on scp-alloc"
+  done
+
+  echo ">> scp-alloc holds the one global allocator, of the wiping type, with no cfg"
+  if [[ ! -f "$root/$ALLOC_LIB_REL" ]]; then
+    fail "$ALLOC_LIB_REL is missing"
+  else
+    local count
+    count=$(grep -c '^#\[global_allocator\]$' "$root/$ALLOC_LIB_REL" || true)
+    [[ "$count" -eq 1 ]] || fail "$ALLOC_LIB_REL must carry exactly one column-0 #[global_allocator], found $count"
+    local next
+    next=$(awk '/^#\[global_allocator\]$/ { getline; print; exit }' "$root/$ALLOC_LIB_REL")
+    [[ "$next" == "$STATIC_LINE" ]] \
+      || fail "$ALLOC_LIB_REL: the line after #[global_allocator] must be \`$STATIC_LINE\`, found \`$next\`"
+    local cfg_hits
+    cfg_hits=$(code_lines_matching "$CFG_PATTERN" "$root/$ALLOC_SRC_REL")
+    if [[ -n "$cfg_hits" ]]; then
+      fail "$ALLOC_SRC_REL carries a cfg attribute or cfg! outside a comment; nothing may gate the allocator:"
+      sed 's/^/          /' <<<"$cfg_hits"
+    fi
+  fi
+
+  echo ">> no other Rust file outside a tests/ directory defines a global allocator"
+  local sources
+  if ! sources=$(rust_sources "$root"); then
+    fail "git ls-files could not list the Rust sources of $root"
+  elif ! grep -qxF "$ALLOC_LIB_REL" <<<"$sources"; then
+    fail "the Rust source listing of $root lacks $ALLOC_LIB_REL, so it does not list the files this check must scan"
+  fi
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    [[ "$rel" == "$ALLOC_LIB_REL" ]] && continue
+    case "/$rel" in */tests/*) continue ;; esac
+    if [[ -n "$(code_lines_matching "$GLOBAL_ALLOC_PATTERN" "$root/$rel")" ]]; then
+      fail "$rel carries #[global_allocator] outside a comment; only $ALLOC_LIB_REL may define one"
+    fi
+  done <<<"$sources"
+
+  [[ "$failures" -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# Self-test: a well-formed fixture tree passes, and each defect fails.
+# ---------------------------------------------------------------------------
+fixture_failures=0
+expect() { # <label> <PASS|FAIL> <rc>
+  local actual
+  [[ "$3" -eq 0 ]] && actual=PASS || actual=FAIL
+  if [[ "$actual" == "$2" ]]; then
+    echo "   ok   — $1 (expected $2)"
+  else
+    echo "   FAIL — $1 (expected $2, got $actual)"
+    fixture_failures=$((fixture_failures + 1))
+  fi
+}
+
+# A defect fixture must fail on the check it names: the run fails and its
+# output carries that check's FAIL message, so a fixture that some other check
+# happens to reject does not stand in for the one it is about.
+expect_fail_on() { # <label> <dir> <fixed string from the named check's FAIL message>
+  local out rc=0
+  out=$(run_fixture_verbose "$2") || rc=$?
+  if [[ "$rc" -ne 0 ]] && grep -qF -- "$3" <<<"$out"; then
+    echo "   ok   — $1 (FAIL on: $3)"
+  else
+    echo "   FAIL — $1 (expected a FAIL carrying \"$3\", got rc=$rc)"
+    fixture_failures=$((fixture_failures + 1))
+  fi
+}
+
+make_fixture() { # <dir>
+  local d="$1" key pkg target src
+  mkdir -p "$d/scripts" "$d/$ALLOC_SRC_REL"
+  cat > "$d/$FEATURE_GRAPH_REL" <<'EOF'
+ARTIFACTS=(
+  "scp-ffi|--no-default-features --features server"
+  "scp-core|"
+  "scp-node|"
+  "scp-ffi-uniffi|"
+)
+EOF
+  cat > "$d/$ALLOC_LIB_REL" <<EOF
+#![deny(unsafe_code)]
+mod wiping;
+pub use wiping::WipingAllocator;
+/// Process-global allocator. No \`cfg\` or \`#[cfg(test)]\` gates it.
+#[global_allocator]
+$STATIC_LINE
+EOF
+  echo 'pub struct WipingAllocator;' > "$d/$ALLOC_SRC_REL/wiping.rs"
+  mkdir -p "$d/crates/scp-mls/tests"
+  printf '#[global_allocator]\nstatic A: W = W;\n' > "$d/crates/scp-mls/tests/inspect.rs"
+
+  local packages="[]" tool
+  for key in ${SHIPPED[@]+"${SHIPPED[@]}"} ${DEV_TOOLS[@]+"${DEV_TOOLS[@]%%|*}"}; do
+    pkg="${key%%:*}"
+    target="${key#*:}"
+    src="$d/crates/$pkg/src/$target.rs"
+    mkdir -p "$(dirname "$src")"
+    if shipped_has "$key"; then
+      printf '//! root\n\n// Links the one `#[global_allocator]`.\n%s\n\nuse std::sync::Arc;\n' "$INSTALL_LINE" > "$src"
+    else
+      printf 'fn main() {}\n' > "$src"
+    fi
+    tool=$(jq -n --arg p "$pkg" --arg t "$target" --arg s "$src" '{name: $p, targets: [{name: $t, kind: ["bin"], src_path: $s}],
+      dependencies: [{name: "scp-alloc", kind: null, optional: false, target: null}]}')
+    packages=$(jq --argjson n "$tool" '
+      if any(.[]; .name == $n.name) then map(if .name == $n.name then .targets += $n.targets else . end)
+      else . + [$n] end' <<<"$packages")
+  done
+  jq -n --argjson p "$packages" '{packages: $p}' > "$d/metadata.json"
+  # Check 6 lists the sources the way it lists the real tree's, through
+  # `git ls-files`, so the fixture's files go into a fresh index.
+  git -C "$d" init -q
+  git -C "$d" add -A
+}
+
+run_fixture() { # <dir> — run the checks on a fixture, silently, and return their status
+  ( failures=0; run_checks "$1" "$1/metadata.json" >/dev/null 2>&1 )
+}
+
+run_fixture_verbose() { # <dir> — run the checks on a fixture, printing their output
+  ( failures=0; run_checks "$1" "$1/metadata.json" 2>&1 )
+}
+
+# Rewrites <dir>/metadata.json through the jq program <filter>.
+edit_metadata() { # <dir> <filter>
+  jq "$2" "$1/metadata.json" > "$1/m.json" && mv "$1/m.json" "$1/metadata.json"
+}
+
+# Replaces the install line of <file> with the lines of <text>, where a literal
+# `\n` in <text> separates lines and every other backslash stays as written.
+replace_install() { # <file> <text>
+  local text="${2//\\n/$'\n'}" line out=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$INSTALL_LINE" ]]; then out+="$text"$'\n'; else out+="$line"$'\n'; fi
+  done < "$1"
+  printf '%s' "$out" > "$1"
+}
+
+run_fixtures() {
+  echo "FIXTURE HARNESS (check-wiping-allocator.sh)"
+  local base rc d
+  base=$(mktemp -d)
+  trap 'rm -rf "$base"' RETURN
+
+  d="$base/good"; make_fixture "$d"
+  run_fixture "$d"; rc=$?
+  expect "a tree where every shipped root links scp-alloc passes" PASS "$rc"
+
+  d="$base/missing"; make_fixture "$d"
+  sed -i.bak "/^use scp_alloc as _;$/d" "$d/crates/scp-relay/src/scp-relay.rs"
+  expect_fail_on "a shipped root without the install line fails" "$d" "lacks a column-0"
+
+  d="$base/cfg"; make_fixture "$d"
+  replace_install "$d/crates/scp-ffi-napi/src/scp_ffi_napi.rs" '#[cfg(not(debug_assertions))]\nuse scp_alloc as _;'
+  grep -q 'cfg(not(debug_assertions))' "$d/crates/scp-ffi-napi/src/scp_ffi_napi.rs" || { echo "   FAIL — cfg fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "a cfg-gated install line fails" "$d" "lacks a column-0"
+
+  # A crate-level `#![cfg(...)]` gates the whole root, the install line with it.
+  d="$base/cratecfg"; make_fixture "$d"
+  replace_install "$d/crates/scp-ffi-uniffi/src/scp_ffi_uniffi.rs" '#![cfg(not(debug_assertions))]\nuse scp_alloc as _;'
+  grep -q '^#!\[cfg(not(debug_assertions))\]$' "$d/crates/scp-ffi-uniffi/src/scp_ffi_uniffi.rs" || { echo "   FAIL — crate-level cfg fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "an install line after a crate-level #![cfg(...)] fails" "$d" "lacks a column-0"
+
+  d="$base/indented"; make_fixture "$d"
+  replace_install "$d/crates/scp-node/src/scp-node.rs" 'mod inner {\n    use scp_alloc as _;\n}'
+  expect_fail_on "an install line nested in a module fails" "$d" "lacks a column-0"
+
+  d="$base/modcol0"; make_fixture "$d"
+  replace_install "$d/crates/scp-node/src/scp-node.rs" 'mod inner {\nuse scp_alloc as _;\n}'
+  grep -q '^mod inner {$' "$d/crates/scp-node/src/scp-node.rs" || { echo "   FAIL — column-0 module fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "a column-0 install line inside a module body fails" "$d" "lacks a column-0"
+
+  d="$base/multilinecfg"; make_fixture "$d"
+  replace_install "$d/crates/scp-relay/src/scp-relay.rs" '#[cfg(all(\n    not(debug_assertions),\n    target_os = "linux",\n))]\nuse scp_alloc as _;'
+  grep -q '^))]$' "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — multi-line cfg fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "an install line after a multi-line cfg ending in ))] fails" "$d" "lacks a column-0"
+
+  d="$base/blockcomment"; make_fixture "$d"
+  replace_install "$d/crates/scp-relay/src/scp-relay.rs" '/*\nuse scp_alloc as _;\n*/'
+  grep -q '^/\*$' "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — block-comment fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "an install line inside a /* */ block comment fails" "$d" "lacks a column-0"
+
+  d="$base/string"; make_fixture "$d"
+  replace_install "$d/crates/scp-relay/src/scp-relay.rs" 'const DOC: &str = "// not a comment, \" not the end\nuse scp_alloc as _;\n";'
+  grep -qF 'const DOC: &str = "// not a comment, \" not the end' "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — string fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "an install line inside a \"...\" string literal fails" "$d" "lacks a column-0"
+
+  d="$base/rawstring"; make_fixture "$d"
+  replace_install "$d/crates/scp-relay/src/scp-relay.rs" 'const DOC: &str = r#"a "b" c"\nuse scp_alloc as _;\n"#;'
+  grep -qF 'const DOC: &str = r#"a "b" c"' "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — raw-string fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "an install line inside an r#\"...\"# raw string fails" "$d" "lacks a column-0"
+
+  d="$base/macro"; make_fixture "$d"
+  replace_install "$d/crates/scp-relay/src/scp-relay.rs" 'macro_rules! install {\n    () => {\nuse scp_alloc as _;\n    };\n}'
+  grep -q '^macro_rules! install {$' "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — macro_rules fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "an install line inside a macro_rules! body fails" "$d" "lacks a column-0"
+
+  # Character literals holding a quote or a backslash open no string, so the
+  # install line after them still counts.
+  d="$base/charquote"; make_fixture "$d"
+  replace_install "$d/crates/scp-relay/src/scp-relay.rs" "const Q: char = '\"';\nconst B: char = '\\\\';\nconst S: char = '\\'';\nuse scp_alloc as _;"
+  grep -qF "const Q: char = '\"';" "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — character-literal fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  run_fixture "$d"; rc=$?
+  expect "an install line after quote and backslash character literals passes" PASS "$rc"
+
+  d="$base/othertype"; make_fixture "$d"
+  sed -i.bak 's/^static WIPING_ALLOCATOR: .*$/static WIPING_ALLOCATOR: std::alloc::System = std::alloc::System;/' "$d/$ALLOC_LIB_REL"
+  expect_fail_on "a different allocator type in scp-alloc fails" "$d" "the line after #[global_allocator] must be"
+
+  d="$base/cfgalloc"; make_fixture "$d"
+  sed -i.bak 's/^#\[global_allocator\]$/#[cfg(not(feature = "off"))]\n#[global_allocator]/' "$d/$ALLOC_LIB_REL"
+  expect_fail_on "a cfg on scp-alloc's static fails" "$d" "carries a cfg attribute or cfg!"
+
+  d="$base/second"; make_fixture "$d"
+  printf '#[global_allocator]\nstatic B: std::alloc::System = std::alloc::System;\n' >> "$d/crates/scp-ffi/src/_scp_core.rs"
+  expect_fail_on "a second #[global_allocator] in a crate's src fails" "$d" "carries #[global_allocator] outside a comment"
+
+  d="$base/unclassified"; make_fixture "$d"
+  edit_metadata "$d" '.packages += [{name: "scp-new", targets: [{name: "scp-new", kind: ["bin"], src_path: "/dev/null"}], dependencies: []}]'
+  expect_fail_on "an unclassified new bin target fails" "$d" "in neither SHIPPED nor DEV_TOOLS"
+
+  d="$base/optional"; make_fixture "$d"
+  edit_metadata "$d" '(.packages[] | select(.name == "scp-relay") | .dependencies) = [{name: "scp-alloc", kind: null, optional: true, target: null}]'
+  expect_fail_on "an optional scp-alloc dependency fails" "$d" "no normal, non-optional, untargeted dependency"
+
+  d="$base/targeted"; make_fixture "$d"
+  edit_metadata "$d" '(.packages[] | select(.name == "scp-relay") | .dependencies) = [{name: "scp-alloc", kind: null, optional: false, target: "cfg(unix)"}]'
+  expect_fail_on "a cfg(unix)-targeted scp-alloc dependency fails" "$d" "no normal, non-optional, untargeted dependency"
+
+  d="$base/devdep"; make_fixture "$d"
+  edit_metadata "$d" '(.packages[] | select(.name == "scp-relay") | .dependencies) = [{name: "scp-alloc", kind: "dev", optional: false, target: null}]'
+  expect_fail_on "a dev-only scp-alloc dependency fails" "$d" "no normal, non-optional, untargeted dependency"
+
+  d="$base/devcdylib"; make_fixture "$d"
+  edit_metadata "$d" '(.packages[] | select(.name == "scp-ffi-uniffi") | .targets[] | select(.name == "uniffi-bindgen") | .kind) = ["cdylib"]'
+  expect_fail_on "an ARTIFACTS cdylib classified as a DEV_TOOLS entry fails" "$d" "is a library artifact"
+
+  # The package's own binary filed as a build-time tool: check 1 sees it
+  # classified, and it is not SHIPPED, so only the ARTIFACTS cross-check can
+  # catch it. The lists are redefined in a subshell for this fixture alone.
+  d="$base/devbin"; make_fixture "$d"
+  local devbin_out
+  devbin_out=$(
+    SHIPPED=("scp-relay:scp-relay" "scp-ffi:_scp_core" "scp-ffi-napi:scp_ffi_napi" "scp-ffi-uniffi:scp_ffi_uniffi" "scp-client-wasm:scp_client_wasm")
+    DEV_TOOLS+=("scp-node:scp-node|mislabelled as a tool")
+    fixture_failures=0
+    expect_fail_on "an ARTIFACTS package's same-named bin classified as a DEV_TOOLS entry fails" "$d" "is the bin named like ARTIFACTS package scp-node"
+  )
+  echo "$devbin_out"
+  case "$devbin_out" in "   ok   — "*) ;; *) fixture_failures=$((fixture_failures + 1)) ;; esac
+
+  # A SHIPPED entry whose package still exists, with its scp-alloc edge, but
+  # whose artifact target carries another name.
+  d="$base/stale"; make_fixture "$d"
+  edit_metadata "$d" '(.packages[] | select(.name == "scp-client-wasm") | .targets[] | select(.name == "scp_client_wasm") | .name) = "scp_client_wasm_renamed"'
+  jq -e '.packages[] | select(.name == "scp-client-wasm") | .dependencies[] | select(.name == "scp-alloc")' "$d/metadata.json" >/dev/null \
+    || { echo "   FAIL — stale fixture lost its scp-alloc edge"; fixture_failures=$((fixture_failures + 1)); }
+  expect_fail_on "a SHIPPED entry naming no real target fails" "$d" "is listed but cargo metadata reports no such"
+
+  d="$base/nopackages"; make_fixture "$d"
+  edit_metadata "$d" '.packages = []'
+  expect_fail_on "a metadata document with an empty packages array fails" "$d" "holds no non-empty packages array"
+
+  d="$base/nopackageskey"; make_fixture "$d"
+  edit_metadata "$d" 'del(.packages)'
+  expect_fail_on "a metadata document with no packages array fails" "$d" "holds no non-empty packages array"
+
+  # A tree whose index lacks scp-alloc's root: the listing check 6 scans is
+  # not the tree's sources.
+  d="$base/unlisted"; make_fixture "$d"
+  git -C "$d" rm -q --cached "$ALLOC_LIB_REL"
+  expect_fail_on "a source listing without scp-alloc's lib.rs fails" "$d" "lacks $ALLOC_LIB_REL"
+
+  if [[ "$fixture_failures" -eq 0 ]]; then
+    echo "FIXTURE HARNESS: all behavioral proofs passed."
+    return 0
+  fi
+  echo "FIXTURE HARNESS: $fixture_failures behavioral proof(s) failed."
+  return 1
+}
+
+exit_code=""
+metadata=""
+# The EXIT trap. Only a deliberate exit sets `exit_code`, so a run that dies
+# (an unbound variable under `set -u`, a failed command under `set -e`) exits 1.
+finish() {
+  if [[ -n "$metadata" ]]; then rm -f "$metadata"; fi
+  exit "${exit_code:-1}"
+}
+
+main() {
+  trap finish EXIT
+  command -v jq >/dev/null || { echo "error: jq is required" >&2; exit_code=2; exit 2; }
+  run_fixtures || { exit_code=1; exit 1; }
+  if [[ "${1:-}" == "--self-test" ]]; then
+    echo "--self-test: skipping the real workspace."
+    exit_code=0
+    exit 0
+  fi
+
+  echo
+  metadata=$(mktemp)
+  (cd "$REPO_ROOT" && cargo metadata --no-deps --format-version 1) > "$metadata"
+  if run_checks "$REPO_ROOT" "$metadata"; then
+    echo
+    echo "PASSED: every shipped binary and cdylib links scp-alloc's wiping allocator, and no other global allocator exists."
+    exit_code=0
+    exit 0
+  fi
+  echo
+  echo "FAILED: $failures check(s). §9.15 of 09-security-model.md requires every shipped artifact to"
+  echo "install the wiping allocator by linking scp-alloc (\`$INSTALL_LINE\` at its crate root)."
+  exit_code=1
+  exit 1
+}
+
+main "$@"

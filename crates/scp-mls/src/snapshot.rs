@@ -25,7 +25,10 @@
 //! the browser tab is the plaintext/custody boundary). The intermediate snapshot
 //! structs hold their key-bearing fields in `Zeroizing` types, so a struct
 //! wipes its key material when it drops, on success and on an early return.
-//! Buffers that serde allocates and frees while decoding a blob are not wiped.
+//! Buffers that serde allocates and frees while decoding a blob are wiped as
+//! they are freed by the wiping global allocator every shipped artifact
+//! installs (security model spec §9.15, freed heap memory), and by nothing in
+//! an application that links this crate without `scp-alloc`.
 //!
 //! # Relationship to the native runtime snapshot (do NOT unify blindly)
 //!
