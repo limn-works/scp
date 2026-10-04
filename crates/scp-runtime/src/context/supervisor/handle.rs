@@ -18,9 +18,8 @@
 //!
 //! The handle wraps a `Weak<Supervisor>` (ADR-049 Decision 16, supervisor
 //! task drain): every method upgrades it for one operation and drops the
-//! upgraded `Arc` when the operation ends, so an actor never keeps its
-//! Supervisor alive and the Supervisor → actor hierarchy holds no reference
-//! cycle (Decision 2). A failed upgrade means every owner dropped the
+//! upgraded `Arc` when the operation ends, so the Supervisor → actor
+//! hierarchy holds no reference cycle (Decision 2). A failed upgrade means every owner dropped the
 //! Supervisor.
 //!
 //! # `&OwnedIdentityDid` parameters

@@ -1017,10 +1017,6 @@ impl ContextActor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 /// Removes an actor's own registry entry after a timer-driven terminal exit.
 /// When the Supervisor has dropped (ADR-049 Decision 16) its registry dropped
 /// with it, so no entry remains to remove; that case logs at debug.
@@ -1040,6 +1036,10 @@ async fn despawn_self_after_ttl_exit(
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
