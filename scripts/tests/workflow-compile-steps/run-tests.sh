@@ -12,15 +12,23 @@
 #     expression, and it passes a job that restores two groups through two rust-cache
 #     steps, both at `false` — the shape job rust-doc of ci.yml takes, because its
 #     `cargo test --doc` reads build-mode artifacts and its `cargo doc` reads check-mode
-#     ones, and the check counts each step in its own group.
+#     ones, and the check counts each step in its own group. It counts a `shared-key`
+#     holding `${{ matrix.<axis> }}` as one group per axis value: it passes such a
+#     writer whose groups each have one writer, fails a literal second writer of one of
+#     those groups, fails a key naming an axis the job's matrix gives no list, and
+#     fails a templated key whose matrix carries `include` or `exclude`.
 #   * Check 2 (uniffi-bindgen steps) fails a `cargo run` with no profile or target flags
 #     whose `--library` sits under `target/<triple>/release` (the second-compile shape
 #     from build-xcframework.sh and the Swift job of build-matrix.yml), one whose
 #     `--library` sits under `target/release` (the Android job's path that no step
-#     produced), and one that passes no `--library`. It passes a `cargo run` whose flags
-#     name the library's directory, with `--release --target`, with `--profile release`
-#     behind a `+toolchain` selector, and with a bare `cargo run` reading `target/debug`,
-#     and it joins backslash-continued lines before reading a command.
+#     produced), one that passes no `--library`, one under the custom `--profile
+#     ci-bridge` whose `--library` sits under `target/<triple>/release`, and one under
+#     the built-in `--profile test` whose `--library` sits under `target/test`. It passes a
+#     `cargo run` whose flags name the library's directory, with `--release --target`,
+#     with `--profile release` behind a `+toolchain` selector, with `--profile ci-bridge
+#     --target` reading `target/<triple>/ci-bridge`, with a bare `cargo run` reading
+#     `target/debug`, with `--profile test` reading `target/debug` and `--profile bench`
+#     reading `target/release`, and it joins backslash-continued lines before reading a command.
 #
 # Each case is a directory under ./fixtures/ that the check reads through
 # `--workflows-dir`. Exit 0 when every case matches its expectation, 1 otherwise.
@@ -52,12 +60,26 @@ FIXTURES=(
     "bad-bindgen-second-compile"
     "bad-bindgen-path-nothing-wrote"
     "bad-bindgen-no-library"
+    "good-cache-matrix-key"
+    "bad-cache-matrix-key-second-writer"
+    "bad-cache-matrix-key-no-axis"
+    "bad-cache-matrix-key-include"
+    "bad-cache-matrix-key-exclude"
+    "bad-bindgen-custom-profile-release-path"
+    "bad-bindgen-test-profile-own-name"
 )
 EXPECTED_EXITS=(
     "0"
     "1"
     "1"
     "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "1"
+    "0"
     "1"
     "1"
     "1"
@@ -76,6 +98,13 @@ EXPECTED_SUBSTRINGS=(
     "writes target/debug/ and the \`--library\` it reads is target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib"
     "writes target/debug/ and the \`--library\` it reads is target/release/libscp_ffi_uniffi.so"
     "passes no \`--library\`"
+    "OK: 2 rust-cache step(s) in 2 group(s)"
+    "cache group 'optional-transport' has 2 steps whose save-if is not false"
+    "names matrix axis 'group', which the job's \`strategy.matrix\` gives no list"
+    "of a \`strategy.matrix\` carrying include, so this check"
+    "of a \`strategy.matrix\` carrying exclude, so this check"
+    "writes target/aarch64-apple-darwin/ci-bridge/ and the \`--library\` it reads is target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib"
+    "writes target/debug/ and the \`--library\` it reads is target/test/libscp_ffi_uniffi.so"
 )
 
 passed=0
@@ -120,11 +149,11 @@ done
 set +e
 good_output="$("$PYTHON" "$CHECK" --workflows-dir "$FIXTURES_DIR/good-groups-and-bindgen" 2>&1)"
 set -e
-if [[ "$good_output" == *"OK: 3 uniffi-bindgen step(s)"* ]]; then
-    echo "PASS [good-groups-and-bindgen counts three bindgen steps]"
+if [[ "$good_output" == *"OK: 6 uniffi-bindgen step(s)"* ]]; then
+    echo "PASS [good-groups-and-bindgen counts six bindgen steps]"
     passed=$((passed + 1))
 else
-    echo "FAIL [good-groups-and-bindgen counts three bindgen steps]: $good_output" >&2
+    echo "FAIL [good-groups-and-bindgen counts six bindgen steps]: $good_output" >&2
     failed=$((failed + 1))
 fi
 

@@ -23,10 +23,10 @@
 //!
 //! # Relationship to the openmls `Lifetime` clock (ADR-057 Prerequisite 1)
 //!
-//! openmls's `js` feature wires `fluvio_wasm_timer::SystemTime`, which reads a
-//! *live, un-captured* `Date.now()` — a second, unhardened clock openmls uses
-//! internally to stamp (`Lifetime::default`/`new`) and validate
-//! (`Lifetime::is_valid`) `KeyPackage` / `LeafNode` lifetimes. Prerequisite 1
+//! openmls's `js` feature wires `web_time::SystemTime` (openmls 0.9.0), which
+//! reads a *live, un-captured* `Date.now()` — a second, unhardened clock openmls
+//! uses internally to stamp (`Lifetime::default`/`new`) and validate
+//! (`Lifetime::validate`) `KeyPackage` / `LeafNode` lifetimes. Prerequisite 1
 //! routes SCP's use of that clock through the captured/hardened
 //! [`Clock`](scp_clock::Clock) this module provides. As of the Prereq-1 landing:
 //!
@@ -34,35 +34,38 @@
 //!   `Lifetime` SCP *mints* is built via `scp_mls::lifetime::key_package_lifetime`
 //!   from the injected hardened clock (`Lifetime::init` with explicit bounds),
 //!   never openmls's `Lifetime::default()`. See `scp-mls/src/group.rs`.
-//! - **The receive/accept side is bracketed.** Every `Lifetime` SCP *accepts*
-//!   is additionally re-validated against the injected hardened clock
+//! - **The receive/accept side is bracketed.** Every `Lifetime` SCP *accepts*,
+//!   except another member's leaf in a Welcome's ratchet tree (below), is
+//!   additionally re-validated against the injected hardened clock
 //!   (`scp_mls::lifetime::validate_key_package_lifetime`) wherever openmls
 //!   exposes the accepted `Lifetime` — post-`KeyPackageIn::validate`
 //!   (add-member / key-package-DID) and pre-merge on staged-commit Add proposals
 //!   — and the RFC 9420 maximum-range bound openmls never enforces is added
 //!   there too.
-//! - **Residual (V3).** openmls's own internal `Lifetime::is_valid` on the
-//!   *Welcome tree-leaf* validation path is NOT injectable and NOT bracketable —
-//!   but not because the accessor is private. `LeafNode::life_time()` is
-//!   `pub(crate)`, yet `leaf_node_source()` IS public and its public
-//!   `LeafNodeSource::KeyPackage(Lifetime)` variant hands back the `Lifetime`
-//!   whenever you hold the `LeafNode`. The real blocker is that a *joined*
-//!   `MlsGroup` gives no public way to reach another member's `LeafNode`:
-//!   `members()`/`member_at()` yield `Member` (no lifetime),
-//!   `export_ratchet_tree()`'s `RatchetTree` has no public node iterator,
-//!   `public_group()` is `pub(crate)`, and only `own_leaf_node()`/`own_leaf()`
-//!   are public — and that own leaf is SCP-minted anyway, so bracketing it is
-//!   possible but pointless (it is not the attacker-supplied Welcome leaf).
-//!   openmls 0.8 also exposes no time-provider seam, so the internal check still
-//!   reads openmls's internal clock. Do NOT "fix" V3 by calling the public
-//!   `leaf_node_source()` on the wrong object — there is no object that yields
-//!   the joining peers' leaves. Closing this residual requires an upstream
-//!   openmls change — a time-provider seam on `OpenMlsProvider` covering
-//!   `Lifetime::new`/`is_valid` — requested upstream (see this change's PR body /
-//!   report for the filed feature-request text). Until then, page same-origin
-//!   integrity (CSP/SRI/COOP/COEP) remains load-bearing for the Welcome-leaf
-//!   freshness check, exactly as it already is for the wall clock this module
-//!   hardens.
+//! - **Welcome tree leaves: no clock (V3).**
+//!   `scp_mls::group::join_group_from_bytes` switches openmls's tree-leaf
+//!   `Lifetime` check off (`skip_lifetime_validation`) and checks only each
+//!   KeyPackage-sourced leaf's range: it rejects a leaf whose `not_after` is
+//!   not later than its `not_before` or whose range exceeds the maximum. No
+//!   clock, neither this module's nor `Date.now()`, takes part in the decision
+//!   on another member's tree leaf. The joiner's own `KeyPackage` must still be
+//!   current: `scp_client::ScpClient::join_context_encrypted` passes this
+//!   module's clock to `join_group_from_bytes`, which checks the joiner's own
+//!   leaf's `Lifetime` against it before it returns a group.
+//! - **Residual: openmls's internal check still runs on two paths.** openmls
+//!   0.9.0's internal checks call `Lifetime::validate`, never
+//!   `validate_with_time` with a caller's time, so its own check inside
+//!   `KeyPackageIn::validate` and `process_message` still reads `web_time`'s
+//!   `Date.now()`, in addition to SCP's checks. Prerequisite 1's one-clock
+//!   criterion is therefore not yet met. Every accept decision on those paths
+//!   also needs SCP's check against this module's clock, so openmls's clock can
+//!   only add rejections: a page script that overrides `Date.now()` after this
+//!   module initializes can make an honest `KeyPackage` or commit fail, but
+//!   cannot get a forged `Lifetime` accepted. Page same-origin integrity
+//!   (CSP/SRI/COOP/COEP) stays load-bearing for every `Lifetime` decision,
+//!   because a script that runs before this module initializes shifts the
+//!   captured clock too. The residual closes when openmls lets the caller
+//!   supply the clock that `KeyPackageIn::validate` and `process_message` read.
 
 use scp_clock::Clock;
 

@@ -928,7 +928,7 @@ mod tests {
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
 
-        let bob_group = join_group(&result.welcome, provider, signer).unwrap();
+        let bob_group = join_group(&result.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
 
         // Exchange sender keys (out-of-band, mirroring the driver's MISSING SEAM).
@@ -983,7 +983,13 @@ mod tests {
         let add_carol = add_member(&mut alice.mls_group, carol_kp_in, &SystemClock).unwrap();
         let mut carol = ContextCryptoState::from_group(
             CTX,
-            join_group(&add_carol.welcome, carol_provider, carol_signer).unwrap(),
+            join_group(
+                &add_carol.welcome,
+                carol_provider,
+                carol_signer,
+                &SystemClock,
+            )
+            .unwrap(),
         );
 
         // Alice adds Bob; Carol (existing member) processes the Commit. Bob's
@@ -1187,7 +1193,7 @@ mod tests {
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
         let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
-        let bob_group = join_group(&result.welcome, provider, signer).unwrap();
+        let bob_group = join_group(&result.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
 
         let ct = alice.encrypt_message(b"one", ALICE, 1).unwrap();
@@ -1284,7 +1290,7 @@ mod tests {
         )
         .unwrap();
         let add = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
-        let bob_group = join_group(&add.welcome, provider, signer).unwrap();
+        let bob_group = join_group(&add.welcome, provider, signer, &SystemClock).unwrap();
         let mut bob =
             ContextCryptoState::from_group_with_wrapping(CTX, bob_group, bob_wpub, bob_wsec);
 

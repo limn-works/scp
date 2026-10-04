@@ -84,7 +84,9 @@ class JoinFromWelcomeTest {
 
         /**
          * Length in bytes of an RFC 9180 HPKE encapsulated key under DHKEM
-         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses.
+         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses. A join
+         * boundary validates `SealedInvitation.enc` against exactly this many
+         * bytes.
          */
         private const val HPKE_ENCAPSULATED_KEY_BYTES = 32
 
@@ -105,9 +107,9 @@ class JoinFromWelcomeTest {
     // Encrypted SingleAdmin params. inviteMember routes the add through the
     // actor's governance gate, which enforces ONLY the proposer's
     // `governance:propose` capability before auto-executing the unilateral
-    // SingleAdmin add (a normally-created SingleAdmin context grants its admin
-    // that capability at genesis). The ceiling below simply keeps the default
-    // SingleAdmin capability set (mirrors the PyO3 reference
+    // SingleAdmin add. The SingleAdmin creator holds every capability in the
+    // declared ceiling, so the ceiling below declares `governance:propose`; a
+    // ceiling without it cannot invite (mirrors the PyO3 reference
     // `test_invite_member_seals_for_single_admin_context`).
     private fun makeInviteParams(): ContextParams =
         ContextParams(
@@ -257,6 +259,8 @@ class JoinFromWelcomeTest {
                     sealed.enc.size,
                     "the HPKE encapsulated key must be 32 bytes (RFC 9180 DHKEM X25519)",
                 )
+                // `ct = ciphertext || tag`, so real sealing never yields an
+                // empty ciphertext.
                 assertTrue(
                     sealed.ciphertext.isNotEmpty(),
                     "the sealed Welcome ciphertext must be non-empty",

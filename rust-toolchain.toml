@@ -19,18 +19,6 @@
 #   - `templates/personal-relay/README.md` documents a container build that copies the
 #     repository root, this file included, for the same reason the root `Dockerfile` does.
 #
-# WHAT SELECTS THE COMPILER IN CI. The workflow steps that read
-# `dtolnay/rust-toolchain@stable` select no version: that action never reads a toolchain
-# file (its `action.yml` performs no filesystem read of the checkout), so each step
-# installs rustup's `stable` and runs `rustup default stable`. rustup then applies this
-# file as a directory override, which beats `rustup default`, so every cargo command in
-# a CI job compiles on the channel below. Each step costs one redundant toolchain
-# install and installs its `targets:` inputs into a toolchain cargo does not use. Deleting
-# those steps, and moving each job's targets to a `rustup target add`, would remove that
-# redundancy; it is not done here because most of them live in `build-matrix.yml` and
-# `release.yml`, which run only on a release tag, so a pull request produces no signal on
-# the change.
-#
 # WHY THE PIN EXISTS. Until 2026-08-22 this repository had no toolchain file, and every
 # workflow step installed `dtolnay/rust-toolchain@stable`, which resolves to whichever
 # stable Rust was published most recently. Rust 1.98.0 shipped on 2026-08-20; its clippy

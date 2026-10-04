@@ -151,7 +151,12 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        // A create must declare a non-empty ceiling (construction.md M2);
+        // `messages:read` alone grants the creator nothing these tests gate.
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
@@ -1425,7 +1430,12 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
     let ctx_id = context_id.to_owned();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        // A create must declare a non-empty ceiling (construction.md M2);
+        // `messages:read` alone grants the creator nothing these tests gate.
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
@@ -1437,8 +1447,8 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
 /// Creates a registered context whose CREATOR holds the `ContextClose`
 /// capability (the ceiling is seeded with `context:close`), so the creator can
 /// later drive it `Closed` through the REAL supervisor close path. The default
-/// `create_test_context_with_id` uses an EMPTY ceiling, under which even the
-/// creator lacks `context:close` — hence this close-capable variant. Returns the
+/// `create_test_context_with_id` uses a `messages:read`-only ceiling, under
+/// which even the creator lacks `context:close` — hence this close-capable variant. Returns the
 /// generated 64-hex context id.
 fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     use scp_core::context::roles::Capability;
@@ -2850,6 +2860,13 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // created on a different runtime is unreachable → transport.rate-limited).
         let ctx = {
             let params = PyDict::new(py);
+            // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
+            // outlet calls all sit inside the ceiling.
+            let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect();
+            params.set_item("ceiling", ceiling).unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };
@@ -3028,6 +3045,13 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         runtime::init_context_manager_for_test(bi);
         let ctx = {
             let params = PyDict::new(py);
+            // Every capability in `default_ceiling()`, so the fixture's mint, delegation and
+            // outlet calls all sit inside the ceiling.
+            let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
+                .iter()
+                .map(|cap| cap.name().into_owned())
+                .collect();
+            params.set_item("ceiling", ceiling).unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };

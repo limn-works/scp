@@ -32,15 +32,21 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 ed25519-dalek = { workspace = true }
 
 # `js` is declared in the wasm32 section below, not here. openmls refuses to compile for
-# wasm32 without it (`compile_error!` at openmls-0.8.1/src/lib.rs:148) and on every other
-# target it adds `fluvio-wasm-timer`, which openmls imports only under
-# `#[cfg(target_arch = "wasm32")]`, plus that crate's `parking_lot` 0.11 and `instant`.
+# wasm32 without it (`compile_error!` at openmls-0.9.0/src/lib.rs:148) and on every other
+# target it adds `web-time` and a getrandom 0.4 `wasm_js` backend, which openmls uses
+# only under `#[cfg(target_arch = "wasm32")]`.
 openmls = { workspace = true }
 openmls_traits = { workspace = true }
 openmls_basic_credential = { workspace = true }
 openmls_rust_crypto = { workspace = true }
 openmls_memory_storage = { workspace = true }
-tls_codec = "0.4"
+tls_codec = "0.5"
+# `lifetime.rs` passes a `web_time::SystemTime` to `Lifetime::validate_with_time` so SCP's temporal rule cannot drift from openmls's; version matches openmls 0.9.0's `web-time = "1.1"`.
+web-time = "1.1"
+# `provider::OsRand` answers openmls's `rand()` from the operating system on every
+# request, keeping no seed (security model spec §9.15 step 2). getrandom 0.2 is the
+# version the wasm32 section below already configures with its `js` backend.
+getrandom = "0.2"
 
 serde = { workspace = true }
 rmp-serde = { workspace = true }
@@ -48,7 +54,7 @@ rmp-serde = { workspace = true }
 # (keypackage_attestation.rs). Workspace-pinned 0.10, wasm32-safe (the same dep
 # scp-protocol uses on the wasm path).
 sha2 = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -56,9 +62,9 @@ tracing = { workspace = true }
 # sets getrandom_backend="wasm_js" globally for the wasm32 target, so no per-crate config
 # is needed. See ADR-057 Prerequisite 1.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# openmls reads the current time for a KeyPackage Lifetime through fluvio-wasm-timer on
+# openmls 0.9.0 reads the current time for a KeyPackage Lifetime through web-time on
 # wasm32 and through std::time elsewhere, and its `js` feature is what supplies that crate
-# plus a getrandom 0.3 wasm_js backend. openmls's lib.rs raises `compile_error!` when a
+# plus a getrandom 0.4 wasm_js backend. openmls's lib.rs raises `compile_error!` when a
 # wasm32 build leaves the feature off, so this target section is where it belongs.
 openmls = { workspace = true, features = ["js"] }
 getrandom = { version = "0.2", features = ["js"] }

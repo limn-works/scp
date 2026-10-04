@@ -300,6 +300,23 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2096.to_owned(),
             },
+            // construction.md M2: a create with no ceiling or a null one omits
+            // a required field; an empty one is an invalid field value.
+            CE::CeilingRequired(declared) => Self::Validation {
+                message: format!("{e}"),
+                code: match declared {
+                    scp_core::context::CeilingDeclaration::Absent
+                    | scp_core::context::CeilingDeclaration::Null => codes::VALID_7004,
+                    scp_core::context::CeilingDeclaration::Empty => codes::VALID_7005,
+                }
+                .to_owned(),
+            },
+            // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
+            // `ContextError::ActorBusy` doc states producers and retry behaviour.
+            CE::ActorBusy(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2130.to_owned(),
+            },
             // ADR-049 §10: actor poisoned (exceeded the respawn budget).
             // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
             // caller can detect "dormant, needs operator recovery".
@@ -394,6 +411,14 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpNapiError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
+        // The core's empty-ceiling rejection keeps its own validation code
+        // (construction.md M2), the one the parser's rejection carries.
+        if let scp_core::context::builder::ContextCreationError::StateTransition(
+            inner @ scp_core::context::ContextError::CeilingRequired(_),
+        ) = e
+        {
+            return inner.into();
+        }
         Self::Context {
             message: format!(
                 "context creation failed: {e} — check context parameters and identity"
@@ -761,6 +786,55 @@ mod tests {
         match e {
             ScpNapiError::Context { code, .. } => code,
             other => panic!("expected ScpNapiError::Context, got {other:?}"),
+        }
+    }
+
+    /// ADR-049 §10: `ContextError::ActorBusy` must surface the dedicated
+    /// SCP-CTX-2130 code, NOT the catch-all SCP-CTX-2001.
+    #[test]
+    fn actor_busy_surfaces_ctx_2130() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::ActorBusy("ctx-1".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2130);
+    }
+
+    /// construction.md M2: the core's empty-ceiling rejection, which reaches
+    /// the bridge wrapped in `ContextCreationError::StateTransition`, keeps
+    /// `SCP-VALID-7005`; every other creation failure keeps `SCP-CTX-2002`.
+    #[test]
+    fn creation_ceiling_required_keeps_valid_7005() {
+        use scp_core::context::builder::ContextCreationError as CCE;
+        let err: ScpNapiError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingRequired(
+                scp_core::context::CeilingDeclaration::Empty,
+            ))
+            .into();
+        match err {
+            ScpNapiError::Validation { code, .. } => assert_eq!(code, codes::VALID_7005),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let err: ScpNapiError =
+            CCE::StateTransition(scp_core::context::ContextError::CeilingImmutable).into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
+    }
+
+    /// construction.md M2: a create that declared no usable ceiling surfaces
+    /// as a validation error, not a context error: an absent or null ceiling
+    /// with `SCP-VALID-7004`, an empty one with `SCP-VALID-7005`.
+    #[test]
+    fn ceiling_required_surfaces_valid_7004_or_7005() {
+        use scp_core::context::CeilingDeclaration as D;
+        for (declared, expected) in [
+            (D::Absent, codes::VALID_7004),
+            (D::Null, codes::VALID_7004),
+            (D::Empty, codes::VALID_7005),
+        ] {
+            let err: ScpNapiError =
+                scp_core::context::ContextError::CeilingRequired(declared).into();
+            match err {
+                ScpNapiError::Validation { code, .. } => assert_eq!(code, expected, "{declared:?}"),
+                other => panic!("expected ScpNapiError::Validation, got {other:?}"),
+            }
         }
     }
 

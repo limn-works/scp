@@ -367,7 +367,10 @@ class TestInviteMemberRealFfi:
         from scp_sdk.types import CustodyType
 
         creator = await scp.identity_create(CustodyType.IN_MEMORY)
-        await scp.context_create(creator.did, {"mode": "encrypted", "governance": "single_admin"})
+        await scp.context_create(
+            creator.did,
+            {"mode": "encrypted", "governance": "single_admin", "ceiling": ["member:invite"]},
+        )
 
         unknown_ctx = "d" * 64
         with pytest.raises(Exception, match="no live context"):
@@ -402,9 +405,9 @@ class TestInviteMemberRealFfi:
         creator = await scp.identity_create(CustodyType.IN_MEMORY)
         # The invite is routed through the actor's governance gate, which checks
         # the proposer's `governance:propose` capability before auto-executing —
-        # that is the ONLY capability enforced for the invite. A normally-created
-        # SingleAdmin context grants its admin `governance:propose` at genesis; the
-        # ceiling below simply keeps the default SingleAdmin capability set.
+        # that is the ONLY capability enforced for the invite. The SingleAdmin
+        # creator holds every capability in the declared ceiling, so the ceiling
+        # below declares `governance:propose`; a ceiling without it cannot invite.
         ctx = await scp.context_create(
             creator.did,
             {

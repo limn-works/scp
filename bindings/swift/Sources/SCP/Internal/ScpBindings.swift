@@ -9172,7 +9172,8 @@ public struct ContextParams {
     public var mode: ContextMode
     /**
      * Capability ceiling — maximum capabilities any participant can hold.
-     * Empty list means no ceiling restriction.
+     * Required and non-empty (construction.md M2): an empty list fails the
+     * create with `SCP-VALID-7005`.
      */
     public var ceiling: [String]
     /**
@@ -9249,7 +9250,8 @@ public struct ContextParams {
          */mode: ContextMode, 
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
-         * Empty list means no ceiling restriction.
+         * Required and non-empty (construction.md M2): an empty list fails the
+         * create with `SCP-VALID-7005`.
          */ceiling: [String], 
         /**
          * Ceiling mutability policy — `Immutable` (default) or `Governed`.

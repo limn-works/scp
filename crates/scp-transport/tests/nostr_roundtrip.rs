@@ -15,7 +15,7 @@ use scp_transport::nostr::adapter::{NostrAdapter, NostrConfig};
 use scp_transport::nostr::protocol::{NostrEvent, SCP_EVENT_KIND};
 
 /// Generate a valid test signing key.
-fn test_signing_key() -> [u8; 32] {
+const fn test_signing_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     key[31] = 42;
     key
@@ -43,8 +43,8 @@ fn nostr_event_creation_and_signing_roundtrip() {
     // internally, but without needing a WebSocket connection.
     let content = "test-content";
     let tags = vec![vec!["r".to_owned(), "deadbeef".to_owned()]];
-    let id = NostrEvent::compute_id(&adapter.pubkey_hex(), 1000, SCP_EVENT_KIND, &tags, content)
-        .unwrap();
+    let id =
+        NostrEvent::compute_id(adapter.pubkey_hex(), 1000, SCP_EVENT_KIND, &tags, content).unwrap();
 
     let mut event = NostrEvent {
         id,

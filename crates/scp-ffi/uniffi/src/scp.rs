@@ -13,7 +13,7 @@
 //!
 //! See #1549 Phase 4 remainder plan and ADR-048.
 
-use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownError};
 use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,10 +142,11 @@ impl Scp {
     pub async fn shutdown(&self, timeout_millis: u64) -> Result<(), ScpError> {
         let timeout = Duration::from_millis(timeout_millis);
         match self.inner.shutdown(timeout).await {
-            Ok(_) => Ok(()),
             // AlreadyShutDown is treated as a harmless lifecycle observation —
-            // double-shutdown is idempotent at the SDK surface.
-            Err(_already) => Ok(()),
+            // double-shutdown is idempotent at the SDK surface. No wildcard arm:
+            // a new ShutdownError variant must fail to compile here until it is
+            // mapped to an ScpError, instead of reporting a live engine as shut down.
+            Ok(_) | Err(ShutdownError::AlreadyShutDown) => Ok(()),
         }
     }
 }

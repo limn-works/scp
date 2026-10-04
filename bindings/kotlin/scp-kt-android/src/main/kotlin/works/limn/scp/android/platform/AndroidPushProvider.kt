@@ -50,8 +50,12 @@ import kotlinx.coroutines.withContext
  * against the §10.7 opacity requirement. The relay sends `{"data": {"scp": "1"}}`
  * as the sole push payload format; any deviation is rejected.
  *
- * @param context Android application [Context], used for Firebase initialisation.
- *   Callers should pass the application context to avoid activity lifecycle leaks.
+ * @param context Android application [Context]. ADR-027's reference code declares this
+ *   provider as `AndroidPushProvider(private val context: Context)`, and this class keeps
+ *   that constructor. Neither [register] nor [handleNotification] reads it: Firebase
+ *   initialises itself from `FirebaseInitProvider`, a content provider that
+ *   firebase-messaging merges into a host app's manifest. Pass an application context
+ *   rather than an activity, so that a stored reference cannot outlive an activity.
  *
  * ## Usage
  *

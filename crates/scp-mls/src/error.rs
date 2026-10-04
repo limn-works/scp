@@ -111,15 +111,27 @@ pub enum MlsError {
     #[error("key package replay: init key already consumed")]
     KeyPackageReplay,
 
-    /// A `KeyPackage` `Lifetime` failed validation against the injected hardened
-    /// [`Clock`](scp_clock::Clock): it is expired, not yet valid, or its total
-    /// range (`not_after - not_before`) exceeds the RFC 9420 maximum acceptable
-    /// range. Raised by
-    /// [`validate_key_package_lifetime`](crate::lifetime::validate_key_package_lifetime),
-    /// SCP's hardened counterpart to openmls's un-injectable internal
-    /// `Lifetime::is_valid` (ADR-057 §Prereq-1). The same variant covers both the
-    /// temporal (expiry / not-before) failure and the maximum-range failure;
-    /// `now` is the timestamp read from the injected clock at validation.
+    /// A `KeyPackage` `Lifetime` failed validation: it is expired, not yet
+    /// valid, or its total range (`not_after - not_before`) is empty, inverted,
+    /// or exceeds the RFC 9420 maximum acceptable range (ADR-057 §Prereq-1).
+    /// The variant has two sources:
+    /// - [`validate_key_package_lifetime`](crate::lifetime::validate_key_package_lifetime),
+    ///   SCP's hardened counterpart to openmls's un-injectable internal
+    ///   `Lifetime::validate`, with `now` read from the injected hardened
+    ///   [`Clock`](scp_clock::Clock);
+    /// - `scp-runtime`'s native `ProductionMlsBackend::join_from_welcome`,
+    ///   which maps openmls's internal-clock rejection of the joiner's own
+    ///   `KeyPackage` to this variant with that `KeyPackage`'s bounds and
+    ///   `now` read from openmls's clock (`0` when that clock reads before
+    ///   the Unix epoch).
+    ///
+    /// From [`join_group`](crate::group::join_group),
+    /// [`join_group_from_bytes`](crate::group::join_group_from_bytes) and
+    /// `MlsBackend::join_from_welcome` it always names the joiner's own
+    /// `KeyPackage`; another member's tree leaf is
+    /// [`MlsError::TreeLeafLifetimeRangeInvalid`]. From the add and commit
+    /// paths it names the added member's `KeyPackage`, and from a standalone
+    /// `KeyPackage` validation it names the `KeyPackage` validated.
     #[error(
         "key package lifetime invalid: not_before={not_before}, not_after={not_after}, now={now}"
     )]
@@ -128,9 +140,36 @@ pub enum MlsError {
         not_before: u64,
         /// The `Lifetime`'s `not_after` bound (Unix seconds).
         not_after: u64,
-        /// The current time read from the injected clock at validation
-        /// (Unix seconds).
+        /// The current time of the clock that rejected the `Lifetime` (Unix
+        /// seconds): the injected clock, or, when `scp-runtime`'s native join
+        /// reports openmls's internal-clock rejection of the joiner's own
+        /// `KeyPackage`, the time openmls read (`0` when openmls's clock reads
+        /// before the Unix epoch).
         now: u64,
+    },
+
+    /// Another member's KeyPackage-sourced leaf of a Welcome's ratchet tree has
+    /// a malformed `Lifetime` range: it is empty or inverted (`not_after` is
+    /// not later than `not_before`), or
+    /// `not_after - not_before` exceeds
+    /// [`KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`](crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS)
+    /// (RFC 9420 §7.2). Raised by
+    /// [`join_group_from_bytes`](crate::group::join_group_from_bytes), which
+    /// reads no clock for another member's tree leaf (ADR-057 §Prereq-1). A
+    /// fault in the joiner's own leaf is
+    /// [`KeyPackageLifetimeInvalid`](Self::KeyPackageLifetimeInvalid) instead.
+    /// `leaf_index` names the offending leaf in the Welcome's ratchet tree.
+    #[error(
+        "tree leaf lifetime range is empty, inverted, or over the maximum: leaf_index={leaf_index}, not_before={not_before}, not_after={not_after}"
+    )]
+    TreeLeafLifetimeRangeInvalid {
+        /// The offending leaf's index in the Welcome's ratchet tree
+        /// (RFC 9420 `LeafIndex`); never the joiner's own leaf.
+        leaf_index: u32,
+        /// The leaf `Lifetime`'s `not_before` bound (Unix seconds).
+        not_before: u64,
+        /// The leaf `Lifetime`'s `not_after` bound (Unix seconds).
+        not_after: u64,
     },
 
     /// Serializing or deserializing an [`crate::ScpMlsGroup`] state snapshot
@@ -160,7 +199,8 @@ pub enum MlsError {
     /// exclusion). Every member publishes its `PseudonymAnnouncement` to the shared
     /// `context_routing_id` AND subscribes to it, so each announcement is echoed to
     /// its author, whose MLS state cannot decrypt its own outbound message
-    /// (openmls `ValidationError::CannotDecryptOwnMessage`). This is a **benign,
+    /// (openmls 0.9.0 returns it as `ProcessedMessageContent::OwnPrivateMessage`,
+    /// which `scp-mls` maps to this variant). This is a **benign,
     /// expected** outcome under the untrusted-relay model — the receive loop MUST
     /// treat it as a DROP (symmetric with an unknown-routing_id drop), NOT a
     /// failure. Distinct from [`Self::DecryptionFailed`] so callers can tell a

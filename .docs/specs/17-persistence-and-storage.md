@@ -505,7 +505,7 @@ derived_key = hex_encode(argon2id(...))        // 64 hex characters, passed via 
 
 A single Argon2id parameterization across the entire codebase is REQUIRED. The passphrase-mode SQLCipher key derivation and the `FileKeyCustody` passphrase-to-wrapping-key derivation MUST share one parameter source; implementations MUST NOT define a second, divergent Argon2id parameter set. The derived 32-byte key feeds the same SQLCipher PRAGMA-key path as raw-key mode (identical `cipher_page_size`, `kdf_iter`, HMAC, and KDF PRAGMAs below).
 
-The passphrase and every intermediate buffer carrying it (and the derived key) MUST be held in zeroizing memory and cleared on drop.
+The passphrase and every intermediate buffer carrying it (and the derived key) MUST be held in zeroizing memory and cleared on drop. The allocator that §9.15 of the security-model spec requires (freed heap memory) also wipes each buffer a dependency frees during the derivation, and the requirement above still binds every buffer SCP owns.
 
 #### Salt Persistence
 
@@ -541,8 +541,11 @@ conn.execute_batch("
     PRAGMA kdf_iter = 256000;
     PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
     PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
+    PRAGMA cipher_memory_security = ON;
 ")?;
 ```
+
+Every SQLCipher connection MUST set `PRAGMA cipher_memory_security = ON`, which makes SQLCipher wipe memory it frees. SQLCipher and its embedded SQLite allocate with the C library's `malloc`, which the wiping global allocator of §9.15 of the security-model spec (freed heap memory) never sees, so the pragma is the only wipe that reaches SQLCipher's freed memory. §9.15 lists the copies that neither wipe reaches, memory OpenSSL obtains from `malloc` among them.
 
 ### Browser Clients Run Storage In-Process
 
@@ -747,9 +750,9 @@ Per ADR-049, this state is owned by the per-context actor (`PerContextState.mode
 
 Two inherent operations on the encrypted-mode state handle snapshot serialization atomically:
 
-- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, wrapping keys, and epoch metadata. Sensitive key material (signer bytes, sender keys, wrapping secret key, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
+- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, wrapping keys, and epoch metadata. Sensitive key material (signer bytes, sender keys, wrapping secret key, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization. The allocator that §9.15 of the security-model spec requires (freed heap memory) wipes each intermediate buffer the serializer frees, including the old block that each growth of the output buffer frees.
 
-- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, reconstructs the sender key store and member wrapping keys, and restores the DHKEM(P-256) wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
+- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer beside the group (never into OpenMLS's key store, because every OpenMLS operation that signs takes the signer as an argument and OpenMLS never reads a stored `SignatureKeyPair` back, so a stored copy would only be a second copy of the private key), reconstructs the sender key store and member wrapping keys, and restores the DHKEM(P-256) wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
 
 The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On context restoration, the blob is restored before the per-context actor resumes so that its MLS group and sender keys are available for subsequent encrypt/decrypt operations.
 

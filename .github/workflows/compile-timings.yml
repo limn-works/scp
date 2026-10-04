@@ -38,6 +38,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # ci.yml sets this key in its workflow-level `env:`, so its dev-profile builds carry
+  # no debug info. The same key here makes this job time those builds rather than the
+  # `line-tables-only` build `[profile.dev]` in the root Cargo.toml gives.
+  # Check `profile-env` in scripts/tests/ci-gate/ci_gate_selftest.py requires it here
+  # and in ci.yml.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # Turns off incremental compilation, so these timings measure the compile every
+  # other CI job runs.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   timings:
@@ -50,7 +59,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

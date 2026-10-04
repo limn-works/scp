@@ -252,6 +252,7 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)
@@ -385,6 +386,7 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
             .unwrap();
         let params = ContextParams {
             mode: ContextMode::Encrypted,
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         sup1.create_context(ctx_id.to_owned(), params, DID::from(creator_did), None)

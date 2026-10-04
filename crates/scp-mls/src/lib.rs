@@ -13,8 +13,7 @@
 //! `openmls` stack. It **must not** depend on `scp-runtime` (tokio/actor
 //! orchestration) or `scp-identity` (tokio-coupled custody/DHT). The async
 //! durable-storage bridge (`ScpMlsProvider<S>`, the `block_in_place` storage
-//! adapters) stays in `scp-runtime`; only the in-memory provider alias lives
-//! here.
+//! adapters) stays in `scp-runtime`; only the in-memory provider lives here.
 //!
 //! # Ciphersuite
 //!
@@ -39,10 +38,16 @@
 //! - [`context_extension`] — `scp_context_params` `group_context` extension
 //!   helpers (§5.13.3, finding FFI-02).
 //! - [`epoch_grace`] — Epoch grace-window store (forward-secrecy bound).
+//! - [`provider`] — The in-memory MLS provider, which zeroizes its storage on
+//!   drop.
 //! - [`error`] — MLS-specific error types.
 //!
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.
+
+// The crate holds the MLS signer, `destroy_group`, and the zeroizing provider;
+// no unsafe code may enter it.
+#![forbid(unsafe_code)]
 
 pub mod context_extension;
 pub mod convergent_timestamp;
@@ -54,7 +59,9 @@ pub mod group;
 pub mod key_package;
 pub mod keypackage_attestation;
 pub mod lifetime;
+pub mod provider;
 pub mod ratchet;
+pub mod secret_msgpack;
 pub mod snapshot;
 pub mod wrapping_extension;
 
@@ -105,13 +112,9 @@ pub use wrapping_extension::{
     make_wrapping_key_extension, scp_capabilities_with_wrapping_key,
 };
 
-/// The in-memory MLS provider type.
-///
-/// This is the `openmls_rust_crypto` provider with all key material held in
-/// process memory. The native runtime's persistent `ScpMlsProvider<S>` (which
-/// snapshots out to durable storage) wraps this; an in-browser client snapshots
-/// it to `IndexedDB` out-of-band. Lifted out of `scp-runtime`'s `storage.rs` into
-/// `scp-mls` so the sync MLS machine is self-contained (ADR-057).
-///
-/// See ADR-001 and ADR-006 for the storage provider strategy.
-pub type InMemoryMlsProvider = openmls_rust_crypto::OpenMlsRustCrypto;
+// The in-memory MLS provider holds all key material in process memory and
+// zeroizes its storage values on drop. The native runtime's persistent
+// `ScpMlsProvider<S>` snapshots out to durable storage; an in-browser client
+// snapshots it to `IndexedDB` out-of-band. It lives in `scp-mls` so the sync MLS
+// machine is self-contained (ADR-057).
+pub use provider::InMemoryMlsProvider;

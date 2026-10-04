@@ -1558,9 +1558,18 @@ fn rollback_join_economy_ticket(
 ///
 /// # Errors
 ///
-/// - [`ContextCreationError::CreationFailed`] for version
-///   incompatibility, governance / consequence-rule / economic-policy
-///   validation failures, or supervisor registration failures.
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+///   with [`CeilingDeclaration::Empty`](scp_protocol::context::CeilingDeclaration::Empty)
+///   when `params.ceiling` is empty, before any context state exists.
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::VersionIncompatible`](scp_protocol::context::ContextError::VersionIncompatible)
+///   when the running SDK does not satisfy `params.min_protocol_version`.
+/// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
+///   breaks the ceiling-entry grammar (spec §5.3.1.1).
+/// - [`ContextCreationError::CreationFailed`] for governance /
+///   consequence-rule / economic-policy validation failures, or supervisor
+///   registration failures.
 /// - Crypto / transport / event-log failures during the initial MLS
 ///   group setup.
 #[allow(clippy::too_many_lines)]
@@ -1576,6 +1585,21 @@ pub async fn create_context(
     creator_did: DID,
     local_pseudonym: Option<[u8; 32]>,
 ) -> Result<ContextHandle, ContextCreationError> {
+    // The ceiling must be non-empty (construction.md M2, Alec's ruling of
+    // 2026-09-30): an empty ceiling describes a context no member can use.
+    // Every create path (`Supervisor::create`, `Supervisor::create_context`,
+    // the `CreateContext` lifecycle command, the standing-pair recreate, and
+    // the governance migration) reaches this function. The rejection runs
+    // here, before any context state exists; `builder::create_context`, which
+    // builds the MLS group, repeats it in its Phase 1 validation so the rule
+    // holds for every in-crate caller.
+    if params.ceiling.is_empty() {
+        return Err(ContextCreationError::StateTransition(
+            scp_protocol::context::ContextError::CeilingRequired(
+                scp_protocol::context::CeilingDeclaration::Empty,
+            ),
+        ));
+    }
     // Defense-in-depth: verify creator's SDK version satisfies
     // min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -1934,7 +1958,7 @@ fn generate_initial_access_key_store(
 /// replay-protection rejection the registry's `validate_and_merge_*` sink
 /// returns) if a per-sender floor regresses (import path) or overshoots (both
 /// paths); the just-built owned crypto is dropped on rejection (the `SenderKey`
-/// zeroizes; the `ScpMlsGroup` / Ed25519 signer is freed, not zeroized - #82) and
+/// and the `ScpMlsGroup`'s Ed25519 signer zeroize on drop) and
 /// the registry is left unchanged (atomic).
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
@@ -2001,8 +2025,8 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // rejection to `ContextError::CryptoFailed`.
     //
     // Rollback: on rejection the just-built `owned` material is dropped at the `?`
-    // return (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
-    // zeroized - #82) so no floor-regressed / half-restored state persists (BUG-1
+    // return (the `SenderKey` and the `ScpMlsGroup`'s signer zeroize on drop) so
+    // no floor-regressed / half-restored state persists (BUG-1
     // atomicity). The registry itself is left UNCHANGED (validate-before-apply,
     // across both axes). Fail-closed by construction: a rejected restore is never
     // seeded onto an actor and writes no durable snapshot, so it cannot resurrect a
@@ -2301,7 +2325,7 @@ pub async fn import_context(
         // onto the fresh `PerContextState`.
         match deps
             .supervisor
-            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.clone())
+            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.0.clone())
             .await
         {
             Ok(()) => {
@@ -2359,8 +2383,8 @@ pub async fn import_context(
     // `context_params` field against the MLS group embedded in `mls_crypto_state`;
     // this closes that gap. A group with no `0xFF02` (not an SCP context) or any
     // rule 2-6 mismatch is rejected as a forged/corrupt import; the owned material
-    // is dropped (the `SenderKey` zeroizes; the group / signer is freed, not
-    // zeroized - #82) so no forged crypto is ever seeded (mirrors the
+    // is dropped (the `SenderKey` and the group's signer zeroize on drop) so no
+    // forged crypto is ever seeded (mirrors the
     // restore path's own rejection and the Welcome-join pre-install rejection). A
     // keyless (needs-reconnect) snapshot has `None` owned material and no group to
     // bind, so it is skipped — its group arrives later via a reconnect Welcome,
@@ -2378,8 +2402,8 @@ pub async fn import_context(
         )
     {
         // On rejection the `imported_owned` material is dropped here (the
-        // `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not zeroized -
-        // #82) so no forged crypto is seeded; fail-closed by construction - the
+        // `SenderKey` and the `ScpMlsGroup`'s signer zeroize on drop) so no forged
+        // crypto is seeded; fail-closed by construction - the
         // rejected crypto is never seeded onto the actor and no durable snapshot is
         // written (there is no longer a provider `taken_context_ids` marker; #2148
         // deleted it). Read the extension from the OWNED group (ADR-049 PR-7 C3 - no
@@ -3069,8 +3093,8 @@ pub async fn restore_context(
         // routes the cold-restart (empty-registry) floors through the SAME sink,
         // closing the D2 replay window on first boot. FAIL-CLOSED via
         // `.map_err(..)?`. On rejection the just-built `owned` material is dropped
-        // here (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
-        // zeroized - #82); fail-closed by construction - a rejected restore is never
+        // here (the `SenderKey` and the `ScpMlsGroup`'s signer zeroize on drop);
+        // fail-closed by construction - a rejected restore is never
         // seeded and writes no durable snapshot, so the id cannot resurrect a
         // divergent second group. #2148 deleted the provider `taken_context_ids`
         // marker this comment referenced, and `build_restored_owned` sets none.
@@ -3095,7 +3119,7 @@ pub async fn restore_context(
         // context, or whose committed params diverge, is a corrupt snapshot and
         // is rejected. Read the extension from the OWNED group (it is no longer
         // provider-resident). On rejection the `owned` material is dropped (the
-        // `SenderKey` zeroizes; the group / signer is freed, not zeroized - #82);
+        // `SenderKey` and the group's signer zeroize on drop);
         // fail-closed by construction - the rejected crypto is never seeded, so no
         // divergent crypto persists (no provider taken-marker exists post-#2148).
         if let Err(reason) = verify_scp_context_binding(
@@ -4022,11 +4046,13 @@ mod restore_reconcile_tests {
                 mode: ContextMode::Broadcast,
                 // Broadcast contexts only support `MemoryScope::Full`.
                 memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ..ContextParams::default()
             }
         } else {
             ContextParams {
                 mode: ContextMode::Encrypted,
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
                 ..ContextParams::default()
             }
         };

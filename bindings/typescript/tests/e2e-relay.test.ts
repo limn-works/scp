@@ -405,12 +405,17 @@ if (bridge === null || scp === null) {
         }),
       );
 
-      // Close the context first.
+      // Close the context first. The creator's close takes the supervisor to
+      // `Closing`, while the handle's cached state string reads "closed".
       await napi.contextClose(ctx, alice.did);
 
       // Subscription to a closed context must fail. Promise-rejection,
-      // not synchronous throw.
-      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
+      // not synchronous throw. The message names `closing`, the state the
+      // supervisor reports, so the assertion fails if the subscribe gate is
+      // removed or reads the handle's cached string instead of the supervisor.
+      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
+        /cannot subscribe to context in 'closing' state/,
+      );
     });
   });
 
