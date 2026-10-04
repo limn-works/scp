@@ -102,7 +102,7 @@
 #     Case 15 names one crate on the command line on a branch that changed another, and
 #     asserts that the summary names the package the run left uncompiled.
 #
-#     Case 16 changes a file under `crates/scp-clock/`, one of the nine packages the
+#     Case 16 changes a file under `crates/scp-clock/`, one of the ten packages the
 #     `wasm-protocol` job compiles for `wasm32-unknown-unknown`, and asserts that the
 #     summary names that target and starts no wasm compile of its own. A host `cargo
 #     check` accepts an API that target rejects.
@@ -987,7 +987,7 @@ fi
 
 # ── Case 16: the wasm target the host compile does not reach ─────────────────────────
 #
-# The `wasm-protocol` job of `.github/workflows/ci.yml` runs one `cargo check` over nine
+# The `wasm-protocol` job of `.github/workflows/ci.yml` runs one `cargo check` over ten
 # packages for `wasm32-unknown-unknown`. `scp-clock` is one of them, and a host `cargo
 # check` accepts an API that target rejects, so a run that compiled `scp-clock` for the
 # host alone and printed `compile ok` would tell a fix agent that the wasm build is safe.
