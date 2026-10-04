@@ -576,17 +576,19 @@ impl<S: Storage> ApplicationNode<S> {
     /// listener (if running) to stop accepting new connections. In-flight
     /// connection handlers drain naturally -- they are not cancelled.
     ///
-    /// The tier re-evaluation task is stopped **and joined** when the node was
-    /// built on a multi-thread runtime and the caller is off any runtime or on a
-    /// multi-thread worker: this blocks, up to a deadline, on the task's
+    /// The tier re-evaluation task is stopped. When the node was built on a
+    /// multi-thread runtime and the caller is off any runtime or on a
+    /// multi-thread worker, this blocks, up to a deadline, on the task's
     /// `JoinHandle`, which tokio completes only after the task's future has been
     /// dropped. When the join completes, the `DidMethod`/`KeyCustody` `Arc`
     /// clones the republish path captured are released before this returns, so
     /// the custody backend's `SqliteStorage` advisory lock is free and a caller
     /// can immediately re-open the same storage path (e.g. a node restart over a
     /// persisted identity) without racing the background task's teardown. At
-    /// the deadline the task is aborted instead. A caller on a `current_thread`
-    /// runtime gets only an abort.
+    /// the deadline the task is aborted instead. If the runtime is shutting
+    /// down, the wait can end before the task's future drops; that case is
+    /// logged at warn. A caller on a `current_thread` runtime gets only an
+    /// abort.
     /// Absent the join the task could still hold the custody
     /// handle for a short, nondeterministic window after `shutdown()` returned,
     /// intermittently failing the next open with an advisory-lock conflict. See
@@ -2224,8 +2226,6 @@ const TIER_REEVALUATION_INTERVAL: Duration = Duration::from_mins(30);
 /// network change events. When the tier changes, it updates the DID
 /// document with the new relay address and logs at INFO level (§10.12.1).
 struct TierReEvalHandle {
-    /// The background task, joined for deterministic teardown.
-    ///
     /// Tokio completes a `JoinHandle` only after the task's future has been
     /// dropped, on every exit path (normal return, cancellation, panic, abort).
     /// Awaiting it therefore blocks until every `Arc` the future captured,
@@ -6378,8 +6378,11 @@ mod tests {
     /// recording that it ran. The tier task's captured `NodePublisher` is the
     /// only owner, so the flag flips only once the task future has been dropped
     /// and that drop has finished — the moment `stop_and_wait` must wait for.
+    /// The drop then sends on `drop_tx`, so a test whose task is aborted
+    /// rather than joined can wait for the drop without polling the flag.
     struct SlowDropPublisher {
         dropped: Arc<std::sync::atomic::AtomicBool>,
+        drop_tx: std::sync::mpsc::Sender<()>,
     }
 
     /// Long enough that a waiter woken before the task future is dropped
@@ -6391,6 +6394,7 @@ mod tests {
             std::thread::sleep(SLOW_DROP_DELAY);
             self.dropped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.drop_tx.send(());
         }
     }
 
@@ -6440,10 +6444,16 @@ mod tests {
     fn slow_drop_tier_task(
         strategy: Arc<dyn NatStrategy>,
         interval: Duration,
-    ) -> (TierReEvalHandle, Arc<std::sync::atomic::AtomicBool>) {
+    ) -> (
+        TierReEvalHandle,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
         let publisher = Arc::new(SlowDropPublisher {
             dropped: Arc::clone(&dropped),
+            drop_tx,
         });
         let document = DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
@@ -6474,7 +6484,7 @@ mod tests {
             None,
             interval,
         );
-        (handle, dropped)
+        (handle, dropped, drop_rx)
     }
 
     /// `stop_and_wait` returns only after the cancelled task's future, and the
@@ -6485,7 +6495,7 @@ mod tests {
         let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
             external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
         }]));
-        let (handle, dropped) = slow_drop_tier_task(strategy, Duration::from_hours(1));
+        let (handle, dropped, _) = slow_drop_tier_task(strategy, Duration::from_hours(1));
 
         handle.stop_and_wait();
 
@@ -6503,7 +6513,7 @@ mod tests {
         let strategy = Arc::new(PanickingNatStrategy {
             entered: std::sync::Mutex::new(Some(entered_tx)),
         });
-        let (handle, dropped) = slow_drop_tier_task(strategy, Duration::from_millis(1));
+        let (handle, dropped, _) = slow_drop_tier_task(strategy, Duration::from_millis(1));
 
         entered_rx
             .await
@@ -6524,7 +6534,7 @@ mod tests {
         let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
             external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
         }]));
-        let (handle, dropped) = slow_drop_tier_task(strategy, Duration::from_hours(1));
+        let (handle, dropped, _) = slow_drop_tier_task(strategy, Duration::from_hours(1));
 
         tokio::spawn(async move { handle.stop_and_wait() })
             .await
@@ -6546,7 +6556,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("multi-thread runtime builds");
-        let (handle, dropped) = {
+        let (handle, dropped, _) = {
             let _entered = runtime.enter();
             let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
                 external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
@@ -6608,7 +6618,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("multi-thread runtime builds");
-        let (handle, _dropped) = {
+        let (handle, _, _) = {
             let _entered = runtime.enter();
             let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
                 external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
@@ -6655,16 +6665,16 @@ mod tests {
 
     /// A task stuck inside a re-evaluation never sees the cancel signal. An
     /// off-runtime caller (the FFI bridges' shape) must still get control back, not
-    /// block forever.
+    /// block forever, and the deadline's abort must drop the task's captures.
     #[test]
-    fn stop_and_wait_off_runtime_returns_when_the_task_is_stuck() {
+    fn stop_and_wait_off_runtime_aborts_a_stuck_task_at_the_deadline() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .expect("multi-thread runtime builds");
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (mut handle, _dropped) = {
+        let (mut handle, _, drop_rx) = {
             let _entered = runtime.enter();
             let strategy = Arc::new(StuckNatStrategy {
                 entered: std::sync::Mutex::new(Some(entered_tx)),
@@ -6685,30 +6695,71 @@ mod tests {
         returned_rx
             .recv_timeout(Duration::from_secs(30))
             .expect("stop_and_wait did not return within 30 s on a stuck task");
+        drop_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stuck tier task's captured publisher was not dropped after the deadline");
     }
 
-    /// A `current_thread` caller cannot block: with the task on a multi-thread
-    /// runtime, `stop_and_wait` called inside a `current_thread` runtime must
-    /// return instead of panicking in `block_in_place`.
+    /// A node dropped without `shutdown()` drops its `TierReEvalHandle`.
+    /// Dropping a `JoinHandle` only detaches its task, so `Drop` must abort a
+    /// task stuck in a re-evaluation, dropping its captures.
     #[test]
-    fn stop_and_wait_from_current_thread_caller_does_not_panic() {
+    fn dropping_the_handle_aborts_a_stuck_task() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .expect("multi-thread runtime builds");
-        let (handle, _dropped) = {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (handle, _, drop_rx) = {
             let _entered = runtime.enter();
-            let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
-                external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
-            }]));
-            slow_drop_tier_task(strategy, Duration::from_hours(1))
+            let strategy = Arc::new(StuckNatStrategy {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+            });
+            slow_drop_tier_task(strategy, Duration::from_millis(1))
         };
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("tier task enters the stuck re-evaluation");
+
+        drop(handle);
+
+        drop_rx.recv_timeout(Duration::from_secs(30)).expect(
+            "the stuck tier task's captured publisher was not dropped after its handle dropped",
+        );
+    }
+
+    /// A `current_thread` caller cannot block: with the task on a multi-thread
+    /// runtime, `stop_and_wait` called inside a `current_thread` runtime must
+    /// return instead of panicking in `block_in_place`, and its abort must drop
+    /// the captures of a task stuck in a re-evaluation.
+    #[test]
+    fn stop_and_wait_from_current_thread_caller_aborts_a_stuck_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (handle, _, drop_rx) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(StuckNatStrategy {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+            });
+            slow_drop_tier_task(strategy, Duration::from_millis(1))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("tier task enters the stuck re-evaluation");
         let caller = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("current-thread runtime builds");
 
         caller.block_on(async { handle.stop_and_wait() }); // ci-allow: block-on: test enters a current_thread runtime to call stop_and_wait from its context
+
+        drop_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stuck tier task's captured publisher was not dropped after the abort");
     }
 
     /// A task spawned on a `current_thread` runtime advances only while that
@@ -6721,7 +6772,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("current-thread runtime builds");
-        let (mut handle, _dropped) = {
+        let (mut handle, _, _) = {
             let _entered = runtime.enter();
             let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
                 external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
