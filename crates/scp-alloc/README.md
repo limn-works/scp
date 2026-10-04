@@ -11,6 +11,11 @@ volatile stores before forwarding the free. It does not override `realloc`, so
 the trait's default allocates the new block, copies, and frees the old block
 through the wiping `dealloc`.
 
+The wipe writes every byte of the block, including pages the program never
+touched, such as the unwritten capacity of a large `alloc_zeroed` block or a
+reserved and never-filled `Vec`, so freeing such a block faults those pages into
+memory first; SCP accepts that cost as a limit of the design.
+
 This crate holds the workspace's one `#[global_allocator]` static. Each shipped
 artifact's crate root links it with:
 
