@@ -19,4 +19,5 @@ future-size-threshold = 16512
 disallowed-methods = [
   { path = "openmls_basic_credential::SignatureKeyPair::store", reason = "writes the MLS signer's private key into provider storage, which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
   { path = "openmls_traits::storage::StorageProvider::write_signature_key_pair", reason = "stores the MLS signer's private key in provider storage (the trait method `SignatureKeyPair::store` calls), which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
+  { path = "openmls_traits::crypto::OpenMlsCrypto::signature_key_gen", reason = "draws the key pair from the one `ChaCha20Rng` that openmls_rust_crypto's `RustCrypto` seeds once for the provider's life and never reseeds or zeroizes, so anyone who reads that long-lived seed from memory regenerates the signing key; create signers with `openmls_basic_credential::SignatureKeyPair::new`, which draws from `OsRng` (security model spec §9.15)" },
 ]

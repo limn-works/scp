@@ -191,7 +191,11 @@ against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36.
 #![forbid(unsafe_code)]
 ```
 
-Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace. If an FFI bridge crate requires unsafe (e.g., cbindgen C ABI), it is the sole exception and must document every `unsafe` block with a `// SAFETY:` comment explaining the invariant.
+Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace, with two exceptions, and each exception documents every `unsafe` block with a `// SAFETY:` comment explaining the invariant:
+- an FFI bridge crate that requires unsafe (e.g., cbindgen C ABI);
+- `crates/scp-alloc`, the wiping global allocator, whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its `GlobalAlloc` implementation and on the wipe routine that implementation calls.
+
+`crates/scp-alloc/src/lib.rs` holds the workspace's one `#[global_allocator]` static. The crate root of each shipped binary and cdylib (`scp-node`, `scp-relay`, `scp-ffi`, `scp-ffi-napi`, `scp-ffi-uniffi`, and `scp-client-wasm`) links that static with `use scp_alloc as _;` and defines no global allocator of its own, because §9.15 of the security-model spec (freed heap memory) requires every shipped artifact to wipe each heap block before freeing it.
 
 Additional enforced rules:
 - No `unwrap()` or `expect()` in library code — use `?` with typed errors
@@ -508,7 +512,7 @@ Every push to a PR branch. Target: < 3 minutes.
 |-----|---------|---------|
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
 | clippy | ubuntu-latest | The five `cargo clippy` commands the CI Commands section above gives: the workspace sweep, the optional-transport lint, and the three commands that lint the PostgreSQL and S3 blob backends |
-| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives. |
+| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives, among its other optional-feature commands. That job splits its commands into three matrix groups on each runner: of those three commands, `transport` runs the scp-transport one and `node-relay` runs the scp-node and scp-relay ones, and `platform-testing` runs none of them. |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
 | doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |

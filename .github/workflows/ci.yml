@@ -41,6 +41,9 @@ env:
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
 # every merge-queue run can read.
+# Job rust-test-optional-features later split its one group into three, one per matrix
+# group, and job rust-clippy split its one group into three, one per matrix leg, so
+# this workflow now writes twelve groups per generation.
 #
 # THE GROUPS. Cargo hashes the compile mode into every artifact's metadata
 # suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,
@@ -113,17 +116,25 @@ env:
 #                     `workspace-release` entry before this arrangement and ran both
 #                     `--release` commands, so what it wrote
 #                     did cover the NAPI dependencies.
-#   transport-optional
-#                     `target/debug` again, but under a feature resolution no
-#                     other job produces — rust-test-optional-features. Its
-#                     `-p scp-transport`, `-p scp-testing`, `-p scp-node` and
-#                     `-p scp-relay` selections resolve features over one
-#                     package's subgraph, not the workspace. The scp-transport
-#                     and scp-testing selections drop `scp-runtime/testing`,
-#                     which gave 337 packages a fingerprint the `workspace-debug`
-#                     entry does not hold, measured before the scp-node and
-#                     scp-relay selections existed. Sharing that entry would
-#                     restore artifacts none of its units match.
+#   transport-optional-transport, transport-optional-node-relay,
+#   transport-optional-platform-testing
+#                     `target/debug` again, but under feature resolutions no
+#                     other job produces — rust-test-optional-features, one group
+#                     per value of its matrix `group` axis, named by
+#                     `shared-key: transport-optional-${{ matrix.group }}`. Its
+#                     `-p scp-transport`, `-p scp-testing`, `-p scp-node`,
+#                     `-p scp-relay` and `-p scp-platform` selections resolve
+#                     features over one package's subgraph, not the workspace.
+#                     The scp-transport and scp-testing selections drop
+#                     `scp-runtime/testing`, which gave 337 packages a
+#                     fingerprint the `workspace-debug` entry does not hold,
+#                     measured before the scp-node and scp-relay selections
+#                     existed. Sharing that entry would restore artifacts none
+#                     of its units match. Each matrix group runs its own
+#                     selections, so one entry for all three would hold only
+#                     the units of whichever leg saved first; three entries per
+#                     runner OS cost more of the 10 GB cap below, a cost taken
+#                     on 2026-10-03 in exchange for the shorter job.
 #   wasm32            `target/wasm32-unknown-unknown/release` — typescript-wasm-check
 #                     and scaffold-typescript-web-check, which both run
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
@@ -160,7 +171,7 @@ env:
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
-# comment on job fuzz-nightly says more). Eleven groups per generation across the two
+# comment on job fuzz-nightly says more). Thirteen groups per generation across the two
 # workflows, where the two together wrote thirty-six entries before. The
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the
 # comment above job pyo3-module counts them.
@@ -175,8 +186,9 @@ env:
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
 # and it finishes eleven minutes before rust-test. The producers are rust-test
 # (workspace-debug), rust-clippy's three legs (workspace-check, clippy-examples and
-# clippy-packages, one each), rust-test-optional-features
-# (transport-optional), pyo3-module (workspace-ci-bridge), typescript-wasm-check
+# clippy-packages, one each), rust-test-optional-features (each of its three
+# transport-optional groups, one writer per group because each matrix leg's step
+# expands the key to its own group), pyo3-module (workspace-ci-bridge), typescript-wasm-check
 # (wasm32), xcframework (apple-uniffi-ci-bridge), pyo3-module-macos
 # (apple-parity-ci-bridge) and
 # fuzz-build (fuzz): in each group, the job that compiles the most of that directory
@@ -1341,16 +1353,42 @@ jobs:
   # The cache group buys the same time and deletes nothing: this job's own
   # artifacts, under its own feature resolution, restore on every later run. It
   # writes on a push to `main` because it is the only job that builds them.
+  #
+  # Builds and tests the code that sits behind features `--workspace` never
+  # activates. One job id, six legs: two runners times three groups of commands,
+  # so the `ci` aggregate's `needs` names every leg through this one id. Each
+  # command runs in exactly one group. The groups were balanced on the macOS leg
+  # of the single-step job this replaced, which took 12 min 11 s, 10 min 46 s of
+  # it in its one test step (run 2026-10-03, job 111299315917): transport about
+  # 4 min 0 s of cargo time (the scp-transport `combined,local-cache` run, the
+  # five optional-transport runs and the blob-backend `startup` run),
+  # node-relay about 3 min 43 s (the scp-node quic and well_known runs and both
+  # binaries' `cloud-blobs` runs), platform-testing about 3 min 3 s (the
+  # scp-platform and persistence_advanced runs, saga_bridge_journal_swap and the
+  # two `cargo check -p scp-testing` commands). Every leg also pays its own
+  # checkout, toolchain and cache restore, 1 min 21 s on that leg.
+  #
+  # Each command stays literal in a `run:` step whose `if:` names its group.
+  # A command list passed through `${{ matrix.* }}` would be one expression
+  # token to the zero-test scan in scripts/tests/ci-gate/ci_gate_selftest.py,
+  # which then could not see a filter that lacks `--no-tests=fail`; that file
+  # also requires the groups the steps name to equal the matrix list.
+  #
+  # Each group writes its own rust-cache entry, `transport-optional-<group>`,
+  # because each group compiles feature resolutions of scp-transport, scp-node,
+  # scp-relay, scp-platform or scp-testing that the other two do not, and one
+  # shared entry would hold only the units of whichever leg saved first.
   rust-test-optional-features:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / test (optional features, ${{ matrix.os }})
+    name: Rust / test (optional features, ${{ matrix.os }}, ${{ matrix.group }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+        group: [transport, node-relay, platform-testing]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -1358,10 +1396,11 @@ jobs:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: transport-optional
+          shared-key: transport-optional-${{ matrix.group }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
-      - name: Run tests
+      - name: Run transport tests
+        if: matrix.group == 'transport'
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -1390,6 +1429,23 @@ jobs:
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test webrtc_roundtrip
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^nostr::/)'
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^webrtc::/)'
+          # scp-transport compiles the PostgreSQL and S3 arms of
+          # `storage_from_env` only under its `postgres-blob` and `s3-blob`
+          # features, which --workspace leaves off. This command runs the
+          # `BackendChoice` unit tests with both arms compiled, the only build in
+          # which they assert that `postgres` and `s3` parse in either case and
+          # are cloud backends. The node-relay group runs the two binaries'
+          # `cloud-blobs` tests.
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
+      - name: Run node and relay tests
+        if: matrix.group == 'node-relay'
+        run: |
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export DYLD_LIBRARY_PATH="${LIBDIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          else
+            export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           # scp-node holds two auto-discovered test files (quic_listener,
           # quic_cross_transport), each gated on `quic` and
           # `allow_unencrypted_storage`, which `testing` implies. --workspace
@@ -1414,6 +1470,33 @@ jobs:
           # it keeps selecting tests after both arms are gone.
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_webtransport_with_feature)'
           cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(=well_known::tests::advertised_transports_includes_udp_dtls_with_feature)'
+          # scp-node and scp-relay compile the PostgreSQL and S3 arms of
+          # `storage_from_env` only under their off-by-default `cloud-blobs`
+          # feature, which --workspace leaves off. Run the two binaries' backend
+          # selection tests with it on. Each test fails when its own package's
+          # `cloud-blobs` feature is on and the build does not list both the
+          # `postgres` and `s3` backends, and when a build that lists a backend
+          # stops exiting on a missing SCP_RELAY_DATABASE_URL or
+          # SCP_RELAY_S3_BUCKET. Each binary
+          # runs in its own invocation because cargo unifies scp-transport's
+          # features across every package one invocation builds: a combined
+          # invocation compiles both arms into scp-relay through scp-node's
+          # feature alone, and passes when scp-relay's `cloud-blobs` enables
+          # nothing. The scp-node command also enables `testing`, the only
+          # build that compiles `--ephemeral`, so the test checks that
+          # `--ephemeral` exits on `postgres` and `s3`. The transport group runs
+          # the scp-transport `BackendChoice` unit tests with both arms compiled.
+          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
+          cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
+      - name: Run platform and scp-testing tests
+        if: matrix.group == 'platform-testing'
+        run: |
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export DYLD_LIBRARY_PATH="${LIBDIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          else
+            export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           # scp-platform gates its Apple SQLCipher storage adapter behind `apple`
           # and its syncable-storage trait behind `sync`. --workspace enables
           # neither (only scp-testing's opt-in `sync` feature enables
@@ -1431,27 +1514,6 @@ jobs:
           # naming it exactly, with `--no-tests=fail`.
           cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=syncable_storage_export_apply_roundtrip)'
           cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=combined_node_storage_both_traits_roundtrip)'
-          # scp-node and scp-relay compile the PostgreSQL and S3 arms of
-          # `storage_from_env` only under their off-by-default `cloud-blobs`
-          # feature, which --workspace leaves off. Run the two binaries' backend
-          # selection tests with it on. Each test fails when its own package's
-          # `cloud-blobs` feature is on and the build does not list both the
-          # `postgres` and `s3` backends, and when a build that lists a backend
-          # stops exiting on a missing SCP_RELAY_DATABASE_URL or
-          # SCP_RELAY_S3_BUCKET. Each binary
-          # runs in its own invocation because cargo unifies scp-transport's
-          # features across every package one invocation builds: a combined
-          # invocation compiles both arms into scp-relay through scp-node's
-          # feature alone, and passes when scp-relay's `cloud-blobs` enables
-          # nothing. The scp-transport command runs the `BackendChoice` unit
-          # tests with both arms compiled, the only build in which they assert
-          # that `postgres` and `s3` parse in either case and are cloud
-          # backends. The scp-node command also enables `testing`, the only
-          # build that compiles `--ephemeral`, so the test checks that
-          # `--ephemeral` exits on `postgres` and `s3`.
-          cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
-          cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
-          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
           # The saga-journal durable crash-recovery round-trip is gated behind
           # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
           # processes). --workspace does NOT activate this optional feature, so
