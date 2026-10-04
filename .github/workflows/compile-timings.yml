@@ -38,6 +38,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Turns off incremental compilation, so these timings measure the compile every
+  # other CI job runs.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   timings:
@@ -50,7 +53,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
