@@ -3708,9 +3708,8 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// (ADR-049 Decision 16, supervisor task drain).
 ///
 /// Steps, in order:
-/// 1. Set the closed flag, so every later spawn through the task tracker
-///    (a create, an actor respawn, a key-package actor, a streaming task)
-///    fails with [`ContextError::SupervisorShutDown`](scp_protocol::context::ContextError::SupervisorShutDown).
+/// 1. Set the closed flag. ADR-049 Decision 16 item 2 names the spawns it
+///    refuses with [`ContextError::SupervisorShutDown`](scp_protocol::context::ContextError::SupervisorShutDown).
 /// 2. Snapshot the actor registry under the write lock. A spawner that
 ///    passed the closed-flag check registers under the same lock, so the
 ///    snapshot holds every actor that can still be spawned.
@@ -3733,6 +3732,18 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// (and its sync wrapper) for process exit and test teardown. Does NOT
 /// send leave messages or notify remote peers.
 pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
+    let removed_count = shutdown_sweep(supervisor).await;
+    supervisor.await_tracked_tasks().await;
+    tracing::info!(
+        removed_count,
+        "shutdown: removed all contexts, stopped key-package actors, and drained every \
+         supervisor task"
+    );
+}
+
+/// Steps 1 to 5 of [`shutdown_all_contexts`]; returns how many context actors
+/// the sweep despawned.
+async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> usize {
     use std::collections::{HashMap, HashSet};
 
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
@@ -3825,19 +3836,13 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
     // TTL / governance timers are ACTOR-OWNED arms (ADR-049 finding A3) and
     // end with their actor's task. Every other supervisor-held task (actor
     // watchdogs, the context-gauge refresh, the streaming saga seal task,
-    // the streaming settlement tasks) is on the tracker, so this wait
-    // returns only when no task holds the supervisor or its storage.
-    supervisor.await_tracked_tasks().await;
-
-    tracing::info!(
-        removed_count = context_ids.len(),
-        "shutdown: removed all contexts, stopped key-package actors, and drained every \
-         supervisor task"
-    );
+    // the streaming settlement tasks) is on the tracker, which step 6 awaits.
+    context_ids.len()
 }
 
-/// How long [`shutdown_all_contexts_sync`] waits for [`shutdown_all_contexts`]
-/// before it abandons the drain and returns an error.
+/// How long [`shutdown_all_contexts_sync`] waits for the tracker drain (step 6
+/// of [`shutdown_all_contexts`]) before it abandons the drain and returns an
+/// error. The sweep before the drain runs to completion either way.
 const SYNC_SHUTDOWN_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Sync wrapper for [`shutdown_all_contexts`].
@@ -3853,9 +3858,10 @@ const SYNC_SHUTDOWN_DRAIN_BOUND: std::time::Duration = std::time::Duration::from
 /// [`ContextError::InvalidState`](scp_protocol::context::ContextError::InvalidState)
 /// when called outside a tokio runtime: nothing was shut down and nothing was
 /// drained, so the caller must not close the storage backend. The same error
-/// when [`shutdown_all_contexts`] has not returned within
-/// [`SYNC_SHUTDOWN_DRAIN_BOUND`]: the drain was abandoned, so supervisor tasks
-/// may still hold storage and the caller must not close the storage backend.
+/// when the tracker drain has not finished within
+/// [`SYNC_SHUTDOWN_DRAIN_BOUND`]: every actor was still despawned and every
+/// registry cleared, but supervisor tasks may still hold storage, so the
+/// caller must not close the storage backend.
 pub fn shutdown_all_contexts_sync(
     supervisor: &crate::context::supervisor::Supervisor,
 ) -> Result<(), scp_protocol::context::ContextError> {
@@ -3870,14 +3876,25 @@ fn shutdown_all_contexts_sync_within(
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown allowlist — the bridge's blocking shutdown path cannot .await.
-            let drain = tokio::time::timeout(bound, shutdown_all_contexts(supervisor));
-            let drained = tokio::task::block_in_place(|| handle.block_on(drain)); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
+            let shutdown = async {
+                let removed_count = shutdown_sweep(supervisor).await;
+                let drained = tokio::time::timeout(bound, supervisor.await_tracked_tasks()).await;
+                (removed_count, drained)
+            };
+            let (removed_count, drained) =
+                tokio::task::block_in_place(|| handle.block_on(shutdown)); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
             drained.map_err(|_elapsed| {
                 scp_protocol::context::ContextError::InvalidState(format!(
-                    "shutdown_all_contexts_sync: shutdown did not finish within {bound:?}; the \
-                     drain was abandoned, so the storage backend must stay open"
+                    "shutdown_all_contexts_sync: the drain did not finish within {bound:?}; \
+                     tracked tasks still run, so the storage backend must stay open"
                 ))
-            })
+            })?;
+            tracing::info!(
+                removed_count,
+                "shutdown: removed all contexts, stopped key-package actors, and drained every \
+                 supervisor task"
+            );
+            Ok(())
         }
         Err(e) => Err(scp_protocol::context::ContextError::InvalidState(format!(
             "shutdown_all_contexts_sync called outside a tokio runtime ({e}); nothing was \
@@ -3945,6 +3962,44 @@ mod shutdown_sweep_tests {
             assert!(rx.recv().await.is_some(), "ShutdownSelf was delivered");
             assert!(rx.recv().await.is_none(), "the despawn closed the inbox");
         }
+    }
+
+    /// The sync wrapper's deadline bounds only the tracker drain: an actor
+    /// that replies to `ShutdownSelf` after the deadline has passed still
+    /// gets its reply awaited, and both registered actors are despawned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_finishes_the_sweep_past_the_drain_deadline() {
+        use crate::context::actor::commands::LifecycleCommand;
+
+        let sup = supervisor();
+        let (tx_slow, mut rx_slow) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        // A closed inbox fails the send at once, so this actor adds no wait.
+        let (tx_next, rx_next) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx_next);
+        sup.register_actor_handle_for_test("ctx-slow", ContextActorHandle::from_sender(tx_slow));
+        sup.register_actor_handle_for_test("ctx-next", ContextActorHandle::from_sender(tx_next));
+        let slow_actor = tokio::spawn(async move {
+            while let Some(cmd) = rx_slow.recv().await {
+                if let ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply }) = cmd {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+
+        let result = shutdown_all_contexts_sync_within(&sup, Duration::from_millis(100));
+        assert!(
+            result.is_ok(),
+            "an empty tracker drains within the deadline, got {result:?}"
+        );
+        assert!(
+            sup.actor_ids().is_empty(),
+            "the sweep despawned every actor although it ran past the deadline, got {:?}",
+            sup.actor_ids()
+        );
+        slow_actor
+            .await
+            .expect("the slow actor's inbox closed after the despawn");
     }
 
     /// Outside a tokio runtime the sync wrapper shuts nothing down and says so.

@@ -489,6 +489,7 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
         ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
         ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
+        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
 }
@@ -833,5 +834,20 @@ mod tests {
             0,
             "a flush without a floor export must persist nothing"
         );
+    }
+
+    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
+    /// recording it as a crypto failure.
+    mod outcome_sketch_tests {
+        use super::super::{ContextError, outcome_error_sketch};
+
+        #[test]
+        fn sketch_keeps_supervisor_shut_down_typed() {
+            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
+            assert!(
+                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
+                "got {sketch:?}"
+            );
+        }
     }
 }

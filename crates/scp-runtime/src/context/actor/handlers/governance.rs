@@ -224,6 +224,7 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
         ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
         ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
+        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
 }
@@ -1586,5 +1587,20 @@ mod consequence_fail_closed_tests {
             .suspended_for(SUBJECT)
             .expect("SUBJECT must have been suspended by the receive-path consequence");
         assert!(suspended.contains(&Capability::MessagesWrite));
+    }
+
+    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
+    /// recording it as a crypto failure.
+    mod outcome_sketch_tests {
+        use super::super::{ContextError, outcome_error_sketch};
+
+        #[test]
+        fn sketch_keeps_supervisor_shut_down_typed() {
+            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
+            assert!(
+                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
+                "got {sketch:?}"
+            );
+        }
     }
 }
