@@ -2017,9 +2017,8 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
 ///
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `AddMember`, `RemoveMember`, etc.) so that the FFI-side
-/// copy used by outlet and MCP capability checks stays current. It does not
-/// touch `ceiling_strings`, and a failed re-read leaves the older role state
-/// in place.
+/// copy stays current. It does not touch `ceiling_strings`, and a failed
+/// re-read leaves the older role state in place.
 ///
 /// The read is `Supervisor::get_role_state_checked`, so a busy or timed-out
 /// actor, a crashed or mid-respawn context and a poisoned context each fail

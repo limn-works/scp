@@ -154,7 +154,7 @@ impl PyContextHandle {
     /// supervisor and refuse a context whose actor the watchdog poisoned or
     /// found crashed; polling this getter may still report the last-known
     /// non-terminal state. An operation the bridge serves from its own state
-    /// (UCAN mint, delegate and validate; outlet and MCP capability checks)
+    /// (UCAN mint, delegate and validate; MCP capability checks)
     /// does not read the supervisor and does not refuse such a context. Join,
     /// leave, send, and receive refuse a poisoned context with `SCP-CTX-2134`
     /// `ContextPoisoned`, as every operation the supervisor answers does, and
@@ -2778,7 +2778,7 @@ impl crate::scp::PyScp {
                 });
             }
 
-            // Also update FFI bridge state's role_state for UCAN/outlet capability checks.
+            // Also update FFI bridge state's role_state.
             crate::runtime::with_ffi_state(bi, &context_id, |st| {
                 st.role_state.members.insert(member_did.clone());
                 Ok(())
