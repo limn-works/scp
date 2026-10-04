@@ -15,7 +15,8 @@
 #     ones, and the check counts each step in its own group. It counts a `shared-key`
 #     holding `${{ matrix.<axis> }}` as one group per axis value: it passes such a
 #     writer whose groups each have one writer, fails a literal second writer of one of
-#     those groups, and fails a key naming an axis the job's matrix gives no list.
+#     those groups, fails a key naming an axis the job's matrix gives no list, and
+#     fails a templated key whose matrix carries `include` or `exclude`.
 #   * Check 2 (uniffi-bindgen steps) fails a `cargo run` with no profile or target flags
 #     whose `--library` sits under `target/<triple>/release` (the second-compile shape
 #     from build-xcframework.sh and the Swift job of build-matrix.yml), one whose
@@ -58,6 +59,8 @@ FIXTURES=(
     "good-cache-matrix-key"
     "bad-cache-matrix-key-second-writer"
     "bad-cache-matrix-key-no-axis"
+    "bad-cache-matrix-key-include"
+    "bad-cache-matrix-key-exclude"
 )
 EXPECTED_EXITS=(
     "0"
@@ -71,6 +74,8 @@ EXPECTED_EXITS=(
     "1"
     "1"
     "0"
+    "1"
+    "1"
     "1"
     "1"
 )
@@ -88,6 +93,8 @@ EXPECTED_SUBSTRINGS=(
     "OK: 2 rust-cache step(s) in 2 group(s)"
     "cache group 'optional-transport' has 2 steps whose save-if is not false"
     "names matrix axis 'group', which the job's \`strategy.matrix\` gives no list"
+    "of a \`strategy.matrix\` carrying include, so this check"
+    "of a \`strategy.matrix\` carrying exclude, so this check"
 )
 
 passed=0

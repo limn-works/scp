@@ -184,12 +184,25 @@ def expand_matrix_key(where: str, key: str, job: dict) -> tuple[list[str], list[
     Each `${{ matrix.<axis> }}` in the key is replaced by every value of that axis's
     list in `strategy.matrix`, so a templated key counts as one group per value, as
     GitHub expands it at runtime. An axis with no list of scalars there (absent, or
-    defined only through `include`) is reported, because this check could not say
-    which groups the step writes.
+    defined only through `include`) is reported, and so is a matrix carrying
+    `include` or `exclude`, because either one can add or remove legs, and this
+    check could not say which groups the step writes.
     """
     keys = [key]
     matrix = (job.get("strategy") or {}).get("matrix")
     for axis in dict.fromkeys(MATRIX_REFERENCE.findall(key)):
+        expanders = [
+            k
+            for k in ("include", "exclude")
+            if isinstance(matrix, dict) and k in matrix
+        ]
+        if expanders:
+            message = (
+                f"{where}: rust-cache `shared-key` {key!r} names matrix axis {axis!r} "
+                f"of a `strategy.matrix` carrying {' and '.join(expanders)}, so this "
+                f"check cannot say which groups the step writes"
+            )
+            return [], [message]
         values = matrix.get(axis) if isinstance(matrix, dict) else None
         if not (
             isinstance(values, list)

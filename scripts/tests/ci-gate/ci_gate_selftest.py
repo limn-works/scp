@@ -4518,7 +4518,9 @@ def matrix_group_gaps(doc: dict) -> list[str]:
     never runs on any leg, so its commands run nowhere while every leg passes.
     A condition in any other shape (`!=`, `contains`, an `||` of two groups)
     is reported rather than read, because this check could not say which legs
-    run it.
+    run it. A matrix carrying `include` or `exclude` is reported rather than
+    read, because either one can add or remove a group's legs while the axis
+    list stays the same.
     """
     gaps = []
     for job_id, job in sorted(doc["jobs"].items()):
@@ -4528,6 +4530,13 @@ def matrix_group_gaps(doc: dict) -> list[str]:
         axis = matrix["group"]
         if not isinstance(axis, list) or not all(isinstance(g, str) for g in axis):
             gaps.append(f"{job_id}: matrix group {axis!r} is not a list of names")
+            continue
+        expanders = [key for key in ("include", "exclude") if key in matrix]
+        if expanders:
+            gaps.append(
+                f"{job_id}: matrix carries {' and '.join(expanders)}, which this "
+                f"check does not expand into legs"
+            )
             continue
         named: set[str] = set()
         with_cargo: set[str] = set()
@@ -4584,7 +4593,7 @@ def check_matrix_groups(path: Path, doc: dict) -> None:
 
 
 def check_matrix_group_controls(doc: dict) -> None:
-    """Four mutants of the live job, each of which the check must report.
+    """Mutants of the live job, each of which the check must report.
 
     Each mutates rust-test-optional-features in ci.yml, the job whose split
     prompted the check, so a control fails if that job loses its group axis as
@@ -4655,6 +4664,33 @@ def check_matrix_group_controls(doc: dict) -> None:
         f"platform-testing steps with no cargo line went unreported "
         f"({len(platform_steps)} step(s) rewritten): {gaps}",
     )
+    for expander, entries in (
+        ("include", [{"os": "ubuntu-latest", "group": "added-by-the-control"}]),
+        ("exclude", [{"group": "platform-testing"}]),
+    ):
+        expanded = copy.deepcopy(doc)
+        expanded["jobs"][job_id]["strategy"]["matrix"][expander] = entries
+        gaps = matrix_group_gaps(expanded)
+        check(
+            f"a matrix carrying {expander} is reported",
+            any(f"matrix carries {expander}," in gap for gap in gaps),
+            f"a matrix whose legs {expander} changes went unreported: {gaps}",
+        )
+
+    either = copy.deepcopy(doc)
+    gated = [
+        step
+        for step in either["jobs"][job_id]["steps"]
+        if "matrix.group" in str(step.get("if") or "")
+    ]
+    gated[0]["if"] = "matrix.group == 'transport' || matrix.group == 'node-relay'"
+    gaps = matrix_group_gaps(either)
+    check(
+        "a step gated on an `||` of two groups is reported",
+        any("which is not `matrix.group == '<g>'`" in gap for gap in gaps),
+        f"a step whose condition names two groups went unreported: {gaps}",
+    )
+
     check(
         "step_runs_cargo reads a cargo line and rejects a script without one",
         step_runs_cargo({"run": "export X=1\ncargo nextest run -p scp-platform\n"})
