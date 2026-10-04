@@ -96,7 +96,7 @@ Compile-time affinity via phantom lifetime was rejected: not expressible across 
 
 ### 5. `shutdown(timeout: Duration)` replaces terminal infallible shutdown
 
-`BridgeInstance::shutdown` gains a `timeout: Duration` argument and becomes async. Internally it uses a `tokio_util::sync::CancellationToken` propagated into every long-running task, a `JoinSet` of spawned workers, and a bounded wait. Outstanding work gets the full timeout to drain; anything still running at the deadline is forcibly cancelled via the token.
+`BridgeInstance::shutdown` gains a `timeout: Duration` argument and becomes async. Internally it uses a `tokio_util::sync::CancellationToken` propagated into every long-running task, a `JoinSet` of spawned workers, and a bounded wait. Outstanding work gets the full timeout to drain; a task in the bridge's own `JoinSet` that is still running at the deadline is forcibly cancelled via the token. The Supervisor's tracked tasks are never cancelled (amendment 2026-10-04 below).
 
 Signature across bridges:
 
@@ -109,7 +109,11 @@ This is a breaking change versus the Phase 4a `shutdown()` that took no argument
 **Amendment 2026-10-04: the bounded wait drains the Supervisor before storage closes.** The bounded wait covers the Supervisor's tasks as well as the bridge's own `JoinSet`. `shutdown(timeout)` awaits `shutdown_all_contexts`, which awaits every task the Supervisor's task tracker spawned (ADR-049, the actor-per-context concurrency model, Decision 16), inside the same deadline. The bridge's storage `close()` runs only after that wait completes.
 
 - **Every task exits before the deadline.** The bridge closes the store, which releases the store's advisory file lock and its database connection, and returns `ShutdownOutcome::GracefulWithin`. An open of the same directory in the same process then succeeds on its first attempt (§17.6 of the persistence and storage spec, One Writer per Durable Directory).
-- **The deadline expires first.** The bridge returns `ShutdownOutcome::TimedOut`. The store keeps its lock and its connection until the last remaining writer exits. Until the store releases its lock, a same-process open of the same directory fails with the typed lock-still-held error, so no moment exists at which two writers hold one directory (red-hat finding RED-1002, two writers on one database).
+- **The deadline expires before every Supervisor task exits.** The bridge returns `ShutdownOutcome::TimedOut`, with `durable_store_open` set when the instance has a durable store. The store keeps its lock and its connection until the last remaining writer exits. Until the store releases its lock, a same-process open of the same directory fails with the typed lock-still-held error, so no moment exists at which two writers hold one directory (red-hat finding RED-1002, two writers on one database).
+- **Every Supervisor task exits before the deadline, and the store refuses to close.** The bridge returns `ShutdownError::DurableStoreClose`. The store keeps its lock and its connection, so a same-process open of the same directory fails with the typed lock-still-held error.
+- **The drain task panics.** The bridge returns `ShutdownOutcome::TimedOut` and counts the panic in `panicked_tasks`. The bridge does not close the store.
+
+An SDK `shutdown` returns no `ShutdownOutcome`. It returns normally on `ShutdownOutcome::GracefulWithin`, on a `ShutdownOutcome::TimedOut` whose `durable_store_open` is false, and on a second shutdown of the same instance. It raises `SCP-STORAGE-8005` when the instance's own store keeps its lock: a `ShutdownOutcome::TimedOut` whose `durable_store_open` is true, or a `ShutdownError::DurableStoreClose`.
 
 ### 6. Long-lived background tasks capture `Weak<BridgeInstance>`, not `Arc`
 
@@ -234,7 +238,7 @@ The registry currently has no live entries. The three bridges share the real eng
 - **Multi-identity and multi-relay coexistence work.** A single process may hold multiple `SCP` instances, each with its own identity and its own relay connection. No shared mutable state leaks across them.
 - **Handle misuse is caught at the boundary.** Cross-instance handle reuse returns `SCP-PERM-3030` immediately, rather than corrupting silently.
 - **Shutdown is bounded and recoverable.** `shutdown(timeout)` drains outstanding work deterministically. Callers no longer deadlock on stuck tasks.
-- **A completed shutdown frees the storage directory.** After `shutdown(timeout)` returns `ShutdownOutcome::GracefulWithin`, no Supervisor task holds the store, so the same process can reopen the same directory at once. After it returns `ShutdownOutcome::TimedOut`, the store's lock stays held until the last writer exits, and a reopen in that window fails with a typed error (§5 amendment, 2026-10-04).
+- **A completed shutdown frees the storage directory.** After `shutdown(timeout)` returns `ShutdownOutcome::GracefulWithin`, no Supervisor task holds the store, so the same process can reopen the same directory at once. After it returns `ShutdownOutcome::TimedOut` with `durable_store_open` set, the store's lock stays held until the last writer exits, and a reopen in that window fails with a typed error (§5 amendment, 2026-10-04).
 - **No deprecation window.** The free-function façade is deleted in PR 4. There is no one-release-cycle tolerance period; every call site migrates in the same change that removes the façade. SCP is pre-release with no external consumers, so the cost of dropping the sunset window is zero and the benefit is eliminating a migration that would have to happen anyway two releases later.
 - **Breaking change to `shutdown` signature.** Documented in the migration guide with a minimal upgrade example.
 

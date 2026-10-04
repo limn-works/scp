@@ -300,7 +300,7 @@ enforcement mechanism.)
 | `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
 | `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
-| `SCP-STORAGE-8005` | selection layer (all bridges) | Durable storage directory's advisory lock is still held by another store (§17.6 "One Writer per Durable Directory") |
+| `SCP-STORAGE-8005` | selection layer and SDK `shutdown` (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store (§17.6 "One Writer per Durable Directory") |
 | `SCP-STORAGE-8006` | storage-error translation (all bridges) | Operation on a store that has released its database connection (§17.6 "One Writer per Durable Directory") |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
@@ -310,13 +310,17 @@ enforcement mechanism.)
 The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
 colliding with the Android backend's `8001-8003`, which were allocated first.
 
-The selection layer owns `8000`, `8004` and `8005`. `8000` reports that the caller
+The selection layer owns `8000` and `8004`, and shares `8005` with each bridge's SDK `shutdown`. `8000` reports that the caller
 named no storage backend; `8004` reports that the backend the caller did name
 failed to open — a wrong `SQLCipher` key or passphrase, an unwritable directory, a
-corrupt file, or a salt-sidecar fail-closed condition. `8005` reports that another
+corrupt file, or a salt-sidecar fail-closed condition. At open, `8005` reports that another
 store, in this process or another, holds the directory's advisory lock, including
 the window after a shutdown that returned `ShutdownOutcome::TimedOut` and before
-the previous instance's last writer exits. Each bridge's storage-error translation raises `8006` when an operation reaches a
+the previous instance's last writer exits. An SDK `shutdown` raises `8005` when it
+leaves the instance's own store holding its lock: the Supervisor drain did not finish
+before the deadline (`ShutdownOutcome::TimedOut` with `durable_store_open`), or the
+store refused to close (`ShutdownError::DurableStoreClose`) (ADR-048 §5, amendment
+2026-10-04). Each bridge's storage-error translation raises `8006` when an operation reaches a
 store whose connection was released. The `PyO3`, NAPI and `UniFFI` bridges all raise
 the same code for each of these conditions. The second selection-layer code took `8004`
 rather than `8001` because the Android backend already owns `8001-8003`: an
