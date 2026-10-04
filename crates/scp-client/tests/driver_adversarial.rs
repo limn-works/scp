@@ -807,7 +807,7 @@ fn malformed_welcome_join_leaves_no_half_built_context() {
 
 #[test]
 fn welcome_with_member_leaf_expired_under_joiner_clock_joins() {
-    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+    use scp_mls::lifetime::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
     let relay = Relay::new();
     let real_now = SystemClock.now_secs();
 
@@ -818,11 +818,12 @@ fn welcome_with_member_leaf_expired_under_joiner_clock_joins() {
     );
     alice.client.create_context(CTX).expect("Alice creates");
 
-    // Carol's leaf expires at `real_now + 600`, so it is current under the
-    // real clock openmls reads when Alice adds her. Carol never commits, so
+    // Carol's leaf expires `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 600`
+    // after the real clock, so Alice's add-side minimum passes and openmls,
+    // which reads the real clock, finds it current. Carol never commits, so
     // her leaf keeps its KeyPackage `Lifetime` into Bob's tree; Alice's own
     // leaf turns `Commit`-sourced when her add commits with a path.
-    let carol_not_after = real_now + 600;
+    let carol_not_after = real_now + KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 600;
     let mut carol = relay.party_with(
         Arc::new(LocalSigner::active(CAROL_DID)),
         Arc::new(MemoryStorage::new()),
@@ -835,21 +836,16 @@ fn welcome_with_member_leaf_expired_under_joiner_clock_joins() {
     alice
         .client
         .add_member(CTX, &carol_kp)
-        .expect("Alice adds Carol while her leaf is current");
+        .expect("Alice adds Carol while her leaf keeps the minimum");
 
-    // Bob's clock reads `real_now + 1200`, past Carol's `not_after`. His own
-    // KeyPackage is minted from that clock with `not_before` back-dated by
-    // `KEY_PACKAGE_LIFETIME_MARGIN_SECS` (one hour), so it is current under
-    // both his clock and the real clock openmls reads.
-    let bob_clock_now = real_now + 1200;
-    assert!(
-        carol_not_after < bob_clock_now,
-        "Carol's leaf is expired under Bob's clock"
-    );
+    // Bob mints his KeyPackage at the real clock, so Alice may add him, then
+    // his clock moves past Carol's `not_after` before he joins. His own
+    // KeyPackage stays current under his clock (84 days from the real clock).
+    let bob_clock = Arc::new(TestClock::new(real_now));
     let mut bob = relay.party_with(
         Arc::new(LocalSigner::active(BOB_DID)),
         Arc::new(MemoryStorage::new()),
-        Arc::new(TestClock::new(bob_clock_now)),
+        Arc::clone(&bob_clock) as Arc<dyn Clock>,
     );
     let bob_kp = bob
         .client
@@ -859,6 +855,11 @@ fn welcome_with_member_leaf_expired_under_joiner_clock_joins() {
         .client
         .add_member(CTX, &bob_kp)
         .expect("Alice adds Bob");
+    bob_clock.advance(carol_not_after + 600 - real_now);
+    assert!(
+        carol_not_after < bob_clock.now_secs(),
+        "Carol's leaf is expired under Bob's clock"
+    );
 
     bob.client
         .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
@@ -872,6 +873,287 @@ fn welcome_with_member_leaf_expired_under_joiner_clock_joins() {
         bob.client.mls_epoch(CTX).expect("Bob's epoch"),
         alice.client.mls_epoch(CTX).expect("Alice's epoch"),
         "Bob joins at Alice's epoch"
+    );
+}
+
+// ===========================================================================
+// 12c. A member merges an add-Commit whose KeyPackage expired under the
+//      member's own clock (security-model spec §9.7.1, the receiver: range
+//      only, no clock)
+// ===========================================================================
+
+#[test]
+fn add_commit_expired_under_receiver_clock_merges() {
+    use scp_mls::lifetime::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+    let relay = Relay::new();
+    let real_now = SystemClock.now_secs();
+
+    let mut alice = relay.party_with(
+        Arc::new(LocalSigner::active(ALICE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    alice.client.create_context(CTX).expect("Alice creates");
+    let bob_clock = Arc::new(TestClock::new(real_now));
+    let mut bob = relay.party_with(
+        Arc::new(LocalSigner::active(BOB_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::clone(&bob_clock) as Arc<dyn Clock>,
+    );
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add_bob = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+    bob.client
+        .join_context_encrypted(
+            CTX,
+            &add_bob.welcome,
+            &add_bob.event_log,
+            &add_bob.wrapping_keys,
+        )
+        .expect("Bob joins");
+
+    // Carol's KeyPackage keeps just over the minimum under Alice's (real)
+    // clock, so the wall clock lies before its `not_after`.
+    let carol_not_after = real_now + KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 600;
+    let mut carol = relay.party_with(
+        Arc::new(LocalSigner::active(CAROL_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(carol_not_after - KEY_PACKAGE_LIFETIME_SECS)),
+    );
+    let carol_kp = carol
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Carol key package");
+    let add_carol = alice
+        .client
+        .add_member(CTX, &carol_kp)
+        .expect("Alice adds Carol");
+
+    // Bob's injected clock moves past Carol's `not_after`; the wall clock
+    // stays before it.
+    bob_clock.advance(carol_not_after + 600 - real_now);
+    assert!(carol_not_after < bob_clock.now_secs());
+    assert!(SystemClock.now_secs() < carol_not_after);
+
+    bob.client.receive_message(CTX, &add_carol.commit).expect(
+        "Bob merges the add-Carol Commit although Carol's KeyPackage expired under his clock",
+    );
+    assert_eq!(
+        bob.client.mls_epoch(CTX).expect("Bob's epoch"),
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        "Bob merged to Alice's epoch"
+    );
+    assert!(
+        bob.client
+            .member_dids(CTX)
+            .expect("Bob's members")
+            .iter()
+            .any(|d| d == CAROL_DID),
+        "Bob's membership holds Carol"
+    );
+}
+
+// ===========================================================================
+// 12c'. A member merges an add-Commit whose KeyPackage is not yet valid under
+//       the member's own clock (security-model spec §9.7.1, the receiver)
+// ===========================================================================
+
+#[test]
+fn add_commit_not_yet_valid_under_receiver_clock_merges() {
+    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_MARGIN_SECS;
+    let relay = Relay::new();
+    let real_now = SystemClock.now_secs();
+
+    let mut alice = relay.party_with(
+        Arc::new(LocalSigner::active(ALICE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    alice.client.create_context(CTX).expect("Alice creates");
+    let bob_clock = Arc::new(TestClock::new(real_now));
+    let mut bob = relay.party_with(
+        Arc::new(LocalSigner::active(BOB_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::clone(&bob_clock) as Arc<dyn Clock>,
+    );
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add_bob = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+    bob.client
+        .join_context_encrypted(
+            CTX,
+            &add_bob.welcome,
+            &add_bob.event_log,
+            &add_bob.wrapping_keys,
+        )
+        .expect("Bob joins");
+
+    // Carol mints her KeyPackage at the real present, so its `not_before`
+    // lies one margin before the wall clock.
+    let carol_not_before = real_now - KEY_PACKAGE_LIFETIME_MARGIN_SECS;
+    let mut carol = relay.party_with(
+        Arc::new(LocalSigner::active(CAROL_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    let carol_kp = carol
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Carol key package");
+    let add_carol = alice
+        .client
+        .add_member(CTX, &carol_kp)
+        .expect("Alice adds Carol");
+
+    // Bob's injected clock moves before Carol's `not_before`; the wall clock
+    // stays after it.
+    bob_clock.set(carol_not_before - 600);
+    assert!(bob_clock.now_secs() < carol_not_before);
+    assert!(carol_not_before < SystemClock.now_secs());
+
+    bob.client.receive_message(CTX, &add_carol.commit).expect(
+        "Bob merges the add-Carol Commit although Carol's KeyPackage is not yet valid under his clock",
+    );
+    assert_eq!(
+        bob.client.mls_epoch(CTX).expect("Bob's epoch"),
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        "Bob merged to Alice's epoch"
+    );
+    assert!(
+        bob.client
+            .member_dids(CTX)
+            .expect("Bob's members")
+            .iter()
+            .any(|d| d == CAROL_DID),
+        "Bob's membership holds Carol"
+    );
+}
+
+// ===========================================================================
+// 12d. The browser driver's add path enforces the adder's minimum remaining
+//      KeyPackage lifetime (security-model spec §9.7.1, the adder)
+// ===========================================================================
+
+#[test]
+fn add_member_enforces_min_remaining_lifetime_boundary() {
+    use scp_mls::lifetime::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+    let relay = Relay::new();
+    let real_now = SystemClock.now_secs();
+
+    // Carol's KeyPackage expires at `not_after`; Dave's one second later.
+    let not_after = real_now + KEY_PACKAGE_LIFETIME_SECS;
+    let mut carol = relay.party_with(
+        Arc::new(LocalSigner::active(CAROL_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    let carol_kp = carol
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Carol key package");
+    let mut dave = relay.party_with(
+        Arc::new(LocalSigner::active(DAVE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now + 1)),
+    );
+    let dave_kp = dave
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Dave key package");
+
+    // Alice's clock leaves Carol one second short of the minimum and Dave
+    // exactly the minimum.
+    let mut alice = relay.party_with(
+        Arc::new(LocalSigner::active(ALICE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(
+            not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1,
+        )),
+    );
+    alice.client.create_context(CTX).expect("Alice creates");
+    let epoch_before = alice.client.mls_epoch(CTX).expect("Alice's epoch");
+
+    let err = alice
+        .client
+        .add_member(CTX, &carol_kp)
+        .expect_err("one second short of the minimum must be refused");
+    assert!(
+        matches!(
+            err,
+            ClientError::Mls(scp_mls::MlsError::KeyPackageLifetimeInvalid { not_after: na, .. })
+                if na == not_after
+        ),
+        "expected KeyPackageLifetimeInvalid for Carol's KeyPackage, got: {err:?}"
+    );
+    assert_eq!(
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        epoch_before,
+        "a refused add leaves the epoch"
+    );
+
+    alice
+        .client
+        .add_member(CTX, &dave_kp)
+        .expect("exactly the minimum remaining is accepted");
+    assert_eq!(
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        epoch_before + 1
+    );
+}
+
+// ===========================================================================
+// 12e. The joiner's own-KeyPackage check requires no minimum (security-model
+//      spec §9.7.1, the joiner)
+// ===========================================================================
+
+#[test]
+fn join_accepts_own_key_package_under_the_minimum() {
+    use scp_mls::lifetime::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+    let relay = Relay::new();
+    let real_now = SystemClock.now_secs();
+
+    let mut alice = relay.party_with(
+        Arc::new(LocalSigner::active(ALICE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    alice.client.create_context(CTX).expect("Alice creates");
+    let bob_clock = Arc::new(TestClock::new(real_now));
+    let mut bob = relay.party_with(
+        Arc::new(LocalSigner::active(BOB_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::clone(&bob_clock) as Arc<dyn Clock>,
+    );
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+
+    // Bob's clock moves to an hour short of the minimum before he joins.
+    let bob_not_after = real_now + KEY_PACKAGE_LIFETIME_SECS;
+    bob_clock.advance(bob_not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 3600 - real_now);
+    assert!(bob_not_after - bob_clock.now_secs() < KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+
+    bob.client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .expect("the joiner's own KeyPackage needs only to be current");
+    assert_eq!(
+        bob.client.mls_epoch(CTX).expect("Bob's epoch"),
+        alice.client.mls_epoch(CTX).expect("Alice's epoch")
     );
 }
 

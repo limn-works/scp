@@ -33,46 +33,48 @@
 //! - **Mints** every `Lifetime` SCP generates via [`key_package_lifetime`],
 //!   which reads the injected [`Clock`] and calls
 //!   `Lifetime::init` with bounds derived from it (never the openmls default).
-//! - **Validates** every `Lifetime` SCP accepts, except another member's
-//!   Welcome tree leaf (range only, below), via
-//!   [`validate_key_package_lifetime`], which runs `validate_with_time` with a
-//!   `now` built from the injected [`Clock`] wherever openmls exposes
-//!   the accepted `Lifetime` (post-`validate` on `KeyPackageIn` and pre-merge
-//!   on staged-commit Add proposals), and additionally enforces the RFC 9420
-//!   maximum-total-range bound that openmls's own `validate` path never checks.
+//! - **Validates** every `KeyPackage` an adder adds via
+//!   [`validate_key_package_lifetime_for_add`], which runs
+//!   `validate_with_time` with a `now` built from the injected [`Clock`],
+//!   requires at least [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] of remaining
+//!   lifetime and a `not_before` at least
+//!   [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`] old, and enforces the RFC 9420 maximum-total-range bound that
+//!   openmls's own `validate` path never checks (security-model spec §9.7.1,
+//!   `KeyPackage` `Lifetime` checks, the adder).
+//! - **Bounds** every `KeyPackage` a member receives in an Add, in a Proposal
+//!   or a Commit, to the maximum range only, through
+//!   `validate_received_key_package_lifetime_range`, which reads no clock
+//!   (§9.7.1, the receiver): a receiver MUST NOT reject an Add because the
+//!   `Lifetime` has expired, or has not yet started, under its own clock.
 //! - **Bounds** every other member's KeyPackage-sourced Welcome tree leaf to
 //!   the maximum range through `validate_tree_leaf_lifetime_ranges`, which
 //!   reads no clock, because RFC 9420 §7.3 only recommends the current-time
 //!   check on a received tree. The joiner's own leaf is the exception: it must
 //!   be current under the injected clock the join functions take and within
 //!   the maximum range, and a fault in it is reported as
-//!   `KeyPackageLifetimeInvalid`.
+//!   `KeyPackageLifetimeInvalid`. The joiner's own check requires no minimum
+//!   remaining lifetime.
 //!
-//! # openmls's internal check, bracketed or switched off
+//! # openmls's internal check, bracketed, bounded, or switched off
 //!
 //! openmls's own `Lifetime::validate` still runs inside `KeyPackageIn::validate`
 //! and `process_message`, against openmls's internal clock (the real wall clock
 //! natively; the attacker-overridable `Date.now()` through `web_time` on wasm),
 //! because those checks call `validate`, never `validate_with_time` with a
 //! caller's time, and neither can be switched off. This is the residual ADR-057
-//! Prerequisite 1 records: there are still two clocks. SCP brackets both paths
-//! against the injected clock, in addition to that internal check and never in
-//! place of it, so an accept decision needs both checks to pass and openmls's
-//! clock can only add rejections. A page script that overrides `Date.now()`
-//! after the browser client's clock module initializes can make an honest
-//! `KeyPackage` or commit fail, but cannot get a forged `Lifetime` accepted.
-//! In [`crate::group::join_group_from_bytes`] openmls's tree-leaf check is
-//! switched off, and SCP checks each leaf's range; the injected clock it takes
-//! is read only for the joiner's own leaf, never for another member's tree
-//! leaf. The residual closes when openmls lets the
-//! caller supply the clock that `KeyPackageIn::validate` and
-//! `process_message` read. The paths:
+//! Prerequisite 1 records: there are still two clocks. The paths:
 //!
-//! - `KeyPackageIn::validate`: [`crate::group::add_member`],
+//! - `KeyPackageIn::validate` on the add side: [`crate::group::add_member`],
 //!   [`crate::group::key_package_in_did`],
 //!   [`crate::group::key_package_in_wrapping_key`], and the runtime backend's
 //!   `validate_key_package` in `scp-runtime` (`crypto/mls/production_backend.rs`
-//!   and `crypto/mls/provider.rs`). Also `ProductionMlsBackend::join_from_welcome`
+//!   and `crypto/mls/provider.rs`). SCP brackets openmls's check there with
+//!   [`validate_key_package_lifetime_for_add`], in addition to openmls's check
+//!   and never in place of it, so an accept decision needs both checks to pass
+//!   and openmls's clock can only add rejections: a page script that overrides
+//!   `Date.now()` after the browser client's clock module initializes can make
+//!   an honest `KeyPackage` fail, but cannot get a forged `Lifetime` accepted.
+//!   Also `ProductionMlsBackend::join_from_welcome`
 //!   → `own_consumed_init_key_key` in `scp-runtime`, which validates the
 //!   signer state's own `KeyPackage` bytes on native only, so openmls's clock
 //!   there can reject a join before `join_group_from_bytes` runs;
@@ -83,11 +85,21 @@
 //!   expired, then brackets openmls's check by checking the same `Lifetime`
 //!   against the injected clock first, and `join_group_from_bytes` checks the joiner's
 //!   own leaf against the injected clock it takes.
-//! - `process_message`: the staged-commit Add proposals in
+//! - `process_message` on the receive side: the Add proposals in
 //!   [`crate::encrypt::decrypt_with_sender_did`] (which
-//!   [`crate::ratchet::process_commit`] calls) and
-//!   [`crate::encrypt::decrypt_with_membership_changes`], checked before the
-//!   merge.
+//!   [`crate::ratchet::process_commit`] reaches through
+//!   [`crate::encrypt::decrypt_commit`]) and
+//!   [`crate::encrypt::decrypt_with_membership_changes`], in a staged Commit
+//!   before the merge and in a received Proposal. SCP's own check there is
+//!   range-only and reads no clock. SCP carries no openmls patch, so
+//!   openmls's receive-side clock check still runs; the adder's
+//!   [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] and
+//!   [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`] bound it, and security-model
+//!   spec §9.7.1 states every condition under which it still refuses a
+//!   Commit: on the `not_after` side, publication delay + relay hold + local
+//!   processing latency + receiver clock lead reaching 7 days + 1 hour; on
+//!   the `not_before` side, a receiver clock more than 3,300 s behind the
+//!   adder's that has not reached `not_before`.
 //! - Welcome tree leaves, range only: [`crate::group::join_group_from_bytes`]
 //!   builds the staged Welcome through
 //!   `StagedWelcome::build_from_welcome(...)?.skip_lifetime_validation().build()`,
@@ -170,10 +182,65 @@ pub const KEY_PACKAGE_LIFETIME_MARGIN_SECS: u64 = 60 * 60;
 /// openmls *has* a `Lifetime::has_acceptable_range` helper but does **not** call
 /// it inside `KeyPackageIn::validate`, so an over-long (but temporally valid,
 /// legitimately signed) `Lifetime` passes openmls's own validation. SCP enforces
-/// the bound in [`validate_key_package_lifetime`] and, for Welcome tree leaves,
-/// in `validate_tree_leaf_lifetime_ranges`.
+/// the bound in [`validate_key_package_lifetime`] (and so in
+/// [`validate_key_package_lifetime_for_add`]), on a received Add in
+/// `validate_received_key_package_lifetime_range`, and, for Welcome tree
+/// leaves, in `validate_tree_leaf_lifetime_ranges`.
 pub const KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS: u64 =
     KEY_PACKAGE_LIFETIME_MARGIN_SECS + KEY_PACKAGE_LIFETIME_SECS;
+
+/// Minimum remaining lifetime, in seconds, an adder requires of a `KeyPackage`.
+///
+/// The remaining lifetime is `not_after - now` under the adder's clock; the
+/// value is 7 days + 1 hour (608,400 s; security-model spec §9.18.7,
+/// `KEY_PACKAGE_MIN_REMAINING_LIFETIME`).
+///
+/// §9.18.7 requires the value to be at least the `InvitationBundle` relay TTL
+/// (7 days, `05-contexts.md` §5.12.3.3) plus
+/// [`KEY_PACKAGE_LIFETIME_MARGIN_SECS`], so a joiner that fetches its Welcome
+/// while the relay still holds the `InvitationBundle` finds its own
+/// `KeyPackage` current, and at least the relay maximum blob TTL
+/// (`MAX_BLOB_TTL`, 7 days, §9.18.11) plus the same margin, so a Commit that
+/// the adder publishes when it checks the `KeyPackage`, and that a receiver
+/// processes when an SCP relay delivers it within its retention, carries no
+/// `KeyPackage` expired under that receiver's clock while the receiver's
+/// clock runs at most one hour ahead of the adder's. Security-model spec
+/// §9.7.1 states every condition under which openmls's receive-side check
+/// still refuses a Commit: delays add up, and a refusal on the `not_after`
+/// side needs publication delay + relay hold + local processing latency +
+/// receiver clock lead to reach 7 days + 1 hour. Neither bound lives in this crate: `scp-runtime`
+/// const-asserts the first against its invitation TTL, and `scp-client`
+/// const-asserts the second against `scp_relay_client::MAX_BLOB_TTL`.
+pub const KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS: u64 =
+    7 * 24 * 60 * 60 + KEY_PACKAGE_LIFETIME_MARGIN_SECS;
+
+/// Minimum age of a `KeyPackage`'s `not_before`, in seconds, under the adder's
+/// clock.
+///
+/// An adder refuses a `KeyPackage` whose `not_before` is later than
+/// `now - KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS` (security-model spec §9.7.1,
+/// the adder; §9.18.7, `KEY_PACKAGE_MIN_NOT_BEFORE_AGE`).
+///
+/// The value is 3,300 s: [`KEY_PACKAGE_LIFETIME_MARGIN_SECS`] (3,600 s, the
+/// backdate [`key_package_lifetime`] applies to `not_before`) minus the §9.14
+/// clock-skew tolerance ([`crate::keypackage_attestation::CLOCK_SKEW_TOLERANCE_SECS`],
+/// 300 s). A receiver whose clock runs at most 3,300 s behind the adder's has
+/// reached `not_before` when it processes the Commit, whatever `not_before` the
+/// joiner signed, so openmls's receive-side check does not refuse the Commit
+/// for a `not_before` in the future. A `KeyPackage` that
+/// [`key_package_lifetime`] mints passes at once under an adder whose clock
+/// runs up to 300 s behind the minter's.
+pub const KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS: u64 =
+    KEY_PACKAGE_LIFETIME_MARGIN_SECS - crate::keypackage_attestation::CLOCK_SKEW_TOLERANCE_SECS;
+
+// A freshly minted `KeyPackage` (`not_before = now - KEY_PACKAGE_LIFETIME_MARGIN_SECS`)
+// passes at an adder whose clock runs up to the skew tolerance slow only if
+// KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS + CLOCK_SKEW_TOLERANCE_SECS
+// <= KEY_PACKAGE_LIFETIME_MARGIN_SECS (security-model spec §9.18.7).
+const _: () = assert!(
+    KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS + crate::keypackage_attestation::CLOCK_SKEW_TOLERANCE_SECS
+        <= KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
 
 /// Mints a `KeyPackage` [`Lifetime`] from the injected [`Clock`].
 ///
@@ -215,9 +282,9 @@ pub fn key_package_lifetime(clock: &dyn Clock) -> Lifetime {
 ///    KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`. A legitimately-signed `Lifetime`
 ///    with an over-long range (which openmls would accept) is rejected here.
 ///
-/// Both checks must pass. This runs in addition to openmls's own internal
-/// validation on the `KeyPackageIn::validate` and staged-commit Add paths. The
-/// Welcome tree-leaf range check does not call this function;
+/// Both checks must pass. [`validate_key_package_lifetime_for_add`] runs these
+/// checks on every add path and adds the minimum remaining lifetime. A received
+/// Add and the Welcome tree-leaf range check do not call this function;
 /// [`crate::group::join_group_from_bytes`] calls it, through
 /// `validate_own_join_leaf_lifetime`, on the joiner's own leaf before it
 /// returns a group, because the joiner's own `KeyPackage` must be current
@@ -232,7 +299,12 @@ pub fn validate_key_package_lifetime(
     lifetime: &Lifetime,
     clock: &dyn Clock,
 ) -> Result<(), MlsError> {
-    let now = clock.now_secs();
+    validate_key_package_lifetime_at(lifetime, clock.now_secs())
+}
+
+/// [`validate_key_package_lifetime`] at a `now` the caller already read, so
+/// [`validate_key_package_lifetime_for_add`] reads its clock once.
+fn validate_key_package_lifetime_at(lifetime: &Lifetime, now: u64) -> Result<(), MlsError> {
     let not_before = lifetime.not_before();
     let not_after = lifetime.not_after();
 
@@ -249,6 +321,83 @@ pub fn validate_key_package_lifetime(
             not_before,
             not_after,
             now,
+        })
+    }
+}
+
+/// Validates the `Lifetime` of a `KeyPackage` the caller is about to add, under
+/// the adder's injected [`Clock`] (security-model spec §9.7.1, `KeyPackage`
+/// `Lifetime` checks, the adder).
+///
+/// Runs every check of [`validate_key_package_lifetime`] (the current time lies
+/// within the `Lifetime`, and the range is non-empty and within the maximum)
+/// and also requires `not_after - now >=`
+/// [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] and `not_before <= now -`
+/// [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`]. Every add path calls this
+/// function; the joiner's own-leaf check calls [`validate_key_package_lifetime`]
+/// instead, because §9.7.1 requires no minimum of the joiner.
+///
+/// # Errors
+///
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if the `Lifetime` fails
+/// [`validate_key_package_lifetime`], has less than the minimum remaining, or
+/// has a `not_before` later than `now -`
+/// [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`] under the injected clock (also when
+/// `now` is below that age, since no `not_before` is old enough then). The
+/// error carries `not_before`, `not_after`, and
+/// the observed `now`.
+pub fn validate_key_package_lifetime_for_add(
+    lifetime: &Lifetime,
+    clock: &dyn Clock,
+) -> Result<(), MlsError> {
+    let now = clock.now_secs();
+    validate_key_package_lifetime_at(lifetime, now)?;
+    // The check above passed, so `now < not_after`; `checked_sub` keeps the
+    // subtraction from resting on that.
+    let not_before = lifetime.not_before();
+    let not_after = lifetime.not_after();
+    let remaining_ok = not_after
+        .checked_sub(now)
+        .is_some_and(|remaining| remaining >= KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+    // `checked_sub` fails closed for a `now` below the age: no `not_before`
+    // lies that far back.
+    let not_before_ok = now
+        .checked_sub(KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS)
+        .is_some_and(|latest| not_before <= latest);
+    if remaining_ok && not_before_ok {
+        Ok(())
+    } else {
+        Err(MlsError::KeyPackageLifetimeInvalid {
+            not_before,
+            not_after,
+            now,
+        })
+    }
+}
+
+/// Bounds the `Lifetime` of a `KeyPackage` in a received Add, in a Proposal or
+/// a Commit, to the maximum range (security-model spec §9.7.1, `KeyPackage`
+/// `Lifetime` checks, the receiver).
+///
+/// Reads no clock, so every honest receiver reaches the same verdict on one
+/// Add. A `Lifetime` that has expired, or has not yet started, under the
+/// receiver's clock passes: RFC 9420 §7.3 only recommends the current-time
+/// check on a received `LeafNode`, and §9.7.1 forbids it.
+///
+/// # Errors
+///
+/// Returns [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] when
+/// `not_after` is not later than `not_before`, or `not_after - not_before`
+/// exceeds [`KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`].
+pub(crate) fn validate_received_key_package_lifetime_range(
+    lifetime: &Lifetime,
+) -> Result<(), MlsError> {
+    if lifetime_range_acceptable(lifetime) {
+        Ok(())
+    } else {
+        Err(MlsError::ReceivedKeyPackageLifetimeRangeInvalid {
+            not_before: lifetime.not_before(),
+            not_after: lifetime.not_after(),
         })
     }
 }
@@ -364,6 +513,137 @@ pub(crate) fn validate_own_join_leaf_lifetime(
 mod tests {
     use super::*;
     use scp_clock::TestClock;
+
+    /// A `Lifetime` minted at `1_000_000_000`, as `key_package_lifetime` mints.
+    fn minted_lifetime() -> Lifetime {
+        key_package_lifetime(&TestClock::new(1_000_000_000))
+    }
+
+    #[test]
+    fn min_remaining_lifetime_is_seven_days_plus_one_hour() {
+        assert_eq!(KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS, 608_400);
+    }
+
+    #[test]
+    fn for_add_accepts_exactly_the_minimum_remaining() {
+        let lifetime = minted_lifetime();
+        let clock = TestClock::new(lifetime.not_after() - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+        assert!(validate_key_package_lifetime_for_add(&lifetime, &clock).is_ok());
+    }
+
+    #[test]
+    fn for_add_refuses_one_second_short_of_the_minimum() {
+        let lifetime = minted_lifetime();
+        let now = lifetime.not_after() - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1;
+        let err = validate_key_package_lifetime_for_add(&lifetime, &TestClock::new(now));
+        assert!(
+            matches!(
+                err,
+                Err(MlsError::KeyPackageLifetimeInvalid { not_before, not_after, now: seen })
+                    if not_before == lifetime.not_before()
+                        && not_after == lifetime.not_after()
+                        && seen == now
+            ),
+            "got {err:?}"
+        );
+        // The same clock passes the check without the minimum: the minimum is
+        // the only reason for the refusal.
+        assert!(validate_key_package_lifetime(&lifetime, &TestClock::new(now)).is_ok());
+    }
+
+    #[test]
+    fn min_not_before_age_is_the_margin_less_the_skew_tolerance() {
+        assert_eq!(KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS, 3_300);
+    }
+
+    /// An adder clock at which a `Lifetime` minted at `MINT` keeps far more than
+    /// the minimum remaining, so only the `not_before` bound decides.
+    const MINT: u64 = 1_000_000_000;
+
+    #[test]
+    fn for_add_accepts_not_before_exactly_at_the_bound() {
+        let now = MINT + 10_000;
+        let lifetime = Lifetime::init(
+            now - KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS,
+            now + KEY_PACKAGE_LIFETIME_SECS,
+        );
+        assert!(validate_key_package_lifetime_for_add(&lifetime, &TestClock::new(now)).is_ok());
+    }
+
+    #[test]
+    fn for_add_refuses_not_before_one_second_past_the_bound() {
+        let now = MINT + 10_000;
+        let lifetime = Lifetime::init(
+            now - KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS + 1,
+            now + KEY_PACKAGE_LIFETIME_SECS,
+        );
+        let err = validate_key_package_lifetime_for_add(&lifetime, &TestClock::new(now));
+        assert!(
+            matches!(
+                err,
+                Err(MlsError::KeyPackageLifetimeInvalid { not_before, not_after, now: seen })
+                    if not_before == lifetime.not_before()
+                        && not_after == lifetime.not_after()
+                        && seen == now
+            ),
+            "got {err:?}"
+        );
+        // The same clock passes the check without the add-side bounds: the
+        // `not_before` bound is the only reason for the refusal.
+        assert!(validate_key_package_lifetime(&lifetime, &TestClock::new(now)).is_ok());
+    }
+
+    #[test]
+    fn for_add_accepts_a_fresh_mint_under_an_adder_300_seconds_slow() {
+        let lifetime = key_package_lifetime(&TestClock::new(MINT));
+        let slow = TestClock::new(MINT - crate::keypackage_attestation::CLOCK_SKEW_TOLERANCE_SECS);
+        assert!(validate_key_package_lifetime_for_add(&lifetime, &slow).is_ok());
+        let fast = TestClock::new(MINT + crate::keypackage_attestation::CLOCK_SKEW_TOLERANCE_SECS);
+        assert!(validate_key_package_lifetime_for_add(&lifetime, &fast).is_ok());
+    }
+
+    #[test]
+    fn for_add_refuses_when_now_is_below_the_not_before_age() {
+        let lifetime = Lifetime::init(0, KEY_PACKAGE_LIFETIME_SECS);
+        let now = KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS - 1;
+        assert!(validate_key_package_lifetime_for_add(&lifetime, &TestClock::new(now)).is_err());
+        let at = TestClock::new(KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS);
+        assert!(validate_key_package_lifetime_for_add(&lifetime, &at).is_ok());
+    }
+
+    #[test]
+    fn for_add_keeps_the_current_time_and_range_checks() {
+        let lifetime = minted_lifetime();
+        let expired = TestClock::new(lifetime.not_after());
+        assert!(validate_key_package_lifetime_for_add(&lifetime, &expired).is_err());
+        let over = Lifetime::init(1_000, 1_000 + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 1);
+        assert!(validate_key_package_lifetime_for_add(&over, &TestClock::new(2_000)).is_err());
+    }
+
+    #[test]
+    fn received_range_accepts_expired_and_not_yet_valid_lifetimes() {
+        assert!(
+            validate_received_key_package_lifetime_range(&Lifetime::init(1_000, 1_100)).is_ok()
+        );
+        assert!(
+            validate_received_key_package_lifetime_range(&Lifetime::init(u64::MAX - 100, u64::MAX))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn received_range_refuses_over_range_and_inverted_lifetimes() {
+        let over = Lifetime::init(1_000, 1_000 + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 1);
+        assert!(matches!(
+            validate_received_key_package_lifetime_range(&over),
+            Err(MlsError::ReceivedKeyPackageLifetimeRangeInvalid { not_before: 1_000, not_after })
+                if not_after == 1_000 + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 1
+        ));
+        assert!(matches!(
+            validate_received_key_package_lifetime_range(&Lifetime::init(2_000, 1_000)),
+            Err(MlsError::ReceivedKeyPackageLifetimeRangeInvalid { .. })
+        ));
+    }
 
     #[test]
     fn range_check_accepts_expired_lifetime_within_max_range() {
