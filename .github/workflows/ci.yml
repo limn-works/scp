@@ -1851,8 +1851,10 @@ jobs:
   # the cache manifest but none of its blobs and rebuilt from `WORKDIR` down, and a pull
   # request run an hour after a main export failed with `blob sha256:…: not found` on the
   # cook layer and recompiled every dependency. A registry is outside that cap.
-  # `packages: write` lets a push to `main` write the cache; a pull request and a merge
-  # group read it, because `cache-to` is set on a push only.
+  # `packages: write` holds for every event that runs this job, a pull request from a
+  # branch of this repository and a merge group included; only the `cache-to`
+  # expression, which that pull request's own copy of this file supplies, keeps those
+  # runs from writing the cache.
   docker-image:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1883,7 +1885,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
       # A pull request from a fork gets a read-only token, which still reads the cache.
+      # `continue-on-error` so a failed login cannot fail the build check.
       - uses: docker/login-action@v3
+        continue-on-error: true
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1893,12 +1897,11 @@ jobs:
           context: .
           push: false
           # Read the cache everywhere; write it only from a push to `main`, so every run
-          # reads what `main` built and no pull request can plant a layer another run
-          # reuses. `mode=max` keeps the chef and builder stages, which hold the
-          # toolchain, cargo-chef, and the cooked dependencies; the final stage alone
-          # holds none of them. `image-manifest=true` stores the cache as an OCI image
-          # manifest, the form GHCR accepts. `ignore-error` so a registry failure cannot
-          # fail the build check: this job answers whether the image builds. A missing
+          # reads what `main` built. `mode=max` keeps the chef and builder stages, which
+          # hold the toolchain, cargo-chef, and the cooked dependencies; the final stage
+          # alone holds none of them. `image-manifest=true` stores the cache as an OCI
+          # image manifest. `ignore-error` so a registry failure cannot fail the build
+          # check: this job answers whether the image builds. A missing
           # or unreadable cache only makes buildkit warn and build every layer.
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
           cache-to: ${{ github.event_name == 'push' && format('type=registry,ref=ghcr.io/{0}/buildcache:docker-image,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true', github.repository) || '' }}
