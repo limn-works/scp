@@ -460,8 +460,8 @@ pub(crate) async fn outlet_stream_open_impl(
 
     // The lifecycle gate asks the supervisor actor, never the handle's cached
     // state, and returns the role state the UCAN check below reads.
-    let role_state = bi
-        .require_active_context_before_authz(&context_id, "open outlet stream in context", |msg| {
+    let gated =
+        crate::bridge::GatedHandle::gate(bi, handle, "open outlet stream in context", |msg| {
             ScpError::Outlet {
                 msg,
                 code: codes::OUTLET_6005.to_owned(),
@@ -502,7 +502,7 @@ pub(crate) async fn outlet_stream_open_impl(
     // re-present.
     crate::bridge::validate_outlet_ucan_uniffi(
         bi,
-        (handle, &role_state),
+        &gated,
         &outlet_id,
         outlet_kind,
         &ucan_token,
@@ -1247,16 +1247,16 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
         },
     )
     .await?;
-    let target_role_state = bi
-        .require_active_context_before_authz(
-            &target_context_id,
-            "start cross-context streaming saga into target context",
-            |msg| ScpError::Outlet {
-                msg,
-                code: codes::OUTLET_6011.to_owned(),
-            },
-        )
-        .await?;
+    let target_gated = crate::bridge::GatedHandle::gate(
+        bi,
+        target_handle,
+        "start cross-context streaming saga into target context",
+        |msg| ScpError::Outlet {
+            msg,
+            code: codes::OUTLET_6011.to_owned(),
+        },
+    )
+    .await?;
     let supervisor = Arc::clone(bi.context_manager_or_error()?);
 
     // ----- (a) validate inputs ------------------------------------------------
@@ -1320,7 +1320,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     let operator_did = registration.operator_did.0.clone();
     validate_outlet_ucan_uniffi(
         bi,
-        (target_handle, &target_role_state),
+        &target_gated,
         &outlet_registration_id,
         outlet_kind,
         &ucan_token,

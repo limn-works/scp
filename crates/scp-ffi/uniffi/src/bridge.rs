@@ -4374,18 +4374,54 @@ pub fn identity_verify_link_attestation(
 // See ADR-021 acceptance criterion 4.
 // ---------------------------------------------------------------------------
 
+/// A context handle and the role state that
+/// [`UniffiBridgeInstance::require_active_context_before_authz`](crate::runtime::UniffiBridgeInstance::require_active_context_before_authz)
+/// returned for that handle's own `context_id`.
+///
+/// [`Self::gate`] is the only constructor, so a role state read for another
+/// context cannot be paired with the handle.
+pub(crate) struct GatedHandle<'a> {
+    handle: &'a ContextHandle,
+    role_state: scp_core::context::roles::ContextRoleState,
+}
+
+impl<'a> GatedHandle<'a> {
+    /// Runs the lifecycle gate on `handle.context_id` and pairs the role state
+    /// it returns with `handle`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever
+    /// [`UniffiBridgeInstance::require_active_context_before_authz`](crate::runtime::UniffiBridgeInstance::require_active_context_before_authz)
+    /// returns.
+    pub(crate) async fn gate<F>(
+        bi: &crate::runtime::UniffiBridgeInstance,
+        handle: &'a ContextHandle,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<Self, ScpError>
+    where
+        F: FnOnce(String) -> ScpError,
+    {
+        let role_state = bi
+            .require_active_context_before_authz(&handle.context_id, verb, mk_err)
+            .await?;
+        Ok(Self { handle, role_state })
+    }
+}
+
 /// Validates a UCAN token for outlet invocation authorization (`UniFFI` bridge).
 ///
 /// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
 /// or `outlet_call:*` capability. Extracted to keep `outlet_invoke` focused.
 ///
 /// ADR-016 step 8 compares the token's grants against the ceiling in
-/// `role_state`, and the chain check anchors on `role_state.creator_did`. The
-/// per-context UCAN state supplies only the revocation list and the nonce
-/// tracker.
+/// `gated`'s role state, and the chain check anchors on that role state's
+/// `creator_did`. The per-context UCAN state supplies only the revocation list
+/// and the nonce tracker.
 pub(crate) fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-    (handle, role_state): (&ContextHandle, &scp_core::context::roles::ContextRoleState),
+    gated: &GatedHandle<'_>,
     outlet_id: &str,
     kind: scp_core::context::outlets::OutletKind,
     ucan_token: &str,
@@ -4396,6 +4432,7 @@ pub(crate) fn validate_outlet_ucan_uniffi(
     use scp_core::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan,
     };
+    let GatedHandle { handle, role_state } = gated;
 
     // Build proof resolver from optional proof tokens.
     let mut proofs = std::collections::HashMap::new();
@@ -5198,8 +5235,8 @@ impl McpUniFfiBridgeProvider {
     }
 
     /// Reads `context_id`'s lifecycle state from the actor that holds it,
-    /// with `Supervisor::read_context_state_checked`, for the outlet access
-    /// gate (ADR-049 §10).
+    /// with `Supervisor::read_context_state_checked`, for an access gate
+    /// (ADR-049 §10).
     ///
     /// # Errors
     ///
@@ -5450,6 +5487,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         use scp_mcp::server::AccessRefusal;
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
         let role_state = Self::gate_role_state(&bi, context_id)?;
+        Self::gate_active_lifecycle(&bi, context_id)?;
         let access = resource.check_access(&role_state, &self.agent_did, context_id);
         access.map_err(AccessRefusal::Denied)
     }
@@ -14160,16 +14198,13 @@ impl Scp {
                 // The lifecycle gate asks the supervisor actor, never the
                 // handle's cached state, and returns the role state the UCAN
                 // check below reads.
-                let role_state = bi
-                    .require_active_context_before_authz(
-                        &handle.context_id,
-                        "invoke outlet in context",
-                        |msg| ScpError::Outlet {
-                            msg,
-                            code: codes::OUTLET_6005.to_owned(),
-                        },
-                    )
-                    .await?;
+                let gated = GatedHandle::gate(&bi, &handle, "invoke outlet in context", |msg| {
+                    ScpError::Outlet {
+                        msg,
+                        code: codes::OUTLET_6005.to_owned(),
+                    }
+                })
+                .await?;
 
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
@@ -14197,7 +14232,7 @@ impl Scp {
                 // bridge UCAN registry, not in the runtime.
                 validate_outlet_ucan_uniffi(
                     &bi,
-                    (&handle, &role_state),
+                    &gated,
                     &outlet_id,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -14444,16 +14479,16 @@ impl Scp {
                     },
                 )
                 .await?;
-                let target_role_state = bi
-                    .require_active_context_before_authz(
-                        &target_handle.context_id,
-                        "use target context",
-                        |msg| ScpError::Outlet {
-                            msg: format!("cannot invoke cross-context outlet: {msg}"),
-                            code: codes::OUTLET_6011.to_owned(),
-                        },
-                    )
-                    .await?;
+                let target_gated = GatedHandle::gate(
+                    &bi,
+                    &target_handle,
+                    "use target context",
+                    |msg| ScpError::Outlet {
+                        msg: format!("cannot invoke cross-context outlet: {msg}"),
+                        code: codes::OUTLET_6011.to_owned(),
+                    },
+                )
+                .await?;
 
                 // Validate chain depth (context-configurable, default 8 per ADR-043).
                 let max_chain_depth = {
@@ -14495,7 +14530,7 @@ impl Scp {
                 // See spec §6.2, §8, ADR-016, and issue #319.
                 validate_outlet_ucan_uniffi(
                     &bi,
-                    (&target_handle, &target_role_state),
+                    &target_gated,
                     &outlet_id,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -14947,16 +14982,13 @@ impl Scp {
                 // The lifecycle gate asks the supervisor actor, never the
                 // handle's cached state, and returns the role state the UCAN
                 // check below reads.
-                let role_state = bi
-                    .require_active_context_before_authz(
-                        &handle.context_id,
-                        "invoke session in context",
-                        |msg| ScpError::Outlet {
-                            msg,
-                            code: codes::OUTLET_6017.to_owned(),
-                        },
-                    )
-                    .await?;
+                let gated = GatedHandle::gate(&bi, &handle, "invoke session in context", |msg| {
+                    ScpError::Outlet {
+                        msg,
+                        code: codes::OUTLET_6017.to_owned(),
+                    }
+                })
+                .await?;
 
                 // Look up outlet_id from session for UCAN validation.
                 let outlet_id_for_ucan = {
@@ -14991,7 +15023,7 @@ impl Scp {
                 // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
                 validate_outlet_ucan_uniffi(
                     &bi,
-                    (&handle, &role_state),
+                    &gated,
                     &outlet_id_for_ucan,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -20973,14 +21005,10 @@ mod tests {
     /// Each single-context outlet entry point below gates on the supervisor
     /// actor, and its refusal withholds the lifecycle state.
     ///
-    /// Each one previously compared `handle.state`, the cached snapshot that
-    /// still reads `Active` after the supervisor despawns the actor, so it
-    /// admitted work into a context the supervisor had stopped serving. The
-    /// gate runs before the caller is authorized, so its refusal names no
+    /// The gate runs before the caller is authorized, so its refusal names no
     /// lifecycle state (the outlet PRD's SCP-OUT-031 PR-2a note). The junk UCAN
     /// token below reaches no authorization step, and each assertion pins the
-    /// entry point's own code, so a revert of any one gate to the cached state
-    /// turns this test red.
+    /// entry point's own code.
     #[test]
     #[cfg(feature = "testing")]
     fn single_context_outlet_gates_read_the_supervisor_not_the_cached_handle_state() {
@@ -25822,14 +25850,15 @@ mod tests {
         );
     }
 
-    /// The MCP outlet access gate reads the actor's lifecycle state. While the
-    /// context is `Active`, a probe passes. Once a close leaves the actor
-    /// resident in `Closing`, still holding its role state, a probe and a
-    /// `tools/call` are both denied with the withheld refusal, and no outlet
-    /// runs. A gate that read only the role state would admit both.
+    /// The MCP outlet and resource access gates read the actor's lifecycle
+    /// state. While the context is `Active`, a probe and a resource read pass.
+    /// Once a close leaves the actor resident in `Closing`, still holding its
+    /// role state, a probe, a `tools/call` and a resource read are each denied
+    /// with the withheld refusal, and no outlet runs. A gate that read only the
+    /// role state would admit all three.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "testing")]
-    async fn uniffi_validate_capability_denies_a_context_whose_actor_is_closing() {
+    async fn uniffi_mcp_access_gates_deny_a_context_whose_actor_is_closing() {
         use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
         use scp_platform::traits::KeyCustody as _;
         let custody = scp_platform::testing::InMemoryKeyCustody::new();
@@ -25950,6 +25979,9 @@ mod tests {
                 scp_mcp::server::CapabilityCheck::Probe,
             )
             .expect("a probe of an Active context with a valid token passes");
+        provider
+            .validate_resource_access("ctx-test", scp_mcp::server::ResourceKind::Tools)
+            .expect("a member's resource read of an Active context passes");
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         supervisor
@@ -26011,6 +26043,13 @@ mod tests {
             ran.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a call into a closing context runs no outlet"
+        );
+        let resource = provider
+            .validate_resource_access("ctx-test", scp_mcp::server::ResourceKind::Tools)
+            .expect_err("a resource read of a closing context must be denied");
+        assert!(
+            is_withheld_denial(&resource),
+            "the resource denial must withhold the state: {resource}"
         );
     }
 
