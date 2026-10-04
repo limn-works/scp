@@ -339,6 +339,12 @@ pub enum OpenStreamRejection {
         /// message names the actual state.
         current_state: String,
     },
+    /// The Supervisor refused the open because `shutdown_all_contexts` has
+    /// begun ([`ContextError::SupervisorShutDown`](crate::context::ContextError::SupervisorShutDown),
+    /// ADR-049 Decision 16 item 2). Nothing was reserved or debited. Shares
+    /// [`Self::ContextNotActive`]'s slug and code, the NON-retryable Protocol
+    /// class: no later open on this Supervisor succeeds.
+    SupervisorShutDown,
 }
 
 impl OpenStreamRejection {
@@ -361,7 +367,9 @@ impl OpenStreamRejection {
             Self::CaveatsBindingMismatch => error_codes::SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
             Self::StreamCapExhausted => error_codes::SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
             // #2196 — reuse the mid-stream teardown slug for a pre-open teardown.
-            Self::ContextNotActive { .. } => error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+            Self::ContextNotActive { .. } | Self::SupervisorShutDown => {
+                error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM
+            }
         }
     }
 
@@ -379,7 +387,9 @@ impl OpenStreamRejection {
             // whole point of the error-masking fix: a permanent context-not-active
             // failure must NOT be reported through the retryable transport-fault
             // band the pre-fix catch-all used.
-            Self::ContextNotActive { .. } => error_codes::CODE_PROTOCOL_SESSION,
+            Self::ContextNotActive { .. } | Self::SupervisorShutDown => {
+                error_codes::CODE_PROTOCOL_SESSION
+            }
             // Mirror `caveat_violation_chunk`'s slug→code routing: the
             // input-schema slug is Input-class (`SCP-OUTLET-6120`), every
             // other caveat slug is Authorization-class (`SCP-OUTLET-6110`).
@@ -408,6 +418,11 @@ impl OpenStreamRejection {
             // legacy `SCP-OUTLET-6080` marker is gone.)
             Self::ContextNotActive { current_state } => InvocationError::ContextNotActive {
                 current_state: current_state.clone(),
+            },
+            // Keeps the non-retryable Protocol-session surface
+            // (`InvocationError::ContextNotActive` maps to `SCP-OUTLET-6101`).
+            Self::SupervisorShutDown => InvocationError::ContextNotActive {
+                current_state: "supervisor shut down".to_owned(),
             },
             _ => InvocationError::CaveatViolation {
                 slug: self.slug().to_owned(),
@@ -3603,6 +3618,35 @@ mod tests {
             }
             other => panic!("expected ContextNotActive round-trip, got {other:?}"),
         }
+    }
+
+    /// A shutdown refusal maps to the non-retryable Protocol class, never the
+    /// retryable transport rate limit an admission rejection carries.
+    #[test]
+    fn supervisor_shut_down_rejection_is_non_retryable_protocol() {
+        use scp_protocol::context::outlets::errors::RetryPolicy;
+        let rej = OpenStreamRejection::SupervisorShutDown;
+        assert_eq!(rej.error_code(), error_codes::CODE_PROTOCOL_SESSION);
+        assert_eq!(
+            error_codes::error_code_to_retry_policy(rej.error_code()),
+            Some(RetryPolicy::Never),
+            "an open refused by shutdown must be non-retryable"
+        );
+        let rate_limited = OpenStreamRejection::AdmissionRateLimited {
+            slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+        };
+        assert_ne!(
+            error_codes::error_code_to_retry_policy(rate_limited.error_code()),
+            Some(RetryPolicy::Never),
+            "the transport rate limit stays retryable"
+        );
+        assert!(
+            matches!(
+                rej.to_invocation_error(),
+                InvocationError::ContextNotActive { .. }
+            ),
+            "the invocation surface keeps the non-retryable class"
+        );
     }
 
     /// #2196 error-masking — EVERY permanent synchronous `invoke_outlet` open

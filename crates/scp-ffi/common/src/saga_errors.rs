@@ -138,6 +138,15 @@ pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
             code: codes::SAGA_13066.to_owned(),
             message,
         },
+        // Nothing was staged, so the saga aborted with no back-off hint; the
+        // code tells a shutdown refusal apart from a policy reject.
+        SagaError::SupervisorShutDown { message } => SagaErrorParts {
+            kind: SagaErrorKind::Aborted {
+                retry_after_ms: None,
+            },
+            code: codes::CTX_2138.to_owned(),
+            message,
+        },
     }
 }
 
@@ -221,6 +230,23 @@ mod tests {
             message: "caller not a member".to_owned(),
         });
         assert_eq!(parts.code, "SCP-SAGA-13050");
+        assert_eq!(
+            parts.kind,
+            SagaErrorKind::Aborted {
+                retry_after_ms: None,
+            }
+        );
+    }
+
+    /// A saga refused by Supervisor shutdown keeps `SCP-CTX-2138`, not a
+    /// saga-abort code, and carries no back-off hint.
+    #[test]
+    fn supervisor_shut_down_keeps_ctx_2138() {
+        let parts = decompose_saga_error(SagaError::SupervisorShutDown {
+            message: "start cross-context streaming saga refused".to_owned(),
+        });
+        assert_eq!(parts.code, codes::CTX_2138);
+        assert_ne!(parts.code, "SCP-SAGA-13067");
         assert_eq!(
             parts.kind,
             SagaErrorKind::Aborted {
