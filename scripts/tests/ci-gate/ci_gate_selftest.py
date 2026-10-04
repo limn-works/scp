@@ -209,8 +209,9 @@ nothing:
                environment's `GHCR_CACHE_TOKEN`, and job docker-image reads it.
                The check reports any job or workflow-level `permissions:` block
                holding `packages: write` or `write-all`, and any step, job key,
-               or workflow-level `env:` reading `secrets.GHCR_CACHE_TOKEN`
-               outside a job declaring `environment: docker-cache`.
+               or workflow-level `env:` reading `secrets.GHCR_CACHE_TOKEN` in
+               any letter case, or reading `toJSON(secrets)`, outside a job
+               declaring `environment: docker-cache`.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -4011,8 +4012,12 @@ def package_write_holders(doc: dict) -> list[str]:
     )
 
 
+# GitHub matches secret names and expression property names without regard to case,
+# and `toJSON(secrets)` hands a step every secret its job can read.
 CACHE_TOKEN_READ = re.compile(
     r"secrets\s*(\.\s*GHCR_CACHE_TOKEN\b|\[\s*['\"]GHCR_CACHE_TOKEN['\"]\s*\])"
+    r"|toJSON\s*\(\s*secrets\s*\)",
+    re.IGNORECASE,
 )
 
 
@@ -4144,6 +4149,27 @@ def check_package_write_and_cache_token(doc: dict) -> None:
                 env={"T": "${{ secrets['GHCR_CACHE_TOKEN'] }}"}
             ),
             ["docker-image.env"],
+        ),
+        (
+            "a docker-image step reading the token in lowercase is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"with": {"password": "${{ secrets.ghcr_cache_token }}"}}
+            ),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image step reading `toJSON(secrets)` is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"run": "echo '${{ toJSON(secrets) }}'"}
+            ),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image step reading another secret is not reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"with": {"password": "${{ secrets.GHCR_CACHE_TOKEN_OLD }}"}}
+            ),
+            [],
         ),
         (
             "a workflow-level `env:` reading the token is reported",
