@@ -2467,12 +2467,28 @@ jobs:
           path: target/ci-bridge/libscp_ffi_napi.so
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
+  # The four macOS bridge jobs (xcframework, pyo3-module-macos, swift-build-test and
+  # bridge-parity-swift) read the `rust` output on every event but pull_request. On a
+  # pull_request event they run when a changed path matches the `swift` filter
+  # (bindings/swift/**, crates/scp-ffi/uniffi/** and crates/scp-ffi/common/**), the
+  # `python` filter (bindings/python/**, crates/scp-ffi/src/** and
+  # crates/scp-ffi/common/**), or the `toolchain` filter both of those outputs OR in.
+  # On a merge_group event they also run on `rust`, so the merge queue runs them on
+  # every Rust change it lands, and on a push to `main` the two producers among them
+  # also run on `rust`, because each writes a cache.
+  #
+  # TRADE-OFF: a pull request confined to Rust crates outside those directories
+  # skips all four, so a change that breaks the Swift bridge, or the PyO3 module on
+  # macOS, fails in the merge queue rather than on the pull request. In exchange a
+  # pull request whose changed paths match neither filter waits on none of these
+  # four macOS jobs.
   xcframework:
     needs: changes
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      (github.event_name != 'pull_request' &&
+      needs.changes.outputs.rust == 'true')
     name: Bridge artifact / Swift XCFramework (macOS)
     runs-on: macos-latest
     timeout-minutes: 60
@@ -2594,11 +2610,13 @@ jobs:
     # bridge-parity-swift is the only consumer.
     # An Ubuntu build cannot serve it: a Python extension module is a native shared
     # object, and the one job pyo3-module publishes is an ELF `.so` built against
-    # glibc for x86_64.
+    # glibc for x86_64. The comment above job xcframework says why a pull request
+    # reads no `rust` clause here.
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      (github.event_name != 'pull_request' &&
+      needs.changes.outputs.rust == 'true')
     name: Bridge artifact / PyO3 module (macOS)
     runs-on: macos-latest
     timeout-minutes: 60
@@ -3444,10 +3462,12 @@ jobs:
       - run: swiftlint lint --strict
       - run: swiftformat --lint Sources/ Tests/
 
-  # ORs on `rust` for a reason spelled out above python-test: this job runs a Swift
-  # suite against an XCFramework, and that XCFramework reaches every Rust workspace
-  # crate through scp-core, while a `swift` filter names only bindings/swift/**,
-  # crates/scp-ffi/uniffi/** and crates/scp-ffi/common/**.
+  # ORs on `rust` outside pull_request events for a reason spelled out above
+  # python-test: this job runs a Swift suite against an XCFramework, and that
+  # XCFramework reaches every Rust workspace crate through scp-core, while a `swift`
+  # filter names only bindings/swift/**, crates/scp-ffi/uniffi/** and
+  # crates/scp-ffi/common/**. The comment above job xcframework says why a pull
+  # request reads no `rust` clause.
   swift-build-test:
     # Job xcframework builds ScpFFI.xcframework and regenerates ScpBindings.swift for
     # this job. This job runs no cargo command, so it installs no Rust toolchain and
@@ -3456,7 +3476,8 @@ jobs:
     if: >-
       github.event_name != 'push' &&
       (needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true')
+      (github.event_name != 'pull_request' &&
+      needs.changes.outputs.rust == 'true'))
     name: Swift / build + test
     runs-on: macos-latest
     timeout-minutes: 60
@@ -3810,13 +3831,15 @@ jobs:
     # drives, and they run concurrently, so this job starts when the slower of the two
     # ends. Both producers are macOS jobs: an ELF `.so` and an aarch64-apple-darwin
     # static library are not interchangeable. This job runs no cargo command, so it
-    # installs no Rust toolchain and reads no cargo cache.
+    # installs no Rust toolchain and reads no cargo cache. The comment above job
+    # xcframework says why a pull request reads no `rust` clause here.
     needs: [changes, pyo3-module-macos, xcframework]
     if: >-
       github.event_name != 'push' &&
       (needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true')
+      (github.event_name != 'pull_request' &&
+      needs.changes.outputs.rust == 'true'))
     name: Cross-bridge runtime parity (UniFFI Swift)
     runs-on: macos-latest
     timeout-minutes: 60
