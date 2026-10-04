@@ -1292,8 +1292,7 @@ impl LiveMcpClient {
     }
 }
 
-/// A `TransportError` carrying one of the MCP client codes
-/// `TRANS_5020`..`TRANS_5025`.
+/// A `TransportError` carrying `code`.
 fn mcp_client_error(code: &str, message: String) -> ScpPyError {
     ScpPyError::TransportError {
         message,
@@ -2873,8 +2872,7 @@ mod tests {
     }
 
     /// A proof token `outlet_grant` cannot parse is a failed read, so
-    /// `tools/list` reports it as an error. A token that parses and fails
-    /// validation is a denial, so `tools/list` omits the tool.
+    /// `tools/list` reports it as an error.
     #[test]
     fn ffi_bridge_provider_outlet_grant_read_failure_is_unreadable_not_denied() {
         let creator = "did:dht:z6MkCreatorGrantRead";
@@ -2910,7 +2908,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
-            "a UCAN that fails validation must be a denial: {err}"
+            "an unparseable agent UCAN must be a denial: {err}"
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);
