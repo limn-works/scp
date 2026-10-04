@@ -2028,13 +2028,7 @@ where
 /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
 /// withholds the lifecycle state from the refusal.
 ///
-/// An entry point that gates before it authorizes the caller and reads no role
-/// state (outlet verify, session create, and the cross-context invoke's source
-/// side) gates through this form rather than [`require_active_context`]. An
-/// entry point that also reads role state calls
-/// [`active_role_state_before_authz`] instead, so the supervisor is resolved
-/// once for both reads. The outlet PRD's SCP-OUT-031 PR-2a note
-/// records the rule this form keeps: the raw lifecycle state never reaches an
+/// The outlet PRD's SCP-OUT-031 PR-2a note records the rule this form keeps: the raw lifecycle state never reaches an
 /// FFI caller before authorization. The refusal therefore reads the same for
 /// every non-`Active` state, for a context no actor serves, and for a state
 /// read that failed: a closing or closed context, a context mid-respawn or
@@ -2084,11 +2078,10 @@ where
 /// supervisor actor reports `Active`, and withholds the lifecycle state from
 /// the refusal.
 ///
-/// Every entry point that gates before it authorizes the caller and then reads
-/// role state takes its ceiling, roles and creator from this function: the
-/// UCAN entry points in `ucan.rs` (`ucan_validate_on`, `ucan_evaluate_on`,
+/// The UCAN entry points in `ucan.rs` (`ucan_validate_on`, `ucan_evaluate_on`,
 /// `ucan_mint_on`, `ucan_delegate_on`, `ucan_revoke_on`) and the outlet entry
-/// points in `outlets.rs` and `outlet_stream.rs`. The bridge copies
+/// points in `outlets.rs` and `outlet_stream.rs` that read role state take
+/// their ceiling, roles and creator from this function. The bridge copies
 /// (`UcanContextState.role_state`, `UcanContextStateCore.ceiling_strings` and
 /// `UcanContextStateCore.creator_did`) refresh only when THIS bridge performs
 /// the mutation.

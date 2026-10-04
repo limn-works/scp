@@ -9099,8 +9099,8 @@ mod tests {
             .expect("the supervisor's creator holds role:assign in the source");
     }
 
-    /// Every gated outlet entry point refuses a context whose actor is resident
-    /// but reports `Closing`, with its own outlet code and the withheld text,
+    /// Each outlet entry point this test calls refuses a context whose actor is
+    /// resident but reports `Closing`, with its own outlet code and the withheld text,
     /// and names neither the lifecycle state nor the context id.
     ///
     /// The actor still answers the role-state read, so an entry point that
