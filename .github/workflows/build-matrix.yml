@@ -344,7 +344,7 @@ jobs:
   # ---------------------------------------------------------------------------
   swift-xcframework:
     name: Swift XCFramework
-    # Pinned: Package.swift requires swift-tools-version 6.2; macos-latest (macOS 15) only ships 6.1
+    # Pinned: Package.swift requires swift-tools-version 6.2, which the macOS 26 image ships
     runs-on: macos-26
     timeout-minutes: 90
     steps:
