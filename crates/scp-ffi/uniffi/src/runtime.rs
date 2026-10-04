@@ -18,10 +18,7 @@
 //! # Lifecycle
 //!
 //! 1. `Scp::with_storage` (the sole public constructor; storage selection
-//!    is mandatory, spec §17.6) constructs a fresh `UniffiBridgeInstance`;
-//!    per-instance setup (e.g. `init_context_manager_with_did`, transport
-//!    setup) happens lazily on the first `Scp::identity_create` /
-//!    `context_create` call.
+//!    is mandatory, spec §17.6) constructs a fresh `UniffiBridgeInstance`.
 //! 2. `Scp::method(...)` delegates to methods on
 //!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
 //!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
