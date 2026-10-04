@@ -301,7 +301,7 @@ enforcement mechanism.)
 | `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
 | `SCP-STORAGE-8005` | selection layer and SDK `shutdown` (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store (§17.6 "One Writer per Durable Directory") |
-| `SCP-STORAGE-8006` | storage-error translation (all bridges) | Operation on a store that has released its database connection (§17.6 "One Writer per Durable Directory") |
+| `SCP-STORAGE-8006` | `From<PlatformError>` translation (all bridges) | `PlatformError::StorageClosed`, which a `SqliteStorage` returns for every operation after its `close()` ran (§17.6 "One Writer per Durable Directory") |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |
@@ -319,8 +319,7 @@ leaves the instance's own store holding its lock: the Supervisor drain did not f
 (`ShutdownOutcome::TimedOut` with `durable_store_open`), the store refused to close
 (`ShutdownError::DurableStoreClose`), or an earlier shutdown had not closed it by the
 time this call's timeout passed (`ShutdownError::AlreadyShutDown` with
-`durable_store_open`) (ADR-048 §5, amendment 2026-10-04). Each bridge's storage-error translation raises `8006` when an operation reaches a
-store whose connection was released. The `PyO3`, NAPI and `UniFFI` bridges all raise
+`durable_store_open`) (ADR-048 §5, amendment 2026-10-04). The `PyO3`, NAPI and `UniFFI` bridges all raise
 the same code for each of these conditions. The second selection-layer code took `8004`
 rather than `8001` because the Android backend already owns `8001-8003`: an
 Android app links `AndroidStorage` and the `UniFFI` bridge into one process, so

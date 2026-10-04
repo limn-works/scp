@@ -96,7 +96,7 @@ Compile-time affinity via phantom lifetime was rejected: not expressible across 
 
 ### 5. `shutdown(timeout: Duration)` replaces terminal infallible shutdown
 
-`BridgeInstance::shutdown` gains a `timeout: Duration` argument and becomes async. Internally it uses a `tokio_util::sync::CancellationToken` propagated into every long-running task, a `JoinSet` of spawned workers, and a bounded wait. Outstanding work gets the full timeout to drain; a task in the bridge's own `JoinSet` that is still running at the deadline is aborted with `JoinSet::abort_all`. The Supervisor's tracked tasks are never cancelled (amendment 2026-10-04 below).
+`BridgeInstance::shutdown` gains a `timeout: Duration` argument and becomes async. Internally it uses a `tokio_util::sync::CancellationToken` propagated into every long-running task, a `JoinSet` of spawned workers, and a bounded wait. Outstanding work gets the full timeout to drain; a task in the bridge's own `JoinSet` that is still running at the deadline is aborted with `JoinSet::abort_all`.
 
 Signature across bridges:
 
@@ -109,7 +109,7 @@ This is a breaking change versus the Phase 4a `shutdown()` that took no argument
 **Amendment 2026-10-04: the bounded wait drains the Supervisor before storage closes.** The bounded wait covers the Supervisor's tasks as well as the bridge's own `JoinSet`. `shutdown(timeout)` awaits `shutdown_all_contexts`, which awaits every task the Supervisor's task tracker spawned (ADR-049, the actor-per-context concurrency model, Decision 16), inside the same deadline. The bridge's storage `close()` runs only after that wait completes.
 
 - **Every task exits before the deadline.** The bridge closes the store, which releases the store's advisory file lock and its database connection, and returns `ShutdownOutcome::GracefulWithin`. An open of the same directory in the same process then succeeds on its first attempt (§17.6 of the persistence and storage spec, One Writer per Durable Directory).
-- **The deadline expires before every Supervisor task exits.** The bridge returns `ShutdownOutcome::TimedOut`, with `durable_store_open` set when the instance has a durable store. Until the store releases its lock, a same-process open of the same directory fails with the typed lock-still-held error, so no moment exists at which two writers hold one directory (red-hat finding RED-1002, two writers on one database).
+- **The deadline expires before every Supervisor task exits.** The bridge returns `ShutdownOutcome::TimedOut`, with `durable_store_open` set when the instance has a durable store. Until the store releases its lock, a same-process open of the same directory fails with the typed lock-still-held error, so no moment exists at which two writers hold one directory (red-hat finding RED-1002, two writers on one database). When the last Supervisor task exits, the bridge closes the store.
 - **Every Supervisor task exits before the deadline, and the store refuses to close.** The bridge returns `ShutdownError::DurableStoreClose`. The store keeps its lock and its connection, so a same-process open of the same directory fails with the typed lock-still-held error.
 - **The drain task panics.** The bridge returns `ShutdownOutcome::TimedOut` and counts the panic in `panicked_tasks`. The bridge does not close the store.
 
