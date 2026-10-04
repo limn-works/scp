@@ -8862,6 +8862,70 @@ mod tests {
         );
     }
 
+    /// `outlet_stream_open_on` builds bridge UCAN state only after the
+    /// lifecycle gate admits the context: a context no actor serves refuses
+    /// and leaves no registry entry, while a live context gets its entry built
+    /// before the UCAN pipeline rejects the token.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_open_builds_bridge_state_only_after_the_gate() {
+        let creator = "did:key:z6MkNapiStreamOpenStateOrder";
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let open = |ctx_id: String| {
+            let bi = Arc::clone(&bi);
+            async move {
+                let handle = active_handle_for(&bi, &ctx_id, creator);
+                crate::outlet_stream::outlet_stream_open_on(
+                    &bi,
+                    &handle,
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    creator.to_owned(),
+                    "bogus.jwt.token".to_owned(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("a bogus token never opens a stream")
+            }
+        };
+
+        let absent = format!("napi-stream-open-absent-state-{}", uuid::Uuid::new_v4());
+        let err = open(absent.clone()).await;
+        assert!(
+            err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the lifecycle gate must refuse: {err}"
+        );
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&absent),
+            "a refused stream open must not build bridge state"
+        );
+
+        let live = format!("napi-stream-open-live-state-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &live,
+            creator,
+            &["messages:write"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        let err = open(live.clone()).await;
+        assert!(
+            !err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a live context must pass the lifecycle gate: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&live),
+            "an admitted stream open must build bridge state"
+        );
+    }
+
     /// `outlet_register_on` refuses the creator when the supervisor ceiling
     /// omits `outlet:register`, although the bridge copy's ceiling
     /// (`default_ceiling()`, written by `register_test_context`) and the

@@ -18,8 +18,6 @@ use scp_ffi_common::validate::{
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
 
-/// Validates a UCAN token for outlet invocation authorization.
-///
 /// Builds the refusal an outlet entry point reports under `code`: the message
 /// the pre-authorization gate composed, unchanged.
 fn outlet_refusal(code: &'static str) -> impl Fn(String) -> ScpNapiError + Copy {
@@ -29,6 +27,8 @@ fn outlet_refusal(code: &'static str) -> impl Fn(String) -> ScpNapiError + Copy 
     }
 }
 
+/// Validates a UCAN token for outlet invocation authorization.
+///
 /// Performs the full 11-step ADR-016 validation pipeline.
 ///
 /// ADR-016 step 8 compares the token's grants against the context's capability
@@ -858,10 +858,9 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// authorized to act for `target_context_id`).
 ///
 /// Every caller passes the `creator_did` of the role state it read from the
-/// supervisor actor through [`crate::runtime::active_role_state_before_authz`], never the
-/// creator a context handle recorded: this call chooses the authority a
-/// cross-context saga signs as, and a context no actor serves must refuse to
-/// sign. `context_id` is carried only for the error message.
+/// supervisor actor, never the creator a context handle recorded: this call
+/// chooses the authority a cross-context saga signs as, and a context no actor
+/// serves must refuse to sign. `context_id` is carried only for the error message.
 pub(crate) async fn resolve_context_signing_key(
     bi: &crate::runtime::NapiBridgeInstance,
     creator_did: &str,

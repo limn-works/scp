@@ -417,7 +417,6 @@ pub(crate) async fn outlet_stream_open_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let input_json_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Outlet {
@@ -442,6 +441,7 @@ pub(crate) async fn outlet_stream_open_on(
     )
     .await
     .map_err(napi::Error::from)?;
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Primary authorization: the full 11-step ADR-016 UCAN pipeline over the
     // bridge-owned per-context UCAN state — IDENTICAL to `outlet_invoke_on`. The
@@ -1629,9 +1629,8 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
     }
 
     // Resolve the TARGET context's Active Signing Key per-call from custody
-    // (never envelope-asserted): the shared saga resolver reads the creator DID
-    // off the supervisor actor, then exports the raw signing key. Recovery runs
-    // after the invoker check above, so a failed read is reported as itself.
+    // (never envelope-asserted). Recovery runs after the invoker check above,
+    // so a failed read is reported as itself.
     let target_creator_did = crate::runtime::live_role_state(bi, &target_context_id)
         .await
         .map_err(napi::Error::from)?
