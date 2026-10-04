@@ -150,9 +150,14 @@ impl CombinedNodeStorage {
 
         // Apply SQLCipher encryption key and hardening PRAGMAs.
         // Matches SqliteStorage settings for consistent security posture.
+        // `cipher_memory_security` comes first so SQLCipher wipes every block
+        // it frees from then on, the key statement's included; its `malloc`
+        // heap is outside the wiping global allocator (spec §17.6, and §9.15
+        // of the security-model spec, freed heap memory).
         let mut hex_key = hex::encode(key);
         let mut pragma_sql = format!(
-            "PRAGMA key = \"x'{hex_key}'\";\n\
+            "PRAGMA cipher_memory_security = ON;\n\
+             PRAGMA key = \"x'{hex_key}'\";\n\
              PRAGMA cipher_page_size = 4096;\n\
              PRAGMA kdf_iter = 256000;\n\
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\

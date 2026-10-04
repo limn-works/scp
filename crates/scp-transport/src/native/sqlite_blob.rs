@@ -111,8 +111,15 @@ impl SqliteBlobStore {
         // corrupted. This is acceptable for relay blob storage because
         // messages can always be retransmitted by senders. The performance
         // benefit (fewer fsyncs) outweighs the minor durability trade-off.
+        //
+        // rusqlite is built with `bundled-sqlcipher`, so this connection is a
+        // SQLCipher connection too. `cipher_memory_security` makes SQLCipher
+        // wipe every block it frees; its `malloc` heap is outside the wiping
+        // global allocator (spec §17.6, and §9.15 of the security-model spec,
+        // freed heap memory).
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            "PRAGMA cipher_memory_security = ON;
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
         )
         .map_err(|e| StorageError::Internal(format!("sqlite pragma: {e}")))?;
