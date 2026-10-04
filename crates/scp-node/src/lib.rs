@@ -6667,7 +6667,7 @@ mod tests {
     /// off-runtime caller (the FFI bridges' shape) must still get control back, not
     /// block forever, and the deadline's abort must drop the task's captures.
     #[test]
-    fn stop_and_wait_off_runtime_aborts_a_stuck_task_at_the_deadline() {
+    fn stop_and_wait_off_runtime_returns_and_drops_captures_of_a_stuck_task() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
