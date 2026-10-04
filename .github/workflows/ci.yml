@@ -1895,13 +1895,50 @@ jobs:
   # at `docker build`.
   #
   # The build reaches the release compile of both binaries, so it is the slowest job
-  # here; the gha cache keeps a re-run that changes no dependency to the final stage.
+  # here; the layer cache keeps a run that changes no dependency to the final compile.
+  #
+  # WHY THE LAYER CACHE LIVES IN GHCR AND NOT THE ACTIONS CACHE. The Actions cache holds
+  # 10 GB per repository and evicts the least recently used entry when it goes over. The
+  # `Swatinem/rust-cache` entries every run restores held about 8.6 GB on their own, so
+  # the buildkit blobs, which only this job reads, were evicted first: a main run found
+  # the cache manifest but none of its blobs and rebuilt from `WORKDIR` down, and a pull
+  # request run an hour after a main export failed with `blob sha256:…: not found` on the
+  # cook layer and recompiled every dependency. The repository's Actions cache, measured
+  # for this change, held 10.68 GB against that 10 GB limit. A registry is outside that
+  # cap.
+  #
+  # The Actions cache has one advantage the registry lacks: GitHub scopes its entries
+  # by branch, so a pull-request branch cannot write an entry `main` reads. A registry
+  # tag has no such scoping, which is why the export needs the main-only token below.
+  #
+  # Move the layer cache back to the Actions cache when either holds:
+  # (a) the repository's Actions cache total, read from
+  #     `gh api repos/{owner}/{repo}/actions/cache/usage`, plus the size of the Docker
+  #     layer export, the sum of the layer `size` fields in the manifest that
+  #     `docker buildx imagetools inspect --raw ghcr.io/<repository>/buildcache:docker-image`
+  #     prints, stays under the repository's cache limit, because other changes
+  #     shrank the Rust cache entries or GitHub raised the limit;
+  # (b) the main-only token arrangement can no longer be kept: the token cannot be
+  #     renewed, or the `docker-cache` environment loses its rule that admits only
+  #     branch `main`.
+  #
+  # WHO CAN WRITE THE CACHE. This job holds `packages: read` and builds without
+  # exporting. Job `docker-image-cache`, the only job that exports, declares
+  # environment `docker-cache`, whose deployment rule admits only branch `main`, and
+  # logs in with that environment's `GHCR_CACHE_TOKEN`, a classic token holding only
+  # `write:packages`; no job in this file holds `packages: write`. Each export moves the
+  # tag and leaves the manifest it replaced as an untagged package version, and no job
+  # in this file deletes those versions: deleting one needs `delete:packages`, which the
+  # token does not hold.
   docker-image:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
     steps:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
       # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
@@ -1922,19 +1959,63 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
+      # `continue-on-error` so a failed login cannot fail the build check.
+      - uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          # Read the cache everywhere; write it only from a push to `main`. A cache
-          # written on a pull-request ref is readable only by that pull request, and it
-          # would evict entries from the 10 GB repository cap that the 22
-          # `Swatinem/rust-cache` steps in this workflow and the 2 in
-          # `.github/workflows/fuzz.yml` share. `ignore-error` so a cache-service
-          # failure cannot fail the build check: this job answers whether the image
-          # builds.
-          cache-from: type=gha,scope=docker-image
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
+          # A missing or unreadable cache only makes buildkit warn and build every layer.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
+
+  # Builds the same image on every push to `main` and exports its layer cache; the
+  # comment on job `docker-image` above says why the export lives in this job alone.
+  # Its `if:` reads only the event, because the `ci` gate cannot read a condition that
+  # joins the event to a filter output and a step-level filter condition would report
+  # success over zero work, so a push that changes no Rust still builds here.
+  docker-image-cache:
+    needs: changes
+    if: github.event_name == 'push'
+    name: Docker / relay and node image (cache export)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: docker-cache
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # Job `docker-image`'s copy of this step says why it is conditional.
+      - name: Free disk space when the runner is short of it
+        run: |
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_CACHE_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          # `mode=max` keeps the chef and builder stages, which hold the toolchain,
+          # cargo-chef, and the cooked dependencies; the final stage alone holds none of
+          # them. `image-manifest=true` stores the cache as an OCI image manifest.
+          # A missing or unreadable cache only makes buildkit warn and build every layer.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image,mode=max,image-manifest=true,oci-mediatypes=true
 
   # ── Shared bridge artifacts ─────────────────────────────────────────
   #
@@ -3610,6 +3691,7 @@ jobs:
       - toolchain-wiring
       - fix-round-check-selftest
       - docker-image
+      - docker-image-cache
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
