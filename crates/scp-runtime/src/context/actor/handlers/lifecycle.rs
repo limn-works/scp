@@ -553,13 +553,15 @@ fn handle_flush_snapshot_actor<'d>(
     let (sender_epochs, recv_floors) = match floors {
         Ok(floors) => floors,
         Err(e) => {
+            crate::metrics::record_persistence_failure();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
                 "flush snapshot skipped: the supervisor holds no floor export"
             );
+            let sketch = outcome_error_sketch(&e);
             let _ = reply.send(Err(e));
-            return futures::future::Either::Left(std::future::ready(Outcome::ok(())));
+            return futures::future::Either::Left(std::future::ready(Outcome::err(sketch)));
         }
     };
     let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
@@ -794,5 +796,42 @@ async fn handle_issue_mls_update_actor(
         Outcome::err(ContextError::CryptoFailed(format!(
             "IssueMlsUpdate failed for context {context_id}"
         )))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use crate::context::messaging_helpers::dropped_supervisor_tests::{
+        Fixture, assert_shut_down, state,
+    };
+
+    #[tokio::test]
+    async fn flush_snapshot_persists_with_live_supervisor() {
+        let f = Fixture::new().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_flush_snapshot_actor(&state(), &f.deps, tx).await;
+        assert!(out.result.is_ok(), "flush: {:?}", out.result);
+        rx.await.unwrap().expect("flush ack");
+        assert_eq!(f.persists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_snapshot_persists_nothing_after_supervisor_drops() {
+        let f = Fixture::new().await.drop_supervisor();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_flush_snapshot_actor(&state(), &f.deps, tx).await;
+        assert!(
+            out.result.is_err(),
+            "the Outcome must record the failed flush"
+        );
+        assert_shut_down(&rx.await.unwrap());
+        assert_eq!(
+            f.persists.load(Ordering::SeqCst),
+            0,
+            "a flush without a floor export must persist nothing"
+        );
     }
 }

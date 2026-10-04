@@ -33,8 +33,7 @@
 //! close-event append before the owner closes storage. These callbacks are
 //! fire-and-forget `()` seams with no caller to return an error to: when the
 //! Supervisor has dropped or shutdown has refused the spawn, the work does not
-//! run and the callback logs at error. The durable reservation record is what
-//! the crash-recovery sweep reconciles from on the next start.
+//! run and the callback logs at error.
 
 use std::future::Future;
 use std::sync::{Arc, Weak};
@@ -92,8 +91,8 @@ fn spawn_supervisor_op<F, Fut>(
 ///
 /// Held as `Arc<dyn StreamEscrowRefundSink>` inside the streaming pump's
 /// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket);
-/// constructed by the streaming open orchestrator with a clone of the
-/// supervisor `Arc`.
+/// constructed by the streaming open orchestrator with a `Weak` to the
+/// supervisor.
 pub(crate) struct ActorEscrowRefundSink {
     /// The supervisor whose mailbox owns the target context's budget tracker.
     supervisor: Weak<Supervisor>,
@@ -103,7 +102,7 @@ pub(crate) struct ActorEscrowRefundSink {
 }
 
 impl ActorEscrowRefundSink {
-    /// Wrap a supervisor `Arc` as the streaming escrow-refund sink, capturing
+    /// Wrap a `Weak` supervisor reference as the streaming escrow-refund sink, capturing
     /// the CURRENT runtime handle (the sole construction site — the streaming
     /// open orchestrator — always runs on the runtime; the captured handle then
     /// outlives it into the `Drop` that may run off-runtime).
@@ -150,8 +149,8 @@ impl StreamEscrowRefundSink for ActorEscrowRefundSink {
 /// settlement to the actor via the supervisor mailbox.
 ///
 /// Held as `Arc<dyn StreamSettlementSink>` inside the streaming pump;
-/// constructed by the streaming open orchestrator with a clone of the
-/// supervisor `Arc` and the reservation's spawn-`generation` (captured in the
+/// constructed by the streaming open orchestrator with a `Weak` to the
+/// supervisor and the reservation's spawn-`generation` (captured in the
 /// adapter, NOT in the settlement payload — the confused-deputy guard compares
 /// it to the live actor's generation at settle time).
 pub(crate) struct ActorStreamSettlementSink {
@@ -170,7 +169,7 @@ pub(crate) struct ActorStreamSettlementSink {
 }
 
 impl ActorStreamSettlementSink {
-    /// Wrap a supervisor `Arc` + the reservation's spawn-`generation` as the
+    /// Wrap a `Weak` supervisor reference + the reservation's spawn-`generation` as the
     /// streaming settlement sink, capturing the current runtime handle.
     ///
     /// The non-test constructor is the streaming open orchestrator
@@ -282,7 +281,7 @@ pub(crate) struct ActorOutletInvokedEventSink {
 }
 
 impl ActorOutletInvokedEventSink {
-    /// Wrap a supervisor `Arc` + the hosting context's event-log key + the
+    /// Wrap a `Weak` supervisor reference + the hosting context's event-log key + the
     /// stream `invoker_did` as the durable close-event sink, capturing the
     /// current runtime handle. Sole non-test constructor: the streaming open
     /// orchestrator (`Supervisor::open_outlet_stream`).

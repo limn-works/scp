@@ -659,9 +659,8 @@ pub async fn close_context_with_key(
     // combinator (replacing the former inline `persist_state_fail_closed`).
     // KEEP-direction: a close that did not durably land is NOT rolled back in
     // memory — silently re-opening a closed context is the unsafe direction; the
-    // persist error is surfaced instead. These mutations are all synchronous (the
-    // self-deadlock-avoiding gauge refresh is a detached `tokio::spawn` that
-    // borrows only `deps`), so they fit the sync `_keep` closure.
+    // persist error is surfaced instead. These mutations are all synchronous,
+    // so they fit the sync `_keep` closure.
     cell.commit_class_s_keep(deps, &context_id, |mut view| {
         let state = view.rest_mut();
 

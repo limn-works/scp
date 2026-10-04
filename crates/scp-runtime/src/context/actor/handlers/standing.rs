@@ -205,3 +205,45 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         other => ContextError::CryptoFailed(format!("{other}")),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use scp_did::DID;
+
+    use crate::context::messaging_helpers::dropped_supervisor_tests::{Fixture, assert_shut_down};
+
+    #[tokio::test]
+    async fn standing_queries_answer_with_live_supervisor() {
+        let f = Fixture::new().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_standing_context_count(&f.deps, tx).await;
+        assert!(out.result.is_ok(), "count: {:?}", out.result);
+        assert_eq!(rx.await.unwrap().unwrap(), 0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let peer = DID("did:example:standing-peer".to_owned());
+        let out = super::handle_has_standing_context(&f.deps, peer, tx).await;
+        assert!(out.result.is_ok(), "has: {:?}", out.result);
+        assert!(!rx.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn standing_queries_fail_closed_after_supervisor_drops() {
+        let f = Fixture::new().await.drop_supervisor();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_standing_context_count(&f.deps, tx).await;
+        assert!(
+            out.result.is_err(),
+            "the Outcome must record the failed count"
+        );
+        assert_shut_down(&rx.await.unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let peer = DID("did:example:standing-peer".to_owned());
+        let out = super::handle_has_standing_context(&f.deps, peer, tx).await;
+        assert!(
+            out.result.is_err(),
+            "the Outcome must record the failed query"
+        );
+        assert_shut_down(&rx.await.unwrap());
+    }
+}

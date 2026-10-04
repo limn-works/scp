@@ -3563,8 +3563,9 @@ async fn emit_divergence_marker(
     let snapshot = match snapshot {
         Ok(ref snapshot) => snapshot,
         Err(e) => {
+            let sketch = outcome_error_sketch(&e);
             let _ = reply.send(Err(e));
-            return Outcome::ok(());
+            return Outcome::err(sketch);
         }
     };
     let context_hex = hex_context_id(&context_id);
@@ -6156,6 +6157,45 @@ mod tests {
         marker
             .verify(&signing.to_signing_key().verifying_key())
             .expect("marker verifies");
+    }
+
+    #[tokio::test]
+    async fn emit_divergence_marker_writes_nothing_after_supervisor_drops() {
+        use crate::context::messaging_helpers::dropped_supervisor_tests::{
+            Fixture, assert_shut_down, ctx_hex, state,
+        };
+        let f = Fixture::new().await.drop_supervisor();
+        let st = state();
+        let snap = build_snapshot_for_persist(&st, &f.deps, &ctx_hex());
+        let (tx, rx) = oneshot::channel();
+        let out = emit_divergence_marker(
+            st.context_id,
+            snap,
+            &f.deps,
+            &SagaId("saga-divergence-dropped".to_owned()),
+            [0xAB; 16],
+            CommittedSide::Target,
+            "evt-committed-10",
+            1_700_000_000,
+            &signing_key_bytes(0x99),
+            tx,
+        )
+        .await;
+        assert!(
+            out.result.is_err(),
+            "the Outcome must record the refused marker"
+        );
+        assert_shut_down(&rx.await.unwrap());
+        assert_eq!(
+            f.appends.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no marker append"
+        );
+        assert_eq!(
+            f.persists.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no snapshot persist"
+        );
     }
 
     #[tokio::test]
