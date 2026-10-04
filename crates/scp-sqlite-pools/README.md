@@ -1,14 +1,14 @@
 # scp-sqlite-pools
 
 Opens SQLCipher connections for SCP (Shared Context Protocol) with SQLite's
-lookaside pool and page-cache bulk block both off (§17.6 of the persistence
+lookaside pool, page-cache bulk block, and page-cache buffer all off (§17.6 of the persistence
 spec, SQLCipher configuration; §9.15 of the security-model spec, freed heap
 memory).
 
 `PRAGMA cipher_memory_security = ON` makes SQLCipher wipe each block its
 allocator frees. The lookaside pool and the page cache's bulk block reuse their
 slots without freeing them, so the pragma never wipes a key, statement text, a
-bound value, or a decrypted page they hold. Every open proves both off before
+bound value, or a decrypted page they hold. Every open checks both off before
 the connection's first statement, and keeps no state between opens:
 
 - SQLite allocates a bulk block only when compiled without
@@ -31,16 +31,25 @@ Each constructor runs `PRAGMA cipher_memory_security = ON` before its
 pragma takes effect, and after that batch calls `require_memory_security`,
 which reads the pragma back and fails with `PoolsError::MemorySecurityOff`
 unless it returns `1`. A plain SQLite returns no row, so the readback also
-proves SQLCipher is the linked engine.
+shows SQLCipher is the linked engine.
 
 A page-cache buffer that a process hands SQLite with
 `sqlite3_config(SQLITE_CONFIG_PAGECACHE, ...)` before it starts reuses its
-slots the same way. After its first statement that reads a page, each
-constructor calls `require_no_page_cache_buffer`, which reads the
-`SQLITE_STATUS_PAGECACHE_USED` high-water mark with `sqlite3_status64` and
-fails with `PoolsError::PageCacheBufferUsed` unless it is 0. A custom page
-cache installed with `SQLITE_CONFIG_PCACHE2` cannot be read back after SQLite
-starts, so no check covers it.
+slots the same way. Before it opens the caller's connection, every open runs
+one page-reading statement on a throwaway in-memory connection, closes it,
+reads the `SQLITE_STATUS_PAGECACHE_USED` high-water mark with
+`sqlite3_status64`, and fails with `PoolsError::PageCacheBufferUsed` unless it
+is 0. The check precedes the caller's open because opening a connection already
+checks a buffer slot out for the pager's scratch space, and its first statement
+reads the database's pages into slots.
+
+These checks and the readback read SQLite's state, so they hold only while no
+code in the same process reconfigures SQLite. That limit takes three forms:
+installing a custom page cache with `SQLITE_CONFIG_PCACHE2` before SQLite
+starts, which cannot be read back; replacing the allocator with
+`SQLITE_CONFIG_MALLOC` after `sqlite3_shutdown`, after which freed blocks go
+unwiped while the readback still returns `1`; and resetting the
+`SQLITE_STATUS_PAGECACHE_USED` high-water mark.
 
 `lookaside_use` reports a connection's
 lookaside use, which is zero for a connection this crate opened.

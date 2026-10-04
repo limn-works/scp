@@ -87,8 +87,9 @@ impl AppleStorage {
         }
 
         let db_path = dir.join("scp.db");
-        // Refuses unless SQLite's page-cache bulk block and this connection's
-        // lookaside pool are both off (spec section 17.6).
+        // Refuses, before it opens the file, unless SQLite's page-cache bulk
+        // block is absent and no page-cache buffer has held a page, and then
+        // unless this connection's lookaside pool is off (spec section 17.6).
         let conn = scp_sqlite_pools::open(&db_path).map_err(|e| {
             PlatformError::StorageError(format!("{e} (database {})", db_path.display()))
         })?;
@@ -97,8 +98,9 @@ impl AppleStorage {
         // `cipher_memory_security` comes first so `SQLCipher` wipes every block
         // its allocator frees from then on; its `malloc` heap is outside the
         // wiping global allocator. The key statement's blocks and the decrypted
-        // pages reach that allocator only because both SQLite pools are off
-        // (proven by the open above) (spec §17.6, and §9.15 of the
+        // pages reach that allocator only because SQLite's reuse paths are off
+        // (checked by the open above), which holds while no code in the
+        // process reconfigures SQLite (spec §17.6, and §9.15 of the
         // security-model spec, freed heap memory).
         let mut hex_key = hex::encode(encryption_key);
         let mut pragma_sql = format!(
@@ -115,8 +117,9 @@ impl AppleStorage {
         result.map_err(|e| {
             PlatformError::StorageError(format!("failed to apply `SQLCipher` pragmas: {e}"))
         })?;
-        // Read the pragma back: `1` proves memory security is on and that
-        // `SQLCipher` is the linked engine (spec §17.6).
+        // Read the pragma back: while no code in the process reconfigures
+        // SQLite, `1` shows memory security is on and that `SQLCipher` is the
+        // linked engine (spec §17.6).
         scp_sqlite_pools::require_memory_security(&conn)
             .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
@@ -132,10 +135,6 @@ impl AppleStorage {
              ) WITHOUT ROWID;",
         )
         .map_err(|e| PlatformError::StorageError(format!("failed to create kv table: {e}")))?;
-        // The schema statement read a page, so the page-cache buffer check
-        // can see a `SQLITE_CONFIG_PAGECACHE` slot it took (spec §17.6).
-        scp_sqlite_pools::require_no_page_cache_buffer()
-            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         Ok(Self {
             conn: Mutex::new(conn),

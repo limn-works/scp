@@ -116,18 +116,20 @@ impl SqliteBlobStore {
         // SQLCipher connection too. `cipher_memory_security` makes SQLCipher
         // wipe every block its allocator frees; its `malloc` heap is outside
         // the wiping global allocator. A block reaches that allocator only
-        // because SQLite's page-cache bulk block and the connection's
-        // lookaside pool are off, which `scp_sqlite_pools` proved before
-        // handing the connection over (spec §17.6, and §9.15 of the
-        // security-model spec, freed heap memory).
+        // because SQLite's page-cache bulk block is absent, no page-cache
+        // buffer has held a page, and the connection's lookaside pool is off,
+        // which `scp_sqlite_pools` checked before handing the connection over;
+        // that holds while no code in the process reconfigures SQLite (spec
+        // §17.6, and §9.15 of the security-model spec, freed heap memory).
         conn.execute_batch(
             "PRAGMA cipher_memory_security = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
         )
         .map_err(|e| StorageError::Internal(format!("sqlite pragma: {e}")))?;
-        // Read the pragma back: `1` proves memory security is on and that
-        // SQLCipher is the linked engine (spec §17.6).
+        // Read the pragma back: while no code in the process reconfigures
+        // SQLite, `1` shows memory security is on and that SQLCipher is the
+        // linked engine (spec §17.6).
         scp_sqlite_pools::require_memory_security(&conn)
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -146,10 +148,6 @@ impl SqliteBlobStore {
             CREATE INDEX IF NOT EXISTS idx_expiry ON blobs (expires_at);",
         )
         .map_err(|e| StorageError::Internal(format!("sqlite schema: {e}")))?;
-        // The schema statement read a page, so the page-cache buffer check
-        // can see a `SQLITE_CONFIG_PAGECACHE` slot it took (spec §17.6).
-        scp_sqlite_pools::require_no_page_cache_buffer()
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

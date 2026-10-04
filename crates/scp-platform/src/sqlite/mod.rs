@@ -145,10 +145,13 @@ impl SqliteStorage {
         })?;
 
         let db_path = dir.join("scp.db");
-        // `scp_sqlite_pools::open` refuses unless SQLite's page-cache bulk
-        // block and this connection's lookaside pool are both off, so every
-        // block holding the key, a statement, a bound value, or a decrypted
-        // page is freed through SQLCipher's allocator (spec section 17.6).
+        // `scp_sqlite_pools::open` refuses, before it opens the file, unless
+        // SQLite's page-cache bulk block is absent and no page-cache buffer
+        // has held a page, and then unless this connection's lookaside pool is
+        // off. While no code in the process reconfigures SQLite, every block
+        // holding the key, a statement, a bound value, or a decrypted page is
+        // then freed through SQLCipher's allocator (spec section 17.6, which
+        // names that limit's three forms).
         let conn = scp_sqlite_pools::open(&db_path)
             .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
@@ -161,9 +164,10 @@ impl SqliteStorage {
         // library's `malloc`, which the wiping global allocator never sees, and
         // the pragma makes SQLCipher wipe each block its allocator frees from
         // then on. The key statement's blocks and the decrypted pages reach
-        // that allocator only because both SQLite pools are off (proven by the
-        // open above); the connection keeps no freed block unwiped (§17.6, and
-        // §9.15 of the security-model spec, freed heap memory).
+        // that allocator only because SQLite's reuse paths are off (checked by
+        // the open above); while no code in the process reconfigures SQLite,
+        // the connection keeps no freed block unwiped (§17.6, and §9.15 of the
+        // security-model spec, freed heap memory).
         let mut hex_key = hex::encode(key);
         let mut pragma_sql = format!(
             "PRAGMA cipher_memory_security = ON;\n\
@@ -181,8 +185,9 @@ impl SqliteStorage {
         result.map_err(|e| {
             PlatformError::StorageError(format!("failed to set SQLCipher pragmas: {e}"))
         })?;
-        // Read the pragma back: `1` proves memory security is on and that
-        // SQLCipher is the linked engine (spec section 17.6).
+        // Read the pragma back: while no code in the process reconfigures
+        // SQLite, `1` shows memory security is on and that SQLCipher is the
+        // linked engine (spec section 17.6).
         scp_sqlite_pools::require_memory_security(&conn)
             .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
@@ -198,10 +203,6 @@ impl SqliteStorage {
             ) WITHOUT ROWID;",
         )
         .map_err(|e| PlatformError::StorageError(format!("failed to create schema: {e}")))?;
-        // The schema statement read a page, so the page-cache buffer check
-        // can see a `SQLITE_CONFIG_PAGECACHE` slot it took (spec section 17.6).
-        scp_sqlite_pools::require_no_page_cache_buffer()
-            .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
         Ok(Self {
             conn: Mutex::new(conn),

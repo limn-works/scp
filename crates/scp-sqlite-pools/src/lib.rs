@@ -1,5 +1,5 @@
-//! Opens `SQLCipher` connections with `SQLite`'s lookaside pool and page-cache
-//! bulk block both proven off (spec §17.6, `SQLCipher` configuration, and §9.15
+//! Opens `SQLCipher` connections with `SQLite`'s lookaside pool, page-cache
+//! bulk block, and page-cache buffer all shown off (spec §17.6, `SQLCipher` configuration, and §9.15
 //! of the security-model spec, freed heap memory).
 //!
 //! `PRAGMA cipher_memory_security = ON` makes `SQLCipher` wipe each block its
@@ -13,7 +13,7 @@
 //!   or cache shrink dropped (`pcache1InitBulk` and `pcache1FreePage` in
 //!   `sqlite3.c`).
 //!
-//! [`open`] and [`open_in_memory`] prove both off before the connection's
+//! [`open`] and [`open_in_memory`] check both off before the connection's
 //! first statement:
 //!
 //! - **Page-cache bulk block.** `SQLite` allocates a bulk block only when it was
@@ -26,26 +26,44 @@
 //!   `SQLCipher` that libsqlite3-sys 0.30.1 compiles defines the option.
 //! - **Lookaside.** After opening, each call runs
 //!   `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)`. `SQLite`
-//!   returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` proves the
+//!   returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` shows the
 //!   pool is off for that connection.
 //!
 //! A third reuse path needs no compile option: a page-cache buffer handed to
 //! `SQLite` with `sqlite3_config(SQLITE_CONFIG_PAGECACHE, ...)` before it
 //! starts. `pcache1Free` returns a slot of that buffer to `SQLite`'s own free
-//! list without calling `sqlite3_free`. After its first statement that reads a
-//! page, each constructor calls [`require_no_page_cache_buffer`], which reads
-//! the process's `SQLITE_STATUS_PAGECACHE_USED` high-water mark and refuses
-//! unless it is 0. A custom page cache (`SQLITE_CONFIG_PCACHE2`) cannot be
-//! read back once `SQLite` has started, so no check here covers it.
+//! list without calling `sqlite3_free`.
+//!
+//! - **Page-cache buffer.** Before it opens the caller's connection, each call
+//!   opens a throwaway in-memory connection, runs one statement on it that
+//!   reads a page, closes it, and reads the process's
+//!   `SQLITE_STATUS_PAGECACHE_USED` high-water mark, refusing with
+//!   [`PoolsError::PageCacheBufferUsed`] unless it is 0. The check must come
+//!   before the caller's connection opens: opening a connection already checks
+//!   a buffer slot out for the pager's scratch space, and the connection's
+//!   first statement reads the database's pages into slots, so a check made
+//!   after either would leave that connection's pages in slots `SQLite` reuses
+//!   unwiped. The throwaway connection holds none of the database's data.
 //!
 //! The crate keeps no state: every open makes its checks itself.
+//!
+//! These checks read `SQLite`'s state, and code in the same process can change
+//! that state. While no code in the process reconfigures `SQLite`, they show
+//! the three paths off. Code in the same process that reconfigures `SQLite` is
+//! one limit of every check here and of the readback below, in three forms:
+//! installing a custom page cache with `SQLITE_CONFIG_PCACHE2` before `SQLite`
+//! starts, which `SQLite` offers no way to read back; replacing the allocator
+//! with `SQLITE_CONFIG_MALLOC` after `sqlite3_shutdown`, after which freed
+//! blocks go unwiped while the readback still returns `1`; and resetting the
+//! `SQLITE_STATUS_PAGECACHE_USED` high-water mark, after which a buffer that
+//! has held pages reads 0.
 //!
 //! The pragma itself must run before the connection's `PRAGMA key` statement,
 //! because `SQLCipher` wipes only blocks freed after the pragma takes effect.
 //! After the batch that holds the key statement, each constructor calls
 //! [`require_memory_security`], which reads the pragma back and refuses unless
 //! it returns `1`; a plain `SQLite` returns no row, so the readback also
-//! proves `SQLCipher` is the linked engine.
+//! shows `SQLCipher` is the linked engine.
 
 #![deny(unsafe_code)]
 
@@ -56,7 +74,7 @@ use std::ptr;
 
 use rusqlite::{Connection, OptionalExtension, ffi};
 
-/// Why a `SQLCipher` connection cannot be opened with both pools off.
+/// Why a `SQLCipher` connection cannot be opened with every reuse path off.
 #[derive(Debug)]
 pub enum PoolsError {
     /// The linked `SQLite` was compiled without
@@ -93,6 +111,9 @@ pub enum PoolsError {
         /// slots checked out at once since `SQLite` started.
         high_water: i64,
     },
+    /// The throwaway in-memory connection that probes for a page-cache buffer
+    /// could not open, run its statement, or close.
+    Probe(rusqlite::Error),
 }
 
 impl fmt::Display for PoolsError {
@@ -129,6 +150,7 @@ impl fmt::Display for PoolsError {
                 "a SQLITE_CONFIG_PAGECACHE buffer has held pages in this process (high-water \
                  mark {high_water}), so freed pages could keep decrypted plaintext unwiped"
             ),
+            Self::Probe(e) => write!(f, "the page-cache buffer probe failed: {e}"),
         }
     }
 }
@@ -136,7 +158,7 @@ impl fmt::Display for PoolsError {
 impl std::error::Error for PoolsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Open(e) | Self::MemorySecurityUnreadable(e) => Some(e),
+            Self::Open(e) | Self::MemorySecurityUnreadable(e) | Self::Probe(e) => Some(e),
             Self::PageCacheBulkPossible
             | Self::LookasideOn { .. }
             | Self::Status { .. }
@@ -146,22 +168,27 @@ impl std::error::Error for PoolsError {
     }
 }
 
-/// Opens the database file at `path` with the page-cache bulk block and the
-/// lookaside pool both proven off. The caller runs its key statement next.
+/// Opens the database file at `path` with the page-cache bulk block, the
+/// page-cache buffer, and the lookaside pool all checked off. The caller runs
+/// its key statement next.
 ///
 /// # Errors
 ///
 /// [`PoolsError::PageCacheBulkPossible`] when the linked `SQLite` lacks
-/// `SQLITE_ENABLE_MEMORY_MANAGEMENT` (no connection is opened),
-/// [`PoolsError::Open`] when `SQLite` cannot open the file, and
-/// [`PoolsError::LookasideOn`] when lookaside cannot be turned off.
+/// `SQLITE_ENABLE_MEMORY_MANAGEMENT`, [`PoolsError::PageCacheBufferUsed`] when
+/// a page-cache buffer has held a page, [`PoolsError::Probe`] when the probe
+/// connection fails, and [`PoolsError::Status`] when `sqlite3_status64` fails,
+/// none of them having opened the file; [`PoolsError::Open`] when `SQLite`
+/// cannot open the file, and [`PoolsError::LookasideOn`] when lookaside cannot
+/// be turned off.
 pub fn open(path: &Path) -> Result<Connection, PoolsError> {
     open_checked(memory_management_compile_option(), || {
         Connection::open(path)
     })
 }
 
-/// Opens an in-memory database with both pools proven off, as [`open`] does.
+/// Opens an in-memory database with every reuse path checked off, as [`open`]
+/// does.
 ///
 /// # Errors
 ///
@@ -201,22 +228,25 @@ fn require_reported_one(reported: Option<String>) -> Result<(), PoolsError> {
 }
 
 /// Refuses when a `SQLITE_CONFIG_PAGECACHE` buffer has held a page in this
-/// process.
-///
-/// Each `SQLCipher` constructor calls this after its connection's first
-/// statement that reads a page (spec §17.6). The status is process-wide, so
-/// the call reads `SQLite`'s own counter and keeps no state.
-///
-/// # Errors
-///
-/// [`PoolsError::PageCacheBufferUsed`] when the
-/// `SQLITE_STATUS_PAGECACHE_USED` high-water mark is above 0, and
-/// [`PoolsError::Status`] when `sqlite3_status64` fails.
-pub fn require_no_page_cache_buffer() -> Result<(), PoolsError> {
+/// process, after a throwaway connection has read a page so that a configured
+/// buffer has served one (spec §17.6). The status is process-wide, so the call
+/// reads `SQLite`'s own counter and keeps no state.
+fn require_no_page_cache_buffer() -> Result<(), PoolsError> {
+    probe_page_cache()?;
     require_no_buffer_slot_used(page_cache_used_high_water()?)
 }
 
-/// Only a high-water mark of 0 proves that no buffer slot ever held a page.
+/// Opens a throwaway in-memory connection, runs one statement that reads a
+/// page, and closes it. The connection holds no data of any database.
+fn probe_page_cache() -> Result<(), PoolsError> {
+    let probe = Connection::open_in_memory().map_err(PoolsError::Probe)?;
+    probe
+        .execute_batch("CREATE TABLE probe (x)")
+        .map_err(PoolsError::Probe)?;
+    probe.close().map_err(|(_, e)| PoolsError::Probe(e))
+}
+
+/// Only a high-water mark of 0 shows that no buffer slot ever held a page.
 const fn require_no_buffer_slot_used(high_water: i64) -> Result<(), PoolsError> {
     if high_water == 0 {
         Ok(())
@@ -249,21 +279,23 @@ pub fn lookaside_use(conn: &Connection) -> Result<LookasideUse, PoolsError> {
 }
 
 /// Refuses before `connect` runs unless `memory_management` (the linked
-/// `SQLite`'s answer for `ENABLE_MEMORY_MANAGEMENT`) is 1, then turns
-/// lookaside off on the new connection. [`open`] and [`open_in_memory`] pass
-/// the real answer; only this crate's unit tests pass another.
+/// `SQLite`'s answer for `ENABLE_MEMORY_MANAGEMENT`) is 1 and no page-cache
+/// buffer has held a page, then turns lookaside off on the new connection.
+/// [`open`] and [`open_in_memory`] pass the real answer; only this crate's
+/// unit tests pass another.
 fn open_checked(
     memory_management: c_int,
     connect: impl FnOnce() -> rusqlite::Result<Connection>,
 ) -> Result<Connection, PoolsError> {
     require_no_bulk_block(memory_management)?;
+    require_no_page_cache_buffer()?;
     let conn = connect().map_err(PoolsError::Open)?;
     turn_lookaside_off(&conn)?;
     Ok(conn)
 }
 
 /// `sqlite3_compileoption_used` returns 1 when the option was defined at
-/// compile time and 0 otherwise; only 1 proves the bulk block absent.
+/// compile time and 0 otherwise; only 1 shows the bulk block absent.
 const fn require_no_bulk_block(memory_management: c_int) -> Result<(), PoolsError> {
     if memory_management == 1 {
         Ok(())
@@ -436,13 +468,25 @@ mod tests {
     }
 
     /// No page-cache buffer is configured in this test binary, so the real
-    /// counter reads 0 after a page has been read.
+    /// counter reads 0 after the probe and a connection have read pages.
     #[test]
     fn page_cache_buffer_check_passes_without_a_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let conn = open_in_memory()?;
         conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")?;
         require_no_page_cache_buffer()?;
         Ok(())
+    }
+
+    /// The probe error names the probe and keeps the `SQLite` error as its
+    /// source.
+    #[test]
+    fn probe_error_keeps_its_source() {
+        let e = PoolsError::Probe(rusqlite::Error::InvalidQuery);
+        assert!(
+            e.to_string()
+                .starts_with("the page-cache buffer probe failed: ")
+        );
+        assert!(std::error::Error::source(&e).is_some());
     }
 
     /// Runs only in the CI build that compiles `SQLite` with

@@ -6,9 +6,12 @@
 //! `SQLite` serves pages from the buffer's slots and returns a freed slot to
 //! its own free list without calling `sqlite3_free`, so `SQLCipher`'s memory
 //! security never wipes it. Each including test binary installs the buffer
-//! once, before anything starts `SQLite`, and runs one test.
+//! once, before anything starts `SQLite`, calls the constructor under test
+//! first, and runs one test. Nothing reads a page before that constructor, so
+//! only the constructor's own probe can raise the high-water mark it refuses.
 
 use std::ffi::{c_int, c_void};
+use std::path::Path;
 
 use rusqlite::ffi;
 
@@ -16,6 +19,9 @@ use rusqlite::ffi;
 const SLOTS: c_int = 16;
 /// The largest `SQLite` page size; a slot holds a page and its header.
 const LARGEST_PAGE: c_int = 65_536;
+/// The text `PoolsError::PageCacheBufferUsed` puts before its high-water mark.
+const REFUSAL: &str = "SQLITE_CONFIG_PAGECACHE buffer has held pages in this process \
+                       (high-water mark ";
 
 /// Installs a leaked, 8-byte-aligned buffer of [`SLOTS`] slots, each large
 /// enough for any page. Must run before `SQLite` starts.
@@ -38,18 +44,40 @@ pub fn install() {
     assert_eq!(code, ffi::SQLITE_OK, "SQLite must not be started yet");
 }
 
-/// Positive control: a statement on a fresh connection checks a buffer slot
-/// out, so the high-water mark the constructors read is above 0.
-pub fn assert_buffer_serves_pages() {
-    let conn = scp_sqlite_pools::open_in_memory().expect("control connection should open");
-    conn.execute_batch("CREATE TABLE control (x); INSERT INTO control VALUES (1);")
-        .expect("control statements should run");
-    let result = scp_sqlite_pools::require_no_page_cache_buffer();
+/// The high-water mark in a storage error that carries the text of
+/// `PoolsError::PageCacheBufferUsed`, or `None` when `message` is another
+/// error. The constructors map `PoolsError` into storage errors that keep
+/// only its text, so the tests read the value from there.
+pub fn refused_high_water(message: &str) -> Option<i64> {
+    let (_, rest) = message.split_once(REFUSAL)?;
+    let (value, _) = rest.split_once(')')?;
+    value.parse().ok()
+}
+
+/// Asserts that a constructor's error `message` is the page-cache buffer
+/// refusal with a high-water mark above 0, and that `database` does not exist,
+/// so the refusal came before the constructor opened its connection. Then,
+/// as a control after the refusal, asserts that `scp_sqlite_pools` itself
+/// refuses an in-memory open with the same structured error.
+pub fn assert_refused_before_open(constructor: &str, message: &str, database: &Path) {
+    let refused = refused_high_water(message);
+    assert!(
+        matches!(refused, Some(h) if h > 0),
+        "{constructor} must refuse with the page-cache buffer error and a high-water mark above \
+         0, got {message}"
+    );
+    let high_water = refused.unwrap_or_default();
+    assert!(
+        !database.exists(),
+        "{constructor} must refuse before it opens {}",
+        database.display()
+    );
+    let control = scp_sqlite_pools::open_in_memory();
     assert!(
         matches!(
-            result,
-            Err(scp_sqlite_pools::PoolsError::PageCacheBufferUsed { high_water }) if high_water > 0
+            control,
+            Err(scp_sqlite_pools::PoolsError::PageCacheBufferUsed { high_water: h }) if h >= high_water
         ),
-        "the configured buffer must have served a page, got {result:?}"
+        "scp_sqlite_pools::open_in_memory must refuse the same buffer, got {control:?}"
     );
 }
