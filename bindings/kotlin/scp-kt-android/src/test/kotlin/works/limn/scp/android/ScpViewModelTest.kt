@@ -587,8 +587,7 @@ internal class TestNativeBindings : NativeBindings {
      * the coroutine takes the result on the calling thread and never moves to the dispatcher.
      * A test that needs the failure to resume the cleanup coroutine on the dispatcher's thread
      * holds the `leave`, waits for the launching call ([ScpViewModel.onCleared] or
-     * [ScpViewModel.trackContext]) to return, which an undispatched launch does only once its
-     * coroutine has suspended, and then opens the latch.
+     * [ScpViewModel.trackContext]) to return, and then opens the latch.
      */
     fun holdLeave(contextHandle: Long): CountDownLatch =
         CountDownLatch(1).also { leaveHolds[contextHandle] = it }
