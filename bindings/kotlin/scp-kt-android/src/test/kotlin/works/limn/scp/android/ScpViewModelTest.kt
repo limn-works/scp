@@ -28,6 +28,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -287,8 +288,12 @@ class ScpViewModelTest {
             cpuDispatcher = Dispatchers.IO,
         )
         val viewModel = OverlapProbeViewModel()
+        val firstLeave = stubBindings.holdLeave(1L)
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
         viewModel.callOnCleared()
+        // callOnCleared returned while the first leave was held on an IO thread, so the
+        // cleanup coroutine has suspended and that leave's failure resumes it on the IO thread.
+        firstLeave.countDown()
         assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
 
         // The first override call is parked inside onCleanupFailure; this leave fails on
@@ -327,8 +332,12 @@ class ScpViewModelTest {
             cpuDispatcher = Dispatchers.Unconfined,
         )
         val viewModel = OverlapProbeViewModel()
+        val firstLeave = stubBindings.holdLeave(1L)
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
         viewModel.callOnCleared()
+        // callOnCleared returned while the first leave was held on an IO thread, so the
+        // cleanup coroutine has suspended and that leave's failure resumes it on the IO thread.
+        firstLeave.countDown()
         assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
 
         viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = inlineBridge))
@@ -377,9 +386,13 @@ class ScpViewModelTest {
         )
         val retry = TrackedContext(handle = 2L, identityHandle = 2L, bridge = inlineBridge)
         val viewModel = RetryingViewModel(retry, stubBindings)
+        val firstLeave = stubBindings.holdLeave(1L)
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
 
         viewModel.callOnCleared()
+        // callOnCleared returned while the first leave was held on an IO thread, so the
+        // cleanup coroutine has suspended and that leave's failure resumes it on the IO thread.
+        firstLeave.countDown()
         assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "both failures never arrived")
 
         assertEquals(
@@ -411,6 +424,7 @@ class ScpViewModelTest {
 }
 
 private const val OVERLAP_WINDOW_MS = 200L
+private const val LEAVE_HOLD_TIMEOUT_S = 5L
 
 /** Records how many [onCleanupFailure] calls run at once; parks the first until released. */
 private class OverlapProbeViewModel : ScpViewModel() {
@@ -537,7 +551,28 @@ internal class TestNativeBindings : NativeBindings {
      */
     var leaveCancelsForHandle: Long? = null
 
+    private val leaveHolds = ConcurrentHashMap<Long, CountDownLatch>()
+
+    /**
+     * Holds every `leave` of [contextHandle] inside this stub until the returned latch opens.
+     *
+     * `CoroutineBridge.ffiCall` runs `leave` in `withContext(ioDispatcher)`. When the
+     * dispatched block finishes before the calling coroutine suspends in that `withContext`,
+     * the coroutine takes the result on the calling thread and never moves to the dispatcher.
+     * A test that needs the failure to resume the cleanup coroutine on the dispatcher's thread
+     * holds the `leave`, waits for the launching call ([ScpViewModel.onCleared] or
+     * [ScpViewModel.trackContext]) to return, which an undispatched launch does only once its
+     * coroutine has suspended, and then opens the latch.
+     */
+    fun holdLeave(contextHandle: Long): CountDownLatch =
+        CountDownLatch(1).also { leaveHolds[contextHandle] = it }
+
     override fun contextLeave(contextHandle: Long, identityHandle: Long) {
+        leaveHolds[contextHandle]?.let { hold ->
+            check(hold.await(LEAVE_HOLD_TIMEOUT_S, TimeUnit.SECONDS)) {
+                "the hold on leave for handle $contextHandle never opened"
+            }
+        }
         leaveCalledHandles.add(contextHandle)
         if (contextHandle == leaveCancelsForHandle) {
             throw CancellationException("cleanup cancelled at handle $contextHandle")

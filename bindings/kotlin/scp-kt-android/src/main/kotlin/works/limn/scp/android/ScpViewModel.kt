@@ -93,7 +93,9 @@ abstract class ScpViewModel : ViewModel() {
     // [launchLeave] starts each cleanup coroutine undispatched on the thread that calls
     // [onCleared] or [trackContext], and `Dispatchers.Unconfined` keeps it there only until
     // the first `leave` suspends into the bridge's I/O dispatcher, so the launching call
-    // returns without waiting on an FFI call when that dispatcher dispatches. An inline one
+    // returns without waiting on an FFI call when that dispatcher dispatches. A `leave` that
+    // finishes on that dispatcher before the coroutine suspends in the bridge's `withContext`
+    // returns its result on the launching thread, and the coroutine continues there. An inline one
     // runs every `leave` before the launching call returns unless the coroutine suspends on
     // [cleanupFailureLock], which another cleanup coroutine's [onCleanupFailure] call can hold.
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
@@ -173,7 +175,12 @@ abstract class ScpViewModel : ViewModel() {
      *
      * What this method does not guarantee: that `leave` calls have finished. The cleanup
      * coroutine starts on the calling thread and, when the bridge's I/O dispatcher dispatches
-     * (the default `Dispatchers.IO` does), leaves it at the first `leave`. A dispatcher that
+     * (the default `Dispatchers.IO` does), leaves it at the first `leave` that is still
+     * running when the coroutine reaches the suspension in the bridge's `withContext`. A
+     * `leave` that finishes on the dispatcher before then hands its result back on the
+     * calling thread, so this method runs that `leave`'s [onCleanupFailure] call, and the
+     * loop goes on to the next `leave`, before it returns. It never waits on a `leave` that is
+     * still running. A dispatcher that
      * runs inline, such as `Dispatchers.Unconfined`, runs every `leave` and every
      * [onCleanupFailure] call on the calling thread before this method returns, unless
      * another cleanup coroutine's [onCleanupFailure] call is running when a `leave` fails. In
@@ -262,7 +269,10 @@ abstract class ScpViewModel : ViewModel() {
      * Runs inside a cleanup coroutine that [onCleared] or a [trackContext] call after clear
      * launches. When the bridge's I/O dispatcher dispatches (the default `Dispatchers.IO`
      * does), that is on whichever thread resumed that coroutine, and the call that launched
-     * it does not wait for it. A dispatcher that runs inline, such as
+     * it does not wait for it, except when the failed `leave` finished on the dispatcher
+     * before the coroutine suspended in the bridge's `withContext`: then the coroutine takes
+     * the failure on the launching thread, and this call runs there before the launching call
+     * returns. A dispatcher that runs inline, such as
      * `Dispatchers.Unconfined`, runs it on the thread that made the launching call (for
      * [onCleared], an Android main thread; for [trackContext], whichever thread called it)
      * before that call returns, unless another cleanup coroutine's call is running at that
