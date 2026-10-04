@@ -341,3 +341,26 @@ debug = "line-tables-only"
 # depends on this line.
 [profile.release]
 debug-assertions = false
+
+# ── CI test-bridge profile ──────────────────────────────────────────────────
+# Used by the four bridge-artifact producer jobs in `.github/workflows/ci.yml`
+# (pyo3-module, pyo3-module-macos, napi-addon, xcframework) and by nothing else:
+# Alec's ruling of 2026-10-04 builds SCP's own crates at opt-level 1 and every
+# dependency at opt-level 3 for those test bridges. Release builds,
+# `.github/workflows/release.yml`, `build-matrix.yml` and local-developer
+# commands keep `--release`.
+#
+# `inherits = "release"` keeps every release setting this file or cargo's
+# defaults give, `debug-assertions = false` included; only `opt-level` differs.
+# Cargo reference, Profiles: `package."*"` matches every package that is not a
+# workspace member, and a named or `"*"` package override takes precedence over
+# `build-override`, so dependency build scripts and proc macros compile at
+# opt-level 3 here where `--release` compiles them at 0. Cargo writes this
+# profile's output to `target/ci-bridge/` (`target/<triple>/ci-bridge/` under
+# `--target`).
+[profile.ci-bridge]
+inherits = "release"
+opt-level = 1
+
+[profile.ci-bridge.package."*"]
+opt-level = 3
