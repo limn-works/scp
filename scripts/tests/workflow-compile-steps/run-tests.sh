@@ -17,12 +17,12 @@
 #     whose `--library` sits under `target/<triple>/release` (the second-compile shape
 #     from build-xcframework.sh and the Swift job of build-matrix.yml), one whose
 #     `--library` sits under `target/release` (the Android job's path that no step
-#     produced), one that passes no `--library`, and one under the custom `--profile
+#     produced), one that passes no `--library`, one under the custom `--profile
 #     ci-bridge` whose `--library` sits under `target/<triple>/release`, and one under
 #     the built-in `--profile test` whose `--library` sits under `target/test`. It passes a
 #     `cargo run` whose flags name the library's directory, with `--release --target`,
 #     with `--profile release` behind a `+toolchain` selector, with `--profile ci-bridge
-#     --target` reading `target/<triple>/ci-bridge`, and with a bare `cargo run` reading
+#     --target` reading `target/<triple>/ci-bridge`, with a bare `cargo run` reading
 #     `target/debug`, with `--profile test` reading `target/debug` and `--profile bench`
 #     reading `target/release`, and it joins backslash-continued lines before reading a command.
 #
