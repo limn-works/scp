@@ -3021,7 +3021,7 @@ jobs:
       # belongs in this job rather than in `kotlin-test`.
       - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
       # `kotlin-test` and `bridge-parity-kotlin` pass `scp.uniffi.prebuiltBindings=true`
-      # with the bindings present and an absolute `CARGO_TARGET_DIR`, so neither reaches
+      # with the bindings present, so neither reaches
       # the property's failure branches or a relative directory. This step runs those
       # cases against scp-kt/build.gradle.kts. No step of this job generates the
       # bindings, so scp.kt is absent until the step writes a placeholder.
