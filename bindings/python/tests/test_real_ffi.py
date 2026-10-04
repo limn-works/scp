@@ -1089,15 +1089,15 @@ class TestTrust:
 
         admin = await scp.identity_create(CustodyType.IN_MEMORY)
         member = await scp.identity_create(CustodyType.IN_MEMORY)
-        # The ceiling MUST carry the governance + child-creation capabilities, or
-        # the proposer (creator) lacks governance:propose / the child-creation
-        # capability and the proposal is permission-denied.
         # Event timestamps are whole Unix seconds from the core's system clock,
         # and a still-open membership interval runs to the latest event
         # timestamp (§7.3.2). Events milliseconds apart that straddle a second
         # boundary yield a duration of 1, so the duration is bounded by the
         # whole seconds the clock crosses during the scenario.
         before_secs = int(time.time())
+        # The ceiling MUST carry the governance + child-creation capabilities, or
+        # the proposer (creator) lacks governance:propose / the child-creation
+        # capability and the proposal is permission-denied.
         handle = scp._native.context_create(
             admin.did,
             {
