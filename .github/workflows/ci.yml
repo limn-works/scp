@@ -40,8 +40,7 @@ env:
   # step's units under a profile the restored entry does not hold, so cargo would
   # rebuild them. Check `profile-env` in scripts/tests/ci-gate/ci_gate_selftest.py
   # rejects a missing workflow-level key and any job-level or step-level one, in this
-  # file and in compile-timings.yml, which sets the same key so that it times the
-  # compile `rust-test` runs.
+  # file and in compile-timings.yml.
   CARGO_PROFILE_DEV_DEBUG: "0"
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────

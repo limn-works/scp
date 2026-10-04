@@ -216,9 +216,9 @@ nothing:
                Dropping the workflow-level key returns CI's dev-profile builds
                to the root Cargo.toml's `line-tables-only` without any check
                noticing.
-               compile-timings.yml runs the cargo invocations `rust-test` runs
-               to measure their compile, so the same rule holds there: without
-               the key it would time builds that carry line tables.
+               compile-timings.yml times cargo builds, so the same rule holds
+               there: without the key it would time builds that carry line
+               tables.
   matrix-axis
                Job rust-test-optional-features runs its commands on six legs,
                two runners times three values of a matrix `group` axis, and job

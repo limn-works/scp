@@ -38,8 +38,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # ci.yml sets this key in its workflow-level `env:`, so `rust-test` compiles with no
-  # debug info. The same key here makes this job time that compile rather than the
+  # ci.yml sets this key in its workflow-level `env:`, so its dev-profile builds carry
+  # no debug info. The same key here makes this job time those builds rather than the
   # `line-tables-only` build `[profile.dev]` in the root Cargo.toml gives.
   # Check `profile-env` in scripts/tests/ci-gate/ci_gate_selftest.py requires it here
   # and in ci.yml.
