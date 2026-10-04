@@ -2264,10 +2264,7 @@ impl TierReEvalHandle {
     ///
     /// On a multi-thread runtime this bridges the sync→async boundary with
     /// [`tokio::task::block_in_place`] + [`Handle::block_on`](tokio::runtime::Handle::block_on),
-    /// awaiting the task's `JoinHandle` so teardown is deterministic. The cancel
-    /// signal makes the task return promptly (it is parked in a `select!` that
-    /// includes the cancel watch), so the wait is bounded by the task's current
-    /// poll, not by the 30-minute re-evaluation interval.
+    /// awaiting the task's `JoinHandle` so teardown is deterministic.
     ///
     /// `block_in_place` PANICS on a `current_thread` runtime and is unavailable
     /// outside a runtime, so both are handled by falling back to a best-effort
@@ -6438,8 +6435,6 @@ mod tests {
         let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
             external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
         }]));
-        // The periodic branch never fires, so the task is parked in its
-        // `select!` when the cancel signal arrives.
         let (handle, dropped) = slow_drop_tier_task(strategy, Duration::from_hours(1));
 
         handle.stop_and_wait();
