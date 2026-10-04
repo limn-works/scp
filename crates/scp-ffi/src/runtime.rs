@@ -1468,8 +1468,6 @@ pub struct FfiBridgeState {
     /// Role state tracking member capabilities.
     ///
     /// Also maintained by `ContextManager` for lifecycle operations.
-    /// This copy is used by UCAN validation (`ucan.rs`) and outlet capability
-    /// checking (`outlets.rs`, `mcp.rs`) which access state via `with_ffi_state`.
     /// Both copies are kept in sync: `register_ffi_state` initializes from
     /// the same parameters, and `py_context_join` updates both.
     pub role_state: ContextRoleState,
@@ -1915,7 +1913,6 @@ where
 /// converted `ActorBusy`, `ActorCrashed`, or `ContextPoisoned` error when the
 /// context's actor is saturated, wedged, mid-respawn, or poisoned, so a caller
 /// never reads an actor that did not answer as an absent context.
-#[cfg(test)]
 pub(crate) fn live_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -2018,9 +2015,8 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
 ///
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `AddMember`, `RemoveMember`, etc.) so that the FFI-side
-/// copy used by outlet and MCP capability checks stays current. It does not
-/// touch `ceiling_strings`, and a failed re-read leaves the older role state
-/// in place.
+/// copy stays current. It does not touch `ceiling_strings`, and a failed
+/// re-read leaves the older role state in place.
 ///
 /// The read is `Supervisor::get_role_state_checked`, so a busy or timed-out
 /// actor, a crashed or mid-respawn context and a poisoned context each fail
@@ -2078,7 +2074,7 @@ pub async fn sync_role_state_from_manager_async(
 /// [`ContextHandle`](scp_core::context::ContextHandle).
 ///
 /// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/outlet capability-check ceiling string set. Used by
+/// the ceiling string set. Used by
 /// `context_join_from_welcome`: the joiner no longer supplies a ceiling, so the
 /// FFI state is registered with the DEFAULT ceiling as a reversible precheck,
 /// then this overwrites it with the ceiling AUTHENTICATED by the joined MLS

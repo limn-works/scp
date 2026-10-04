@@ -407,12 +407,24 @@ fn outlet_stream_open_impl(
     }
     let input_json = crate::types::py_dict_to_json(input)?;
 
+    // The supervisor actor answers the lifecycle question before the UCAN
+    // pipeline reads the role state, so a context no actor serves refuses with
+    // the same withheld text as every other non-`Active` state — see
+    // `crate::outlets::active_outlet_role_state`.
+    let role_state = crate::outlets::active_outlet_role_state(
+        bi,
+        context_id,
+        "open outlet stream in context",
+        scp_ffi_common::error_codes::OUTLET_6005,
+    )?;
+
     // Primary authorization: the full 11-step ADR-016 UCAN pipeline over the
     // bridge-owned per-context UCAN state — IDENTICAL to `outlet_invoke_impl`.
     // The stream is validated ONCE at open (§5.4.5 "UCAN check locus");
     // chunks do not re-present.
     crate::outlets::validate_outlet_ucan(
         bi,
+        &role_state,
         context_id,
         outlet_id,
         ucan_token,
@@ -1103,10 +1115,7 @@ fn outlet_stream_compute_caveats_binding_impl(
 // ---------------------------------------------------------------------------
 // Cross-context streaming saga (§5.4.5, §6.2.4, SCP-OUT-047) — open / poll /
 // recover. The streaming ANALOG of the unary cross-context saga export in
-// `outlets.rs`, sharing its `enforce_caller_principal_binding`,
-// `resolve_context_signing_key`, `validate_outlet_ucan`, and `map_saga_error`
-// verbatim, and the SAME `BridgeStreamExecutor` / `resolve_stream_signer` /
-// `BridgeStreamRevocationChecker` this module already defines.
+// `outlets.rs`.
 // ---------------------------------------------------------------------------
 
 /// The control-plane "no active cross-context streaming saga" rejection for an
@@ -1219,34 +1228,27 @@ fn outlet_streaming_saga_open_impl(
     // codes before the drive even starts.
     //
     // PyO3 is string-keyed (no `ContextHandle`), so the authoritative lifecycle
-    // state is read from the per-context supervisor actor via
-    // `read_context_state` — the equivalent of the NAPI/UniFFI handle-state
-    // guard. Checked BEFORE the caller-principal binding and the saga drive, so a
-    // non-active context is rejected before any escrow debit or receiver hand-out.
-    // Codes match NAPI/UniFFI: `OUTLET_6010` (caller axis) / `OUTLET_6011`
-    // (target axis). A missing actor (`None`) is treated as non-active.
-    let caller_state = rt.block_on(supervisor.read_context_state(caller_context_id));
-    if !matches!(caller_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot start cross-context streaming saga: caller context in \
-                 {caller_state:?} state"
-            ),
-            code: scp_ffi_common::error_codes::OUTLET_6010.to_owned(),
-        }
-        .into());
-    }
-    let target_state = rt.block_on(supervisor.read_context_state(target_context_id));
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot start cross-context streaming saga: target context in \
-                 {target_state:?} state"
-            ),
-            code: scp_ffi_common::error_codes::OUTLET_6011.to_owned(),
-        }
-        .into());
-    }
+    // state is read from the per-context supervisor actor through
+    // `crate::outlets::active_outlet_role_state`. Checked BEFORE the
+    // caller-principal binding and the saga drive, so a non-active context is
+    // rejected before any escrow debit or receiver hand-out. Codes:
+    // `OUTLET_6010` (caller axis) / `OUTLET_6011` (target axis). A
+    // context no actor serves is treated as non-active. Both gates run before
+    // the caller-principal binding, so both withhold the lifecycle state. The
+    // target role state answers the UCAN validation, and each role state's
+    // creator names the key that context signs under.
+    let caller_role = crate::outlets::active_outlet_role_state(
+        bi,
+        caller_context_id,
+        "start cross-context streaming saga from caller context",
+        scp_ffi_common::error_codes::OUTLET_6010,
+    )?;
+    let target_role = crate::outlets::active_outlet_role_state(
+        bi,
+        target_context_id,
+        "start cross-context streaming saga into target context",
+        scp_ffi_common::error_codes::OUTLET_6011,
+    )?;
 
     // ----- (b) caller-principal binding (CALLER axis) — BEFORE the saga runs --
     crate::outlets::enforce_caller_principal_binding(
@@ -1265,6 +1267,7 @@ fn outlet_streaming_saga_open_impl(
     // `target_context_id`. Validated ONCE at open (§5.4.5 "UCAN check locus").
     crate::outlets::validate_outlet_ucan(
         bi,
+        &target_role,
         target_context_id,
         outlet_registration_id,
         ucan_token,
@@ -1410,8 +1413,8 @@ fn outlet_streaming_saga_open_impl(
     };
 
     // ----- (d) signing keys: each co-resident context's Active Signing Key ----
-    let target_signing_key = crate::outlets::resolve_context_signing_key(bi, target_context_id)?;
-    let caller_signing_key = crate::outlets::resolve_context_signing_key(bi, caller_context_id)?;
+    let target_signing_key = crate::context::resolve_signing_key(bi, &target_role.creator_did)?;
+    let caller_signing_key = crate::context::resolve_signing_key(bi, &caller_role.creator_did)?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
     let caller_context_bytes = scp_core::context::state::context_id_to_bytes(caller_context_id);
@@ -1663,6 +1666,7 @@ impl crate::scp::PyScp {
     /// Raises `UcanError` if authorization fails. Raises `ContextError`
     /// carrying a `SCP-OUTLET-NNNN` code if the open is rejected (admission
     /// caps, escrow, caveats binding, node pump ceiling, or a §7.3.8 caveat).
+    /// Raises `ContextError` (`SCP-OUTLET-6005`) if the context is not `Active`.
     #[pyo3(name = "outlet_stream_open")]
     #[pyo3(signature = (
         context_id, outlet_id, input, caller_did, ucan_token,
@@ -1840,7 +1844,9 @@ impl crate::scp::PyScp {
     /// binding fails; `UcanError` if authorization fails; a saga terminal error
     /// (`SagaAbortedError` / `SagaNeedsRepairError` / `SagaBusyError`) if the
     /// Prepare/Commit-transition is rejected; `ValidationError` if an
-    /// id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
+    /// id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes;
+    /// `ContextError` (`SCP-OUTLET-6010` caller, `SCP-OUTLET-6011` target) if
+    /// either context is not `Active`.
     #[pyo3(name = "outlet_streaming_saga_open")]
     #[pyo3(signature = (
         caller_context_id, target_context_id, caller_did, outlet_registration_id,
