@@ -1037,7 +1037,7 @@ impl CrashWindow {
 
 /// Spawn a context actor's watchdog task (ADR-049 §10).
 ///
-/// This is a free function — deliberately NOT an inline `tokio::spawn`
+/// This is a free function — deliberately NOT an inline spawn
 /// inside [`Supervisor::spawn_actor_with_watchdog`] — so the watchdog
 /// future's `Send` proof is resolved here, OUTSIDE the opaque `impl
 /// Future` scope of the spawn method. The watchdog reaches
@@ -1045,8 +1045,7 @@ impl CrashWindow {
 /// `Supervisor::spawn_actor_with_state` → `spawn_actor_with_watchdog`,
 /// forming a self-referential async cycle. Spawning inline makes the
 /// compiler try to fetch an opaque type's hidden type within its own
-/// defining scope (unsupported); moving the spawn into this free fn —
-/// whose only relationship to the cycle is a plain `tokio::spawn` call —
+/// defining scope (unsupported); moving the spawn into this free fn
 /// breaks that self-reference. The watchdog owns its `JoinHandle`
 /// directly (TTL / governance timers are actor-owned arms — ADR-049
 /// finding A3 — so no supervisor timer JoinSet exists).
@@ -4312,7 +4311,7 @@ impl Supervisor {
     // `ContextActor::run()` future (via the actor-shape cross-context
     // `recovery_notify_contact` → `dispatch_recovery_send_notification`), and it
     // calls `respawn_from_snapshot`, which constructs a fresh `run()` future to
-    // `tokio::spawn`. As an `async fn` its opaque return type would make
+    // spawn. As an `async fn` its opaque return type would make
     // `run()`'s type/`Send` inference cyclic (`run` ⊇ … ⊇
     // `recovery_send_notification_direct` ⊇ `respawn` ⊇ `run`) and fail to
     // resolve (E0391). Returning an explicit `Pin<Box<dyn Future + Send>>`
@@ -7220,27 +7219,50 @@ impl Supervisor {
         // durably folds it into B's frontier (StreamCaptureAppend), and seals at
         // close (CommitBStreamSettle).
         // The task spawns on the tracker so shutdown waits for its seal
-        // (ADR-049 Decision 16). A refusal means shutdown has begun: the future
-        // drops unrun (its escrow guard reverses the open-time hold), the staged
-        // Prepare-B slot is cleared, and the caller gets a typed abort.
-        let seal = crate::context::outlets::invoke::run_streaming_saga_seal_task(
-            Arc::downgrade(self),
-            target_hex.clone(),
-            saga_id.clone(),
-            SigningKeyBytes::from_signing_key(signing_keys.target),
-            inner_rx,
-            outer_tx,
-            escrow_ticket,
-            descriptor,
-            output_schema,
-            aggregate_schema,
-            a_event_log,
-        );
-        if let Err(refused) = self.spawn_tracked("spawn streaming saga seal task", seal) {
+        // (ADR-049 Decision 16). The permit is taken BEFORE the seal future is
+        // built, so a refusal leaves the escrow ticket here: the hold is then
+        // reversed by an awaited mailbox call, because the ticket's Drop refund
+        // spawns through the same closed gate and would be refused.
+        let refused = match self.spawn_permit("spawn streaming saga seal task") {
+            Ok(permit) => {
+                let seal = crate::context::outlets::invoke::run_streaming_saga_seal_task(
+                    Arc::downgrade(self),
+                    target_hex.clone(),
+                    saga_id.clone(),
+                    SigningKeyBytes::from_signing_key(signing_keys.target),
+                    inner_rx,
+                    outer_tx,
+                    escrow_ticket,
+                    descriptor,
+                    output_schema,
+                    aggregate_schema,
+                    a_event_log,
+                );
+                permit.spawn(seal);
+                None
+            }
+            Err(refused) => Some((refused, escrow_ticket)),
+        };
+        if let Some((refused, escrow_ticket)) = refused {
+            let reserved = escrow_ticket.reserved();
+            if reserved.value() > 0
+                && let Err(err) = self
+                    .reverse_stream_escrow_via_actor(&target_hex, &caller_did, reserved)
+                    .await
+            {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    reserved = reserved.value(),
+                    "streaming saga: seal spawn refused by shutdown and the open-time \
+                     escrow reversal failed — the hold stays debited"
+                );
+            }
+            escrow_ticket.consume();
             self.abort_staged_streaming_saga(&saga_id, &target_hex)
                 .await;
             return Err(SagaError::Aborted {
-                reason: SagaAbortReason::ParticipantUnavailable,
+                reason: SagaAbortReason::Rejected,
                 code: 13067,
                 message: refused.to_string(),
             });
@@ -10928,8 +10950,7 @@ impl Supervisor {
     /// tracker and awaits it. Returns only after every tracked task has
     /// exited, so the caller may then close the storage backend it passed to
     /// the supervisor (§17.6 of the persistence spec, One Writer per Durable
-    /// Directory). Imposes no deadline of its own: the bridge's bounded
-    /// shutdown wait bounds it (ADR-048 §5, as amended 2026-10-04).
+    /// Directory). Imposes no deadline of its own.
     ///
     /// Does NOT send leave messages or notify remote peers. A second call
     /// finds nothing left to stop and returns once the tracker is empty.
@@ -19745,9 +19766,9 @@ mod tests {
     /// nothing keeps the Supervisor alive (ADR-049 Decision 16): every
     /// supervisor-spawned task holds a `Weak` and the tracker wait has seen
     /// each one exit. A `Weak` probe taken before shutdown must fail to
-    /// upgrade. With strong back-references in the actor deps or watchdogs,
-    /// or without the tracker wait, a context actor, key-package actor, or
-    /// watchdog still holds an `Arc` and the probe upgrades.
+    /// upgrade. With strong back-references in the actor deps or watchdogs, a
+    /// context actor, key-package actor, or watchdog still holds an `Arc` and
+    /// the probe upgrades.
     #[tokio::test]
     async fn supervisor_drops_after_shutdown_and_owner_release() {
         let supervisor_arc = supervisor_with_providers();
@@ -21224,21 +21245,27 @@ mod tests {
     }
 
     /// The returned `SupervisorHandle` holds a `Weak` to the OUTER
-    /// supervisor `Arc` (ADR-049 Decision 16): building it adds a weak
-    /// reference and no strong one.
+    /// supervisor `Arc` (ADR-049 Decision 16): a copy of the handle adds one
+    /// weak reference and no strong one. The weak count is compared around a
+    /// handle clone, because `build_actor_deps` also spawns a key-package
+    /// watchdog that holds its own `Weak`.
     #[tokio::test]
-    async fn build_actor_deps_handle_holds_outer_arc() {
+    async fn build_actor_deps_handle_holds_weak_outer_arc() {
         let (supervisor, _crypto, _mls_storage) = build_deps_fixture();
         let strong_before = Arc::strong_count(&supervisor);
-        let weak_before = Arc::weak_count(&supervisor);
         let deps = supervisor
             .build_actor_deps(&DID("did:example:alice".to_owned()))
             .await
             .expect("build_actor_deps succeeds");
-        assert!(
-            Arc::weak_count(&supervisor) > weak_before,
+        let weak_with_deps = Arc::weak_count(&supervisor);
+        let handle_copy = deps.supervisor.clone();
+        assert_eq!(
+            Arc::weak_count(&supervisor),
+            weak_with_deps + 1,
             "SupervisorHandle must downgrade the outer Arc"
         );
+        drop(handle_copy);
+        assert_eq!(Arc::weak_count(&supervisor), weak_with_deps);
         assert_eq!(
             Arc::strong_count(&supervisor),
             strong_before,
@@ -34758,6 +34785,89 @@ mod streaming_saga_tests {
         );
 
         drop(invoked);
+    }
+
+    /// ADR-049 Decision 16 — a seal spawn refused because shutdown has begun
+    /// reverses the open-time escrow hold before the typed abort. The ticket's
+    /// Drop refund spawns through the same closed gate, so without the awaited
+    /// reversal the invoker's budget stays debited by the full reserve. The
+    /// open-gate case is `xctx_streaming_saga_paid_drive_ac1_ac3_ac5_ac6`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_seal_spawn_refused_by_shutdown_reverses_escrow() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x47; 16]);
+        let executor = Arc::new(FiniteChunkExecutor {
+            data_chunks: 10,
+            invoked: Arc::clone(&invoked),
+        });
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        supervisor.close_spawn_gate();
+
+        let result = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x9au8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                executor,
+                Some(binding),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                params,
+            )
+            .await;
+        let Err(SagaError::Aborted {
+            reason,
+            code,
+            message,
+        }) = result
+        else {
+            panic!("a seal spawn refused by shutdown must abort the saga");
+        };
+        assert!(
+            message.contains("spawn streaming saga seal task"),
+            "the abort comes from the refused seal spawn, not an earlier step: {message}"
+        );
+        assert_eq!(reason, SagaAbortReason::Rejected);
+        assert_eq!(code, 13067);
+
+        let target_hex = hex::encode(SS_TARGET);
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED),
+            "the open-time escrow hold is reversed when the seal spawn is refused"
+        );
+        assert!(
+            journal
+                .load_unresolved()
+                .await
+                .expect("load_unresolved")
+                .is_empty(),
+            "the refused saga is resolved Aborted"
+        );
     }
 
     /// #2196 — a non-active (Closing) TARGET context rejects the cross-context

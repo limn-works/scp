@@ -1093,7 +1093,7 @@ impl SupervisorHandle {
 // not a CI grep-ban.
 
 // Compile-time witness that `SupervisorHandle` is `Send + Sync` — the
-// handle rides inside `ActorDeps`, which is moved into `tokio::spawn`.
+// handle rides inside `ActorDeps`, which is moved into a spawned task.
 const fn _assert_send_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SupervisorHandle>();
