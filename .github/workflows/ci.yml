@@ -1048,9 +1048,9 @@ jobs:
   # ── Why this job is a three-leg matrix ──────────────────────────────────────
   #
   # Measured on the 2026-10-04 runs, the single job spent 53 s restoring its cache
-  # and then about 6.5 min in three serial blocks of work that share no compiled
-  # output: the `--workspace` sweep (87 s), scripts/check-examples-compile.sh
-  # (about 77 s), and the per-package feature commands (about 4 min). Each leg
+  # and then about 6.5 min in three serial blocks of work: the `--workspace`
+  # sweep (87 s), scripts/check-examples-compile.sh (about 77 s), and the
+  # per-package feature commands (about 4 min). Each leg
   # runs one block, so the job takes as long as its longest leg rather than the
   # sum. Every command the single job ran runs on exactly one leg, with the
   # flags and features it had there.
