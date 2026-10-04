@@ -231,6 +231,7 @@ scp-platform/vendored-openssl
 scp-protocol/default
 scp-relay-client/default
 scp-runtime/default
+scp-sqlite-pools/default
 scp-transport/default
 scp-transport/redb-blob
 scp-transport/sqlite-blob
