@@ -1088,6 +1088,76 @@ impl UniffiBridgeInstance {
         Ok(())
     }
 
+    /// Reads a context's role state from that context's supervisor actor.
+    ///
+    /// Tests read through this method. An authorization path reads through
+    /// [`UniffiBridgeInstance::require_active_context_before_authz`] instead.
+    ///
+    /// Fails closed. A context whose actor holds no role state yields
+    /// `ScpError::Context` with `SCP-CTX-2023`; no caller receives a
+    /// permissive default.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns, `ScpError::Context` with `SCP-CTX-2023` when the supervisor
+    /// holds no role state for `context_id`, and the converted `ActorBusy`
+    /// (`SCP-CTX-2130`), `ActorCrashed` (`SCP-CTX-2135`), or `ContextPoisoned`
+    /// (`SCP-CTX-2134`) error when the context's actor is saturated, wedged,
+    /// mid-respawn, or poisoned.
+    #[cfg(test)]
+    pub(crate) async fn live_role_state(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
+        let supervisor = self.context_manager_or_error()?;
+        role_state_on(supervisor, context_id).await
+    }
+
+    /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`,
+    /// withholds every answer about the context from the refusal, and returns
+    /// the context's role state for the authorization decision that follows.
+    ///
+    /// The outlet PRD's
+    /// SCP-OUT-031 PR-2a note records the rule this gate keeps: the raw
+    /// lifecycle state never reaches an FFI caller before authorization. A
+    /// context that is not `Active`, a context no actor serves, an actor that
+    /// did not answer (`ActorBusy`), a context mid-respawn or past a failed
+    /// respawn (`ActorCrashed`), a poisoned context, and a context whose actor
+    /// returned no role state all refuse with the same text and the caller's
+    /// code, and the text never names the context. Each cause goes to the
+    /// `debug` log.
+    ///
+    /// The gate resolves this bridge's supervisor once and returns that
+    /// resolution's error unchanged: a suspended bridge and a bridge with no
+    /// `ContextManager` attached describe the caller's bridge, not the
+    /// context. Both mailbox reads, the lifecycle state and then the role
+    /// state, run in a private function that takes the resolved supervisor and
+    /// no bridge instance, so neither read can resolve the supervisor again
+    /// and turn a bridge error into a withheld context answer.
+    ///
+    /// `mk_err` wraps the refusal message in the error variant and the error
+    /// code the calling entry point reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error [`UniffiBridgeInstance::context_manager_or_error`]
+    /// returns, unchanged. Returns whatever `mk_err` builds for every answer
+    /// about the context other than an `Active` lifecycle state followed by a
+    /// role state.
+    pub async fn require_active_context_before_authz<F>(
+        &self,
+        context_id: &str,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError>
+    where
+        F: FnOnce(String) -> crate::ScpError,
+    {
+        let supervisor = self.context_manager_or_error()?;
+        active_role_state_on(supervisor, context_id, verb, mk_err).await
+    }
+
     /// Per-instance equivalent of the module-level
     /// `with_rate_limit_tracker` free function.
     ///
@@ -1618,6 +1688,82 @@ pub fn build_event_log_provider() -> (
 // ---------------------------------------------------------------------------
 // Per-context UCAN state
 // ---------------------------------------------------------------------------
+
+/// Reads `context_id`'s role state from `supervisor`, a supervisor the caller
+/// has already resolved.
+///
+/// # Errors
+///
+/// Returns the converted `ActorBusy`, `ActorCrashed`, or `ContextPoisoned`
+/// error, and `ScpError::Context` with `SCP-CTX-2023` when the supervisor
+/// holds no role state for `context_id`.
+async fn role_state_on(
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
+    supervisor
+        .get_role_state_checked(context_id)
+        .await?
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: format!(
+                "context '{context_id}' has no live supervisor role state — refusing to \
+                 authorize against an absent membership record"
+            ),
+            code: codes::CTX_2023.to_owned(),
+        })
+}
+
+/// Runs both reads of
+/// [`UniffiBridgeInstance::require_active_context_before_authz`] on
+/// `supervisor`: the lifecycle state, then, only when it reads `Active`, the
+/// role state.
+///
+/// The function takes the resolved supervisor and no bridge instance, so its
+/// signature rules out a second supervisor resolution between the two reads.
+/// Every outcome other than `Active` followed by a role state becomes the one
+/// withheld refusal `mk_err` builds.
+///
+/// # Errors
+///
+/// Returns whatever `mk_err` builds when the lifecycle read fails, finds no
+/// actor, or reports a state other than `Active`, and when the role-state read
+/// fails.
+async fn active_role_state_on<F>(
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError>
+where
+    F: FnOnce(String) -> crate::ScpError,
+{
+    let refusal = || {
+        format!(
+            "cannot {verb}: {}",
+            scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+        )
+    };
+    match supervisor.read_context_state_checked(context_id).await {
+        Ok(Some(scp_core::context::ContextState::Active)) => {}
+        answer => {
+            tracing::debug!(
+                context_id,
+                ?answer,
+                "pre-authorization lifecycle read did not report Active; withholding the \
+                 answer from the caller"
+            );
+            return Err(mk_err(refusal()));
+        }
+    }
+    role_state_on(supervisor, context_id).await.map_err(|e| {
+        tracing::debug!(
+            context_id,
+            error = %e,
+            "pre-authorization role-state read failed; withholding the cause from the caller"
+        );
+        mk_err(refusal())
+    })
+}
 
 /// Per-context UCAN validation state.
 ///
