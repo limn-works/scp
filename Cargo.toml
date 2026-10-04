@@ -302,9 +302,8 @@ await_holding_lock = "deny"
 # ── Dev/test profile ────────────────────────────────────────────────────────
 # Dev/test builds emit line-tables-only debug info instead of the cargo default
 # full DWARF (`debug = 2`). Every compiled artifact keeps its line table (so
-# panic/backtrace frames still resolve to `file:line:col` — what tests and CI
-# need) but drops the bulky variable/type DWARF that only an interactive
-# debugger consumes.
+# panic/backtrace frames still resolve to `file:line:col`) but drops the bulky
+# variable/type DWARF that only an interactive debugger consumes.
 #
 # MEASURED on this 24-member workspace, two clean from-scratch builds of
 # `cargo build --workspace --all-targets` with the CI feature set, isolated

@@ -215,6 +215,10 @@ nothing:
                profile the restored entry does not hold and rebuilds each one.
                Dropping the workflow-level key returns every CI build to the
                root Cargo.toml's `line-tables-only` without any check noticing.
+               compile-timings.yml runs the cargo invocations `rust-test` runs
+               to measure their compile, so the same rule holds there: without
+               the key it would time builds that carry line tables, which no
+               CI build compiles.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -243,6 +247,7 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOW = REPO / ".github/workflows/ci.yml"
+COMPILE_TIMINGS = REPO / ".github/workflows/compile-timings.yml"
 AGGREGATE = REPO / "scripts/ci-aggregate-result.py"
 
 # A ci.yml job whose work is a script or a lint finishes in under a minute; one
@@ -3989,7 +3994,7 @@ CARGO_PROFILE_PREFIX = "CARGO_PROFILE_"
 
 
 def profile_env_gaps(doc: dict) -> list[str]:
-    """Return each way ci.yml's `CARGO_PROFILE_*` environment breaks the rule.
+    """Return each way a workflow's `CARGO_PROFILE_*` environment breaks the rule.
 
     CRITERION: the workflow-level `env:` sets WORKFLOW_PROFILE_KEY to
     WORKFLOW_PROFILE_VALUE, and no job-level or step-level `env:` sets any key
@@ -4019,10 +4024,10 @@ def profile_env_gaps(doc: dict) -> list[str]:
     return gaps
 
 
-def check_profile_env_is_workflow_level(doc: dict) -> None:
+def check_profile_env_is_workflow_level(doc: dict, name: str) -> None:
     gaps = profile_env_gaps(doc)
     check(
-        f"ci.yml: {WORKFLOW_PROFILE_KEY} is set at workflow level and no job or "
+        f"{name}: {WORKFLOW_PROFILE_KEY} is set at workflow level and no job or "
         f"step sets a {CARGO_PROFILE_PREFIX}* key",
         not gaps,
         f"{gaps}: a per-job value splits a rust-cache group, and a missing "
@@ -4038,7 +4043,7 @@ def check_profile_env_is_workflow_level(doc: dict) -> None:
             gap == f"job {job_id}: env sets {WORKFLOW_PROFILE_KEY}"
             for gap in profile_env_gaps(mutated)
         ),
-        f"a ci.yml setting {WORKFLOW_PROFILE_KEY} on job {job_id} went unreported",
+        f"a {name} setting {WORKFLOW_PROFILE_KEY} on job {job_id} went unreported",
     )
     mutated = copy.deepcopy(doc)
     mutated["jobs"][job_id]["steps"][0].setdefault("env", {})[
@@ -4051,21 +4056,21 @@ def check_profile_env_is_workflow_level(doc: dict) -> None:
             and gap.endswith("env sets CARGO_PROFILE_TEST_OPT_LEVEL")
             for gap in profile_env_gaps(mutated)
         ),
-        f"a ci.yml setting a CARGO_PROFILE_* key on a step of {job_id} went unreported",
+        f"a {name} setting a CARGO_PROFILE_* key on a step of {job_id} went unreported",
     )
     mutated = copy.deepcopy(doc)
     (mutated.get("env") or {}).pop(WORKFLOW_PROFILE_KEY, None)
     check(
         f"removing the workflow-level {WORKFLOW_PROFILE_KEY} is reported",
         any(gap.startswith("workflow env: ") for gap in profile_env_gaps(mutated)),
-        f"a ci.yml without a workflow-level {WORKFLOW_PROFILE_KEY} went unreported",
+        f"a {name} without a workflow-level {WORKFLOW_PROFILE_KEY} went unreported",
     )
     mutated = copy.deepcopy(doc)
     mutated.setdefault("env", {})[WORKFLOW_PROFILE_KEY] = "2"
     check(
         f'a workflow-level {WORKFLOW_PROFILE_KEY}: "2" is reported',
         any(gap.startswith("workflow env: ") for gap in profile_env_gaps(mutated)),
-        f"a ci.yml setting {WORKFLOW_PROFILE_KEY} to 2 went unreported",
+        f"a {name} setting {WORKFLOW_PROFILE_KEY} to 2 went unreported",
     )
 
 
@@ -4342,7 +4347,10 @@ def main() -> int:
     check_shared_uploads_outlive_the_rerun_window(workflow)
 
     print("profile-env — CARGO_PROFILE_* is set for the whole workflow or not at all")
-    check_profile_env_is_workflow_level(workflow)
+    check_profile_env_is_workflow_level(workflow, "ci.yml")
+    check_profile_env_is_workflow_level(
+        yaml.safe_load(COMPILE_TIMINGS.read_text()), "compile-timings.yml"
+    )
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
