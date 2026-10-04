@@ -35,13 +35,12 @@ dependencies {
 }
 
 // Directory `generateUniffiBindings` writes the generated Kotlin bindings into.
-// `compileKotlin` depends on that task (see the bottom of this file), so every
-// compilation regenerates the bindings and no source-set exclusion is needed to
-// keep a `uniffi.scp.*` reference compiling. The exclusion that used to sit here
-// named `RealFFITest.kt`, a file the repository no longer contains, and it
-// gated on `listFiles()`, which lists only this directory's immediate children
-// while the generator writes `uniffi/scp/scp.kt` two levels down — so the
-// condition was already always false.
+// `compileKotlin` depends on that task (see the bottom of this file), so no
+// source-set exclusion is needed to keep a `uniffi.scp.*` reference compiling.
+// The exclusion that used to sit here named `RealFFITest.kt`, a file the
+// repository no longer contains, and it gated on `listFiles()`, which lists only
+// this directory's immediate children while the generator writes
+// `uniffi/scp/scp.kt` two levels down — so the condition was already always false.
 val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
 
 // ---------------------------------------------------------------------------
@@ -286,17 +285,15 @@ tasks.register<Exec>("generateUniffiBindings") {
         )
     }
     onlyIf("scp.uniffi.prebuiltBindings is not true") { prebuiltBindings != "true" }
-    // Invalidate on any Rust change under the uniffi crate so stale bindings never compile.
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))
     outputs.dir(uniffiBindingsDir)
 }
 
-// Wire generation into the compile chain so `./gradlew :scp-kt:build` or `test`
-// always regenerates when Rust sources change. Without this, a developer who
-// edits the UniFFI bridge and forgets to regenerate would compile Kotlin
-// against stale bindings — every caller would silently miss any new handle-
-// affinity check or API change. (Round-2 black-hat finding.)
+// Without this dependency, a developer who edits the UniFFI bridge and forgets
+// to regenerate would compile Kotlin against stale bindings — every caller would
+// silently miss any new handle-affinity check or API change. (Round-2 black-hat
+// finding.)
 tasks.matching { it.name == "compileKotlin" }.configureEach {
     dependsOn("generateUniffiBindings")
 }
