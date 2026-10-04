@@ -512,7 +512,8 @@ Every push to a PR branch. Target: < 3 minutes.
 |-----|---------|---------|
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
 | clippy | ubuntu-latest | The five `cargo clippy` commands the CI Commands section above gives: the workspace sweep, the optional-transport lint, and the three commands that lint the PostgreSQL and S3 blob backends |
-| test | ubuntu-latest, macos-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives, among its other optional-feature commands. That job splits its commands into three matrix groups on each runner: of those three commands, `transport` runs the scp-transport one and `node-relay` runs the scp-node and scp-relay ones, and `platform-testing` runs none of them. |
+| test | ubuntu-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives, among its other optional-feature commands. That job splits its commands into three matrix groups: of those three commands, `transport` runs the scp-transport one and `node-relay` runs the scp-node and scp-relay ones, and `platform-testing` runs none of them. |
+| test (macOS) | macos-latest | Job `rust-test-macos` in `.github/workflows/ci.yml` tests the two crates whose code or dependencies depend on macOS: scp-transport, under the commands of the `transport` group except its scp-transport `cloud-blobs` command, and scp-platform, under the `apple` feature and the other features of the `platform-testing` group. |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
 | doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
@@ -526,7 +527,7 @@ Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
 | Job | Runs on | Command |
 |-----|---------|---------|
 | All Tier 1 jobs | (same as above) | (same as above) |
-| harness meta-tests | ubuntu-latest, macos-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2` |
+| harness meta-tests | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2` |
 | phase integration | ubuntu-latest | `cargo nextest run --workspace --features scp-testing/ci-tier2 -E 'test(phase_integration)'` |
 
 Harness meta-tests cover §16.13.1–10: InMemoryRelay, InMemoryTransport, SimulatedClock, NetworkTopology, ScenarioBuilder, determinism, ProtocolRepository, MlsStorageBridge, assertion library, and preset scenario validation. Phase integration runs the current phase's end-to-end test (P1 in Phase 1, P2 in Phase 2, etc.).

@@ -204,8 +204,8 @@ nothing:
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
   matrix-axis
-               Job rust-test-optional-features runs its commands on six legs,
-               two runners times three values of a matrix `group` axis, and job
+               Job rust-test-optional-features runs its commands on three
+               legs, one per value of a matrix `group` axis, and job
                rust-clippy runs on three values of a `leg` axis. GitHub runs a
                leg whose value no step names and reports it green over none of
                the gated commands, and it skips a step whose value the axis
@@ -629,6 +629,7 @@ RUST_ONLY_RUNS = {
     "rust-fmt": True,
     "rust-test": True,
     "rust-test-optional-features": True,
+    "rust-test-macos": True,
     "rust-test-napi-production": True,
     "scaffold-typescript-web-check": False,
     "swift-build-test": True,
