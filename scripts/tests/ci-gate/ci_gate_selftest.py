@@ -5837,8 +5837,9 @@ def check_push_writer_mutants(doc: dict) -> None:
     # A job whose `runs-on` reads an `os` axis writes one rust-cache entry per `os`
     # value, because rust-cache keys by platform. No job in ci.yml has such an axis
     # (rust-test and rust-test-optional-features run on ubuntu-latest alone, and
-    # rust-test-macos on macos-latest alone), so the `os` cases give those two jobs
-    # an `os` axis over both runners, read by `runs-on`, before narrowing it.
+    # rust-test-macos on macos-latest alone), so the `os` cases give rust-test and
+    # rust-test-optional-features an `os` axis over both runners, read by
+    # `runs-on`, before narrowing it.
     def with_os_axis(source: dict, job_id: str) -> dict:
         widened = copy.deepcopy(source)
         job = widened["jobs"][job_id]
