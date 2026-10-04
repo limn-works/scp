@@ -64,6 +64,7 @@ page-cache buffer check and its connection.
 `lookaside_use` reports a connection's
 lookaside use, which is zero for a connection this crate opened.
 
-This is one of three crates that may use `unsafe` (`.docs/standards/rust.md`
-§Safety Rules): its root sets `#![deny(unsafe_code)]`, and the only unsafe
-blocks are its calls into SQLite's C API, each with a `// SAFETY:` comment.
+This crate is one of the exceptions to the workspace-wide ban on unsafe code
+that `.docs/standards/rust.md` §Safety Rules lists: its root sets
+`#![deny(unsafe_code)]`, and the only unsafe blocks are its calls into SQLite's
+C API, each with a `// SAFETY:` comment.

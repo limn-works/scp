@@ -151,7 +151,7 @@ impl SqliteStorage {
         // off. While no code in the process reconfigures SQLite, every block
         // holding the key, a statement, a bound value, or a decrypted page is
         // then freed through SQLCipher's allocator (spec section 17.6, which
-        // names that limit's three forms).
+        // names that limit's forms).
         let conn = scp_sqlite_pools::open(&db_path)
             .map_err(|e| PlatformError::StorageError(e.to_string()))?;
 
