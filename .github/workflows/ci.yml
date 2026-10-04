@@ -3288,9 +3288,8 @@ jobs:
           # `-Pscp.uniffi.prebuiltBindings=true` skips `generateUniffiBindings`, which
           # would otherwise rebuild the crate, so these tests compile against the
           # bindings this job uploads and load the cdylib it uploads.
-          # No PR or merge-queue run executes `generateUniffiBindings` or its
-          # `cargo metadata` target-dir fallback; only build-matrix.yml and
-          # release.yml do.
+          # No PR or merge-queue run executes `generateUniffiBindings`; only
+          # build-matrix.yml and release.yml do.
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
 
   # ── Swift ──────────────────────────────────────────────────────────
