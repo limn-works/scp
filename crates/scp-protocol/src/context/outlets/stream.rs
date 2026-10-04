@@ -3260,4 +3260,38 @@ mod tests {
             );
         }
     }
+
+    /// Golden manifest roots for a 3-leaf manifest and a 257-leaf manifest.
+    /// The 3-leaf tree promotes its third leaf hash past one odd level. The
+    /// 257-leaf tree is one leaf past 256, so its levels hold 257, 129, 65,
+    /// 33, 17, 9, 5, 3, 2 and 1 hashes, and the 257th leaf hash is promoted
+    /// unchanged through the eight odd levels. The hex digests were computed
+    /// with the level-by-level pair-and-promote loop that
+    /// `compute_chunk_manifest_root` held when this test was added. The
+    /// hardcoded bytes depend on neither `indep_mth` nor `MerkleFrontier`, so
+    /// a change to the library's level fold turns this test red even when
+    /// the frontier and the fold change together.
+    #[test]
+    fn manifest_root_kat_pins_odd_and_past_power_of_two_counts() {
+        for (n, golden) in [
+            (
+                3u64,
+                "5538d6a9bdb72a2418aa6af8277e1a284860280f69497d0311b1227204864608",
+            ),
+            (
+                257u64,
+                "e99783f40a56b15ead7e36c799ed5273ef5340c87e81d38319d1ee69e81f8fd3",
+            ),
+        ] {
+            let chunks: Vec<OutletStreamChunk> =
+                (0..n).map(|i| chunk_of_kind(i, (i % 4) as u8)).collect();
+            let root = compute_chunk_manifest_root(&chunks).unwrap();
+            assert_eq!(
+                root,
+                indep_mth(&chunks),
+                "{n}-leaf root diverged from independent MTH"
+            );
+            assert_eq!(hex::encode(root), golden, "{n}-leaf root golden KAT drift");
+        }
+    }
 }
