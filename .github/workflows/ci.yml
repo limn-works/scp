@@ -2477,9 +2477,11 @@ jobs:
   # every Rust change it lands, and on a push to `main` the two producers among them
   # also run on `rust`, because each writes a cache.
   #
-  # TRADE-OFF: a pull request confined to Rust crates outside those directories
-  # skips all four, so a change that breaks the Swift bridge, or the PyO3 module on
-  # macOS, fails in the merge queue rather than on the pull request.
+  # TRADE-OFF: a pull request whose changed paths the `rust` filter matches and
+  # none of those three filters does (a crate outside those directories, Cargo.toml
+  # or Cargo.lock among them) skips all four, so a change that breaks the Swift
+  # bridge, or the PyO3 module on macOS, fails in the merge queue rather than on the
+  # pull request.
   xcframework:
     needs: changes
     if: >-
@@ -2608,8 +2610,7 @@ jobs:
     # bridge-parity-swift is the only consumer.
     # An Ubuntu build cannot serve it: a Python extension module is a native shared
     # object, and the one job pyo3-module publishes is an ELF `.so` built against
-    # glibc for x86_64. The comment above job xcframework says why a pull request
-    # reads no `rust` clause here.
+    # glibc for x86_64.
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
@@ -3464,8 +3465,7 @@ jobs:
   # python-test: this job runs a Swift suite against an XCFramework, and that
   # XCFramework reaches every Rust workspace crate through scp-core, while a `swift`
   # filter names only bindings/swift/**, crates/scp-ffi/uniffi/** and
-  # crates/scp-ffi/common/**. The comment above job xcframework says why a pull
-  # request reads no `rust` clause.
+  # crates/scp-ffi/common/**.
   swift-build-test:
     # Job xcframework builds ScpFFI.xcframework and regenerates ScpBindings.swift for
     # this job. This job runs no cargo command, so it installs no Rust toolchain and
@@ -3829,8 +3829,7 @@ jobs:
     # drives, and they run concurrently, so this job starts when the slower of the two
     # ends. Both producers are macOS jobs: an ELF `.so` and an aarch64-apple-darwin
     # static library are not interchangeable. This job runs no cargo command, so it
-    # installs no Rust toolchain and reads no cargo cache. The comment above job
-    # xcframework says why a pull request reads no `rust` clause here.
+    # installs no Rust toolchain and reads no cargo cache.
     needs: [changes, pyo3-module-macos, xcframework]
     if: >-
       github.event_name != 'push' &&

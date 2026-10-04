@@ -6232,6 +6232,11 @@ MACOS_BRIDGE_PATH_CASES = (
             "push": MACOS_PRODUCERS,
         },
     ),
+    (
+        "pyo3",
+        "crates/scp-ffi/src/lib.rs",
+        {"pull_request": MACOS_PYTHON, "merge_group": MACOS_ALL, "push": MACOS_PRODUCERS},
+    ),
 )
 
 STEP_FILTER_OUTPUT = re.compile(r"steps\.filter\.outputs\.([A-Za-z0-9_-]+)")
@@ -6375,6 +6380,11 @@ def check_macos_bridge_mutants(doc: dict) -> None:
             "bindings/python dropped from the python filter",
             {"python": "bindings/python/**"},
             python_pr,
+        ),
+        (
+            "the PyO3 bridge path dropped from the python filter",
+            {"python": "crates/scp-ffi/src/**"},
+            "pyo3 (crates/scp-ffi/src/lib.rs), pull_request",
         ),
     ):
         mutant = copy.deepcopy(doc)
