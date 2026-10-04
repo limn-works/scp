@@ -2086,13 +2086,16 @@ where
 /// that fails there would otherwise hand the caller the context id (the
 /// absent-role-state text names it) or the actor's fault code
 /// (`SCP-CTX-2130`, `SCP-CTX-2135`, `SCP-CTX-2134`) before authorization, so
-/// every failure becomes the same withheld refusal `mk_err` builds. The cause
+/// each such failure becomes the same withheld refusal `mk_err` builds. The cause
 /// goes to the `debug` log, where an operator can still read it.
 ///
 /// # Errors
 ///
-/// Returns whatever `mk_err` builds when `read` is an error.
+/// Returns [`ScpNapiError::Context`] with `SCP-CTX-2000` when `read` is an
+/// error and `bi` is suspended or holds no supervisor, as the gate does.
+/// Returns whatever `mk_err` builds when `read` is any other error.
 pub fn withhold_read_before_authz<T, F>(
+    bi: &NapiBridgeInstance,
     context_id: &str,
     read: Result<T, ScpNapiError>,
     verb: &str,
@@ -2102,6 +2105,9 @@ where
     F: FnOnce(String) -> ScpNapiError,
 {
     read.map_err(|e| {
+        if let Err(bridge_local) = typed_supervisor(bi) {
+            return bridge_local;
+        }
         tracing::debug!(
             context_id,
             error = %e,
@@ -2974,8 +2980,10 @@ mod tests {
     /// Each input carries what a raw failure would hand an unauthorized
     /// caller: the context id the absent-role-state refusal names, or an actor
     /// fault code.
-    #[test]
-    fn a_read_that_fails_after_the_gate_is_withheld() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_that_fails_after_the_gate_is_withheld() {
+        let bi = NapiBridgeInstance::new_napi();
+        init_supervisor_for_test_on(&bi);
         let ctx_id = "ctx-withheld-after-gate";
         for raw in [
             ScpNapiError::Context {
@@ -2994,7 +3002,7 @@ mod tests {
         ] {
             let raw_text = raw.to_string();
             let err =
-                withhold_read_before_authz::<(), _>(ctx_id, Err(raw), "probe", caller_refusal)
+                withhold_read_before_authz::<(), _>(&bi, ctx_id, Err(raw), "probe", caller_refusal)
                     .expect_err("a failed read must stay a refusal");
             let text = err.to_string();
             assert!(
@@ -3011,9 +3019,62 @@ mod tests {
         }
 
         assert_eq!(
-            withhold_read_before_authz(ctx_id, Ok(7_u8), "probe", caller_refusal)
+            withhold_read_before_authz(&bi, ctx_id, Ok(7_u8), "probe", caller_refusal)
                 .expect("a successful read passes through"),
             7
+        );
+    }
+
+    /// A read that fails while the bridge is suspended, or on a bridge with no
+    /// supervisor, keeps the bridge-local `SCP-CTX-2000` refusal the gate
+    /// passes through, so the caller reads "call `resume()`" rather than
+    /// "context is not active". Once the bridge resumes, the same failed read
+    /// is withheld again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_that_fails_on_a_suspended_bridge_keeps_the_ctx_2000_refusal() {
+        let ctx_id = "ctx-suspended-after-gate";
+        let raw = || ScpNapiError::Context {
+            message: format!("context '{ctx_id}' has no live supervisor role state"),
+            code: codes::CTX_2023.to_owned(),
+        };
+
+        let bare = NapiBridgeInstance::new_napi();
+        let err =
+            withhold_read_before_authz::<(), _>(&bare, ctx_id, Err(raw()), "probe", caller_refusal)
+                .expect_err("a bridge with no supervisor must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("Supervisor not yet attached")),
+            "expected the no-supervisor SCP-CTX-2000 refusal, got {err:?}"
+        );
+
+        let bi = NapiBridgeInstance::new_napi();
+        init_supervisor_for_test_on(&bi);
+        bi.core.suspend().expect("suspend");
+        let err =
+            withhold_read_before_authz::<(), _>(&bi, ctx_id, Err(raw()), "probe", caller_refusal)
+                .expect_err("a suspended bridge must refuse");
+        assert!(
+            matches!(&err, ScpNapiError::Context { code, message }
+                if code == codes::CTX_2000 && message.contains("bridge is suspended")),
+            "expected the suspended SCP-CTX-2000 refusal, got {err:?}"
+        );
+        assert!(
+            !err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a suspended bridge must not report the context as not active: {err}"
+        );
+
+        bi.core.resume().await.expect("resume");
+        let err =
+            withhold_read_before_authz::<(), _>(&bi, ctx_id, Err(raw()), "probe", caller_refusal)
+                .expect_err("a failed read must stay a refusal");
+        assert!(
+            err.to_string().contains(&format!(
+                "cannot probe: {}",
+                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+            )) && err.to_string().contains(codes::VALID_7004),
+            "after resume the failed read must be withheld again: {err}"
         );
     }
 

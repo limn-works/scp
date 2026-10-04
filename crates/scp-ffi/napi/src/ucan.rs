@@ -306,6 +306,7 @@ pub(crate) async fn ucan_validate_on(
     // Both come from the supervisor actor, so a ceiling the supervisor narrowed
     // binds the very next validation, and a context no actor serves refuses.
     let role_state = crate::runtime::withhold_read_before_authz(
+        bi,
         &context_id,
         crate::runtime::live_role_state(bi, &context_id).await,
         "validate a UCAN in context",
@@ -442,6 +443,7 @@ pub(crate) async fn ucan_evaluate_on(
     // `ucan_validate_on` reads them there: the bridge copy reports a ceiling a
     // governance action may already have narrowed.
     let role_state = crate::runtime::withhold_read_before_authz(
+        bi,
         &context_id,
         crate::runtime::live_role_state(bi, &context_id).await,
         "evaluate a UCAN in context",
@@ -526,6 +528,7 @@ pub(crate) async fn ucan_mint_on(
     // and a mint that widened an empty handle ceiling to `default_ceiling()`
     // granted capabilities the context never held.
     let role_state = crate::runtime::withhold_read_before_authz(
+        bi,
         &context_id,
         crate::runtime::live_role_state(bi, &context_id).await,
         "mint a UCAN in context",
@@ -690,6 +693,7 @@ pub(crate) async fn ucan_delegate_on(
     // delegation, and it is never the handle's copy widened to
     // `default_ceiling()` when that copy is empty.
     let ceiling = Some(crate::runtime::withhold_read_before_authz(
+        bi,
         &context_id,
         crate::runtime::live_ceiling_strings(bi, &context_id).await,
         "delegate a UCAN in context",
@@ -782,6 +786,7 @@ pub(crate) async fn ucan_revoke_on(
     // context no actor serves refuses the revocation instead of authorizing it
     // against the creator this bridge recorded when it registered the context.
     let creator_did = crate::runtime::withhold_read_before_authz(
+        bi,
         &context_id,
         crate::runtime::live_role_state(bi, &context_id).await,
         "revoke a UCAN in context",

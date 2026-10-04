@@ -1,7 +1,7 @@
 /**
  * Every UCAN operation on the `SCP` class surfaces the NAPI bridge's
  * pre-authorization refusal for a context that is not active as a typed
- * {@link ContextError} carrying `SCP-CTX-2023` (ADR-049 §10).
+ * {@link ContextError} carrying `SCP-CTX-2023`.
  *
  * The NAPI bridge withholds the context's lifecycle state from that refusal, so
  * the code is the only signal a caller gets; a wrapper that let the raw `Error`
