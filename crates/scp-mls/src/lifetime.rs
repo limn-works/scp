@@ -40,9 +40,6 @@
 //!   the accepted `Lifetime` (post-`validate` on `KeyPackageIn` and pre-merge
 //!   on staged-commit Add proposals), and additionally enforces the RFC 9420
 //!   maximum-total-range bound that openmls's own `validate` path never checks.
-//!   One exception: [`crate::ratchet::process_commit`]
-//!   (`crates/scp-mls/src/ratchet.rs`), a path only tests call, merges a
-//!   Commit's staged Add proposals without the pre-merge check.
 //! - **Bounds** every other member's KeyPackage-sourced Welcome tree leaf to
 //!   the maximum range through `validate_tree_leaf_lifetime_ranges`, which
 //!   reads no clock, because RFC 9420 §7.3 only recommends the current-time
@@ -87,7 +84,8 @@
 //!   against the injected clock first, and `join_group_from_bytes` checks the joiner's
 //!   own leaf against the injected clock it takes.
 //! - `process_message`: the staged-commit Add proposals in
-//!   [`crate::encrypt::decrypt_with_sender_did`] and
+//!   [`crate::encrypt::decrypt_with_sender_did`] (which
+//!   [`crate::ratchet::process_commit`] calls) and
 //!   [`crate::encrypt::decrypt_with_membership_changes`], checked before the
 //!   merge.
 //! - Welcome tree leaves, range only: [`crate::group::join_group_from_bytes`]

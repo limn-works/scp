@@ -341,27 +341,19 @@ impl std::fmt::Display for KpRef {
 /// Durable KP record: the publishable public bytes + the private signer-state.
 /// Persisted under `scp-kp/{identity}/{kp_ref}`.
 ///
-/// The `signer_state` field holds private signing/HPKE join material. A
-/// transient `PersistedKeyPackage` (built to serialize a record, or parsed back
-/// out during reconcile) would otherwise drop its `signer_state` un-zeroed. The
-/// hand-written [`Drop`] zeroes that private field on every drop while leaving
-/// the on-disk serde format (plain `Vec<u8>` fields) unchanged. `public_bytes`
-/// is publishable and not zeroed.
+/// The `signer_state` field holds private signing/HPKE join material, so it
+/// is `Zeroizing`: a transient `PersistedKeyPackage` (built to serialize a
+/// record, or parsed back out during reconcile) wipes it on every drop.
+/// zeroize's `serde` impls delegate to the inner `Vec<u8>`, so the record
+/// encodes as it did with a plain `Vec<u8>` field. `public_bytes` is
+/// publishable and not zeroed.
 #[derive(Serialize, Deserialize)]
 struct PersistedKeyPackage {
     /// TLS-serialized public KeyPackage bytes (publishable).
     public_bytes: Vec<u8>,
-    /// Opaque private signer-state (the join material). Held in `Zeroizing`
-    /// in memory; at rest it lives in `mls_storage` and is deleted on
-    /// consume/cancel. Zeroed on drop via the `Drop` impl below.
-    signer_state: Vec<u8>,
-}
-
-impl Drop for PersistedKeyPackage {
-    fn drop(&mut self) {
-        // Zero the private join material; `public_bytes` is publishable.
-        zeroize::Zeroize::zeroize(&mut self.signer_state);
-    }
+    /// Opaque private signer-state (the join material). At rest it lives in
+    /// `mls_storage` and is deleted on consume/cancel.
+    signer_state: Zeroizing<Vec<u8>>,
 }
 
 /// Durable reservation record. Persisted under
@@ -1011,9 +1003,10 @@ impl KeyPackageStoreActor {
         }
     }
 
-    /// Persist one KP record (public + private signer-state). The MessagePack
-    /// scratch buffer carries the private signer-state, so it is wrapped in
-    /// [`Zeroizing`] (mirrors `serialize_signer_state`).
+    /// Persist one KP record (public + private signer-state). The `MessagePack`
+    /// buffer carries the private signer-state, so it is encoded into one
+    /// exactly-sized buffer wiped on drop (security model spec §9.15 step 2;
+    /// mirrors `serialize_signer_state`).
     async fn persist_kp_record(
         &self,
         kp_ref: &KpRef,
@@ -1022,12 +1015,10 @@ impl KeyPackageStoreActor {
     ) -> Result<(), ContextError> {
         let record = PersistedKeyPackage {
             public_bytes: public_bytes.to_vec(),
-            signer_state: signer_state.to_vec(),
+            signer_state: Zeroizing::new(signer_state.to_vec()),
         };
-        let bytes = Zeroizing::new(
-            rmp_serde::to_vec_named(&record)
-                .map_err(|e| ContextError::PersistenceFailed(format!("kp record encode: {e}")))?,
-        );
+        let bytes = scp_mls::secret_msgpack::encode_named(&record)
+            .map_err(|e| ContextError::PersistenceFailed(format!("kp record encode: {e}")))?;
         self.mls_storage
             .store(&self.kp_record_key(kp_ref), &bytes)
             .await
@@ -2104,7 +2095,10 @@ impl KeyPackageStoreActor {
             let Some(bytes) = rec else {
                 continue; // record gone (consumed/cancelled) — not restorable.
             };
-            let mut parsed: PersistedKeyPackage = match rmp_serde::from_slice(&bytes) {
+            let PersistedKeyPackage {
+                public_bytes,
+                signer_state,
+            } = match rmp_serde::from_slice(&bytes) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(
@@ -2116,18 +2110,15 @@ impl KeyPackageStoreActor {
                     continue;
                 }
             };
-            // `PersistedKeyPackage` has a `Drop` that zeroes its private
-            // `signer_state`, so its fields cannot be moved out by value. Take
-            // each field out via `mem::take` (leaving an empty Vec the Drop
-            // harmlessly zeroes) so the private bytes move into the actor's
-            // `Zeroizing` home without an un-zeroed copy.
+            // Both fields move into the actor's records without a copy; an
+            // excluded consumed record drops its `Zeroizing` signer-state.
             if let Some((rid, reserved_at_ms)) = reserved_by_ref.remove(&kp_ref) {
                 self.reserved.insert(
                     rid,
                     ReservedKeyPackage {
                         kp_ref: kp_ref.clone(),
-                        public_bytes: std::mem::take(&mut parsed.public_bytes),
-                        signer_state: Zeroizing::new(std::mem::take(&mut parsed.signer_state)),
+                        public_bytes,
+                        signer_state,
                         reserved_at_ms,
                     },
                 );
@@ -2158,8 +2149,8 @@ impl KeyPackageStoreActor {
             } else {
                 self.pool.push(PooledKeyPackage {
                     kp_ref,
-                    public_bytes: std::mem::take(&mut parsed.public_bytes),
-                    signer_state: Zeroizing::new(std::mem::take(&mut parsed.signer_state)),
+                    public_bytes,
+                    signer_state,
                 });
             }
         }
