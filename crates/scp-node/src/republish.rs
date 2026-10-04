@@ -220,7 +220,7 @@ pub struct SelfDidRepublishing<D: DhtClient + 'static> {
     /// a synchronous `drop` cannot perform it inline. Behind a
     /// [`std::sync::Mutex`] because the node owns the cycle behind an
     /// [`Arc`] and stops it through a shared `&self`, exactly as
-    /// `TierReEvalHandle` holds its completion receiver.
+    /// `TierReEvalHandle` holds its task's `JoinHandle`.
     reseed_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Set by every teardown path so the [`Drop`] backstop stays out of the way
     /// once the arms are already accounted for.
