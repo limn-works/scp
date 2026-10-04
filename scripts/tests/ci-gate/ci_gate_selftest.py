@@ -203,6 +203,15 @@ nothing:
                no assertion. Both now sit in a fenced block or name the block
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
+  package-writers
+               Job docker-image-cache writes the Docker layer cache to the
+               ghcr.io tag `buildcache:docker-image` with the `docker-cache`
+               environment's `GHCR_CACHE_TOKEN`, and job docker-image reads it.
+               The check reports any job or workflow-level `permissions:` block
+               holding `packages: write` or `write-all`, and any step, job key,
+               or workflow-level `env:` reading `secrets.GHCR_CACHE_TOKEN` in
+               any letter case, or reading `toJSON(secrets)`, outside a job
+               declaring `environment: docker-cache`.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -584,6 +593,9 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # scripts/fix-round-check.sh names.
 EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 
+# Jobs whose `if:` is `github.event_name == 'push'`.
+PUSH_ONLY_JOBS = ("docker-image-cache",)
+
 # Jobs a `changes` filter output selects.
 RUST_ONLY_RUNS = {
     "bridge-parity": True,
@@ -637,31 +649,41 @@ SCENARIOS = {
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=RUST_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
         filters=DOCS_ONLY,
         event="pull_request",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=DOCS_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, push": Scenario(
         name="docs-only, push",
         filters=DOCS_ONLY,
         event="push",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
+        runs=DOCS_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        | dict.fromkeys(PUSH_ONLY_JOBS, True),
     ),
     "rust-only, merge_group": Scenario(
         name="rust-only, merge_group",
         filters=RUST_ONLY,
         event="merge_group",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
+        runs=RUST_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "python-only, pull_request": Scenario(
         name="python-only, pull_request",
         filters=PYTHON_ONLY,
         event="pull_request",
-        runs=PYTHON_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=PYTHON_ONLY_RUNS
+        | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
 }
 
@@ -3969,6 +3991,201 @@ def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
             )
 
 
+def package_write_holders(doc: dict) -> list[str]:
+    """Return `workflow` and every job id whose own `permissions:` grants package write.
+
+    Job docker-image-cache writes the Docker layer cache tag with the `docker-cache`
+    environment's token, so no `GITHUB_TOKEN` in this workflow needs
+    `packages: write`. `write-all` grants `packages: write`.
+    """
+
+    def grants_package_write(permissions: object) -> bool:
+        if isinstance(permissions, str):
+            return permissions == "write-all"
+        return isinstance(permissions, dict) and permissions.get("packages") == "write"
+
+    holders = ["workflow"] if grants_package_write(doc.get("permissions")) else []
+    return holders + sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if grants_package_write(job.get("permissions"))
+    )
+
+
+# GitHub matches secret names and expression property names without regard to case,
+# and `toJSON(secrets)` hands a step every secret its job can read.
+CACHE_TOKEN_READ = re.compile(
+    r"secrets\s*(\.\s*GHCR_CACHE_TOKEN\b|\[\s*['\"]GHCR_CACHE_TOKEN['\"]\s*\])"
+    r"|toJSON\s*\(\s*secrets\s*\)",
+    re.IGNORECASE,
+)
+
+
+def cache_token_reads_outside_environment(doc: dict) -> list[str]:
+    """Return every reader of `secrets.GHCR_CACHE_TOKEN` outside a `docker-cache` job.
+
+    A reader is a step, a job-level key other than `steps:`, or the workflow-level
+    `env:`; the workflow-level `env:` reaches every job, so it is always reported.
+    """
+
+    def reads(value: object) -> bool:
+        return bool(CACHE_TOKEN_READ.search(json.dumps(value)))
+
+    found = ["workflow.env"] if reads(doc.get("env")) else []
+    for job_id, job in doc["jobs"].items():
+        environment = job.get("environment")
+        if isinstance(environment, dict):
+            environment = environment.get("name")
+        if environment == "docker-cache":
+            continue
+        found += [
+            f"{job_id}.{key}"
+            for key, value in job.items()
+            if key != "steps" and reads(value)
+        ]
+        found += [
+            f"{job_id}.steps[{index}]"
+            for index, step in enumerate(job.get("steps") or [])
+            if reads(step)
+        ]
+    return found
+
+
+def check_package_write_and_cache_token(doc: dict) -> None:
+    """No block grants `packages: write`; the cache token is read only in `docker-cache`."""
+    check(
+        "no job and no workflow-level block holds `packages: write` or `write-all`",
+        package_write_holders(doc) == [],
+        f"blocks granting package write: {package_write_holders(doc)}",
+    )
+    check(
+        "every reader of `secrets.GHCR_CACHE_TOKEN` is in a job declaring "
+        "`environment: docker-cache`",
+        cache_token_reads_outside_environment(doc) == [],
+        f"readers outside the environment: {cache_token_reads_outside_environment(doc)}",
+    )
+    write_mutants = (
+        (
+            "a docker-image-cache job granted `packages: write` is reported",
+            lambda d: d["jobs"]["docker-image-cache"]["permissions"].update(
+                packages="write"
+            ),
+            ["docker-image-cache"],
+        ),
+        (
+            "a docker-image job with `permissions: write-all` is reported",
+            lambda d: d["jobs"]["docker-image"].update(permissions="write-all"),
+            ["docker-image"],
+        ),
+        (
+            "a workflow-level `packages: write` is reported",
+            lambda d: d["permissions"].update(packages="write"),
+            ["workflow"],
+        ),
+        (
+            "a workflow-level `permissions: write-all` is reported",
+            lambda d: d.update(permissions="write-all"),
+            ["workflow"],
+        ),
+        (
+            "`permissions: read-all` at both levels is not reported",
+            lambda d: (
+                d.update(permissions="read-all"),
+                d["jobs"]["docker-image"].update(permissions="read-all"),
+            ),
+            [],
+        ),
+    )
+    for name, mutate, expected in write_mutants:
+        mutant = copy.deepcopy(doc)
+        mutate(mutant)
+        check(
+            name,
+            package_write_holders(mutant) == expected,
+            f"reported {package_write_holders(mutant)}, expected {expected}",
+        )
+    image_steps = len(doc["jobs"]["docker-image"]["steps"])
+    cache_readers = [
+        f"docker-image-cache.steps[{index}]"
+        for index, step in enumerate(doc["jobs"]["docker-image-cache"]["steps"])
+        if CACHE_TOKEN_READ.search(json.dumps(step))
+    ]
+    check(
+        "a docker-image-cache step reads `secrets.GHCR_CACHE_TOKEN`, so the two "
+        "environment mutants below have a reader to expose",
+        cache_readers != [],
+        "no docker-image-cache step reads the token",
+    )
+    login = {
+        "uses": "docker/login-action@v3",
+        "with": {"password": "${{ secrets.GHCR_CACHE_TOKEN }}"},
+    }
+    token_mutants = (
+        (
+            "a docker-image-cache job without `environment:` is reported",
+            lambda d: d["jobs"]["docker-image-cache"].pop("environment"),
+            cache_readers,
+        ),
+        (
+            "a docker-image-cache job in another environment is reported",
+            lambda d: d["jobs"]["docker-image-cache"].update(environment="production"),
+            cache_readers,
+        ),
+        (
+            "`environment: {name: docker-cache}` is accepted",
+            lambda d: d["jobs"]["docker-image-cache"].update(
+                environment={"name": "docker-cache"}
+            ),
+            [],
+        ),
+        (
+            "a docker-image step reading the token is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(login),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image job-level `env:` reading the token by index is reported",
+            lambda d: d["jobs"]["docker-image"].update(
+                env={"T": "${{ secrets['GHCR_CACHE_TOKEN'] }}"}
+            ),
+            ["docker-image.env"],
+        ),
+        (
+            "a docker-image step reading the token in lowercase is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"with": {"password": "${{ secrets.ghcr_cache_token }}"}}
+            ),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image step reading `toJSON(secrets)` is reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"run": "echo '${{ toJSON(secrets) }}'"}
+            ),
+            [f"docker-image.steps[{image_steps}]"],
+        ),
+        (
+            "a docker-image step reading another secret is not reported",
+            lambda d: d["jobs"]["docker-image"]["steps"].append(
+                {"with": {"password": "${{ secrets.GHCR_CACHE_TOKEN_OLD }}"}}
+            ),
+            [],
+        ),
+        (
+            "a workflow-level `env:` reading the token is reported",
+            lambda d: d.setdefault("env", {}).update(
+                T="${{ secrets.GHCR_CACHE_TOKEN }}"
+            ),
+            ["workflow.env"],
+        ),
+    )
+    for name, mutate, expected in token_mutants:
+        mutant = copy.deepcopy(doc)
+        mutate(mutant)
+        found = cache_token_reads_outside_environment(mutant)
+        check(name, found == expected, f"reported {found}, expected {expected}")
+
+
 # Each entry is (text the restore key must carry, the input that text stands for).
 # The file patterns are `hashFiles` arguments; the expressions are `${{ }}` contexts.
 ARTIFACT_KEY_FILE_INPUTS = (
@@ -4721,6 +4938,9 @@ def main() -> int:
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
+
+    print("package-writers — no `packages: write`; the cache token stays in docker-cache")
+    check_package_write_and_cache_token(workflow)
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)
