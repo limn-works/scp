@@ -1564,8 +1564,8 @@ jobs:
           # --workspace does NOT activate scp-testing's optional `sqlite`
           # feature. Three targets hold the tests it gates, and the other
           # targets already run under --workspace. Each run below selects only
-          # gated tests with `--no-tests=fail`, so deleting or re-gating them
-          # fails this lane: the `sqlite` module persistence_tests! expands in
+          # gated tests with `--no-tests=fail`: the `sqlite` module
+          # persistence_tests! expands in
           # persistence, every test in persistence_sdk, and one named test in
           # saga_bridge_journal_swap.
           cargo nextest run --no-tests=fail -p scp-testing --features sqlite --test persistence -E 'test(/^sqlite::/)'
