@@ -4442,24 +4442,32 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
 
 
 # Each producer whose upload lists several paths, with the artifact it uploads, the
-# marker file its build step touches under RUNNER_TEMP, and the uploaded paths the
+# marker file its build step touches under RUNNER_TEMP, the uploaded paths the
 # checkout tracks (a cache hit that leaves a tracked path out cannot be detected,
-# because the checkout supplies it).
+# because the checkout supplies it), and whether its verify step rejects a
+# zero-byte output (kotlin-test's two paths are files; the xcframework's include
+# directories).
 MULTI_PATH_PRODUCERS = (
     (
         "xcframework",
         "swift-xcframework-dev",
         "xcframework-build-start",
         ("bindings/swift/Sources/SCP/Internal/ScpBindings.swift",),
+        False,
     ),
-    ("kotlin-test", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", ()),
+    ("kotlin-test", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", (), True),
 )
 # Uploaded paths that name a file rather than a directory.
 UPLOADED_FILE_SUFFIXES = (".swift", ".so", ".kt")
 
 
 def check_multi_path_outputs_are_verified(
-    doc: dict, job_id: str, artifact: str, marker_name: str, tracked: tuple[str, ...]
+    doc: dict,
+    job_id: str,
+    artifact: str,
+    marker_name: str,
+    tracked: tuple[str, ...],
+    rejects_empty: bool,
 ) -> None:
     """Run a producer's verify step against each uploaded path gone or stale.
 
@@ -4468,7 +4476,8 @@ def check_multi_path_outputs_are_verified(
     marker the job touches before its build, and exits 0 when every path is fresh.
     On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step exits
     non-zero when an untracked path is absent and exits 0 when every path is
-    present.
+    present. When `rejects_empty` is set, the step also exits non-zero when a path
+    is a fresh zero-byte file, after a build and on a cache hit.
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
     nothing. The xcframework upload lists the tracked ScpBindings.swift, so the
@@ -4499,7 +4508,12 @@ def check_multi_path_outputs_are_verified(
     )
     now = 1_000_000_000
 
-    def run_with(missing: str | None, stale: str | None, hit: bool = False) -> int:
+    def run_with(
+        missing: str | None,
+        stale: str | None,
+        hit: bool = False,
+        empty: str | None = None,
+    ) -> int:
         with tempfile.TemporaryDirectory() as root:
             runner_temp = Path(root, "runner-temp")
             runner_temp.mkdir()
@@ -4517,7 +4531,7 @@ def check_multi_path_outputs_are_verified(
                     else target / "content"
                 )
                 file.parent.mkdir(parents=True, exist_ok=True)
-                file.write_text("built\n")
+                file.write_text("" if path == empty else "built\n")
                 stamp = now - 100 if path == stale or hit else now + 100
                 for entry in {file, target}:
                     os.utime(entry, (stamp, stamp))
@@ -4562,6 +4576,18 @@ def check_multi_path_outputs_are_verified(
             run_with(path, None, hit=True) != 0,
             f"the verify step passes a cache hit without {path}",
         )
+    if rejects_empty:
+        for path in paths:
+            check(
+                f"{job_id}: a zero-byte {path} written by the build fails the producer",
+                run_with(None, None, empty=path) != 0,
+                f"the verify step before the upload passes over an empty {path}",
+            )
+            check(
+                f"{job_id}: on a cache hit a zero-byte {path} fails the producer",
+                run_with(None, None, hit=True, empty=path) != 0,
+                f"the verify step passes a cache hit that restored an empty {path}",
+            )
 
 
 def a_producer_and_an_unguarded_consumer(
@@ -4785,9 +4811,9 @@ def main() -> int:
         "producer-outputs — a producer uploading several paths fails on a missing "
         "output"
     )
-    for job_id, artifact, marker_name, tracked in MULTI_PATH_PRODUCERS:
+    for job_id, artifact, marker_name, tracked, rejects_empty in MULTI_PATH_PRODUCERS:
         check_multi_path_outputs_are_verified(
-            workflow, job_id, artifact, marker_name, tracked
+            workflow, job_id, artifact, marker_name, tracked, rejects_empty
         )
 
     print("needs-condition — a job's dependencies run wherever the job does")
