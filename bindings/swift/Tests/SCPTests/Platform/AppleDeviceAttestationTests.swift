@@ -54,8 +54,7 @@
 //    expires, and one case asserts the default is 25 seconds.
 // 6. When `attestKey` returns an attestation object, the adapter records
 //    that key ID as attested, and a later `attest` generates and attests a
-//    replacement key, which becomes the stored key only when its attestation
-//    returns. `DCError.invalidKey` from
+//    replacement key. `DCError.invalidKey` from
 //    `assertRequest`'s `generateAssertion` keeps a key with no record
 //    (`SCP-ATTEST-9022`) and discards a recorded key's ID and record
 //    (`SCP-ATTEST-9023`);
@@ -1974,11 +1973,6 @@
     /// when the stored key carries an attestation record, including when that
     /// record lands while the `attest` waits in the queue, and a failed
     /// replacement attestation leaves the attested key in place.
-    ///
-    /// A key generated to replace an attested key is stored apart from it,
-    /// so `assertRequest` keeps naming the key an
-    /// earlier published attestation names whatever the replacement's
-    /// `attestKey` answers.
     struct AppAttestKeyReplacementTests {
         @Test("two attests in a row attest two keys, and an assertion reaches the second")
         func repeatedAttestReplacesKey() async {
@@ -2179,8 +2173,7 @@
             }) == "returned bytes")
             #expect(service.assertedKeyIds == [replacementKeyId, storedKeyId])
 
-            // The next attest generates another replacement, which becomes
-            // the stored key only when an attestation naming it returns.
+            // The next attest generates another replacement.
             let attestation = try? await harness.adapter.attest(challenge: Data(repeating: 0x02, count: 32), deviceId: deviceId)
             #expect(attestation == nextAttestation)
             #expect(service.attestedKeyIds == [replacementKeyId, scriptedKeyId])
