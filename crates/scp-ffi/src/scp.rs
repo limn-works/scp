@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError};
+use scp_ffi_common::bridge_instance::{
+    BridgeInstanceCore, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+};
 
 use crate::error::ScpPyError;
 use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
@@ -302,9 +304,10 @@ impl PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the tokio runtime is unavailable, and the
-    /// storage error if the durable store refused to close after the
-    /// Supervisor drained; the store then keeps its advisory lock.
+    /// Raises `ContextError` if the tokio runtime is unavailable, and
+    /// `ValidationError` with `SCP-STORAGE-8005` when the durable store still
+    /// holds its advisory lock after the call: the Supervisor drain did not
+    /// finish before the deadline, or the store refused to close.
     pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {
         let timeout = Duration::from_millis(timeout_millis);
         let rt = crate::runtime()?;
@@ -313,24 +316,7 @@ impl PyScp {
         // drain tasks for up to `timeout_millis`, and we must not block the
         // Python interpreter meanwhile.
         py.allow_threads(|| {
-            rt.block_on(async move {
-                match inner.shutdown(timeout).await {
-                    Ok(_) => Ok::<(), ScpPyError>(()),
-                    // AlreadyShutDown is swallowed: Python callers expect
-                    // `.shutdown()` to be idempotent. No wildcard arm: a new
-                    // ShutdownError variant must fail to compile here until it
-                    // is mapped to a Python error, instead of reporting a live
-                    // engine as shut down.
-                    Err(e @ ShutdownError::AlreadyShutDown) => {
-                        tracing::debug!("SCP.shutdown: {e} — treating as no-op");
-                        Ok(())
-                    }
-                    // The Supervisor drained but the durable store refused to
-                    // close: it keeps its lock, so the caller learns a reopen
-                    // will fail.
-                    Err(ShutdownError::DurableStoreClose(e)) => Err(ScpPyError::from(e)),
-                }
-            })
+            rt.block_on(async move { sdk_shutdown(inner.shutdown(timeout).await) })
         })?;
         Ok(())
     }
@@ -383,6 +369,55 @@ impl PyScp {
         Self {
             inner: Arc::new(PyBridgeInstance::new_in_memory_for_test()),
         }
+    }
+}
+
+/// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Writer
+/// per Durable Directory"): a durable store the shutdown left holding its
+/// advisory lock raises `SCP-STORAGE-8005`, so the caller learns that a
+/// reopen of the directory will fail.
+fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpPyError> {
+    sdk_shutdown_result(result).map_err(|message| ScpPyError::ValidationError {
+        message,
+        code: scp_ffi_common::error_codes::STORAGE_8005.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod sdk_shutdown_tests {
+    use super::*;
+    use scp_ffi_common::error_codes::STORAGE_8005;
+
+    #[test]
+    fn store_left_locked_raises_storage_8005() {
+        let timed_out = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            durable_store_open: true,
+        }));
+        assert!(
+            matches!(&timed_out, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
+            "{timed_out:?}"
+        );
+        let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
+            scp_platform::PlatformError::StorageError("close refused".to_owned()),
+        )));
+        assert!(
+            matches!(&refused, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn released_store_reports_success() {
+        assert!(
+            sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
+                elapsed: Duration::ZERO,
+                panicked_tasks: 0,
+            }))
+            .is_ok()
+        );
+        assert!(sdk_shutdown(Err(ShutdownError::AlreadyShutDown)).is_ok());
     }
 }
 

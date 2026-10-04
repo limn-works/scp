@@ -20,7 +20,9 @@ use std::time::Duration;
 use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownError};
+use scp_ffi_common::bridge_instance::{
+    BridgeInstanceCore as _, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+};
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
 
@@ -317,8 +319,8 @@ impl Scp {
     /// Shuts down this bridge instance with a graceful deadline.
     ///
     /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-    /// aborts any remaining tasks, then clears registries and runs
-    /// shutdown hooks. Permanent — a shut-down instance cannot be reused.
+    /// then clears registries and runs shutdown hooks. Permanent — a
+    /// shut-down instance cannot be reused.
     ///
     /// The unit is **milliseconds** — unified across all Rust bridges.
     /// The width is `u64` so the NAPI / `UniFFI` / `PyO3` bridges share
@@ -336,17 +338,7 @@ impl Scp {
     ) -> napi::Result<()> {
         let (_sign, value, _lossless) = timeout_millis.get_u64();
         let timeout = Duration::from_millis(value);
-        match self.inner.shutdown(timeout).await {
-            // `AlreadyShutDown` is treated as a harmless lifecycle
-            // observation — double-shutdown is idempotent at the SDK
-            // surface. No wildcard arm: a new ShutdownError variant must
-            // fail to compile here until it is mapped to a JS error, instead
-            // of reporting a live engine as shut down.
-            Ok(_) | Err(ShutdownError::AlreadyShutDown) => Ok(()),
-            // The Supervisor drained but the durable store refused to close:
-            // it keeps its lock, so the caller learns a reopen will fail.
-            Err(ShutdownError::DurableStoreClose(e)) => Err(ScpNapiError::from(e).into()),
-        }
+        sdk_shutdown(self.inner.shutdown(timeout).await).map_err(Into::into)
     }
 
     /// Returns the instance id as a base-10 string.
@@ -5311,6 +5303,55 @@ mod concurrency_cap_tests {
             RECOVERY_CONCURRENCY_CAP,
             "pool must return to full capacity once permits are dropped"
         );
+    }
+}
+
+/// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Writer
+/// per Durable Directory"): a durable store the shutdown left holding its
+/// advisory lock raises `SCP-STORAGE-8005`, so the caller learns that a
+/// reopen of the directory will fail.
+fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpNapiError> {
+    sdk_shutdown_result(result).map_err(|message| ScpNapiError::Validation {
+        message,
+        code: codes::STORAGE_8005.to_owned(),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod sdk_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn store_left_locked_raises_storage_8005() {
+        let err = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            durable_store_open: true,
+        }))
+        .err()
+        .map(NapiError::from)
+        .expect("a store left holding its lock must not report success");
+        assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
+        let err = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
+            scp_platform::PlatformError::StorageError("close refused".to_owned()),
+        )))
+        .err()
+        .map(NapiError::from)
+        .expect("a store that refused to close must not report success");
+        assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
+    }
+
+    #[test]
+    fn released_store_reports_success() {
+        assert!(
+            sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
+                elapsed: Duration::ZERO,
+                panicked_tasks: 0,
+            }))
+            .is_ok()
+        );
+        assert!(sdk_shutdown(Err(ShutdownError::AlreadyShutDown)).is_ok());
     }
 }
 

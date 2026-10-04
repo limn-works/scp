@@ -23599,6 +23599,32 @@ mod tests {
         assert_eq!(context_code_of(err), codes::CTX_2138);
     }
 
+    /// Spec §17.6 "One Writer per Durable Directory": a held lock and a closed
+    /// store carry their registered storage codes; any other platform error
+    /// keeps the crypto catch-all.
+    #[test]
+    fn storage_platform_errors_carry_registered_codes() {
+        let held: ScpError = scp_platform::PlatformError::StorageLockHeld {
+            dir: "/tmp/scp".to_owned(),
+            lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+        }
+        .into();
+        assert!(
+            matches!(&held, ScpError::Validation { code, .. } if code == codes::STORAGE_8005),
+            "{held:?}"
+        );
+        let closed: ScpError = scp_platform::PlatformError::StorageClosed.into();
+        assert!(
+            matches!(&closed, ScpError::Validation { code, .. } if code == codes::STORAGE_8006),
+            "{closed:?}"
+        );
+        let other: ScpError = scp_platform::PlatformError::StorageError("io".to_owned()).into();
+        assert!(
+            matches!(&other, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4004),
+            "{other:?}"
+        );
+    }
+
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the
     /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
     /// The same code is surfaced by the `PyO3` bridge for

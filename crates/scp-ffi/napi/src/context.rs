@@ -2115,10 +2115,6 @@ pub(crate) async fn context_subscribe_on(
     // orphan the task, making shutdown falsely report `GracefulWithin`
     // while the subscription still held onto `transport_mgr`,
     // `ContextManager`, and the cancel_token Arcs.
-    // Capture an owned `Arc<Supervisor>` scoped to this bridge so the spawned
-    // task doesn't need to re-resolve it via a per-instance lookup. Falls back
-    // gracefully if the supervisor is not attached yet; the spawned task
-    // signals completion when so.
     // A `Weak` (ADR-049 Decision 16): the subscribe task and the heartbeat
     // scheduler run in the bridge's `JoinSet` and must not keep the Supervisor
     // alive past shutdown. Each use upgrades it; a failed upgrade ends the task.
@@ -2405,8 +2401,8 @@ pub(crate) async fn context_subscribe_on(
         // `cancel_token`; the other three did not, so without this the
         // `run_heartbeat_scheduler` task (which shares this `cancel_token`)
         // would keep firing `Supervisor::send_heartbeat` on a dead
-        // subscription — leaking the task plus its owned `Arc<Supervisor>`
-        // and exported signing key, and emitting false liveness. A later
+        // subscription — leaking the task and exported signing key, and
+        // emitting false liveness. A later
         // re-subscribe overwrites the handle's cancel token without cancelling
         // the old one, so this teardown is the only thing that stops the
         // orphaned scheduler. Cancelling an already-cancelled token (the

@@ -1185,11 +1185,13 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 /// finds `{dir}/scp.db.lock` held by another store, in this process or
 /// another (`scp_platform::PlatformError::StorageLockHeld`). Spec §17.6 "One
 /// Writer per Durable Directory" makes the open fail at once: it does not
-/// wait for the lock and does not fall back to another backend. Within one
-/// process the lock stays held after a shutdown that returned
-/// `ShutdownOutcome::TimedOut`, until the previous instance's last writer
-/// exits; after a shutdown that returned `GracefulWithin`, the lock is free
-/// and a reopen succeeds on its first attempt.
+/// wait for the lock and does not fall back to another backend.
+///
+/// Also returned by an SDK `shutdown` that left the instance's own store
+/// holding its lock: the Supervisor drain did not finish before the deadline
+/// (`ShutdownOutcome::TimedOut` with `durable_store_open`), or the store
+/// refused to close (`ShutdownError::DurableStoreClose`). A reopen of the
+/// directory then fails with this code until the store is released.
 pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
 
 /// The store has released its database connection.

@@ -172,9 +172,7 @@ pub enum StorageInitError {
     },
     /// Another store holds the directory's advisory lock, in this process or
     /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Writer per
-    /// Durable Directory"). Within one process this persists after a
-    /// shutdown that returned `ShutdownOutcome::TimedOut` until the previous
-    /// instance's last writer exits.
+    /// Durable Directory").
     LockHeld {
         /// The directory path the caller asked for (for the error message).
         path: String,
@@ -231,10 +229,11 @@ impl From<StorageInitError> for crate::ScpError {
     fn from(err: StorageInitError) -> Self {
         match err {
             // A rejected key, an unwritable directory and a held advisory lock
-            // are all caller-supplied selections this bridge could not honour,
-            // which `SCP-STORAGE-8004` names. The `PyO3` and NAPI bridges
-            // report the same code for the same failure, so a caller reading a
-            // code learns the same thing whichever binding raised it. Reporting
+            // are all caller-supplied selections this bridge could not honour;
+            // `err.code()` names each (`SCP-STORAGE-8004`, or `8005` for a held
+            // lock). The `PyO3` and NAPI bridges report the same code for the
+            // same failure, so a caller reading a code learns the same thing
+            // whichever binding raised it. Reporting
             // `SCP-CTX-2000` here said "context error" for a storage-selection
             // failure that no context took part in.
             StorageInitError::SqliteOpen { .. } | StorageInitError::LockHeld { .. } => {
@@ -531,7 +530,9 @@ impl UniffiBridgeInstance {
     ///
     /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
     /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
-    /// or a salt-sidecar fail-closed condition). FAIL CLOSED (spec §17.6):
+    /// or a salt-sidecar fail-closed condition), and
+    /// [`StorageInitError::LockHeld`] if another store holds the directory's
+    /// advisory lock. FAIL CLOSED (spec §17.6):
     /// the bridge does NOT silently degrade to in-memory or no-storage on a
     /// failed durable-backend open. The error surfaces to Swift as `throws`
     /// and Kotlin as a thrown exception via the [`From`] impl on
@@ -1710,6 +1711,78 @@ mod tests {
             bi.durable_providers_ref().is_some(),
             "in-memory dev path must populate the durable providers"
         );
+    }
+
+    /// `from_open_failure` keeps the lock-still-held condition apart from
+    /// every other open failure, and `code()` names each one's registered
+    /// code (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes).
+    #[test]
+    fn open_failure_classification_carries_registered_codes() {
+        let held = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+        );
+        assert!(
+            matches!(held, StorageInitError::LockHeld { .. }),
+            "{held:?}"
+        );
+        assert_eq!(held.code(), scp_ffi_common::error_codes::STORAGE_8005);
+        let other = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageError("bad key".to_owned()),
+        );
+        assert!(
+            matches!(other, StorageInitError::SqliteOpen { .. }),
+            "{other:?}"
+        );
+        assert_eq!(other.code(), scp_ffi_common::error_codes::STORAGE_8004);
+    }
+
+    /// Spec §17.6 "One Writer per Durable Directory": a second open of a
+    /// directory whose store is live fails with `LockHeld`, and a shutdown
+    /// that finished in time closes the store (through the bridge's
+    /// `durable_store_closer`) before it returns, so a reopen succeeds on its
+    /// first attempt even while the shut-down instance is still alive.
+    #[test]
+    fn sqlite_shutdown_releases_the_lock_before_returning() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x33u8; 32],
+            },
+        })
+        .expect("first open");
+        let second = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x33u8; 32],
+            },
+        });
+        assert!(
+            matches!(second, Err(StorageInitError::LockHeld { .. })),
+            "a second open of a live store's directory must fail with LockHeld"
+        );
+        let outcome = crate::runtime().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "{outcome:?}"
+        );
+        let reopened = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x33u8; 32],
+            },
+        });
+        assert!(
+            reopened.is_ok(),
+            "a reopen after a shutdown that finished in time must succeed on its first attempt"
+        );
+        drop(bi);
     }
 
     #[test]

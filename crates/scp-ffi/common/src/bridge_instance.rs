@@ -2504,10 +2504,11 @@ impl CoreFields {
         // (economy accessors), which is already true.
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
+        let has_durable_store = store_closer.is_some();
         let drain = self
             .run_shutdown_side_effects(remaining, store_closer)
             .await;
-        combine_shutdown_outcome(outcome, drain)
+        combine_shutdown_outcome(outcome, drain, has_durable_store)
     }
 
     /// Cleanup body of the async [`shutdown_core_async`](Self::shutdown_core_async)
@@ -2643,11 +2644,10 @@ impl CoreFields {
 
         if let Some(supervisor) = self.supervisor.get() {
             // The sync path has no caller to return an error to (it runs
-            // from destructors and atexit hooks). `shutdown_all_contexts_sync`
-            // fails only outside a tokio runtime, when nothing was drained.
-            // This path never closes the durable store, so an undrained
-            // Supervisor cannot lose its storage under a live writer: the
-            // advisory lock is released when the last storage `Arc` drops.
+            // from destructors and atexit hooks). This path never closes the
+            // durable store, so an undrained Supervisor cannot lose its
+            // storage under a live writer: the advisory lock is released when
+            // the last storage `Arc` drops.
             if let Err(e) = supervisor.flush_all_contexts_sync() {
                 tracing::warn!(
                     error = %e,
@@ -2733,10 +2733,13 @@ fn close_durable_store(
 /// and the Supervisor's tracked tasks to have finished in time. A drain that
 /// did not finish turns the outcome into [`ShutdownOutcome::TimedOut`]; its
 /// `aborted_tasks` still counts only the bridge tasks aborted, because no
-/// tracked task is ever aborted.
+/// tracked task is ever aborted. `durable_store_open` is true only when the
+/// drain did not finish and the instance has a durable store, which then
+/// stayed open.
 fn combine_shutdown_outcome(
     outcome: ShutdownOutcome,
     drain: SupervisorDrain,
+    has_durable_store: bool,
 ) -> Result<ShutdownOutcome, ShutdownError> {
     let drain_panics = usize::from(matches!(drain, SupervisorDrain::Panicked));
     match drain {
@@ -2746,15 +2749,58 @@ fn combine_shutdown_outcome(
             ShutdownOutcome::GracefulWithin { panicked_tasks, .. } => ShutdownOutcome::TimedOut {
                 aborted_tasks: 0,
                 panicked_tasks: panicked_tasks + drain_panics,
+                durable_store_open: has_durable_store,
             },
             ShutdownOutcome::TimedOut {
                 aborted_tasks,
                 panicked_tasks,
+                ..
             } => ShutdownOutcome::TimedOut {
                 aborted_tasks,
                 panicked_tasks: panicked_tasks + drain_panics,
+                durable_store_open: has_durable_store,
             },
         }),
+    }
+}
+
+/// Reduces a [`BridgeInstanceCore::shutdown`] result to what an SDK
+/// `shutdown` reports. An SDK `shutdown` returns no [`ShutdownOutcome`], so
+/// this decides whether the caller sees success or an error.
+///
+/// Returns `Ok(())` when no durable store is left holding its advisory lock:
+/// [`ShutdownOutcome::GracefulWithin`], a `TimedOut` whose
+/// `durable_store_open` is false, and [`ShutdownError::AlreadyShutDown`].
+///
+/// # Errors
+///
+/// Returns the message of the [`crate::error_codes::STORAGE_8005`] error each
+/// bridge raises when the durable store still holds its advisory lock: a
+/// `TimedOut` with `durable_store_open` set, or
+/// [`ShutdownError::DurableStoreClose`].
+pub fn sdk_shutdown_result(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), String> {
+    match result {
+        Ok(
+            ShutdownOutcome::GracefulWithin { .. }
+            | ShutdownOutcome::TimedOut {
+                durable_store_open: false,
+                ..
+            },
+        )
+        | Err(ShutdownError::AlreadyShutDown) => Ok(()),
+        Ok(ShutdownOutcome::TimedOut {
+            durable_store_open: true,
+            ..
+        }) => Err(
+            "shutdown did not finish draining the Supervisor before its deadline: the durable \
+             store stays open and keeps its advisory lock, so a reopen of the same directory \
+             fails until the store is released"
+                .to_owned(),
+        ),
+        Err(e @ ShutdownError::DurableStoreClose(_)) => Err(format!(
+            "{e} — the durable store keeps its advisory lock, so a reopen of the same \
+             directory fails until the process releases it"
+        )),
     }
 }
 
@@ -2798,6 +2844,7 @@ async fn drain_under_deadline(
     ShutdownOutcome::TimedOut {
         aborted_tasks: aborted,
         panicked_tasks: panicked + abort_panicked,
+        durable_store_open: false,
     }
 }
 
@@ -3184,8 +3231,7 @@ pub enum ShutdownOutcome {
     /// The deadline expired before the bridge's own tasks or the
     /// Supervisor's tracked tasks finished, or the Supervisor drain panicked.
     /// The bridge's `JoinSet` was aborted; the Supervisor's tracked tasks
-    /// never are, and the durable store keeps its advisory lock until the
-    /// last of them exits.
+    /// never are.
     TimedOut {
         /// Number of the bridge's own `JoinSet` tasks that were aborted
         /// because the shutdown deadline was reached (tasks that had already
@@ -3197,6 +3243,13 @@ pub enum ShutdownOutcome {
         /// secondary failure mode when the primary shutdown path races with
         /// a panicking task.
         panicked_tasks: usize,
+        /// True when the Supervisor drain did not finish and the instance has
+        /// a durable store: the store was not closed and keeps its advisory
+        /// lock. After a drain that missed the deadline, the detached drain
+        /// closes it once the last tracked task exits; after a drain that
+        /// panicked, nothing closes it and the lock is released when the
+        /// last handle to the store drops.
+        durable_store_open: bool,
     },
 }
 
@@ -5001,12 +5054,17 @@ mod tests {
         let ShutdownOutcome::TimedOut {
             aborted_tasks,
             panicked_tasks,
+            durable_store_open,
         } = outcome
         else {
             unreachable!("expected TimedOut, got {outcome:?}");
         };
         assert_eq!(aborted_tasks, 1);
         assert_eq!(panicked_tasks, 0);
+        assert!(
+            !durable_store_open,
+            "an instance with no durable store never reports one open"
+        );
         assert!(instance.is_shutdown());
     }
 
@@ -5274,7 +5332,7 @@ mod tests {
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let supervisor = Supervisor::with_providers(
             Arc::new(NodeMlsFactory::new(
-                "did:test:bridge-drain".to_owned(),
+                "did:dht:zbridgedrain".to_owned(),
                 Arc::new(scp_clock::SystemClock),
             )),
             Box::new(LocalTransportProvider),
@@ -5293,7 +5351,7 @@ mod tests {
                     ceiling: vec![scp_core::context::Capability::MessagesRead],
                     ..scp_core::context::ContextParams::default()
                 },
-                scp_did::DID::from("did:test:bridge-drain-creator"),
+                scp_did::DID::from("did:dht:zbridgedraincreator"),
                 None,
             )
             .await
@@ -5323,8 +5381,18 @@ mod tests {
             .await
             .expect("shutdown reports an outcome");
         assert!(
-            matches!(outcome, ShutdownOutcome::TimedOut { .. }),
-            "a wedged drain must report TimedOut, got {outcome:?}"
+            matches!(
+                outcome,
+                ShutdownOutcome::TimedOut {
+                    durable_store_open: true,
+                    ..
+                }
+            ),
+            "a wedged drain must report TimedOut with the store open, got {outcome:?}"
+        );
+        assert!(
+            sdk_shutdown_result(Ok(outcome)).is_err(),
+            "an SDK shutdown must not report success while the store keeps its lock"
         );
 
         let reopen = scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY);
@@ -5378,5 +5446,97 @@ mod tests {
             .expect("the store closed before shutdown returned, so the first reopen succeeds");
         reopened.close().expect("close the reopened store");
         drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// The SDK surface reports success only when no durable store is left
+    /// holding its lock, and an error for each way the store can stay locked.
+    #[test]
+    fn sdk_shutdown_result_fails_only_while_the_store_keeps_its_lock() {
+        let graceful = ShutdownOutcome::GracefulWithin {
+            elapsed: Duration::ZERO,
+            panicked_tasks: 0,
+        };
+        assert_eq!(sdk_shutdown_result(Ok(graceful)), Ok(()));
+        let timed_out_store_closed = ShutdownOutcome::TimedOut {
+            aborted_tasks: 1,
+            panicked_tasks: 0,
+            durable_store_open: false,
+        };
+        assert_eq!(sdk_shutdown_result(Ok(timed_out_store_closed)), Ok(()));
+        assert_eq!(
+            sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown)),
+            Ok(())
+        );
+
+        let timed_out_store_open = ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            durable_store_open: true,
+        };
+        let msg = sdk_shutdown_result(Ok(timed_out_store_open)).unwrap_err();
+        assert!(msg.contains("keeps its advisory lock"), "{msg}");
+        let msg = sdk_shutdown_result(Err(ShutdownError::DurableStoreClose(
+            scp_platform::PlatformError::StorageError("close refused".to_owned()),
+        )))
+        .unwrap_err();
+        assert!(
+            msg.contains("close refused") && msg.contains("keeps its advisory lock"),
+            "{msg}"
+        );
+    }
+
+    /// `durable_store_open` is set only when the drain did not finish and the
+    /// instance has a durable store; a finished drain closes the store even
+    /// when the bridge's own tasks timed out.
+    #[test]
+    fn combine_shutdown_outcome_marks_the_store_open_only_for_an_unfinished_drain() {
+        let graceful = || ShutdownOutcome::GracefulWithin {
+            elapsed: Duration::ZERO,
+            panicked_tasks: 0,
+        };
+        let bridge_timed_out = || ShutdownOutcome::TimedOut {
+            aborted_tasks: 2,
+            panicked_tasks: 0,
+            durable_store_open: false,
+        };
+        assert_eq!(
+            combine_shutdown_outcome(graceful(), SupervisorDrain::Pending, true).unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 0,
+                panicked_tasks: 0,
+                durable_store_open: true,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(graceful(), SupervisorDrain::Panicked, true).unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 0,
+                panicked_tasks: 1,
+                durable_store_open: true,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Pending, false).unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 2,
+                panicked_tasks: 0,
+                durable_store_open: false,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Finished(Ok(())), true)
+                .unwrap(),
+            bridge_timed_out()
+        );
+        assert!(matches!(
+            combine_shutdown_outcome(
+                graceful(),
+                SupervisorDrain::Finished(Err(scp_platform::PlatformError::StorageError(
+                    "close refused".to_owned()
+                ))),
+                true,
+            ),
+            Err(ShutdownError::DurableStoreClose(_))
+        ));
     }
 }

@@ -45,7 +45,7 @@ fn selection_layer_codes_carry_their_registered_numbers() {
     assert_eq!(STORAGE_8006, "SCP-STORAGE-8006");
 }
 
-/// Neither selection-layer code takes a number another backend owns. An
+/// No selection-layer code takes a number another backend owns. An
 /// Android app links `AndroidStorage` and the `UniFFI` bridge into one process,
 /// so a selection-layer code inside `8001`--`8003` would make one code string
 /// name two conditions in that app.

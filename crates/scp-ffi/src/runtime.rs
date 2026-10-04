@@ -282,9 +282,7 @@ pub enum StorageInitError {
     },
     /// Another store holds the directory's advisory lock, in this process or
     /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Writer per
-    /// Durable Directory"). Within one process this persists after a
-    /// shutdown that returned `ShutdownOutcome::TimedOut` until the previous
-    /// instance's last writer exits.
+    /// Durable Directory").
     LockHeld {
         /// The directory path the caller asked for (for the error message).
         path: String,
@@ -627,14 +625,16 @@ impl PyBridgeInstance {
     ///   trust, and MCP reads hit the same connection pool (one DB
     ///   connection per process — `SQLite` cannot share one across two
     ///   `SqliteStorage::new` calls). If opening fails, the
-    ///   [`StorageInitError::SqliteOpen`] error is returned to the caller
+    ///   [`StorageInitError`] is returned to the caller
     ///   (and logged via `tracing::error!`) — no half-constructed bridge
     ///   is exposed.
     ///
     /// # Errors
     ///
     /// Returns [`StorageInitError::SqliteOpen`] if `SqliteStorage::new`
-    /// fails (bad key, permission denied, corrupt file, schema mismatch).
+    /// fails (bad key, permission denied, corrupt file, schema mismatch), and
+    /// [`StorageInitError::LockHeld`] if another store holds the directory's
+    /// advisory lock.
     pub fn with_storage_py(cfg: StorageConfig) -> Result<Self, StorageInitError> {
         match cfg {
             StorageConfig::InMemory => {
@@ -3356,6 +3356,72 @@ mod tests {
     /// trait methods can be driven from a sync `#[test]` without depending on
     /// the bridge's shared global runtime (which may not be initialized in a
     /// unit-test process).
+    /// `from_open_failure` keeps the lock-still-held condition apart from
+    /// every other open failure, and `code()` names each one's registered
+    /// code (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes).
+    #[test]
+    fn open_failure_classification_carries_registered_codes() {
+        let held = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+        );
+        assert!(
+            matches!(held, StorageInitError::LockHeld { .. }),
+            "{held:?}"
+        );
+        assert_eq!(held.code(), scp_ffi_common::error_codes::STORAGE_8005);
+        let other = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageError("bad key".to_owned()),
+        );
+        assert!(
+            matches!(other, StorageInitError::SqliteOpen { .. }),
+            "{other:?}"
+        );
+        assert_eq!(other.code(), scp_ffi_common::error_codes::STORAGE_8004);
+    }
+
+    /// Spec §17.6 "One Writer per Durable Directory": a second open of a
+    /// directory whose store is live fails with `LockHeld`, and a shutdown
+    /// that finished in time closes the store (through the bridge's
+    /// `durable_store_closer`) before it returns, so a reopen succeeds on its
+    /// first attempt even while the shut-down instance is still alive.
+    #[test]
+    fn sqlite_shutdown_releases_the_lock_before_returning() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
+        })
+        .expect("first open");
+        let second = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            matches!(second, Err(StorageInitError::LockHeld { .. })),
+            "a second open of a live store's directory must fail with LockHeld"
+        );
+        let outcome = test_rt().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "{outcome:?}"
+        );
+        let reopened = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            reopened.is_ok(),
+            "a reopen after a shutdown that finished in time must succeed on its first attempt"
+        );
+        drop(bi);
+    }
+
     fn test_rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
