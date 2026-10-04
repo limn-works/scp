@@ -584,6 +584,11 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # scripts/fix-round-check.sh names.
 EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 
+# Jobs whose `if:` is `github.event_name == 'push'`. Job docker-image-cache holds
+# `packages: write` to export the Docker layer cache, and
+# check_package_writers_run_only_on_push requires that grant to stay push-only.
+PUSH_ONLY_JOBS = ("docker-image-cache",)
+
 # Jobs a `changes` filter output selects.
 RUST_ONLY_RUNS = {
     "bridge-parity": True,
@@ -637,31 +642,36 @@ SCENARIOS = {
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
         filters=DOCS_ONLY,
         event="pull_request",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "docs-only, push": Scenario(
         name="docs-only, push",
         filters=DOCS_ONLY,
         event="push",
-        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
+        runs=DOCS_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        | dict.fromkeys(PUSH_ONLY_JOBS, True),
     ),
     "rust-only, merge_group": Scenario(
         name="rust-only, merge_group",
         filters=RUST_ONLY,
         event="merge_group",
-        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False),
+        runs=RUST_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, False)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
     "python-only, pull_request": Scenario(
         name="python-only, pull_request",
         filters=PYTHON_ONLY,
         event="pull_request",
-        runs=PYTHON_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True),
+        runs=PYTHON_ONLY_RUNS | dict.fromkeys(EVENT_ONLY_JOBS, True)
+        | dict.fromkeys(PUSH_ONLY_JOBS, False),
     ),
 }
 
@@ -3969,6 +3979,44 @@ def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
             )
 
 
+def package_writers_off_push(doc: dict) -> list[str]:
+    """Return every job holding `packages: write` whose `if:` is not push-only.
+
+    Job docker-image-cache exports the Docker layer cache that every run reads, so
+    a pull request or merge group run that held this grant from the workflow on
+    `main` could overwrite what `main` reads.
+    """
+    return sorted(
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if (job.get("permissions") or {}).get("packages") == "write"
+        and " ".join(str(job.get("if") or "").split()) != "github.event_name == 'push'"
+    )
+
+
+def check_package_writers_run_only_on_push(doc: dict) -> None:
+    """Only a push-only job holds `packages: write`; two mutants must be reported."""
+    check(
+        "every job holding `packages: write` runs only on a push",
+        package_writers_off_push(doc) == [],
+        f"jobs holding `packages: write` off a push: {package_writers_off_push(doc)}",
+    )
+    granted = copy.deepcopy(doc)
+    granted["jobs"]["docker-image"]["permissions"]["packages"] = "write"
+    check(
+        "a docker-image job granted `packages: write` is reported",
+        package_writers_off_push(granted) == ["docker-image"],
+        f"the grant went unreported: {package_writers_off_push(granted)}",
+    )
+    widened = copy.deepcopy(doc)
+    widened["jobs"]["docker-image-cache"]["if"] = "needs.changes.outputs.rust == 'true'"
+    check(
+        "a docker-image-cache job whose `if:` admits a pull request is reported",
+        package_writers_off_push(widened) == ["docker-image-cache"],
+        f"the widened condition went unreported: {package_writers_off_push(widened)}",
+    )
+
+
 def check_xcframework_outputs_are_verified(doc: dict) -> None:
     """Run the xcframework job's verify step against each uploaded path gone or stale.
 
@@ -4243,6 +4291,7 @@ def main() -> int:
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
+    check_package_writers_run_only_on_push(workflow)
 
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)

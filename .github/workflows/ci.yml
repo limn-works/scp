@@ -1851,10 +1851,13 @@ jobs:
   # the cache manifest but none of its blobs and rebuilt from `WORKDIR` down, and a pull
   # request run an hour after a main export failed with `blob sha256:…: not found` on the
   # cook layer and recompiled every dependency. A registry is outside that cap.
-  # `packages: write` holds for every event that runs this job, a pull request from a
-  # branch of this repository and a merge group included; only the `cache-to`
-  # expression, which that pull request's own copy of this file supplies, keeps those
-  # runs from writing the cache.
+  #
+  # WHO CAN WRITE THE CACHE. This job holds `packages: read` and builds without
+  # exporting. Job `docker-image-cache` runs only on a push to `main`, holds
+  # `packages: write`, and is the only job that exports. The split leaves one
+  # exposure open: a pull request from a branch of this repository runs its own copy
+  # of this file, which can grant itself `packages: write` and export to the tag every
+  # later run reads through `cache-from`.
   docker-image:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1863,7 +1866,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
       # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
@@ -1884,7 +1887,6 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
-      # A pull request from a fork gets a read-only token, which still reads the cache.
       # `continue-on-error` so a failed login cannot fail the build check.
       - uses: docker/login-action@v3
         continue-on-error: true
@@ -1896,15 +1898,54 @@ jobs:
         with:
           context: .
           push: false
-          # Read the cache everywhere; write it only from a push to `main`, so every run
-          # reads what `main` built. `mode=max` keeps the chef and builder stages, which
-          # hold the toolchain, cargo-chef, and the cooked dependencies; the final stage
-          # alone holds none of them. `image-manifest=true` stores the cache as an OCI
-          # image manifest. `ignore-error` so a registry failure cannot fail the build
-          # check: this job answers whether the image builds. A missing
+          # A missing or unreadable cache only makes buildkit warn and build every layer.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
+
+  # Builds the same image on every push to `main` and exports its layer cache; the
+  # comment on job `docker-image` above says why the export lives in this job alone.
+  # Its `if:` reads only the event, because the `ci` gate cannot read a condition that
+  # joins the event to a filter output and a step-level filter condition would report
+  # success over zero work, so a push that changes no Rust still builds here.
+  docker-image-cache:
+    needs: changes
+    if: github.event_name == 'push'
+    name: Docker / relay and node image (cache export)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Job `docker-image`'s copy of this step says why it is conditional.
+      - name: Free disk space when the runner is short of it
+        run: |
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      # `continue-on-error` so a failed login cannot fail the build check.
+      - uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          # `mode=max` keeps the chef and builder stages, which hold the toolchain,
+          # cargo-chef, and the cooked dependencies; the final stage alone holds none of
+          # them. `image-manifest=true` stores the cache as an OCI image manifest.
+          # `ignore-error` so a registry failure cannot fail the build check. A missing
           # or unreadable cache only makes buildkit warn and build every layer.
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
-          cache-to: ${{ github.event_name == 'push' && format('type=registry,ref=ghcr.io/{0}/buildcache:docker-image,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true', github.repository) || '' }}
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
 
   # ── Shared bridge artifacts ─────────────────────────────────────────
   #
@@ -3361,6 +3402,7 @@ jobs:
       - toolchain-wiring
       - fix-round-check-selftest
       - docker-image
+      - docker-image-cache
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts

@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Builds the `scp-relay` and `scp-node` binaries into a Debian runtime image.
 #
 # WHERE THE RUST VERSION COMES FROM. This file names none. `rust-toolchain.toml` — the
