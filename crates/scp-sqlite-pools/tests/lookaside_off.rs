@@ -2,9 +2,6 @@
 //! lookaside pool, even after the key statement and an insert with bound
 //! values, the statements whose text and values a lookaside slot would keep
 //! (spec §17.6, `SQLCipher` configuration).
-//!
-//! Every connection in this file opens through the crate, so `SQLite`
-//! initializes after the page-cache configuration call.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

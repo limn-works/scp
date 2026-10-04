@@ -1486,7 +1486,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [transport, node-relay, platform-testing]
+        group: [transport, node-relay, platform-testing, sqlite-without-memory-management]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -1578,6 +1578,23 @@ jobs:
           # the scp-transport `BackendChoice` unit tests with both arms compiled.
           cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --test storage_backend_selection
           cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
+      # 17-persistence-and-storage.md §17.6: scp-sqlite-pools refuses every
+      # open unless the linked SQLite was compiled with
+      # SQLITE_ENABLE_MEMORY_MANAGEMENT, the option under which no page cache
+      # allocates a bulk block. The default build defines it, so only a build
+      # that undefines it shows the refusal comes from the real compile-option
+      # query and not a constant. This group compiles the bundled SQLCipher
+      # with the option undefined, in a target directory of its own so no
+      # other build or cache sees that SQLite, and runs the crate's one ignored
+      # test, which asserts that `open` and `open_in_memory` refuse with
+      # `PageCacheBulkPossible`. Selecting only that test leaves out
+      # page_cache_rollback.rs, which fails in this build by design.
+      - name: Refuse a SQLite built without ENABLE_MEMORY_MANAGEMENT
+        if: matrix.group == 'sqlite-without-memory-management'
+        env:
+          LIBSQLITE3_FLAGS: -USQLITE_ENABLE_MEMORY_MANAGEMENT
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-without-memory-management
+        run: cargo nextest run --no-tests=fail -p scp-sqlite-pools --lib --run-ignored only -E 'test(=tests::open_refuses_a_sqlite_built_without_memory_management)'
       - name: Run platform and scp-testing tests
         if: matrix.group == 'platform-testing'
         run: |
