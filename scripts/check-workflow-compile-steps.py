@@ -29,6 +29,9 @@ CHECK 1 — every `Swatinem/rust-cache` step names its group and says whether it
   finishes first decide the entry's contents; a group with no writer never populates;
   a writer on any ref other than `main` writes an entry that only its own ref can read.
   The cap is per repository, not per workflow, so the count runs across every file.
+  A `shared-key` holding `${{ matrix.<axis> }}` counts as one group per value of that
+  axis, the keys GitHub expands it to on the job's legs, so a templated writer and a
+  literal writer of one expanded key count as two writers of that group.
 
 CHECK 2 — every uniffi-bindgen step reads the library out of the directory its own
 `cargo run` writes.
@@ -140,7 +143,7 @@ def check_workflows(workflows_dir: Path) -> list[str]:
                 uses = step.get("uses")
                 if isinstance(uses, str) and uses.startswith(RUST_CACHE_ACTION):
                     cache_steps += 1
-                    failures.extend(check_cache_step(where, step, producers))
+                    failures.extend(check_cache_step(where, step, job, producers))
                 run = step.get("run")
                 if isinstance(run, str):
                     found, step_failures = check_bindgen_run(where, run)
@@ -174,8 +177,53 @@ def check_workflows(workflows_dir: Path) -> list[str]:
     return failures
 
 
+MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
+
+
+def expand_matrix_key(where: str, key: str, job: dict) -> tuple[list[str], list[str]]:
+    """The keys a `shared-key` takes on the job's matrix legs, and any failure.
+
+    Each `${{ matrix.<axis> }}` in the key is replaced by every value of that axis's
+    list in `strategy.matrix`, so a templated key counts as one group per value, as
+    GitHub expands it at runtime. An axis with no list of scalars there (absent, or
+    defined only through `include`) is reported, and so is a matrix carrying
+    `include` or `exclude`, because either one can add or remove legs, and this
+    check could not say which groups the step writes.
+    """
+    keys = [key]
+    matrix = (job.get("strategy") or {}).get("matrix")
+    for axis in dict.fromkeys(MATRIX_REFERENCE.findall(key)):
+        expanders = [
+            k
+            for k in ("include", "exclude")
+            if isinstance(matrix, dict) and k in matrix
+        ]
+        if expanders:
+            message = (
+                f"{where}: rust-cache `shared-key` {key!r} names matrix axis {axis!r} "
+                f"of a `strategy.matrix` carrying {' and '.join(expanders)}, so this "
+                f"check cannot say which groups the step writes"
+            )
+            return [], [message]
+        values = matrix.get(axis) if isinstance(matrix, dict) else None
+        if not (
+            isinstance(values, list)
+            and values
+            and all(isinstance(v, (str, int, float, bool)) for v in values)
+        ):
+            message = (
+                f"{where}: rust-cache `shared-key` {key!r} names matrix axis {axis!r}, "
+                f"which the job's `strategy.matrix` gives no list of values, so this "
+                f"check cannot say which groups the step writes"
+            )
+            return [], [message]
+        pattern = re.compile(r"\$\{\{\s*matrix\." + re.escape(axis) + r"\s*\}\}")
+        keys = [pattern.sub(lambda _m, v=str(v): v, k) for k in keys for v in values]
+    return list(dict.fromkeys(keys)), []
+
+
 def check_cache_step(
-    where: str, step: dict, producers: dict[str, list[str]]
+    where: str, step: dict, job: dict, producers: dict[str, list[str]]
 ) -> list[str]:
     failures: list[str] = []
     with_block = step.get("with")
@@ -200,10 +248,14 @@ def check_cache_step(
         )
         return failures
     save_if = with_block["save-if"]
+    keys, key_failures = expand_matrix_key(where, shared_key, job)
+    failures.extend(key_failures)
     if is_false(save_if):
-        producers.setdefault(shared_key, [])
+        for key in keys:
+            producers.setdefault(key, [])
         return failures
-    producers[shared_key].append(where)
+    for key in keys:
+        producers[key].append(where)
     if not (isinstance(save_if, str) and DEFAULT_BRANCH_REF in save_if):
         failures.append(
             f"{where}: the writer of cache group {shared_key!r} has save-if {save_if!r}, "
