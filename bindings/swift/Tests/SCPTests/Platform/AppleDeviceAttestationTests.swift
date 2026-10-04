@@ -33,8 +33,7 @@
 //    §9.3.1 of the security model spec as those two inputs.
 // 5. While every call ends with Apple's answer, App Attest sees one
 //    outstanding call at a time: a call queued behind a running call reaches
-//    Apple only after that call ends, concurrent `attest` calls on a device
-//    with no stored key generate one key, and every adapter over one
+//    Apple only after that call ends, and every adapter over one
 //    `UserDefaults` object shares one lock and one call serializer. A call that the `isSupported` check or the 32-byte
 //    check rejects returns while another call holds the serializer, so it
 //    never waits in the queue. A call Apple does not answer within the

@@ -260,9 +260,7 @@
     /// `callSerializer`, an actor, runs the App Attest calls of every `attest`
     /// and `assertRequest`, key generation included, one call at a time, in
     /// the order the serializer accepts them. Each call therefore reads the
-    /// stored key ID after every preceding call ended. When every preceding
-    /// call ended with Apple's answer, concurrent `attest` calls on a device
-    /// with no stored key generate one key.
+    /// stored key ID after every preceding call ended.
     /// `attest` and `assertRequest` check `isSupported` and the 32-byte
     /// length before they queue a call, so a call either check rejects waits
     /// for no other call.
@@ -327,9 +325,7 @@
         private let lock: NSLock
 
         /// Runs one App Attest call at a time, so each call reads the stored
-        /// key ID after every preceding call ended, and concurrent `attest`
-        /// calls generate one key while every preceding call ended with
-        /// Apple's answer.
+        /// key ID after every preceding call ended.
         private let callSerializer: AppAttestCallSerializer
 
         /// How long one serialized App Attest call may run before its caller
@@ -551,9 +547,7 @@
 
             // The two checks above run before the call is queued, so a call
             // they reject waits for no other call. The key ID is read inside
-            // the serialized call, so it follows every preceding call's write,
-            // and concurrent first calls generate one key while every
-            // preceding call ended with Apple's answer.
+            // the serialized call, so it follows every preceding call's write.
             let outcome = await callSerializer.run(timeLimit: callTimeLimit) { [self] call in
                 // Apple attests one key once, so a key this adapter recorded
                 // as attested goes to no `attestKey` call: a stored
@@ -1068,9 +1062,7 @@
     /// promise to run jobs in the order callers made them: it may run a
     /// later, higher-priority caller's job before an earlier, lower-priority
     /// one. So the order App Attest sees is the acceptance order, not the
-    /// order in which callers called `attest` or `assertRequest`. Neither the
-    /// serializer's mutual exclusion nor the one-key guarantee, which holds
-    /// while every call ends with Apple's answer, depends on that order.
+    /// order in which callers called `attest` or `assertRequest`.
     ///
     /// **Why serialization, rather than a lock around the key-ID read:**
     /// `generateKey` answers through a completion handler, so a lock cannot be
