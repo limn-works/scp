@@ -1079,6 +1079,12 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     test("participation facts match the canonical cross-SDK counts (real SCP method)", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
+      // Event timestamps are whole Unix seconds from the core's system clock,
+      // and a still-open membership interval runs to the latest event timestamp
+      // (§7.3.2). Events milliseconds apart that straddle a second boundary
+      // yield a duration of 1, so the duration is bounded by the whole seconds
+      // the clock crosses during the scenario instead of pinned to 0.
+      const beforeSecs = Math.floor(Date.now() / 1000);
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -1126,13 +1132,15 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         }),
         admin.did,
       );
+      const afterSecs = Math.floor(Date.now() / 1000);
 
       const adminRec = await scpInstance.participationRecord(realContextId, admin.did);
       const memberRec = await scpInstance.participationRecord(realContextId, member.did);
 
       // The CANONICAL counts the Python sibling test asserts verbatim. Keys are
       // the deterministic, DID-independent facts (the Merkle root + subject_did
-      // are excluded since they vary per run).
+      // are excluded since they vary per run; the wall-clock participation
+      // duration is bounded separately below).
       const counts = (r: BehavioralRecord) => ({
         governanceActionsAgainst: r.governanceActionsAgainst,
         governanceActionsBy: r.governanceActionsBy,
@@ -1141,7 +1149,6 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         contextCreationCount: r.contextCreationCount,
         roleProgressionCount: r.roleProgressionCount,
         attestationCount: r.attestationCount,
-        participationDurationSecs: r.participationDurationSecs,
       });
       expect(counts(adminRec)).toEqual({
         governanceActionsAgainst: 0,
@@ -1151,7 +1158,6 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         contextCreationCount: 1,
         roleProgressionCount: 0,
         attestationCount: 0,
-        participationDurationSecs: 0,
       });
       expect(counts(memberRec)).toEqual({
         governanceActionsAgainst: 1,
@@ -1161,8 +1167,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         contextCreationCount: 0,
         roleProgressionCount: 1,
         attestationCount: 0,
-        participationDurationSecs: 0,
       });
+      // Every event timestamp lies in [beforeSecs, afterSecs], so no membership
+      // interval can exceed the whole seconds elapsed across the scenario.
+      for (const rec of [adminRec, memberRec]) {
+        expect(rec.participationDurationSecs).toBeGreaterThanOrEqual(0);
+        expect(rec.participationDurationSecs).toBeLessThanOrEqual(afterSecs - beforeSecs);
+      }
     });
 
     // `evaluateTrust` must remain usable on a context with NO convergent leaves
