@@ -206,14 +206,14 @@ nothing:
   matrix-axis
                Job rust-test-optional-features runs its commands on six legs,
                two runners times three values of a matrix `group` axis, and job
-               rust-clippy runs on three values of a `leg` axis; each step picks
-               its legs with `if: matrix.<axis> == '<value>'`. GitHub runs a leg
-               whose value no step names and reports it green over none of the
-               gated commands, and it skips a step whose value the axis lacks
-               on every leg, so deleting `platform-testing` from the `group`
-               axis would have dropped eight commands from every run while `ci`
-               passed. The check reports a step gated in that form on an axis
-               the job's matrix does not define.
+               rust-clippy runs on three values of a `leg` axis. GitHub runs a
+               leg whose value no step names and reports it green over none of
+               the gated commands, and it skips a step whose value the axis
+               lacks on every leg, so deleting `platform-testing` from the
+               `group` axis would have dropped eight commands from every run
+               while `ci` passed. The check reports a step gated with
+               `if: matrix.<axis> == '<value>'` on an axis the job's matrix does
+               not define.
   package-writers
                Job docker-image-cache writes the Docker layer cache to the
                ghcr.io tag `buildcache:docker-image` with the `docker-cache`
