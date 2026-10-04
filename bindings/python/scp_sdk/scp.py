@@ -1470,17 +1470,24 @@ class SCP:
         parent_token: str,
         capabilities: list[str],
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`)."""
+        """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`).
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
         from scp_sdk.ucan import UcanToken
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_delegate,
-            context_id,
-            delegator_did,
-            delegatee_did,
-            parent_token,
-            capabilities,
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_delegate,
+                context_id,
+                delegator_did,
+                delegatee_did,
+                parent_token,
+                capabilities,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return UcanToken._from_bridge(raw)
 
     async def ucan_mint(
@@ -1490,17 +1497,31 @@ class SCP:
         capabilities: list[str],
         proofs: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`)."""
+        """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`).
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
         from scp_sdk.ucan import UcanToken
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_mint, context_id, member_did, capabilities, proofs
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_mint, context_id, member_did, capabilities, proofs
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return UcanToken._from_bridge(raw)
 
     async def ucan_revoke(self, context_id: str, token: str, revoker_did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_revoke``."""
-        return await asyncio.to_thread(self._native.ucan_revoke, context_id, token, revoker_did)
+        """Delegate to ``_scp_core.SCP.ucan_revoke``.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
+        """
+        try:
+            return await asyncio.to_thread(self._native.ucan_revoke, context_id, token, revoker_did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def ucan_validate(
         self,
@@ -1517,6 +1538,9 @@ class SCP:
         presenting agent to the token's own ``aud`` (which would make the
         step-5 audience check the tautology ``aud == aud`` and inflate trust).
         Pass the DID the token must be addressed to.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
 
         try:
@@ -1572,21 +1596,27 @@ class SCP:
         capability URI to additionally require the token grants it. (The
         enforcing :meth:`ucan_validate` gate keeps a mandatory capability.)
 
-        Raises ``ValidationError`` only for malformed FFI input
+        Raises ``ValidationError`` for malformed FFI input
         (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
         ``did``); capability/signature/expiry outcomes are reported via the
         returned booleans, never as exceptions.
+
+        Raises :class:`~scp_sdk.errors.ContextError` carrying ``SCP-CTX-2023`` when
+        the context is not active.
         """
         from scp_sdk.trust import structured_to_capability_validation
 
-        raw = await asyncio.to_thread(
-            self._native.ucan_evaluate,
-            context_id,
-            token,
-            capability,
-            presenting_agent_did,
-            proof_tokens,
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.ucan_evaluate,
+                context_id,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         # Shared six-field projection — pins the canonical CapabilityValidation
         # shape in one place (the same helper Layer 1 of ``evaluate_trust`` uses).
         return structured_to_capability_validation(raw)
