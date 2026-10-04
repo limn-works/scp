@@ -33,7 +33,6 @@ use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
-use zeroize::Zeroizing;
 
 use super::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
@@ -306,21 +305,21 @@ impl ProductionMlsBackend {
 /// Opaque byte layout behind [`SignerState`]. Private to this module.
 ///
 /// `signer_bytes` and `mls_storage_entries` hold private signing key and HPKE
-/// decryption-key material. A transient `SerializedSigner` (the wrapper built to
-/// serialize a signer-state in `serialize_signer_state`, or parsed back out of
-/// one via `parse_signer_state` during a join) would otherwise drop those
-/// private `Vec`s un-zeroed. The hand-written [`Drop`] zeroes them on every drop
-/// while leaving the on-disk serde format (plain `Vec<u8>` / tuple-vec fields)
-/// unchanged. `key_package_public_bytes` is the publishable KP and is not zeroed.
+/// decryption-key material, so both are `Zeroizing`: a transient
+/// `SerializedSigner` (the wrapper built to serialize a signer-state in
+/// `serialize_signer_state`, or parsed back out of one via `parse_signer_state`
+/// during a join) wipes them on every drop. `Zeroizing`'s serde impls delegate
+/// to the inner value, so the encoding is that of plain `Vec<u8>` / tuple-vec
+/// fields. `key_package_public_bytes` is the publishable KP and is not zeroed.
 #[derive(Serialize, Deserialize)]
 struct SerializedSigner {
     /// MessagePack-serialized [`SignatureKeyPair`] bytes. Zeroed on drop.
-    signer_bytes: Vec<u8>,
+    signer_bytes: zeroize::Zeroizing<Vec<u8>>,
     /// Raw MLS storage entries from the `InMemoryMlsProvider` generated
     /// alongside the `KeyPackage`. Needed to process a Welcome addressed to
     /// the KP (`OpenMLS` reads the private HPKE decryption key out of
     /// storage when decrypting the Welcome). Zeroed on drop.
-    mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    mls_storage_entries: scp_mls::snapshot::ProviderStorageEntries,
     /// TLS-serialized PUBLIC `KeyPackage` bytes this signer-state was
     /// generated for. Carried so [`MlsBackend::join_from_welcome`] can derive
     /// the consumed-init-key marker from the signer-state's OWN KP and bind it
@@ -330,49 +329,33 @@ struct SerializedSigner {
     key_package_public_bytes: Vec<u8>,
 }
 
-impl Drop for SerializedSigner {
-    fn drop(&mut self) {
-        // Zero the private signing-key + HPKE-key material on drop;
-        // `key_package_public_bytes` is publishable.
-        zeroize::Zeroize::zeroize(&mut self.signer_bytes);
-        for (k, v) in &mut self.mls_storage_entries {
-            zeroize::Zeroize::zeroize(k);
-            zeroize::Zeroize::zeroize(v);
-        }
-    }
-}
-
 fn serialize_signer_state(
     signer: &SignatureKeyPair,
     provider: &InMemoryMlsProvider,
     key_package_public_bytes: &[u8],
 ) -> Result<SignerState, MlsError> {
-    let signer_bytes = Zeroizing::new(
-        rmp_serde::to_vec_named(signer)
-            .map_err(|e| MlsError::StorageError(format!("signer serialization: {e}")))?,
-    );
-
-    let mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-        let values = provider
-            .storage()
-            .values
-            .read()
-            .map_err(|e| MlsError::StorageError(format!("provider lock poisoned: {e}")))?;
-        values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
-
-    let wrapper = SerializedSigner {
-        signer_bytes: signer_bytes.to_vec(),
-        mls_storage_entries,
-        key_package_public_bytes: key_package_public_bytes.to_vec(),
-    };
-
-    let bytes = Zeroizing::new(
-        rmp_serde::to_vec_named(&wrapper)
-            .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?,
-    );
+    let wrapper = serialized_signer(signer, provider, key_package_public_bytes)?;
+    let bytes = scp_mls::secret_msgpack::encode_named(&wrapper)
+        .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?;
 
     Ok(SignerState { bytes })
+}
+
+/// Captures the [`SerializedSigner`] wrapper [`serialize_signer_state`]
+/// encodes: the signer bytes, the provider's storage entries, and the public
+/// `KeyPackage` bytes.
+fn serialized_signer(
+    signer: &SignatureKeyPair,
+    provider: &InMemoryMlsProvider,
+    key_package_public_bytes: &[u8],
+) -> Result<SerializedSigner, MlsError> {
+    let (signer_bytes, mls_storage_entries) =
+        scp_mls::snapshot::capture_signer_and_storage(provider, signer)?;
+    Ok(SerializedSigner {
+        signer_bytes,
+        mls_storage_entries,
+        key_package_public_bytes: key_package_public_bytes.to_vec(),
+    })
 }
 
 /// Parse the opaque [`SignerState`] blob into its [`SerializedSigner`] wrapper
@@ -400,11 +383,10 @@ fn signer_and_provider_from_wrapper(
             .values
             .write()
             .map_err(|e| MlsError::StorageError(format!("provider lock poisoned: {e}")))?;
-        // `SerializedSigner` has a `Drop` that zeroes its private fields, so
-        // the entries cannot be moved out by value; take them out via
-        // `mem::take` (leaving an empty Vec the Drop harmlessly zeroes) so the
-        // private bytes move into the provider without an extra copy.
-        for (k, v) in std::mem::take(&mut wrapper.mls_storage_entries) {
+        // The entries move into the provider without a copy; the provider's
+        // own `Drop` wipes them, and the drained `Zeroizing` vector wipes its
+        // buffer when `wrapper` drops.
+        for (k, v) in wrapper.mls_storage_entries.drain(..) {
             values.insert(k, v);
         }
     }
@@ -518,19 +500,10 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
     ) -> Result<(), MlsError> {
-        // Parse the incoming Commit bytes and process via `decrypt_with_sender_did`
-        // path, but only accept Commit outcomes. This reuses the existing
-        // `process_message` + `merge_staged_commit` sequence verbatim.
-        let content = decrypt_with_sender_did(group, commit_bytes, self.clock.as_ref())?;
-        match content {
-            DecryptedContent::Commit { .. } => Ok(()),
-            DecryptedContent::Application { .. } => Err(MlsError::CommitProcessingFailed(
-                "expected Commit, got Application message".to_string(),
-            )),
-            DecryptedContent::Proposal { .. } => Err(MlsError::CommitProcessingFailed(
-                "expected Commit, got Proposal message".to_string(),
-            )),
-        }
+        // `decrypt_commit` refuses a non-Commit before decrypting it, so a
+        // refused application message or Proposal consumes no ratchet
+        // generation, then merges a Commit through `decrypt_with_sender_did`.
+        scp_mls::encrypt::decrypt_commit(group, commit_bytes, self.clock.as_ref())
     }
 
     async fn advance_epoch(
@@ -860,6 +833,42 @@ mod tests {
 
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()
+    }
+
+    /// `SerializedSigner`'s `Zeroizing` fields encode exactly as the plain
+    /// `Vec` fields they replaced, so a signer-state written before the change
+    /// still parses and one written after it reads as the plain layout.
+    #[test]
+    fn serialized_signer_encodes_like_plain_fields() {
+        #[derive(Serialize, Deserialize)]
+        struct Plain {
+            signer_bytes: Vec<u8>,
+            mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+            key_package_public_bytes: Vec<u8>,
+        }
+        let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        let provider = InMemoryMlsProvider::default();
+        provider
+            .storage()
+            .values
+            .write()
+            .unwrap()
+            .insert(b"EncryptionKeyPair-a".to_vec(), vec![0xC3_u8; 48]);
+        let wrapper = serialized_signer(&signer, &provider, &[0x5A_u8; 37]).unwrap();
+        assert_eq!(wrapper.mls_storage_entries.len(), 1);
+        let plain = Plain {
+            signer_bytes: wrapper.signer_bytes.to_vec(),
+            mls_storage_entries: wrapper.mls_storage_entries.to_vec(),
+            key_package_public_bytes: wrapper.key_package_public_bytes.clone(),
+        };
+        let plain_bytes = rmp_serde::to_vec_named(&plain).unwrap();
+        assert_eq!(rmp_serde::to_vec_named(&wrapper).unwrap(), plain_bytes);
+        let parsed = parse_signer_state(&SignerState {
+            bytes: zeroize::Zeroizing::new(plain_bytes),
+        })
+        .unwrap();
+        assert_eq!(*parsed.signer_bytes, plain.signer_bytes);
+        assert_eq!(*parsed.mls_storage_entries, plain.mls_storage_entries);
     }
 
     /// A `ProductionMlsBackend` with the durable consumed-init-key store
@@ -1756,6 +1765,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bob_grp.epoch().unwrap(), 2);
+    }
+
+    /// An application message handed to the backend's `process_commit` is
+    /// refused before decryption, so Bob's epoch is unchanged and the same bytes
+    /// still decrypt through the backend's `decrypt`: the refusal consumed no
+    /// sender ratchet generation and deleted no key.
+    #[tokio::test]
+    async fn process_commit_refuses_application_message_without_consuming_its_key() {
+        let backend = joinable_backend();
+
+        let alice_cred = test_credential("alice-pcapp");
+        let bob_cred = test_credential("bob-pcapp");
+        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
+        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+        let added = backend
+            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+        let mut bob_grp = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        let epoch_before = bob_grp.epoch().unwrap();
+
+        let ct = backend.encrypt(&mut alice_grp, b"in flight").await.unwrap();
+        let err = backend.process_commit(&mut bob_grp, &ct).await.unwrap_err();
+        assert!(
+            matches!(err, MlsError::CommitProcessingFailed(_)),
+            "expected CommitProcessingFailed, got {err:?}"
+        );
+        assert_eq!(bob_grp.epoch().unwrap(), epoch_before);
+
+        match backend.decrypt(&mut bob_grp, &ct).await.unwrap() {
+            DecryptedContent::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"in flight");
+            }
+            other => panic!("expected Application, got {other:?}"),
+        }
     }
 
     /// Byte-level equivalence: a backend-produced encryption can be

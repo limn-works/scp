@@ -52,7 +52,7 @@ tls_codec = "0.5"
 # native and a wasm32 build round-trip byte-compatibly.
 serde = { workspace = true }
 rmp-serde = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 
 # wasm32 backends: mirror scp-mls/Cargo.toml so the driver compiles to wasm32.

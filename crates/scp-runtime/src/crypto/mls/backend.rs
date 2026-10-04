@@ -261,8 +261,22 @@ pub trait MlsBackend: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`MlsError::DecryptionFailed`] for parse / verification
-    /// failures; [`MlsError::CommitProcessingFailed`] if merging fails.
+    /// On every error raised before the merge the group's epoch is unchanged;
+    /// a storage error from openmls's `merge_staged_commit` can leave the group
+    /// partly merged, so the caller treats the group as unusable.
+    ///
+    /// - [`MlsError::GroupDestroyed`] if the group has been destroyed.
+    /// - [`MlsError::DecryptionFailed`] if the bytes are not an MLS protocol
+    ///   message, or decryption, verification, or sender resolution fails.
+    /// - [`MlsError::CommitProcessingFailed`] if a well-formed message is an
+    ///   application message or a Proposal rather than a Commit (refused
+    ///   before decryption, so it consumes no ratchet generation), or if
+    ///   merging fails.
+    /// - [`MlsError::CannotDecryptOwnMessage`] for the local member's own
+    ///   echoed Commit.
+    /// - [`MlsError::KeyPackageLifetimeInvalid`] if an Add proposal's
+    ///   `KeyPackage` lifetime fails the injected-clock or maximum-range check;
+    ///   the Commit is not merged.
     async fn process_commit(
         &self,
         group: &mut ScpMlsGroup,

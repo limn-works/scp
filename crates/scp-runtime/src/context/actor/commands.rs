@@ -3854,7 +3854,7 @@ pub enum LifecycleControlCommand {
     PrepareForReplace {
         /// The incoming export's MLS crypto bytes (empty = no incoming
         /// crypto state) — the only handler-side payload import needs.
-        mls_state: Vec<u8>,
+        mls_state: zeroize::Zeroizing<Vec<u8>>,
         /// `Ok(())` iff the context was replaceable AND crypto teardown +
         /// epoch-floor validate/merge succeeded. On failure the actor stays
         /// live (no terminal claim) and surfaces the reason: `MembershipFailed`

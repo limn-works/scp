@@ -139,9 +139,11 @@ uuid = { version = "1", features = ["v4", "v7"] }
 # every SCP call site takes a provider: `scp-runtime`'s `ScpMlsProvider` wraps
 # `openmls_rust_crypto::RustCrypto` (crates/scp-runtime/src/crypto/mls/storage.rs) and
 # `scp-mls`'s `InMemoryMlsProvider` wraps `openmls_rust_crypto::OpenMlsRustCrypto`
-# (crates/scp-mls/src/provider.rs). Enabling it compiled 23 libcrux crates, 2 hax crates,
-# `openmls_libcrux_crypto` and `hpke-rs-libcrux` into every build, and carried eleven
-# RUSTSEC advisories that `deny.toml` had to ignore.
+# (crates/scp-mls/src/provider.rs); both take their randomness from
+# `scp_mls::provider::OsRand`, a stateless operating-system source. Enabling it
+# compiled 23 libcrux crates, 2 hax crates, `openmls_libcrux_crypto` and
+# `hpke-rs-libcrux` into every build, and carried eleven RUSTSEC advisories that
+# `deny.toml` had to ignore.
 openmls = { version = "0.9" }
 openmls_traits = "0.6"
 openmls_basic_credential = "0.6"

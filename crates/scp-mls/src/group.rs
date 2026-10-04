@@ -60,10 +60,12 @@ pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 /// (A dedicated `scp-mls` unit test cross-checks this against the `test-utils`
 /// `private()` accessor, so a future upstream serde-shape change fails loudly.)
 ///
-/// The intermediate serialized bytes and the extracted seed `Vec` are zeroized;
-/// the returned seed rides home in [`Zeroizing`](zeroize::Zeroizing). Fails
-/// closed if the seed is not exactly 32 bytes, so a non-Ed25519 or malformed
-/// signer can never be silently truncated into a derivation.
+/// The signer is serialized by [`crate::secret_msgpack::encode_named`] into one
+/// buffer sized to the encoding, so no reallocation frees a partial copy; that buffer and
+/// the extracted seed `Vec` are zeroized, and the returned seed rides home in
+/// [`Zeroizing`](zeroize::Zeroizing). Fails closed if the seed is not exactly
+/// 32 bytes, so a non-Ed25519 or malformed signer can never be silently
+/// truncated into a derivation.
 fn extract_ed25519_seed(
     signer: &SignatureKeyPair,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>, MlsError> {
@@ -95,10 +97,10 @@ fn extract_ed25519_seed(
         )));
     }
 
-    let mut serialized = rmp_serde::to_vec_named(signer)
+    let serialized = crate::secret_msgpack::encode_named(signer)
         .map_err(|e| MlsError::PseudonymDerivationFailed(format!("serializing MLS signer: {e}")))?;
     let extract: Result<Ed25519SeedExtract, _> = rmp_serde::from_slice(&serialized);
-    serialized.zeroize();
+    drop(serialized);
     let mut extract = extract.map_err(|e| {
         MlsError::PseudonymDerivationFailed(format!("recovering MLS signer private seed: {e}"))
     })?;
@@ -950,7 +952,11 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // old one, and `InMemoryMlsProvider`'s `Drop` zeroizes every value present
     // then, once. This does not reach values openmls already
     // replaced or deleted during the group's life: `MemoryStorage` freed those
-    // unzeroized.
+    // unzeroized. The provider's random source (`OsRand`) keeps no seed, so no
+    // generator state survives from which the secrets openmls drew through
+    // `rand()` could be regenerated. HPKE encapsulation randomness is drawn
+    // through `crypto()` instead, and hpke-rs leaves its state unwiped (see the
+    // `provider` module doc).
     group.provider = InMemoryMlsProvider::default();
 
     // Mark the group as destroyed so all future operations are rejected.
@@ -1773,9 +1779,62 @@ mod tests {
             "generate_key_package must not copy the signer into provider storage"
         );
 
+        // join_group: the joiner's provider after processing the Welcome.
+        let mut alice = create_group(&cred, &SystemClock).unwrap();
+        let bob_cred = test_credential("bob");
+        let (bob_kp, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let add = add_member(
+            &mut alice,
+            bob_kp.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
+        let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
+        assert!(
+            !stores_signature_key_pair(bob.provider()),
+            "join_group must not copy the signer into provider storage"
+        );
+
+        // deserialize_state: the provider a restored snapshot is rebuilt into.
+        let restored = ScpMlsGroup::deserialize_state(&bob.serialize_state().unwrap()).unwrap();
+        assert!(
+            !restored
+                .provider()
+                .storage()
+                .values
+                .read()
+                .unwrap()
+                .is_empty(),
+            "the restored provider holds the group's secrets, so the scan sees real entries"
+        );
+        assert!(
+            !stores_signature_key_pair(restored.provider()),
+            "deserialize_state must not copy the signer into provider storage"
+        );
+
         // Control: the detector does see a stored signer.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the detector: stores the signer on purpose"
+        )]
         signer.store(provider.storage()).unwrap();
         assert!(stores_signature_key_pair(&provider));
+
+        // Control for the trait-method entry: a direct `StorageProvider` call,
+        // which bypasses `SignatureKeyPair::store`, is disallowed too.
+        let direct = InMemoryMlsProvider::default();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint: stores the signer through the trait on purpose"
+        )]
+        openmls_traits::storage::StorageProvider::write_signature_key_pair(
+            direct.storage(),
+            &signer.id(),
+            &signer,
+        )
+        .unwrap();
+        assert!(stores_signature_key_pair(&direct));
     }
 
     #[test]
