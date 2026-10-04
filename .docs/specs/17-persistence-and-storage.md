@@ -535,8 +535,24 @@ Only the first-initialization case — no `scp.db` and no `scp.salt` — generat
 // (`'<derived_key>'`) would instead treat the 64 hex characters as a passphrase
 // and PBKDF2-stretch them — a redundant second KDF over already-derived key
 // material. Raw-key syntax avoids that double-KDF.
+//
+// `conn` comes from an open that has already run the compile-option,
+// page-cache buffer probe, and lookaside checks below.
+
+// Step 1: the memory-security pragma, in a statement of its own.
+conn.execute_batch("PRAGMA cipher_memory_security = ON;")?;
+
+// Step 2: the readback, before the key statement. Anything other than the
+// single value `1` (a plain SQLite returns no row) refuses the open.
+let on: Option<String> = conn
+    .query_row("PRAGMA cipher_memory_security;", [], |row| row.get(0))
+    .optional()?;
+if on.as_deref() != Some("1") {
+    return Err(StorageError::MemorySecurityOff);
+}
+
+// Step 3: the key batch.
 conn.execute_batch("
-    PRAGMA cipher_memory_security = ON;
     PRAGMA key = \"x'<derived_key>'\";
     PRAGMA cipher_page_size = 4096;
     PRAGMA kdf_iter = 256000;
