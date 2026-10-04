@@ -1,6 +1,6 @@
 //! Opens `SQLCipher` connections with `SQLite`'s lookaside pool and page-cache
-//! bulk block both off (spec §17.6, `SQLCipher` configuration, and §9.15 of the
-//! security-model spec, freed heap memory).
+//! bulk block both proven off (spec §17.6, `SQLCipher` configuration, and §9.15
+//! of the security-model spec, freed heap memory).
 //!
 //! `PRAGMA cipher_memory_security = ON` makes `SQLCipher` wipe each block its
 //! allocator frees. Two `SQLite` pools reuse their slots without freeing them
@@ -13,34 +13,23 @@
 //!   or cache shrink dropped (`pcache1InitBulk` and `pcache1FreePage` in
 //!   `sqlite3.c`).
 //!
-//! Both are turned off at run time, so a build of `SQLCipher` with any flags,
-//! from the `PyPI` sdist, crates.io or the repository, has them off:
+//! [`open`] and [`open_in_memory`] prove both off before the connection's
+//! first statement:
 //!
-//! - **Page-cache bulk block.** `SQLite` sizes the bulk block from
-//!   `sqlite3GlobalConfig.nPage`, read once at initialization. Before any
-//!   connection opens, this crate calls
-//!   `sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0)` once per process,
-//!   records its return code in a `OnceLock`, and initializes `SQLite`. The call
-//!   returns `SQLITE_MISUSE` once `SQLite` is initialized, so a recorded
-//!   `SQLITE_OK` proves the bulk block is off for every connection in the
-//!   process, and any other code makes every open fail.
-//! - **Lookaside.** After opening a connection and before its first statement,
-//!   [`open`] calls `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0,
-//!   0)`. `SQLite` returns `SQLITE_BUSY` while any slot is in use, so
-//!   `SQLITE_OK` proves the pool is off for that connection.
+//! - **Page-cache bulk block.** `SQLite` allocates a bulk block only when it was
+//!   compiled without `SQLITE_ENABLE_MEMORY_MANAGEMENT`. With that option
+//!   `pcache1Init` sets `separateCache = 0`, so `nInitPage` stays 0 and
+//!   `pcache1InitBulk` allocates nothing, whatever the run-time configuration.
+//!   Before opening, each call asks the linked `SQLite`
+//!   `sqlite3_compileoption_used("ENABLE_MEMORY_MANAGEMENT")` and refuses
+//!   with [`PoolsError::PageCacheBulkPossible`] unless it returns 1. The bundled
+//!   `SQLCipher` that libsqlite3-sys 0.30.1 compiles defines the option.
+//! - **Lookaside.** After opening, each call runs
+//!   `sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)`. `SQLite`
+//!   returns `SQLITE_BUSY` while any slot is in use, so `SQLITE_OK` proves the
+//!   pool is off for that connection.
 //!
-//! The bundled `SQLCipher` that libsqlite3-sys 0.30.1 compiles defines
-//! `SQLITE_ENABLE_MEMORY_MANAGEMENT`, under which every cache shares one page
-//! group and `SQLite` allocates no bulk block, whatever the configuration. The
-//! page-cache call keeps the bulk block off for a build without that flag, and
-//! the recorded code is the only proof that does not depend on how `SQLite`
-//! was compiled.
-//!
-//! [`open`] and [`open_in_memory`] are the only ways SCP opens a `SQLCipher`
-//! connection. `SQLite`'s initialization reads the configuration once, so code
-//! that opens a connection without this crate before the first [`open`] leaves
-//! the bulk block on in a build that allocates one, and every later [`open`]
-//! then fails with [`PoolsError::PageCacheBulkOn`].
+//! The crate keeps no state: every open makes both checks itself.
 
 #![deny(unsafe_code)]
 
@@ -48,28 +37,16 @@ use std::ffi::{c_int, c_void};
 use std::fmt;
 use std::path::Path;
 use std::ptr;
-use std::sync::OnceLock;
 
 use rusqlite::{Connection, ffi};
-
-/// The return code of this process's one pre-initialization
-/// `sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0)` call, or of the
-/// `sqlite3_initialize` that follows it when that fails. `SQLite` reads the
-/// page-cache configuration only when it initializes, once per process, so
-/// only a record of this one call can prove later that the bulk block is off;
-/// every open reads it and refuses to proceed unless it is `SQLITE_OK`.
-static PAGE_CACHE_CONFIG_RESULT: OnceLock<c_int> = OnceLock::new();
 
 /// Why a `SQLCipher` connection cannot be opened with both pools off.
 #[derive(Debug)]
 pub enum PoolsError {
-    /// The process-wide page-cache configuration did not return `SQLITE_OK`.
-    /// `SQLITE_MISUSE` (21) means `SQLite` was initialized before the call
-    /// ran, so the bulk block is on for every connection in this process.
-    PageCacheBulkOn {
-        /// The `SQLite` result code recorded for the configuration call.
-        code: c_int,
-    },
+    /// The linked `SQLite` was compiled without
+    /// `SQLITE_ENABLE_MEMORY_MANAGEMENT`, so its page caches may allocate a
+    /// bulk block that the pragma never wipes.
+    PageCacheBulkPossible,
     /// `SQLite` could not open the connection.
     Open(rusqlite::Error),
     /// `sqlite3_db_config(SQLITE_DBCONFIG_LOOKASIDE, NULL, 0, 0)` did not
@@ -88,12 +65,10 @@ pub enum PoolsError {
 impl fmt::Display for PoolsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PageCacheBulkOn { code } => write!(
-                f,
-                "SQLite's page-cache bulk block cannot be proven off: the pre-initialization \
-                 sqlite3_config(SQLITE_CONFIG_PAGECACHE) returned code {code} (21 means SQLite \
-                 was initialized before SCP opened its first connection), so freed pages \
-                 would keep decrypted plaintext unwiped"
+            Self::PageCacheBulkPossible => f.write_str(
+                "SQLite's page-cache bulk block cannot be proven absent: the linked SQLite was \
+                 compiled without SQLITE_ENABLE_MEMORY_MANAGEMENT, so freed pages could keep \
+                 decrypted plaintext unwiped",
             ),
             Self::Open(e) => write!(f, "failed to open database: {e}"),
             Self::LookasideOn { code } => write!(
@@ -110,7 +85,7 @@ impl std::error::Error for PoolsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Open(e) => Some(e),
-            Self::PageCacheBulkOn { .. } | Self::LookasideOn { .. } | Self::Status { .. } => None,
+            Self::PageCacheBulkPossible | Self::LookasideOn { .. } | Self::Status { .. } => None,
         }
     }
 }
@@ -120,14 +95,14 @@ impl std::error::Error for PoolsError {
 ///
 /// # Errors
 ///
-/// [`PoolsError::PageCacheBulkOn`] when the process-wide configuration was not
-/// `SQLITE_OK`, [`PoolsError::Open`] when `SQLite` cannot open the file, and
+/// [`PoolsError::PageCacheBulkPossible`] when the linked `SQLite` lacks
+/// `SQLITE_ENABLE_MEMORY_MANAGEMENT` (no connection is opened),
+/// [`PoolsError::Open`] when `SQLite` cannot open the file, and
 /// [`PoolsError::LookasideOn`] when lookaside cannot be turned off.
 pub fn open(path: &Path) -> Result<Connection, PoolsError> {
-    require_page_cache_bulk_off()?;
-    let conn = Connection::open(path).map_err(PoolsError::Open)?;
-    turn_lookaside_off(&conn)?;
-    Ok(conn)
+    open_checked(memory_management_compile_option(), || {
+        Connection::open(path)
+    })
 }
 
 /// Opens an in-memory database with both pools proven off, as [`open`] does.
@@ -136,10 +111,10 @@ pub fn open(path: &Path) -> Result<Connection, PoolsError> {
 ///
 /// As [`open`].
 pub fn open_in_memory() -> Result<Connection, PoolsError> {
-    require_page_cache_bulk_off()?;
-    let conn = Connection::open_in_memory().map_err(PoolsError::Open)?;
-    turn_lookaside_off(&conn)?;
-    Ok(conn)
+    open_checked(
+        memory_management_compile_option(),
+        Connection::open_in_memory,
+    )
 }
 
 /// How much a connection's lookaside pool has served since it opened.
@@ -165,37 +140,37 @@ pub fn lookaside_use(conn: &Connection) -> Result<LookasideUse, PoolsError> {
     })
 }
 
-fn require_page_cache_bulk_off() -> Result<(), PoolsError> {
-    let code = *PAGE_CACHE_CONFIG_RESULT.get_or_init(configure_page_cache_before_init);
-    if code == ffi::SQLITE_OK {
+/// Refuses before `connect` runs unless `memory_management` (the linked
+/// `SQLite`'s answer for `ENABLE_MEMORY_MANAGEMENT`) is 1, then turns
+/// lookaside off on the new connection. [`open`] and [`open_in_memory`] pass
+/// the real answer; only this crate's unit tests pass another.
+fn open_checked(
+    memory_management: c_int,
+    connect: impl FnOnce() -> rusqlite::Result<Connection>,
+) -> Result<Connection, PoolsError> {
+    require_no_bulk_block(memory_management)?;
+    let conn = connect().map_err(PoolsError::Open)?;
+    turn_lookaside_off(&conn)?;
+    Ok(conn)
+}
+
+/// `sqlite3_compileoption_used` returns 1 when the option was defined at
+/// compile time and 0 otherwise; only 1 proves the bulk block absent.
+const fn require_no_bulk_block(memory_management: c_int) -> Result<(), PoolsError> {
+    if memory_management == 1 {
         Ok(())
     } else {
-        Err(PoolsError::PageCacheBulkOn { code })
+        Err(PoolsError::PageCacheBulkPossible)
     }
 }
 
-/// Sets the page cache's initial bulk size to zero pages, then initializes
-/// `SQLite` so the setting takes effect before anything else can initialize it.
-/// Runs at most once per process, inside `PAGE_CACHE_CONFIG_RESULT`'s
-/// `get_or_init`.
 #[allow(unsafe_code)]
-fn configure_page_cache_before_init() -> c_int {
-    let no_buffer: *mut c_void = ptr::null_mut();
-    let zero: c_int = 0;
-    // SAFETY: `SQLITE_CONFIG_PAGECACHE` takes three variadic arguments, a
-    // `void*` buffer, an `int` slot size and an `int` slot count, and these are
-    // exactly those types. Before initialization `sqlite3_config` is not
-    // thread-safe: no other thread may call into `SQLite` while it runs. Every
-    // SCP connection opens through this crate, and `OnceLock::get_or_init`
-    // runs this function on one thread while every other caller waits, so no
-    // SCP code calls `SQLite` concurrently. Once `SQLite` is initialized the call
-    // only reads the initialized flag and returns `SQLITE_MISUSE`.
-    let code = unsafe { ffi::sqlite3_config(ffi::SQLITE_CONFIG_PAGECACHE, no_buffer, zero, zero) };
-    if code != ffi::SQLITE_OK {
-        return code;
-    }
-    // SAFETY: `sqlite3_initialize` takes no arguments and is thread-safe.
-    unsafe { ffi::sqlite3_initialize() }
+fn memory_management_compile_option() -> c_int {
+    // SAFETY: `sqlite3_compileoption_used` takes one NUL-terminated C string
+    // and only reads it; the literal is static and NUL-terminated. The
+    // function reads a constant table compiled into SQLite, needs no
+    // initialization and is thread-safe.
+    unsafe { ffi::sqlite3_compileoption_used(c"ENABLE_MEMORY_MANAGEMENT".as_ptr()) }
 }
 
 #[allow(unsafe_code)]
@@ -238,5 +213,67 @@ fn status_high_water(conn: &Connection, op: c_int) -> Result<c_int, PoolsError> 
         Ok(high_water)
     } else {
         Err(PoolsError::Status { code })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// The linked `SQLite` reports `ENABLE_MEMORY_MANAGEMENT`, so production
+    /// opens pass the bulk-block check on this build.
+    #[test]
+    fn linked_sqlite_is_compiled_with_memory_management() {
+        assert_eq!(memory_management_compile_option(), 1);
+    }
+
+    #[test]
+    fn bulk_block_check_accepts_only_one() {
+        assert!(require_no_bulk_block(1).is_ok());
+        for answer in [0, -1, 2] {
+            assert!(
+                matches!(
+                    require_no_bulk_block(answer),
+                    Err(PoolsError::PageCacheBulkPossible)
+                ),
+                "answer {answer} must be refused"
+            );
+        }
+    }
+
+    /// A `SQLite` without the option is refused before any connection opens.
+    #[test]
+    fn open_refuses_without_memory_management_and_opens_nothing() {
+        let connected = Cell::new(false);
+        let result = open_checked(0, || {
+            connected.set(true);
+            Connection::open_in_memory()
+        });
+        assert!(
+            matches!(result, Err(PoolsError::PageCacheBulkPossible)),
+            "open must refuse a SQLite compiled without ENABLE_MEMORY_MANAGEMENT, got {result:?}"
+        );
+        assert!(
+            !connected.get(),
+            "the refusal must come before the connection opens"
+        );
+    }
+
+    /// With the option present, the same path opens and turns lookaside off.
+    #[test]
+    fn open_with_memory_management_opens_with_lookaside_off() -> Result<(), PoolsError> {
+        let conn = open_checked(1, Connection::open_in_memory)?;
+        conn.execute_batch("CREATE TABLE t (v BLOB NOT NULL); INSERT INTO t VALUES (x'00');")
+            .map_err(PoolsError::Open)?;
+        assert_eq!(
+            lookaside_use(&conn)?,
+            LookasideUse {
+                slots_high_water: 0,
+                hits: 0
+            }
+        );
+        Ok(())
     }
 }

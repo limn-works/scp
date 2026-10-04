@@ -1,6 +1,6 @@
-//! With the page-cache bulk block off, a page that a rollback drops is freed
+//! On the `SQLite` this crate links, a page that a rollback drops is freed
 //! through `SQLite`'s allocator, the path `SQLCipher`'s memory security wipes,
-//! instead of staying on the cache's private free list (spec §17.6,
+//! instead of staying on a bulk block's private free list (spec §17.6,
 //! `SQLCipher` configuration).
 //!
 //! The test installs a recording allocator under `SQLite` before it initializes:
@@ -16,10 +16,10 @@
 //!
 //! The bundled `SQLCipher` that libsqlite3-sys 0.30.1 compiles defines
 //! `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which makes every cache share one page
-//! group and allocate no bulk block at all, so on this build the test passes
-//! with or without `scp_sqlite_pools`'s page-cache call. It holds the property
-//! for any build: a `SQLite` built without that flag allocates the bulk block
-//! unless the call ran, and then this test fails.
+//! group and allocate no bulk block, and `scp_sqlite_pools::open` refuses a
+//! `SQLite` without that option. This test shows the property the check
+//! stands for on this build: ROLLBACK frees each marked page through
+//! `sqlite3_free`.
 //!
 //! The file holds one test and runs in a process of its own, because the
 //! allocator must be installed before anything initializes `SQLite`.
