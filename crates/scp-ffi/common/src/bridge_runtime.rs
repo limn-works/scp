@@ -281,30 +281,25 @@ impl ProtocolRepoVariant {
         }
     }
 
-    /// Releases persistent resources held by the variant.
+    /// Returns the closer for the variant's durable store, or `None` for
+    /// [`ProtocolRepoVariant::InMemory`], which holds no advisory lock.
     ///
-    /// For [`ProtocolRepoVariant::Sqlite`] this walks the
-    /// `Arc<ProtocolRepository<Arc<SqliteStorage>>>` chain to reach
-    /// the `SqliteStorage` and calls
-    /// [`scp_platform::sqlite::SqliteStorage::close`] — releasing the
-    /// advisory lock on `{dir}/scp.db.lock` even when other `Arc`
-    /// holders (`CoreFields::persistence`, `ContextManager`) keep the
-    /// storage struct alive until the bridge instance drops.
-    /// [`ProtocolRepoVariant::InMemory`] has no persistent resources
-    /// and the call is a no-op.
-    ///
-    /// Called from `bridge_specific_shutdown` on the NAPI + `UniFFI`
-    /// bridges so that `SCP.shutdown()` at the SDK surface releases
-    /// the lock without requiring the caller to drop the `SCP` handle
-    /// itself.
-    pub fn close(&self) {
+    /// For [`ProtocolRepoVariant::Sqlite`] the closer owns a clone of the
+    /// `Arc<SqliteStorage>` and calls
+    /// [`scp_platform::sqlite::SqliteStorage::close`], which closes the
+    /// connection and releases the advisory lock on `{dir}/scp.db.lock` even
+    /// while other `Arc` holders (`CoreFields::persistence`, the Supervisor)
+    /// keep the storage struct alive; their later operations fail with the
+    /// closed-store error. The NAPI and `UniFFI` bridges return it from
+    /// `BridgeInstanceCore::durable_store_closer`, so `SCP.shutdown()` closes
+    /// the store after the Supervisor drain (ADR-049 Decision 16).
+    #[must_use]
+    pub fn durable_store_closer(&self) -> Option<crate::bridge_instance::DurableStoreCloser> {
         match self {
-            Self::InMemory(_) => {}
+            Self::InMemory(_) => None,
             Self::Sqlite(repo) => {
-                // `ProtocolRepository<S>::storage()` returns `&S` — here
-                // `&Arc<SqliteStorage>` — and `SqliteStorage::close()` is
-                // `&self`, so the `Arc` deref gives us the call we need.
-                repo.storage().close();
+                let storage = Arc::clone(repo.storage());
+                Some(Box::new(move || storage.close()))
             }
         }
     }

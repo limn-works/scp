@@ -2021,7 +2021,7 @@ mod monotonic_seq_crash_safety_tests {
             // Release the advisory lock exactly as `SCP.shutdown()` does before
             // the handle drops at the end of this scope. After this block the
             // storage — and any in-memory state — is GONE.
-            storage.close();
+            storage.close().expect("close releases the lock");
         }
         assert_eq!(in_flight, vec![0, 1, 2], "grants advance strictly by one");
         let prior_max = *in_flight.iter().max().unwrap();
@@ -2042,6 +2042,6 @@ mod monotonic_seq_crash_safety_tests {
             "resumed monotonic_seq {resumed} must strictly exceed prior in-flight max {prior_max}"
         );
         assert_eq!(resumed, 3, "the cursor continues from the persisted value");
-        storage2.close();
+        storage2.close().expect("close releases the lock");
     }
 }

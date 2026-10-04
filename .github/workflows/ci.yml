@@ -1561,17 +1561,9 @@ jobs:
           # naming it exactly, with `--no-tests=fail`.
           cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=syncable_storage_export_apply_roundtrip)'
           cargo nextest run --no-tests=fail -p scp-testing --features sync,combined --test persistence_advanced -E 'test(=combined_node_storage_both_traits_roundtrip)'
-          # The saga-journal durable crash-recovery round-trip is gated behind
-          # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
-          # processes). --workspace does NOT activate this optional feature, so
-          # run that test explicitly with it enabled. Scoped to the
-          # saga_bridge_journal_swap target on purpose: the broader
-          # `-p scp-testing --features sqlite` also pulls in `persistence_sdk`,
-          # which has a PRE-EXISTING SqliteStorage advisory-lock-on-reopen bug
-          # (fails identically on main; the supervisor's spawned actors hold the
-          # SqliteStorage Arc past the test's reopen). That is unrelated to this
-          # journal swap and is left to its own focused fix.
-          cargo nextest run -p scp-testing --features sqlite --test saga_bridge_journal_swap
+          # --workspace does NOT activate scp-testing's optional `sqlite`
+          # feature, so run every test it gates.
+          cargo nextest run --no-tests=fail -p scp-testing --features sqlite
           # crates/scp-testing/src/lib.rs compiles `pub mod helpers` only under
           # this crate's `testing` feature, and that feature's list must name
           # every feature helpers.rs needs, because the one build that turns it

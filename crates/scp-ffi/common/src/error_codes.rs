@@ -576,6 +576,18 @@ pub const CTX_2136: &str = "SCP-CTX-2136";
 ///
 /// Maps from `ContextError::NothingToRestore`.
 pub const CTX_2137: &str = "SCP-CTX-2137";
+/// Supervisor shutting down.
+///
+/// The Supervisor that owns the context set its closed flag in
+/// `shutdown_all_contexts`, or has dropped, so it refused to start the
+/// operation (ADR-049 Decision 16, supervisor task drain).
+///
+/// Distinct from the generic `CTX_2001` catch-all so a caller can tell an
+/// operation refused by shutdown apart from a failure of the operation
+/// itself. Construct a new `SCP` instance to continue.
+///
+/// Maps from `ContextError::SupervisorShutDown`.
+pub const CTX_2138: &str = "SCP-CTX-2138";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
@@ -1153,8 +1165,8 @@ pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 /// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
 /// rejects the caller's selection: a wrong key or passphrase on an existing
 /// `SQLCipher` database, a directory the process cannot write, a corrupt
-/// file, a salt-sidecar fail-closed condition, or a second handle against a
-/// database another `SCP` instance already holds an advisory lock on.
+/// file, or a salt-sidecar fail-closed condition. A directory whose advisory
+/// lock another store holds is [`STORAGE_8005`] instead.
 /// Spec §17.6 makes this terminal — no bridge downgrades to in-memory
 /// storage after it. All three bridges report this one code, so a caller
 /// reading a code learns the same thing whichever binding raised it.
@@ -1166,6 +1178,28 @@ pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 /// reusing `8001` would make one code string mean both "storage key not
 /// found" and "durable backend failed to open" inside that app.
 pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
+
+/// The durable storage directory's advisory lock is still held.
+///
+/// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
+/// finds `{dir}/scp.db.lock` held by another store, in this process or
+/// another (`scp_platform::PlatformError::StorageLockHeld`). Spec §17.6 "One
+/// Writer per Durable Directory" makes the open fail at once: it does not
+/// wait for the lock and does not fall back to another backend. Within one
+/// process the lock stays held after a shutdown that returned
+/// `ShutdownOutcome::TimedOut`, until the previous instance's last writer
+/// exits; after a shutdown that returned `GracefulWithin`, the lock is free
+/// and a reopen succeeds on its first attempt.
+pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
+
+/// The store has released its database connection.
+///
+/// Returned when an operation reaches a `SqliteStorage` after its `close()`
+/// ran (`scp_platform::PlatformError::StorageClosed`). Spec §17.6 "One
+/// Writer per Durable Directory": a closed store refuses every operation and
+/// never reopens its database implicitly. Construct a new `SCP` instance on
+/// the directory to continue.
+pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
 
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)

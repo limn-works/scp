@@ -280,6 +280,43 @@ pub enum StorageInitError {
         /// The underlying `scp-platform` error rendered via `Display`.
         message: String,
     },
+    /// Another store holds the directory's advisory lock, in this process or
+    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Writer per
+    /// Durable Directory"). Within one process this persists after a
+    /// shutdown that returned `ShutdownOutcome::TimedOut` until the previous
+    /// instance's last writer exits.
+    LockHeld {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl StorageInitError {
+    /// Builds the variant for a failed `SqliteStorage` open: the typed
+    /// lock-still-held condition keeps its own variant, every other open
+    /// failure is [`Self::SqliteOpen`].
+    #[must_use]
+    pub fn from_open_failure(path: String, err: &scp_platform::PlatformError) -> Self {
+        let message = err.to_string();
+        if matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }) {
+            Self::LockHeld { path, message }
+        } else {
+            Self::SqliteOpen { path, message }
+        }
+    }
+
+    /// The registered `SCP-STORAGE-` code for this failure
+    /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
+    /// `8005` for a held lock, `8004` for every other open failure.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SqliteOpen { .. } => scp_ffi_common::error_codes::STORAGE_8004,
+            Self::LockHeld { .. } => scp_ffi_common::error_codes::STORAGE_8005,
+        }
+    }
 }
 
 impl std::fmt::Display for StorageInitError {
@@ -287,6 +324,12 @@ impl std::fmt::Display for StorageInitError {
         match self {
             Self::SqliteOpen { path, message } => {
                 write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+            Self::LockHeld { path, message } => {
+                write!(
+                    f,
+                    "SQLCipher storage at {path} is held by another store: {message}"
+                )
             }
         }
     }
@@ -327,21 +370,25 @@ impl StorageProvider {
         )))
     }
 
-    /// Releases any persistent resources held by the variant.
+    /// Returns the closer for the variant's durable store, or `None` for
+    /// [`StorageProvider::InMemoryEncrypted`], which holds no advisory lock.
     ///
-    /// For [`StorageProvider::Sqlite`] this delegates to
-    /// [`SqliteStorage::close`] to release the advisory lock on
-    /// `scp.db.lock` even when outer `Arc<SqliteStorage>` references
-    /// remain alive. [`StorageProvider::InMemoryEncrypted`] has no
-    /// persistent resources and the call is a no-op.
-    ///
-    /// Called from `bridge_specific_shutdown` on the `PyO3` bridge so
-    /// that `SCP.shutdown()` on a `StorageConfig::Sqlite` instance
-    /// releases the lock at the SDK surface.
-    pub fn close(&self) {
+    /// For [`StorageProvider::Sqlite`] the closer owns a clone of the
+    /// `Arc<SqliteStorage>` and calls [`SqliteStorage::close`], releasing the
+    /// advisory lock on `scp.db.lock` even while other `Arc<SqliteStorage>`
+    /// references remain alive. The `PyO3` bridge returns it from
+    /// `BridgeInstanceCore::durable_store_closer`, so `SCP.shutdown()` closes
+    /// the store after the Supervisor drain (ADR-049 Decision 16).
+    #[must_use]
+    pub fn durable_store_closer(
+        &self,
+    ) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
         match self {
-            Self::InMemoryEncrypted(_) => {}
-            Self::Sqlite(storage) => storage.close(),
+            Self::InMemoryEncrypted(_) => None,
+            Self::Sqlite(storage) => {
+                let storage = Arc::clone(storage);
+                Some(Box::new(move || storage.close()))
+            }
         }
     }
 }
@@ -626,10 +673,7 @@ impl PyBridgeInstance {
                         path = %path.display(),
                         "with_storage_py: SQLCipher open failed — returning error to caller, no in-memory fallback"
                     );
-                    StorageInitError::SqliteOpen {
-                        path: path.display().to_string(),
-                        message: e.to_string(),
-                    }
+                    StorageInitError::from_open_failure(path.display().to_string(), &e)
                 })?;
                 let arc_storage = Arc::new(storage);
                 // Build persistence bridge first so we can share
@@ -776,24 +820,20 @@ impl BridgeInstanceCore for PyBridgeInstance {
         &self.core
     }
 
+    fn durable_store_closer(&self) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
+        // The `Sqlite` variant holds an advisory lock on `{dir}/scp.db.lock`
+        // that the shared shutdown releases after the Supervisor drain, so
+        // `SCP(storage=...)` against the same path succeeds after a prior
+        // `SCP.shutdown()` that finished in time.
+        self.storage_provider
+            .get()
+            .and_then(StorageProvider::durable_store_closer)
+    }
+
     fn bridge_specific_shutdown(&self) {
         // Clear the identity registry so held `Arc<FfiKeyCustody>` entries
         // drop, triggering `Zeroizing` on key material.
         self.identity_registry.clear();
-        // `storage_provider` is `OnceLock` — we cannot clear the slot, but
-        // the `Sqlite` variant holds an advisory lock on
-        // `{dir}/scp.db.lock` that must be released at shutdown so
-        // `SCP(storage=...)` against the same path succeeds after a prior
-        // `SCP.shutdown()`. `StorageProvider::close()` delegates to
-        // `SqliteStorage::close()` which drops the `File` inside the
-        // lock-file mutex without dropping the `Arc<SqliteStorage>`
-        // (other Arc holders — `CoreFields::persistence`,
-        // `ContextManager::persistence` — keep the storage struct alive
-        // until the `PyBridgeInstance` itself drops). The
-        // `InMemoryEncrypted` variant's `close()` is a no-op.
-        if let Some(provider) = self.storage_provider.get() {
-            provider.close();
-        }
         // Clear the typed per-context FFI state registry so per-context
         // `OutletRegistry`, `EventLog`, receive channel senders, and
         // registered outlet handlers drop.

@@ -144,6 +144,43 @@ pub enum StorageInitError {
         /// The underlying `scp-platform` error rendered via `Display`.
         message: String,
     },
+    /// Another store holds the directory's advisory lock, in this process or
+    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Writer per
+    /// Durable Directory"). Within one process this persists after a
+    /// shutdown that returned `ShutdownOutcome::TimedOut` until the previous
+    /// instance's last writer exits.
+    LockHeld {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl StorageInitError {
+    /// Builds the variant for a failed `SqliteStorage` open: the typed
+    /// lock-still-held condition keeps its own variant, every other open
+    /// failure is [`Self::SqliteOpen`].
+    #[must_use]
+    pub fn from_open_failure(path: String, err: &scp_platform::PlatformError) -> Self {
+        let message = err.to_string();
+        if matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }) {
+            Self::LockHeld { path, message }
+        } else {
+            Self::SqliteOpen { path, message }
+        }
+    }
+
+    /// The registered `SCP-STORAGE-` code for this failure
+    /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
+    /// `8005` for a held lock, `8004` for every other open failure.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SqliteOpen { .. } => scp_ffi_common::error_codes::STORAGE_8004,
+            Self::LockHeld { .. } => scp_ffi_common::error_codes::STORAGE_8005,
+        }
+    }
 }
 
 impl std::fmt::Display for StorageInitError {
@@ -151,6 +188,12 @@ impl std::fmt::Display for StorageInitError {
         match self {
             Self::SqliteOpen { path, message } => {
                 write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+            Self::LockHeld { path, message } => {
+                write!(
+                    f,
+                    "SQLCipher storage at {path} is held by another store: {message}"
+                )
             }
         }
     }
@@ -486,10 +529,7 @@ impl NapiBridgeInstance {
                         path = %path.display(),
                         "with_storage_napi: SQLCipher open failed — failing closed, no in-memory fallback"
                     );
-                    StorageInitError::SqliteOpen {
-                        path: path.display().to_string(),
-                        message: e.to_string(),
-                    }
+                    StorageInitError::from_open_failure(path.display().to_string(), &e)
                 })?;
 
                 let arc_storage = Arc::new(storage);
@@ -663,6 +703,14 @@ impl BridgeInstanceCore for NapiBridgeInstance {
     // the shared contract and be caught by the cross-bridge consistency
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 
+    fn durable_store_closer(&self) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
+        // The `Sqlite` variant's advisory lock on `{dir}/scp.db.lock` is
+        // released after the Supervisor drain, so a later
+        // `new SCP({ storage: { type: 'sqlite', path, key } })` against the
+        // same directory succeeds once a shutdown finished in time.
+        self.protocol_repository.durable_store_closer()
+    }
+
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping the `Arc<NapiKeyCustody>` values
         // (callback custody in production, in-memory custody under
@@ -671,15 +719,6 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // previous `clear_fn` closures).
         self.ucan_registry.clear();
         self.identity_registry.clear();
-        // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
-        // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
-        // (`CoreFields::persistence`, `ContextManager`) keep the storage
-        // struct alive until the `NapiBridgeInstance` drops, but the
-        // advisory lock must be released now so that a subsequent
-        // `new SCP({ storage: { type: 'sqlite', path, key } })` against
-        // the same directory does not fail with "already open by another
-        // SCP instance". The `InMemory` variant's `close()` is a no-op.
-        self.protocol_repository.close();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         // Migrated off `crate::mcp::clear_registries` (called by a

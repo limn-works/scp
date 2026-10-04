@@ -862,10 +862,9 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     let err = second_open
         .err()
         .expect("opening the root DB twice (while the first handle lives) must fail");
-    let err_str = err.to_string();
     assert!(
-        err_str.contains("already open by another SCP instance"),
-        "the second root open must be rejected by the advisory lock, got: {err_str}"
+        matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }),
+        "the second root open must be rejected by the advisory lock, got: {err}"
     );
 
     // -- A second, live owner of the SAME handle, standing in for the binary's

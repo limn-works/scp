@@ -776,20 +776,33 @@ pub struct KeyPackageStoreActor {
 }
 
 impl KeyPackageStoreActor {
-    /// Spawns a new actor task and returns its handle + `JoinHandle`.
-    ///
-    /// The supervisor keeps the `JoinHandle` and attaches a watchdog (mirroring
-    /// the per-context actor watchdog, ADR-049 §10). On spawn the actor runs
-    /// the §9 respawn reconciliation from `mls_storage` and replenishes to
-    /// [`MIN_BUFFER`] before serving commands.
-    ///
-    /// The returned handle is the only way to reach the actor — the
-    /// `mpsc::Receiver<KeyPackageCommand>` is moved into the actor task and
-    /// never escapes.
+    /// Spawns a new actor task on the ambient runtime and returns its handle
+    /// and `JoinHandle`. Test-only: production spawns through
+    /// [`Self::new`] and the Supervisor's task tracker (ADR-049 Decision 16).
+    #[cfg(test)]
     pub(in crate::context) fn spawn(
         identity: DID,
         deps: KeyPackageStoreDeps,
     ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
+        let (handle, actor) = Self::new(identity, deps);
+        (handle, tokio::spawn(actor.run()))
+    }
+
+    /// Builds a new actor and its handle without spawning it.
+    ///
+    /// The Supervisor spawns [`Self::run`] through its task tracker and
+    /// attaches a watchdog to the `JoinHandle` (mirroring the per-context
+    /// actor watchdog, ADR-049 §10 and Decision 16). On spawn the actor runs
+    /// the §9 respawn reconciliation from `mls_storage` and replenishes to
+    /// [`MIN_BUFFER`] before serving commands.
+    ///
+    /// The returned handle is the only way to reach the actor — the
+    /// `mpsc::Receiver<KeyPackageCommand>` moves into the actor and never
+    /// escapes.
+    pub(in crate::context) fn new(
+        identity: DID,
+        deps: KeyPackageStoreDeps,
+    ) -> (KeyPackageStoreHandle, Self) {
         let (tx, rx) = mpsc::channel::<KeyPackageCommand>(KP_MAILBOX_CAPACITY);
 
         // Build the credential once. The DID is a genuine local participant
@@ -812,8 +825,7 @@ impl KeyPackageStoreActor {
             published_refs: HashSet::new(),
             inbox: rx,
         };
-        let join = tokio::spawn(actor.run());
-        (KeyPackageStoreHandle::from_sender(tx), join)
+        (KeyPackageStoreHandle::from_sender(tx), actor)
     }
 
     // -----------------------------------------------------------------
@@ -1053,7 +1065,7 @@ impl KeyPackageStoreActor {
     /// Dispatch loop. On startup runs the §9 reconciliation + an initial
     /// replenish, then serves commands until the inbox closes or a `Shutdown`
     /// command arrives.
-    async fn run(mut self) {
+    pub(in crate::context) async fn run(mut self) {
         if let Err(e) = self.reconcile_from_storage().await {
             tracing::error!(
                 actor_kind = "key_package_store",

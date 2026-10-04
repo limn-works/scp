@@ -1408,7 +1408,7 @@ mod tests {
             drop(node);
             // Release an advisory lock on `<db_dir>/scp.db.lock` before a
             // second open, which `SqliteStorage::new` takes non-blockingly.
-            storage.close();
+            storage.close().expect("close releases the lock");
             drop(storage);
             // Yield to let the tokio runtime drain cancelled relay tasks.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1427,7 +1427,7 @@ mod tests {
             );
             node.shutdown();
             drop(node);
-            storage.close();
+            storage.close().expect("close releases the lock");
         }
 
         // Cleanup
@@ -1442,16 +1442,16 @@ mod tests {
     /// `Arc<SqliteStorage>` exactly as `PyBridgeInstance`,
     /// `NapiBridgeInstance`, and `UniffiBridgeInstance` hold theirs.
     ///
-    /// Its `bridge_specific_shutdown` reproduces what all three shipped
-    /// bridges do there: it calls [`SqliteStorage::close`], which drops an
-    /// advisory `flock(2)` on `{dir}/scp.db.lock`. Before that call it records
-    /// whether its registered node had already stopped, which is what makes
-    /// ordering — not merely eventual shutdown — observable to a test.
+    /// Its `durable_store_closer` reproduces what all three shipped bridges
+    /// return: a closer that calls [`SqliteStorage::close`], which drops an
+    /// advisory `flock(2)` on `{dir}/scp.db.lock`. Before that call the closer
+    /// records whether the registered node had already stopped, which is what
+    /// makes ordering — not merely eventual shutdown — observable to a test.
     struct StorageOwningInstance {
         core: CoreFields,
         storage: Arc<SqliteStorage>,
-        node: std::sync::Mutex<Option<std::sync::Weak<RunningNode>>>,
-        node_stopped_before_close: std::sync::atomic::AtomicBool,
+        node: Arc<std::sync::Mutex<Option<std::sync::Weak<RunningNode>>>>,
+        node_stopped_before_close: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl StorageOwningInstance {
@@ -1459,8 +1459,8 @@ mod tests {
             Self {
                 core: CoreFields::new(),
                 storage,
-                node: std::sync::Mutex::new(None),
-                node_stopped_before_close: std::sync::atomic::AtomicBool::new(false),
+                node: Arc::new(std::sync::Mutex::new(None)),
+                node_stopped_before_close: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -1471,7 +1471,7 @@ mod tests {
             *self.node.lock().expect("observation mutex") = Some(Arc::downgrade(node));
         }
 
-        /// Reports what `bridge_specific_shutdown` saw when it ran.
+        /// Reports what the store closer saw when it ran.
         fn node_stopped_before_close(&self) -> bool {
             self.node_stopped_before_close
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -1484,20 +1484,23 @@ mod tests {
             &self.core
         }
 
-        fn bridge_specific_shutdown(&self) {
-            let stopped = self
-                .node
-                .lock()
-                .expect("observation mutex")
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|node| InstanceBorrower::stopped(&*node));
-            self.node_stopped_before_close
-                .store(stopped, std::sync::atomic::Ordering::SeqCst);
-            // What every shipped bridge does here, and what makes ordering
-            // load-bearing: releasing an advisory lock that guards one writer
-            // per directory.
-            self.storage.close();
+        fn durable_store_closer(&self) -> Option<crate::bridge_instance::DurableStoreCloser> {
+            let node = Arc::clone(&self.node);
+            let observed = Arc::clone(&self.node_stopped_before_close);
+            let storage = Arc::clone(&self.storage);
+            Some(Box::new(move || {
+                let stopped = node
+                    .lock()
+                    .expect("observation mutex")
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_some_and(|node| InstanceBorrower::stopped(&*node));
+                observed.store(stopped, std::sync::atomic::Ordering::SeqCst);
+                // What every shipped bridge does here, and what makes
+                // ordering load-bearing: releasing an advisory lock that
+                // guards one writer per directory.
+                storage.close()
+            }))
         }
     }
 
@@ -1583,7 +1586,7 @@ mod tests {
         // exists so a reopen succeeds while a caller still holds its handle.
         let reopened = SqliteStorage::new(&db_dir, &[0x11u8; 32])
             .expect("a second SQLCipher open must succeed after an instance shutdown");
-        reopened.close();
+        reopened.close().expect("close releases the lock");
 
         drop(instance);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1724,7 +1727,7 @@ mod tests {
         running.shutdown();
         assert!(running.is_shutdown());
         drop(running);
-        storage.close();
+        storage.close().expect("close releases the lock");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

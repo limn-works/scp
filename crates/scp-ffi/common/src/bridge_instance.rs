@@ -2442,25 +2442,36 @@ impl CoreFields {
     ///    Tasks that finish within the deadline report
     ///    [`ShutdownOutcome::GracefulWithin`] with the elapsed time.
     /// 4. On timeout, calls `JoinSet::abort_all` and returns
-    ///    [`ShutdownOutcome::TimedOut`] with the number of tasks aborted and
-    ///    the number that panicked.
-    /// 5. Runs the bridge-agnostic cleanup (flush persistence, drop MLS
-    ///    groups, clear registries, run shutdown hooks, clear transport)
+    ///    [`ShutdownOutcome::TimedOut`] with the number of the bridge's own
+    ///    tasks aborted and the number that panicked.
+    /// 5. Runs the bridge-agnostic cleanup (flush persistence, drain the
+    ///    Supervisor, clear registries, run shutdown hooks, clear transport)
     ///    regardless of graceful/timeout outcome — these side effects must
-    ///    happen on *every* shutdown. The persistence flush
-    ///    (`ContextManager::flush_all_contexts_sync`) is executed
-    ///    inside the remaining timeout budget so the caller's deadline is
-    ///    honored end-to-end; if it exceeds the budget, flush is abandoned
-    ///    and a warning is logged.
+    ///    happen on *every* shutdown. The flush and the Supervisor drain run
+    ///    inside the remaining budget, so the caller's deadline is honored
+    ///    end-to-end.
+    /// 6. Closes the durable store through `store_closer` only after the
+    ///    Supervisor's tracked tasks have all exited (ADR-048 §5 as amended,
+    ///    ADR-049 Decision 16). When the drain finishes inside the deadline,
+    ///    the store closes before this returns. When it does not, the result
+    ///    is [`ShutdownOutcome::TimedOut`], no tracked task is aborted, and the
+    ///    drain keeps running detached: the store keeps its advisory lock
+    ///    until the last tracked writer exits and the drain closes it, so a
+    ///    reopen of the same directory meanwhile fails with the lock-still-held
+    ///    error.
     ///
     /// # Errors
     ///
     /// - [`ShutdownError::AlreadyShutDown`] — the instance has already been
     ///   shut down. The caller is expected to treat this as a harmless
-    ///   lifecycle observation (no additional work to do).
+    ///   lifecycle observation (no additional work to do). `store_closer`
+    ///   is dropped unrun: the shutdown that won owns the close.
+    /// - [`ShutdownError::DurableStoreClose`] — the drain finished in time but
+    ///   the store refused to close; it keeps its connection and lock.
     pub async fn shutdown_core_async(
         &self,
         timeout: Duration,
+        store_closer: Option<DurableStoreCloser>,
     ) -> Result<ShutdownOutcome, ShutdownError> {
         // Idempotent terminal transition. The sync `shutdown()` path also
         // swaps this flag; whichever call wins is the one that runs
@@ -2478,7 +2489,10 @@ impl CoreFields {
             guard.cancel();
         }
 
-        let start = std::time::Instant::now();
+        // One clock for the whole deadline: the runtime clock, which every
+        // `timeout` below reads. A wall-clock `elapsed` here would disagree
+        // with those timeouts whenever the runtime clock is paused.
+        let start = tokio::time::Instant::now();
         let outcome = drain_under_deadline(&self.tasks, timeout, start).await;
 
         // Run the sync cleanup side effects inside the remaining budget so
@@ -2490,23 +2504,35 @@ impl CoreFields {
         // (economy accessors), which is already true.
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
-        self.run_shutdown_side_effects(remaining).await;
-
-        Ok(outcome)
+        let drain = self
+            .run_shutdown_side_effects(remaining, store_closer)
+            .await;
+        combine_shutdown_outcome(outcome, drain)
     }
 
-    /// Shared cleanup body executed by both the sync [`shutdown`](Self::shutdown)
-    /// and the async [`shutdown_core_async`](Self::shutdown_core_async) paths.
+    /// Cleanup body of the async [`shutdown_core_async`](Self::shutdown_core_async)
+    /// path; [`Self::blocking_run_shutdown_side_effects`] is the sync sibling.
     ///
     /// Must only be called after `self.shutdown` has been swapped to `true`.
-    /// Clears transport, flushes persistence (inside `flush_budget` when
-    /// called from the async path, or with no bound from the sync path
-    /// via [`Self::blocking_run_shutdown_side_effects`]), drops MLS groups +
-    /// sender keys, clears bridge-owned registries, and runs any registered
-    /// shutdown hooks. Infallible: lock poisoning, hook panics, and flush
-    /// timeouts are logged and cleanup continues — shutdown must finish
-    /// regardless.
-    async fn run_shutdown_side_effects(&self, flush_budget: Duration) {
+    /// Clears transport, flushes persistence, drains the Supervisor, closes
+    /// the durable store after the drain, clears bridge-owned registries, and
+    /// runs any registered shutdown hooks. `budget` bounds the flush and the
+    /// drain together.
+    ///
+    /// The drain (`Supervisor::shutdown_all_contexts`, which closes the
+    /// Supervisor's task tracker and awaits it) runs in its own task, followed
+    /// by `store_closer`. The task is awaited until the deadline and never
+    /// aborted: aborting would cut a tracked writer mid-write, and closing the
+    /// store before that writer exits would release the advisory lock while
+    /// the writer still holds the connection's work in flight (ADR-049
+    /// Decision 16). Past the deadline the task keeps running and closes the
+    /// store itself when the last tracked task exits.
+    async fn run_shutdown_side_effects(
+        &self,
+        budget: Duration,
+        store_closer: Option<DurableStoreCloser>,
+    ) -> SupervisorDrain {
+        let deadline = tokio::time::Instant::now() + budget;
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
@@ -2514,55 +2540,90 @@ impl CoreFields {
             urls.clear();
         }
 
-        if let Some(supervisor) = self.supervisor.get() {
-            // Persistence flush must honor the caller-supplied deadline.
-            // The flush is now natively async (per-context bounded
-            // `Mutex::lock` with a 250ms budget and degraded-snapshot
-            // fallback for wedged contexts); wrap in `tokio::time::timeout`
-            // so aggregate storage latency cannot push us past the caller's
-            // shutdown budget. Zero budget falls through to a best-effort
-            // inline flush (matches the sync shutdown path's contract).
-            //
-            // Supervisor::flush_all_contexts/shutdown_all_contexts are thin
-            // forwarders over the infallible ContextManager methods; the only
-            // reachable error is `NotInitialized` (no manager attached to
-            // the supervisor). Any error returned here we log rather than
-            // panic since shutdown must finish.
-            if flush_budget.is_zero() {
+        let drain = if let Some(supervisor) = self.supervisor.get() {
+            // The flush honors the caller's deadline: a wedged context cannot
+            // push shutdown past it. The flush is natively async (per-context
+            // bounded lock with a degraded-snapshot fallback).
+            if budget.is_zero() {
                 tracing::warn!(
                     "shutdown flush budget exhausted before flush_all_contexts — \
                      context state may not be persisted"
                 );
             } else {
-                match tokio::time::timeout(flush_budget, supervisor.flush_all_contexts()).await {
+                match tokio::time::timeout_at(deadline, supervisor.flush_all_contexts()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(
                             error = %e,
-                            "flush_all_contexts returned an error during shutdown \
-                             (likely supervisor providers detached mid-flight) — \
+                            "flush_all_contexts returned an error during shutdown — \
                              context state may not be persisted"
                         );
                     }
                     Err(_elapsed) => {
                         tracing::warn!(
-                            budget_ms = flush_budget.as_millis(),
+                            budget_ms = budget.as_millis(),
                             "flush_all_contexts exceeded shutdown budget — \
                              context state may not be persisted"
                         );
                     }
                 }
             }
-            if let Err(e) = supervisor.shutdown_all_contexts().await {
-                tracing::warn!(
-                    error = %e,
-                    "shutdown_all_contexts returned an error during shutdown \
-                     (likely supervisor providers detached mid-flight)"
-                );
+            let supervisor = Arc::clone(supervisor);
+            let mut drain_then_close = tokio::spawn(async move {
+                supervisor.shutdown_all_contexts().await;
+                drop(supervisor);
+                close_durable_store(store_closer)
+            });
+            match tokio::time::timeout_at(deadline, &mut drain_then_close).await {
+                Ok(Ok(closed)) => SupervisorDrain::Finished(closed),
+                Ok(Err(join_error)) => {
+                    tracing::error!(
+                        error = %join_error,
+                        "Supervisor drain panicked during shutdown — the durable store \
+                         was not closed and keeps its advisory lock"
+                    );
+                    SupervisorDrain::Panicked
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis(),
+                        "Supervisor drain exceeded the shutdown deadline — tracked tasks \
+                         keep running, and the durable store keeps its advisory lock until \
+                         the last one exits"
+                    );
+                    // Detach, never abort: the task closes the store itself
+                    // once the drain finishes, and logs a close failure, since
+                    // no caller remains to receive it.
+                    tokio::spawn(async move {
+                        match drain_then_close.await {
+                            Ok(Ok(())) => {
+                                tracing::info!(
+                                    "late Supervisor drain finished; durable store closed"
+                                );
+                            }
+                            Ok(Err(e)) => tracing::error!(
+                                error = %e,
+                                "late Supervisor drain finished but the durable store refused \
+                                 to close; it keeps its connection and advisory lock"
+                            ),
+                            Err(join_error) => tracing::error!(
+                                error = %join_error,
+                                "late Supervisor drain panicked — the durable store was not \
+                                 closed and keeps its advisory lock"
+                            ),
+                        }
+                    });
+                    SupervisorDrain::Pending
+                }
             }
-        }
+        } else {
+            // No Supervisor was ever attached, so no tracked task can write
+            // through the store.
+            SupervisorDrain::Finished(close_durable_store(store_closer))
+        };
 
         self.finish_shutdown_cleanup();
+        drain
     }
 
     /// Non-async sibling of [`Self::run_shutdown_side_effects`] used by the sync
@@ -2581,11 +2642,12 @@ impl CoreFields {
         }
 
         if let Some(supervisor) = self.supervisor.get() {
-            // Supervisor::flush_all_contexts_sync and shutdown_all_contexts
-            // are thin forwarders over the infallible ContextManager methods.
-            // Any non-Ok return indicates the manager was detached
-            // mid-flight (or never attached), which we log since sync
-            // shutdown must finish regardless.
+            // The sync path has no caller to return an error to (it runs
+            // from destructors and atexit hooks). `shutdown_all_contexts_sync`
+            // fails only outside a tokio runtime, when nothing was drained.
+            // This path never closes the durable store, so an undrained
+            // Supervisor cannot lose its storage under a live writer: the
+            // advisory lock is released when the last storage `Arc` drops.
             if let Err(e) = supervisor.flush_all_contexts_sync() {
                 tracing::warn!(
                     error = %e,
@@ -2597,8 +2659,8 @@ impl CoreFields {
             if let Err(e) = supervisor.shutdown_all_contexts_sync() {
                 tracing::warn!(
                     error = %e,
-                    "shutdown_all_contexts_sync returned an error during shutdown \
-                     (likely supervisor providers detached mid-flight)"
+                    "shutdown_all_contexts_sync could not drain the Supervisor during \
+                     shutdown"
                 );
             }
         }
@@ -2636,6 +2698,66 @@ impl CoreFields {
     }
 }
 
+/// Closes an instance's durable store and releases its advisory lock.
+///
+/// Returned by [`BridgeInstanceCore::durable_store_closer`] and run by
+/// [`CoreFields::shutdown_core_async`] only after the Supervisor's tracked
+/// tasks have all exited (ADR-049 Decision 16). Owns its own clone of the
+/// storage handle, so it can run from the detached drain task after the
+/// shutdown call has returned.
+pub type DurableStoreCloser =
+    Box<dyn FnOnce() -> Result<(), scp_platform::PlatformError> + Send + 'static>;
+
+/// How the Supervisor drain ended inside the shutdown deadline.
+enum SupervisorDrain {
+    /// Every tracked task exited in time; the store close ran and returned
+    /// this result.
+    Finished(Result<(), scp_platform::PlatformError>),
+    /// The deadline passed first. The drain keeps running detached and
+    /// closes the store when it finishes.
+    Pending,
+    /// The drain task panicked. The store was not closed.
+    Panicked,
+}
+
+/// Runs `store_closer` when one exists.
+fn close_durable_store(
+    store_closer: Option<DurableStoreCloser>,
+) -> Result<(), scp_platform::PlatformError> {
+    store_closer.map_or(Ok(()), |close| close())
+}
+
+/// Folds the Supervisor drain into the bridge-task outcome.
+///
+/// [`ShutdownOutcome::GracefulWithin`] requires both the bridge's own tasks
+/// and the Supervisor's tracked tasks to have finished in time. A drain that
+/// did not finish turns the outcome into [`ShutdownOutcome::TimedOut`]; its
+/// `aborted_tasks` still counts only the bridge tasks aborted, because no
+/// tracked task is ever aborted.
+fn combine_shutdown_outcome(
+    outcome: ShutdownOutcome,
+    drain: SupervisorDrain,
+) -> Result<ShutdownOutcome, ShutdownError> {
+    let drain_panics = usize::from(matches!(drain, SupervisorDrain::Panicked));
+    match drain {
+        SupervisorDrain::Finished(Err(e)) => Err(ShutdownError::DurableStoreClose(e)),
+        SupervisorDrain::Finished(Ok(())) => Ok(outcome),
+        SupervisorDrain::Pending | SupervisorDrain::Panicked => Ok(match outcome {
+            ShutdownOutcome::GracefulWithin { panicked_tasks, .. } => ShutdownOutcome::TimedOut {
+                aborted_tasks: 0,
+                panicked_tasks: panicked_tasks + drain_panics,
+            },
+            ShutdownOutcome::TimedOut {
+                aborted_tasks,
+                panicked_tasks,
+            } => ShutdownOutcome::TimedOut {
+                aborted_tasks,
+                panicked_tasks: panicked_tasks + drain_panics,
+            },
+        }),
+    }
+}
+
 /// Locks the `JoinSet` long enough to drain outstanding tasks with a
 /// deadline. On graceful drain, returns [`ShutdownOutcome::GracefulWithin`]
 /// with the elapsed time since `start` and the count of tasks that
@@ -2650,7 +2772,7 @@ impl CoreFields {
 async fn drain_under_deadline(
     tasks: &AsyncMutex<JoinSet<()>>,
     timeout: Duration,
-    start: std::time::Instant,
+    start: tokio::time::Instant,
 ) -> ShutdownOutcome {
     // The `JoinSet` lock is held for the full drain — `abort_all` +
     // `join_next` below all need exclusive access to the same set.
@@ -2806,6 +2928,9 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// corruption (red-hat RED-1002), so every borrower stops first. See
     /// [`InstanceBorrower`].
     ///
+    /// The durable store closes inside `shutdown_core_async`, after the
+    /// Supervisor drain, never in `bridge_specific_shutdown`.
+    ///
     /// `bridge_specific_shutdown` runs UNCONDITIONALLY — even when
     /// [`CoreFields::shutdown_core_async`] returns
     /// [`ShutdownError::AlreadyShutDown`]. That variant signals a race
@@ -2827,10 +2952,24 @@ pub trait BridgeInstanceCore: Send + Sync {
         // closes this instance's `SQLCipher` handle, and a node started on
         // that handle must not still be writing when it does.
         self.core().stop_borrowers();
-        let result = self.core().shutdown_core_async(timeout).await;
+        let result = self
+            .core()
+            .shutdown_core_async(timeout, self.durable_store_closer())
+            .await;
         self.bridge_specific_shutdown();
         result
     }
+
+    /// Returns the closer for this instance's durable store, or `None` when
+    /// the instance holds no store with an advisory lock (an in-memory
+    /// backend).
+    ///
+    /// [`Self::shutdown`] hands it to [`CoreFields::shutdown_core_async`],
+    /// which runs it only after the Supervisor's tracked tasks have exited.
+    /// Every bridge implements this rather than closing storage in
+    /// [`Self::bridge_specific_shutdown`], which runs whether or not the
+    /// drain finished.
+    fn durable_store_closer(&self) -> Option<DurableStoreCloser>;
 
     /// Override hook for per-bridge concrete structs to drop their
     /// bridge-specific typed fields (MCP registries, custody store, etc.).
@@ -3042,12 +3181,16 @@ pub enum ShutdownOutcome {
         /// regardless.
         panicked_tasks: usize,
     },
-    /// The deadline expired before all tasks finished; the `JoinSet` was
-    /// aborted.
+    /// The deadline expired before the bridge's own tasks or the
+    /// Supervisor's tracked tasks finished, or the Supervisor drain panicked.
+    /// The bridge's `JoinSet` was aborted; the Supervisor's tracked tasks
+    /// never are, and the durable store keeps its advisory lock until the
+    /// last of them exits.
     TimedOut {
-        /// Number of tasks that were aborted because the shutdown deadline
-        /// was reached (tasks that had already completed before the deadline
-        /// are not counted).
+        /// Number of the bridge's own `JoinSet` tasks that were aborted
+        /// because the shutdown deadline was reached (tasks that had already
+        /// completed before the deadline are not counted). Supervisor tracked
+        /// tasks are never aborted, so they never count here.
         aborted_tasks: usize,
         /// Number of tasks that panicked during the abort drain. A nonzero
         /// count indicates a task unwound on the abort path — typically a
@@ -3058,13 +3201,18 @@ pub enum ShutdownOutcome {
 }
 
 /// Error produced by [`CoreFields::shutdown_core_async`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ShutdownError {
     /// The instance has already been shut down; a second call is a no-op
     /// from the caller's perspective but is surfaced so the caller can
     /// distinguish "I did the work" from "someone else already did."
     #[error("bridge instance has already been shut down")]
     AlreadyShutDown,
+    /// The Supervisor drained in time, but the durable store refused to
+    /// close. The store keeps its connection and advisory lock, so a reopen
+    /// of the same directory fails until the process releases it.
+    #[error("durable store failed to close after shutdown: {0}")]
+    DurableStoreClose(scp_platform::PlatformError),
 }
 
 #[cfg(test)]
@@ -4818,7 +4966,7 @@ mod tests {
     async fn shutdown_core_async_graceful_when_no_tasks() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let outcome = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap();
         let ShutdownOutcome::GracefulWithin {
@@ -4847,7 +4995,7 @@ mod tests {
             });
         }
         let outcome = instance
-            .shutdown_core_async(Duration::from_millis(500))
+            .shutdown_core_async(Duration::from_millis(500), None)
             .await
             .unwrap();
         let ShutdownOutcome::TimedOut {
@@ -4877,7 +5025,7 @@ mod tests {
             });
         }
         let outcome = instance
-            .shutdown_core_async(Duration::from_secs(2))
+            .shutdown_core_async(Duration::from_secs(2), None)
             .await
             .unwrap();
         assert!(
@@ -4935,7 +5083,7 @@ mod tests {
             });
         }
         let outcome = instance
-            .shutdown_core_async(SLOW_PANIC_DEADLINE)
+            .shutdown_core_async(SLOW_PANIC_DEADLINE, None)
             .await
             .unwrap();
         let ShutdownOutcome::GracefulWithin { panicked_tasks, .. } = outcome else {
@@ -4958,7 +5106,7 @@ mod tests {
         }));
 
         instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -4968,16 +5116,16 @@ mod tests {
     async fn shutdown_core_async_is_idempotent() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let first = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap();
         assert!(matches!(first, ShutdownOutcome::GracefulWithin { .. }));
 
         let err = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap_err();
-        assert_eq!(err, ShutdownError::AlreadyShutDown);
+        assert!(matches!(err, ShutdownError::AlreadyShutDown));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4988,10 +5136,10 @@ mod tests {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
         let err = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap_err();
-        assert_eq!(err, ShutdownError::AlreadyShutDown);
+        assert!(matches!(err, ShutdownError::AlreadyShutDown));
     }
 
     // -----------------------------------------------------------------
@@ -5010,8 +5158,11 @@ mod tests {
         fn core(&self) -> &CoreFields {
             &self.core
         }
+        fn durable_store_closer(&self) -> Option<DurableStoreCloser> {
+            None
+        }
         // `shutdown` inherits the trait default (landed in commit 6 of
-        // ADR-049): `self.core().shutdown_core_async(timeout).await +
+        // ADR-049): `self.core().shutdown_core_async(timeout, closer).await +
         // self.bridge_specific_shutdown()`. Overriding it here would
         // diverge from production behavior and be caught by the
         // cross-bridge consistency gate.
@@ -5037,5 +5188,195 @@ mod tests {
         let outcome = bridge.shutdown(Duration::from_secs(1)).await.unwrap();
         assert!(matches!(outcome, ShutdownOutcome::GracefulWithin { .. }));
         assert!(bridge.core().is_shutdown());
+    }
+
+    // -----------------------------------------------------------------
+    // Drain before close (ADR-049 Decision 16; ADR-048 §5 as amended)
+    // -----------------------------------------------------------------
+
+    /// Event log whose `destroy_event_log` waits for a permit on `gate`. A
+    /// gate with no permits wedges the context actor's `ShutdownSelf`, so the
+    /// Supervisor drain cannot finish until the test adds a permit.
+    struct GatedDestroyEventLog {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for GatedDestroyEventLog {
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _: scp_event_log::EventType,
+            _: &str,
+            _: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            self.gate
+                .acquire()
+                .await
+                .map(drop)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))
+        }
+    }
+
+    /// Bridge whose durable store is a real `SqliteStorage`, so the drain-then-
+    /// close ordering is observable through the directory's advisory lock.
+    struct SqliteBackedBridge {
+        core: CoreFields,
+        storage: Arc<scp_platform::sqlite::SqliteStorage>,
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeInstanceCore for SqliteBackedBridge {
+        fn core(&self) -> &CoreFields {
+            &self.core
+        }
+        fn durable_store_closer(&self) -> Option<DurableStoreCloser> {
+            let storage = Arc::clone(&self.storage);
+            Some(Box::new(move || storage.close()))
+        }
+    }
+
+    const SQLITE_TEST_KEY: [u8; 32] = [0x5au8; 32];
+
+    fn unique_store_dir(label: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "scp-bridge-drain-{label}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create store dir");
+        dir
+    }
+
+    /// Builds a bridge over a Supervisor whose event-log destroy waits on
+    /// `gate`, with one created context so shutdown has an actor to stop.
+    async fn sqlite_bridge_with_context(
+        dir: &std::path::Path,
+        gate: Arc<tokio::sync::Semaphore>,
+    ) -> SqliteBackedBridge {
+        let key_resolver: scp_core::context::governance::KeyResolver =
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
+        let supervisor = Supervisor::with_providers(
+            Arc::new(NodeMlsFactory::new(
+                "did:test:bridge-drain".to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            )),
+            Box::new(LocalTransportProvider),
+            Box::new(GatedDestroyEventLog { gate }),
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            test_mls_storage(),
+        );
+        supervisor
+            .create_context(
+                "bridge-drain-ctx".to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID::from("did:test:bridge-drain-creator"),
+                None,
+            )
+            .await
+            .expect("create context");
+        let storage = Arc::new(
+            scp_platform::sqlite::SqliteStorage::new(dir, &SQLITE_TEST_KEY).expect("open store"),
+        );
+        SqliteBackedBridge {
+            core: CoreFields::with_supervisor(supervisor),
+            storage,
+        }
+    }
+
+    /// A shutdown whose Supervisor drain misses the deadline reports
+    /// `TimedOut`, leaves the drain running, and keeps the store's lock: a
+    /// reopen of the directory meanwhile fails with `StorageLockHeld`. Once
+    /// the last writer exits, the late drain closes the store and the
+    /// directory reopens.
+    #[tokio::test]
+    async fn timed_out_shutdown_keeps_lock_until_drain_finishes() {
+        let dir = unique_store_dir("timeout");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let bridge = sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await;
+
+        let outcome = bridge
+            .shutdown(Duration::from_millis(200))
+            .await
+            .expect("shutdown reports an outcome");
+        assert!(
+            matches!(outcome, ShutdownOutcome::TimedOut { .. }),
+            "a wedged drain must report TimedOut, got {outcome:?}"
+        );
+
+        let reopen = scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY);
+        assert!(
+            matches!(
+                reopen,
+                Err(scp_platform::PlatformError::StorageLockHeld { .. })
+            ),
+            "a reopen during a timed-out shutdown must fail with StorageLockHeld, got {:?}",
+            reopen.map(|_| ())
+        );
+
+        // Release the wedged writer; the detached drain then closes the store.
+        gate.add_permits(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let reopen = loop {
+            match scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY) {
+                Err(scp_platform::PlatformError::StorageLockHeld { .. })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => break other,
+            }
+        };
+        reopen
+            .expect("the late drain never released the store")
+            .close()
+            .expect("close the reopened store");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A shutdown whose drain finishes inside the deadline reports
+    /// `GracefulWithin` and has closed the store before returning, so the
+    /// directory reopens on the first try.
+    #[tokio::test]
+    async fn graceful_shutdown_closes_store_before_returning() {
+        let dir = unique_store_dir("graceful");
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let bridge = sqlite_bridge_with_context(&dir, gate).await;
+
+        let outcome = bridge
+            .shutdown(Duration::from_secs(10))
+            .await
+            .expect("shutdown reports an outcome");
+        assert!(
+            matches!(outcome, ShutdownOutcome::GracefulWithin { .. }),
+            "an unwedged drain must finish in time, got {outcome:?}"
+        );
+        let reopened = scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY)
+            .expect("the store closed before shutdown returned, so the first reopen succeeds");
+        reopened.close().expect("close the reopened store");
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

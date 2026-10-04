@@ -82,7 +82,11 @@ async fn handle_standing_context_count(
     let count_fut = async { crate::context::standing_helpers::standing_context_count(deps) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
-        Ok(count) => (Outcome::ok(()), Ok(count)),
+        Ok(Ok(count)) => (Outcome::ok(()), Ok(count)),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "standing_context_count exceeded {HANDLER_TIMEOUT:?} budget"
@@ -105,7 +109,11 @@ async fn handle_has_standing_context(
     let has_fut = async { crate::context::standing_helpers::has_standing_context(deps, &peer_did) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, has_fut).await {
-        Ok(has) => (Outcome::ok(()), Ok(has)),
+        Ok(Ok(has)) => (Outcome::ok(()), Ok(has)),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "has_standing_context exceeded {HANDLER_TIMEOUT:?} budget"

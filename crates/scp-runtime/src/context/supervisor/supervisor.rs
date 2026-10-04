@@ -1050,15 +1050,51 @@ impl CrashWindow {
 /// breaks that self-reference. The watchdog owns its `JoinHandle`
 /// directly (TTL / governance timers are actor-owned arms — ADR-049
 /// finding A3 — so no supervisor timer JoinSet exists).
+///
+/// The watchdog spawns through the caller's [`SpawnPermit`] onto the
+/// supervisor's task tracker and holds only a `Weak<Supervisor>` while it
+/// waits (ADR-049 Decision 16). It upgrades once the actor exits, for the one
+/// crash-handling operation; a failed upgrade means every owner dropped the
+/// Supervisor, so no respawn is possible and the watchdog ends.
 fn spawn_actor_watchdog_task(
-    supervisor: Arc<Supervisor>,
+    permit: &SpawnPermit<'_>,
+    supervisor: std::sync::Weak<Supervisor>,
     ctx_id: String,
     owning_did: DID,
     join: tokio::task::JoinHandle<()>,
 ) {
-    tokio::spawn(async move {
-        supervisor.actor_watchdog(ctx_id, owning_did, join).await;
+    permit.spawn(async move {
+        let outcome = join.await;
+        let Some(supervisor) = supervisor.upgrade() else {
+            log_watchdog_without_supervisor("context_actor", &ctx_id, &outcome);
+            return;
+        };
+        supervisor.actor_watchdog(ctx_id, owning_did, outcome).await;
     });
+}
+
+/// Logs an actor exit that a watchdog observed after every owner dropped the
+/// Supervisor. A clean exit is the expected end of a drained actor; a panic
+/// can no longer be respawned and is reported without its payload (the
+/// ADR-049 §10 payload-free rule).
+fn log_watchdog_without_supervisor(
+    actor_kind: &'static str,
+    subject: &str,
+    outcome: &Result<(), tokio::task::JoinError>,
+) {
+    match outcome {
+        Err(e) if e.is_panic() => tracing::error!(
+            actor_kind,
+            subject,
+            panic_location = "unknown",
+            "actor panicked after its supervisor dropped; not respawned, payload intentionally not logged"
+        ),
+        Ok(()) | Err(_) => tracing::debug!(
+            actor_kind,
+            subject,
+            "actor exited after its supervisor dropped"
+        ),
+    }
 }
 
 /// Spawn a `KeyPackageStoreActor`'s watchdog task (ADR-049 §10).
@@ -1070,14 +1106,64 @@ fn spawn_actor_watchdog_task(
 /// resolve when spawned inline. The watchdog owns its `JoinHandle` directly
 /// (no supervisor timer JoinSet exists — timers are actor-owned arms, ADR-049
 /// finding A3).
+///
+/// Spawns through the caller's [`SpawnPermit`] and holds a `Weak<Supervisor>`,
+/// exactly as [`spawn_actor_watchdog_task`] does (ADR-049 Decision 16).
 fn spawn_kp_actor_watchdog_task(
-    supervisor: Arc<Supervisor>,
+    permit: &SpawnPermit<'_>,
+    supervisor: std::sync::Weak<Supervisor>,
     identity: DID,
     join: tokio::task::JoinHandle<()>,
 ) {
-    tokio::spawn(async move {
-        supervisor.kp_actor_watchdog(identity, join).await;
+    permit.spawn(async move {
+        let outcome = join.await;
+        let Some(supervisor) = supervisor.upgrade() else {
+            log_watchdog_without_supervisor("key_package_store", &identity.0, &outcome);
+            return;
+        };
+        supervisor.kp_actor_watchdog(identity, outcome).await;
     });
+}
+
+/// Permission to spawn onto the Supervisor's task tracker (ADR-049 Decision
+/// 16), issued by [`Supervisor::spawn_permit`] only while the closed flag is
+/// clear.
+///
+/// The permit holds the read guard of the closed flag, so
+/// `shutdown_all_contexts` cannot set the flag, and therefore cannot take its
+/// actor snapshot, while a permit is alive. Take a permit, register what the
+/// spawned task serves, spawn, and drop the permit, all without an `.await`
+/// in between: the guard is `!Send`, so holding it across an `.await` fails to
+/// compile in any spawned future.
+pub(in crate::context) struct SpawnPermit<'a> {
+    tracker: &'a tokio_util::task::TaskTracker,
+    _open: std::sync::RwLockReadGuard<'a, bool>,
+}
+
+impl SpawnPermit<'_> {
+    /// Spawns `future` onto the Supervisor's task tracker.
+    pub(in crate::context) fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tracker.spawn(future)
+    }
+
+    /// Spawns `future` onto the Supervisor's task tracker, on `runtime`. For a
+    /// caller that can run off any runtime thread (a `Drop`), where
+    /// [`Self::spawn`] would panic for want of an ambient runtime.
+    pub(in crate::context) fn spawn_on<F>(
+        &self,
+        future: F,
+        runtime: &tokio::runtime::Handle,
+    ) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tracker.spawn_on(future, runtime)
+    }
 }
 
 /// Flat, named-field request for
@@ -1410,6 +1496,24 @@ pub struct Supervisor {
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
     /// Per-identity `KeyPackageStoreActor` handles.
     pub(in crate::context::supervisor) key_package_stores: DashMap<DID, KeyPackageStoreHandle>,
+    /// The one task tracker every supervisor-held task spawns through
+    /// (ADR-049 Decision 16, supervisor task drain). Membership is decided by
+    /// what the spawned future holds: an `Arc<Supervisor>`, a
+    /// [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle),
+    /// an [`ActorDeps`](crate::context::actor::deps::ActorDeps), or a
+    /// supervisor-owned writer of the storage backend. Spawn only through
+    /// [`Self::spawn_permit`] or [`Self::spawn_tracked`], which refuse once
+    /// shutdown begins. [`Self::shutdown_all_contexts`] closes the tracker and
+    /// awaits it.
+    task_tracker: tokio_util::task::TaskTracker,
+    /// The closed flag of ADR-049 Decision 16: `true` once
+    /// [`Self::shutdown_all_contexts`] has begun. A spawner holds the read
+    /// guard (inside a [`SpawnPermit`]) across the synchronous spawn call, and
+    /// shutdown takes the write guard to set the flag, so no spawn that passed
+    /// the check can land after shutdown's snapshot. The guard is never held
+    /// across an `.await`; `std::sync::RwLock` is the workspace-permitted lock
+    /// for a synchronous critical section.
+    spawn_gate: std::sync::RwLock<bool>,
     /// Configuration.
     // Operational in Phase 2 of post-review-round-1 plan (saga + watchdog
     // configuration plumbed through ActorDeps).
@@ -1881,6 +1985,8 @@ impl Supervisor {
             bootstrap_spawn_lock,
             saga_journal,
             key_package_stores: DashMap::new(),
+            task_tracker: tokio_util::task::TaskTracker::new(),
+            spawn_gate: std::sync::RwLock::new(false),
             health_config,
             crash_windows: DashMap::new(),
             // ADR-049 (read-authority switch): supervisor-owned authoritative Class-M floor registry.
@@ -2663,17 +2769,24 @@ impl Supervisor {
             return Ok(handle.value().clone());
         }
         let deps = self.build_kp_store_deps(identity)?;
-        let (handle, join) =
-            crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
+        // ADR-049 Decision 16: the actor and its watchdog spawn through one
+        // permit, taken after the last `.await` and before the insert, so a
+        // shutdown that has begun refuses this spawn with a typed error and
+        // a shutdown that begins later sees the registered handle.
+        let permit = self.spawn_permit("spawn key-package actor")?;
+        let (handle, actor) =
+            crate::context::supervisor::key_package_actor::KeyPackageStoreActor::new(
                 identity.clone(),
                 deps,
             );
         self.key_package_stores
             .insert(identity.clone(), handle.clone());
+        let join = permit.spawn(actor.run());
         // Attach the watchdog (ADR-049 §10) — mirrors the per-context actor
         // watchdog. Keeps the JoinHandle and respawns from durable storage on
         // panic; poisons the identity after the 3-crash/60s budget.
-        spawn_kp_actor_watchdog_task(Arc::clone(self), identity.clone(), join);
+        spawn_kp_actor_watchdog_task(&permit, Arc::downgrade(self), identity.clone(), join);
+        drop(permit);
         Ok(handle)
     }
 
@@ -2861,7 +2974,7 @@ impl Supervisor {
             Arc::clone,
         );
         let key_package_store = self.key_package_store_for(owning_did).await?;
-        let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
+        let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(self);
         // Mint the actor's capability token here, at the supervisor build
         // site, for THIS actor's owning identity (ADR-049 §5). This is the
         // only mint path — `issue_for_actor` is `pub(super)`, reachable
@@ -4579,13 +4692,26 @@ impl Supervisor {
         let ctx_id_str = state.handle.context_id().to_owned();
 
         let handle = ContextActorHandle::from_sender(tx);
+        // Write-path mutation: register the handle under the write
+        // lock — same contract as [`Self::spawn_actor`]. Reject a
+        // duplicate registration (first-writer-wins) instead of
+        // silently overwriting a live actor: the overwrite would
+        // leak the loser's spawned task and diverge crypto state.
+        let _guard = self.write_lock.lock().await;
+        // ADR-049 Decision 16: take the spawn permit under the write lock,
+        // after the last `.await`. Once shutdown has begun the spawn is
+        // refused with a typed error; otherwise shutdown cannot take its
+        // actor snapshot until this registration and both spawns finish.
+        let permit = match self.spawn_permit("spawn context actor") {
+            Ok(permit) => permit,
+            Err(refused) => {
+                // The refused `state` never becomes a live actor: dispose its
+                // seeded crypto exactly as the duplicate-birth branch below.
+                let _ = state.dispose_secrets();
+                return Err(refused);
+            }
+        };
         {
-            // Write-path mutation: register the handle under the write
-            // lock — same contract as [`Self::spawn_actor`]. Reject a
-            // duplicate registration (first-writer-wins) instead of
-            // silently overwriting a live actor: the overwrite would
-            // leak the loser's spawned task and diverge crypto state.
-            let _guard = self.write_lock.lock().await;
             if self.actors.contains_key(&ctx_id_str) {
                 // Losing duplicate birth: this `state` never becomes a live
                 // actor, so dispose its seeded crypto (#2148 F6) — `destroy_group`
@@ -4613,13 +4739,13 @@ impl Supervisor {
         // (ADR-049 finding A3), reconciled inside the actor's own `run()`
         // loop — no separate supervisor timer JoinSet exists.
         let inbox = rx;
-        let join = tokio::spawn(async move {
+        let join = permit.spawn(async move {
             Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox).run()).await;
         });
 
         // Spawn the watchdog: it awaits the actor's completion and, on a
-        // panic, records the crash + (poison-or-respawn). A clone of the
-        // supervisor `Arc` keeps it alive for the watchdog's lifetime.
+        // panic, records the crash + (poison-or-respawn). It holds a `Weak`
+        // and upgrades it only after the actor exits (ADR-049 Decision 16).
         // Spawn the watchdog through a free helper (not inline) so its
         // future's `Send` proof is resolved OUTSIDE this method's opaque
         // `impl Future` scope. Spawning inline would form a self-referential
@@ -4628,7 +4754,8 @@ impl Supervisor {
         // `spawn_actor_with_state`) that the compiler refuses to resolve
         // ("fetching the hidden types of an opaque inside of the defining
         // scope is not supported").
-        spawn_actor_watchdog_task(Arc::clone(self), ctx_id_str, owning_did, join);
+        spawn_actor_watchdog_task(&permit, Arc::downgrade(self), ctx_id_str, owning_did, join);
+        drop(permit);
 
         Ok(handle)
     }
@@ -4672,9 +4799,8 @@ impl Supervisor {
         self: Arc<Self>,
         ctx_id: String,
         owning_did: DID,
-        join: tokio::task::JoinHandle<()>,
+        outcome: Result<(), tokio::task::JoinError>,
     ) {
-        let outcome = join.await;
         let join_err = match outcome {
             // Clean return: the run loop exited normally. No crash, no
             // respawn. Leave any existing poison record untouched.
@@ -4778,8 +4904,11 @@ impl Supervisor {
     /// [`is_panic`](tokio::task::JoinError::is_panic). The panic payload is
     /// NEVER read or formatted — a KP actor panic could carry private
     /// signer-state bytes.
-    async fn kp_actor_watchdog(self: Arc<Self>, identity: DID, join: tokio::task::JoinHandle<()>) {
-        let outcome = join.await;
+    async fn kp_actor_watchdog(
+        self: Arc<Self>,
+        identity: DID,
+        outcome: Result<(), tokio::task::JoinError>,
+    ) {
         let join_err = match outcome {
             Ok(()) => return,
             Err(e) => e,
@@ -7090,21 +7219,32 @@ impl Supervisor {
         // receiver + the pinned descriptor/schemas). It forwards each chunk,
         // durably folds it into B's frontier (StreamCaptureAppend), and seals at
         // close (CommitBStreamSettle).
-        tokio::spawn(
-            crate::context::outlets::invoke::run_streaming_saga_seal_task(
-                Arc::clone(self),
-                target_hex,
-                saga_id.clone(),
-                SigningKeyBytes::from_signing_key(signing_keys.target),
-                inner_rx,
-                outer_tx,
-                escrow_ticket,
-                descriptor,
-                output_schema,
-                aggregate_schema,
-                a_event_log,
-            ),
+        // The task spawns on the tracker so shutdown waits for its seal
+        // (ADR-049 Decision 16). A refusal means shutdown has begun: the future
+        // drops unrun (its escrow guard reverses the open-time hold), the staged
+        // Prepare-B slot is cleared, and the caller gets a typed abort.
+        let seal = crate::context::outlets::invoke::run_streaming_saga_seal_task(
+            Arc::downgrade(self),
+            target_hex.clone(),
+            saga_id.clone(),
+            SigningKeyBytes::from_signing_key(signing_keys.target),
+            inner_rx,
+            outer_tx,
+            escrow_ticket,
+            descriptor,
+            output_schema,
+            aggregate_schema,
+            a_event_log,
         );
+        if let Err(refused) = self.spawn_tracked("spawn streaming saga seal task", seal) {
+            self.abort_staged_streaming_saga(&saga_id, &target_hex)
+                .await;
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::ParticipantUnavailable,
+                code: 13067,
+                message: refused.to_string(),
+            });
+        }
 
         // AC1 — return the receiver PROMPTLY (the journal is `Committing`; the
         // seal reaches `Committed` at stream-close, off the mailbox).
@@ -10773,32 +10913,152 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Shut down every context the supervisor owns (best-effort,
-    /// local cleanup only).
+    /// Shut down every context the supervisor owns and wait for every task
+    /// the supervisor spawned to exit (ADR-049 Decision 16, supervisor task
+    /// drain; local cleanup only).
     ///
-    /// Destroys per-context sender keys + MLS groups + event logs in
-    /// that order (release secrets before tearing down structure;
-    /// `SenderKey`s, the MLS group's signer, and its provider-storage values
-    /// zeroize on drop),
-    /// removes the contexts from the supervisor's registry, clears the
-    /// standing-context tracking + local-DID registry + per-identity
-    /// wrapping keys, and aborts background tasks (TTL timers,
-    /// governance timeouts). Does NOT send leave messages or notify
-    /// remote peers — used by `scp_ffi_common::BridgeInstance::shutdown`
-    /// for process exit / test teardown.
+    /// In order: sets the closed flag, so every later spawn through the task
+    /// tracker fails with [`ContextError::SupervisorShutDown`]; destroys each
+    /// context's sender keys, MLS group, and event log through its actor
+    /// (release secrets before tearing down structure; `SenderKey`s, the MLS
+    /// group's signer, and its provider-storage values zeroize on drop) and
+    /// removes the actor from the registry; stops every key-package actor and
+    /// clears `key_package_stores`; clears the standing-context index, the
+    /// local-DID registry, and the per-identity wrapping keys; closes the task
+    /// tracker and awaits it. Returns only after every tracked task has
+    /// exited, so the caller may then close the storage backend it passed to
+    /// the supervisor (§17.6 of the persistence spec, One Writer per Durable
+    /// Directory). Imposes no deadline of its own: the bridge's bounded
+    /// shutdown wait bounds it (ADR-048 §5, as amended 2026-10-04).
     ///
-    /// Phase 1 fix-up of ADR-049 (post-review-round-1): now async to
-    /// allow proper `lock().await` acquisition rather than the prior
-    /// best-effort `try_lock` that silently skipped cleanup on
-    /// contention.
+    /// Does NOT send leave messages or notify remote peers. A second call
+    /// finds nothing left to stop and returns once the tracker is empty.
+    ///
+    /// Infallible: a per-context mailbox failure is logged and does not stop
+    /// the sweep, because the actor is despawned either way, which closes its
+    /// inbox. Returning means the drain finished.
+    pub async fn shutdown_all_contexts(&self) {
+        crate::context::lifecycle_helpers::shutdown_all_contexts(self).await;
+    }
+
+    /// Issues a [`SpawnPermit`] for the Supervisor's task tracker, or refuses
+    /// once [`Self::shutdown_all_contexts`] has begun (ADR-049 Decision 16).
+    ///
+    /// `operation` names the refused spawn in the error. A poisoned flag lock
+    /// is recovered: the flag is a plain `bool` that a panic cannot leave half
+    /// written.
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())`. Best-effort cleanup logs
-    /// per-context failures via `tracing::warn!` inside the helper.
-    pub async fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::shutdown_all_contexts(self).await;
-        Ok(())
+    /// [`ContextError::SupervisorShutDown`] once the closed flag is set.
+    pub(in crate::context) fn spawn_permit(
+        &self,
+        operation: &str,
+    ) -> Result<SpawnPermit<'_>, ContextError> {
+        let open = self
+            .spawn_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *open {
+            return Err(ContextError::SupervisorShutDown(format!(
+                "{operation} refused: the supervisor starts no task once \
+                 shutdown_all_contexts has begun"
+            )));
+        }
+        Ok(SpawnPermit {
+            tracker: &self.task_tracker,
+            _open: open,
+        })
+    }
+
+    /// Spawns `future` onto the Supervisor's task tracker, or refuses once
+    /// shutdown has begun (ADR-049 Decision 16). For a spawn that must also
+    /// register state the drain reads, take a [`Self::spawn_permit`] and
+    /// register under it instead.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] once the closed flag is set; the
+    /// future is dropped without running.
+    pub(in crate::context) fn spawn_tracked<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let permit = self.spawn_permit(operation)?;
+        Ok(permit.spawn(future))
+    }
+
+    /// [`Self::spawn_tracked`] on an explicit runtime handle, for a caller that
+    /// can run off any runtime thread.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] once the closed flag is set; the
+    /// future is dropped without running.
+    pub(in crate::context) fn spawn_tracked_on<F>(
+        &self,
+        operation: &str,
+        future: F,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let permit = self.spawn_permit(operation)?;
+        Ok(permit.spawn_on(future, runtime))
+    }
+
+    /// Sets the closed flag (ADR-049 Decision 16, step 2). Blocks only until
+    /// every live [`SpawnPermit`] drops, and a permit is never held across an
+    /// `.await`, so the wait is bounded by one synchronous spawn.
+    pub(in crate::context) fn close_spawn_gate(&self) {
+        *self
+            .spawn_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
+    /// Stops every key-package actor and clears `key_package_stores`
+    /// (ADR-049 Decision 16, step 3). The map is drained under the write lock
+    /// so no resolver observes a half-cleared map; the shutdown commands are
+    /// sent after the lock drops. A send that fails (inbox closed or full) is
+    /// logged and is not fatal: dropping the last handle closes the actor's
+    /// inbox, and the actor's run loop exits on the closed inbox.
+    pub(in crate::context) async fn stop_key_package_actors(&self) {
+        let handles: Vec<(DID, KeyPackageStoreHandle)> = {
+            let _guard = self.write_lock.lock().await;
+            let drained = self
+                .key_package_stores
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect();
+            self.key_package_stores.clear();
+            drained
+        };
+        for (identity, handle) in handles {
+            if let Err(e) = handle.send_shutdown().await {
+                tracing::warn!(
+                    identity = %identity.0,
+                    error = %e,
+                    "shutdown: key-package actor did not accept Shutdown; its inbox closes \
+                     when the last handle drops"
+                );
+            }
+        }
+    }
+
+    /// Closes the task tracker and waits until every tracked task has exited
+    /// (ADR-049 Decision 16, step 3). Call only after the closed flag is set
+    /// and every actor was told to stop.
+    pub(in crate::context) async fn await_tracked_tasks(&self) {
+        self.task_tracker.close();
+        self.task_tracker.wait().await;
     }
 
     /// Sync wrapper for [`Self::shutdown_all_contexts`].
@@ -10806,18 +11066,15 @@ impl Supervisor {
     /// Required by destructor / atexit-style sync callers (the FFI
     /// bridge instance's blocking-shutdown path) that cannot `.await`.
     /// Uses [`tokio::runtime::Handle::try_current`] to bridge sync →
-    /// async; **callers MUST be inside a tokio runtime**. No-op (with
-    /// warning) when called outside a runtime.
-    ///
-    /// Phase 1 fix-up of ADR-049 (post-review-round-1).
+    /// async; **callers MUST be inside a tokio runtime**.
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())`. Per-context cleanup failures
-    /// are logged via `tracing` inside the helper.
+    /// [`ContextError::InvalidState`] when called outside a tokio runtime:
+    /// nothing was shut down or drained, so the caller must not close the
+    /// storage backend.
     pub fn shutdown_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::shutdown_all_contexts_sync(self);
-        Ok(())
+        crate::context::lifecycle_helpers::shutdown_all_contexts_sync(self)
     }
 
     // -------------------------------------------------------------------
@@ -12311,6 +12568,7 @@ impl Supervisor {
                         error = %e,
                         "dedicated rate-limit runtime build failed; failing closed"
                     );
+                    drop(supervisor);
                     let _ = tx.send(false);
                     return;
                 }
@@ -12324,6 +12582,10 @@ impl Supervisor {
             } else {
                 rt.block_on(supervisor.try_consume_hard_rate_limit(&context_id, &did, now_secs)) // ci-allow: block-on: ADR-049 §7 FFI sync rate-limit allowlist (dedicated-thread consume)
             };
+            // Release the Supervisor before replying, so the reference never
+            // outlives the synchronous call the caller blocks on (ADR-049
+            // Decision 16).
+            drop(supervisor);
             let _ = tx.send(result);
         });
         rx.recv().unwrap_or(false)
@@ -12972,7 +13234,7 @@ impl Supervisor {
         let settlement_sink: Arc<dyn crate::context::outlets::invoke::StreamSettlementSink> =
             Arc::new(
                 crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink::new(
-                    Arc::clone(self),
+                    Arc::downgrade(self),
                     reservation.generation,
                 ),
             );
@@ -12986,7 +13248,7 @@ impl Supervisor {
         let durable_invoked_sink: Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink> =
             Arc::new(
                 crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink::new(
-                    Arc::clone(self),
+                    Arc::downgrade(self),
                     crate::context::state::context_id_to_bytes(context_id),
                     invoker_did.as_ref().to_owned(),
                 ),
@@ -13135,7 +13397,7 @@ impl Supervisor {
         // unspent-portion refund.
         let escrow_refund_sink: Arc<dyn dispatch::StreamEscrowRefundSink> = Arc::new(
             crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
-                Arc::clone(self),
+                Arc::downgrade(self),
             ),
         );
         let escrow_ticket = dispatch::StreamEscrowTicket::new(
@@ -13151,7 +13413,7 @@ impl Supervisor {
         // helper's "no store → fail closed" branch is unreachable here.
         let counter_store: Arc<dyn crate::trust::CaveatCounterApi> = Arc::new(
             crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter::new(
-                Arc::clone(self),
+                Arc::downgrade(self),
             ),
         );
 
@@ -14470,9 +14732,8 @@ impl Supervisor {
                     if forced_non_durable
                         || !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
                             &state.export_crypto_state(
-                                deps.supervisor.export_sender_key_epochs(&context_id_bytes),
-                                deps.supervisor
-                                    .export_recv_sequence_floors(&context_id_bytes),
+                                self.export_sender_key_epochs(&context_id_bytes),
+                                self.export_recv_sequence_floors(&context_id_bytes),
                                 welcome_wrapping_public,
                                 &*welcome_wrapping_secret,
                             ),
@@ -14588,14 +14849,14 @@ impl Supervisor {
         // additional persist is needed here). The governance-timeout interval
         // is ACTOR-OWNED (ADR-049 Decision-1 / finding A3): the spawned actor's
         // `reconcile_timers` arms it while `Active` — no bootstrap install.
-        deps.supervisor.update_context_gauges().await;
+        deps.supervisor.update_context_gauges().await?;
         if params.ttl.is_some() {
             // Joiner arms with no explicit deadline — the actor handler derives
             // the convergent expiry deadline on the same creator-assigned
             // `creation_timestamp_secs + params.ttl` basis the creator used.
             deps.supervisor
                 .dispatch_start_ttl_timer(&context_id, params.clone(), None)
-                .await;
+                .await?;
         }
 
         Ok(handle)
@@ -19480,6 +19741,67 @@ mod tests {
         );
     }
 
+    /// After `shutdown_all_contexts` returns and the owner drops its handle,
+    /// nothing keeps the Supervisor alive (ADR-049 Decision 16): every
+    /// supervisor-spawned task holds a `Weak` and the tracker wait has seen
+    /// each one exit. A `Weak` probe taken before shutdown must fail to
+    /// upgrade. With strong back-references in the actor deps or watchdogs,
+    /// or without the tracker wait, a context actor, key-package actor, or
+    /// watchdog still holds an `Arc` and the probe upgrades.
+    #[tokio::test]
+    async fn supervisor_drops_after_shutdown_and_owner_release() {
+        let supervisor_arc = supervisor_with_providers();
+        for ctx_id_bytes in [[0x3Cu8; 32], [0x4Du8; 32]] {
+            let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                1_700_000_000,
+                DID("did:example:admin".to_owned()),
+            );
+            let deps = test_actor_deps(&supervisor_arc).await;
+            supervisor_arc
+                .spawn_actor_with_state(state, deps, None)
+                .await
+                .expect("fresh context id registers");
+        }
+        supervisor_arc
+            .key_package_store_for(&DID("did:dht:z6MkProbeKp".to_owned()))
+            .await
+            .expect("kp store resolves with providers");
+        let probe = Arc::downgrade(&supervisor_arc);
+
+        supervisor_arc.shutdown_all_contexts().await;
+        assert!(
+            supervisor_arc.key_package_stores.is_empty(),
+            "shutdown must clear key_package_stores"
+        );
+        drop(supervisor_arc);
+
+        assert!(
+            probe.upgrade().is_none(),
+            "a supervisor-spawned task still holds the Supervisor after shutdown"
+        );
+    }
+
+    /// Once shutdown has begun, a spawn through the tracker is refused with
+    /// a typed error rather than run untracked (ADR-049 Decision 16).
+    #[tokio::test]
+    async fn spawn_after_shutdown_is_refused() {
+        let supervisor_arc = supervisor_with_providers();
+        supervisor_arc.shutdown_all_contexts().await;
+        let refused = supervisor_arc.spawn_tracked("probe spawn", async {});
+        assert!(
+            matches!(refused, Err(ContextError::SupervisorShutDown(_))),
+            "a spawn after shutdown must fail with SupervisorShutDown"
+        );
+        let kp = supervisor_arc
+            .key_package_store_for(&DID("did:dht:z6MkLateKp".to_owned()))
+            .await;
+        assert!(
+            kp.is_err(),
+            "a key-package actor spawn after shutdown must be refused"
+        );
+    }
+
     /// A Phase-3 outlet-economy settle that finds NO registered actor for
     /// its context (the actor was despawned during the off-mailbox
     /// executor window) must NOT silently drop the in-flight ticket:
@@ -20901,23 +21223,28 @@ mod tests {
         );
     }
 
-    /// The returned `SupervisorHandle` wraps a clone of the OUTER
-    /// supervisor `Arc` (regression guard for the `self: &Arc<Self>`
-    /// receiver) — `strong_count` bumps when the handle is built.
+    /// The returned `SupervisorHandle` holds a `Weak` to the OUTER
+    /// supervisor `Arc` (ADR-049 Decision 16): building it adds a weak
+    /// reference and no strong one.
     #[tokio::test]
     async fn build_actor_deps_handle_holds_outer_arc() {
         let (supervisor, _crypto, _mls_storage) = build_deps_fixture();
-        let before = Arc::strong_count(&supervisor);
+        let strong_before = Arc::strong_count(&supervisor);
+        let weak_before = Arc::weak_count(&supervisor);
         let deps = supervisor
             .build_actor_deps(&DID("did:example:alice".to_owned()))
             .await
             .expect("build_actor_deps succeeds");
-        let after = Arc::strong_count(&supervisor);
         assert!(
-            after > before,
-            "SupervisorHandle must clone the outer Arc (count {before} -> {after})"
+            Arc::weak_count(&supervisor) > weak_before,
+            "SupervisorHandle must downgrade the outer Arc"
         );
-        assert!(deps.supervisor.local_dids().is_empty());
+        assert_eq!(
+            Arc::strong_count(&supervisor),
+            strong_before,
+            "SupervisorHandle must not hold a strong reference"
+        );
+        assert!(deps.supervisor.local_dids().unwrap().is_empty());
         deps.key_package_store
             .send_shutdown()
             .await
@@ -35573,4 +35900,15 @@ mod streaming_saga_tests {
 
         drop(recording);
     }
+}
+
+/// Keeps `supervisor` alive for the rest of the test process.
+///
+/// `ActorDeps` holds only a `Weak` back-reference (ADR-049 Decision 16), so a
+/// fixture that builds a Supervisor, returns only its `ActorDeps`, and drops
+/// the `Arc` would leave every supervisor operation failing with
+/// `SupervisorShutDown`. Those fixtures call this to model a live owner.
+#[cfg(test)]
+pub(crate) fn leak_for_test(supervisor: &Arc<Supervisor>) {
+    std::mem::forget(Arc::clone(supervisor));
 }

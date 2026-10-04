@@ -338,6 +338,13 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2136.to_owned(),
             },
+            // ADR-049 Decision 16: the Supervisor refused the operation
+            // because shutdown began. Dedicated SCP-CTX-2138 instead of
+            // CTX_2001. Mirrors the PyO3 bridge for cross-bridge parity.
+            CE::SupervisorShutDown(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2138.to_owned(),
+            },
             // §5.9: a `RestoreAccess` requested capabilities that were not
             // actually suspended for the member (and the member is not
             // read-excluded with read requested). Dedicated SCP-CTX-2137
@@ -637,6 +644,23 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpNapiError {
 
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
+        // Spec §17.6 "One Writer per Durable Directory": the closed-store and
+        // lock-still-held conditions carry their registered storage codes.
+        match &e {
+            scp_platform::PlatformError::StorageClosed => {
+                return Self::Validation {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8006.to_owned(),
+                };
+            }
+            scp_platform::PlatformError::StorageLockHeld { .. } => {
+                return Self::Validation {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8005.to_owned(),
+                };
+            }
+            _ => {}
+        }
         Self::Crypto {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
@@ -863,6 +887,16 @@ mod tests {
         let err: ScpNapiError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// ADR-049 Decision 16: an operation the Supervisor refused because
+    /// shutdown began must surface the dedicated SCP-CTX-2138 code, distinct
+    /// from the catch-all.
+    #[test]
+    fn supervisor_shut_down_surfaces_ctx_2138() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
     }
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the

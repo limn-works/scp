@@ -808,6 +808,23 @@ pub enum ContextError {
     #[error("SCP-CTX-2136: key package already consumed (init-key replay rejected): {0}")]
     KeyPackageReplay(String),
 
+    /// The Supervisor that owns the context has begun shutting down, or has
+    /// already dropped (ADR-049 Decision 16, supervisor task drain).
+    ///
+    /// Returned when `shutdown_all_contexts` has set the Supervisor's closed
+    /// flag and a caller then tries to spawn a task through the Supervisor's
+    /// task tracker (a context create, an actor respawn, a key-package actor,
+    /// a streaming task), and when an actor or a supervisor-spawned task finds
+    /// that its `Weak<Supervisor>` back-reference no longer upgrades. The
+    /// operation did not run. The payload names the refused operation.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2138` through a dedicated translator
+    /// arm in each FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
+    /// `SCP-CTX-2001` fallthrough — so a caller can tell an operation refused
+    /// by shutdown apart from a failure of the operation itself.
+    #[error("SCP-CTX-2138: supervisor is shutting down: {0}")]
+    SupervisorShutDown(String),
+
     /// A structured outlet error surfaced from the runtime with its full
     /// §5.4.4 taxonomy intact (SCP-OUT-031 PR-2a).
     ///

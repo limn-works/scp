@@ -431,7 +431,7 @@ async fn handle_land_sender_key_response(
         epoch,
         scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
     ) {
-        let e: ContextError = e.into();
+        let e: ContextError = e;
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);

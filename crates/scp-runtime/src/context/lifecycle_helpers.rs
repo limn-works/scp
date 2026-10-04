@@ -751,10 +751,26 @@ pub async fn close_context_with_key(
         // budget`). Detach it: the close handler returns, this actor's command loop
         // frees, and the refresh then observes up-to-date state. Gauges are
         // eventually-consistent metrics, so fire-and-forget is the correct coupling.
+        // The task captures the handle, so it spawns on the Supervisor's tracker
+        // (ADR-049 Decision 16) and shutdown waits for it. A refusal means
+        // shutdown has begun or the Supervisor dropped: no registry remains to
+        // measure, so the refresh is skipped and logged.
         let supervisor = deps.supervisor.clone();
-        tokio::spawn(async move {
-            supervisor.update_context_gauges().await;
-        });
+        let refresh = async move {
+            if let Err(e) = supervisor.update_context_gauges().await {
+                tracing::debug!(error = %e, "context gauge refresh skipped: supervisor gone");
+            }
+        };
+        if let Err(e) = deps
+            .supervisor
+            .spawn_tracked("refresh context gauges after close", refresh)
+        {
+            tracing::debug!(
+                context_id = %context_id,
+                error = %e,
+                "context gauge refresh not spawned: supervisor shutting down"
+            );
+        }
 
         Ok(())
     })
@@ -1677,7 +1693,7 @@ pub async fn create_context(
     // ADR-049 PR-4 §5: create-seed the supervisor floor registry so a
     // default-empty entry exists from creation (it then grows via
     // mirror-forward). Insert-if-absent — never resets an advanced entry.
-    deps.supervisor.seed_context_floors(&context_id_bytes);
+    deps.supervisor.seed_context_floors(&context_id_bytes)?;
     let actor_members: HashSet<DID> = initial_members.clone();
     let create_is_broadcast = broadcast_context.is_some();
     let mode = if create_is_broadcast {
@@ -1833,7 +1849,7 @@ pub async fn create_context(
         .await
         .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
-    finalize_create(deps, &context_id, params.ttl, &handle).await;
+    finalize_create(deps, &context_id, params.ttl, &handle).await?;
     Ok(handle)
 }
 
@@ -1857,20 +1873,25 @@ pub async fn create_context(
 /// governance-timeout interval task, persistence/broadcast, and the TTL
 /// timer all reach the freshly-spawned actor through the supervisor
 /// registry, never the `DashMap`.
+///
+/// # Errors
+///
+/// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
+/// (ADR-049 Decision 16).
 pub async fn finalize_create(
     deps: &ActorDeps,
     context_id: &str,
     ttl_duration: Option<std::time::Duration>,
     handle: &ContextHandle,
-) {
-    deps.supervisor.update_context_gauges().await;
+) -> Result<(), ContextError> {
+    deps.supervisor.update_context_gauges().await?;
     // The governance-timeout interval is ACTOR-OWNED (ADR-049 Decision-1 /
     // finding A3): the freshly-spawned actor's `reconcile_timers` arms a
     // 60 s interval while the context is `Active` — no bootstrap mailbox
     // install is needed.
     deps.supervisor
         .persist_context_and_broadcast(context_id)
-        .await;
+        .await?;
     if ttl_duration.is_some() {
         // Install the TTL timer by mailboxing StartTtlTimer to the
         // freshly-spawned actor: the actor owns `state.ttl.timer` and
@@ -1880,8 +1901,9 @@ pub async fn finalize_create(
             // Create path: no explicit deadline — the actor handler derives the
             // convergent `creation_timestamp_secs + params.ttl` deadline.
             .dispatch_start_ttl_timer(context_id, handle.params().clone(), None)
-            .await;
+            .await?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,15 +2054,13 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // seeded onto an actor and writes no durable snapshot, so it cannot resurrect a
     // divergent second group for this id (there is no provider `taken_context_ids`
     // marker; #2148 deleted it, and `build_restored_owned` sets none).
-    deps.supervisor
-        .validate_and_merge_all_floors(
-            ctx_id_bytes,
-            restored.sender_epochs,
-            restored.recv_sequence,
-            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-            policy,
-        )
-        .map_err(ContextError::from)?;
+    deps.supervisor.validate_and_merge_all_floors(
+        ctx_id_bytes,
+        restored.sender_epochs,
+        restored.recv_sequence,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        policy,
+    )?;
 
     Ok(owned)
 }
@@ -2312,7 +2332,7 @@ pub async fn import_context(
     // gate provided. On success the prior actor claims itself terminal
     // and exits; we deterministically despawn its dead handle before the
     // fresh spawn below.
-    if deps.supervisor.lookup(&context_id).is_some() {
+    if deps.supervisor.lookup(&context_id)?.is_some() {
         // Crypto state is read from the SIGNED snapshot field (ADR-050: all
         // importer-restored state lives in the signed preimage), never from an
         // unsigned envelope blob. Validated by `validate_export_for_import` above.
@@ -2333,7 +2353,7 @@ pub async fn import_context(
                 // remove its dead handle so the respawn slot is vacant. The
                 // replace-gap marker makes a lifecycle-state read during the
                 // gap report `ActorCrashed`, not an absent context.
-                let _ = deps.supervisor.despawn_for_replace(&context_id).await;
+                let _: bool = deps.supervisor.despawn_for_replace(&context_id).await?;
             }
             // ONLY a stale/unreachable handle routes to recovery. The prior
             // actor exited (or dropped its reply) before we reached it. ALL
@@ -2344,7 +2364,7 @@ pub async fn import_context(
             // recovery branch below would re-restore the replayed snapshot and
             // silently bypass the replay guard.
             Err(ContextError::ContextNotRegistered(_)) => {
-                if deps.supervisor.lookup(&context_id).is_some() {
+                if deps.supervisor.lookup(&context_id)?.is_some() {
                     // A concurrent operation already owns the slot — refuse to
                     // overwrite it.
                     return Err(ContextError::MembershipFailed(format!(
@@ -2793,7 +2813,7 @@ pub async fn import_context(
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    deps.supervisor.update_context_gauges().await;
+    deps.supervisor.update_context_gauges().await?;
 
     // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
     // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
@@ -2802,7 +2822,7 @@ pub async fn import_context(
     // 8. Persist if persistence is configured.
     deps.supervisor
         .persist_context_and_broadcast(&context_id)
-        .await;
+        .await?;
 
     // 9. Re-arm the TTL timer through the partitioned single-source deadline
     // (ADR-049 §9). The create BASE + PROMOTION come from the PRUNE-IMMUNE,
@@ -2838,7 +2858,7 @@ pub async fn import_context(
     ) {
         deps.supervisor
             .dispatch_start_ttl_timer(&context_id, handle.params().clone(), Some(deadline))
-            .await;
+            .await?;
     }
 
     Ok(handle)
@@ -3098,15 +3118,13 @@ pub async fn restore_context(
         // seeded and writes no durable snapshot, so the id cannot resurrect a
         // divergent second group. #2148 deleted the provider `taken_context_ids`
         // marker this comment referenced, and `build_restored_owned` sets none.
-        deps.supervisor
-            .validate_and_merge_all_floors(
-                &ctx_id_bytes,
-                restored_floors.sender_epochs,
-                restored_floors.recv_sequence,
-                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-                scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal,
-            )
-            .map_err(ContextError::from)?;
+        deps.supervisor.validate_and_merge_all_floors(
+            &ctx_id_bytes,
+            restored_floors.sender_epochs,
+            restored_floors.recv_sequence,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+            scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal,
+        )?;
 
         // §5.13.3 rule 1 (FFI-02, load-time binding). Verify the rehydrated
         // group's committed `scp_context_params` (`0xFF02`) extension binds the
@@ -3515,7 +3533,7 @@ pub async fn restore_context(
     if let Some(deadline) = restore_ttl_deadline {
         deps.supervisor
             .dispatch_start_ttl_timer(context_id, handle.params().clone(), Some(deadline))
-            .await;
+            .await?;
     }
 
     Ok(())
@@ -3687,51 +3705,80 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// Sweep entry point: shut down every actor (best-effort, local
 /// cleanup only).
 ///
-/// Destroys per-context sender keys + MLS groups + event logs in that
-/// order (zeroize secrets before tearing down structure) by dispatching
-/// [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf)
-/// to each actor (each actor owns its `PerContextState` and drops it when
-/// its task exits — no `DashMap` cleanup needed), then clears
-/// supervisor-level state (standing contexts, local DIDs, wrapping keys,
-/// task set).
+/// Shuts down every context and drains the supervisor's tracked tasks
+/// (ADR-049 Decision 16, supervisor task drain).
 ///
-/// Relocates the legacy `shutdown_all_contexts_legacy` off the
-/// `Supervisor::contexts` `DashMap` iteration (the legacy body is now
-/// deleted). Used by
+/// Steps, in order:
+/// 1. Set the closed flag, so every later spawn through the task tracker
+///    (a create, an actor respawn, a key-package actor, a streaming task)
+///    fails with [`ContextError::SupervisorShutDown`](scp_protocol::context::ContextError::SupervisorShutDown).
+/// 2. Snapshot the actor registry under the write lock. A spawner that
+///    passed the closed-flag check registers under the same lock, so the
+///    snapshot holds every actor that can still be spawned.
+/// 3. Send each actor
+///    [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf),
+///    which destroys sender keys, the MLS group, and the event log in that
+///    order (zeroize secrets before tearing down structure), then despawn the
+///    actor whether or not the send succeeded: the despawn drops the last
+///    mailbox sender, the actor's `run()` loop exits on the closed inbox, and
+///    its task releases its `PerContextState`.
+/// 4. Stop every key-package actor and clear `key_package_stores`.
+/// 5. Clear the standing-context index, the local-DID registry, and the
+///    per-identity wrapping keys.
+/// 6. Close the task tracker and await it.
+///
+/// Used by
 /// [`Supervisor::shutdown_all_contexts`](crate::context::supervisor::Supervisor::shutdown_all_contexts)
-/// (and its sync wrapper) for process exit / test teardown. Does NOT
+/// (and its sync wrapper) for process exit and test teardown. Does NOT
 /// send leave messages or notify remote peers.
 pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
     use std::collections::{HashMap, HashSet};
 
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
 
-    let context_ids = supervisor.actor_ids();
+    supervisor.close_spawn_gate();
+    let context_ids = {
+        let _guard = supervisor.write_lock.lock().await;
+        supervisor.actor_ids()
+    };
     for ctx_id in &context_ids {
-        let Some(actor) = supervisor.lookup(ctx_id) else {
-            continue;
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
-        if actor
-            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-            .await
-            .is_err()
-        {
-            continue;
+        if let Some(actor) = supervisor.lookup(ctx_id) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
+            match actor
+                .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+                .await
+            {
+                Ok(()) => match rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        context_id = %ctx_id,
+                        error = %e,
+                        "shutdown: actor reported a ShutdownSelf teardown failure; despawning"
+                    ),
+                    Err(_dropped) => tracing::warn!(
+                        context_id = %ctx_id,
+                        "shutdown: actor exited before replying to ShutdownSelf; despawning"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    context_id = %ctx_id,
+                    error = %e,
+                    "shutdown: ShutdownSelf not delivered; despawning, which closes the \
+                     actor's inbox and drops its state"
+                ),
+            }
         }
-        let _ = rx.await;
         // `ShutdownSelf` tears down the per-context resources (sender
         // keys, MLS group, event log, timers) but does NOT break the
         // actor's `run()` loop — only `LifecycleControlCommand::Shutdown`
         // and a claimed `PrepareForReplace` do, and neither is sent here.
-        // We must explicitly despawn the actor: `despawn_actor` removes
-        // the handle from `actors` under the write lock, dropping the
-        // last `mpsc::Sender`. That closes the inbox, so the actor's
-        // `run()` loop exits on its inbox-closed (`None`) arm and the
-        // spawned task releases its `PerContextState`. Without this the
-        // handle leaks (context stays discoverable via `lookup` /
-        // `actor_ids` after "shutdown") and the task never exits.
+        // Despawning removes the handle from `actors` under the write lock,
+        // dropping the last `mpsc::Sender`. That closes the inbox, so the
+        // actor's `run()` loop exits on its inbox-closed (`None`) arm and the
+        // spawned task releases its `PerContextState`. The despawn runs
+        // even when the send failed, so a full or wedged mailbox cannot keep
+        // an actor registered past shutdown.
         supervisor.despawn_actor(ctx_id).await;
         // Clean shutdown: reap the (non-poison) crash-window entry so it does
         // not leak past teardown (ADR-049 §10). A poisoned entry is preserved
@@ -3741,18 +3788,16 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         supervisor.reap_crash_window(ctx_id);
         // Drop the authoritative Class-M floor registry entry on the same
         // teardown sweep (ADR-049) — the floor-registry twin of the crash-window
-        // reap above. Harmless-but-tidy here (the whole Supervisor is about to be
-        // dropped), but it keeps the registry floors' lifecycle aligned 1:1 with
-        // crash_windows and leaves no per-context registry entry behind after a
-        // shutdown sweep.
+        // reap above, keeping the registry floors' lifecycle aligned 1:1 with
+        // crash_windows.
         let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
         supervisor.remove_context_floors(&ctx_id_bytes);
         // Drop the per-context stream admission-tracker registry entry on the
-        // same teardown sweep (spec §5.4.5) — the streaming twin of the
-        // crash-window / floor-registry reaps above, keeping the admission
-        // registry from leaking past a shutdown.
+        // same teardown sweep (spec §5.4.5).
         supervisor.reap_stream_admission(ctx_id);
     }
+
+    supervisor.stop_key_package_actors().await;
 
     // Supervisor-level state clear. Acquired under the write_lock once
     // for the standing_contexts + local_dids stores so a concurrent
@@ -3770,14 +3815,17 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 
     supervisor.clear_wrapping_keys();
 
-    // No supervisor timer JoinSet to abort: TTL / governance timers are
-    // ACTOR-OWNED arms (ADR-049 finding A3). Despawning each actor above
-    // drops its inbox sender, so its `run()` loop exits and its owned timer
-    // arms are dropped with the task — no separate teardown needed.
+    // TTL / governance timers are ACTOR-OWNED arms (ADR-049 finding A3) and
+    // end with their actor's task. Every other supervisor-held task (actor
+    // watchdogs, the context-gauge refresh, the streaming saga seal task,
+    // the streaming settlement tasks) is on the tracker, so this wait
+    // returns only when no task holds the supervisor or its storage.
+    supervisor.await_tracked_tasks().await;
 
     tracing::info!(
         removed_count = context_ids.len(),
-        "shutdown: removed all contexts via actor mailbox and cleared identity registries"
+        "shutdown: removed all contexts, stopped key-package actors, and drained every \
+         supervisor task"
     );
 }
 
@@ -3787,21 +3835,26 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 /// instance's blocking-shutdown path) that cannot `.await`. Per
 /// ADR-049 §7 allowlist for the FFI shutdown path — uses
 /// [`tokio::runtime::Handle::try_current`] +
-/// [`tokio::task::block_in_place`] to bridge sync → async; no-op
-/// (with warning) when called outside a runtime.
-pub fn shutdown_all_contexts_sync(supervisor: &crate::context::supervisor::Supervisor) {
+/// [`tokio::task::block_in_place`] to bridge sync → async.
+///
+/// # Errors
+///
+/// [`ContextError::InvalidState`](scp_protocol::context::ContextError::InvalidState)
+/// when called outside a tokio runtime: nothing was shut down and nothing was
+/// drained, so the caller must not close the storage backend.
+pub fn shutdown_all_contexts_sync(
+    supervisor: &crate::context::supervisor::Supervisor,
+) -> Result<(), scp_protocol::context::ContextError> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown allowlist — the bridge's blocking shutdown path cannot .await.
             tokio::task::block_in_place(|| handle.block_on(shutdown_all_contexts(supervisor))); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
+            Ok(())
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "shutdown_all_contexts_sync called outside tokio runtime; \
-                 skipping shutdown — per-actor resources will leak"
-            );
-        }
+        Err(e) => Err(scp_protocol::context::ContextError::InvalidState(format!(
+            "shutdown_all_contexts_sync called outside a tokio runtime ({e}); nothing was \
+             shut down or drained, so the storage backend must stay open"
+        ))),
     }
 }
 

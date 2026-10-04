@@ -147,6 +147,9 @@ impl Scp {
             // a new ShutdownError variant must fail to compile here until it is
             // mapped to an ScpError, instead of reporting a live engine as shut down.
             Ok(_) | Err(ShutdownError::AlreadyShutDown) => Ok(()),
+            // The Supervisor drained but the durable store refused to close:
+            // it keeps its lock, so the caller learns a reopen will fail.
+            Err(ShutdownError::DurableStoreClose(e)) => Err(ScpError::from(e)),
         }
     }
 }

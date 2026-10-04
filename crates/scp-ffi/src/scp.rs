@@ -214,12 +214,13 @@ impl PyScp {
             }
         };
         // FAIL CLOSED (spec §17.6): a failed durable-backend open raises
-        // `ValidationError` carrying `SCP-STORAGE-8004`, the code the NAPI and
-        // `UniFFI` bridges raise for this same failure.
+        // `ValidationError` carrying `SCP-STORAGE-8004`, or `SCP-STORAGE-8005`
+        // when another store still holds the directory's lock — the codes the
+        // NAPI and `UniFFI` bridges raise for the same failures.
         let bi =
             PyBridgeInstance::with_storage_py(cfg).map_err(|e| ScpPyError::ValidationError {
                 message: e.to_string(),
-                code: scp_ffi_common::error_codes::STORAGE_8004.to_owned(),
+                code: e.code().to_owned(),
             })?;
         Ok(Self {
             inner: Arc::new(bi),
@@ -301,7 +302,9 @@ impl PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the tokio runtime is unavailable.
+    /// Raises `ContextError` if the tokio runtime is unavailable, and the
+    /// storage error if the durable store refused to close after the
+    /// Supervisor drained; the store then keeps its advisory lock.
     pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {
         let timeout = Duration::from_millis(timeout_millis);
         let rt = crate::runtime()?;
@@ -322,6 +325,10 @@ impl PyScp {
                         tracing::debug!("SCP.shutdown: {e} — treating as no-op");
                         Ok(())
                     }
+                    // The Supervisor drained but the durable store refused to
+                    // close: it keeps its lock, so the caller learns a reopen
+                    // will fail.
+                    Err(ShutdownError::DurableStoreClose(e)) => Err(ScpPyError::from(e)),
                 }
             })
         })?;

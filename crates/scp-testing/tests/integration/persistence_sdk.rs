@@ -67,6 +67,8 @@ use scp_platform::in_memory::InMemoryStorage;
 
 #[cfg(feature = "sqlite")]
 use scp_platform::sqlite::SqliteStorage;
+#[cfg(feature = "sqlite")]
+use scp_platform::traits::Storage as _;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -228,8 +230,10 @@ async fn context_create_persists_membership_to_sqlite() {
             .await
             .expect("context_create must succeed with sqlite-backed persistence");
         assert_eq!(handle.state(), ContextState::Active);
-        // Flush snapshots before drop.
+        // Flush snapshots, then drain the supervisor so no task still holds
+        // the store when this block drops it (ADR-049 Decision 16).
         manager.flush_all_contexts_sync().unwrap();
+        manager.shutdown_all_contexts().await;
     }
 
     // Phase 2: reopen same path, inspect the persisted ContextSnapshot.
@@ -335,10 +339,12 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         let _ = context_routing_id(ctx_id);
         let _ = context_id_bytes(ctx_id);
 
-        // Flush to SQLite before dropping — mirrors
-        // `CoreFields::shutdown_core_async` and `suspend()`'s
-        // `flush_all_contexts_sync` call.
+        // Flush to SQLite, then drain the supervisor before dropping —
+        // mirrors `CoreFields::shutdown_core_async`, which flushes and then
+        // waits for every supervisor task before the store closes
+        // (ADR-049 Decision 16).
         manager.flush_all_contexts_sync().unwrap();
+        manager.shutdown_all_contexts().await;
     }
 
     // ---- Phase 2: Reopen the same database in a second "process". ----
@@ -423,6 +429,118 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         !manager2.is_member(ctx_id, &bob.0).await,
         "Bob was never added, must not appear in restored membership"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AC5: Drain, then close: the same directory reopens on the first try
+// ---------------------------------------------------------------------------
+
+/// Builds a supervisor whose persistence writes through `storage`, the same
+/// shared handle a `StorageConfig::Sqlite` bridge instance holds.
+#[cfg(feature = "sqlite")]
+fn supervisor_over(storage: Arc<SqliteStorage>) -> Arc<Supervisor> {
+    let repo = Arc::new(ProtocolRepository::new(storage));
+    Supervisor::with_providers(
+        Arc::new(NodeMlsFactory::new(
+            ALICE_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
+        Box::new(NotConfiguredTransportProvider),
+        Box::new(MerkleEventLogProvider::new()),
+        permissive_key_resolver(),
+        Some(Box::new(ProtocolRepositoryContextBridge::new(repo))),
+        None,
+        None,
+        None,
+        Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
+            InMemoryStorage::new(),
+        ))) as Arc<dyn OpenMlsStorageAdapter>,
+    )
+}
+
+/// A store reopens on the first try, with no retry, once its owner has
+/// drained the supervisor (ADR-049 Decision 16; spec §17.6, One Writer per
+/// Durable Directory).
+///
+/// Two ways out of a "process" are checked:
+/// 1. Shut down and drop the supervisor. No task may still hold the store,
+///    so the owner's handle is the last one, and dropping it releases the
+///    advisory lock.
+/// 2. Shut down, then call `SqliteStorage::close` while handles still exist.
+///    The lock goes with the connection, the directory reopens, and the old
+///    handle refuses every later operation with `StorageClosed`.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_then_reopen_same_path_is_deterministic() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice = DID::from(ALICE_DID);
+
+    // ---- Process 1: the owner's drop releases the store. ----
+    let storage = Arc::new(SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap());
+    {
+        let manager = supervisor_over(Arc::clone(&storage));
+        manager.register_local_did(alice.clone()).await.unwrap();
+        manager
+            .create_context(
+                "ctx-reopen-drop".to_owned(),
+                encrypted_params(),
+                alice.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        manager.flush_all_contexts_sync().unwrap();
+        manager.shutdown_all_contexts().await;
+    }
+    assert_eq!(
+        Arc::strong_count(&storage),
+        1,
+        "after shutdown and the owner's drop, no supervisor task may still hold the store"
+    );
+    drop(storage);
+
+    // ---- Process 2: first-try reopen, then explicit close. ----
+    let storage = Arc::new(
+        SqliteStorage::new(tmpdir.path(), &SQLITE_KEY)
+            .expect("the first reopen after a drained shutdown must succeed"),
+    );
+    let manager = supervisor_over(Arc::clone(&storage));
+    manager.register_local_did(alice.clone()).await.unwrap();
+    manager
+        .create_context(
+            "ctx-reopen-close".to_owned(),
+            encrypted_params(),
+            alice.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    manager.flush_all_contexts_sync().unwrap();
+    manager.shutdown_all_contexts().await;
+    storage
+        .close()
+        .expect("close releases the connection and the lock");
+
+    // ---- Process 3: first-try reopen while the old handles still exist. ----
+    let reopened = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY)
+        .expect("the first reopen after close must succeed while old handles exist");
+    assert!(
+        matches!(
+            storage
+                .retrieve("context/ctx-reopen-close/full_snapshot")
+                .await,
+            Err(scp_platform::PlatformError::StorageClosed)
+        ),
+        "the closed handle must refuse every later operation"
+    );
+    let repo = ProtocolRepository::new(reopened);
+    for ctx_id in ["ctx-reopen-drop", "ctx-reopen-close"] {
+        assert!(
+            repo.load_full_snapshot(ctx_id).await.unwrap().is_some(),
+            "{ctx_id} must be persisted and readable after the reopen"
+        );
+    }
+    drop(manager);
 }
 
 // ---------------------------------------------------------------------------

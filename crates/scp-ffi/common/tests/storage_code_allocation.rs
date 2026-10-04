@@ -4,7 +4,7 @@
 //! `.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes allocates the
 //! band per owner and states the rule in prose: "never reuse a number assigned
 //! to a different backend, even across languages". This file asserts that rule
-//! for the two codes `scp-ffi-common` defines, because a violation is invisible
+//! for the codes `scp-ffi-common` defines, because a violation is invisible
 //! at the Rust layer — the colliding owner, `scp-kt-android` `AndroidStorage`,
 //! is Kotlin, and an Android app links it and the `UniFFI` bridge into one
 //! process.
@@ -17,7 +17,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use scp_ffi_common::error_codes::{STORAGE_8000, STORAGE_8004};
+use scp_ffi_common::error_codes::{STORAGE_8000, STORAGE_8004, STORAGE_8005, STORAGE_8006};
 
 /// Numbers the `scp-kt-android` `AndroidStorage` backend owns
 /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
@@ -35,12 +35,14 @@ const BROWSER_OWNED: [&str; 4] = [
     "SCP-STORAGE-8013",
 ];
 
-/// The two codes the storage-selection layer raises across all three bridges
+/// The codes the storage-selection layer raises across all three bridges
 /// carry the numbers `.docs/standards/sdk-common.md` allocates to that layer.
 #[test]
 fn selection_layer_codes_carry_their_registered_numbers() {
     assert_eq!(STORAGE_8000, "SCP-STORAGE-8000");
     assert_eq!(STORAGE_8004, "SCP-STORAGE-8004");
+    assert_eq!(STORAGE_8005, "SCP-STORAGE-8005");
+    assert_eq!(STORAGE_8006, "SCP-STORAGE-8006");
 }
 
 /// Neither selection-layer code takes a number another backend owns. An
@@ -49,7 +51,7 @@ fn selection_layer_codes_carry_their_registered_numbers() {
 /// name two conditions in that app.
 #[test]
 fn selection_layer_codes_avoid_every_other_owner_sub_block() {
-    for code in [STORAGE_8000, STORAGE_8004] {
+    for code in [STORAGE_8000, STORAGE_8004, STORAGE_8005, STORAGE_8006] {
         assert!(
             !ANDROID_OWNED.contains(&code),
             "{code} collides with a number scp-kt-android AndroidStorage owns"

@@ -848,6 +848,7 @@ mod tests {
             None,
             mls_storage,
         );
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         let deps = supervisor
             .build_actor_deps(&DID("did:example:broadcast-actor".to_owned()))
             .await

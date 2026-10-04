@@ -2528,7 +2528,7 @@ pub fn build_snapshot_for_persist(
     state: &PerContextState,
     deps: &ActorDeps,
     context_id: &str,
-) -> crate::context::state::ContextSnapshot {
+) -> Result<crate::context::state::ContextSnapshot, ContextError> {
     let mut snapshot = build_snapshot_from_state(state);
     // ADR-056: canonical digest, not a re-hash of the hex id.
     let ctx_id_bytes = state::context_id_to_bytes(context_id);
@@ -2539,10 +2539,16 @@ pub fn build_snapshot_for_persist(
     // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
     // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
     // sequence is read from `state.send_tracker` inside the twin.
+    //
+    // When the Supervisor has dropped (ADR-049 Decision 16) no floor export
+    // exists; the error propagates, because a snapshot written with empty
+    // floors would durably regress them.
+    let sender_epochs = deps.supervisor.export_sender_key_epochs(&ctx_id_bytes)?;
+    let recv_floors = deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes)?;
     let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
     match state.export_crypto_state(
-        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
-        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        sender_epochs,
+        recv_floors,
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
@@ -2561,7 +2567,7 @@ pub fn build_snapshot_for_persist(
             );
         }
     }
-    snapshot
+    Ok(snapshot)
 }
 
 /// Whether an MLS crypto export is durable enough to stand up a Welcome-JOINER.
@@ -2622,11 +2628,21 @@ pub fn persist_state_best_effort<'d, 'c>(
 ) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let snapshot = build_snapshot_for_persist(state, deps, context_id);
     async move {
-        if let Err(e) = deps
-            .persistence
-            .persist_context(context_id, &snapshot)
-            .await
-        {
+        // Bound by reference: a moved-out copy would give this future a second
+        // `ContextSnapshot`-sized slot (clippy `large_futures`).
+        let snapshot = match snapshot {
+            Ok(ref snapshot) => snapshot,
+            Err(e) => {
+                crate::metrics::record_persistence_failure();
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "context snapshot not persisted: no floor export"
+                );
+                return;
+            }
+        };
+        if let Err(e) = deps.persistence.persist_context(context_id, snapshot).await {
             crate::metrics::record_persistence_failure();
             tracing::warn!(
                 context_id = %context_id,
@@ -2673,7 +2689,14 @@ pub fn persist_state_fail_closed<'d, 'c>(
     // before the returned future — keeps this future `Send` (see
     // [`build_snapshot_for_persist`]).
     let snapshot = build_snapshot_for_persist(state, deps, context_id);
-    async move { persist_snapshot_fail_closed(&snapshot, deps, context_id).await }
+    // Matched by reference: `&snapshot?` would move the snapshot into a second
+    // slot of this future (clippy `large_futures`).
+    async move {
+        match snapshot {
+            Ok(ref snapshot) => persist_snapshot_fail_closed(snapshot, deps, context_id).await,
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Fail-closed persist of an ALREADY-BUILT snapshot (ADR-049 §9 Class S).
@@ -4561,6 +4584,7 @@ mod pseudonym_routing_tests {
             Some(clock),
             mls_storage,
         );
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID(ALICE.to_owned()))
             .await

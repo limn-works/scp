@@ -5174,9 +5174,14 @@ pub(crate) async fn run_cross_context_bridge(
 /// a synthesized terminal) while B's DURABLE manifest is the `SagaId`-keyed
 /// frontier folded via `StreamCaptureAppend`. This task never re-signs a chunk and
 /// never re-invokes the outlet.
+///
+/// The task runs on the Supervisor's task tracker and holds only a
+/// `Weak<Supervisor>` (ADR-049 Decision 16), upgraded per operation. A failed
+/// upgrade takes the same path as a vanished target actor: the seal closes over
+/// the durable prefix and the journal stays `Committing` for crash recovery.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_streaming_saga_seal_task(
-    supervisor: std::sync::Arc<crate::context::supervisor::Supervisor>,
+    supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
     target_context_hex: String,
     saga_id: crate::context::supervisor::saga_journal::SagaId,
     target_signing_key: crate::context::actor::commands::SigningKeyBytes,
@@ -5307,7 +5312,10 @@ pub(crate) async fn run_streaming_saga_seal_task(
         // actor is unreachable), NOT A closing its channel — the post-loop
         // terminal-guarantee synthesis must still fire so A never truncates after
         // a non-terminal `Data` (crypto review: preserve the terminal guarantee).
-        let Some(actor) = supervisor.lookup(&target_context_hex) else {
+        let Some(actor) = supervisor
+            .upgrade()
+            .and_then(|sup| sup.lookup(&target_context_hex))
+        else {
             capture_broke = true;
             break;
         };
@@ -5405,7 +5413,10 @@ pub(crate) async fn run_streaming_saga_seal_task(
     // control plane), NOT here — see SCP-OUT-047's live-cancel control-plane
     // action item.
     let terminal_status = terminal.terminal_status.clone();
-    let seal_result = match supervisor.lookup(&target_context_hex) {
+    let seal_result = match supervisor
+        .upgrade()
+        .and_then(|sup| sup.lookup(&target_context_hex))
+    {
         Some(actor) => {
             let settle_saga_id = saga_id.clone();
             actor
@@ -5475,14 +5486,22 @@ pub(crate) async fn run_streaming_saga_seal_task(
             let settlement_applied = match outcome.settlement {
                 None => true,
                 Some(settlement) => {
-                    match supervisor
-                        .settle_outlet_stream_via_actor(
-                            *settlement,
-                            outcome.generation,
-                            Some(saga_id.clone()),
-                        )
-                        .await
-                    {
+                    let settled = match supervisor.upgrade() {
+                        Some(sup) => {
+                            sup.settle_outlet_stream_via_actor(
+                                *settlement,
+                                outcome.generation,
+                                Some(saga_id.clone()),
+                            )
+                            .await
+                        }
+                        None => Err(scp_protocol::context::ContextError::SupervisorShutDown(
+                            "streaming-saga seal task: supervisor dropped before the close-time \
+                             settlement"
+                                .to_owned(),
+                        )),
+                    };
+                    match settled {
                         Ok(application) => application.applied,
                         Err(err) => {
                             tracing::error!(
@@ -5502,7 +5521,15 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 // Resolve the journal to `Committed` so crash recovery does not
                 // redrive a completed saga. Non-secret (the streaming saga journals
                 // public metadata only).
-                if let Err(err) = supervisor.resolve_saga_committed(&saga_id).await {
+                let resolved = match supervisor.upgrade() {
+                    Some(sup) => sup.resolve_saga_committed(&saga_id).await,
+                    None => Err(scp_protocol::context::ContextError::SupervisorShutDown(
+                        "streaming-saga seal task: supervisor dropped before the journal \
+                         resolve"
+                            .to_owned(),
+                    )),
+                };
+                if let Err(err) = resolved {
                     tracing::error!(
                         saga_id = %saga_id.0,
                         %err,
@@ -5817,7 +5844,12 @@ where
 
     // Spawn the OFF-MAILBOX bridge task owning the inner receiver, the outer
     // sender, the PINNED descriptor, the schemas, and A's event-log provider.
-    tokio::spawn(run_cross_context_bridge(
+    // The task holds no Supervisor reference, but it writes A's event log, so it
+    // spawns on the Supervisor's tracker and shutdown waits for that write
+    // before the owner closes storage (ADR-049 Decision 16, step 5). A refusal
+    // means shutdown has begun: the future drops unrun, which closes B's
+    // receiver, and the caller gets a typed error.
+    let bridge = run_cross_context_bridge(
         inner_rx,
         outer_tx,
         descriptor,
@@ -5833,7 +5865,12 @@ where
         timestamp_secs,
         MAX_CROSS_CONTEXT_STREAM_CHUNKS,
         None,
-    ));
+    );
+    supervisor
+        .spawn_tracked("spawn cross-context bridge task", bridge)
+        .map_err(|refused| InvocationError::ExecutionFailed {
+            message: refused.to_string(),
+        })?;
 
     Ok(outer_rx)
 }

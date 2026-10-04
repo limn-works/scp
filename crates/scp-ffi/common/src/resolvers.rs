@@ -233,6 +233,21 @@ pub struct IdentityBackedDidResolver {
     resolution_rt: OnceLock<tokio::runtime::Runtime>,
 }
 
+impl Drop for IdentityBackedDidResolver {
+    /// Releases the resolution runtime without waiting for its workers.
+    ///
+    /// The last `Arc` to the resolver can drop on a thread inside a runtime
+    /// context (a bridge's own drop at the end of an async block, or a runtime
+    /// worker at shutdown). `Runtime`'s own drop blocks on its pool and panics
+    /// there; `shutdown_background` does not wait, and no caller can be parked
+    /// on this runtime once its owner is gone.
+    fn drop(&mut self) {
+        if let Some(rt) = self.resolution_rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
 impl IdentityBackedDidResolver {
     /// Creates a new production resolver wrapping any
     /// `scp_identity::resolver::DidResolver` implementation.
@@ -349,7 +364,12 @@ impl IdentityBackedDidResolver {
                     "failed to build DID-resolution runtime: {e}"
                 ))
             })?;
-        let _ = self.resolution_rt.set(built);
+        if let Err(lost) = self.resolution_rt.set(built) {
+            // A concurrent caller won the race. A plain drop of the losing
+            // runtime blocks on its pool and panics when this thread is inside
+            // a runtime context, so release it without waiting.
+            lost.shutdown_background();
+        }
         // The slot is guaranteed populated now (by us or the race winner).
         self.resolution_rt
             .get()
@@ -1256,6 +1276,29 @@ mod tests {
         let cache = Arc::new(DidCache::new());
         let resolver = Arc::new(DualLayerResolver::new(relay, dht, cache, Vec::new()));
         Arc::new(IdentityBackedDidResolver::new(resolver, handle))
+    }
+
+    /// Dropping the last resolver reference from inside a multi-thread runtime
+    /// task, after its resolution runtime was built, releases that runtime
+    /// without the blocking-pool panic a plain `Runtime` drop raises there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_inside_runtime_task_releases_resolution_runtime_without_panic() {
+        let resolver = identity_resolver_over(
+            Arc::new(InMemoryDhtClient::new()),
+            tokio::runtime::Handle::current(),
+        );
+        resolver
+            .resolution_handle()
+            .expect("the resolution runtime builds");
+        assert!(
+            resolver.resolution_rt.get().is_some(),
+            "the drop under test must release a built runtime"
+        );
+        let dropped = tokio::spawn(async move { drop(resolver) }).await;
+        assert!(
+            dropped.is_ok(),
+            "dropping the resolver inside a runtime task must not panic: {dropped:?}"
+        );
     }
 
     #[test]

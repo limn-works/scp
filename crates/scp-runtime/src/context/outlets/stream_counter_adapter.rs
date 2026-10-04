@@ -30,7 +30,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use scp_platform::PlatformError;
 use scp_protocol::context::ContextError;
@@ -46,13 +46,14 @@ use crate::trust::caveat_counters::{CaveatCounterApi, CounterError, CounterExhau
 ///
 /// Held as `Arc<dyn CaveatCounterApi>` inside the streaming pump's
 /// [`StreamCounterReservation`](crate::context::outlets::dispatch::StreamCounterReservation);
-/// constructed by the streaming open orchestrator with a clone of the
-/// supervisor `Arc`.
+/// constructed by the streaming open orchestrator with a `Weak` reference to
+/// the supervisor.
 pub(crate) struct ActorClassSCaveatCounterAdapter {
     /// The supervisor whose mailbox owns the target context's Class-S state.
-    /// Held as an `Arc` because the adapter outlives any single call and is
-    /// shared across the async stream pump's tasks.
-    supervisor: Arc<Supervisor>,
+    /// A `Weak` (ADR-049 Decision 16): the adapter lives inside the streaming
+    /// pump, a supervisor-spawned task, so it never keeps the Supervisor alive.
+    /// Each operation upgrades it; a failed upgrade returns a typed error.
+    supervisor: Weak<Supervisor>,
 }
 
 impl ActorClassSCaveatCounterAdapter {
@@ -60,15 +61,31 @@ impl ActorClassSCaveatCounterAdapter {
     ///
     /// The non-test constructor is the streaming open orchestrator
     /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
-    pub(crate) const fn new(supervisor: Arc<Supervisor>) -> Self {
+    pub(crate) const fn new(supervisor: Weak<Supervisor>) -> Self {
         Self { supervisor }
+    }
+
+    /// Upgrades the back-reference for one operation.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    fn supervisor(&self) -> Result<Arc<Supervisor>, ContextError> {
+        self.supervisor.upgrade().ok_or_else(|| {
+            ContextError::SupervisorShutDown(
+                "ActorClassSCaveatCounterAdapter: supervisor dropped".to_owned(),
+            )
+        })
     }
 
     /// Current Unix time in seconds from the supervisor's injected clock, or a
     /// fail-closed [`CounterError::Store`] when no clock is configured.
     fn now_secs(&self) -> Result<u64, CounterError> {
         use scp_clock::Clock as _;
-        let clock = self.supervisor.clock_ref().ok_or_else(|| {
+        let supervisor = self
+            .supervisor()
+            .map_err(|e| context_error_to_counter_store(&e))?;
+        let clock = supervisor.clock_ref().ok_or_else(|| {
             CounterError::Store(StoreError::Storage(PlatformError::StorageError(
                 "ActorClassSCaveatCounterAdapter: no clock configured on the supervisor — \
                  cannot stamp the caveat-counter reservation timestamp; failing closed"
@@ -106,7 +123,7 @@ impl ActorClassSCaveatCounterAdapter {
             now_secs,
             reply: reply_tx,
         };
-        self.supervisor.dispatch_outlets_command(cmd).await?;
+        self.supervisor()?.dispatch_outlets_command(cmd).await?;
         reply_rx.await.map_err(|_| {
             ContextError::TransportFailed(
                 "ActorClassSCaveatCounterAdapter::reserve_via_actor — actor reply channel closed"
@@ -133,7 +150,7 @@ impl ActorClassSCaveatCounterAdapter {
             amount,
             reply: reply_tx,
         };
-        self.supervisor.dispatch_outlets_command(cmd).await?;
+        self.supervisor()?.dispatch_outlets_command(cmd).await?;
         reply_rx.await.map_err(|_| {
             ContextError::TransportFailed(
                 "ActorClassSCaveatCounterAdapter::release_via_actor — actor reply channel closed"
@@ -291,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn check_and_increment_admits_then_exhausts_and_mutates_owned_state() {
         let supervisor = supervisor_with_registered_context().await;
-        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::clone(&supervisor));
+        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
         let cid = "cid-mc";
 
         adapter
@@ -323,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn release_returns_capacity_and_saturates_at_zero() {
         let supervisor = supervisor_with_registered_context().await;
-        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::clone(&supervisor));
+        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
         let cid = "cid-rel";
 
         // Consume the single slot; a second consume must now reject.
@@ -359,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn per_ucan_cid_isolation() {
         let supervisor = supervisor_with_registered_context().await;
-        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::clone(&supervisor));
+        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
 
         // Exhaust cid-a's max_calls=1.
         adapter
@@ -388,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn amount_cumulative_exhausts_structurally() {
         let supervisor = supervisor_with_registered_context().await;
-        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::clone(&supervisor));
+        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
         let cid = "cid-amt";
 
         adapter
@@ -415,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn missing_actor_fails_closed_as_store_error() {
         let supervisor = supervisor_with_registered_context().await;
-        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::clone(&supervisor));
+        let adapter = ActorClassSCaveatCounterAdapter::new(Arc::downgrade(&supervisor));
         let unregistered = hex::encode([0xEE_u8; 32]);
 
         let err = adapter

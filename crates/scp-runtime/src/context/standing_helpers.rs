@@ -102,7 +102,11 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
 // ---------------------------------------------------------------------------
 
 /// Returns the number of tracked standing contexts.
-pub fn standing_context_count(deps: &ActorDeps) -> usize {
+///
+/// # Errors
+///
+/// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+pub fn standing_context_count(deps: &ActorDeps) -> Result<usize, ContextError> {
     deps.supervisor.standing_context_count()
 }
 
@@ -111,7 +115,11 @@ pub fn standing_context_count(deps: &ActorDeps) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if a standing context exists for the given peer DID.
-pub fn has_standing_context(deps: &ActorDeps, peer_did: &DID) -> bool {
+///
+/// # Errors
+///
+/// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+pub fn has_standing_context(deps: &ActorDeps, peer_did: &DID) -> Result<bool, ContextError> {
     deps.supervisor.has_standing_context(peer_did)
 }
 
@@ -124,8 +132,7 @@ pub async fn register_standing_context(
     deps: &ActorDeps,
     peer_did: DID,
 ) -> Result<(), ContextError> {
-    deps.supervisor.register_standing_context(peer_did).await;
-    Ok(())
+    deps.supervisor.register_standing_context(peer_did).await
 }
 
 // ---------------------------------------------------------------------------

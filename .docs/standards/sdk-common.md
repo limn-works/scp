@@ -300,6 +300,8 @@ enforcement mechanism.)
 | `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
 | `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
+| `SCP-STORAGE-8005` | selection layer (all bridges) | Durable storage directory's advisory lock is still held by another store (§17.6 "One Writer per Durable Directory") |
+| `SCP-STORAGE-8006` | selection layer (all bridges) | Operation on a store that has released its database connection (§17.6 "One Writer per Durable Directory") |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |
@@ -308,12 +310,15 @@ enforcement mechanism.)
 The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
 colliding with the Android backend's `8001-8003`, which were allocated first.
 
-The selection layer owns `8000` and `8004`. `8000` reports that the caller named
-no storage backend; `8004` reports that the backend the caller did name failed to
-open — a wrong `SQLCipher` key or passphrase, an unwritable directory, a corrupt
-file, a salt-sidecar fail-closed condition, or a database another `SCP` instance
-already holds an advisory lock on. The `PyO3`, NAPI and `UniFFI` bridges all
-raise `8004` for that one condition. The second selection-layer code took `8004`
+The selection layer owns `8000` and `8004`-`8006`. `8000` reports that the caller
+named no storage backend; `8004` reports that the backend the caller did name
+failed to open — a wrong `SQLCipher` key or passphrase, an unwritable directory, a
+corrupt file, or a salt-sidecar fail-closed condition. `8005` reports that another
+store, in this process or another, holds the directory's advisory lock, including
+the window after a shutdown that returned `ShutdownOutcome::TimedOut` and before
+the previous instance's last writer exits. `8006` reports an operation on a store
+whose connection was released. The `PyO3`, NAPI and `UniFFI` bridges all raise
+the same code for each of these conditions. The second selection-layer code took `8004`
 rather than `8001` because the Android backend already owns `8001-8003`: an
 Android app links `AndroidStorage` and the `UniFFI` bridge into one process, so
 reusing `8001` would make one code string mean both "storage key not found" and

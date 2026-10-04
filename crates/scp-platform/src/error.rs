@@ -33,6 +33,36 @@ pub enum PlatformError {
     #[error("storage error: {0}")]
     StorageError(String),
 
+    /// The store has released its database connection, so it refuses every
+    /// operation (spec §17.6 "One Writer per Durable Directory": a closed
+    /// store refuses operations and never reopens its database implicitly).
+    ///
+    /// Open a new store on the directory to continue.
+    #[error(
+        "storage closed: the store released its database connection and refuses \
+         every operation — open a new store on the directory"
+    )]
+    StorageClosed,
+
+    /// Another store holds the directory's exclusive advisory lock, in this
+    /// process or another (spec §17.6 "One Writer per Durable Directory": one
+    /// opener per directory). The open fails at once; it neither waits for
+    /// the lock nor opens the database.
+    ///
+    /// Within one process the lock stays held until the previous owner's
+    /// shutdown completes and its last writer exits.
+    #[error(
+        "storage lock still held: another store holds the advisory lock on {lock_path} \
+         — shut down the instance that opened {dir} and let its shutdown complete \
+         before opening the directory again"
+    )]
+    StorageLockHeld {
+        /// The database directory whose lock is held.
+        dir: String,
+        /// The lock file (`{dir}/scp.db.lock`).
+        lock_path: String,
+    },
+
     /// A device attestation operation failed.
     #[error("attestation error: {0}")]
     AttestationError(String),

@@ -2119,7 +2119,10 @@ pub(crate) async fn context_subscribe_on(
     // task doesn't need to re-resolve it via a per-instance lookup. Falls back
     // gracefully if the supervisor is not attached yet; the spawned task
     // signals completion when so.
-    let supervisor_for_task = crate::runtime::supervisor(bi).ok().cloned();
+    // A `Weak` (ADR-049 Decision 16): the subscribe task and the heartbeat
+    // scheduler run in the bridge's `JoinSet` and must not keep the Supervisor
+    // alive past shutdown. Each use upgrades it; a failed upgrade ends the task.
+    let supervisor_for_task = crate::runtime::supervisor(bi).ok().map(Arc::downgrade);
 
     // §9.9.2 send side: resolve the local member's signing key now (the key
     // lives at this FFI boundary, never inside the actor) so a periodic
@@ -2167,7 +2170,10 @@ pub(crate) async fn context_subscribe_on(
             None
         } else {
             use scp_core::context::actor::commands::QueriesCommand;
-            match supervisor_for_task.as_ref() {
+            match supervisor_for_task
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
                 Some(sup) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = QueriesCommand::LocalPseudonym {
@@ -2290,7 +2296,15 @@ pub(crate) async fn context_subscribe_on(
                         envelope_bytes: envelope.encrypted_blob.clone(),
                         reply: tx,
                     };
-                    let dispatch_result = supervisor.dispatch_command(&context_id, cmd).await;
+                    let Some(live) = supervisor.upgrade() else {
+                        tracing::debug!(
+                            context_id = %context_id,
+                            "supervisor dropped; subscription ends"
+                        );
+                        break;
+                    };
+                    let dispatch_result = live.dispatch_command(&context_id, cmd).await;
+                    drop(live);
                     let reply_result = if dispatch_result.is_ok() {
                         rx.await.ok()
                     } else {

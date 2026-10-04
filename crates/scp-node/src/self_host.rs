@@ -298,7 +298,11 @@ where
     )
     .await?;
 
-    deployer.deploy(node, &deploy_id, custody, assets).await
+    let deploy_result = deployer.deploy(node, &deploy_id, custody, assets).await;
+    // The caller owns the storage behind `durable`; drain before handing it
+    // back so no tracked task outlives this call (ADR-049 Decision 16).
+    deployer.shutdown().await;
+    deploy_result
 }
 
 /// A long-lived self-host site deployer bound to ONE in-process supervisor and
@@ -366,34 +370,48 @@ impl SelfHostDeployer {
         let supervisor =
             connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, durable)
                 .await?;
-        node.register_broadcast_context(context_id.clone(), Some("SCP Self-Host Site".to_owned()))
+        // Every setup failure past this point drains the Supervisor before
+        // returning, so no tracked task outlives the caller's storage
+        // (ADR-049 Decision 16).
+        let setup: Result<(), SelfHostError> = async {
+            node.register_broadcast_context(
+                context_id.clone(),
+                Some("SCP Self-Host Site".to_owned()),
+            )
             .await
             .map_err(|e| SelfHostError::RegisterContext(e.to_string()))?;
-        let context_params = scp_core::context::ContextParams {
-            mode: scp_core::context::params::ContextMode::Broadcast,
-            // Broadcast contexts only support `MemoryScope::Full`; the default
-            // scope is `Ephemeral`, which `create_context` rejects for
-            // broadcast mode.
-            memory_scope: scp_core::context::params::MemoryScope::Full,
-            // A create must declare a non-empty ceiling (construction.md M2);
-            // the site's author publishes content and its subscribers read
-            // it, so the ceiling is messaging only.
-            ceiling: vec![
-                scp_core::context::roles::Capability::MessagesRead,
-                scp_core::context::roles::Capability::MessagesWrite,
-            ],
-            ..Default::default()
-        };
-        supervisor
-            .create_context(context_id.clone(), context_params, author_did.clone(), None)
-            .await
-            .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
+            let context_params = scp_core::context::ContextParams {
+                mode: scp_core::context::params::ContextMode::Broadcast,
+                // Broadcast contexts only support `MemoryScope::Full`; the default
+                // scope is `Ephemeral`, which `create_context` rejects for
+                // broadcast mode.
+                memory_scope: scp_core::context::params::MemoryScope::Full,
+                // A create must declare a non-empty ceiling (construction.md M2);
+                // the site's author publishes content and its subscribers read
+                // it, so the ceiling is messaging only.
+                ceiling: vec![
+                    scp_core::context::roles::Capability::MessagesRead,
+                    scp_core::context::roles::Capability::MessagesWrite,
+                ],
+                ..Default::default()
+            };
+            supervisor
+                .create_context(context_id.clone(), context_params, author_did.clone(), None)
+                .await
+                .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
 
-        // Enable projection ONCE with the group's broadcast key/epoch. Because
-        // the group (and thus the key/epoch) is stable for this deployer's
-        // lifetime, every later `deploy` publishes under the same key and the
-        // registry needs no further key updates.
-        enable_projection(&supervisor, node, &context_id, &node_did, hostname).await?;
+            // Enable projection ONCE with the group's broadcast key/epoch. Because
+            // the group (and thus the key/epoch) is stable for this deployer's
+            // lifetime, every later `deploy` publishes under the same key and the
+            // registry needs no further key updates.
+            enable_projection(&supervisor, node, &context_id, &node_did, hostname).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = setup {
+            supervisor.shutdown_all_contexts().await;
+            return Err(e);
+        }
 
         Ok(Self {
             supervisor,
@@ -401,6 +419,17 @@ impl SelfHostDeployer {
             context_id,
             signing_key_handle,
         })
+    }
+
+    /// Drains the deployer's Supervisor: stops its context and key-package
+    /// actors, refuses further spawns, and waits for every tracked task to
+    /// exit (ADR-049 Decision 16). The owner calls this before it closes the
+    /// storage the deployer's `DurableProviders` wrap. Every later [`deploy`]
+    /// fails, because the Supervisor serves no context.
+    ///
+    /// [`deploy`]: Self::deploy
+    pub async fn shutdown(&self) {
+        self.supervisor.shutdown_all_contexts().await;
     }
 
     /// Publishes `assets` under `deploy_id` through the reused supervisor/group
@@ -1062,6 +1091,10 @@ pub enum HostSiteError {
     /// An encrypted `SQLite` database could not be opened.
     #[error("storage open error: {0}")]
     StorageOpen(String),
+    /// The deployer's encrypted `SQLite` MLS store refused to close after its
+    /// Supervisor drained. The store keeps its connection and advisory lock.
+    #[error("storage close error: {0}")]
+    StorageClose(String),
     /// The persistent key custody backend failed to initialize.
     #[error("key custody error: {0}")]
     Custody(String),
@@ -1563,12 +1596,13 @@ where
     )
     .await
     {
-        Ok(d) => Arc::new(d),
+        Ok((d, mls_store)) => (Arc::new(d), mls_store),
         Err(e) => {
             release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
             return Err(e);
         }
     };
+    let (deployer, mls_store) = deployer;
 
     // -- Initial deploy BEFORE the public port opens. --
     if let Err(e) = deployer
@@ -1576,6 +1610,7 @@ where
         .await
     {
         release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
+        retire_deployer_after_failure(&deployer, &mls_store).await;
         return Err(HostSiteError::Deploy(e));
     }
     tracing::info!(committed = asset_count, "self-host site deployed");
@@ -1600,7 +1635,7 @@ where
     // -- Build the TLS config and open the RESTRICTED public surface in the
     //    background. On either failure the retained NAT mappings are released
     //    best-effort before returning. --
-    open_self_host_public_surface(
+    if let Err(e) = open_self_host_public_surface(
         node.as_ref(),
         http_addr,
         plaintext,
@@ -1608,11 +1643,15 @@ where
         &upnp_mapper,
         &natpmp_mapper,
     )
-    .await?;
+    .await
+    {
+        retire_deployer_after_failure(&deployer, &mls_store).await;
+        return Err(e);
+    }
 
     // -- Run the refresh + NAT-renewal loops, await shutdown, and tear down. --
     run_refresh_and_serve_until_shutdown(RefreshAndServe {
-        deployer,
+        deployer: Arc::clone(&deployer),
         node,
         custody,
         assets,
@@ -1624,8 +1663,36 @@ where
     })
     .await;
 
+    // The refresh loop has exited, so the deployer's Supervisor is the last
+    // writer to the MLS store: drain it, then close the store.
+    retire_deployer(&deployer, &mls_store).await?;
     tracing::info!("host_site stopped");
     Ok(())
+}
+
+/// Drains the deployer's Supervisor, then closes the MLS store its
+/// `DurableProviders` wrap (ADR-049 Decision 16: drain before close).
+///
+/// # Errors
+///
+/// [`HostSiteError::StorageClose`] when the store refuses to close; it keeps
+/// its connection and advisory lock.
+async fn retire_deployer(
+    deployer: &SelfHostDeployer,
+    mls_store: &SqliteStorage,
+) -> Result<(), HostSiteError> {
+    deployer.shutdown().await;
+    mls_store.close().map_err(|e| {
+        HostSiteError::StorageClose(format!("failed to close MLS SQLite storage: {e}"))
+    })
+}
+
+/// [`retire_deployer`] on a path already returning another error. That error
+/// is the one returned, so a close failure here is logged at error level.
+async fn retire_deployer_after_failure(deployer: &SelfHostDeployer, mls_store: &SqliteStorage) {
+    if let Err(e) = retire_deployer(deployer, mls_store).await {
+        tracing::error!(error = %e, "self-host deployer teardown after a failure");
+    }
 }
 
 /// Builds the self-signed multi-SAN TLS config (unless `plaintext`) and opens the
@@ -2323,7 +2390,8 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
 }
 
 /// Performs the one-time [`SelfHostDeployer`] setup over a `SQLite` MLS store
-/// under `storage_dir/mls`. Mirrors the binary's `build_self_host_deployer`.
+/// under `storage_dir/mls`, and returns the store with the deployer so the
+/// caller can close it after [`SelfHostDeployer::shutdown`].
 async fn build_host_site_deployer<S>(
     node: &ApplicationNode<S>,
     storage_dir: &Path,
@@ -2331,7 +2399,7 @@ async fn build_host_site_deployer<S>(
     node_did: &str,
     context_id: &str,
     key_resolver: scp_core::context::governance::KeyResolver,
-) -> Result<SelfHostDeployer, HostSiteError>
+) -> Result<(SelfHostDeployer, Arc<SqliteStorage>), HostSiteError>
 where
     S: scp_platform::EncryptedStorage + 'static,
 {
@@ -2349,10 +2417,11 @@ where
     // separate calls let a single mutated constructor pass a fresh in-memory
     // store to the journal while leaving every gate/test green — binding them
     // into one newtype makes that divergence a compile error.
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
 
     let signing_key_handle = node.identity().identity().active_signing_key;
-    SelfHostDeployer::start(
+    let started = SelfHostDeployer::start(
         node,
         node_did.to_owned(),
         context_id.to_owned(),
@@ -2361,8 +2430,18 @@ where
         key_resolver,
         durable,
     )
-    .await
-    .map_err(|e| HostSiteError::DeployerSetup(e.to_string()))
+    .await;
+    match started {
+        Ok(deployer) => Ok((deployer, mls_inner)),
+        Err(e) => {
+            // `start` drained its Supervisor before failing, so the store has
+            // no writer left.
+            if let Err(close) = mls_inner.close() {
+                tracing::error!(error = %close, "MLS SQLite store did not close after a failed deployer setup");
+            }
+            Err(HostSiteError::DeployerSetup(e.to_string()))
+        }
+    }
 }
 
 /// Mints a unique deploy id for a single self-host deploy run.

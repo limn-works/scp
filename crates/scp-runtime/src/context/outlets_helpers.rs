@@ -3457,6 +3457,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&DID(ADMIN.to_owned()))
                 .await
@@ -4038,6 +4039,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&DID(INVOKER.to_owned()))
                 .await
@@ -4534,6 +4536,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&DID(INVOKER.to_owned()))
                 .await
@@ -4969,6 +4972,7 @@ mod tests {
                 Some(clock),
                 mls_storage,
             );
+            crate::context::supervisor::supervisor::leak_for_test(&supervisor);
             supervisor
                 .build_actor_deps(&invoker())
                 .await

@@ -507,7 +507,9 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 ///
 /// Best-effort: persist failures log via `tracing::warn!` and
 /// increment `crate::metrics::record_persistence_failure()`; the
-/// reply oneshot always carries `Ok(())`.
+/// reply carries `Ok(())` after a persist attempt. When the Supervisor
+/// has dropped, nothing is persisted and the reply carries
+/// [`ContextError::SupervisorShutDown`].
 // `Send` discipline (ADR-049 Decision 7): SYNC fn returning a future. The
 // snapshot is built from `&PerContextState` in the synchronous prelude; the
 // returned future captures only the owned `context_id` / `snapshot` / `reply`
@@ -534,10 +536,36 @@ fn handle_flush_snapshot_actor<'d>(
     // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
     // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
     // sequence is read from `state.send_tracker` inside the twin.
+    //
+    // The floors come from the Supervisor. When it has dropped (ADR-049
+    // Decision 16), no floor export exists, and persisting a snapshot with
+    // empty floors would durably regress them (re-admitting replays after
+    // restore), so the flush persists nothing and replies with the typed error.
+    let floors = deps
+        .supervisor
+        .export_sender_key_epochs(&ctx_id_bytes)
+        .and_then(|epochs| {
+            Ok((
+                epochs,
+                deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes)?,
+            ))
+        });
+    let (sender_epochs, recv_floors) = match floors {
+        Ok(floors) => floors,
+        Err(e) => {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "flush snapshot skipped: the supervisor holds no floor export"
+            );
+            let _ = reply.send(Err(e));
+            return futures::future::Either::Left(std::future::ready(Outcome::ok(())));
+        }
+    };
     let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
     match state.export_crypto_state(
-        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
-        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        sender_epochs,
+        recv_floors,
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
@@ -560,7 +588,7 @@ fn handle_flush_snapshot_actor<'d>(
     // (built by `snapshot_context` above), so the single `persist_context` write
     // covers it atomically — the prior separate best-effort `persist_broadcast`
     // write is gone (ADR-049 §9 / §5.14.8 block-before-serve).
-    async move {
+    futures::future::Either::Right(async move {
         if let Err(e) = deps
             .persistence
             .persist_context(&context_id, &snapshot)
@@ -575,7 +603,7 @@ fn handle_flush_snapshot_actor<'d>(
         }
         let _ = reply.send(Ok(()));
         Outcome::ok(())
-    }
+    })
 }
 
 /// Handle [`LifecycleCommand::ShutdownSelf`] (actor-shape).

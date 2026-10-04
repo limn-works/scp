@@ -563,6 +563,14 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2136.to_owned(),
             },
+            // ADR-049 Decision 16: the Supervisor refused the operation
+            // because shutdown began. Dedicated SCP-CTX-2138 instead of
+            // CTX_2001 so a caller can tell a refusal by shutdown apart from
+            // a failure of the operation.
+            CE::SupervisorShutDown(_) => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2138.to_owned(),
+            },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for outlet-economy and outlet-invocation failures
             // (economy 12xxx, outlet-invocation 6xxx). Recover the embedded
@@ -897,6 +905,23 @@ impl From<scp_transport::TransportError> for ScpPyError {
 
 impl From<scp_platform::PlatformError> for ScpPyError {
     fn from(e: scp_platform::PlatformError) -> Self {
+        // Spec §17.6 "One Writer per Durable Directory": the closed-store and
+        // lock-still-held conditions carry their registered storage codes.
+        match &e {
+            scp_platform::PlatformError::StorageClosed => {
+                return Self::ValidationError {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8006.to_owned(),
+                };
+            }
+            scp_platform::PlatformError::StorageLockHeld { .. } => {
+                return Self::ValidationError {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8005.to_owned(),
+                };
+            }
+            _ => {}
+        }
         Self::CryptoError {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
@@ -1152,6 +1177,16 @@ mod tests {
         let err: ScpPyError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// ADR-049 Decision 16: an operation the Supervisor refused because
+    /// shutdown began must surface the dedicated SCP-CTX-2138 code, distinct
+    /// from the catch-all.
+    #[test]
+    fn supervisor_shut_down_surfaces_ctx_2138() {
+        let err: ScpPyError =
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
     }
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the

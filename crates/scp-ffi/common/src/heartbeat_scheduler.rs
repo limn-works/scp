@@ -64,10 +64,12 @@ pub fn heartbeat_interval(profile: TransportProfile) -> Option<std::time::Durati
 /// has nothing to prove liveness against yet).
 ///
 /// Intended to be `tokio::spawn`'d (or enrolled in the bridge's `JoinSet`)
-/// alongside the relay subscribe loop. Holds an owned `Arc<Supervisor>` and an
-/// owned key, so it has no borrow ties to the subscribe task.
+/// alongside the relay subscribe loop. Holds a `Weak<Supervisor>` (ADR-049
+/// Decision 16), so the scheduler never keeps the Supervisor alive past
+/// shutdown, and an owned key, so it has no borrow ties to the subscribe task.
+/// Each tick upgrades the `Weak`; a failed upgrade stops the scheduler.
 pub async fn run_heartbeat_scheduler(
-    supervisor: Arc<Supervisor>,
+    supervisor: std::sync::Weak<Supervisor>,
     context_id: String,
     sender_did: DID,
     signing_key: SigningKey,
@@ -82,18 +84,31 @@ pub async fn run_heartbeat_scheduler(
     // lifetime (matching the prior single-capture exposure window) rather than
     // being re-copied per tick.
     let signing_key = Arc::new(signing_key);
+    // A child token the tick cancels when the Supervisor has dropped; the
+    // parent subscription token is untouched.
+    let cancel = cancel.child_token();
+    let stop = cancel.clone();
     scheduler_loop(interval, cancel, bridge_cancel, move || {
         // The per-tick async block is `move` and outlives the `FnMut` closure
         // call, so it must OWN what it touches — it cannot borrow the closure's
-        // captures. Per tick we clone only cheap handles: the `Arc<Supervisor>`
-        // and `Arc<SigningKey>` clones are refcount bumps (no secret-scalar
+        // captures. Per tick we take only cheap handles: the `Weak` upgrade
+        // and the `Arc<SigningKey>` clone are refcount bumps (no secret-scalar
         // copy), and the DID / context-id string clones are negligible against
         // the ≥60s tick cadence.
-        let supervisor = Arc::clone(&supervisor);
+        let supervisor = supervisor.upgrade();
+        let stop = stop.clone();
         let context_id = context_id.clone();
         let sender_did = sender_did.clone();
         let signing_key = Arc::clone(&signing_key);
         async move {
+            let Some(supervisor) = supervisor else {
+                tracing::debug!(
+                    context_id = %context_id,
+                    "supervisor dropped; heartbeat scheduler stops"
+                );
+                stop.cancel();
+                return;
+            };
             if let Err(e) = supervisor
                 .send_heartbeat(&context_id, &sender_did, &signing_key)
                 .await
