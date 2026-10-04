@@ -2325,7 +2325,7 @@ pub async fn import_context(
         // onto the fresh `PerContextState`.
         match deps
             .supervisor
-            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.clone())
+            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.0.clone())
             .await
         {
             Ok(()) => {

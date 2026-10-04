@@ -448,7 +448,13 @@ mod tests {
 
         // Bob processes Alice's commit.
         let mut grace_store = crate::epoch_grace::EpochGraceStore::new();
-        crate::ratchet::process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        crate::ratchet::process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        )
+        .unwrap();
 
         // Alice's wrapping key should be unchanged after the update.
         let alice_extracted = extract_own_wrapping_key(&alice_group).unwrap();

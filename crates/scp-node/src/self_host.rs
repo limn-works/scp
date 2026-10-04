@@ -470,8 +470,7 @@ impl SelfHostDeployer {
 ///
 /// The async resolution is bridged to the sync `KeyResolver` signature with a
 /// runtime-FLAVOR-aware match, mirroring the repo's other async→sync bridges
-/// ([`ApplicationNode`]'s `stop_and_wait` and the supervisor's
-/// `try_consume_hard_rate_limit_from_any_context`):
+/// (the supervisor's `try_consume_hard_rate_limit_from_any_context`):
 /// - **No ambient runtime** (a bare sync caller / `block_on`-driven entry):
 ///   `handle.block_on` drives the resolve directly.
 /// - **Multi-thread runtime:** [`block_in_place`](tokio::task::block_in_place)
@@ -533,7 +532,7 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
                 tokio::runtime::RuntimeFlavor::MultiThread => {
                     let outcome = tokio::task::block_in_place(|| {
                         handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
-                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
+                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors try_consume_hard_rate_limit_from_any_context)
                     let doc = outcome.ok().flatten()?;
                     scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
                 }

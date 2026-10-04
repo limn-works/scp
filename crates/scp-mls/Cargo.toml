@@ -43,6 +43,10 @@ openmls_memory_storage = { workspace = true }
 tls_codec = "0.5"
 # `lifetime.rs` passes a `web_time::SystemTime` to `Lifetime::validate_with_time` so SCP's temporal rule cannot drift from openmls's; version matches openmls 0.9.0's `web-time = "1.1"`.
 web-time = "1.1"
+# `provider::OsRand` answers openmls's `rand()` from the operating system on every
+# request, keeping no seed (security model spec §9.15 step 2). getrandom 0.2 is the
+# version the wasm32 section below already configures with its `js` backend.
+getrandom = "0.2"
 
 serde = { workspace = true }
 rmp-serde = { workspace = true }
@@ -50,7 +54,7 @@ rmp-serde = { workspace = true }
 # (keypackage_attestation.rs). Workspace-pinned 0.10, wasm32-safe (the same dep
 # scp-protocol uses on the wasm path).
 sha2 = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
