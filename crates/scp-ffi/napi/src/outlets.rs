@@ -1505,30 +1505,29 @@ pub(crate) async fn outlet_interface_accept_on(
     // so the check does not ask whether the caller may bind another context's
     // outlet offer into this context. Roles and the creator come from the
     // supervisor actor.
-    crate::runtime::with_context(bi, &context_id, |_rt| {
-        let context_handle = scp_core::context::ContextHandle::new(
-            context_id.clone(),
-            scp_core::context::ContextParams::default(),
-        );
+    let context_handle = scp_core::context::ContextHandle::new(
+        context_id.clone(),
+        scp_core::context::ContextParams::default(),
+    );
 
-        scp_core::context::outlets::interface::accept_outlet_interface(
-            context_handle.context_id(),
-            &mut interface,
-            &role_state,
-            &role_state.creator_did,
-            None,
-        )
+    scp_core::context::outlets::interface::accept_outlet_interface(
+        context_handle.context_id(),
+        &mut interface,
+        &role_state,
+        &role_state.creator_did,
+        None,
+    )
+    .map_err(|e| ScpNapiError::Outlet {
+        message: format!("accept_outlet_interface failed: {e}"),
+        code: codes::OUTLET_6032.to_owned(),
+    })?;
+
+    serde_json::to_string(&interface)
         .map_err(|e| ScpNapiError::Outlet {
-            message: format!("accept_outlet_interface failed: {e}"),
-            code: codes::OUTLET_6032.to_owned(),
-        })?;
-
-        serde_json::to_string(&interface).map_err(|e| ScpNapiError::Outlet {
             message: format!("failed to serialize OutletInterface: {e}"),
             code: codes::OUTLET_6033.to_owned(),
         })
-    })
-    .map_err(napi::Error::from)
+        .map_err(napi::Error::from)
 }
 
 /// Per-bridge-instance implementation of [`Scp::outlet_interface_revoke`](crate::scp::Scp::outlet_interface_revoke).
