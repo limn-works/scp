@@ -259,17 +259,26 @@ trap 'rm -rf "$WORK"' EXIT
 #   $4 the exit code the stub `cargo` returns for `cargo fmt`
 #   $5 the exit code a stub `python3.12` returns, or the empty string for no such stub
 #
-# The stub `cargo` answers `check`, `fmt`, and `metadata` itself and hands every other
-# subcommand to the real cargo this harness found before it led PATH with the stub.
+# The stub `cargo` answers `check`, `fmt`, and a `metadata` that resolves dependencies
+# itself, answers `metadata` from a `metadata.json` beside the stubs when the case wrote
+# one, and hands every other call to the real cargo this harness found before it led PATH
+# with the stub.
 #
 # WHICH SUBCOMMANDS THE STUB ANSWERS, and the criterion that decides: a subcommand belongs
 # to the stub when the real one waits on the shared target directory's build lock, because
 # this harness must finish in a bounded time on a machine where some other worktree is
 # always compiling. `cargo check` waits by definition. `cargo fmt` waits because it resolves
-# the workspace through a full `cargo metadata` first, and `cargo metadata` waits for the
-# same reason. Measured on 2026-09-13: an earlier revision of this file delegated `fmt`, and
-# one case sat in it for 87 minutes behind another worktree's `cargo clippy --workspace`
-# until a 2400-second bound killed the run after case 1.
+# the workspace through a full `cargo metadata` first, and a `cargo metadata` without
+# `--no-deps` waits for the same reason, so the stub refuses one rather than delegate it.
+# Measured on 2026-09-13: an earlier revision of this file delegated `fmt`, and one case
+# sat in it for 87 minutes behind another worktree's `cargo clippy --workspace` until a
+# 2400-second bound killed the run after case 1.
+#
+# `cargo metadata --no-deps` resolves no dependency and reads only the workspace's
+# manifests, so it stays delegated when the case wrote no `metadata.json`. Case 3 runs
+# `scripts/check-wiping-allocator.sh` over this repository, and that gate fails closed on a
+# metadata answer that lists no package; an earlier revision of this stub answered every
+# `metadata` call with an object holding no package list, which turned case 3 red.
 #
 # `cargo tree` stays delegated, so the twelve resolutions inside
 # `scripts/check-shipped-feature-graph.sh` and `scripts/check-protocol-deps.sh` read this
@@ -327,15 +336,20 @@ case "\$1" in
     metadata)
         # The runner reads two things out of this answer: the target directory its summary
         # names, and the dependency declarations its compile step derives a feature set
-        # from. A case that wants the second writes its own JSON to metadata.json beside
-        # these stubs; every other case gets the object below, which carries no package
-        # list and drives the runner's "this run could not read them" branch.
+        # from. A fixture case writes its answer to metadata.json beside these stubs,
+        # either through write_no_package_metadata below or as JSON of its own.
         if [[ -f "$dir/metadata.json" ]]; then
             cat "$dir/metadata.json"
-        else
-            printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'
+            exit 0
         fi
-        exit 0
+        no_deps=0
+        for arg in "\$@"; do
+            [[ \$arg == --no-deps ]] && no_deps=1
+        done
+        if [[ \$no_deps -eq 0 ]]; then
+            printf 'stub cargo refuses a cargo metadata that resolves dependencies: %s\n' "\$*" >&2
+            exit 101
+        fi
         ;;
 esac
 # Delegating means removing this directory from PATH first. The cargo on PATH here is a
@@ -349,6 +363,14 @@ exec cargo "\$@"
 EOF
 
     chmod +x "$dir/bin/rustc" "$dir/bin/rustup" "$dir/bin/cargo"
+}
+
+# Make the stub `cargo` under $1 answer `cargo metadata` with an object that names a target
+# directory and carries no package list, which drives the runner's "this run could not read
+# them" branch. A fixture repository is no workspace the real cargo can read, so every
+# fixture harness that writes no JSON of its own calls this.
+write_no_package_metadata() {
+    printf '{"version":1,"target_directory":"%s/stub-target-dir"}\n' "$1" > "$1/metadata.json"
 }
 
 # Run this repository's own `scripts/fix-round-check.sh` against one named crate, under the
@@ -450,6 +472,7 @@ fixture_commit() {
 run_fixture() {
     local root=$1 harness="$1.harness"
     write_stubs "$harness" "$PIN_CHANNEL" 0 0 ""
+    write_no_package_metadata "$harness"
     PATH="$harness/bin:$PATH" bash "$root/scripts/fix-round-check.sh" > "$harness/out.txt" 2>&1
     printf '%s' $? > "$harness/rc.txt"
 }
@@ -941,6 +964,7 @@ build_fixture "$FIXTURE15"
 fixture_commit "$FIXTURE15" crates/scp-ffi/napi/src/lib.rs
 HARNESS15="$FIXTURE15.harness"
 write_stubs "$HARNESS15" "$PIN_CHANNEL" 0 0 ""
+write_no_package_metadata "$HARNESS15"
 PATH="$HARNESS15/bin:$PATH" bash "$FIXTURE15/scripts/fix-round-check.sh" scp-clock \
     > "$HARNESS15/out.txt" 2>&1
 printf '%s' $? > "$HARNESS15/rc.txt"
@@ -1474,6 +1498,7 @@ fixture_commit "$FIXTURE24" crates/scp-ffi/napi/src/lib.rs
 git -C "$FIXTURE24" update-ref -d refs/remotes/origin/main
 HARNESS24="$FIXTURE24.harness"
 write_stubs "$HARNESS24" "$PIN_CHANNEL" 0 0 ""
+write_no_package_metadata "$HARNESS24"
 PATH="$HARNESS24/bin:$PATH" bash "$FIXTURE24/scripts/fix-round-check.sh" scp-clock \
     > "$HARNESS24/out.txt" 2>&1
 printf '%s' $? > "$HARNESS24/rc.txt"
