@@ -51,9 +51,7 @@ env:
 #
 #   workspace-debug   `target/debug` under build mode — rust-test (both matrix legs),
 #                     rust-test-napi-production, rust-build-pyo3-production,
-#                     rust-build-uniffi-production, kotlin-test (whose one cargo
-#                     command builds `scp-ffi-uniffi` under the dev profile, on an
-#                     artifact-cache miss), fail-closed-pre-rotation,
+#                     rust-build-uniffi-production, kotlin-test, fail-closed-pre-rotation,
 #                     shipped-feature-graph; and
 #                     rust-doc (its `cargo test --doc`) in part, as the paragraph after
 #                     this list says.
@@ -1877,7 +1875,7 @@ jobs:
           push: false
           # Read the cache everywhere; write it only from a push to `main`. A cache
           # written on a pull-request ref is readable only by that pull request, and it
-          # would evict entries from the 10 GB repository cap that the 21
+          # would evict entries from the 10 GB repository cap that the
           # `Swatinem/rust-cache` steps in this workflow and the 2 in
           # `.github/workflows/fuzz.yml` share. `ignore-error` so a cache-service
           # failure cannot fail the build check: this job answers whether the image
@@ -3479,6 +3477,10 @@ jobs:
         env:
           # JNA loads the UniFFI cdylib via the system library path.
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+          # The kotlin_runner fixture reads this instead of running `cargo metadata`,
+          # which on this toolchain-less job would make rustup install the pinned
+          # channel.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
           # Explicit runner-binary override (conftest also falls back
           # to the default installDist output; this makes CI failures
           # easier to diagnose by pinning the path).

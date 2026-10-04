@@ -66,7 +66,17 @@ def _cargo_target_dir() -> Path:
     `~/.cargo/config.toml` points every worktree at one shared directory builds
     the cdylib outside this checkout. `cargo metadata --no-deps` reads the
     manifests and compiles nothing.
+
+    A set `CARGO_TARGET_DIR` is read directly instead. Cargo gives that variable
+    precedence over every other source and resolves a relative value against the
+    directory it runs in, which for the `cargo metadata` call below is the
+    repository root. Job `bridge-parity-kotlin` in `.github/workflows/ci.yml` sets
+    it because that job installs no Rust toolchain, and a `cargo metadata` there
+    would make rustup install the pinned channel.
     """
+    env_target_dir = os.environ.get("CARGO_TARGET_DIR", "")
+    if env_target_dir:
+        return _REPO_ROOT / env_target_dir
     out = subprocess.run(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"],
         cwd=_REPO_ROOT,

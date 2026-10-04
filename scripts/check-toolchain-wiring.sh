@@ -109,7 +109,7 @@
 #   `maturin develop`, `napi-addon` runs `cargo build -p scp-ffi-napi`, and `xcframework`
 #   runs `build-xcframework.sh`, and the jobs that need those artifacts download them;
 #   `typescript-wasm-check` and `scaffold-typescript-web-check` run `wasm-pack build`,
-#   `kotlin-test` and `bridge-parity-kotlin` run `cargo build -p scp-ffi-uniffi`, and
+#   `kotlin-test` runs `cargo build -p scp-ffi-uniffi`, and
 #   `docs.yml`'s `rust-docs` runs `cargo doc`. Listing the pin in each of those filters is
 #   a list that grows with the lanes. Instead each workflow declares one `toolchain`
 #   filter holding the pin, and every output of its `changes` job ORs that filter in. The
