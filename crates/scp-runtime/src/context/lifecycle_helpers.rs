@@ -3718,7 +3718,9 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 ///    [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf),
 ///    which destroys sender keys, the MLS group, and the event log in that
 ///    order (zeroize secrets before tearing down structure), then despawn the
-///    actor whether or not the send succeeded: the despawn drops the last
+///    actor whether or not the send succeeded and whether or not the actor
+///    replied within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT):
+///    the despawn drops the last
 ///    mailbox sender, the actor's `run()` loop exits on the closed inbox, and
 ///    its task releases its `PerContextState`.
 /// 4. Stop every key-package actor and clear `key_package_stores`.
@@ -3748,16 +3750,21 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
                 .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
                 .await
             {
-                Ok(()) => match rx.await {
+                Ok(()) => match crate::context::actor::bounded_reply_await(rx).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!(
                         context_id = %ctx_id,
                         error = %e,
                         "shutdown: actor reported a ShutdownSelf teardown failure; despawning"
                     ),
-                    Err(_dropped) => tracing::warn!(
+                    Err(crate::context::actor::BoundedReplyError::Dropped) => tracing::warn!(
                         context_id = %ctx_id,
                         "shutdown: actor exited before replying to ShutdownSelf; despawning"
+                    ),
+                    Err(crate::context::actor::BoundedReplyError::Elapsed) => tracing::warn!(
+                        context_id = %ctx_id,
+                        "shutdown: actor did not reply to ShutdownSelf within REPLY_TIMEOUT; \
+                         despawning"
                     ),
                 },
                 Err(e) => tracing::warn!(
@@ -3776,8 +3783,9 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // dropping the last `mpsc::Sender`. That closes the inbox, so the
         // actor's `run()` loop exits on its inbox-closed (`None`) arm and the
         // spawned task releases its `PerContextState`. The despawn runs
-        // even when the send failed, so a full or wedged mailbox cannot keep
-        // an actor registered past shutdown.
+        // even when the send failed or the reply did not arrive within
+        // `REPLY_TIMEOUT`, so a full mailbox or a wedged actor cannot keep an
+        // actor registered past shutdown.
         supervisor.despawn_actor(ctx_id).await;
         // Clean shutdown: reap the (non-poison) crash-window entry so it does
         // not leak past teardown (ADR-049 §10). A poisoned entry is preserved
@@ -3828,6 +3836,10 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
     );
 }
 
+/// How long [`shutdown_all_contexts_sync`] waits for [`shutdown_all_contexts`]
+/// before it abandons the drain and returns an error.
+const SYNC_SHUTDOWN_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Sync wrapper for [`shutdown_all_contexts`].
 ///
 /// Required by destructor / atexit-style sync callers (the FFI bridge
@@ -3840,20 +3852,137 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 ///
 /// [`ContextError::InvalidState`](scp_protocol::context::ContextError::InvalidState)
 /// when called outside a tokio runtime: nothing was shut down and nothing was
-/// drained, so the caller must not close the storage backend.
+/// drained, so the caller must not close the storage backend. The same error
+/// when [`shutdown_all_contexts`] has not returned within
+/// [`SYNC_SHUTDOWN_DRAIN_BOUND`]: the drain was abandoned, so supervisor tasks
+/// may still hold storage and the caller must not close the storage backend.
 pub fn shutdown_all_contexts_sync(
     supervisor: &crate::context::supervisor::Supervisor,
+) -> Result<(), scp_protocol::context::ContextError> {
+    shutdown_all_contexts_sync_within(supervisor, SYNC_SHUTDOWN_DRAIN_BOUND)
+}
+
+/// [`shutdown_all_contexts_sync`] with the drain bound as a parameter.
+fn shutdown_all_contexts_sync_within(
+    supervisor: &crate::context::supervisor::Supervisor,
+    bound: std::time::Duration,
 ) -> Result<(), scp_protocol::context::ContextError> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown allowlist — the bridge's blocking shutdown path cannot .await.
-            tokio::task::block_in_place(|| handle.block_on(shutdown_all_contexts(supervisor))); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
-            Ok(())
+            let drain = tokio::time::timeout(bound, shutdown_all_contexts(supervisor));
+            let drained = tokio::task::block_in_place(|| handle.block_on(drain)); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
+            drained.map_err(|_elapsed| {
+                scp_protocol::context::ContextError::InvalidState(format!(
+                    "shutdown_all_contexts_sync: shutdown did not finish within {bound:?}; the \
+                     drain was abandoned, so the storage backend must stay open"
+                ))
+            })
         }
         Err(e) => Err(scp_protocol::context::ContextError::InvalidState(format!(
             "shutdown_all_contexts_sync called outside a tokio runtime ({e}); nothing was \
              shut down or drained, so the storage backend must stay open"
         ))),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod shutdown_sweep_tests {
+    //! ADR-049 Decision 16: the shutdown sweep despawns an actor that never
+    //! replies to `ShutdownSelf`, and the sync wrapper abandons a drain that
+    //! does not finish within its bound.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use scp_protocol::context::ContextError;
+
+    use super::{
+        shutdown_all_contexts, shutdown_all_contexts_sync, shutdown_all_contexts_sync_within,
+    };
+    use crate::context::actor::{ContextActorHandle, ContextCommand, REPLY_TIMEOUT};
+    use crate::context::supervisor::Supervisor;
+
+    fn supervisor() -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MkShutdownSweep".to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        crate::context::test_supervisor(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(crate::context::providers::MerkleEventLogProvider::new()),
+            Arc::new(|_, _| None),
+        )
+    }
+
+    /// Two actors accept `ShutdownSelf` into a free mailbox slot and never
+    /// reply. The sweep waits `REPLY_TIMEOUT` for each, then despawns both, so
+    /// neither stays registered and the sweep reaches its end.
+    #[tokio::test(start_paused = true)]
+    async fn sweep_despawns_actors_that_never_reply_to_shutdown_self() {
+        let sup = supervisor();
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        sup.register_actor_handle_for_test("ctx-wedged-a", ContextActorHandle::from_sender(tx_a));
+        sup.register_actor_handle_for_test("ctx-wedged-b", ContextActorHandle::from_sender(tx_b));
+
+        let start = tokio::time::Instant::now();
+        shutdown_all_contexts(&sup).await;
+        assert!(
+            start.elapsed() >= REPLY_TIMEOUT * 2,
+            "the sweep waits REPLY_TIMEOUT for each unanswered ShutdownSelf"
+        );
+        assert!(
+            sup.actor_ids().is_empty(),
+            "an actor that never replies to ShutdownSelf is despawned, got {:?}",
+            sup.actor_ids()
+        );
+        // Each mailbox received the one ShutdownSelf, and the despawn dropped
+        // the last sender, so the inbox reads closed after it.
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(rx.recv().await.is_some(), "ShutdownSelf was delivered");
+            assert!(rx.recv().await.is_none(), "the despawn closed the inbox");
+        }
+    }
+
+    /// Outside a tokio runtime the sync wrapper shuts nothing down and says so.
+    #[test]
+    fn sync_shutdown_outside_a_runtime_is_an_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sup = rt.block_on(async { supervisor() });
+        let result = shutdown_all_contexts_sync(&sup);
+        assert!(
+            matches!(&result, Err(ContextError::InvalidState(m)) if m.contains("outside a tokio runtime")),
+            "got {result:?}"
+        );
+    }
+
+    /// An idle supervisor drains within the bound; a tracked task that never
+    /// exits makes the wrapper abandon the drain and return an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_returns_ok_when_drained_and_err_when_the_drain_stalls() {
+        let idle = supervisor();
+        assert!(
+            shutdown_all_contexts_sync_within(&idle, Duration::from_secs(5)).is_ok(),
+            "an idle supervisor drains within the bound"
+        );
+
+        let stalled = supervisor();
+        stalled
+            .spawn_tracked("never-exiting probe", std::future::pending::<()>())
+            .expect("spawn before shutdown");
+        let start = std::time::Instant::now();
+        let result = shutdown_all_contexts_sync_within(&stalled, Duration::from_millis(200));
+        assert!(
+            matches!(&result, Err(ContextError::InvalidState(m)) if m.contains("did not finish within")),
+            "a stalled drain is abandoned with an error, got {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the wrapper returns at the bound, not after the stalled task"
+        );
     }
 }
 

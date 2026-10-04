@@ -1245,4 +1245,89 @@ mod tests {
         let sink = ActorEscrowRefundSink::new(Arc::downgrade(&supervisor));
         sink.refund(&ctx_key(), &invoker(), Amount::new(10));
     }
+
+    /// ADR-049 Decision 16: a sink operation spawned before shutdown runs on
+    /// the tracker and the drain waits for it; one fired after shutdown, or
+    /// against a dropped Supervisor, does not run.
+    #[tokio::test]
+    async fn sink_op_is_drained_by_shutdown_and_refused_after_it() {
+        let supervisor = build_supervisor(None);
+        let weak = Arc::downgrade(&supervisor);
+        let runtime = tokio::runtime::Handle::current();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in = Arc::clone(&ran);
+        super::spawn_supervisor_op(&weak, &runtime, "in-flight probe", move |_sup| async move {
+            let _ = release_rx.await;
+            ran_in.fetch_add(1, Ordering::SeqCst);
+        });
+        let shutdown = tokio::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            async move { supervisor.shutdown_all_contexts().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown waits for a sink operation spawned before it"
+        );
+        release_tx.send(()).expect("the probe is still waiting");
+        shutdown.await.expect("shutdown task");
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the in-flight operation ran");
+
+        let late = Arc::new(AtomicUsize::new(0));
+        let late_in = Arc::clone(&late);
+        super::spawn_supervisor_op(&weak, &runtime, "late probe", move |_sup| async move {
+            late_in.fetch_add(1, Ordering::SeqCst);
+        });
+        let gone = Arc::new(AtomicUsize::new(0));
+        let gone_in = Arc::clone(&gone);
+        super::spawn_supervisor_op(
+            &std::sync::Weak::new(),
+            &runtime,
+            "dropped probe",
+            move |_sup| async move {
+                gone_in.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            late.load(Ordering::SeqCst),
+            0,
+            "shutdown refuses a sink operation fired after it"
+        );
+        assert_eq!(
+            gone.load(Ordering::SeqCst),
+            0,
+            "a dropped Supervisor runs no sink operation"
+        );
+    }
+
+    /// A reservation persist against a dropped Supervisor returns the typed
+    /// `SupervisorShutDown` error, not success.
+    #[tokio::test]
+    async fn persist_reservation_after_supervisor_drop_is_typed_error() {
+        let sink = ActorStreamSettlementSink::new(std::sync::Weak::new(), 1);
+        let result = sink
+            .persist_reservation(
+                &ctx_key(),
+                [3u8; 16],
+                StreamReservationRecord {
+                    invoker_did: invoker(),
+                    ucan_cid: UCAN_CID.to_owned(),
+                    cost_per_chunk: Amount::new(10),
+                    amount_cumulative_reserved: 50,
+                    reserved_escrow: Amount::new(100),
+                    generation: 0,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(scp_protocol::context::ContextError::SupervisorShutDown(_))
+            ),
+            "got {result:?}"
+        );
+    }
 }

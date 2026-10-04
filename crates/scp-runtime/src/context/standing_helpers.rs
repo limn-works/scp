@@ -106,7 +106,7 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
 /// # Errors
 ///
 /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-pub fn standing_context_count(deps: &ActorDeps) -> Result<usize, ContextError> {
+pub(super) fn standing_context_count(deps: &ActorDeps) -> Result<usize, ContextError> {
     deps.supervisor.standing_context_count()
 }
 
@@ -119,7 +119,7 @@ pub fn standing_context_count(deps: &ActorDeps) -> Result<usize, ContextError> {
 /// # Errors
 ///
 /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-pub fn has_standing_context(deps: &ActorDeps, peer_did: &DID) -> Result<bool, ContextError> {
+pub(super) fn has_standing_context(deps: &ActorDeps, peer_did: &DID) -> Result<bool, ContextError> {
     deps.supervisor.has_standing_context(peer_did)
 }
 

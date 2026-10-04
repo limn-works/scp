@@ -444,4 +444,20 @@ mod tests {
             "a routing miss must fail closed as Store(_), got {err:?}"
         );
     }
+
+    /// A dropped Supervisor fails the op closed as [`CounterError::Store`]
+    /// carrying the `SupervisorShutDown` reason, never an admission.
+    #[tokio::test]
+    async fn dropped_supervisor_fails_closed_as_store_error() {
+        let adapter = ActorClassSCaveatCounterAdapter::new(std::sync::Weak::new());
+        let err = adapter
+            .check_and_increment(&ctx_key(), "cid-gone", CaveatKind::MaxCalls, 1, 5, 0)
+            .await
+            .expect_err("a dropped Supervisor cannot enforce the cap");
+        assert!(
+            matches!(&err, CounterError::Store(_))
+                && format!("{err:?}").contains("supervisor dropped"),
+            "a dropped Supervisor must fail closed as Store(_), got {err:?}"
+        );
+    }
 }

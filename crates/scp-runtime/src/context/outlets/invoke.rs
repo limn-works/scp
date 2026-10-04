@@ -5162,9 +5162,9 @@ pub(crate) async fn run_cross_context_bridge(
 /// On a successful seal the open-failure `escrow_ticket` is `consume`d (its hold
 /// stays reserved through the pump per AC3; the durable ledger owns the billed /
 /// refund split the seal recorded) and the saga journal is resolved to
-/// `Committed`. On a seal FAILURE the ticket is dropped so its `Drop` reverses
-/// the open-time hold, and the journal is LEFT at `Committing` for the
-/// autonomous crash-recovery sweep (SCP-OUT-046 #136).
+/// `Committed`. On a seal FAILURE the ticket is dropped, and the journal is
+/// LEFT at `Committing` for the autonomous crash-recovery sweep (SCP-OUT-046
+/// #136).
 ///
 /// The receiving-context A-side `CrossContextOutletInvoked` dual-log leaf
 /// (SCP-OUT-046 #135) is recorded from the SEALED `outcome` (the signed receipt +
@@ -5177,8 +5177,8 @@ pub(crate) async fn run_cross_context_bridge(
 ///
 /// The task runs on the Supervisor's task tracker and holds only a
 /// `Weak<Supervisor>` (ADR-049 Decision 16), upgraded per operation. A failed
-/// upgrade takes the same path as a vanished target actor: the seal closes over
-/// the durable prefix and the journal stays `Committing` for crash recovery.
+/// upgrade takes the same path as a vanished target actor: the journal stays
+/// `Committing` for crash recovery.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_streaming_saga_seal_task(
     supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
@@ -5546,8 +5546,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
             }
         }
         Err(err) => {
-            // The seal did not commit. Drop the ticket so its `Drop` reverses the
-            // open-time hold (the sole refund path when no seal ran). Leave the
+            // The seal did not commit. Drop the ticket. Leave the
             // journal at `Committing` — the autonomous crash-recovery sweep
             // (SCP-OUT-046 #136) resolves it (witness present → Committed; absent
             // → the key-bearing truncated close, or an honest NeedsRepair).
@@ -5571,8 +5570,8 @@ pub(crate) async fn run_streaming_saga_seal_task(
             tracing::error!(
                 saga_id = %saga_id.0,
                 %err,
-                "streaming-saga seal task: CommitBStreamSettle failed — open-time escrow hold \
-                 reversed, journal left Committing for crash recovery"
+                "streaming-saga seal task: CommitBStreamSettle failed — journal left Committing \
+                 for crash recovery"
             );
         }
     }
@@ -9456,6 +9455,74 @@ mod tests {
                 "a lossless contiguous stream is forwarded verbatim, with no synthesized error \
                  terminal"
             );
+        }
+
+        /// Counts the refunds the escrow ticket's `Drop` requests for `B_CTX`.
+        #[derive(Default)]
+        struct RecordingRefundSink {
+            calls: AtomicU64,
+            amount: AtomicU64,
+        }
+
+        impl crate::context::outlets::dispatch::StreamEscrowRefundSink for RecordingRefundSink {
+            fn refund(
+                &self,
+                context_id: &str,
+                _member_did: &DID,
+                amount: scp_protocol::economy::types::Amount,
+            ) {
+                assert_eq!(context_id, B_CTX, "the refund targets the ticket's context");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.amount.fetch_add(amount.value(), Ordering::SeqCst);
+            }
+        }
+
+        /// ADR-049 Decision 16: a streaming-saga seal task whose Supervisor has
+        /// dropped sends no `CommitBStreamSettle`, drops the escrow ticket
+        /// (whose `Drop` asks its sink for the refund), and returns.
+        #[tokio::test]
+        async fn seal_task_with_dropped_supervisor_drops_the_ticket_and_returns() {
+            let (a_log, _) = fresh_a_log().await;
+            let sink = Arc::new(RecordingRefundSink::default());
+            let ticket = crate::context::outlets::dispatch::StreamEscrowTicket::new(
+                Arc::clone(&sink)
+                    as Arc<dyn crate::context::outlets::dispatch::StreamEscrowRefundSink>,
+                B_CTX.to_owned(),
+                DID(INVOKER.to_owned()),
+                scp_protocol::economy::types::Amount::new(40),
+            );
+            let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
+            drop(inner_tx);
+            let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(4);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_streaming_saga_seal_task(
+                    std::sync::Weak::new(),
+                    B_CTX.to_owned(),
+                    crate::context::supervisor::saga_journal::SagaId("saga-dropped-sup".to_owned()),
+                    crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                        &operator_key(),
+                    ),
+                    inner_rx,
+                    outer_tx,
+                    ticket,
+                    pinned_descriptor(&operator_key()),
+                    permissive_schema(),
+                    None,
+                    a_log as Arc<dyn ContextEventLogProvider>,
+                ),
+            )
+            .await
+            .expect("the seal task returns when the Supervisor has dropped");
+            assert_eq!(
+                (
+                    sink.calls.load(Ordering::SeqCst),
+                    sink.amount.load(Ordering::SeqCst)
+                ),
+                (1, 40),
+                "the unsealed ticket is dropped unconsumed, so its sink is asked once"
+            );
+            while outer_rx.recv().await.is_some() {}
         }
     }
 

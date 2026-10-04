@@ -989,7 +989,7 @@ fn persist_state_best_effort<'d, 'c>(
 ) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     // Single source of truth: the canonical best-effort persist builds the
     // snapshot, exports the crypto state with the Supervisor's floors, and
-    // persists nothing when the Supervisor has dropped (ADR-049 Decision 16).
+    // persists nothing when the Supervisor has dropped.
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id)
 }
 
