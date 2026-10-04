@@ -136,7 +136,7 @@ nothing:
                against the `merge_group` ref, so following that header would
                have left every queue entry waiting on a status no run reports.
   needs-condition
-               Four jobs build one bridge artifact each and upload it, and six
+               Five jobs build one bridge artifact each and upload it, and six
                jobs download what they build instead of compiling their own.
                GitHub skips a job when any job in its `needs` list is skipped,
                so a producer whose `if:` is narrower than one consumer's skips
@@ -4659,7 +4659,7 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
 
 
 # Each producer whose upload lists several paths, with the artifact it uploads, the
-# marker file its build step touches under RUNNER_TEMP, the uploaded paths the
+# marker file the job touches before its build under RUNNER_TEMP, the uploaded paths the
 # checkout tracks (a cache hit that leaves a tracked path out cannot be detected,
 # because the checkout supplies it), and whether its verify step rejects a
 # zero-byte output (kotlin-test's two paths are files; the xcframework's include
