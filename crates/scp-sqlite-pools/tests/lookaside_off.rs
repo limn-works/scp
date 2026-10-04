@@ -37,6 +37,24 @@ fn file_connection_serves_nothing_from_lookaside() {
     );
 }
 
+/// Positive control: a default connection keeps lookaside on, and the same
+/// workload checks slots out of it, so `lookaside_use` can read above zero
+/// and the two tests above can fail.
+#[test]
+fn default_connection_serves_from_lookaside() {
+    let conn = Connection::open_in_memory().expect("default connection should open");
+    key_and_insert(&conn);
+    let used = lookaside_use(&conn).expect("status should read");
+    assert!(
+        used.slots_high_water > 0,
+        "a default connection must check lookaside slots out, got {used:?}"
+    );
+    assert!(
+        used.hits > 0,
+        "a default connection must serve allocations from lookaside, got {used:?}"
+    );
+}
+
 #[test]
 fn in_memory_connection_serves_nothing_from_lookaside() {
     let conn = open_in_memory().expect("open_in_memory should succeed");
