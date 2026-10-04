@@ -31,8 +31,7 @@ commit that deletes or moves a file outside a member's directory does not select
 that reads that file with `include_str!` or `include_bytes!`. The script then adds every
 workspace member that depends on a selected member, directly or transitively, as
 `Graph.affected` defines the walk, and prints `-p <name>` for each. It keeps only the
-`--features` entries whose package is selected, because cargo rejects `<package>/<feature>`
-for a package the command does not select.
+`--features` entries whose package is selected.
 
 `fuzz/` is a standalone workspace whose crates `fuzz/rust-toolchain.toml` builds on a
 nightly compiler, so the hook does not lint it; the script names each such `.rs` path on
