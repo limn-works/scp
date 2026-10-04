@@ -1454,7 +1454,6 @@ mod tests {
     /// Drives `context_id`'s supervisor actor from `Active` to `Closing` through
     /// the `CloseContext` dispatch the bridges' `context_close` sends. The actor
     /// stays resident and keeps its role state.
-    #[allow(clippy::expect_used)] // A broken test fixture panics.
     fn close_supervisor_context(
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,

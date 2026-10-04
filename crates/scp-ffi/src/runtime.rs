@@ -2177,38 +2177,6 @@ pub(crate) fn create_supervisor_context_with_params_for_test(
     .expect("test supervisor context creation must succeed");
 }
 
-/// Test-only: builds a bridge instance whose supervisor role state DIFFERS from
-/// the bridge copy in `FfiBridgeState`, and returns it with the context id.
-///
-/// `register_context` receives an EMPTY ceiling argument, so the bridge copy
-/// `FfiBridgeState.ceiling_strings` carries `default_ceiling()`. The supervisor
-/// context carries `supervisor_ceiling`, a non-empty list the caller makes
-/// narrower than that default, so a test that asserts the supervisor's answer
-/// fails the moment a call site goes back to reading the copy.
-///
-/// # Panics
-///
-/// Panics when `register_context` or the supervisor context creation fails,
-/// each a broken fixture rather than a condition under test.
-#[cfg(test)]
-#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
-pub(crate) fn live_state_fixture(
-    prefix: &str,
-    creator_did: &str,
-    supervisor_ceiling: &[&str],
-) -> (Arc<PyBridgeInstance>, String) {
-    crate::init_runtime().ok();
-    let bi = Arc::new(PyBridgeInstance::new_py());
-    let context_id = format!("{prefix}-{}", uuid::Uuid::new_v4());
-    register_context(&bi, &context_id, creator_did, &[]).expect("fixture registration");
-    let ceiling: Vec<String> = supervisor_ceiling
-        .iter()
-        .map(|entry| (*entry).to_owned())
-        .collect();
-    create_supervisor_context_for_test(&bi, &context_id, creator_did, &ceiling);
-    (bi, context_id)
-}
-
 /// Closes the receive channel for a context by dropping the sender (SCP-216).
 ///
 /// Called by `py_context_leave` when a member leaves. Dropping the sender
@@ -2807,6 +2775,36 @@ mod tests {
     // crate — does not see an unused import (ADR-062 §Decision 6 parity).
     #[cfg(feature = "testing")]
     use scp_platform::testing::InMemoryKeyCustody;
+
+    /// Test-only: builds a bridge instance whose supervisor role state DIFFERS from
+    /// the bridge copy in `FfiBridgeState`, and returns it with the context id.
+    ///
+    /// `register_context` receives an EMPTY ceiling argument, so the bridge copy
+    /// `FfiBridgeState.ceiling_strings` carries `default_ceiling()`. The supervisor
+    /// context carries `supervisor_ceiling`, a non-empty list the caller makes
+    /// narrower than that default, so a test that asserts the supervisor's answer
+    /// fails the moment a call site goes back to reading the copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `register_context` or the supervisor context creation fails,
+    /// each a broken fixture rather than a condition under test.
+    fn live_state_fixture(
+        prefix: &str,
+        creator_did: &str,
+        supervisor_ceiling: &[&str],
+    ) -> (Arc<PyBridgeInstance>, String) {
+        crate::init_runtime().ok();
+        let bi = Arc::new(PyBridgeInstance::new_py());
+        let context_id = format!("{prefix}-{}", uuid::Uuid::new_v4());
+        register_context(&bi, &context_id, creator_did, &[]).expect("fixture registration");
+        let ceiling: Vec<String> = supervisor_ceiling
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect();
+        create_supervisor_context_for_test(&bi, &context_id, creator_did, &ceiling);
+        (bi, context_id)
+    }
 
     /// Helper to generate unique context IDs for parallel test isolation.
     fn unique_ctx_id(prefix: &str) -> String {
