@@ -10685,8 +10685,7 @@ impl Scp {
                 // resolved authoritatively by the supervisor's first-writer-wins
                 // spawn lock below.
                 //
-                // FLAG-1: the caller no longer supplies a ceiling, so occupy with the
-                // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on
+                // FLAG-1: the Occupied dedup is keyed on
                 // `context_id`, so the "detect a duplicate BEFORE consuming the
                 // single-use KeyPackage" crash-safety is preserved regardless of the
                 // ceiling. The AUTHENTICATED ceiling is re-synced from the joined
@@ -10721,8 +10720,7 @@ impl Scp {
                 };
 
                 // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-                // signed params, overwriting the DEFAULT ceiling used for the
-                // reversible occupy. The authoritative ceiling lives in the bundle
+                // signed params. The authoritative ceiling lives in the bundle
                 // the creator signed — never in caller input. Runs AFTER the
                 // irreversible commit; the UCAN state was just occupied (and not
                 // removed on this success path), so the sync targets a live entry.
@@ -25653,13 +25651,6 @@ mod tests {
         );
     }
 
-    // ----- Missing-signing-custody → SCP-IDENT-1017 -----
-    //
-    // A context handle / identity that retains no custody (externally loaded:
-    // `in_memory_custody`, `signing_key`, `callback_custody` all `None`) must
-    // reject event-log checkpoint with a canonical missing-signing-custody
-    // code — not an overloaded permission/nonce code.
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_without_retained_custody_returns_ident_1017() {
         let scp = scp_test();
@@ -26206,6 +26197,93 @@ mod tests {
         }
     }
 
+    /// `ucan_validate` and `ucan_evaluate` anchor the chain on the creator the
+    /// supervisor holds (ADR-016 step 4), and `ucan_revoke` admits that
+    /// creator as a revoker, when the handle and the per-context UCAN state
+    /// this bridge registered both name another creator.
+    ///
+    /// The owner's token validates under a handle naming `other`, and a
+    /// revoke of the holder's delegation by `other` is refused while the same
+    /// revoke by the owner succeeds. An edit that read the creator from the
+    /// handle or the UCAN state fails each assertion.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_evaluate_and_revoke_use_the_supervisor_creator() {
+        let rt = runtime();
+        let scp = scp_test();
+        let owner = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let created = rt
+            .block_on(scp.context_create(
+                Arc::clone(&owner),
+                ContextParams {
+                    ceiling: vec!["messages:read".to_owned(), "messages:write".to_owned()],
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create should succeed");
+        let context_id = created.context_id();
+        let token = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&created),
+                holder.did(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("a mint by the context creator must succeed")
+            .encoded();
+        let cap = format!("scp:ctx:{context_id}/messages:write");
+        let delegated = rt
+            .block_on(scp.ucan_delegate(
+                Arc::clone(&created),
+                holder.did(),
+                "did:dht:z6MkUniffiLiveCreatorDelegatee".to_owned(),
+                token.clone(),
+                vec![cap.clone()],
+            ))
+            .expect("the holder's delegation must succeed")
+            .encoded();
+
+        let other = "did:dht:z6MkUniffiHandleCreator";
+        scp.inner
+            .with_ucan_state(&context_id, |state| {
+                other.clone_into(&mut state.creator_did);
+            })
+            .expect("the UCAN state exists after the mint");
+        let (custody, signing_key, _key) = rt.block_on(unregistered_callback_custody());
+        let handle = handle_carrying_custody(&scp, &context_id, other, custody, signing_key);
+
+        let evaluation = rt
+            .block_on(scp.ucan_evaluate(
+                Arc::clone(&handle),
+                token.clone(),
+                Some(cap.clone()),
+                holder.did(),
+                None,
+            ))
+            .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid,
+            "evaluate must anchor the chain on the supervisor's creator: {evaluation:?}"
+        );
+        rt.block_on(scp.ucan_validate(Arc::clone(&handle), token, cap, holder.did(), None))
+            .expect("validate must anchor the chain on the supervisor's creator");
+
+        let refused = rt
+            .block_on(scp.ucan_revoke(Arc::clone(&handle), delegated.clone(), other.to_owned()))
+            .expect_err("a creator the supervisor does not hold must not revoke");
+        assert!(
+            refused.to_string().contains("neither the token issuer"),
+            "the refusal must be the revoker authorization: {refused}"
+        );
+        rt.block_on(scp.ucan_revoke(handle, delegated, owner.did()))
+            .expect("the supervisor's creator must revoke a token it did not issue");
+    }
+
     /// Every UCAN entry point refuses once no actor serves the context, and the
     /// refusal withholds the lifecycle state.
     ///
@@ -26343,6 +26421,13 @@ mod tests {
             "expected SCP-IDENT-1001, got: {err_str}"
         );
     }
+
+    // ----- Missing-signing-custody → SCP-IDENT-1017 -----
+    //
+    // A context handle / identity that retains no custody (externally loaded:
+    // `in_memory_custody`, `signing_key`, `callback_custody` all `None`) must
+    // reject event-log checkpoint with a canonical missing-signing-custody
+    // code — not an overloaded permission/nonce code.
 
     #[tokio::test]
     async fn event_log_checkpoint_without_retained_custody_returns_ident_1017() {

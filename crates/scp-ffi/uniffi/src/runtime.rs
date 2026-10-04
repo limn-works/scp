@@ -1119,9 +1119,7 @@ impl UniffiBridgeInstance {
     /// withholds every answer about the context from the refusal, and returns
     /// the context's role state for the authorization decision that follows.
     ///
-    /// `ucan_validate`, `ucan_evaluate`, `ucan_mint`, `ucan_delegate`, and
-    /// `ucan_revoke` take their ceiling and creator from this gate, because
-    /// each one runs it before it authorizes the caller. The outlet PRD's
+    /// The outlet PRD's
     /// SCP-OUT-031 PR-2a note records the rule this gate keeps: the raw
     /// lifecycle state never reaches an FFI caller before authorization. A
     /// context that is not `Active`, a context no actor serves, an actor that
