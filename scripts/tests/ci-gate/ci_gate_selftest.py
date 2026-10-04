@@ -136,7 +136,7 @@ nothing:
                against the `merge_group` ref, so following that header would
                have left every queue entry waiting on a status no run reports.
   needs-condition
-               Four jobs build one bridge artifact each and upload it, and six
+               Five jobs build one bridge artifact each and upload it, and six
                jobs download what they build instead of compiling their own.
                GitHub skips a job when any job in its `needs` list is skipped,
                so a producer whose `if:` is narrower than one consumer's skips
@@ -170,11 +170,14 @@ nothing:
                "Re-run failed jobs" re-runs a failed consumer without its
                producer, so a consumer re-run a day after its run started
                failed its download while GitHub still offered the re-run.
-  xcframework-outputs
+  producer-outputs
                The XCFramework upload named `if-no-files-found: error` over
                three paths, one of them the tracked ScpBindings.swift, so the
                checkout always supplied a match and the option could not fail
-               the producer when build-xcframework.sh wrote nothing.
+               the producer when build-xcframework.sh wrote nothing. The
+               kotlin-test upload lists the UniFFI cdylib and the Kotlin
+               bindings, and a build that wrote one of them satisfies the
+               option the same way.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
@@ -745,6 +748,8 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
         "bridge-parity",
         "bridge-parity-kotlin",
         "bridge-parity-swift",
+        # Producer of the UniFFI cdylib bridge-parity-kotlin downloads.
+        "kotlin-test",
         "napi-addon",
         "pyo3-module",
         "pyo3-module-macos",
@@ -1674,6 +1679,59 @@ def check_private_items_detects_a_dropped_flag(
                 "documents_private_items returned True over a command carrying no "
                 "--document-private-items, so it reads something other than the flag",
             )
+
+
+NO_CARGO_PATH = "PATH=$no_cargo_path"
+
+
+def no_cargo_gradle_calls(job: dict) -> list[str]:
+    """Each `./gradlew` command line in `job` that runs with cargo off PATH."""
+    return [
+        line
+        for step in job.get("steps", [])
+        for line in logical_lines(step.get("run", ""))
+        if NO_CARGO_PATH in line and "./gradlew" in line
+    ]
+
+
+def passes_no_daemon(line: str) -> bool:
+    """Report whether one `./gradlew` command line passes --no-daemon."""
+    return "--no-daemon" in line.split()
+
+
+def check_no_cargo_gradle_calls_skip_the_daemon(jobs: dict) -> None:
+    """kotlin-lint's cargo-free Gradle calls run without the shared daemon.
+
+    CRITERION: a Gradle daemon that an earlier step started can resolve `cargo`
+    against the PATH it started with, so a call that reuses it can reach the
+    `cargo metadata` fallback whatever PATH the shell passes. Each call that
+    strips cargo from PATH passes --no-daemon, and stripping the flag from each
+    one fails the predicate.
+    """
+    calls = no_cargo_gradle_calls(jobs["kotlin-lint"])
+    check(
+        "kotlin-lint runs ./gradlew with cargo off PATH",
+        len(calls) >= 2,
+        f"found {len(calls)} such calls; the skip check and the "
+        f"CARGO_TARGET_DIR loop each make one",
+    )
+    for line in calls:
+        check(
+            f"kotlin-lint: {line[:58]} passes --no-daemon",
+            passes_no_daemon(line),
+            "a reused daemon can resolve cargo against the PATH it started with",
+        )
+        stripped = " ".join(t for t in line.split() if t != "--no-daemon")
+        check(
+            f"kotlin-lint: {line[:40]} with --no-daemon removed -> reported",
+            not passes_no_daemon(stripped),
+            "the predicate accepted a call that reuses the daemon",
+        )
+    check(
+        "passes_no_daemon rejects a token that only starts with --no-daemon",
+        not passes_no_daemon("./gradlew --no-daemon-x detekt"),
+        "the predicate matched a prefix rather than the whole flag",
+    )
 
 
 def check_workspace_and_rustdoc_readers(documents: list[tuple[Path, dict]]) -> None:
@@ -3720,25 +3778,39 @@ def narrow_condition(expression: str, clause_fragment: str) -> str:
 
 
 def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
-    """Narrowing one producer's condition by one clause is caught above."""
-    narrowed = copy.deepcopy(doc)
-    producer = narrowed["jobs"]["pyo3-module"]
-    producer["if"] = narrow_condition(producer["if"], "outputs.kotlin")
-    gaps = dependency_condition_gaps(narrowed)
-    check(
-        "dropping the kotlin clause from pyo3-module is reported",
-        any("bridge-parity-kotlin runs and pyo3-module skips" in gap for gap in gaps),
-        f"a producer that no longer covers bridge-parity-kotlin went unreported: {gaps}",
-    )
-    # The mutant has to reach the union comparison, not the branch that reports an
-    # expression this grammar cannot read: that branch names every dependant of the
-    # mutated job whatever the comparison answers, which would let this control pass
-    # over a comparison that had been deleted.
-    check(
-        "the narrowed producer is reported by the comparison, not by a parse refusal",
-        not any("cannot decide" in gap for gap in gaps),
-        f"the mutant expression went unread: {gaps}",
-    )
+    """Narrowing one producer's condition by one clause is caught above.
+
+    Each (producer, clause) pair below is a producer whose `if:` carries that clause
+    for bridge-parity-kotlin alone: kotlin-test's own tests need `kotlin || rust`, so
+    its `python` clause is the one an edit scoped to the Kotlin lane would drop.
+    """
+    for producer_id, clause in (
+        ("pyo3-module", "outputs.kotlin"),
+        ("kotlin-test", "outputs.python"),
+    ):
+        narrowed = copy.deepcopy(doc)
+        producer = narrowed["jobs"][producer_id]
+        producer["if"] = narrow_condition(producer["if"], clause)
+        gaps = dependency_condition_gaps(narrowed)
+        check(
+            f"dropping the {clause} clause from {producer_id} is reported",
+            any(
+                f"bridge-parity-kotlin runs and {producer_id} skips" in gap
+                for gap in gaps
+            ),
+            f"a producer that no longer covers bridge-parity-kotlin went unreported: "
+            f"{gaps}",
+        )
+        # The mutant has to reach the union comparison, not the branch that reports an
+        # expression this grammar cannot read: that branch names every dependant of
+        # the mutated job whatever the comparison answers, which would let this
+        # control pass over a comparison that had been deleted.
+        check(
+            f"the narrowed {producer_id} is reported by the comparison, not by a "
+            f"parse refusal",
+            not any("cannot decide" in gap for gap in gaps),
+            f"the mutant expression went unread: {gaps}",
+        )
 
 
 def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> None:
@@ -4511,6 +4583,12 @@ ARTIFACT_KEY_JOB_FILE_INPUTS = {
     "xcframework": (
         ("bindings/swift/build-xcframework.sh", "the script that runs the build"),
     ),
+    "kotlin-test": (
+        (
+            "scripts/generate-uniffi-kotlin.sh",
+            "the script that generates the Kotlin bindings",
+        ),
+    ),
 }
 ARTIFACT_KEY_EXPRESSION_INPUTS = (
     ("runner.os", "the runner OS"),
@@ -4548,7 +4626,8 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
     entries in ARTIFACT_KEY_JOB_FILE_INPUTS inside a `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
     digest that key reads in a step before the restore that hashes the job's own
     definition out of ci.yml; restores, saves and uploads one path list; and saves under the key it
-    restored.
+    restored. Each entry in ARTIFACT_KEY_JOB_FILE_INPUTS for the job is listed, or
+    covered by a `/**` entry, under a paths-filter key that gates the job.
 
     WHY: on a key hit the producer skips its build and uploads what an earlier run
     built. A key that omits one input restores that earlier build after the input
@@ -4591,6 +4670,17 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
         ):
             if pattern not in hashed:
                 gaps.append(f"{job_id}: key hashes no {pattern} ({meaning})")
+        routed = {
+            entry
+            for step in paths_filter_steps(doc)
+            for key in gating_filter_keys(doc, doc["jobs"][job_id])
+            for entry in (step.filters.get(key) or [])
+        }
+        for pattern, meaning in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ()):
+            if pattern not in routed and not directory_covered(routed, pattern):
+                gaps.append(
+                    f"{job_id}: no paths filter gating the job lists {pattern} ({meaning})"
+                )
         expressions = re.findall(r"\$\{\{\s*([^}]*?)\s*\}\}", key)
         for context, meaning in ARTIFACT_KEY_EXPRESSION_INPUTS:
             if context not in expressions:
@@ -4662,8 +4752,8 @@ def check_artifact_cache_keys(doc: dict) -> None:
     )
     producers = bridge_producers(doc)
     check(
-        "ci.yml: the artifact cache check reads all four bridge producers",
-        {"napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
+        "ci.yml: the artifact cache check reads all five bridge producers",
+        {"kotlin-test", "napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
         <= set(producers),
         f"found {producers}",
     )
@@ -4693,6 +4783,33 @@ def check_artifact_cache_keys(doc: dict) -> None:
                     ),
                     f"a ci.yml whose {job_id} key omits {text} went unreported",
                 )
+        # Control: each job file input dropped from the filters gating the job is reported.
+        for pattern, _ in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ()):
+            mutated = copy.deepcopy(doc)
+            for job in mutated["jobs"].values():
+                for step in job.get("steps") or []:
+                    if not str(step.get("uses") or "").startswith("dorny/paths-filter"):
+                        continue
+                    filters = yaml.safe_load(step["with"]["filters"])
+                    step["with"]["filters"] = yaml.safe_dump(
+                        {
+                            key: [
+                                entry
+                                for entry in entries
+                                if entry != pattern
+                                and not directory_covered({entry}, pattern)
+                            ]
+                            for key, entries in filters.items()
+                        }
+                    )
+            check(
+                f"{job_id}: a filter set that does not route {pattern} is reported",
+                any(
+                    gap.startswith(f"{job_id}: no paths filter") and pattern in gap
+                    for gap in artifact_cache_key_gaps(mutated)
+                ),
+                f"a ci.yml whose filters omit {pattern} went unreported for {job_id}",
+            )
         # Control: the artifact-inputs step moved after the restore is reported.
         mutated = copy.deepcopy(doc)
         moved = mutated["jobs"][job_id]["steps"]
@@ -4940,45 +5057,156 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
         )
 
 
-def check_xcframework_outputs_are_verified(doc: dict) -> None:
-    """Run the xcframework job's verify step against each uploaded path gone or stale.
+# Each producer whose upload lists several paths, with the artifact it uploads, the
+# marker file the job touches before its build under RUNNER_TEMP, the uploaded paths the
+# checkout tracks (a cache hit that leaves a tracked path out cannot be detected,
+# because the checkout supplies it), and whether its verify step rejects a
+# zero-byte output (kotlin-test's two paths are files; the xcframework's include
+# directories).
+MULTI_PATH_PRODUCERS = (
+    (
+        "xcframework",
+        "swift-xcframework-dev",
+        "xcframework-build-start",
+        ("bindings/swift/Sources/SCP/Internal/ScpBindings.swift",),
+        False,
+    ),
+    ("kotlin-test", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", (), True),
+)
+# Uploaded paths that name a file rather than a directory.
+UPLOADED_FILE_SUFFIXES = (".swift", ".so", ".kt")
 
-    CRITERION: for every path the `swift-xcframework-dev` upload lists, the step
-    before that upload exits non-zero when the path is absent or holds nothing
-    newer than the marker the build step touches, and exits 0 when every path is
-    fresh. On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step
-    exits non-zero when an untracked path is absent and exits 0 when every path is
-    present.
+
+def multi_path_producer_gaps(doc: dict) -> list[str]:
+    """Name each job whose upload lists several paths but is not in the tuple, or
+    sits in the tuple with no such upload."""
+    uploaders = {
+        job_id
+        for job_id, job in (doc.get("jobs") or {}).items()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "").startswith("actions/upload-artifact")
+        and len(str((step.get("with") or {}).get("path") or "").split()) > 1
+    }
+    listed = {row[0] for row in MULTI_PATH_PRODUCERS}
+    return [
+        f"{job_id} uploads several paths and is missing from MULTI_PATH_PRODUCERS"
+        for job_id in sorted(uploaders - listed)
+    ] + [
+        f"{job_id} is in MULTI_PATH_PRODUCERS and has no upload listing several paths"
+        for job_id in sorted(listed - uploaders)
+    ]
+
+
+def check_multi_path_producers_are_listed(doc: dict) -> None:
+    """MULTI_PATH_PRODUCERS holds exactly the jobs whose upload lists several paths."""
+    gaps = multi_path_producer_gaps(doc)
+    check(
+        "MULTI_PATH_PRODUCERS equals the jobs whose upload lists several paths",
+        not gaps,
+        "; ".join(gaps),
+    )
+    mutated = copy.deepcopy(doc)
+    for step in mutated["jobs"]["napi-addon"]["steps"]:
+        if (step.get("with") or {}).get("name") == "napi-addon-linux":
+            step["with"]["path"] += "\nbindings/typescript/index.d.ts"
+    gaps = multi_path_producer_gaps(mutated)
+    check(
+        "a second path on napi-addon's upload is reported as missing from the tuple",
+        gaps
+        == [
+            "napi-addon uploads several paths and is missing from MULTI_PATH_PRODUCERS"
+        ],
+        f"got {gaps}",
+    )
+    mutated = copy.deepcopy(doc)
+    for step in mutated["jobs"]["kotlin-test"]["steps"]:
+        if (step.get("with") or {}).get("name") == "uniffi-kotlin-linux":
+            step["with"]["path"] = step["with"]["path"].split()[0]
+    gaps = multi_path_producer_gaps(mutated)
+    check(
+        "kotlin-test uploading one path is reported as extra in the tuple",
+        gaps
+        == [
+            (
+                "kotlin-test is in MULTI_PATH_PRODUCERS and has no upload listing "
+                "several paths"
+            )
+        ],
+        f"got {gaps}",
+    )
+
+
+def check_multi_path_outputs_are_verified(
+    doc: dict,
+    job_id: str,
+    artifact: str,
+    marker_name: str,
+    tracked: tuple[str, ...],
+    rejects_empty: bool,
+) -> None:
+    """Run a producer's verify step against each uploaded path gone or stale.
+
+    CRITERION: for every path the `artifact` upload lists, the step before that
+    upload exits non-zero when the path is absent or holds nothing newer than the
+    marker the job touches before its build, and exits 0 when every path is fresh.
+    On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step exits
+    non-zero when an untracked path is absent and exits 0 when every path is
+    present. When `rejects_empty` is set, the step also exits non-zero when a path
+    is a fresh zero-byte file, after a build and on a cache hit.
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
-    nothing. The upload lists the tracked ScpBindings.swift, so the checkout always
-    supplies a match and the option alone cannot fail the producer.
+    nothing. The xcframework upload lists the tracked ScpBindings.swift, so the
+    checkout always supplies a match, and a build that writes one of kotlin-test's
+    two paths satisfies the option, so the option alone cannot fail either producer.
     """
-    steps = doc["jobs"]["xcframework"]["steps"]
+    steps = doc["jobs"][job_id]["steps"]
     upload = next(
         i
         for i, step in enumerate(steps)
-        if (step.get("with") or {}).get("name") == "swift-xcframework-dev"
+        if (step.get("with") or {}).get("name") == artifact
     )
     script = steps[upload - 1].get("run") or ""
     paths = (steps[upload]["with"]["path"]).split()
+    check(
+        f"{job_id}: the {artifact} upload lists more than one path",
+        len(paths) > 1,
+        f"it lists {paths}",
+    )
+    marker_touched = any(
+        f'touch "$RUNNER_TEMP/{marker_name}"' in str(step.get("run") or "")
+        for step in steps[:upload]
+    )
+    check(
+        f"{job_id}: a step before the upload touches the {marker_name} marker",
+        marker_touched,
+        "the verify step compares against a marker no step writes",
+    )
     now = 1_000_000_000
 
-    def run_with(missing: str | None, stale: str | None, hit: bool = False) -> int:
+    def run_with(
+        missing: str | None,
+        stale: str | None,
+        hit: bool = False,
+        empty: str | None = None,
+    ) -> int:
         with tempfile.TemporaryDirectory() as root:
             runner_temp = Path(root, "runner-temp")
             runner_temp.mkdir()
             if not hit:
-                marker = runner_temp / "xcframework-build-start"
+                marker = runner_temp / marker_name
                 marker.touch()
                 os.utime(marker, (now, now))
             for path in paths:
                 if path == missing:
                     continue
                 target = Path(root, "tree", path)
-                file = target / "content" if target.suffix != ".swift" else target
+                file = (
+                    target
+                    if target.suffix in UPLOADED_FILE_SUFFIXES
+                    else target / "content"
+                )
                 file.parent.mkdir(parents=True, exist_ok=True)
-                file.touch()
+                file.write_text("" if path == empty else "built\n")
                 stamp = now - 100 if path == stale or hit else now + 100
                 for entry in {file, target}:
                     os.utime(entry, (stamp, stamp))
@@ -4995,35 +5223,46 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
             ).returncode
 
     check(
-        "xcframework: the verify step passes when the build wrote every output",
+        f"{job_id}: the verify step passes when the build wrote every output",
         run_with(None, None) == 0,
         "the verify step rejects a build that wrote every uploaded path",
     )
     for path in paths:
         check(
-            f"xcframework: a missing {path} fails the producer",
+            f"{job_id}: a missing {path} fails the producer",
             run_with(path, None) != 0,
             f"the verify step before the upload passes without {path}",
         )
         check(
-            f"xcframework: a {path} older than the build fails the producer",
+            f"{job_id}: a {path} older than the build fails the producer",
             run_with(None, path) != 0,
             f"the verify step before the upload passes over a stale {path}",
         )
     check(
-        "xcframework: on a cache hit the verify step passes when the restore wrote "
+        f"{job_id}: on a cache hit the verify step passes when the restore wrote "
         "every output",
         run_with(None, None, hit=True) == 0,
         "the verify step rejects a cache hit that restored every uploaded path",
     )
-    # The checkout supplies the tracked ScpBindings.swift, so CI cannot reach a hit
-    # that lacks it.
-    for path in (p for p in paths if not p.endswith("ScpBindings.swift")):
+    # The checkout supplies a tracked path, so CI cannot reach a hit that lacks it.
+    for path in (p for p in paths if p not in tracked):
         check(
-            f"xcframework: on a cache hit a missing {path} fails the producer",
+            f"{job_id}: on a cache hit a missing {path} fails the producer",
             run_with(path, None, hit=True) != 0,
             f"the verify step passes a cache hit without {path}",
         )
+    if rejects_empty:
+        for path in paths:
+            check(
+                f"{job_id}: a zero-byte {path} written by the build fails the producer",
+                run_with(None, None, empty=path) != 0,
+                f"the verify step before the upload passes over an empty {path}",
+            )
+            check(
+                f"{job_id}: on a cache hit a zero-byte {path} fails the producer",
+                run_with(None, None, hit=True, empty=path) != 0,
+                f"the verify step passes a cache hit that restored an empty {path}",
+            )
 
 
 def a_producer_and_an_unguarded_consumer(
@@ -6385,8 +6624,15 @@ def main() -> int:
     )
     check_artifact_input_digests_fail_closed(workflow)
 
-    print("xcframework-outputs — the XCFramework producer fails on a missing output")
-    check_xcframework_outputs_are_verified(workflow)
+    print(
+        "producer-outputs — a producer uploading several paths fails on a missing "
+        "output"
+    )
+    check_multi_path_producers_are_listed(workflow)
+    for job_id, artifact, marker_name, tracked, rejects_empty in MULTI_PATH_PRODUCERS:
+        check_multi_path_outputs_are_verified(
+            workflow, job_id, artifact, marker_name, tracked, rejects_empty
+        )
 
     print("package-writers — no `packages: write`; the cache token stays in docker-cache")
     check_package_write_and_cache_token(workflow)
@@ -6443,6 +6689,9 @@ def main() -> int:
     check_rustdoc_documents_private_items(documents)
     check_private_items_detects_a_dropped_flag(documents)
     check_workspace_and_rustdoc_readers(documents)
+
+    print("no-cargo-gradle — kotlin-lint's cargo-free Gradle calls skip the daemon")
+    check_no_cargo_gradle_calls_skip_the_daemon(jobs)
 
     print("merge-queue — a workflow that skips to a success status runs in the queue")
     check_merge_queue_triggers(documents)
