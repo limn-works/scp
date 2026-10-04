@@ -209,7 +209,7 @@ nothing:
                its step sees into its cache key. A `CARGO_PROFILE_*` key in one
                job's `env:` therefore gives that job a key no other member of
                its `shared-key` group computes, so that job restores no entry
-               its group saved and compiles the group's ~650 dependencies from
+               its group saved and compiles the group's dependencies from
                scratch. A `CARGO_PROFILE_*` key in the `env:` of a step that runs
                cargo makes cargo compile that step's units under a profile the
                restored entry does not hold and rebuild each one.
