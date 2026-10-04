@@ -1090,12 +1090,8 @@ impl UniffiBridgeInstance {
 
     /// Reads a context's role state from that context's supervisor actor.
     ///
-    /// ADR-016 step 8 compares a token's grants against the context's
-    /// capability ceiling, and step 4 checks that the chain's root issuer is
-    /// the context creator. A ceiling or creator this bridge recorded when it
-    /// registered the context goes stale on the first `ModifyCeiling`
-    /// governance action the supervisor applies by another route, so every
-    /// authorization read goes to the actor.
+    /// Tests read through this method. An authorization path reads through
+    /// [`UniffiBridgeInstance::require_active_context_before_authz`] instead.
     ///
     /// Fails closed. A context whose actor holds no role state yields
     /// `ScpError::Context` with `SCP-CTX-2023`; no caller receives a
@@ -1110,7 +1106,8 @@ impl UniffiBridgeInstance {
     /// (`SCP-CTX-2134`) error when the context's actor is saturated, wedged,
     /// mid-respawn, or poisoned, so a caller never reads an actor that did not
     /// answer as an absent context.
-    pub async fn live_role_state(
+    #[cfg(test)]
+    pub(crate) async fn live_role_state(
         &self,
         context_id: &str,
     ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {

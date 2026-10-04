@@ -25179,9 +25179,7 @@ mod tests {
 
     /// `ucan_mint` must work over callback custody (production path): the minted
     /// token's detached Ed25519 signature verifies against the custody's
-    /// `#active` public key. Pins that `ucan_mint_impl`, past its lifecycle
-    /// gate, signs through the `UniffiKeyCustody::Callback` entry this
-    /// instance's identity registry holds for the live context creator.
+    /// `#active` public key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_works_over_callback_custody() {
         let scp = scp_test();
@@ -25202,6 +25200,142 @@ mod tests {
         // custody's #active public key — proving a real signature was produced
         // on the production path (not a fail-closed stub).
         assert_encoded_ucan_signature_verifies(&token.encoded, &verifying_key);
+    }
+
+    /// Generates a callback custody holding a fresh Ed25519 key that no
+    /// identity registry records, and returns it with that key's handle and
+    /// verifying key.
+    async fn unregistered_callback_custody() -> (
+        Arc<CallbackKeyCustody>,
+        KeyHandle,
+        ed25519_dalek::VerifyingKey,
+    ) {
+        let custody = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let key = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("callback custody generates an Ed25519 key");
+        let pk_bytes: [u8; 32] = custody
+            .public_key(&key)
+            .await
+            .expect("callback custody exposes the public key")
+            .into_bytes()
+            .try_into()
+            .expect("Ed25519 public key is 32 bytes");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .expect("custody public key is a valid Ed25519 verifying key");
+        (custody, key, verifying_key)
+    }
+
+    /// Builds a `ContextHandle` for `context_id` and `creator_did` that carries
+    /// `custody` and `signing_key` as its own custody fields.
+    fn handle_carrying_custody(
+        scp: &Arc<crate::scp::Scp>,
+        context_id: &str,
+        creator_did: &str,
+        custody: Arc<CallbackKeyCustody>,
+        signing_key: KeyHandle,
+    ) -> Arc<ContextHandle> {
+        Arc::new(ContextHandle {
+            context_id: context_id.to_owned(),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: creator_did.to_owned(),
+            #[cfg(feature = "testing")]
+            in_memory_custody: None,
+            callback_custody: Some(custody),
+            signing_key: Some(signing_key),
+            ceiling_strings: scp_core::context::roles::default_ceiling()
+                .to_ucan_string_set()
+                .into_iter()
+                .collect(),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id: scp.instance_id(),
+        })
+    }
+
+    /// A handle whose custody belongs to another principal, as a Welcome
+    /// joiner's handle does, still yields a token signed by the context
+    /// creator's key from this instance's identity registry. A mint that
+    /// signed with the handle's custody would produce a signature that only
+    /// the joiner's key verifies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_signs_with_the_registry_creator_key_not_the_handle_custody() {
+        let scp = scp_test();
+        let (creator_handle, creator_key) =
+            callback_context_handle(&scp, CALLBACK_SUPERVISOR_CEILING).await;
+        let (joiner_custody, joiner_signing_key, joiner_key) =
+            unregistered_callback_custody().await;
+        let joined_handle = handle_carrying_custody(
+            &scp,
+            &creator_handle.context_id,
+            &creator_handle.creator_did,
+            joiner_custody,
+            joiner_signing_key,
+        );
+
+        let token = ucan_mint_impl(
+            Arc::clone(&scp.inner),
+            joined_handle,
+            "did:dht:z6MkCallbackMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint for a context whose creator this instance hosts must succeed");
+
+        assert_encoded_ucan_signature_verifies(&token.encoded, &creator_key);
+        let (signing_input, sig_b64) = token
+            .encoded
+            .rsplit_once('.')
+            .expect("encoded UCAN has a signature segment");
+        let sig_bytes = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(sig_b64)
+                .expect("signature segment is base64url")
+        };
+        let sig =
+            ed25519_dalek::Signature::from_slice(&sig_bytes).expect("token signature is 64 bytes");
+        assert!(
+            ed25519_dalek::Verifier::verify(&joiner_key, signing_input.as_bytes(), &sig).is_err(),
+            "the token must not carry the handle custody's signature"
+        );
+    }
+
+    /// A handle that carries custody does not let a mint proceed when this
+    /// instance's identity registry holds no entry for the live context
+    /// creator: the mint refuses with SCP-IDENT-1017 instead of signing with
+    /// the handle's key under the creator's issuer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_refuses_handle_custody_when_the_registry_lacks_the_creator() {
+        let scp = scp_test();
+        let context_id = format!("ctx-handle-custody-{}", scp.instance_id());
+        let creator_did = "did:dht:z6MkUnhostedCreator";
+        register_supervisor_context(&scp, &context_id, creator_did, CALLBACK_SUPERVISOR_CEILING)
+            .await;
+        let (custody, signing_key, _key) = unregistered_callback_custody().await;
+        let handle = handle_carrying_custody(&scp, &context_id, creator_did, custody, signing_key);
+
+        let err = ucan_mint_impl(
+            Arc::clone(&scp.inner),
+            handle,
+            "did:dht:z6MkCallbackMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect_err("a mint must not sign with the handle's custody");
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains(codes::IDENT_1017),
+            "expected SCP-IDENT-1017, got: {err_str}"
+        );
     }
 
     /// Verifies that a JWT-encoded UCAN's detached Ed25519 signature (the final
@@ -25523,14 +25657,8 @@ mod tests {
     //
     // A context handle / identity that retains no custody (externally loaded:
     // `in_memory_custody`, `signing_key`, `callback_custody` all `None`) must
-    // reject UCAN mint and event-log checkpoint with a canonical
-    // missing-signing-custody code — not an overloaded permission/nonce code.
-    //
-    // UCAN delegate sits outside this group: it signs with its own delegator's
-    // key, which it reads from an identity custody registry and never from a
-    // context handle, so its fail-closed code is a registry-miss
-    // `SCP-IDENT-1001` that PyO3 and napi also return (see
-    // `ucan_delegate_unregistered_delegator_returns_ident_1001`).
+    // reject event-log checkpoint with a canonical missing-signing-custody
+    // code — not an overloaded permission/nonce code.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_without_retained_custody_returns_ident_1017() {
