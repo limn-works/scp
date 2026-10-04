@@ -98,8 +98,9 @@ pub use group::{
 };
 pub use lifetime::{
     KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,
-    KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS, key_package_lifetime,
-    validate_key_package_lifetime, validate_key_package_lifetime_for_add,
+    KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS,
+    KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS, key_package_lifetime, validate_key_package_lifetime,
+    validate_key_package_lifetime_for_add,
 };
 pub use openmls_basic_credential::SignatureKeyPair;
 // The snapshot STRUCTS (`MlsGroupSnapshot`, `PendingJoinSnapshot`) are NOT
