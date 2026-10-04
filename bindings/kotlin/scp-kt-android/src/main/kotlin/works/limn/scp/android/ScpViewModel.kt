@@ -91,11 +91,9 @@ abstract class ScpViewModel : ViewModel() {
     private var cleared = false
 
     // [launchLeave] starts each cleanup coroutine undispatched on the thread that calls
-    // [onCleared] or [trackContext], and `Dispatchers.Unconfined` keeps it there only until
-    // the first `leave` suspends into the bridge's I/O dispatcher, so the launching call
-    // returns without waiting on an FFI call when that dispatcher dispatches. An inline one
-    // runs every `leave` before the launching call returns unless the coroutine suspends on
-    // [cleanupFailureLock], which another cleanup coroutine's [onCleanupFailure] call can hold.
+    // [onCleared] or [trackContext]. An inline bridge I/O dispatcher runs every `leave` before
+    // the launching call returns unless the coroutine suspends on [cleanupFailureLock], which
+    // another cleanup coroutine's [onCleanupFailure] call can hold.
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
 
     // Serializes [onCleanupFailure] across every cleanup coroutine: [onCleared] launches one

@@ -295,8 +295,8 @@ class ScpViewModelTest {
         val firstLeave = stubBindings.holdLeave(1L)
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
         viewModel.callOnCleared()
-        // callOnCleared returned while the first leave was held on an IO thread, so the
-        // cleanup coroutine has suspended and that leave's failure resumes it on the IO thread.
+        // The first leave cannot finish until this latch opens, so callOnCleared returned with
+        // the cleanup coroutine suspended and that leave's failure resumes it on the IO thread.
         firstLeave.countDown()
         assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
 
@@ -339,8 +339,8 @@ class ScpViewModelTest {
         val firstLeave = stubBindings.holdLeave(1L)
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
         viewModel.callOnCleared()
-        // callOnCleared returned while the first leave was held on an IO thread, so the
-        // cleanup coroutine has suspended and that leave's failure resumes it on the IO thread.
+        // The first leave cannot finish until this latch opens, so callOnCleared returned with
+        // the cleanup coroutine suspended and that leave's failure resumes it on the IO thread.
         firstLeave.countDown()
         assertTrue(viewModel.firstEntered.await(5, TimeUnit.SECONDS), "first failure never arrived")
 
@@ -394,8 +394,8 @@ class ScpViewModelTest {
         viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = ioBridge))
 
         viewModel.callOnCleared()
-        // callOnCleared returned while the first leave was held on an IO thread, so the
-        // cleanup coroutine has suspended and that leave's failure resumes it on the IO thread.
+        // The first leave cannot finish until this latch opens, so callOnCleared returned with
+        // the cleanup coroutine suspended and that leave's failure resumes it on the IO thread.
         firstLeave.countDown()
         assertTrue(viewModel.bothDone.await(5, TimeUnit.SECONDS), "both failures never arrived")
 
