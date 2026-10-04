@@ -1,8 +1,11 @@
 // PlatformAdapter.kt — Android platform adapter factory (ADR-027)
 //
 // Assembles all four Android platform providers (KeyCustody, DeviceAttestation,
-// PushProvider, Storage) into a single adapter object. Called by the Kotlin SDK's
-// SCP.create() when custody = "platform".
+// PushProvider, Storage) into a single adapter object. No code in the Kotlin SDKs calls
+// the factory, and no code passes the adapter to the Rust engine. ADR-027 requires the Kotlin
+// SDK's `SCP.create()` to call the factory and inject the four providers into the Rust engine
+// as UniFFI callback interfaces (ADR-021, the UniFFI bridge), so the shipped factory diverges
+// from both ADRs; story SCP-214 tracks injecting a key custody provider.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer).
 
@@ -13,14 +16,30 @@ import android.content.Context
 /**
  * Assembled Android platform adapter holding all four provider implementations.
  *
- * Created by [AndroidPlatformAdapter.make] and passed to the Rust engine via
- * UniFFI at SDK initialization time. Each provider implements the corresponding
- * UniFFI callback interface defined in `crates/scp-ffi/uniffi/src/bridge.rs`.
+ * Created by [AndroidPlatformAdapter.make]. Each provider implements a Kotlin interface in
+ * `Types.kt`, and each interface's KDoc states how it differs from the Rust trait and from the
+ * UniFFI callback interface in `crates/scp-ffi/uniffi/src/lib.rs`. No code passes this
+ * adapter to the Rust engine yet. The UniFFI bridge has no function that accepts a storage,
+ * push or device attestation provider, and `SCP.identityCreateWithCustody` in `scp-kt`
+ * accepts only the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody]
+ * does not implement.
  *
- * @property keyCustody Android Keystore key management (TEE-backed Ed25519 on API 33+).
- * @property deviceAttestation Play Integrity Standard API device attestation.
- * @property push Firebase Cloud Messaging with opaque data-only payloads.
- * @property storage SQLCipher encrypted storage with TEE-derived AES-256 key.
+ * @property keyCustody Android Keystore and Bouncy Castle key management (Keystore-held Ed25519
+ *   on API 33+ today, reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel`
+ *   check; on API 26-32 a Bouncy Castle software Ed25519 key in process memory, whose seed
+ *   [AndroidKeyCustody] writes to EncryptedSharedPreferences and
+ *   [KeyCustodyProvider.exportSigningKeyBytes] returns; and in-memory software X25519 key
+ *   agreement at every API level; ADR-027 requires a P-256 signing key in
+ *   Keystore at every supported API level and P-256 key agreement in Keystore from API 31;
+ *   story SCP-110 tracks both moves).
+ * @property deviceAttestation Play Integrity device attestation, which requests a Classic
+ *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
+ * @property push Firebase Cloud Messaging; checks only the `scp` wake field of a data-only
+ *   payload and returns the same [WakeSignal.PULL] whatever other fields it carries. §10.7
+ *   opacity binds the sender (§10.7.1 step 5), and no code in this repository sends a push, so
+ *   SCP-112's opacity criterion is unmet.
+ * @property storage SQLCipher encrypted storage whose 32-byte passphrase is derived from a
+ *   Keystore-held AES-256 key; SQLCipher derives the database key from that passphrase.
  */
 data class AndroidPlatformAdapterImpl(
     val keyCustody: KeyCustodyProvider,
@@ -34,26 +53,43 @@ data class AndroidPlatformAdapterImpl(
  *
  * Assembles the four platform providers ([AndroidKeyCustody],
  * [AndroidDeviceAttestation], [AndroidPushProvider], [AndroidStorage]) using
- * the provided Android [Context]. The returned [AndroidPlatformAdapterImpl] is
- * passed to `NativeLib.scpCreate()` to inject platform capabilities into the
- * Rust engine.
- *
- * ## Usage
- *
- * ```kotlin
- * val adapter = AndroidPlatformAdapter.make(applicationContext)
- * val scp = NativeLib.scpCreate(adapter)
- * ```
+ * the provided Android [Context]. No code passes the returned
+ * [AndroidPlatformAdapterImpl] to the Rust engine: the UniFFI bridge has no function that
+ * accepts a storage, push or device attestation provider, and `SCP.identityCreateWithCustody`
+ * in `scp-kt` takes the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which the Kotlin
+ * [KeyCustodyProvider] in `Types.kt` is not.
  *
  * ## Provider construction
  *
- * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access (#119).
+ * - [AndroidKeyCustody] requires context for EncryptedSharedPreferences access.
  * - [AndroidDeviceAttestation] requires context for Play Integrity API access.
  * - [AndroidPushProvider] takes a context because ADR-027's reference code declares
- *   `AndroidPushProvider(private val context: Context)`. It reads none:
- *   `FirebaseMessaging.getInstance()` resolves an app that `FirebaseInitProvider` already
- *   initialised.
- * - [AndroidStorage] requires context for database file and Keystore access.
+ *   `AndroidPushProvider(private val context: Context)`. It does not read it; FCM token
+ *   retrieval goes through `FirebaseMessaging.getInstance()`, which needs the default FirebaseApp initialised before
+ *   [AndroidPushProvider.register] runs (FirebaseInitProvider does this at app start when the
+ *   app carries its Firebase configuration; otherwise the caller calls
+ *   `FirebaseApp.initializeApp`).
+ * - [AndroidStorage] requires context for the database file path and the SQLCipher open helper.
+ *
+ * ## Divergence from ADR-027 acceptance criterion 12
+ *
+ * The criterion requires [make] to construct [AndroidDeviceAttestation] for each call with the
+ * `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry, and to throw
+ * [ScpException] when any provider fails to initialize (for example, Play Integrity
+ * unavailable or FCM not configured). [make] does neither. It calls the four constructors once,
+ * passes no `cloudProjectNumber`, and probes no provider:
+ *
+ * - [AndroidKeyCustody]'s constructor gets or creates the Keystore master key, opens
+ *   EncryptedSharedPreferences, and restores every persisted software Ed25519 seed from it.
+ *   An exception from any of the three reaches the caller as thrown, not wrapped in
+ *   [ScpException]. The restore decrypts every entry of the file and Base64-decodes each
+ *   seed, so a file the master key no longer decrypts, such as after a backup restore, or a
+ *   seed that is not valid Base64 makes [make] throw.
+ * - [AndroidDeviceAttestation] creates its `IntegrityManager` inside each
+ *   [AndroidDeviceAttestation.attest] call, so an absent Play Integrity service surfaces at
+ *   that call.
+ * - [AndroidPushProvider] does not touch Firebase until [AndroidPushProvider.register].
+ * - [AndroidStorage] opens its database on its first method call.
  *
  * See ADR-027 in `.docs/adrs/phase-6.md` for the full design rationale.
  */
@@ -64,7 +100,9 @@ object AndroidPlatformAdapter {
      *
      * @param context Android application context. Must be an application context
      *   (not an activity context) to avoid memory leaks from long-lived references.
-     * @return [AndroidPlatformAdapterImpl] with all four providers initialized.
+     * @return [AndroidPlatformAdapterImpl] holding the four constructed providers. [make] adds
+     *   no check of its own, so a missing Play Integrity service, an unconfigured Firebase or
+     *   an unopenable database surfaces at the first call that needs it, not here.
      */
     fun make(context: Context): AndroidPlatformAdapterImpl {
         return AndroidPlatformAdapterImpl(
