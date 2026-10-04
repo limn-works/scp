@@ -61,11 +61,14 @@
 //!   `validate_with_time` with a caller's time, so its own check inside
 //!   `KeyPackageIn::validate` and `process_message` still reads `web_time`'s
 //!   `Date.now()`. On the add path SCP's check against this module's clock
-//!   also runs, so there openmls's clock can only add rejections. On the
-//!   receive path openmls's check is the only clock check; the adder's minimum
-//!   remaining lifetime keeps it from refusing an add-Commit a relay delivers
-//!   within its retention, and a page script that overrides `Date.now()` can
-//!   make an honest commit fail but cannot get a forged `Lifetime` accepted.
+//!   also runs, so there openmls's clock can only add rejections, and a page
+//!   script that overrides `Date.now()` cannot get a forged `Lifetime`
+//!   accepted on an add. On the receive path SCP's verdict is the range
+//!   check, which reads no clock; openmls's own check is the only clock check
+//!   there, so a `Date.now()` override can only add rejections and can make an
+//!   honest add-Commit fail. The adder's minimum remaining lifetime keeps
+//!   openmls's check from refusing an add-Commit a relay delivers within its
+//!   retention.
 //!   Page same-origin integrity (CSP/SRI/COOP/COEP) stays load-bearing for
 //!   every `Lifetime` decision, because a script that runs before this module
 //!   initializes shifts the captured clock too. The residual closes when
