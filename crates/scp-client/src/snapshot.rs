@@ -72,7 +72,10 @@
 //! field holding key material or decrypted plaintext has a type that wipes on
 //! drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so a snapshot wipes
 //! those fields when it drops. Buffers that serde and `rmp_serde` allocate and
-//! free while decoding a snapshot are not wiped.
+//! free while decoding a snapshot are wiped as they are freed by the wiping
+//! global allocator every shipped artifact installs (security model spec §9.15,
+//! freed heap memory), and by nothing in an application that links this crate
+//! without `scp-alloc`.
 
 use std::collections::{HashMap, VecDeque};
 

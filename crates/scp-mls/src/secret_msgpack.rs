@@ -2,20 +2,24 @@
 //!
 //! `rmp_serde::to_vec_named` starts from an empty `Vec` and grows it by
 //! reallocation, and every buffer it abandons on the way is freed holding a
-//! prefix of the encoding without being wiped. For a value that carries a
-//! private key (the MLS signer, or a snapshot holding it and the provider's
-//! HPKE and epoch secrets) those freed buffers are unwiped key copies, which
-//! the local destruction of MLS state in security model spec §9.15 step 2 does
-//! not allow. [`encode_named`] measures the encoding first, writes it once
-//! into a buffer allocated at that exact size, and returns it in
-//! [`Zeroizing`], so exactly one buffer ever holds the bytes and it is wiped
-//! when dropped.
+//! prefix of the encoding. In a shipped SCP artifact the wiping global
+//! allocator zeroes each such buffer as it is freed (security model spec
+//! §9.15, freed heap memory). In a Rust application that links this crate
+//! without `scp-alloc` nothing does, and for a value that carries a private
+//! key (the MLS signer, or a snapshot holding it and the provider's HPKE and
+//! epoch secrets) those freed buffers are unwiped key copies, which the local
+//! destruction of MLS state in §9.15 step 2 does not allow. [`encode_named`]
+//! measures the encoding first, writes it once into a buffer allocated at
+//! that exact size, and returns it in [`Zeroizing`], so exactly one buffer
+//! ever holds the bytes and it is wiped when dropped, whichever global
+//! allocator the application installs.
 //!
-//! That guarantee covers the encodings SCP performs through this function
-//! only. openmls's own `MemoryStorage`, the store inside every
+//! That one-buffer guarantee covers the encodings SCP performs through this
+//! function only. openmls's own `MemoryStorage`, the store inside every
 //! [`crate::InMemoryMlsProvider`], encodes, copies, and decodes the secrets
-//! it holds through `serde_json` and frees those copies unwiped; the
-//! [`crate::provider`] module lists that gap.
+//! it holds through `serde_json`; only the wiping global allocator wipes
+//! those copies, and the [`crate::provider`] module lists what it does not
+//! reach.
 //!
 //! # Precondition: every sequence and map has a known length
 //!
@@ -24,8 +28,9 @@
 //! `serialize_seq(None)` / `serialize_map(None)`, makes rmp-serde 1.3.1 encode
 //! that compound's elements into a private growing `Vec`
 //! (`UnknownLengthCompound`, `encode.rs:477-540`) and copy them out at the
-//! end, so that `Vec` and every buffer it outgrew are freed unwiped whatever
-//! writer the caller passes. A secret must therefore never sit inside such a
+//! end, so that `Vec` and every buffer it outgrew are freed outside the one
+//! buffer whatever writer the caller passes, and only the wiping global
+//! allocator wipes them. A secret must therefore never sit inside such a
 //! compound. The signer, `ProviderSignerDump`, the scp-runtime crypto snapshot
 //! and `ContextSnapshot`, and the scp-client persisted types derive no
 //! `flatten` and write no unknown-length compound around their secret fields.
@@ -52,7 +57,7 @@ impl std::io::Write for ByteCounter {
 ///
 /// `value` must give every sequence and map its length up front (no
 /// `#[serde(flatten)]`, no `serialize_seq(None)`); otherwise rmp-serde copies
-/// part of the encoding through its own unwiped buffer (see the module
+/// part of the encoding through its own growing buffer (see the module
 /// precondition).
 ///
 /// # Errors

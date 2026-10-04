@@ -13790,7 +13790,8 @@ impl Scp {
         // retained custody (used to sign the Phase-3 consistency checkpoint).
         // Private key never crosses FFI beyond this in-process driver call.
         // The 32-byte seed is held in `Zeroizing` so it is wiped after the
-        // driver call rather than lingering in freed memory.
+        // driver call, on the stack as well as the heap; the wiping global
+        // allocator reaches freed heap blocks only (security model spec §9.15).
         let signing_key = resolve_identity_signing_key(&identity).await?;
         let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
 

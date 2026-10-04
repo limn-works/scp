@@ -965,13 +965,14 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
     // The provider's storage holds HPKE key pairs, epoch and message secrets,
     // and key packages. Replacing the provider with a fresh empty one drops the
     // old one, and `InMemoryMlsProvider`'s `Drop` zeroizes every value present
-    // then, once. This does not reach values openmls already
-    // replaced or deleted during the group's life: `MemoryStorage` freed those
-    // unzeroized. The provider's random source (`OsRand`) keeps no seed, so no
+    // then, once. Values openmls replaced or deleted during the group's life
+    // were freed earlier, and in a shipped artifact the wiping global allocator
+    // zeroed each one as it was freed (security model spec §9.15, freed heap
+    // memory). The provider's random source (`OsRand`) keeps no seed, so no
     // generator state survives from which the secrets openmls drew through
     // `rand()` could be regenerated. HPKE encapsulation randomness is drawn
-    // through `crypto()` instead, and hpke-rs leaves its state unwiped (see the
-    // `provider` module doc).
+    // through `crypto()` instead, and hpke-rs holds that generator's state on
+    // the stack, which §9.15 lists as a limit (see the `provider` module doc).
     group.provider = InMemoryMlsProvider::default();
 
     // Mark the group as destroyed so all future operations are rejected.

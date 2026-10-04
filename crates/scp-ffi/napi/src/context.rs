@@ -3678,7 +3678,8 @@ pub(crate) async fn context_reconnect_on(
     let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     // Hold the 32-byte seed in `Zeroizing` so it is wiped after the driver
-    // call rather than lingering in freed memory.
+    // call, on the stack as well as the heap; the wiping global allocator
+    // reaches freed heap blocks only (security model spec §9.15).
     let signing_key_bytes = zeroize::Zeroizing::new(sk.to_bytes());
 
     let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(

@@ -378,8 +378,9 @@ impl ContextExport {
 /// A `Full` export carries the context's access keys, and a snapshot handed
 /// in with `mls_crypto_state` set carries the MLS signer, so the encoding is
 /// written once into an exactly-sized buffer
-/// ([`scp_mls::secret_msgpack::encode_named`]) and no outgrown buffer is
-/// freed unwiped. The bytes equal `rmp_serde::to_vec_named`'s. The returned
+/// ([`scp_mls::secret_msgpack::encode_named`]) and no outgrown buffer holding
+/// them is ever freed (security model spec §9.15, freed heap memory). The
+/// bytes equal `rmp_serde::to_vec_named`'s. The returned
 /// `Vec` is that buffer, moved out without a copy, for the bridge to hand to
 /// the host.
 pub fn serialize_export(export: &ContextExport) -> Result<Vec<u8>, ContextError> {

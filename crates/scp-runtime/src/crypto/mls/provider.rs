@@ -102,7 +102,9 @@ use scp_protocol::crypto::sender_keys::{
 /// type that wipes on drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so
 /// the intermediate `MlsCryptoSnapshot` wipes those fields when it drops on an
 /// export or restore path, early returns included. Buffers that serde
-/// allocates and frees while decoding the blob are not wiped. `Zeroizing`'s
+/// allocates and frees while decoding the blob are wiped as they are freed by
+/// the wiping global allocator every shipped artifact installs (security model
+/// spec §9.15, freed heap memory). `Zeroizing`'s
 /// serde impls delegate to the inner value, so the encoding is that of the
 /// plain fields.
 // ADR-049 PR-7 (crypto-state move, prep A): visibility elevated from private to
@@ -1121,7 +1123,8 @@ impl NodeMlsFactory {
         // Take the local_sender_key and leave a zeroed placeholder. SenderKey
         // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot
         // drops, and the original is moved into crypto_state. Stack copies the
-        // move makes are not wiped.
+        // move makes are not wiped; security model spec §9.15 (freed heap
+        // memory) lists stack copies as a limit.
         let local_sender_key = std::mem::replace(
             &mut snapshot.local_sender_key,
             SenderKey::from_bytes([0u8; 32]),
