@@ -4378,9 +4378,18 @@ pub fn identity_verify_link_attestation(
 ///
 /// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
 /// or `outlet_call:*` capability. Extracted to keep `outlet_invoke` focused.
+///
+/// ADR-016 step 8 compares the token's grants against the ceiling in
+/// `role_state`, and the chain check anchors on `role_state.creator_did`. The
+/// caller passes the role state that
+/// [`UniffiBridgeInstance::require_active_context_before_authz`](crate::runtime::UniffiBridgeInstance::require_active_context_before_authz)
+/// returned, so both come from the supervisor actor. The per-context UCAN
+/// state supplies only the revocation list and the nonce tracker.
+#[allow(clippy::too_many_arguments)] // The outlet entry points' UCAN inputs, plus the gate's role state.
 pub(crate) fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
+    role_state: &scp_core::context::roles::ContextRoleState,
     outlet_id: &str,
     kind: scp_core::context::outlets::OutletKind,
     ucan_token: &str,
@@ -4405,6 +4414,7 @@ pub(crate) fn validate_outlet_ucan_uniffi(
         }
     }
     let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
     // Ensure UCAN state is registered for this context on the caller's instance.
     bi.ensure_ucan_registered(
@@ -4428,8 +4438,8 @@ pub(crate) fn validate_outlet_ucan_uniffi(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &ucan_state.ceiling_strings,
-            context_creator_did: &ucan_state.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
@@ -5315,6 +5325,12 @@ impl McpUniFfiBridgeProvider {
             })?
         };
 
+        // ADR-016 step 8 compares the token's grants against the ceiling in
+        // `role_state`, and the chain check anchors on its `creator_did`. The
+        // caller read `role_state` from the actor, so neither comes from the
+        // per-context UCAN state, which supplies only the revocation list and
+        // the nonce tracker.
+        let ceiling_strings = role_state.ceiling().to_ucan_string_set();
         let agent_did = self.agent_did.clone();
         bi.with_ucan_state(context_id, |ucan_state| {
             let production_resolver = bi.did_resolver();
@@ -5333,8 +5349,8 @@ impl McpUniFfiBridgeProvider {
                 nonce_tracker: &mut nonce_adapter,
                 revocation_checker: &revocation_checker,
                 proof_resolver: &proof_resolver,
-                ceiling: &ucan_state.ceiling_strings,
-                context_creator_did: &ucan_state.creator_did,
+                ceiling: &ceiling_strings,
+                context_creator_did: &role_state.creator_did,
                 presenting_agent_did: &agent_did,
                 clock_skew_tolerance_secs:
                     scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -13915,22 +13931,10 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_outlet_name(&definition.name)?;
-
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot register outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::OUTLET_6003.to_owned(),
-                    });
-                }
-                drop(state);
 
                 let input_schema: serde_json::Value =
                     serde_json::from_str(&definition.input_schema_json).map_err(|e| {
@@ -13968,13 +13972,16 @@ impl Scp {
                 let test_vectors: Vec<scp_core::context::outlets::OutletTestVector> =
                     match definition.test_vectors_json.as_deref() {
                         None => Vec::new(),
-                        Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
-                            msg: format!("invalid test_vectors_json: {e}"),
-                            code: codes::VALID_7037.to_owned(),
-                        })?,
+                        Some(json) => {
+                            serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                                msg: format!("invalid test_vectors_json: {e}"),
+                                code: codes::VALID_7037.to_owned(),
+                            })?
+                        }
                     };
 
-                let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
+                let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref()
+                {
                     None => [0u8; 32],
                     Some(bytes) => scp_ffi_common::validate::expect_fixed_bytes::<32>(
                         bytes,
@@ -13986,18 +13993,38 @@ impl Scp {
                     })?,
                 };
 
-                let outlet_id = format!("outlet-{}", definition.name.replace(' ', "-").to_lowercase());
+                let outlet_id = format!(
+                    "outlet-{}",
+                    definition.name.replace(' ', "-").to_lowercase()
+                );
 
-                let cost = definition.cost.map(|c| scp_core::context::outlets::OutletCost {
-                    // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
-                    // carries it as a native `u64` (Swift `UInt64` / Kotlin
-                    // `ULong`), which represents the full smallest-unit range
-                    // exactly.
-                    amount: scp_core::economy::Amount(c.amount),
-                    currency: c.currency,
-                    payee: c.payee.into(),
-                    cost_formula: c.cost_formula,
-                });
+                let cost = definition
+                    .cost
+                    .map(|c| scp_core::context::outlets::OutletCost {
+                        // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
+                        // carries it as a native `u64` (Swift `UInt64` / Kotlin
+                        // `ULong`), which represents the full smallest-unit range
+                        // exactly.
+                        amount: scp_core::economy::Amount(c.amount),
+                        currency: c.currency,
+                        payee: c.payee.into(),
+                        cost_formula: c.cost_formula,
+                    });
+
+                // The input checks above refuse a malformed definition before
+                // the lifecycle gate. The gate asks the supervisor actor, never
+                // the handle's cached state, and returns the role state the
+                // capability check below reads.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "register outlet in context",
+                        |msg| ScpError::Outlet {
+                            msg,
+                            code: codes::OUTLET_6003.to_owned(),
+                        },
+                    )
+                    .await?;
 
                 let core_registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id,
@@ -14020,26 +14047,20 @@ impl Scp {
                     signature: Vec::new(),
                 };
 
-                // Build a role state for capability checking.
-                let ceiling = scp_core::context::roles::default_ceiling();
-                let role_state = scp_core::context::roles::ContextRoleState::new(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    ceiling,
-                    vec![],
-                    &scp_clock::SystemClock,
-                )
-                .map_err(|e| ScpError::Outlet {
-                    msg: format!("failed to create role state: {e}"),
-                    code: codes::OUTLET_6003.to_owned(),
-                })?;
-
-                let mut registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // The capability check reads the supervisor's role state:
+                // its membership, roles, and ceiling. It asks whether the
+                // context creator (`role_state.creator_did`) holds the
+                // capability, because this entry point receives no caller
+                // identity.
+                let mut registry = handle
+                    .outlet_registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (registered_id, _event) = scp_core::context::outlets::register_outlet(
                     &mut registry,
                     &role_state,
                     core_registration,
-                    &handle.creator_did,
+                    &role_state.creator_did,
                 )
                 .map_err(|e| ScpError::Outlet {
                     msg: format!("outlet registration failed: {e}"),
@@ -14098,24 +14119,28 @@ impl Scp {
                     validate_ucan_token(jwt)?;
                 }
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::OUTLET_6005.to_owned(),
-                    });
-                }
-                drop(state);
+                // The lifecycle gate asks the supervisor actor, never the
+                // handle's cached state, and returns the role state the UCAN
+                // check below reads.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "invoke outlet in context",
+                        |msg| ScpError::Outlet {
+                            msg,
+                            code: codes::OUTLET_6005.to_owned(),
+                        },
+                    )
+                    .await?;
 
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
                 // outlets, `outlet_call:{id}` for Action outlets.
                 let outlet_kind_for_ucan = {
-                    let registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let registry = handle
+                        .outlet_registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     registry
                         .get(&outlet_id)
                         .map(|r| r.kind)
@@ -14135,6 +14160,7 @@ impl Scp {
                 validate_outlet_ucan_uniffi(
                     &bi,
                     &handle,
+                    &role_state,
                     &outlet_id,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -14168,9 +14194,7 @@ impl Scp {
                 let invocation_ucan_token =
                     scp_core::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
                         ScpError::Permission {
-                            msg: format!(
-                                "invalid invocation UCAN for outlet '{outlet_id}': {e}"
-                            ),
+                            msg: format!("invalid invocation UCAN for outlet '{outlet_id}': {e}"),
                             code: codes::PERM_3001.to_owned(),
                         }
                     })?;
@@ -14203,11 +14227,17 @@ impl Scp {
                 // `outlet_registry` mutex is released before Phase 1 of
                 // `invoke_outlet_with_economy` acquires the manager mutex.
                 let registry = {
-                    let reg = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let reg = handle
+                        .outlet_registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     reg.clone()
                 };
                 let handler = {
-                    let handlers = handle.outlet_handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let handlers = handle
+                        .outlet_handlers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     handlers.get(&outlet_id).cloned()
                 };
 
@@ -14245,7 +14275,9 @@ impl Scp {
                             },
                             |h| {
                                 h(input).map_err(|e| {
-                                    format!("outlet handler for '{outlet_id_for_executor}' failed: {e}")
+                                    format!(
+                                        "outlet handler for '{outlet_id_for_executor}' failed: {e}"
+                                    )
                                 })
                             },
                         )
@@ -14254,7 +14286,8 @@ impl Scp {
 
                 let manager = bi.context_manager_expect()?;
                 let invoker_did_typed: scp_did::DID = identity.did.clone().into();
-                let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
+                let outlet_id_typed =
+                    scp_core::context::outlets::OutletId::from(outlet_id.as_str());
                 let outcome = manager
                     .invoke_outlet_with_economy(
                         &context_id,
@@ -14299,20 +14332,21 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot verify outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The lifecycle gate asks the supervisor actor, never the
+                // handle's cached state. Verification reads no role state, so
+                // the role state the gate returns goes unused.
+                bi.require_active_context_before_authz(
+                    &handle.context_id,
+                    "verify outlet in context",
+                    |msg| ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6007.to_owned(),
-                    });
-                }
-                drop(state);
+                    },
+                )
+                .await?;
 
                 Ok(OutletVerificationResult {
                     outlet_id,
@@ -14359,31 +14393,30 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                // Validate source context is active.
-                let source_state = source_handle.state.lock().await;
-                if !matches!(*source_state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke cross-context outlet: source context in {:?} state",
-                            *source_state
-                        ),
+                // Lifecycle gate on both axes, read from each context's
+                // supervisor actor, never the handles' cached state. The
+                // source side reads no role state, so its gate's role state
+                // goes unused; the target side's role state feeds the UCAN
+                // check below.
+                bi.require_active_context_before_authz(
+                    &source_handle.context_id,
+                    "use source context",
+                    |msg| ScpError::Outlet {
+                        msg: format!("cannot invoke cross-context outlet: {msg}"),
                         code: codes::OUTLET_6010.to_owned(),
-                    });
-                }
-                drop(source_state);
-
-                // Validate target context is active.
-                let target_state = target_handle.state.lock().await;
-                if !matches!(*target_state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke cross-context outlet: target context in {:?} state",
-                            *target_state
-                        ),
-                        code: codes::OUTLET_6011.to_owned(),
-                    });
-                }
-                drop(target_state);
+                    },
+                )
+                .await?;
+                let target_role_state = bi
+                    .require_active_context_before_authz(
+                        &target_handle.context_id,
+                        "use target context",
+                        |msg| ScpError::Outlet {
+                            msg: format!("cannot invoke cross-context outlet: {msg}"),
+                            code: codes::OUTLET_6011.to_owned(),
+                        },
+                    )
+                    .await?;
 
                 // Validate chain depth (context-configurable, default 8 per ADR-043).
                 let max_chain_depth = {
@@ -14426,6 +14459,7 @@ impl Scp {
                 validate_outlet_ucan_uniffi(
                     &bi,
                     &target_handle,
+                    &target_role_state,
                     &outlet_id,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -14579,7 +14613,10 @@ impl Scp {
     /// overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
     /// if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
     /// decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
-    /// JSON.
+    /// JSON. Returns [`ScpError::Outlet`] with `SCP-OUTLET-6010` (caller
+    /// context) or `SCP-OUTLET-6011` (target context) and the text "context is
+    /// not active" when that context's supervisor actor does not report
+    /// `Active`, when no actor serves it, or when either read fails.
     ///
     /// See spec §6.2.4 and ADR-049 §3a.
     #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
@@ -14630,6 +14667,31 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
+                // Lifecycle gate on both axes, read from each context's
+                // supervisor actor, BEFORE the caller-principal binding and
+                // the saga drive, so a context that is not `Active` is refused
+                // before the supervisor reserves anything. A missing actor
+                // fails closed. This entry point reads no role state, so the
+                // role state each gate returns goes unused.
+                bi.require_active_context_before_authz(
+                    &caller_context_id,
+                    "use caller context",
+                    |msg| ScpError::Outlet {
+                        msg: format!("cannot start cross-context saga: {msg}"),
+                        code: codes::OUTLET_6010.to_owned(),
+                    },
+                )
+                .await?;
+                bi.require_active_context_before_authz(
+                    &target_context_id,
+                    "use target context",
+                    |msg| ScpError::Outlet {
+                        msg: format!("cannot start cross-context saga: {msg}"),
+                        code: codes::OUTLET_6011.to_owned(),
+                    },
+                )
+                .await?;
+
                 // Caller-principal binding (§6.2.4 *Caller authentication*) —
                 // BEFORE the saga runs, so the supervisor never observes an
                 // unauthenticated caller. Clone the supervisor `Arc` out of the
@@ -14765,17 +14827,18 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot create session in context in {:?} state — context must be active",
-                            *state
-                        ),
+                // The lifecycle gate asks the supervisor actor, never the
+                // handle's cached state. Session creation reads no role
+                // state, so the role state the gate returns goes unused.
+                bi.require_active_context_before_authz(
+                    &handle.context_id,
+                    "create session in context",
+                    |msg| ScpError::Outlet {
+                        msg,
                         code: codes::OUTLET_6014.to_owned(),
-                    });
-                }
-                drop(state);
+                    },
+                )
+                .await?;
 
                 let mut store = handle.session_store.lock().await;
 
@@ -14845,17 +14908,19 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke session in context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::OUTLET_6017.to_owned(),
-                    });
-                }
-                drop(state);
+                // The lifecycle gate asks the supervisor actor, never the
+                // handle's cached state, and returns the role state the UCAN
+                // check below reads.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "invoke session in context",
+                        |msg| ScpError::Outlet {
+                            msg,
+                            code: codes::OUTLET_6017.to_owned(),
+                        },
+                    )
+                    .await?;
 
                 // Look up outlet_id from session for UCAN validation.
                 let outlet_id_for_ucan = {
@@ -14870,7 +14935,10 @@ impl Scp {
                 // SCP-OUT-014: select the split capability stem from the
                 // session outlet's registered kind.
                 let outlet_kind_for_ucan = {
-                    let registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let registry = handle
+                        .outlet_registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     registry
                         .get(&outlet_id_for_ucan)
                         .map(|r| r.kind)
@@ -14888,6 +14956,7 @@ impl Scp {
                 validate_outlet_ucan_uniffi(
                     &bi,
                     &handle,
+                    &role_state,
                     &outlet_id_for_ucan,
                     outlet_kind_for_ucan,
                     &ucan_token,
@@ -14997,6 +15066,11 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// Carries no lifecycle gate. It releases one session entry the handle
+    /// itself owns and decides no authorization question, and refusing that
+    /// release in a `Closing` or `Expired` context would strand the entry until
+    /// the handle drops.
     pub async fn outlet_session_close(
         &self,
         handle: Arc<ContextHandle>,
@@ -15039,21 +15113,24 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_outlet_id(&outlet_id)?;
 
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot expose outlet interface in context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::OUTLET_6030.to_owned(),
-                    });
-                }
-                drop(state);
+                // The lifecycle gate asks the supervisor actor, never the
+                // handle's cached state, and returns the role state the
+                // capability check below reads.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "expose outlet interface in context",
+                        |msg| ScpError::Outlet {
+                            msg,
+                            code: codes::OUTLET_6030.to_owned(),
+                        },
+                    )
+                    .await?;
 
                 let rate_limit = match rate_limit_json {
                     Some(ref json) => {
@@ -15067,32 +15144,26 @@ impl Scp {
                     None => None,
                 };
 
-                let ceiling = scp_core::context::roles::default_ceiling();
-                let role_state = scp_core::context::roles::ContextRoleState::new(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    ceiling,
-                    vec![],
-                    &scp_clock::SystemClock,
-                )
-                .map_err(|e| ScpError::Outlet {
-                    msg: format!("failed to create role state: {e}"),
-                    code: codes::OUTLET_6030.to_owned(),
-                })?;
-
                 let context_handle = scp_core::context::ContextHandle::new(
                     handle.context_id.clone(),
                     scp_core::context::ContextParams::default(),
                 );
 
-                let registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let registry = handle
+                    .outlet_registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+                // The capability check reads the supervisor's role state. It
+                // asks whether the context creator (`role_state.creator_did`)
+                // holds the capability, because this entry point receives no
+                // caller identity.
                 let interface = scp_core::context::outlets::interface::expose_outlet(
                     context_handle.context_id(),
                     &outlet_id,
                     &target_context_id,
                     &role_state,
-                    &handle.creator_did,
+                    &role_state.creator_did,
                     &registry,
                     rate_limit,
                     None,
@@ -15127,19 +15198,22 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot accept outlet interface in context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::OUTLET_6032.to_owned(),
-                    });
-                }
-                drop(state);
+                // The lifecycle gate asks the supervisor actor, never the
+                // handle's cached state, and returns the role state the
+                // capability check below reads.
+                let role_state = bi
+                    .require_active_context_before_authz(
+                        &handle.context_id,
+                        "accept outlet interface in context",
+                        |msg| ScpError::Outlet {
+                            msg,
+                            code: codes::OUTLET_6032.to_owned(),
+                        },
+                    )
+                    .await?;
 
                 let mut interface: scp_core::context::outlets::interface::OutletInterface =
                     serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
@@ -15147,29 +15221,20 @@ impl Scp {
                         code: codes::VALID_7041.to_owned(),
                     })?;
 
-                let ceiling = scp_core::context::roles::default_ceiling();
-                let role_state = scp_core::context::roles::ContextRoleState::new(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    ceiling,
-                    vec![],
-                    &scp_clock::SystemClock,
-                )
-                .map_err(|e| ScpError::Outlet {
-                    msg: format!("failed to create role state: {e}"),
-                    code: codes::OUTLET_6032.to_owned(),
-                })?;
-
                 let context_handle = scp_core::context::ContextHandle::new(
                     handle.context_id.clone(),
                     scp_core::context::ContextParams::default(),
                 );
 
+                // The capability check reads the supervisor's role state. It
+                // asks whether the context creator (`role_state.creator_did`)
+                // holds the capability, because this entry point receives no
+                // caller identity.
                 scp_core::context::outlets::interface::accept_outlet_interface(
                     context_handle.context_id(),
                     &mut interface,
                     &role_state,
-                    &handle.creator_did,
+                    &role_state.creator_did,
                     None,
                 )
                 .map_err(|e| ScpError::Outlet {
@@ -15193,6 +15258,12 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// Carries no lifecycle gate. It reads no context state and grants
+    /// nothing: it builds an `InterfaceRevoked` event from the interface id and
+    /// the clock and hands it back for the caller to distribute, so a gate
+    /// would deny a member the record of a revocation without withholding any
+    /// capability.
     pub async fn outlet_interface_revoke(
         &self,
         handle: Arc<ContextHandle>,
@@ -20714,6 +20785,269 @@ mod tests {
         );
     }
 
+    /// The cross-context outlet entry points gate both contexts on the
+    /// supervisor actor, and each refusal withholds the lifecycle state.
+    ///
+    /// `outlet_invoke_cross_context` compared `handle.state`, the cached
+    /// snapshot that still reads `Active` after the supervisor despawns the
+    /// actor, so it admitted an invocation into a context the supervisor had
+    /// stopped serving. `outlet_invoke_cross_context_saga` carried no lifecycle
+    /// gate at all. The test drives one axis through each entry point, so the
+    /// code the refusal carries identifies which read refused.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn cross_context_outlet_gates_read_the_supervisor_not_the_cached_handle_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let live = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed for the live context");
+        let dead = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed for the despawned context");
+
+        // A TTL expiry despawns the actor on the supervisor's own timer. The
+        // handle's cached state still reads `Active` afterwards.
+        rt.block_on(async {
+            scp.inner
+                .context_manager_or_error()
+                .expect("supervisor")
+                .despawn_actor(&dead.context_id())
+                .await
+        });
+        assert!(matches!(
+            *rt.block_on(dead.state.lock()),
+            ContextState::Active
+        ));
+
+        // Target axis, unary entry point: the source is live, so the code names
+        // which of the two reads refused.
+        let unary = rt
+            .block_on(scp.outlet_invoke_cross_context(
+                Arc::clone(&live),
+                Arc::clone(&dead),
+                "probe-outlet".to_owned(),
+                "{}".to_owned(),
+                Arc::clone(&identity),
+                "not-a-real-token".to_owned(),
+                1,
+                None,
+            ))
+            .expect_err("a target context no actor serves must refuse the unary invocation");
+        match unary {
+            ScpError::Outlet { ref code, ref msg } => {
+                assert_eq!(code, codes::OUTLET_6011, "unary refusal reported: {msg}");
+                assert!(
+                    msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+                    "unary refusal must come from the lifecycle gate: {msg}"
+                );
+                assert!(
+                    !msg.contains(&dead.context_id()),
+                    "unary refusal must withhold the context id: {msg}"
+                );
+            }
+            other => panic!("unary refusal must be an Outlet error, got: {other:?}"),
+        }
+
+        // Caller axis, saga entry point.
+        let saga = rt
+            .block_on(scp.outlet_invoke_cross_context_saga(
+                Arc::clone(&dead),
+                Arc::clone(&live),
+                identity.did(),
+                "probe-outlet".to_owned(),
+                "{}".to_owned(),
+                "000102030405060708090a0b0c0d0e0f".to_owned(),
+                1,
+                1,
+                None,
+            ))
+            .expect_err("a caller context no actor serves must refuse the saga");
+        match saga {
+            ScpError::Outlet { ref code, ref msg } => {
+                assert_eq!(code, codes::OUTLET_6010, "saga refusal reported: {msg}");
+                assert!(
+                    msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+                    "saga refusal must come from the lifecycle gate: {msg}"
+                );
+                assert!(
+                    !msg.contains(&dead.context_id()),
+                    "saga refusal must withhold the context id: {msg}"
+                );
+            }
+            other => panic!("saga refusal must be an Outlet error, got: {other:?}"),
+        }
+    }
+
+    /// Each single-context outlet entry point below gates on the supervisor
+    /// actor, and its refusal withholds the lifecycle state.
+    ///
+    /// Each one previously compared `handle.state`, the cached snapshot that
+    /// still reads `Active` after the supervisor despawns the actor, so it
+    /// admitted work into a context the supervisor had stopped serving. The
+    /// gate runs before the caller is authorized, so its refusal names no
+    /// lifecycle state (the outlet PRD's SCP-OUT-031 PR-2a note). The junk UCAN
+    /// token below reaches no authorization step, and each assertion pins the
+    /// entry point's own code, so a revert of any one gate to the cached state
+    /// turns this test red.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn single_context_outlet_gates_read_the_supervisor_not_the_cached_handle_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let dead = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        rt.block_on(async {
+            scp.inner
+                .context_manager_or_error()
+                .expect("supervisor")
+                .despawn_actor(&dead.context_id())
+                .await
+        });
+        assert!(matches!(
+            *rt.block_on(dead.state.lock()),
+            ContextState::Active
+        ));
+
+        let junk_token = "not-a-real-token".to_owned();
+        let definition = OutletDefinition {
+            name: "uniffi-despawned-register-probe".to_owned(),
+            description: "a despawned-actor fixture outlet".to_owned(),
+            kind: OutletKind::Action,
+            input_schema_json: r#"{"type":"object"}"#.to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: identity.did(),
+            cost: None,
+        };
+        // A malformed definition is refused by its input check before the
+        // lifecycle gate runs.
+        let malformed = rt
+            .block_on(scp.outlet_register(
+                Arc::clone(&dead),
+                OutletDefinition {
+                    name: "uniffi-despawned-malformed-probe".to_owned(),
+                    input_schema_json: "not valid json{{{".to_owned(),
+                    ..definition.clone()
+                },
+            ))
+            .expect_err("a malformed definition must be refused");
+        assert!(
+            matches!(&malformed, ScpError::Validation { code, .. } if code == codes::VALID_7035),
+            "the input check must answer before the lifecycle gate, got {malformed:?}"
+        );
+        let refusals: Vec<(&str, &str, Result<(), ScpError>)> = vec![
+            (
+                "register",
+                codes::OUTLET_6003,
+                rt.block_on(scp.outlet_register(Arc::clone(&dead), definition))
+                    .map(drop),
+            ),
+            (
+                "invoke",
+                codes::OUTLET_6005,
+                rt.block_on(scp.outlet_invoke(
+                    Arc::clone(&dead),
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    Arc::clone(&identity),
+                    Some(junk_token.clone()),
+                    None,
+                    None,
+                ))
+                .map(drop),
+            ),
+            (
+                "stream_open",
+                codes::OUTLET_6005,
+                rt.block_on(scp.outlet_stream_open(
+                    Arc::clone(&dead),
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    identity.did(),
+                    junk_token.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .map(drop),
+            ),
+            (
+                "verify",
+                codes::OUTLET_6007,
+                rt.block_on(scp.outlet_verify(Arc::clone(&dead), "probe-outlet".to_owned()))
+                    .map(drop),
+            ),
+            (
+                "session_create",
+                codes::OUTLET_6014,
+                rt.block_on(scp.outlet_session_create(
+                    Arc::clone(&dead),
+                    "probe-outlet".to_owned(),
+                    dead.context_id(),
+                    None,
+                ))
+                .map(drop),
+            ),
+            (
+                "session_invoke",
+                codes::OUTLET_6017,
+                rt.block_on(scp.outlet_session_invoke(
+                    Arc::clone(&dead),
+                    "probe-session".to_owned(),
+                    "{}".to_owned(),
+                    Arc::clone(&identity),
+                    junk_token,
+                    None,
+                ))
+                .map(drop),
+            ),
+            (
+                "interface_expose",
+                codes::OUTLET_6030,
+                rt.block_on(scp.outlet_interface_expose(
+                    Arc::clone(&dead),
+                    "probe-outlet".to_owned(),
+                    "probe-target-context".to_owned(),
+                    None,
+                ))
+                .map(drop),
+            ),
+            (
+                "interface_accept",
+                codes::OUTLET_6032,
+                rt.block_on(scp.outlet_interface_accept(Arc::clone(&dead), "{}".to_owned()))
+                    .map(drop),
+            ),
+        ];
+        for (entry_point, expected_code, result) in refusals {
+            match result {
+                Err(ScpError::Outlet { ref code, ref msg }) => {
+                    assert_eq!(code, expected_code, "{entry_point} refusal reported: {msg}");
+                    assert!(
+                        msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+                        "{entry_point} must refuse at the lifecycle gate: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("Active") && !msg.contains(&dead.context_id()),
+                        "{entry_point} refusal must withhold the lifecycle state and the id: {msg}"
+                    );
+                }
+                other => panic!("{entry_point} must refuse with an Outlet error, got: {other:?}"),
+            }
+        }
+    }
+
     /// A context already active on this instance collides at the atomic UCAN
     /// occupy — the join fails BEFORE the single-use `KeyPackage` is consumed,
     /// leaving the pre-existing handle untouched.
@@ -23165,6 +23499,14 @@ mod tests {
     async fn registered_at_is_seconds_epoch() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
+        // `outlet_register` reads the creator's capability off the actor.
+        register_supervisor_context(
+            &scp,
+            "ctx-test",
+            "did:dht:z6MkTestUser",
+            &["outlet:register"],
+        )
+        .await;
         let def = OutletDefinition {
             name: "timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
@@ -23206,6 +23548,14 @@ mod tests {
     async fn register_query_outlet_round_trips_kind() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
+        // `outlet_register` reads the creator's capability off the actor.
+        register_supervisor_context(
+            &scp,
+            "ctx-test",
+            "did:dht:z6MkTestUser",
+            &["outlet:register"],
+        )
+        .await;
         let def = OutletDefinition {
             name: "query-probe".to_owned(),
             description: "probes kind round-trip".to_owned(),
@@ -25233,10 +25583,15 @@ mod tests {
     /// Probe records nothing, so probing first leaves the token unspent. Had
     /// `invoke_outlet` passed the Probe check, the second call would run.
     ///
-    /// The handle names the token's issuer as the context's creator, so the
-    /// UCAN step accepts the root token; the actor names the agent as the
-    /// creator holding `outlet:call:*`, so the role-state check passes.
+    /// The actor names the token's issuer as the creator, holds the agent as
+    /// an admin, and carries `outlet:call:*` in its ceiling, so the role-state
+    /// check and the UCAN step both pass. The handle's own copies name another
+    /// creator and a ceiling without `outlet:call:*`, so a UCAN step that read
+    /// either copy, or
+    /// the per-context UCAN state registered from them, would refuse the first
+    /// call.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
     async fn uniffi_invoke_outlet_records_the_token_nonce_and_refuses_its_replay() {
         use scp_platform::traits::KeyCustody as _;
         let custody = scp_platform::testing::InMemoryKeyCustody::new();
@@ -25257,10 +25612,12 @@ mod tests {
 
         let scp = scp_test();
         let bi = Arc::clone(&scp.inner);
-        bi.init_context_manager_with_did(agent);
-        bi.context_manager_or_error()
+        bi.init_context_manager_with_did(&issuer);
+        let supervisor = bi
+            .context_manager_or_error()
             .expect("supervisor must be attached")
-            .clone()
+            .clone();
+        supervisor
             .create_context(
                 "ctx-test".to_owned(),
                 scp_core::context::ContextParams {
@@ -25270,12 +25627,20 @@ mod tests {
                     ],
                     ..scp_core::context::ContextParams::default()
                 },
-                scp_did::DID(agent.to_owned()),
+                scp_did::DID(issuer.clone()),
                 None,
             )
             .await
             .expect("context creation must succeed");
-        let handle = test_handle_with(&scp, &issuer, vec!["outlet_call:*".to_owned()]);
+        supervisor
+            .test_insert_member("ctx-test", scp_did::DID(agent.to_owned()), "admin")
+            .await
+            .expect("the agent must be recorded as a member of the actor");
+        let handle = test_handle_with(
+            &scp,
+            "did:dht:z6MkStaleHandleCreator",
+            vec!["messages:read".to_owned()],
+        );
         register_context_handle(&bi, &handle);
         handle
             .outlet_registry
@@ -25931,6 +26296,7 @@ mod tests {
                         scp_core::context::roles::Capability::MessagesRead,
                         scp_core::context::roles::Capability::MessagesWrite,
                         scp_core::context::roles::Capability::OutletCallAll,
+                        scp_core::context::roles::Capability::OutletRegister,
                     ],
                     ..scp_core::context::ContextParams::default()
                 },
@@ -27614,6 +27980,52 @@ mod tests {
         (handle, verifying_key)
     }
 
+    /// `outlet_register` refuses the creator when the supervisor ceiling lacks
+    /// `outlet:register`, and admits the creator once the supervisor ceiling
+    /// carries it.
+    ///
+    /// Before the live read existed, `outlet_register` graded the registrant
+    /// against a `ContextRoleState` it built on the spot from the handle's
+    /// creator DID and `default_ceiling()`, which carries `outlet:register`, so
+    /// the narrow supervisor ceiling below changed nothing about what it
+    /// admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_register_follows_the_supervisor_ceiling_not_the_handle_ceiling() {
+        let definition = |name: &str, operator: &str| OutletDefinition {
+            name: name.to_owned(),
+            description: "a live-ceiling fixture outlet".to_owned(),
+            kind: OutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: operator.to_owned(),
+            cost: None,
+        };
+
+        let narrow_scp = scp_test();
+        let (narrow, _key) = callback_context_handle(&narrow_scp, &["messages:write"]).await;
+        let operator = narrow.creator_did.clone();
+        let err = narrow_scp
+            .outlet_register(narrow, definition("uniffi-narrow-ceiling-probe", &operator))
+            .await
+            .expect_err("a supervisor ceiling without outlet:register must refuse registration");
+        assert!(
+            err.to_string().contains("OutletRegister"),
+            "the refusal must name the missing capability: {err}"
+        );
+
+        let wide_scp = scp_test();
+        let (wide, _key) =
+            callback_context_handle(&wide_scp, &["messages:write", "outlet:register"]).await;
+        wide_scp
+            .outlet_register(wide, definition("uniffi-wide-ceiling-probe", &operator))
+            .await
+            .expect("a supervisor ceiling carrying outlet:register must admit registration");
+    }
+
     /// `ucan_mint` must work over callback custody (production path): the minted
     /// token's detached Ed25519 signature verifies against the custody's
     /// `#active` public key.
@@ -28540,6 +28952,115 @@ mod tests {
             None,
         ))
         .expect("a mint inside the moved ceiling must succeed");
+    }
+
+    /// `outlet_invoke` grades the invocation UCAN against a supervisor ceiling
+    /// that moved after this bridge registered the context.
+    ///
+    /// `context_create` records `outlet:call:*` on the actor, on the handle's
+    /// `ceiling_strings`, and in the per-context UCAN state. The test then
+    /// replaces the actor with one whose ceiling omits `outlet:call:*`, which
+    /// leaves both bridge copies as they were, so the UCAN step must refuse
+    /// the `outlet:call:*` token at ADR-016 step 8. A UCAN step that read
+    /// either copy would pass the token on to the invocation.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn outlet_invoke_follows_a_supervisor_ceiling_moved_after_registration() {
+        let rt = runtime();
+        let scp = scp_test();
+        let owner = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(
+                Arc::clone(&owner),
+                ContextParams {
+                    ceiling: vec![
+                        "messages:read".to_owned(),
+                        "outlet:register".to_owned(),
+                        "outlet:call:*".to_owned(),
+                    ],
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let outlet_id = rt
+            .block_on(scp.outlet_register(
+                Arc::clone(&handle),
+                OutletDefinition {
+                    name: "uniffi-moved-ceiling-probe".to_owned(),
+                    description: "a moved-ceiling fixture outlet".to_owned(),
+                    kind: OutletKind::Action,
+                    input_schema_json:
+                        r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                            .to_owned(),
+                    output_schema_json: r#"{"type":"object"}"#.to_owned(),
+                    test_vectors_json: None,
+                    implementation_hash: None,
+                    operator_did: owner.did(),
+                    cost: None,
+                },
+            ))
+            .expect("the registered ceiling admits outlet:register");
+        let token = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&handle),
+                holder.did(),
+                vec!["outlet:call:*".to_owned()],
+                None,
+            ))
+            .expect("a mint inside the registered ceiling must succeed")
+            .encoded();
+
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("supervisor")
+            .clone();
+        assert!(
+            rt.block_on(sup.despawn_actor(&context_id)),
+            "the context's actor must be registered before the move"
+        );
+        rt.block_on(sup.create_context(
+            context_id.clone(),
+            scp_core::context::ContextParams {
+                ceiling: vec![
+                    scp_core::context::roles::Capability::MessagesRead,
+                    scp_core::context::roles::Capability::OutletRegister,
+                ],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID(owner.did()),
+            None,
+        ))
+        .expect("the narrowed actor must spawn");
+        assert_eq!(
+            scp.inner.with_ucan_state(&context_id, |st| st
+                .ceiling_strings
+                .contains("outlet_call:*")),
+            Some(true),
+            "precondition: the registered UCAN state still carries outlet_call:*"
+        );
+
+        let err = rt
+            .block_on(scp.outlet_invoke(
+                Arc::clone(&handle),
+                outlet_id,
+                "{}".to_owned(),
+                Arc::clone(&holder),
+                Some(token),
+                None,
+                None,
+            ))
+            .expect_err("the moved supervisor ceiling must refuse the outlet:call:* token");
+        assert!(
+            err.to_string().to_lowercase().contains("ceiling"),
+            "the refusal must be the UCAN ceiling check: {err}"
+        );
     }
 
     /// `ucan_validate`, `ucan_evaluate`, and `ucan_delegate` compare a token's
