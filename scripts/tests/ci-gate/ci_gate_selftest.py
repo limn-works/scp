@@ -4599,11 +4599,13 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
 
     CRITERION: in every job, an axis of `strategy.matrix` is read when at least
     one step's `if:` reads exactly `matrix.<axis> == '<value>'`. For each axis
-    read, every value the axis lists is named by at least one such step, and
-    every value such a step names is in the axis list. A value no step names
-    runs legs that skip every gated step, and a step naming a value the axis
-    lacks never runs on any leg, so its commands run nowhere while every leg
-    passes. Another step whose `if:` mentions `matrix.<axis>` for an axis read
+    read, every value such a step names is in the axis list, and, unless the
+    job's `runs-on` reads that axis, every value the axis lists is named by at
+    least one such step. A value no step names runs legs that skip every gated
+    step, and a step naming a value the axis lacks never runs on any leg, so
+    its commands run nowhere while every leg passes. An axis `runs-on` reads
+    picks each leg's runner, so a step gated to one of its values (a macOS-only
+    install) leaves the other legs running every ungated step. Another step whose `if:` mentions `matrix.<axis>` for an axis read
     is reported rather than read, because this check could not say which legs
     run it. A matrix carrying `include` or `exclude` is reported rather than
     read, because either one can add or remove an axis value's legs while the
@@ -4677,6 +4679,8 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
                         f"matrix axis {axis_name} {axis} lacks, so its commands "
                         f"run on no leg"
                     )
+            if mention.search(str(job.get("runs-on") or "")):
+                continue
             for value in axis:
                 if value not in named:
                     gaps.append(
@@ -4689,8 +4693,7 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
 def check_matrix_axes(path: Path, doc: dict) -> None:
     gaps = matrix_axis_gaps(doc)
     check(
-        f"{path.name}: every value of a gated matrix axis has a step and every "
-        f"step's value is in its axis",
+        f"{path.name}: every gated matrix axis agrees with the steps gated on it",
         not gaps,
         "; ".join(gaps),
     )
@@ -4812,6 +4815,38 @@ def check_matrix_axis_controls(doc: dict) -> None:
         "matrix_axis_gaps passes the live ci.yml and skips an axis no step gates on",
         not matrix_axis_gaps(doc) and not matrix_axis_gaps(ungated),
         f"gaps on ci.yml or on an ungated axis: {matrix_axis_gaps(doc)}",
+    )
+
+    def one_os_gate(runs_on: str) -> dict:
+        return {
+            "jobs": {
+                "j": {
+                    "runs-on": runs_on,
+                    "strategy": {"matrix": {"os": ["ubuntu-latest", "macos-latest"]}},
+                    "steps": [{"name": "brew", "if": "matrix.os == 'macos-latest'"}],
+                }
+            }
+        }
+
+    gaps = matrix_axis_gaps(one_os_gate("${{ matrix.os }}"))
+    check(
+        "a step gated to one value of an axis runs-on reads is not reported",
+        not gaps,
+        f"a one-value gate on the runner axis was reported: {gaps}",
+    )
+    gaps = matrix_axis_gaps(one_os_gate("ubuntu-latest"))
+    check(
+        "the same gate on an axis runs-on does not read reports the unnamed value",
+        any("matrix axis os value 'ubuntu-latest' has no step" in gap for gap in gaps),
+        f"an axis value no step names went unreported: {gaps}",
+    )
+    runner_typo = one_os_gate("${{ matrix.os }}")
+    runner_typo["jobs"]["j"]["steps"][0]["if"] = "matrix.os == 'macos-lates'"
+    gaps = matrix_axis_gaps(runner_typo)
+    check(
+        "a step gated on a value the runs-on axis lacks is still reported",
+        any("names os 'macos-lates', which matrix axis" in gap for gap in gaps),
+        f"a step no leg runs went unreported on the runner axis: {gaps}",
     )
 
     no_matrix = {"jobs": {"j": {"steps": [{"name": "s", "if": "matrix.leg == 'a'"}]}}}
