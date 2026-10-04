@@ -996,9 +996,8 @@
         /// stored key and its record in place. When `keyId` is the stored key
         /// ID, remove it and its attestation record, and make any replacement
         /// key ID the stored key ID, so the next `attest` hands that key to
-        /// `attestKey` again, as `DCError.h` asks of a retry after
-        /// `DCError.serverUnavailable`. Remove nothing for any other key ID,
-        /// which keeps a key ID stored after `keyId` in place.
+        /// `attestKey` again. Remove nothing for any other key ID, which
+        /// keeps a key ID stored after `keyId` in place.
         ///
         /// Thread-safe: protected by `lock`.
         ///
