@@ -151,13 +151,10 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        // `default_ceiling()` holds every capability the tests below mint,
-        // delegate and invoke.
+        // A create must declare a non-empty ceiling (construction.md M2);
+        // `messages:read` alone grants the creator nothing these tests gate.
         let params = scp_core::context::ContextParams {
-            ceiling: scp_core::context::roles::default_ceiling()
-                .iter()
-                .cloned()
-                .collect(),
+            ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..scp_core::context::ContextParams::default()
         };
         supervisor
