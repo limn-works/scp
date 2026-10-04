@@ -1592,6 +1592,54 @@ else
     report "case 25 found at least one suite that reads this repository's workflow files" 1 "no suite .github/workflows/ci.yml starts under scripts/ matched the repository-rooted workflow read this case looks for, so the assertion above compared an empty set and could not fail"
 fi
 
+# ── Case 26: the wiping-allocator gate exits non-zero when it dies mid-run ──────────────
+#
+# THE CRITERION: a run of `scripts/check-wiping-allocator.sh` that dies before a deliberate
+# exit, from a failed command under `set -e` or an unbound variable under `set -u`, exits
+# non-zero. The run-tests harness runs that gate in case 3, so a gate that exits 0 after a
+# death turns case 3 green on a check it never finished.
+#
+# The gate cannot read the status of a death from `$?`: on bash 3.2 `$?` inside an EXIT
+# trap reads 0 after a `set -u` death. Its EXIT trap exits with `${exit_code:-1}`, and
+# every deliberate exit sets `exit_code` first, so a death leaves it empty and exits 1.
+#
+# This case puts a cargo on PATH that fails every call, and runs the real gate with no
+# argument under `/bin/bash`, which is bash 3.2 on macOS and bash 5 on the Linux runners.
+# The fixtures need no cargo and pass; the gate's `cargo metadata --no-deps` then fails,
+# and `set -e` ends the run inside `main` with `exit_code` still empty. The case asserts
+# the exit status 1, that the run got past the fixtures, that the stub cargo saw the
+# `metadata` call, and that no PASSED line was printed.
+#
+# The mutation it kills: writing `exit "${exit_code:-0}"` in the gate's `finish` makes
+# this run exit 0, and every other assertion in this file still passes.
+HARNESS26="$WORK/wiping-death"
+mkdir -p "$HARNESS26/bin"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/cargo.log"\nexit 101\n' "$HARNESS26" > "$HARNESS26/bin/cargo"
+chmod +x "$HARNESS26/bin/cargo"
+: > "$HARNESS26/cargo.log"
+WIPING26_RC=0
+PATH="$HARNESS26/bin:$PATH" /bin/bash "$REPO_ROOT/scripts/check-wiping-allocator.sh" > "$HARNESS26/out.txt" 2>&1 || WIPING26_RC=$?
+if [[ $WIPING26_RC -eq 1 ]]; then
+    report "case 26 a wiping-allocator gate run that dies at cargo metadata exits 1" 0 ""
+else
+    report "case 26 a wiping-allocator gate run that dies at cargo metadata exits 1" 1 "the gate exited $WIPING26_RC: $(tail -n 4 "$HARNESS26/out.txt")"
+fi
+if grep -qF 'FIXTURE HARNESS: all behavioral proofs passed.' "$HARNESS26/out.txt"; then
+    report "case 26 reached the gate's main past its fixtures" 0 ""
+else
+    report "case 26 reached the gate's main past its fixtures" 1 "the output holds no fixture pass line, so the run stopped somewhere else: $(tail -n 4 "$HARNESS26/out.txt")"
+fi
+if grep -q '^metadata ' "$HARNESS26/cargo.log"; then
+    report "case 26 died at the gate's cargo metadata call" 0 ""
+else
+    report "case 26 died at the gate's cargo metadata call" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS26/cargo.log")"
+fi
+if grep -qF 'PASSED:' "$HARNESS26/out.txt"; then
+    report "case 26 printed no PASSED line" 1 "the gate printed PASSED after its cargo metadata call failed"
+else
+    report "case 26 printed no PASSED line" 0 ""
+fi
+
 printf '\n'
 if [[ $FAILURES -eq 0 ]]; then
     printf 'fix-round-check tests: every case passed.\n'
