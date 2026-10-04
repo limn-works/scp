@@ -35,8 +35,7 @@ env:
 # WHAT THE TWO INPUTS DO. `shared-key` replaces the job id in the key, so the jobs that
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
-# every merge-queue run can read. Together they took this workflow from eighteen entries
-# per generation to eight, and they put those eight on the ref that every run reads.
+# every merge-queue run can read.
 # Job rust-test-optional-features later split its one group into three, one per matrix
 # group, and job rust-clippy split its one group into three, one per matrix leg, so
 # this workflow now writes twelve groups per generation.
