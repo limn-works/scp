@@ -477,7 +477,9 @@ pub enum KeyPackageCommand {
     /// integrator SHOULD simply retry `ConfirmConsume` with the SAME
     /// `reservation_id`. The retry is idempotent for the DURABLE CONSUME: the
     /// re-run inner join hits the already-written consumed-init-key marker
-    /// (`MlsError::KeyPackageReplay`), which the handler recognizes as its OWN
+    /// (`MlsError::KeyPackageReplay`, which `join_from_welcome` returns before
+    /// any lifetime check, so also once the KeyPackage has expired under
+    /// either clock), which the handler recognizes as its OWN
     /// prior completion and finishes the durable consume (delete + tombstone +
     /// cleanup). Single-use still holds across the retry, and the retry can
     /// NEVER be coerced into a second or DIFFERENT join: an alternate welcome's
@@ -505,6 +507,29 @@ pub enum KeyPackageCommand {
     /// of this reservation, so it is surfaced as `KeyPackageReplay` — never a
     /// spurious `Ok` — closing the false-success chain a re-pool could otherwise
     /// ride.
+    ///
+    /// # Errors
+    ///
+    /// A failed inner join maps through `map_join_error`, and the reservation
+    /// is kept:
+    /// - [`ContextError::KeyPackageReplay`]: the reserved KeyPackage's init
+    ///   key is already consumed and this reservation's KP record still exists,
+    ///   so the marker is not this reservation's own prior completion.
+    /// - [`ContextError::InvalidKeyPackage`]: the joiner's own reserved
+    ///   KeyPackage is not current, under the injected clock or openmls's
+    ///   clock, or its `Lifetime` range is empty, inverted or over the maximum
+    ///   (`MlsError::KeyPackageLifetimeInvalid`). Cancel the reservation, or
+    ///   retry after correcting the clock.
+    /// - [`ContextError::CryptoFailed`]: every other join failure, chiefly a
+    ///   Welcome or ratchet tree from the sender that the join rejects,
+    ///   including another member's out-of-range tree leaf
+    ///   (`MlsError::TreeLeafLifetimeRangeInvalid`). A retry with the same
+    ///   Welcome reaches the same rejection; wait for another Welcome. A
+    ///   failure to read or write the consumed-init-key store also maps here.
+    ///
+    /// Outside the join, an unknown or already-completed reservation, and an
+    /// own-prior-completion retry, are [`ContextError::InvalidState`]; a failed
+    /// KP-record or tombstone write is [`ContextError::PersistenceFailed`].
     ConfirmConsume {
         /// The reservation ID returned by [`Self::Reserve`].
         reservation_id: ReservationId,
@@ -837,20 +862,34 @@ impl KeyPackageStoreActor {
     }
 
     /// Map an [`MlsError`] from the fused join to a typed [`ContextError`].
-    /// A replay rejection (the crypto-layer consumed-init-key backstop) maps to
-    /// the dedicated [`ContextError::KeyPackageReplay`] — distinct from
-    /// [`ContextError::InvalidState`] (which also means "unknown reservation")
-    /// so a caller can detect a security-relevant single-use replay. Everything
-    /// else is a crypto failure, including a Welcome whose tree holds a
-    /// KeyPackage-sourced leaf that fails the injected-clock or maximum-range
-    /// lifetime check (ADR-057 §Prereq-1): that is the sender's tree, not the
-    /// caller's KeyPackage, so it is not [`ContextError::InvalidKeyPackage`].
-    /// No dedicated error variant for a rejected Welcome exists yet.
+    /// Each lifetime variant names one party's leaf (ADR-057 §Prereq-1):
+    ///
+    /// - A replay rejection (the crypto-layer consumed-init-key backstop) maps
+    ///   to the dedicated [`ContextError::KeyPackageReplay`], distinct from
+    ///   [`ContextError::InvalidState`] (which also means "unknown
+    ///   reservation"), so a caller can detect a security-relevant single-use
+    ///   replay.
+    /// - [`MlsError::KeyPackageLifetimeInvalid`] names the caller's OWN reserved
+    ///   KeyPackage: its `Lifetime` is expired or not yet valid under the
+    ///   injected clock (or under openmls's internal clock in the native
+    ///   backend), or its range is empty, inverted or over the maximum. It
+    ///   maps to [`ContextError::InvalidKeyPackage`]. The native backend
+    ///   checks the injected clock before openmls's, so an expired own
+    ///   KeyPackage is `InvalidKeyPackage` whichever clock reads it, never
+    ///   `CryptoFailed`.
+    /// - [`MlsError::TreeLeafLifetimeRangeInvalid`] names ANOTHER member's leaf
+    ///   in the sender's tree whose range is empty, inverted or over the
+    ///   maximum. It is not the caller's KeyPackage, so it maps, with every
+    ///   other error, to [`ContextError::CryptoFailed`]. No dedicated error
+    ///   variant for a rejected Welcome exists yet.
     fn map_join_error(e: &MlsError) -> ContextError {
         match e {
             MlsError::KeyPackageReplay => ContextError::KeyPackageReplay(
                 "key package already consumed (init-key replay rejected)".to_owned(),
             ),
+            own @ MlsError::KeyPackageLifetimeInvalid { .. } => {
+                ContextError::InvalidKeyPackage(format!("join from welcome: {own}"))
+            }
             other => ContextError::CryptoFailed(format!("join from welcome: {other}")),
         }
     }
@@ -1389,8 +1428,9 @@ impl KeyPackageStoreActor {
                         return Err(Self::map_join_error(&e));
                     }
                 } else {
-                    // Ordinary crypto failure (bad/duplicate welcome). Join failed —
-                    // KP NOT burned; reservation stays for retry/cancel.
+                    // Ordinary join failure (a bad or duplicate Welcome, or the own
+                    // KeyPackage's `Lifetime` rejected). Join failed — KP NOT
+                    // burned; reservation stays for retry/cancel.
                     return Err(Self::map_join_error(&e));
                 }
                 // Own-prior-completion (replay + KP record already absent): there is
