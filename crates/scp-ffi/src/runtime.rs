@@ -1887,14 +1887,6 @@ where
 
 /// Reads a context's role state from that context's supervisor actor.
 ///
-/// The UCAN entry points in `ucan.rs` read the capability ceiling and the
-/// context creator through this function at the moment they decide, never
-/// through the bridge copies `FfiBridgeState.role_state`, `ceiling_strings`
-/// and `creator_did` (ADR-016 steps 4 and 8). A bridge-local copy only
-/// refreshes when THIS bridge performs the mutation, so a `ModifyCeiling` or a
-/// membership change the supervisor applied by another route leaves a copy
-/// that still grants authority the supervisor already withdrew.
-///
 /// Fails closed. A context whose actor returns no role state yields
 /// [`ScpPyError::ContextError`] with `SCP-CTX-2023`; no caller receives a
 /// permissive default.
@@ -3961,7 +3953,7 @@ mod tests {
     /// The pre-authorization gate withholds a failure of the role-state read it
     /// runs after the lifecycle read answered `Active`, the window in which a
     /// crash, a poison or a saturated mailbox can land between the two mailbox
-    /// round trips. Each failure `live_role_state` can return there (the
+    /// round trips. Each inner `Err` `role_state_on` can return there (the
     /// converted `ActorCrashed`, `ContextPoisoned` and `ActorBusy` errors, and
     /// the absent-role-state refusal that names the context) refuses with the
     /// withheld text and the caller's code, and the role state a successful
