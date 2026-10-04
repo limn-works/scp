@@ -62,13 +62,23 @@ env:
 #                     units cargo compiles in check mode as well). rust-doc restores both
 #                     groups, one rust-cache step each, because its two commands read
 #                     two disjoint artifact sets out of the one directory.
-#   workspace-release `target/ci-bridge` on Linux — pyo3-module, which runs
+#   workspace-ci-bridge
+#                     `target/ci-bridge` on Linux — pyo3-module, which runs
 #                     `maturin develop --profile ci-bridge`, and napi-addon, which runs
 #                     `cargo build -p scp-ffi-napi --profile ci-bridge`. The four
 #                     bridge producers build under the `ci-bridge` profile the root
 #                     Cargo.toml defines (SCP's crates at opt-level 1, dependencies at
-#                     opt-level 3); the group names keep the words they had when the
-#                     producers built `--release`. Those two jobs are the
+#                     opt-level 3). This group and the two `-ci-bridge` groups below
+#                     replaced `workspace-release`, `apple-uniffi` and `apple-parity`,
+#                     which held `--release` output, when the producers moved to the
+#                     profile. Keeping the old names would have stalled each group:
+#                     rust-cache's key hashes no `[profile]` table, so the old entry
+#                     matched the new key in full, restored a `target/release` the
+#                     profile never reads, and a full match skips the save, so `main`
+#                     would never have written the `target/ci-bridge` entry. Measured
+#                     on the pull request's run: napi-addon restored
+#                     `v0-rust-workspace-release-…` with `full match: true` and
+#                     compiled every dependency (6m49s). Those two jobs are the
 #                     only members. python-test, typescript-check and bridge-parity
 #                     ran one or both of those commands and belonged to this group;
 #                     they now download what the producers upload, so none of them
@@ -106,17 +116,18 @@ env:
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
 #                     group for its registry alone, because both compile under the dev
 #                     profile; each step below says so where it sits.
-#   apple-uniffi      `target/aarch64-apple-darwin/ci-bridge` — xcframework, which runs
+#   apple-uniffi-ci-bridge
+#                     `target/aarch64-apple-darwin/ci-bridge` — xcframework, which runs
 #                     `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`
-#                     for both macOS jobs
-#                     that read an XCFramework. swift-build-test ran that script and
+#                     for both macOS jobs that read an XCFramework. swift-build-test ran that script and
 #                     wrote this entry; it downloads the result instead and reads no
 #                     cargo cache.
-#   apple-parity      `target/ci-bridge` on macOS — pyo3-module-macos, which runs
-#                     `maturin develop --profile ci-bridge` for bridge-parity-swift. The name
-#                     stays as bridge-parity-swift wrote it, because renaming a group
-#                     abandons the entry `main` holds under the old name and makes the
-#                     next run compile cold.
+#   apple-parity-ci-bridge
+#                     `target/ci-bridge` on macOS — pyo3-module-macos, which runs
+#                     `maturin develop --profile ci-bridge` for bridge-parity-swift.
+#                     A rename abandons the entry `main` holds under the old name, so
+#                     a group keeps its name unless, as here, that entry holds a
+#                     directory its members no longer read.
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
@@ -150,8 +161,9 @@ env:
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
 # and it finishes eleven minutes before rust-test. The producers are rust-test
 # (workspace-debug), rust-clippy (workspace-check), rust-test-optional-features
-# (transport-optional), pyo3-module (workspace-release), typescript-wasm-check
-# (wasm32), xcframework (apple-uniffi), pyo3-module-macos (apple-parity) and
+# (transport-optional), pyo3-module (workspace-ci-bridge), typescript-wasm-check
+# (wasm32), xcframework (apple-uniffi-ci-bridge), pyo3-module-macos
+# (apple-parity-ci-bridge) and
 # fuzz-build (fuzz): in each group, the job that compiles the most of that directory
 # under that mode.
 #
@@ -2087,7 +2099,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: workspace-release
+          shared-key: workspace-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -2191,7 +2203,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: workspace-release
+          shared-key: workspace-ci-bridge
           save-if: false
       - name: Build NAPI native addon
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -2276,7 +2288,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: apple-uniffi
+          shared-key: apple-uniffi-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build XCFramework (dev mode — macOS arm64 only)
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -2410,7 +2422,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: apple-parity
+          shared-key: apple-parity-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -3309,7 +3321,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # `workspace-debug`, not `workspace-release`: the one cargo command left in
+          # `workspace-debug`, not `workspace-ci-bridge`: the one cargo command left in
           # this job builds `scp-ffi-uniffi` under the dev profile into `target/debug`,
           # which is the directory and the compile mode that group holds. It read
           # `workspace-release` while it also ran `maturin develop --release`, and job
