@@ -259,7 +259,13 @@ fn context_create_registers_in_runtime() {
     let did = create_test_identity(&bi);
     let ctx_id = create_test_context(&bi, &did);
 
-    let creator = runtime::live_role_state(&bi, &ctx_id).unwrap().creator_did;
+    let supervisor = runtime::supervisor(&bi).unwrap().clone();
+    let read_ctx = ctx_id.clone();
+    let creator = test_runtime()
+        .block_on(async move { supervisor.get_role_state_checked(&read_ctx).await })
+        .unwrap()
+        .expect("the supervisor holds role state for the created context")
+        .creator_did;
     assert_eq!(creator, did);
     assert!(
         runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),

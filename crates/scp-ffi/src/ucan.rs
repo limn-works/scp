@@ -338,9 +338,7 @@ impl crate::scp::PyScp {
         }
         // ADR-016 step 8 compares the token's grants against the context's
         // capability ceiling, and the chain check anchors on the context creator.
-        // Both come from the supervisor actor, so a `ModifyCeiling` governance
-        // action binds the very next validation, and a context no actor serves
-        // refuses. Read BEFORE the token parse: an unknown or actor-less context
+        // Read BEFORE the token parse: an unknown or actor-less context
         // refuses on its own account rather than on the shape of a
         // caller-supplied token.
         let role_state = active_ucan_role_state(bi, context_id, "validate a UCAN in context")?;
@@ -709,9 +707,8 @@ impl crate::scp::PyScp {
         for cap in &capabilities {
             validate::validate_capability_uri(cap)?;
         }
-        // The ceiling bounds what a delegation may carry; it comes from the
-        // supervisor actor so a narrowed ceiling binds the next delegation. Read
-        // BEFORE the parent parse: an unknown or actor-less context refuses on its
+        // The ceiling bounds what a delegation may carry. Read BEFORE the
+        // parent parse: an unknown or actor-less context refuses on its
         // own account rather than on the shape of a caller-supplied token.
         let ceiling_strings = active_ucan_role_state(bi, context_id, "delegate a UCAN in context")?
             .ceiling()

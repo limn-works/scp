@@ -1817,12 +1817,13 @@ pub fn read_live_context_state(
 /// and an actor that returned no role state refuse with the same text and the
 /// caller's code, and the text never names the context.
 ///
-/// The function resolves the bridge's supervisor once and runs both reads on
-/// that one supervisor, so a suspend that lands after the resolution reaches
-/// neither read. It returns the resolution error and each read's
-/// sync-to-async bridge error unchanged: a suspended bridge, a bridge with no
-/// `ContextManager` attached, and a failed sync-to-async bridge describe the
-/// caller's bridge or runtime, not the context.
+/// The function resolves the bridge's supervisor once and hands it to
+/// `active_role_state_on`, which runs both reads and takes no
+/// `&PyBridgeInstance`, so neither read can resolve the supervisor again. It
+/// returns the resolution error and each read's sync-to-async bridge error
+/// unchanged: a suspended bridge, a bridge with no `ContextManager` attached,
+/// and a failed sync-to-async bridge describe the caller's bridge or runtime,
+/// not the context.
 ///
 /// `mk_err` wraps the refusal message in the error variant and the error code
 /// the calling entry point reports.
@@ -1847,7 +1848,21 @@ pub fn active_role_state_before_authz<F>(
 where
     F: FnOnce(String) -> ScpPyError,
 {
-    let sup = Arc::clone(supervisor(bi)?);
+    active_role_state_on(Arc::clone(supervisor(bi)?), context_id, verb, mk_err)
+}
+
+/// Runs both [`active_role_state_before_authz`] reads, the lifecycle state
+/// read and then the role-state read, on `sup`, the supervisor that function
+/// resolved.
+fn active_role_state_on<F>(
+    sup: Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<ContextRoleState, ScpPyError>
+where
+    F: FnOnce(String) -> ScpPyError,
+{
     let lifecycle_sup = Arc::clone(&sup);
     let ctx = context_id.to_owned();
     let state =
@@ -1900,7 +1915,8 @@ where
 /// converted `ActorBusy`, `ActorCrashed`, or `ContextPoisoned` error when the
 /// context's actor is saturated, wedged, mid-respawn, or poisoned, so a caller
 /// never reads an actor that did not answer as an absent context.
-pub fn live_role_state(
+#[cfg(test)]
+pub(crate) fn live_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<ContextRoleState, ScpPyError> {
