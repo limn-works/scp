@@ -35,7 +35,7 @@
 //!   `OsRng`. `OpenMlsRand::random_array` and `random_vec` are the other:
 //!   `RustCrypto` implements `OpenMlsRand` too, so `crypto()` exposes them.
 //!   No SCP code calls them through `crypto()` today, but nothing enforces
-//!   that yet; issue #2653 tracks making such a draw fail to compile by type;
+//!   that yet;
 //! - HPKE encapsulation randomness. openmls draws it through `crypto()`, not
 //!   `rand()`: each `hpke_seal` builds an hpke-rs context whose
 //!   `HpkeRustCryptoPrng` seeds a `ChaCha20Rng` from the operating system for
