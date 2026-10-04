@@ -578,14 +578,15 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// The tier re-evaluation task is stopped **and joined** when the node was
     /// built on a multi-thread runtime and the caller is off any runtime or on a
-    /// multi-thread worker: this blocks on the task's `JoinHandle`, which tokio
-    /// completes only after the task's future has been dropped, so the
-    /// `DidMethod`/`KeyCustody` `Arc` clones the republish path captured are
-    /// released before this returns. For those callers, after `shutdown()`
-    /// returns the custody backend's `SqliteStorage` advisory lock is free, so a
-    /// caller can immediately re-open the same storage path (e.g. a node restart
-    /// over a persisted identity) without racing the background task's
-    /// teardown. A caller on a `current_thread` runtime gets only an abort.
+    /// multi-thread worker: this blocks, up to a deadline, on the task's
+    /// `JoinHandle`, which tokio completes only after the task's future has been
+    /// dropped. When the join completes, the `DidMethod`/`KeyCustody` `Arc`
+    /// clones the republish path captured are released before this returns, so
+    /// the custody backend's `SqliteStorage` advisory lock is free and a caller
+    /// can immediately re-open the same storage path (e.g. a node restart over a
+    /// persisted identity) without racing the background task's teardown. At
+    /// the deadline the task is aborted instead. A caller on a `current_thread`
+    /// runtime gets only an abort.
     /// Absent the join the task could still hold the custody
     /// handle for a short, nondeterministic window after `shutdown()` returned,
     /// intermittently failing the next open with an advisory-lock conflict. See
@@ -2254,7 +2255,18 @@ struct TierReEvalHandle {
     /// node's runtime (the reason `SelfDidRepublishing::runtime` in
     /// `republish.rs` gives).
     runtime: tokio::runtime::Handle,
+    /// How long [`stop_and_wait`](Self::stop_and_wait) waits for the task to
+    /// end before it aborts the task and returns (ADR-048 §5 bounded wait).
+    /// [`TIER_TASK_STOP_DEADLINE`] in production.
+    stop_deadline: Duration,
 }
+
+/// The bound on [`TierReEvalHandle::stop_and_wait`]'s wait for the tier task.
+///
+/// The task reads its cancel signal only between re-evaluations, so a
+/// re-evaluation already in flight at shutdown (NAT probing, then the DID
+/// document publish) runs on until it finishes or this deadline passes.
+const TIER_TASK_STOP_DEADLINE: Duration = Duration::from_secs(5);
 
 impl TierReEvalHandle {
     /// Signals the background re-evaluation task to stop, WITHOUT waiting for it
@@ -2274,14 +2286,18 @@ impl TierReEvalHandle {
     /// every `Arc` it captured — has been dropped.
     ///
     /// The task runs on the stored [`runtime`](Self::runtime). When that runtime
-    /// is multi-thread, its workers drive the task while this thread blocks on
-    /// the `JoinHandle`: a caller off any runtime blocks through
-    /// [`Handle::block_on`](tokio::runtime::Handle::block_on), and a caller on a
-    /// multi-thread worker wraps that in [`tokio::task::block_in_place`].
+    /// is multi-thread, its workers drive the task while this thread waits up to
+    /// [`stop_deadline`](Self::stop_deadline) for the `JoinHandle` to resolve; a
+    /// caller on a multi-thread worker waits inside
+    /// [`tokio::task::block_in_place`]. At the deadline the task is aborted and
+    /// this returns without waiting further, so the task's captures can outlive
+    /// the return, e.g. when the task is blocked on a host-language custody
+    /// callback that needs the thread this caller holds (the GIL, the JS main
+    /// thread).
     ///
     /// A caller on a `current_thread` runtime gets a best-effort `abort()` +
-    /// cancel signal instead: `block_in_place` panics there, and
-    /// `Handle::block_on` panics inside a runtime context. A stored
+    /// cancel signal instead: `block_in_place` panics there, and waiting without
+    /// it would stall every task that runtime drives. A stored
     /// `current_thread` runtime gets the same abort, because its task advances
     /// only while that runtime's owner thread drives it, and the owner may be the
     /// thread waiting on this call.
@@ -2305,18 +2321,38 @@ impl TierReEvalHandle {
             return;
         }
         // The JoinHandle resolves only after the runtime has dropped the task
-        // future, so the future's captured `Arc`s are gone when this returns.
+        // future, so the future's captured `Arc`s are gone when it resolves. A
+        // forwarder on the task's runtime relays the result over a std channel,
+        // so the wait needs no timer and no `block_on`. If the runtime has shut
+        // down, the forwarder is dropped unrun and `recv_timeout` returns
+        // `Disconnected` at once.
+        let abort = task.abort_handle();
+        let (joined_tx, joined_rx) = std::sync::mpsc::sync_channel(1);
+        drop(self.runtime.spawn(async move {
+            let _ = joined_tx.send(task.await);
+        }));
+        let wait = || joined_rx.recv_timeout(self.stop_deadline);
         let joined = if caller.is_some() {
-            tokio::task::block_in_place(|| {
-                self.runtime.block_on(task) // ci-allow: block-on: joins the tier task so the captured DidMethod/custody Arcs drop before shutdown() returns
-            }) // ci-allow: block-on: deterministic node teardown — multi-thread-checked sync→async join releasing the custody Arc before storage re-open
+            tokio::task::block_in_place(wait) // ci-allow: block-on: multi-thread worker waits, bounded by stop_deadline, for the tier task's captured custody Arc to drop before shutdown() returns
         } else {
-            self.runtime.block_on(task) // ci-allow: block-on: off-runtime caller joins the tier task on the multi-thread runtime that drives it, so the custody Arc drops before shutdown() returns
+            wait()
         };
-        if let Err(e) = joined {
-            // Teardown still completed (the future is dropped either way), but
-            // a panic in the task is a defect to surface.
-            tracing::error!(error = %e, "tier re-evaluation task ended abnormally");
+        match joined {
+            Ok(Err(e)) if e.is_panic() => {
+                // The future is dropped either way, but a panic in the task is
+                // a defect to surface.
+                tracing::error!(error = %e, "tier re-evaluation task panicked");
+            }
+            // A cancelled join: only runtime shutdown can cancel the task once
+            // its handle is taken, and that drops the future too.
+            Ok(Ok(()) | Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                abort.abort();
+                tracing::warn!(
+                    deadline = ?self.stop_deadline,
+                    "tier re-evaluation task did not stop by the deadline; aborted it"
+                );
+            }
         }
     }
 
@@ -2628,6 +2664,7 @@ fn spawn_tier_reevaluation(
         task: std::sync::Mutex::new(Some(task)),
         cancel_tx,
         runtime: tokio::runtime::Handle::current(),
+        stop_deadline: TIER_TASK_STOP_DEADLINE,
     }
 }
 
@@ -6504,6 +6541,66 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "stop_and_wait returned before the tier task's captured publisher was dropped"
         );
+    }
+
+    /// NAT strategy that reports it was entered, then never completes, so the
+    /// tier task sits in an in-flight re-evaluation that never reads its cancel
+    /// signal.
+    struct StuckNatStrategy {
+        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl NatStrategy for StuckNatStrategy {
+        fn select_tier(
+            &self,
+            _relay_port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>> + Send + '_>,
+        > {
+            let entered = self
+                .entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(tx) = entered {
+                let _ = tx.send(());
+            }
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A task stuck inside a re-evaluation never sees the cancel signal. An
+    /// off-runtime caller (the FFI bridges' shape) must still get control back
+    /// once the stop deadline passes (ADR-048 §5), not block forever.
+    #[test]
+    fn stop_and_wait_off_runtime_returns_at_the_deadline_when_the_task_is_stuck() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (mut handle, _dropped) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(StuckNatStrategy {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+            });
+            slow_drop_tier_task(strategy, Duration::from_millis(1))
+        };
+        handle.stop_deadline = Duration::from_millis(100);
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("tier task enters the stuck re-evaluation");
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            handle.stop_and_wait();
+            let _ = returned_tx.send(());
+        });
+
+        returned_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("stop_and_wait returned at its deadline instead of waiting on a stuck task");
     }
 
     /// A `current_thread` caller cannot block: with the task on a multi-thread

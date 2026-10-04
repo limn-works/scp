@@ -394,8 +394,7 @@ pub struct ActiveArms {
 /// `DidPublisher` trait exists in `published_state`.
 ///
 /// Object safety is why neither method returns `impl Future`: `stop_and_wait` is
-/// synchronous (it bridges to the async stop the way `TierReEvalHandle` does),
-/// and `active_arms` returns a boxed future. `active_arms` carries
+/// synchronous, and `active_arms` returns a boxed future. `active_arms` carries
 /// `#[cfg(all(test, feature = "testing"))]`, so a doc build compiles no link
 /// target for it.
 pub trait RepublishCycle: Send + Sync {
