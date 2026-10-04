@@ -1326,11 +1326,6 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         let did_a = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did_a);
 
-        // `outlet_call:*` and `messages:write` both sit in `default_ceiling()`,
-        // which `create_test_context` gave the supervisor, and the outlet entry
-        // points read the ceiling from there, so the test writes no bridge-side
-        // ceiling.
-
         // Register an outlet using the helper.
         let reg = build_outlet_reg(py, "cross_domain_outlet", &did_a);
         let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
