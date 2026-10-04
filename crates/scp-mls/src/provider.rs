@@ -28,12 +28,14 @@
 //!   unwiped; and it decodes every read through `serde_json`. SCP's own
 //!   encoders do not reach inside this store;
 //! - the `ChaCha20Rng` inside the wrapped `RustCrypto`. It stays in memory for
-//!   the provider's life, but nothing SCP reaches draws from it: among
-//!   `RustCrypto`'s methods only `signature_key_gen` does, and SCP never calls
-//!   it: the `disallowed-methods` ban on `OpenMlsCrypto::signature_key_gen`
-//!   in `.clippy.toml` and `crates/scp-runtime/clippy.toml` enforces that,
-//!   and SCP creates signers through `SignatureKeyPair::new`, which draws
-//!   from `OsRng`;
+//!   the provider's life, and two kinds of draw reach its seed.
+//!   `OpenMlsCrypto::signature_key_gen` is one: the `disallowed-methods` ban
+//!   in `.clippy.toml` and `crates/scp-runtime/clippy.toml` forbids it, and
+//!   SCP creates signers through `SignatureKeyPair::new`, which draws from
+//!   `OsRng`. `OpenMlsRand::random_array` and `random_vec` are the other:
+//!   `RustCrypto` implements `OpenMlsRand` too, so `crypto()` exposes them.
+//!   No SCP code calls them through `crypto()` today, but nothing enforces
+//!   that yet; issue #2653 tracks making such a draw fail to compile by type;
 //! - HPKE encapsulation randomness. openmls draws it through `crypto()`, not
 //!   `rand()`: each `hpke_seal` builds an hpke-rs context whose
 //!   `HpkeRustCryptoPrng` seeds a `ChaCha20Rng` from the operating system for
