@@ -2040,27 +2040,25 @@ jobs:
   #     dependency version), every Cargo.toml (features, profiles, workspace
   #     inheritance), `.cargo/**` (rustflags), all of `crates/**` (the sources of
   #     every crate any bridge reaches, hashed whole so that no hand-kept crate list
-  #     can go stale), and the job's own build input outside crates/: the
-  #     `[tool.maturin]` features in bindings/python/pyproject.toml for the two PyO3
-  #     jobs, and bindings/swift/build-xcframework.sh for job xcframework;
+  #     can go stale), bindings/python/pyproject.toml for the two PyO3 jobs, and
+  #     bindings/swift/build-xcframework.sh for job xcframework;
   #   * a digest the `artifact-inputs` step computes over the job's own definition in
   #     this file (its build command and feature list), the workflow-level `env:`
   #     block every build inherits, the list of tracked paths under crates/
   #     (`hashFiles` hashes contents alone, so a renamed file changes no file hash),
-  #     the runner image name, and the versions of the tools the build runs outside
-  #     cargo: Python and maturin for the PyO3 jobs, glibc and the C compiler on
-  #     Linux, the libssl-dev package napi-addon links against, and Xcode and its
-  #     macOS SDK on macOS.
+  #     the runner image name and build (`ImageVersion` changes whenever any
+  #     preinstalled package on the image changes), and the versions of the tools
+  #     the build runs outside cargo: Python and maturin for the PyO3 jobs, glibc,
+  #     the C compiler and the libssl-dev package on Linux, and Xcode and its macOS
+  #     SDK on macOS.
   #
-  # The cache holds the uploaded files alone, never `target/`. A run triggered by a
-  # push to `main` or by a pull request saves on a miss. A merge-queue run does not
-  # save, because GitHub lets only the `gh-readonly-queue/…` ref that wrote an entry
-  # read it, and no later run uses that ref. A
-  # pull-request entry is readable by that pull request alone, so no pull request
-  # can place an artifact that `main` or another pull request restores. A run that
-  # misses on all four producers saves four entries, which totalled about 102 MB in
-  # run 37154692160, against the 10 GB repository cap the cache section at the top of
-  # this file counts. scripts/tests/ci-gate/ci_gate_selftest.py
+  # The cache holds the uploaded files alone, never `target/`. Only a push to `main`
+  # saves on a miss, for the reason the cache section at the top of this file gives
+  # for `save-if`: an entry a pull-request or merge-queue run wrote is readable by
+  # that ref alone and would evict entries later runs read. No pull request can
+  # place an artifact that `main` or another pull request restores. A push to `main`
+  # that misses on all four producers saves four entries; the four artifacts
+  # totalled about 102 MB in run 37154692160. scripts/tests/ci-gate/ci_gate_selftest.py
   # reports a producer whose key drops one of the file inputs above.
   pyo3-module:
     needs: changes
@@ -2112,13 +2110,13 @@ jobs:
         run: |
           set -euo pipefail
           job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
-            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            '$0 == start {found = 1; print; next} found && /^  [^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           if [ -z "$job_definition" ]; then
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
-          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           source .venv/bin/activate
           inputs="$RUNNER_TEMP/artifact-inputs"
@@ -2126,11 +2124,12 @@ jobs:
             printf '%s\n' "$job_definition"
             printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:?ImageOS is unset}"
+            echo "image=${ImageOS:?ImageOS is unset}-${ImageVersion:?ImageVersion is unset}"
             python -VV
             maturin --version
             ldd --version 2>&1 | sed -n 1p
             cc --version | sed -n 1p
+            dpkg-query -W -f='${Version}\n' libssl-dev
           } > "$inputs"
           digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -2177,7 +2176,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Save the PyO3 module under its input key
-        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
@@ -2218,20 +2217,20 @@ jobs:
         run: |
           set -euo pipefail
           job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
-            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            '$0 == start {found = 1; print; next} found && /^  [^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           if [ -z "$job_definition" ]; then
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
-          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           inputs="$RUNNER_TEMP/artifact-inputs"
           {
             printf '%s\n' "$job_definition"
             printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:?ImageOS is unset}"
+            echo "image=${ImageOS:?ImageOS is unset}-${ImageVersion:?ImageVersion is unset}"
             ldd --version 2>&1 | sed -n 1p
             cc --version | sed -n 1p
             dpkg-query -W -f='${Version}\n' libssl-dev
@@ -2272,7 +2271,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Save the NAPI addon under its input key
-        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: target/release/libscp_ffi_napi.so
@@ -2301,20 +2300,20 @@ jobs:
         run: |
           set -euo pipefail
           job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
-            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            '$0 == start {found = 1; print; next} found && /^  [^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           if [ -z "$job_definition" ]; then
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
-          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           inputs="$RUNNER_TEMP/artifact-inputs"
           {
             printf '%s\n' "$job_definition"
             printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:?ImageOS is unset}"
+            echo "image=${ImageOS:?ImageOS is unset}-${ImageVersion:?ImageVersion is unset}"
             xcodebuild -version
             xcrun --sdk macosx --show-sdk-version
           } > "$inputs"
@@ -2396,7 +2395,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Save the XCFramework under its input key
-        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -2435,13 +2434,13 @@ jobs:
         run: |
           set -euo pipefail
           job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
-            '$0 == start {found = 1; print; next} found && /^  [^ ]/ {exit} found {print}' \
+            '$0 == start {found = 1; print; next} found && /^  [^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           if [ -z "$job_definition" ]; then
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
-          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ ]/ {exit} found {print}' \
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ #]/ {exit} found {print}' \
             .github/workflows/ci.yml)
           source .venv/bin/activate
           inputs="$RUNNER_TEMP/artifact-inputs"
@@ -2449,7 +2448,7 @@ jobs:
             printf '%s\n' "$job_definition"
             printf '%s\n' "$workflow_env"
             git ls-files -- crates
-            echo "image=${ImageOS:?ImageOS is unset}"
+            echo "image=${ImageOS:?ImageOS is unset}-${ImageVersion:?ImageVersion is unset}"
             python -VV
             maturin --version
             xcodebuild -version
@@ -2484,7 +2483,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
       - name: Save the PyO3 module under its input key
-        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.event_name != 'merge_group'
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: bindings/python/scp_sdk/_scp_core*.so

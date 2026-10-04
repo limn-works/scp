@@ -175,12 +175,6 @@ nothing:
                three paths, one of them the tracked ScpBindings.swift, so the
                checkout always supplied a match and the option could not fail
                the producer when build-xcframework.sh wrote nothing.
-  artifact-key
-               Each bridge producer restores the artifact an earlier run built
-               when its cache key matches, and then skips its build. A key that
-               omits one input, such as Cargo.lock, restores the earlier build
-               after a dependency bump, and every consumer tests the stale
-               binary and passes.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
@@ -4038,8 +4032,8 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
     restores that artifact with `actions/cache/restore` under a key that names the
     version literal, each file pattern in ARTIFACT_KEY_FILE_INPUTS and the job's
     entries in ARTIFACT_KEY_JOB_FILE_INPUTS inside a `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
-    digest that key reads in a step that hashes the job's own definition out of
-    ci.yml; restores, saves and uploads one path list; and saves under the key it
+    digest that key reads in a step before the restore that hashes the job's own
+    definition out of ci.yml; restores, saves and uploads one path list; and saves under the key it
     restored.
 
     WHY: on a key hit the producer skips its build and uploads what an earlier run
@@ -4091,6 +4085,10 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
             (step for step in steps if step.get("id") == "artifact-inputs"), None
         )
         digest_run = str((digest or {}).get("run") or "")
+        if digest is not None and steps.index(digest) > steps.index(restore):
+            gaps.append(
+                f"{job_id}: the artifact-inputs step runs after the restore that reads its digest"
+            )
         if (
             "GITHUB_JOB" not in digest_run
             or ".github/workflows/ci.yml" not in digest_run
@@ -4181,6 +4179,23 @@ def check_artifact_cache_keys(doc: dict) -> None:
                     ),
                     f"a ci.yml whose {job_id} key omits {text} went unreported",
                 )
+        # Control: the artifact-inputs step moved after the restore is reported.
+        mutated = copy.deepcopy(doc)
+        moved = mutated["jobs"][job_id]["steps"]
+        digest_index = next(
+            i for i, s in enumerate(moved) if s.get("id") == "artifact-inputs"
+        )
+        moved.append(moved.pop(digest_index))
+        check(
+            f"{job_id}: an artifact-inputs step after the restore is reported",
+            any(
+                gap == f"{job_id}: the artifact-inputs step runs after the restore "
+                "that reads its digest"
+                for gap in artifact_cache_key_gaps(mutated)
+            ),
+            f"a ci.yml whose {job_id} computes its digest after the restore went "
+            f"unreported",
+        )
 
 
 ARTIFACT_INPUT_TOOLS = (
@@ -4205,11 +4220,13 @@ def run_artifact_inputs_step(
     script: str | None = None,
     workflow: str | None = None,
     image_os: str | None = "stub-image",
+    image_version: str | None = "stub-build",
 ) -> tuple[int, str]:
     """Run an artifact-inputs step with every tool stubbed and `failing` exiting 1.
 
     `script` replaces the step's own `run:` text, `workflow` the ci.yml the step
-    reads, and `image_os=None` leaves ImageOS unset. Return the exit code and what
+    reads, and `image_os=None` and `image_version=None` leave ImageOS and
+    ImageVersion unset. Return the exit code and what
     the step wrote to GITHUB_OUTPUT.
     """
     with tempfile.TemporaryDirectory() as root:
@@ -4240,8 +4257,11 @@ def run_artifact_inputs_step(
             "RUNNER_TEMP": str(runner_temp),
         }
         env.pop("ImageOS", None)
+        env.pop("ImageVersion", None)
         if image_os is not None:
             env["ImageOS"] = image_os
+        if image_version is not None:
+            env["ImageVersion"] = image_version
         # GitHub runs a step that names no `shell:` under `bash -e {0}`, and a step
         # that names `shell: bash` under `bash --noprofile --norc -eo pipefail {0}`.
         if step.get("shell") == "bash":
@@ -4262,17 +4282,22 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
     """Run each producer's artifact-inputs step with each tool it calls failing.
 
     CRITERION: each bridge producer's `artifact-inputs` step exits non-zero when any
-    command in ARTIFACT_INPUT_TOOLS whose output it hashes fails or when ImageOS is
-    unset, exits 0 and writes a digest when every command succeeds, and writes a
-    different digest when the workflow-level env: block changes.
+    command in ARTIFACT_INPUT_TOOLS whose output it hashes fails or when ImageOS or
+    ImageVersion is unset, exits 0 and writes a digest when every command succeeds, and writes a
+    different digest when the workflow-level env: block changes, at its top or below
+    the column-0 comments that follow it, or when the job's own definition changes
+    below a comment indented as a job key.
 
     WHY: a tool that fails puts nothing into the digest, so the key stops encoding
     that tool's version, and a later change to the tool restores an artifact the
-    earlier version built. The same holds for the runner image name and for the
-    workflow env every build inherits.
+    earlier version built. The same holds for the runner image name and build and
+    for the workflow env every build inherits.
     """
     workflow = WORKFLOW.read_text()
     probed = workflow.replace("\nenv:\n", f"\nenv:\n{ARTIFACT_ENV_PROBE}", 1)
+    # YAML keeps env: open across the column-0 comments below it, so a variable
+    # written just above `jobs:` is still inherited by every build.
+    probed_low = workflow.replace("\njobs:\n", f"\n{ARTIFACT_ENV_PROBE}jobs:\n", 1)
     for job_id in bridge_producers(doc):
         steps = doc["jobs"][job_id]["steps"]
         step = next((s for s in steps if s.get("id") == "artifact-inputs"), None) or {}
@@ -4316,12 +4341,75 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
             code != 0,
             "the step hashed a missing runner image name and exited 0",
         )
+        code, _ = run_artifact_inputs_step(step, job_id, None, image_version=None)
+        check(
+            f"{job_id}: the artifact-inputs step fails when ImageVersion is unset",
+            code != 0,
+            "the step hashed a missing runner image build and exited 0",
+        )
+        _, other_build = run_artifact_inputs_step(
+            step, job_id, None, image_version="other-build"
+        )
+        check(
+            f"{job_id}: a different runner image build changes the digest",
+            other_build != output,
+            f"changing ImageVersion left the digest at {output!r}",
+        )
         _, probed_output = run_artifact_inputs_step(step, job_id, None, workflow=probed)
         check(
             f"{job_id}: a change to the workflow-level env changes the digest",
             probed != workflow and probed_output != output,
             f"adding {ARTIFACT_ENV_PROBE.strip()!r} to the workflow env left the "
             f"digest at {output!r}",
+        )
+        _, low_output = run_artifact_inputs_step(step, job_id, None, workflow=probed_low)
+        check(
+            f"{job_id}: an env variable below the comments after env: changes the digest",
+            probed_low != workflow and low_output != output,
+            f"adding {ARTIFACT_ENV_PROBE.strip()!r} above jobs: left the digest at "
+            f"{output!r}",
+        )
+        # A job key written below a comment at job-key indent is still part of the
+        # job, so two values of that key must give two digests.
+        header = f"\n  {job_id}:\n"
+        job_probes = [
+            workflow.replace(
+                header, f"{header}  # probe\n    continue-on-error: {value}\n", 1
+            )
+            for value in ("false", "true")
+        ]
+        job_outputs = [
+            run_artifact_inputs_step(step, job_id, None, workflow=w)[1]
+            for w in job_probes
+        ]
+        check(
+            f"{job_id}: a job key below a job-indent comment changes the digest",
+            job_probes[0] != workflow and job_outputs[0] != job_outputs[1],
+            f"changing a key below a comment in job {job_id} left the digest at "
+            f"{job_outputs[0]!r}",
+        )
+        # Control: extraction that stops at any column-0 or job-indent line, comments
+        # included, misses both probes above.
+        comment_stop = script.replace("/^[^ #]/", "/^[^ ]/").replace(
+            "/^  [^ #]/", "/^  [^ ]/"
+        )
+        _, stop_plain = run_artifact_inputs_step(step, job_id, None, script=comment_stop)
+        _, stop_low = run_artifact_inputs_step(
+            step, job_id, None, script=comment_stop, workflow=probed_low
+        )
+        stop_jobs = [
+            run_artifact_inputs_step(
+                step, job_id, None, script=comment_stop, workflow=w
+            )[1]
+            for w in job_probes
+        ]
+        check(
+            f"{job_id}: a step whose extraction stops at a comment is reported",
+            comment_stop != script
+            and stop_low == stop_plain
+            and stop_jobs[0] == stop_jobs[1],
+            "extraction that stops at a comment still saw a variable or job key "
+            "written below one",
         )
         # Control: the step with its workflow-env line removed is reported.
         without_env = "\n".join(
@@ -4345,7 +4433,8 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
     before that upload exits non-zero when the path is absent or holds nothing
     newer than the marker the build step touches, and exits 0 when every path is
     fresh. On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step
-    exits non-zero when a path is absent and exits 0 when every path is present.
+    exits non-zero when an untracked path is absent and exits 0 when every path is
+    present.
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
     nothing. The upload lists the tracked ScpBindings.swift, so the checkout always
@@ -4413,7 +4502,9 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
         run_with(None, None, hit=True) == 0,
         "the verify step rejects a cache hit that restored every uploaded path",
     )
-    for path in paths:
+    # The checkout supplies the tracked ScpBindings.swift, so CI cannot reach a hit
+    # that lacks it.
+    for path in (p for p in paths if not p.endswith("ScpBindings.swift")):
         check(
             f"xcframework: on a cache hit a missing {path} fails the producer",
             run_with(path, None, hit=True) != 0,
