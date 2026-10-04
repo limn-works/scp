@@ -587,25 +587,34 @@ mod tests {
     const TEST_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
     const TEST_RETRY_DELAY: Duration = Duration::from_millis(10);
 
-    /// Returns a loopback API URL whose port refuses connections: the port is
-    /// bound to reserve it, then released, so a connect gets an immediate RST
-    /// instead of waiting out the request timeout the way a non-routable
-    /// address does.
-    fn refused_api_url() -> String {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}")
+    /// Returns a loopback API URL whose server closes every connection on
+    /// accept without answering, so each request fails at once instead of
+    /// waiting out the request timeout the way a non-routable address does.
+    /// The listener runs on the calling test's runtime and holds the port
+    /// until that runtime shuts down, so no other test's listener can take
+    /// the port while the test runs.
+    async fn closing_api_url() -> String {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        format!("http://{addr}")
     }
 
     #[tokio::test]
     async fn provision_falls_back_to_self_signed_when_api_unreachable() {
+        let api_url = closing_api_url().await;
         let provider = ScpDnsProvider::new(
             "did:dht:test-fallback",
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             8443,
         )
-        .with_api_url(&refused_api_url())
+        .with_api_url(&api_url)
         .with_registration_timing(TEST_REQUEST_TIMEOUT, TEST_RETRY_DELAY);
 
         // provision_with_fallback() should succeed via self-signed fallback.
@@ -622,10 +631,11 @@ mod tests {
 
     #[tokio::test]
     async fn cached_cert_is_returned_on_second_call() {
-        // Use a refusing API so we get self-signed, then verify cache.
+        // Use a closing API so we get self-signed, then verify cache.
+        let api_url = closing_api_url().await;
         let provider =
             ScpDnsProvider::new("did:dht:test-cache", IpAddr::V4(Ipv4Addr::LOCALHOST), 8443)
-                .with_api_url(&refused_api_url())
+                .with_api_url(&api_url)
                 .with_registration_timing(TEST_REQUEST_TIMEOUT, TEST_RETRY_DELAY);
 
         let cert1 = provider.provision_with_fallback().await.unwrap();
