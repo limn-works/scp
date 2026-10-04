@@ -834,17 +834,7 @@ pub(crate) async fn context_create_on(
                     code: codes::CTX_2000.to_owned(),
                 })
             })?
-            .map_err(|e| match e {
-                // The core's empty-ceiling rejection keeps its typed
-                // validation code (construction.md M2).
-                scp_core::context::builder::ContextCreationError::StateTransition(
-                    scp_core::context::ContextError::CeilingRequired(_),
-                ) => NapiError::from(ScpNapiError::from(e)),
-                other => NapiError::from(ScpNapiError::Context {
-                    message: format!("create_context failed: {other}"),
-                    code: codes::CTX_2000.to_owned(),
-                }),
-            })?
+            .map_err(|e| NapiError::from(create_context_failure(e)))?
     };
 
     // Register the creator's DID as a local DID for defense-in-depth. Routes
@@ -2292,24 +2282,24 @@ pub(crate) async fn context_subscribe_on(
                         envelope_bytes: envelope.encrypted_blob.clone(),
                         reply: tx,
                     };
-                    let Some(live) = supervisor.upgrade() else {
+                    let Some(dispatch_result) =
+                        dispatch_to_live_supervisor(&supervisor, &context_id, cmd).await
+                    else {
                         tracing::debug!(
                             context_id = %context_id,
                             "supervisor dropped; subscription ends"
                         );
                         break;
                     };
-                    let dispatch_result = live.dispatch_command(&context_id, cmd).await;
-                    drop(live);
                     let reply_result = if dispatch_result.is_ok() {
                         rx.await.ok()
                     } else {
                         None
                     };
                     let deliver_result = match (dispatch_result, reply_result) {
-                        (Ok(_), Some(r)) => r,
+                        (Ok(()), Some(r)) => r,
                         (Err(e), _) => Err(e),
-                        (Ok(_), None) => Err(scp_core::context::ContextError::CryptoFailed(
+                        (Ok(()), None) => Err(scp_core::context::ContextError::CryptoFailed(
                             "deliver shim reply dropped".to_owned(),
                         )),
                     };
@@ -5599,6 +5589,36 @@ fn busy_or(op: &str, code: &str, e: &scp_core::context::ContextError) -> ScpNapi
     }
 }
 
+/// Maps a refused `CreateContext` to its SDK error. The core's empty-ceiling
+/// rejection keeps its typed validation code (construction.md M2), and a
+/// create refused because Supervisor shutdown began keeps SCP-CTX-2138; every
+/// other failure carries SCP-CTX-2000.
+fn create_context_failure(e: scp_core::context::builder::ContextCreationError) -> ScpNapiError {
+    match e {
+        scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_),
+        ) => ScpNapiError::from(e),
+        other => ScpNapiError::Context {
+            message: format!("create_context failed: {other}"),
+            code: codes::CTX_2000.to_owned(),
+        },
+    }
+}
+
+/// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still
+/// points at, holding the upgraded `Arc` only for the dispatch. `None` when the
+/// Supervisor has dropped, which ends the relay subscription loop (ADR-049
+/// Decision 16).
+async fn dispatch_to_live_supervisor(
+    supervisor: &std::sync::Weak<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    cmd: scp_core::context::actor::commands::MessagingCommand,
+) -> Option<Result<(), scp_core::context::ContextError>> {
+    let live = supervisor.upgrade()?;
+    Some(live.dispatch_command(context_id, cmd).await.map(drop))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5620,6 +5640,46 @@ mod tests {
     use scp_did::DID;
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
+
+    /// A create refused because Supervisor shutdown began keeps SCP-CTX-2138;
+    /// an unrelated create failure carries SCP-CTX-2000.
+    #[test]
+    fn create_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::builder::ContextCreationError;
+        let code_of = |e: ContextCreationError| match super::create_context_failure(e) {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected a context error, got {other:?}"),
+        };
+        assert_eq!(
+            code_of(ContextCreationError::StateTransition(
+                scp_core::context::ContextError::SupervisorShutDown("create".to_owned()),
+            )),
+            codes::CTX_2138
+        );
+        assert_eq!(
+            code_of(ContextCreationError::TransportNotConnected),
+            codes::CTX_2000
+        );
+    }
+
+    /// A dropped Supervisor yields `None`, which ends the subscription loop,
+    /// and the command is never dispatched.
+    #[tokio::test]
+    async fn dispatch_to_dropped_supervisor_ends_the_subscription() {
+        use scp_core::context::actor::commands::MessagingCommand;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DeliverIncoming {
+            context_id: "ctx".to_owned(),
+            envelope_bytes: vec![1, 2, 3],
+            reply,
+        };
+        let outcome = super::dispatch_to_live_supervisor(&std::sync::Weak::new(), "ctx", cmd).await;
+        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
+        assert!(
+            rx.await.is_err(),
+            "the command must be dropped undispatched"
+        );
+    }
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
     /// supervisor. Mirrors the production rewire pattern but is callable

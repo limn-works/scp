@@ -204,8 +204,8 @@ class SCP internal constructor(
             try {
                 inner.shutdown(timeoutMillis = millis)
             } catch (e: ScpException.Validation) {
-                // `SCP-STORAGE-8005` is raised after the teardown ran: only the durable
-                // store still holds its lock, so the instance is recorded as shut down.
+                // `SCP-STORAGE-8005` is raised after the teardown ran, so the instance is
+                // recorded as shut down.
                 if (e.code == STORAGE_LOCK_HELD_CODE) shutdownRecorded.set(true)
                 throw e
             }

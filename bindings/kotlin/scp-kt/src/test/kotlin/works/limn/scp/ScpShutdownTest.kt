@@ -87,8 +87,8 @@ class ScpShutdownTest {
         }
     }
 
-    // SCP-STORAGE-8005 arrives after a teardown that ran, with only the durable store still
-    // holding its lock, so the error propagates and the instance is recorded as shut down.
+    // SCP-STORAGE-8005 arrives after a teardown that ran, so the error propagates and the
+    // instance is recorded as shut down.
     @Test
     fun `a shutdown that leaves the store locked propagates and marks the instance shut down`() {
         runTest(testDispatcher) {

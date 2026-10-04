@@ -230,6 +230,42 @@ mod tests {
         }
     }
 
+    /// A tick whose `Weak<Supervisor>` no longer upgrades stops the scheduler
+    /// without cancelling the caller's subscription or bridge token.
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_stops_when_the_supervisor_has_dropped() {
+        let interval = heartbeat_interval(TransportProfile::Server).unwrap();
+        let cancel = CancellationToken::new();
+        let bridge_cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_heartbeat_scheduler(
+            std::sync::Weak::new(),
+            "ctx".to_owned(),
+            DID::from("did:dht:heartbeat-test"),
+            SigningKey::from_bytes(&[7; 32]),
+            interval,
+            cancel.clone(),
+            bridge_cancel.clone(),
+        ));
+        settle().await;
+        assert!(!handle.is_finished(), "no tick has run before one interval");
+
+        tokio::time::advance(interval + std::time::Duration::from_secs(1)).await;
+        settle().await;
+        assert!(
+            handle.is_finished(),
+            "the first tick after the Supervisor dropped must stop the scheduler"
+        );
+        handle.await.unwrap();
+        assert!(
+            !cancel.is_cancelled(),
+            "the subscription token is untouched"
+        );
+        assert!(
+            !bridge_cancel.is_cancelled(),
+            "the bridge token is untouched"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn scheduler_loop_ticks_on_interval_and_consumes_first_immediate_tick() {
         use std::sync::Arc;

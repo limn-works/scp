@@ -92,8 +92,7 @@ final class ScpClassTests: XCTestCase {
         // Already shut down by tearDown; directly exercise a fresh one here.
         let extra = try SCP(storage: .inMemory)
         try await extra.shutdown(timeout: 1)
-        // Second call must not throw — the SDK surface treats
-        // AlreadyShutDown as a harmless no-op.
+        // A second call on an in-memory instance does not throw.
         try await extra.shutdown(timeout: 1)
     }
 

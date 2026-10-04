@@ -300,9 +300,8 @@ impl PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the tokio runtime is unavailable, and
-    /// `ValidationError` with `SCP-STORAGE-8005` when the durable store still
-    /// holds its advisory lock after the call.
+    /// Raises `ValidationError` with `SCP-STORAGE-8005` when the durable store
+    /// still holds its advisory lock after the call.
     pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {
         let timeout = Duration::from_millis(timeout_millis);
         let rt = crate::runtime()?;

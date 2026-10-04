@@ -2594,6 +2594,7 @@ impl CoreFields {
                     }
                 }
             }
+            let has_durable_store = store_closer.is_some();
             let supervisor = Arc::clone(supervisor);
             let mut drain_then_close = tokio::spawn(async move {
                 supervisor.shutdown_all_contexts().await;
@@ -2605,17 +2606,16 @@ impl CoreFields {
                 Ok(Err(join_error)) => {
                     tracing::error!(
                         error = %join_error,
-                        "Supervisor drain panicked during shutdown — the durable store \
-                         was not closed and keeps its advisory lock"
+                        "{}",
+                        drain_panicked_message(has_durable_store)
                     );
                     SupervisorDrain::Panicked
                 }
                 Err(_elapsed) => {
                     tracing::warn!(
                         budget_ms = budget.as_millis(),
-                        "Supervisor drain exceeded the shutdown deadline — tracked tasks \
-                         keep running, and the durable store keeps its advisory lock until \
-                         the last one exits"
+                        "{}",
+                        drain_timed_out_message(has_durable_store)
                     );
                     // Detach, never abort: the task closes the store itself
                     // once the drain finishes, and logs a close failure, since
@@ -2624,7 +2624,8 @@ impl CoreFields {
                         match drain_then_close.await {
                             Ok(Ok(())) => {
                                 tracing::info!(
-                                    "late Supervisor drain finished; durable store closed"
+                                    "{}",
+                                    late_drain_finished_message(has_durable_store)
                                 );
                             }
                             Ok(Err(e)) => tracing::error!(
@@ -2634,8 +2635,8 @@ impl CoreFields {
                             ),
                             Err(join_error) => tracing::error!(
                                 error = %join_error,
-                                "late Supervisor drain panicked — the durable store was not \
-                                 closed and keeps its advisory lock"
+                                "late {}",
+                                drain_panicked_message(has_durable_store)
                             ),
                         }
                     });
@@ -2743,6 +2744,38 @@ enum SupervisorDrain {
     Pending,
     /// The drain task panicked. The store was not closed.
     Panicked,
+}
+
+/// Log line for a Supervisor drain task that panicked. A durable store is
+/// named only when the instance has one.
+const fn drain_panicked_message(has_durable_store: bool) -> &'static str {
+    if has_durable_store {
+        "Supervisor drain panicked during shutdown — the durable store was not closed and \
+         keeps its advisory lock"
+    } else {
+        "Supervisor drain panicked during shutdown"
+    }
+}
+
+/// Log line for a Supervisor drain that missed the shutdown deadline. A
+/// durable store is named only when the instance has one.
+const fn drain_timed_out_message(has_durable_store: bool) -> &'static str {
+    if has_durable_store {
+        "Supervisor drain exceeded the shutdown deadline — tracked tasks keep running, and the \
+         durable store keeps its advisory lock until the last one exits"
+    } else {
+        "Supervisor drain exceeded the shutdown deadline — tracked tasks keep running"
+    }
+}
+
+/// Log line for a detached Supervisor drain that finished after the
+/// deadline. A durable store is named only when the instance has one.
+const fn late_drain_finished_message(has_durable_store: bool) -> &'static str {
+    if has_durable_store {
+        "late Supervisor drain finished; durable store closed"
+    } else {
+        "late Supervisor drain finished"
+    }
 }
 
 /// Runs `store_closer` when one exists.
@@ -3029,6 +3062,10 @@ pub trait BridgeInstanceCore: Send + Sync {
         // closes this instance's `SQLCipher` handle, and a node started on
         // that handle must not still be writing when it does.
         self.core().stop_borrowers();
+        // Release stream receivers before the drain: their pumps run on the
+        // Supervisor's tracker and settle only once their receiver drops, so
+        // the drain would otherwise wait on them until the deadline.
+        self.release_streams();
         let result = self
             .core()
             .shutdown_core_async(timeout, self.durable_store_closer())
@@ -3047,6 +3084,13 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// [`Self::bridge_specific_shutdown`], which runs whether or not the
     /// drain finished.
     fn durable_store_closer(&self) -> Option<DurableStoreCloser>;
+
+    /// Override hook for per-bridge concrete structs to drop their outlet-
+    /// stream and streaming-saga registries. [`Self::shutdown`] calls it
+    /// before the Supervisor drain, because each registry entry holds the
+    /// receiver whose drop lets a tracked pump settle. The default
+    /// implementation is a no-op.
+    fn release_streams(&self) {}
 
     /// Override hook for per-bridge concrete structs to drop their
     /// bridge-specific typed fields (MCP registries, custody store, etc.).
@@ -5260,7 +5304,8 @@ mod tests {
             None
         }
         // `shutdown` inherits the trait default (landed in commit 6 of
-        // ADR-049): `self.core().shutdown_core_async(timeout, closer).await +
+        // ADR-049): `self.release_streams()`, then
+        // `self.core().shutdown_core_async(timeout, closer).await +
         // self.bridge_specific_shutdown()`. Overriding it here would
         // diverge from production behavior and be caught by the
         // cross-bridge consistency gate.
@@ -5403,6 +5448,50 @@ mod tests {
             core: CoreFields::with_supervisor(supervisor),
             storage,
         }
+    }
+
+    /// Bridge whose `release_streams` frees the gate a tracked writer waits
+    /// on, standing in for a stream pump that settles once its receiver drops.
+    struct StreamReleasingBridge {
+        inner: SqliteBackedBridge,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeInstanceCore for StreamReleasingBridge {
+        fn core(&self) -> &CoreFields {
+            &self.inner.core
+        }
+        fn durable_store_closer(&self) -> Option<DurableStoreCloser> {
+            self.inner.durable_store_closer()
+        }
+        fn release_streams(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    /// `shutdown` releases stream receivers before the Supervisor drain, so a
+    /// writer that exits only once its stream is released lets the drain
+    /// finish inside the deadline and the store close.
+    #[tokio::test]
+    async fn shutdown_releases_streams_before_the_drain() {
+        let dir = unique_store_dir("release-streams");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let bridge = StreamReleasingBridge {
+            inner: sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await,
+            gate,
+        };
+        let outcome = bridge
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown reports an outcome");
+        assert!(
+            !matches!(outcome, ShutdownOutcome::TimedOut { .. }),
+            "the drain must not wait on a writer that release_streams frees, got {outcome:?}"
+        );
+        assert!(sdk_shutdown_result(Ok(outcome)).is_ok());
+        drop(scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY).expect("reopen"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A shutdown whose Supervisor drain misses the deadline reports
@@ -5634,6 +5723,26 @@ mod tests {
             !unused.load(Ordering::SeqCst),
             "a losing call runs no closer"
         );
+    }
+
+    /// The drain log lines name a durable store only for an instance that has
+    /// one.
+    #[test]
+    fn drain_log_lines_name_the_store_only_when_one_exists() {
+        for message in [
+            drain_panicked_message(true),
+            drain_timed_out_message(true),
+            late_drain_finished_message(true),
+        ] {
+            assert!(message.contains("durable store"), "{message}");
+        }
+        for message in [
+            drain_panicked_message(false),
+            drain_timed_out_message(false),
+            late_drain_finished_message(false),
+        ] {
+            assert!(!message.contains("store"), "{message}");
+        }
     }
 
     /// The SDK surface reports success only when no durable store is left

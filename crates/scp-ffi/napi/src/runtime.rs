@@ -711,6 +711,17 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         self.protocol_repository.durable_store_closer()
     }
 
+    fn release_streams(&self) {
+        // Drop every live §5.4.5 stream on this instance — dropping the
+        // `StreamEntry` `Arc`s releases the control handle + chunk receiver, so
+        // any parked pump task winds down (SCP-OUT-037, C8a).
+        self.outlet_stream_registry.clear();
+        // Drop every live §5.4.5 / §6.2.4 cross-context streaming saga on this
+        // instance — dropping the `StreamingSagaEntry` `Arc`s releases each
+        // saga's chunk receiver (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
+    }
+
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping the `Arc<NapiKeyCustody>` values
         // (callback custody in production, in-memory custody under
@@ -725,14 +736,6 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
-        // Drop every live §5.4.5 stream on this instance — dropping the
-        // `StreamEntry` `Arc`s releases the control handle + chunk receiver, so
-        // any parked pump task winds down (SCP-OUT-037, C8a).
-        self.outlet_stream_registry.clear();
-        // Drop every live §5.4.5 / §6.2.4 cross-context streaming saga on this
-        // instance — dropping the `StreamingSagaEntry` `Arc`s releases each
-        // saga's chunk receiver (SCP-OUT-047).
-        self.outlet_streaming_saga_registry.clear();
         // Reset the full-stack test network slot. Best-effort: on lock
         // poisoning we leave the slot alone — a poisoned mutex means
         // another thread panicked while holding it, which is a larger

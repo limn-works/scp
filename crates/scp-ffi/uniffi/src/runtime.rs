@@ -1270,6 +1270,16 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         self.protocol_repository.durable_store_closer()
     }
 
+    fn release_streams(&self) {
+        // Drop every live streaming-outlet session (and its billing pump `Arc`)
+        // on shutdown, matching the PyO3 / NAPI bridges.
+        self.outlet_stream_registry.clear();
+        // Drop every live cross-context streaming saga (releasing each saga's
+        // chunk receiver `Arc`) on shutdown, matching the PyO3 / NAPI bridges
+        // (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
+    }
+
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping `Arc<UniffiKeyCustody>` values
         // zeroizes any key material they hold via the custody provider's
@@ -1282,13 +1292,6 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
-        // Drop every live streaming-outlet session (and its billing pump `Arc`)
-        // on shutdown, matching the PyO3 / NAPI bridges.
-        self.outlet_stream_registry.clear();
-        // Drop every live cross-context streaming saga (releasing each saga's
-        // chunk receiver `Arc`) on shutdown, matching the PyO3 / NAPI bridges
-        // (SCP-OUT-047).
-        self.outlet_streaming_saga_registry.clear();
         // Clear identity-link-attestation and context-handle registries.
         // Migrated off module-level `OnceLock` statics in bridge.rs in
         // #1549 Phase 4 PR 2 commit 6. Dropping `Arc<ContextHandle>`

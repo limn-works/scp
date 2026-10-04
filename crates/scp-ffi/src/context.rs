@@ -2519,15 +2519,7 @@ impl crate::scp::PyScp {
             rt.block_on(async move {
                 sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
                     .await
-                    .map_err(|e| match e {
-                        // The core's empty-ceiling rejection stays typed so
-                        // it surfaces with its validation code
-                        // (construction.md M2).
-                        scp_core::context::builder::ContextCreationError::StateTransition(
-                            inner @ scp_core::context::ContextError::CeilingRequired(_),
-                        ) => inner,
-                        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
-                    })?;
+                    .map_err(create_context_failure)?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
@@ -2544,13 +2536,10 @@ impl crate::scp::PyScp {
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
-                match e {
-                    scp_core::context::ContextError::CeilingRequired(_) => {
-                        PyErr::from(crate::error::ScpPyError::from(e))
-                    }
-                    other => PyRuntimeError::new_err(format!(
-                        "ContextManager create_context failed: {other}"
-                    )),
+                if keeps_create_failure_code(&e) {
+                    PyErr::from(crate::error::ScpPyError::from(e))
+                } else {
+                    PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
                 }
             })?;
         }
@@ -6329,6 +6318,32 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Whether a refused create keeps its typed SDK code: the core's empty-ceiling
+/// rejection keeps its validation code (construction.md M2), and a create
+/// refused because Supervisor shutdown began keeps SCP-CTX-2138.
+const fn keeps_create_failure_code(e: &scp_core::context::ContextError) -> bool {
+    matches!(
+        e,
+        scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_)
+    )
+}
+
+/// Flattens a refused create to a [`scp_core::context::ContextError`], keeping
+/// the variants [`keeps_create_failure_code`] names typed.
+fn create_context_failure(
+    e: scp_core::context::builder::ContextCreationError,
+) -> scp_core::context::ContextError {
+    match e {
+        scp_core::context::builder::ContextCreationError::StateTransition(inner)
+            if keeps_create_failure_code(&inner) =>
+        {
+            inner
+        }
+        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests (SCP-216)
 // ---------------------------------------------------------------------------
@@ -6339,6 +6354,29 @@ mod tests {
     use super::*;
     use crate::runtime::RECEIVE_BUFFER_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A create refused because Supervisor shutdown began stays typed and maps
+    /// to SCP-CTX-2138; an unrelated create failure is flattened.
+    #[test]
+    fn create_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::builder::ContextCreationError;
+        let shut_down = create_context_failure(ContextCreationError::StateTransition(
+            scp_core::context::ContextError::SupervisorShutDown("create".to_owned()),
+        ));
+        assert!(keeps_create_failure_code(&shut_down));
+        match crate::error::ScpPyError::from(shut_down) {
+            crate::error::ScpPyError::ContextError { code, .. } => {
+                assert_eq!(code, scp_ffi_common::error_codes::CTX_2138);
+            }
+            other => panic!("expected a context error, got {other:?}"),
+        }
+        let flattened = create_context_failure(ContextCreationError::TransportNotConnected);
+        assert!(!keeps_create_failure_code(&flattened));
+        assert!(matches!(
+            flattened,
+            scp_core::context::ContextError::CreationFailed(_)
+        ));
+    }
 
     fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
         std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())

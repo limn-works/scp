@@ -830,6 +830,19 @@ impl BridgeInstanceCore for PyBridgeInstance {
             .and_then(StorageProvider::durable_store_closer)
     }
 
+    fn release_streams(&self) {
+        // Clear the outlet-stream registry so every live stream's
+        // `StreamSessionHandle` (and its detached chunk receiver) drops —
+        // dropping the receiver closes the channel and lets the off-mailbox
+        // pump observe the close and settle out during instance shutdown.
+        self.outlet_stream_registry.clear();
+        // Clear the cross-context streaming-saga registry so every live saga
+        // stream's chunk receiver drops — dropping the receiver closes the
+        // channel and lets the off-mailbox seal task observe the close and
+        // settle out during instance shutdown (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
+    }
+
     fn bridge_specific_shutdown(&self) {
         // Clear the identity registry so held `Arc<FfiKeyCustody>` entries
         // drop, triggering `Zeroizing` on key material.
@@ -842,16 +855,6 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
-        // Clear the outlet-stream registry so every live stream's
-        // `StreamSessionHandle` (and its detached chunk receiver) drops —
-        // dropping the receiver closes the channel and lets the off-mailbox
-        // pump observe the close and settle out during instance shutdown.
-        self.outlet_stream_registry.clear();
-        // Clear the cross-context streaming-saga registry so every live saga
-        // stream's chunk receiver drops — dropping the receiver closes the
-        // channel and lets the off-mailbox seal task observe the close and
-        // settle out during instance shutdown (SCP-OUT-047).
-        self.outlet_streaming_saga_registry.clear();
         // Reset lifecycle-owned typed slots so their held URLs / networks
         // do not survive past shutdown. Best-effort: on lock poisoning
         // we swallow the error and leave the slot alone — a poisoned
