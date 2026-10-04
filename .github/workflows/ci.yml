@@ -13,6 +13,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # CARGO_INCREMENTAL=0 turns off incremental compilation, which a CI job that compiles
+  # a tree once gains nothing from. `Swatinem/rust-cache` hashes every CARGO_* variable
+  # into its cache key, so the value also has to match across every job that shares a
+  # cache group.
+  CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
@@ -428,7 +433,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
@@ -498,7 +502,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
@@ -640,7 +643,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
 
@@ -776,7 +778,6 @@ jobs:
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
-      - uses: dtolnay/rust-toolchain@stable
       # This job reads the `workspace-debug` cache group for its registry alone,
       # the way job shipped-feature-graph does: the twelve `cargo tree`
       # resolutions the suite drives download the index and the `.crate` files,
@@ -1003,9 +1004,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       # Reads the `wasm32` group typescript-wasm-check writes. This command compiles
       # under the dev profile and that job builds under release, so what this restore
       # supplies is the registry — the crates.io sources every dependency of these nine
@@ -1025,9 +1023,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1061,9 +1056,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
       - run: cargo fmt --all -- --check
 
   # ── Why this job is a three-leg matrix ──────────────────────────────────────
@@ -1105,9 +1097,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       # scripts/check-examples-compile.sh parses cargo metadata with jq, which
       # the runner image ships. This step fails the job by name if an image drops it.
       - name: Require jq
@@ -1280,7 +1269,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1364,7 +1352,6 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1519,7 +1506,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
         with:
@@ -1618,7 +1604,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
         with:
@@ -1738,7 +1723,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1836,7 +1820,6 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -2066,8 +2049,8 @@ jobs:
   # (5.0 min), spent 2.6 of its 4.4 min installing a toolchain, restoring the cargo
   # cache and building that cdylib, and ended at 9.4 min, while kotlin-test ended at
   # 6.1 min. Waiting for kotlin-test and downloading costs about 1.1 min of start time
-  # and saves the 2.6, and a separate producer job would pay its own checkout,
-  # toolchain and cache steps for a build kotlin-test still needs before its tests.
+  # and saves the 2.6, and a separate producer job would pay its own checkout, cache
+  # restore and toolchain install for a build kotlin-test still needs before its tests.
   #
   # WHICH FEATURE SETS ARE THE SAME, read out of the manifests rather than off the
   # command lines, because the four consumers spell one set three ways:
@@ -2118,7 +2101,7 @@ jobs:
   # reports a downloaded artifact kept for fewer days.
   #
   # REUSE ACROSS RUNS. Each producer restores its artifact files from `actions/cache`
-  # under the key below, and skips the toolchain, cargo-cache and build steps when the
+  # under the key below, and skips the cargo-cache and build steps when the
   # key hits. The upload runs either way, so consumers download the same artifact name
   # and path on a hit and on a miss.
   # The key holds:
@@ -2231,8 +2214,6 @@ jobs:
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -2335,8 +2316,6 @@ jobs:
         with:
           path: target/ci-bridge/libscp_ffi_napi.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -2419,8 +2398,6 @@ jobs:
             bindings/swift/Headers
             bindings/swift/Sources/SCP/Internal/ScpBindings.swift
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/swift/build-xcframework.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -2553,8 +2530,6 @@ jobs:
         with:
           path: bindings/python/scp_sdk/_scp_core*.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'bindings/python/pyproject.toml') }}-${{ steps.artifact-inputs.outputs.digest }}
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -2865,9 +2840,6 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm32
@@ -2937,9 +2909,6 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: wasm32
@@ -3227,8 +3196,6 @@ jobs:
       - name: Mark the start of the build
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
@@ -3298,8 +3265,8 @@ jobs:
         working-directory: bindings/kotlin
         env:
           # Read by `cargoTargetDir` in bindings/kotlin/scp-kt/build.gradle.kts in place
-          # of a `cargo metadata` call, which on a cache hit would make rustup install the
-          # pinned toolchain this job skipped.
+          # of a `cargo metadata` call, which on a cache hit, where no cargo command has
+          # run, would make rustup install the pinned toolchain for that call alone.
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           # Set JNA library path to find the compiled Rust cdylib
