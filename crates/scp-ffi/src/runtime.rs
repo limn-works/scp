@@ -1800,8 +1800,8 @@ pub fn read_live_context_state(
 }
 
 /// Reads `context_id`'s role state for an authorization decision after its
-/// supervisor actor reports `Active`, and withholds the lifecycle state and
-/// every read failure from the refusal.
+/// supervisor actor reports `Active`, and withholds the lifecycle state from
+/// the refusal.
 ///
 /// The UCAN entry points in `ucan.rs` (`ucan_validate`, `ucan_evaluate`,
 /// `ucan_mint`, `ucan_delegate`, `ucan_revoke`) take their ceiling and creator
@@ -1811,11 +1811,17 @@ pub fn read_live_context_state(
 /// authorization. The function makes two mailbox round trips, the lifecycle
 /// state read and then the [`live_role_state`] read, and a fault can land
 /// between them. The refusal therefore reads the same for every non-`Active`
-/// state, for a context no actor serves, and for a failure of either read: a
-/// context mid-respawn or past a failed respawn (`ActorCrashed`), a poisoned
-/// context (`ContextPoisoned`), an actor that did not answer (`ActorBusy`),
+/// state, for a context no actor serves, and for an actor fault either read
+/// meets: a context mid-respawn or past a failed respawn (`ActorCrashed`), a
+/// poisoned context (`ContextPoisoned`), an actor that did not answer (`ActorBusy`),
 /// and an actor that returned no role state refuse with the same text and the
 /// caller's code, and the text never names the context.
+///
+/// The function resolves the bridge's supervisor and runs the lifecycle read
+/// on it before it applies that rule, and returns their errors unchanged: a
+/// suspended bridge, a bridge with no `ContextManager` attached, and a failed
+/// sync-to-async bridge describe the caller's bridge or runtime, not the
+/// context.
 ///
 /// `mk_err` wraps the refusal message in the error variant and the error code
 /// the calling entry point reports.
@@ -1823,8 +1829,14 @@ pub fn read_live_context_state(
 /// # Errors
 ///
 /// Returns whatever `mk_err` builds when the supervisor reports any state other
-/// than `Active`, when no actor serves `context_id`, when the state read fails,
-/// and when the role-state read fails or finds no role state.
+/// than `Active`, when no actor serves `context_id`, when the context's actor
+/// did not answer either read, was mid-respawn, past a failed respawn or
+/// poisoned, and when the role-state read finds no role state.
+///
+/// Returns the [`supervisor`] error unchanged when the bridge is suspended or
+/// has no `ContextManager` attached, and the `block_on_supervisor_query`
+/// error unchanged when the lifecycle read cannot reach the supervisor from
+/// this thread.
 pub fn active_role_state_before_authz<F>(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1834,12 +1846,12 @@ pub fn active_role_state_before_authz<F>(
 where
     F: FnOnce(String) -> ScpPyError,
 {
-    withhold_before_authz(
-        read_live_context_state(bi, context_id),
-        || live_role_state(bi, context_id),
-        verb,
-        mk_err,
-    )
+    let sup = Arc::clone(supervisor(bi)?);
+    let ctx = context_id.to_owned();
+    let state =
+        block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
+            .map_err(ScpPyError::from);
+    withhold_before_authz(state, || live_role_state(bi, context_id), verb, mk_err)
 }
 
 /// Applies the [`active_role_state_before_authz`] refusal rule to a lifecycle

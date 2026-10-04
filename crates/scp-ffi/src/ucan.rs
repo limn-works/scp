@@ -248,10 +248,9 @@ fn require_revocable_ucan_context(
 /// Each of the five entry points reads the context's capability ceiling or
 /// creator from the supervisor actor (ADR-016 steps 4 and 8), so each first
 /// asks that actor whether it still serves the context and then reads the role
-/// state. A context the supervisor closed, tombstoned or poisoned, one no actor
-/// serves, and a failure of either read refuse here with `SCP-CTX-2023`. The
-/// refusal withholds the lifecycle state and the read failure, because the
-/// gate runs before the caller is authorized.
+/// state. A context the supervisor closed, tombstoned or poisoned, and one no
+/// actor serves, refuse here with `SCP-CTX-2023`. The refusal withholds the
+/// lifecycle state, because the gate runs before the caller is authorized.
 fn active_ucan_role_state(
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
@@ -305,9 +304,8 @@ impl crate::scp::PyScp {
     /// insufficient capabilities, revoked token, nonce replay, etc.
     ///
     /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
-    /// actor reports any state other than `Active`, when no actor serves the
-    /// context, or when its state read or role-state read fails; the message
-    /// withholds the lifecycle state and the read failure.
+    /// actor reports any state other than `Active` or when no actor serves the
+    /// context; the message withholds the lifecycle state.
     ///
     /// See ADR-016 §5 for the full 11-step validation specification.
     #[pyo3(signature = (context_id, token, capability, presenting_agent_did, proof_tokens=None))]
@@ -445,9 +443,8 @@ impl crate::scp::PyScp {
     /// reported via the returned booleans, not as exceptions.
     ///
     /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
-    /// actor reports any state other than `Active`, when no actor serves the
-    /// context, or when its state read or role-state read fails; the message
-    /// withholds the lifecycle state and the read failure.
+    /// actor reports any state other than `Active` or when no actor serves the
+    /// context; the message withholds the lifecycle state.
     ///
     /// See ADR-016 §5 and `CapabilityValidation` in scp-core.
     #[pyo3(signature = (context_id, token, capability, presenting_agent_did, proof_tokens=None))]
@@ -571,9 +568,8 @@ impl crate::scp::PyScp {
     /// ceiling, issuer not authorized, signing fails, etc.
     ///
     /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
-    /// actor reports any state other than `Active`, when no actor serves the
-    /// context, or when its state read or role-state read fails; the message
-    /// withholds the lifecycle state and the read failure.
+    /// actor reports any state other than `Active` or when no actor serves the
+    /// context; the message withholds the lifecycle state.
     ///
     /// Raises `ContextError` with `SCP-CTX-2001` when the supervisor admits the
     /// context but this bridge holds no state for it.
@@ -688,9 +684,8 @@ impl crate::scp::PyScp {
     /// audience, capabilities wider than parent, signing failure, etc.
     ///
     /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
-    /// actor reports any state other than `Active`, when no actor serves the
-    /// context, or when its state read or role-state read fails; the message
-    /// withholds the lifecycle state and the read failure.
+    /// actor reports any state other than `Active` or when no actor serves the
+    /// context; the message withholds the lifecycle state.
     ///
     /// Raises `ContextError` with `SCP-CTX-2001` when the supervisor admits the
     /// context but this bridge holds no state for it.
@@ -815,9 +810,8 @@ impl crate::scp::PyScp {
     /// token, or event log append failure.
     ///
     /// Raises `ContextError` with `SCP-CTX-2023` when the context's supervisor
-    /// actor reports any state other than `Active`, when no actor serves the
-    /// context, or when its state read or role-state read fails; the message
-    /// withholds the lifecycle state and the read failure.
+    /// actor reports any state other than `Active` or when no actor serves the
+    /// context; the message withholds the lifecycle state.
     ///
     /// Raises `ContextError` with `SCP-CTX-2001` when the supervisor admits the
     /// context but this bridge holds no state for it.
@@ -1690,6 +1684,97 @@ mod tests {
             }
             crate::runtime::remove_context(bi, &ctx_id);
         }
+    }
+
+    /// Every UCAN entry point returns the bridge's own error unchanged when the
+    /// bridge is suspended or has no `ContextManager` attached, and never the
+    /// withheld `SCP-CTX-2023` refusal: that state belongs to the caller's
+    /// bridge instance, not to the context, so a caller told the context is not
+    /// active would never learn to call `resume()`. The suspended bridge serves
+    /// an `Active` context its gate admits before the suspend, so each refusal
+    /// comes from the suspend and not from the context.
+    #[test]
+    fn every_ucan_entry_point_returns_a_bridge_instance_error_unchanged() {
+        let creator = "did:dht:z6MkUcanGateSuspended";
+        let calls = |scp: &crate::scp::PyScp, ctx_id: &str| -> [(&'static str, PyResult<()>); 5] {
+            [
+                (
+                    "validate",
+                    scp.ucan_validate(ctx_id, "aaa.bbb.ccc", "messages:write", creator, None)
+                        .map(drop),
+                ),
+                (
+                    "evaluate",
+                    scp.ucan_evaluate(ctx_id, "aaa.bbb.ccc", Some("messages:write"), creator, None)
+                        .map(drop),
+                ),
+                (
+                    "mint",
+                    scp.ucan_mint(
+                        ctx_id,
+                        "did:dht:z6MkUcanGateSuspendedAudience",
+                        vec!["messages:write".to_owned()],
+                        None,
+                    )
+                    .map(drop),
+                ),
+                (
+                    "delegate",
+                    scp.ucan_delegate(
+                        ctx_id,
+                        creator,
+                        "did:dht:z6MkUcanGateSuspendedAudience",
+                        "aaa.bbb.ccc",
+                        vec!["messages:write".to_owned()],
+                    )
+                    .map(drop),
+                ),
+                ("revoke", scp.ucan_revoke(ctx_id, "aaa.bbb.ccc", creator)),
+            ]
+        };
+
+        crate::init_runtime().ok();
+        let suspended = crate::scp::PyScp::new_in_memory_for_test();
+        let ctx_id = format!("ucan-gate-suspended-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(&suspended.inner, &ctx_id, creator, &[]).unwrap();
+        crate::runtime::create_supervisor_context_for_test(
+            &suspended.inner,
+            &ctx_id,
+            creator,
+            &["messages:read".to_owned(), "messages:write".to_owned()],
+        );
+        active_ucan_role_state(&suspended.inner, &ctx_id, "validate a UCAN in context")
+            .expect("the gate must admit the Active context before the suspend");
+        suspended.suspend().expect("suspend");
+
+        let unattached = crate::scp::PyScp::new_in_memory_for_test();
+        assert!(
+            !unattached.inner.core.has_supervisor(),
+            "the fixture must leave the bridge with no ContextManager attached"
+        );
+
+        for (bridge, scp, expected) in [
+            ("suspended", &suspended, "bridge is suspended"),
+            ("unattached", &unattached, "ContextManager not yet attached"),
+        ] {
+            for (entry_point, result) in calls(scp, &ctx_id) {
+                let message = format!(
+                    "{}",
+                    result.expect_err("a bridge that cannot reach its supervisor must refuse")
+                );
+                assert!(
+                    message.contains(expected),
+                    "{entry_point} ({bridge}) must return the bridge's own error: {message}"
+                );
+                assert!(
+                    !message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && !message.contains("SCP-CTX-2023"),
+                    "{entry_point} ({bridge}) must not report bridge state as the withheld \
+                     context refusal: {message}"
+                );
+            }
+        }
+        crate::runtime::remove_context(&suspended.inner, &ctx_id);
     }
 
     /// `ucan_evaluate` reads the same two supervisor-owned inputs the enforcing
