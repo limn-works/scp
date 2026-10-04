@@ -181,12 +181,7 @@ impl<S: Storage> ProtocolRepository<S> {
         key: &[u8; 32],
     ) -> Result<(), StoreError> {
         let storage_key = bridge_credential_root_key(bridge_id)?;
-        // Wrap the `Vec` copy of the raw root key in `Zeroizing` so the heap
-        // buffer is scrubbed on drop — `store_value_zeroize` only scrubs the
-        // *serialized* envelope, not this intermediate. The root key is the
-        // single secret gating all credential decryption for the bridge.
-        let raw = Zeroizing::new(key.to_vec());
-        self.store_value_zeroize(&storage_key, &*raw).await
+        self.store_value_zeroize(&storage_key, key.as_slice()).await
     }
 
     /// Loads a bridge's root credential key, wrapped in [`Zeroizing`].
