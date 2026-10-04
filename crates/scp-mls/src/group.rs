@@ -21,7 +21,7 @@ use crate::convergent_timestamp::encode_convergent_timestamp_aad;
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
 use crate::lifetime::{
-    key_package_lifetime, validate_key_package_lifetime, validate_own_join_leaf_lifetime,
+    key_package_lifetime, validate_key_package_lifetime_for_add, validate_own_join_leaf_lifetime,
     validate_tree_leaf_lifetime_ranges,
 };
 use openmls::group::GroupContext;
@@ -606,7 +606,11 @@ pub struct AddMemberResult {
 ///   key package (which runs its own un-injectable internal `Lifetime::validate`
 ///   against openmls's clock), the accepted `Lifetime` is *additionally*
 ///   re-validated against this hardened clock — and checked for the RFC 9420
-///   maximum-range bound openmls never applies (ADR-057 §Prereq-1).
+///   maximum-range bound openmls never applies (ADR-057 §Prereq-1) and for at
+///   least [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`](crate::lifetime::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS)
+///   remaining and a `not_before` at least
+///   [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`](crate::lifetime::KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS)
+///   old (security-model spec §9.7.1, the adder).
 ///
 /// # Returns
 ///
@@ -618,7 +622,8 @@ pub struct AddMemberResult {
 /// Returns [`MlsError::AddMemberFailed`] if `OpenMLS` rejects the add operation.
 /// Returns [`MlsError::KeyPackageLifetimeInvalid`] if the accepted key package's
 /// `Lifetime` fails validation against the injected clock (expired, not yet
-/// valid, or over-long range).
+/// valid, over-long range, less than the minimum remaining lifetime, or a
+/// `not_before` younger than the minimum age).
 /// Returns [`MlsError::MergePendingCommitFailed`] if committing fails.
 ///
 /// See ADR-001 acceptance criterion 2.
@@ -637,7 +642,15 @@ pub fn add_member(
     // Re-validate the accepted `Lifetime` against the injected hardened clock,
     // and enforce the RFC 9420 maximum-range bound openmls's `validate` never
     // applies. This is additive hardening — it never replaces openmls's check.
-    validate_key_package_lifetime(verified_key_package.life_time(), clock)?;
+    // Security-model spec §9.7.1, the adder: also require the minimum remaining
+    // lifetime and the minimum `not_before` age. A Commit published at this
+    // check, and processed when a relay delivers it within its retention,
+    // then carries no KeyPackage expired under a receiver whose clock runs at
+    // most one hour ahead of this adder's, and every receiver whose clock
+    // runs at most 3,300 s behind it has reached `not_before` (openmls checks
+    // a received Add against the receiver's wall clock; §9.7.1 states every
+    // condition under which it still refuses the Commit).
+    validate_key_package_lifetime_for_add(verified_key_package.life_time(), clock)?;
 
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
@@ -764,7 +777,8 @@ pub fn add_member_with_convergent_timestamp(
 /// Returns [`MlsError::AddMemberFailed`] if the key package fails validation
 /// (bad signature, wrong protocol version, or an invalid/expired `Lifetime`),
 /// [`MlsError::KeyPackageLifetimeInvalid`] if the accepted `Lifetime` fails
-/// validation against the injected clock, or
+/// validation against the injected clock, including the add-side minimum
+/// remaining lifetime, or
 /// [`MlsError::CredentialSerializationFailed`] if the validated leaf
 /// credential is not a parseable SCP `BasicCredential`.
 pub fn key_package_in_did(
@@ -783,7 +797,7 @@ pub fn key_package_in_did(
     // SECURITY (ADR-057 §Prereq-1): mirror the hardened-clock re-validation
     // `add_member` performs, so the DID this function authenticates belongs to a
     // key package `add_member` will also accept (and vice versa).
-    validate_key_package_lifetime(verified.life_time(), clock)?;
+    validate_key_package_lifetime_for_add(verified.life_time(), clock)?;
 
     let credential = verified.leaf_node().credential().clone();
     let basic = BasicCredential::try_from(credential).map_err(|e| {
@@ -822,7 +836,8 @@ pub fn key_package_in_did(
 ///
 /// Returns [`MlsError::AddMemberFailed`] if the key package fails validation,
 /// [`MlsError::KeyPackageLifetimeInvalid`] if the accepted `Lifetime` fails the
-/// hardened-clock re-validation, or [`MlsError::ExtensionError`] if the leaf
+/// hardened-clock re-validation, including the add-side minimum remaining
+/// lifetime and minimum `not_before` age, or [`MlsError::ExtensionError`] if the leaf
 /// carries no (or a malformed) `scp_wrapping_key` extension.
 pub fn key_package_in_wrapping_key(
     key_package: &KeyPackageIn,
@@ -838,7 +853,7 @@ pub fn key_package_in_wrapping_key(
     // SECURITY (ADR-057 §Prereq-1): mirror the hardened-clock re-validation
     // `add_member` / `key_package_in_did` perform, so this accepts exactly the
     // key packages the add path accepts.
-    validate_key_package_lifetime(verified.life_time(), clock)?;
+    validate_key_package_lifetime_for_add(verified.life_time(), clock)?;
 
     crate::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())?.ok_or_else(
         || {
@@ -1158,10 +1173,11 @@ fn generate_key_package_inner(
     // clock as the rest of the client. Without this call `build()` falls back to
     // `Lifetime::default()` → `Lifetime::new()`, which reads openmls's INTERNAL
     // clock — under the wasm `js` feature `web_time::SystemTime`, an
-    // attacker-overridable `Date.now()`. Generation is fully routed. On the
-    // receive side, add_member / key_package_in_did / the staged-commit Add
-    // paths re-validate accepted `Lifetime`s against the injected clock, with
-    // openmls's internal `Lifetime::validate` also running on them, and
+    // attacker-overridable `Date.now()`. Generation is fully routed. The add paths
+    // (add_member / key_package_in_did / key_package_in_wrapping_key) re-validate
+    // accepted `Lifetime`s against the injected clock with the add-side minimum,
+    // a received Add (Commit or Proposal) is checked for range only, against no
+    // clock, and
     // `join_group_from_bytes` checks only the range of every other member's
     // KeyPackage-sourced Welcome tree leaf, against no clock, and checks the
     // joiner's own leaf against `own_clock` (see `crate::lifetime` module
@@ -1454,6 +1470,32 @@ pub fn group_holding_carol_leaf_over_max_range() -> Result<(ScpMlsGroup, u64), M
             .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
     }
     Ok((alice, over_long_not_after))
+}
+
+/// Test fixture: the local member of `group` proposes adding `key_package`.
+///
+/// It sends a bare Add proposal through openmls's `propose_add_member`, as
+/// any member of the group could, since SCP's own add path always commits.
+/// Returns the TLS-serialized proposal message.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed and
+/// [`MlsError::AddMemberFailed`] if openmls refuses the proposal or the
+/// proposal cannot be serialized.
+#[cfg(any(test, feature = "testing"))]
+pub fn propose_add_member_bare(
+    group: &mut ScpMlsGroup,
+    key_package: &KeyPackage,
+) -> Result<Vec<u8>, MlsError> {
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let (proposal, _proposal_ref) = g
+        .propose_add_member(&group.provider, signer, key_package)
+        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
+    proposal
+        .tls_serialize_detached()
+        .map_err(|e| MlsError::AddMemberFailed(format!("serializing the proposal: {e}")))
 }
 
 #[cfg(test)]
@@ -1996,6 +2038,89 @@ mod tests {
             alice.epoch().unwrap(),
             epoch_before + 1,
             "an accepted add advances the epoch"
+        );
+    }
+
+    /// Bob's fresh `KeyPackage` and the two adder clocks at the add-side
+    /// minimum's boundary: `not_after - MIN` (exactly the minimum remains) and
+    /// `not_after - MIN + 1` (one second short of it).
+    #[allow(clippy::unwrap_used)]
+    fn bob_key_package_and_min_boundary_clocks()
+    -> (KeyPackageIn, scp_clock::TestClock, scp_clock::TestClock) {
+        use crate::lifetime::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS;
+        let (bundle, _s, _p) = generate_key_package(&test_credential("bob"), &SystemClock).unwrap();
+        let not_after = bundle.key_package().life_time().not_after();
+        let at_min = scp_clock::TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+        let past_min =
+            scp_clock::TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1);
+        (bundle.key_package().clone().into(), at_min, past_min)
+    }
+
+    /// Security-model spec §9.7.1, the adder: `add_member` accepts a
+    /// `KeyPackage` with exactly the minimum remaining lifetime and refuses one
+    /// a second short of it, without moving the epoch.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn add_member_enforces_min_remaining_lifetime_boundary() {
+        let (bob_kp, at_min, past_min) = bob_key_package_and_min_boundary_clocks();
+        let mut alice = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        let epoch_before = alice.epoch().unwrap();
+
+        let err = add_member(&mut alice, bob_kp.clone(), &past_min)
+            .err()
+            .expect("one second short of the minimum must be refused");
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { now, .. } if now == past_min.now_secs()),
+            "expected KeyPackageLifetimeInvalid at the refused clock, got {err:?}"
+        );
+        assert_eq!(alice.epoch().unwrap(), epoch_before);
+
+        add_member(&mut alice, bob_kp, &at_min).unwrap();
+        assert_eq!(alice.epoch().unwrap(), epoch_before + 1);
+    }
+
+    /// `key_package_in_did` enforces the same minimum boundary as `add_member`.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn key_package_in_did_enforces_min_remaining_lifetime_boundary() {
+        let (bob_kp, at_min, past_min) = bob_key_package_and_min_boundary_clocks();
+        let err = key_package_in_did(&bob_kp, ProtocolVersion::Mls10, &past_min).unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expected KeyPackageLifetimeInvalid, got {err:?}"
+        );
+        assert_eq!(
+            key_package_in_did(&bob_kp, ProtocolVersion::Mls10, &at_min).unwrap(),
+            "did:dht:z6Mkbob"
+        );
+    }
+
+    /// `key_package_in_wrapping_key` enforces the same minimum boundary as
+    /// `add_member`.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn key_package_in_wrapping_key_enforces_min_remaining_lifetime_boundary() {
+        use crate::lifetime::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS;
+        let wk = [0x5A_u8; 32];
+        let (bundle, _s, _p) = generate_key_package_with_wrapping_key(
+            &test_credential("bob"),
+            Some(&wk),
+            &SystemClock,
+        )
+        .unwrap();
+        let not_after = bundle.key_package().life_time().not_after();
+        let kp: KeyPackageIn = bundle.key_package().clone().into();
+        let past_min =
+            scp_clock::TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1);
+        let err = key_package_in_wrapping_key(&kp, ProtocolVersion::Mls10, &past_min).unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expected KeyPackageLifetimeInvalid, got {err:?}"
+        );
+        let at_min = scp_clock::TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+        assert_eq!(
+            key_package_in_wrapping_key(&kp, ProtocolVersion::Mls10, &at_min).unwrap(),
+            wk
         );
     }
 

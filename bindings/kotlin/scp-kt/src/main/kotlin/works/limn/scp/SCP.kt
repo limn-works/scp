@@ -1458,7 +1458,10 @@ class SCP internal constructor(
     suspend fun isLocalDid(did: String): Boolean = inner.isLocalDid(did = did)
 
     /** Forwards to [NativeScp.mcpClientConnectSse] on [inner]. */
-    suspend fun mcpClientConnectSse(url: String): String = inner.mcpClientConnectSse(url = url)
+    suspend fun mcpClientConnectSse(
+        url: String,
+        authToken: String?,
+    ): String = inner.mcpClientConnectSse(url = url, authToken = authToken)
 
     /**
      * Forwards to [NativeScp.mcpClientConnectStdio] on [inner].

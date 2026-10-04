@@ -25,14 +25,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use openmls::prelude::*;
-use scp_clock::Clock;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 use crate::convergent_timestamp::decode_convergent_timestamp_aad;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
 
-use crate::lifetime::validate_key_package_lifetime;
+use crate::lifetime::validate_received_key_package_lifetime_range;
 use crate::wrapping_extension::extract_wrapping_key;
 
 /// Runs `MlsGroup::process_message` on an inbound protocol message and rejects
@@ -62,6 +61,30 @@ use crate::wrapping_extension::extract_wrapping_key;
 /// `PrivateMessage` whose sender is the local member, before decryption, so a
 /// member's own Commit sent as a `PrivateMessage` also arrives as
 /// `OwnPrivateMessage`.
+///
+/// # openmls's receive-side `Lifetime` clock check
+///
+/// This is SCP's one `process_message` call. openmls 0.9.0 checks a received
+/// Add's `KeyPackage` `Lifetime` against the receiver's wall clock inside it,
+/// in `KeyPackageIn::validate` (reached through `AddProposalIn::validate`) and
+/// in `validate_leaf_node` (reached through `stage_commit`), and offers no
+/// switch for either check. Security-model spec §9.7.1 forbids a receiver to
+/// reject an Add by its own clock; SCP's own receive-side check is range-only
+/// (`validate_received_key_package_lifetime_range`). SCP carries no openmls
+/// patch: the adder's `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` and
+/// `KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS` bound openmls's check, and §9.7.1
+/// states every condition under which it still refuses a Commit (on the
+/// `not_after` side, publication delay + relay hold + local processing
+/// latency + receiver clock lead reaching 7 days + 1 hour; on the
+/// `not_before` side, a receiver clock more than 3,300 s behind the adder's),
+/// each refusal surfacing here as [`MlsError::DecryptionFailed`].
+///
+/// Future path (ADR-057 Prerequisite 1, the future-path bullet under the
+/// residual bullet): once openmls takes a receive-side lifetime policy or a
+/// caller-supplied time, pass one here, on this call, that covers both of
+/// openmls's reads, `KeyPackageIn::validate` and `validate_leaf_node`. A
+/// policy that covers only `validate_leaf_node` leaves openmls's clock in the
+/// receive decision through `KeyPackageIn::validate`.
 fn process_inbound(
     g: &mut MlsGroup,
     provider: &crate::InMemoryMlsProvider,
@@ -89,14 +112,14 @@ fn process_inbound(
 /// The result of decrypting an MLS protocol message.
 ///
 /// MLS messages are not limited to application data — they may also be Commits
-/// (epoch changes) or Proposals (deferred operations cached by `OpenMLS`). This
+/// (epoch changes) or Proposals (deferred operations). This
 /// enum allows callers to distinguish message types and handle each correctly:
 ///
 /// - `Application` — user-generated plaintext with a sender DID.
 /// - `Commit` — epoch advancement; the group has been updated via
 ///   `merge_staged_commit`. No plaintext is produced.
-/// - `Proposal` — a deferred operation cached by `OpenMLS` during
-///   `process_message`. No plaintext is produced.
+/// - `Proposal` — a deferred operation, which openmls does not store. No
+///   plaintext is produced.
 ///
 /// Callers that only expect application messages should match on `Application`
 /// and treat `Commit`/`Proposal` as control messages (no user payload).
@@ -115,8 +138,8 @@ pub enum DecryptedContent {
         /// The sender's DID string extracted from the MLS credential.
         sender_did: String,
     },
-    /// A Proposal message cached by `OpenMLS` during `process_message`.
-    /// No explicit merge is needed — `OpenMLS` caches proposals automatically.
+    /// A Proposal message. openmls does not store it: a received proposal is
+    /// stored only through `store_pending_proposal`, which SCP does not call.
     Proposal {
         /// The sender's DID string extracted from the MLS credential.
         sender_did: String,
@@ -298,8 +321,10 @@ pub fn decrypt_with_sender_key(
 /// - **`StagedCommitMessage`** — calls `merge_staged_commit` to apply the
 ///   epoch change (preventing MLS group corruption), then returns
 ///   `DecryptedContent::Commit` with the sender DID.
-/// - **`ProposalMessage` / `ExternalJoinProposalMessage`** — proposals are
-///   cached by `OpenMLS` during `process_message` automatically. Returns
+/// - **`ProposalMessage` / `ExternalJoinProposalMessage`** — an Add proposal's
+///   `KeyPackage` `Lifetime` gets the clock-free range bound; no proposal is
+///   stored (openmls stores a received proposal only through
+///   `store_pending_proposal`, which SCP does not call). Returns
 ///   `DecryptedContent::Proposal` with the sender DID.
 ///
 /// # Arguments
@@ -314,24 +339,34 @@ pub fn decrypt_with_sender_key(
 /// fails (including credential parsing failure).
 /// Returns [`MlsError::CommitProcessingFailed`] if a staged commit cannot be
 /// merged after processing.
-/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if a Commit's Add proposal
-/// carries a `KeyPackage` whose `Lifetime` fails validation against the injected
-/// clock; the staged commit is dropped **without merging** (ADR-057 §Prereq-1).
-///
-/// # Arguments
-///
-/// * `clock` - The injected hardened [`Clock`]. For a Commit, each Add
-///   proposal's `KeyPackage` `Lifetime` is re-validated against it *before*
-///   `merge_staged_commit`, so an add carrying a forged/expired lifetime is
-///   rejected pre-merge — the openmls internal `Lifetime::validate` that ran
-///   during `process_message` is on the un-injectable (wasm: unhardened) clock.
+/// Returns [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] if an Add, in a
+/// Commit or in a Proposal, carries a `KeyPackage` whose `Lifetime` range is
+/// empty, inverted, or over the maximum; for a Commit the staged commit is
+/// dropped **without merging**. This check reads no clock: a receiver does not
+/// reject an Add because its `KeyPackage` has expired, or has not yet started,
+/// under the receiver's clock (security-model spec §9.7.1, `KeyPackage`
+/// `Lifetime` checks, the receiver).
 pub fn decrypt_with_sender_did(
     group: &mut ScpMlsGroup,
     ciphertext: &[u8],
-    clock: &dyn Clock,
 ) -> Result<DecryptedContent, MlsError> {
     let protocol_message = parse_protocol_message(group, ciphertext)?;
-    decrypt_protocol_message_with_sender_did(group, protocol_message, clock)
+    decrypt_protocol_message_with_sender_did(group, protocol_message)
+}
+
+/// Bounds the `KeyPackage` `Lifetime` of a received Add proposal to the maximum
+/// range, reading no clock (security-model spec §9.7.1, the receiver). Any
+/// other proposal type passes.
+///
+/// # Errors
+///
+/// Returns [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] for an Add
+/// whose `Lifetime` range is empty, inverted, or over the maximum.
+fn validate_received_proposal(proposal: &QueuedProposal) -> Result<(), MlsError> {
+    if let Proposal::Add(add) = proposal.proposal() {
+        validate_received_key_package_lifetime_range(add.key_package().life_time())?;
+    }
+    Ok(())
 }
 
 /// Parses inbound bytes into the `ProtocolMessage` the decrypt step consumes.
@@ -358,7 +393,6 @@ fn parse_protocol_message(
 fn decrypt_protocol_message_with_sender_did(
     group: &mut ScpMlsGroup,
     protocol_message: ProtocolMessage,
-    clock: &dyn Clock,
 ) -> Result<DecryptedContent, MlsError> {
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     // Rejects a self-authored echo before the sender lookup below.
@@ -393,17 +427,17 @@ fn decrypt_protocol_message_with_sender_did(
             sender_did,
         }),
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-            // SECURITY (ADR-057 §Prereq-1): re-validate each Add proposal's
-            // KeyPackage `Lifetime` against the injected hardened clock BEFORE
-            // merging. openmls validated these lifetimes during
-            // `process_message` against its own un-injectable (wasm: unhardened)
-            // clock; this bracket adds the hardened check + the RFC 9420
-            // max-range bound. On failure we return WITHOUT merging, so the
-            // group stays on its current epoch (fail-closed, not half-applied) —
-            // the same shape as the Remove-refusal in
+            // Security-model spec §9.7.1, the receiver: bound each Add
+            // proposal's KeyPackage `Lifetime` to the RFC 9420 maximum range
+            // BEFORE merging, reading no clock, so every honest receiver
+            // reaches the same verdict. On failure we return WITHOUT merging,
+            // so the group stays on its current epoch (fail-closed, not
+            // half-applied), the same shape as the Remove-refusal in
             // `decrypt_with_membership_changes`.
             for add in staged_commit.add_proposals() {
-                validate_key_package_lifetime(add.add_proposal().key_package().life_time(), clock)?;
+                validate_received_key_package_lifetime_range(
+                    add.add_proposal().key_package().life_time(),
+                )?;
             }
 
             // Merge the staged commit to advance the group epoch. Without
@@ -416,10 +450,11 @@ fn decrypt_protocol_message_with_sender_did(
                 })?;
             Ok(DecryptedContent::Commit { sender_did })
         }
-        ProcessedMessageContent::ProposalMessage(_)
-        | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-            // Proposals are cached by OpenMLS automatically during
-            // process_message — no explicit action needed.
+        ProcessedMessageContent::ProposalMessage(proposal)
+        | ProcessedMessageContent::ExternalJoinProposalMessage(proposal) => {
+            // §9.7.1, the receiver: an Add in a received Proposal gets the
+            // same clock-free range bound as an Add in a Commit.
+            validate_received_proposal(&proposal)?;
             Ok(DecryptedContent::Proposal { sender_did })
         }
         // `process_inbound` already rejected both variants; the arm keeps the
@@ -454,7 +489,7 @@ fn decrypt_protocol_message_with_sender_did(
 /// A Commit then gets the checks [`decrypt_with_sender_did`] runs: the
 /// `catch_unwind` guard around openmls's `process_message`, the mapping of the local member's own
 /// echoed message to [`MlsError::CannotDecryptOwnMessage`], and, before the
-/// merge, the injected-clock and maximum-range check on every Add proposal's
+/// merge, the clock-free maximum-range check on every Add proposal's
 /// `KeyPackage` `Lifetime`.
 ///
 /// Both [`crate::ratchet::process_commit`] and the runtime backend's
@@ -469,11 +504,7 @@ fn decrypt_protocol_message_with_sender_did(
 /// otherwise. On every error raised before the merge the group's epoch is
 /// unchanged; a storage error from openmls's `merge_staged_commit` can leave
 /// the group partly merged, so the caller treats the group as unusable.
-pub fn decrypt_commit(
-    group: &mut ScpMlsGroup,
-    commit_bytes: &[u8],
-    clock: &dyn Clock,
-) -> Result<(), MlsError> {
+pub fn decrypt_commit(group: &mut ScpMlsGroup, commit_bytes: &[u8]) -> Result<(), MlsError> {
     let protocol_message = parse_protocol_message(group, commit_bytes)?;
     let content_type = protocol_message.content_type();
     if content_type != ContentType::Commit {
@@ -486,7 +517,7 @@ pub fn decrypt_commit(
     // the content type for a PrivateMessage, and the signature and membership
     // tag do for a PublicMessage. Kept as a typed refusal rather than a panic.
     let DecryptedContent::Commit { .. } =
-        decrypt_protocol_message_with_sender_did(group, protocol_message, clock)?
+        decrypt_protocol_message_with_sender_did(group, protocol_message)?
     else {
         return Err(MlsError::CommitProcessingFailed(
             "message is not a Commit".to_string(),
@@ -579,8 +610,8 @@ pub enum InboundChange {
         /// order, read from the pre-merge tree.
         removed_dids: Vec<String>,
     },
-    /// A Proposal cached by `OpenMLS` during `process_message`. No plaintext and
-    /// no committed membership change yet.
+    /// A Proposal, which openmls does not store. No plaintext and no committed
+    /// membership change.
     Proposal {
         /// The sender's DID string extracted from the MLS credential.
         sender_did: String,
@@ -661,8 +692,8 @@ fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
 ///
 /// Each Add proposal's `KeyPackage` was already validated by `process_message`,
 /// so its DID is cryptographically authenticated. This pass additionally
-/// re-validates the `KeyPackage` `Lifetime` against the injected hardened clock
-/// (ADR-057 §Prereq-1) and enforces the sender-key-distribution fail-closed
+/// bounds the `KeyPackage` `Lifetime` to the maximum range, reading no clock
+/// (security-model spec §9.7.1, the receiver), and enforces the sender-key-distribution fail-closed
 /// requirement (INVARIANT 3): a leaf carrying no `scp_wrapping_key` extension is
 /// rejected via `?`, so the caller drops the staged commit unmerged and the group
 /// stays on its current epoch. A member no peer can HPKE-seal a sender key to must
@@ -670,18 +701,17 @@ fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if an Add proposal's
-/// `Lifetime` fails hardened-clock validation, [`MlsError::ExtensionError`] if a
+/// Returns [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] if an Add
+/// proposal's `Lifetime` range is empty, inverted, or over the maximum, [`MlsError::ExtensionError`] if a
 /// leaf carries no `scp_wrapping_key` extension, or a credential-parse error.
 fn recover_added_members_pre_merge(
     staged_commit: &StagedCommit,
-    clock: &dyn Clock,
 ) -> Result<(Vec<String>, Vec<[u8; 32]>), MlsError> {
     let mut added_dids = Vec::new();
     let mut added_wrapping_keys = Vec::new();
     for add in staged_commit.add_proposals() {
         let key_package = add.add_proposal().key_package();
-        validate_key_package_lifetime(key_package.life_time(), clock)?;
+        validate_received_key_package_lifetime_range(key_package.life_time())?;
         added_dids.push(credential_to_did(key_package.leaf_node().credential())?);
         let wrapping_key =
             extract_wrapping_key(key_package.leaf_node().extensions())?.ok_or_else(|| {
@@ -749,8 +779,9 @@ fn recover_added_members_pre_merge(
 ///   so the group stays on its current epoch, consistent with the caller's
 ///   SCP-layer state.
 /// - **`ProposalMessage` / `ExternalJoinProposalMessage`** →
-///   [`InboundChange::Proposal`]; `OpenMLS` caches the proposal, no membership
-///   change is committed yet, and the AAD is ignored.
+///   [`InboundChange::Proposal`] after an Add proposal's `KeyPackage` `Lifetime`
+///   passes the clock-free range bound; the proposal is not stored, no
+///   membership change is committed, and the AAD is ignored.
 ///
 /// # Errors
 ///
@@ -760,27 +791,18 @@ fn recover_added_members_pre_merge(
 /// Remove-bearing Commit does not error here — it is surfaced as
 /// [`InboundChange::UnsupportedMembershipChange`] without merging, leaving the
 /// group consistent.
-/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if an add-Commit's Add
-/// proposal carries a `KeyPackage` whose `Lifetime` fails validation against the
-/// injected clock; the staged commit is dropped **without merging** (ADR-057
-/// §Prereq-1).
+/// Returns [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] if an Add, in a
+/// Commit or in a Proposal, carries a `KeyPackage` whose `Lifetime` range is
+/// empty, inverted, or over the maximum; for a Commit the staged commit is
+/// dropped **without merging**. The check reads no clock (security-model spec
+/// §9.7.1, `KeyPackage` `Lifetime` checks, the receiver).
 /// Returns [`MlsError::ConvergentTimestampMissing`] /
 /// [`MlsError::ConvergentTimestampMalformed`] (ADR-057) if an add-Commit's AAD
 /// carries no timestamp or a malformed one. These are raised *pre-merge*, so the
 /// epoch is unchanged.
-///
-/// # Arguments
-///
-/// * `clock` - The injected hardened [`Clock`]. For an add-Commit, each Add
-///   proposal's `KeyPackage` `Lifetime` is re-validated against it *before*
-///   `merge_staged_commit`, mirroring the openmls-independent hardening in
-///   [`decrypt_with_sender_did`] and [`crate::group::add_member`]. It is no
-///   longer used to adjudicate the convergent timestamp (which is adopted
-///   verbatim).
 pub fn decrypt_with_membership_changes(
     group: &mut ScpMlsGroup,
     ciphertext: &[u8],
-    clock: &dyn Clock,
 ) -> Result<InboundChange, MlsError> {
     if group.group.is_none() {
         return Err(MlsError::GroupDestroyed);
@@ -891,12 +913,9 @@ pub fn decrypt_with_membership_changes(
             // Commit carrying an invalid Add is rejected above), so the DIDs are
             // cryptographically authenticated, not advisory.
             //
-            // SECURITY (ADR-057 §Prereq-1): re-validate each Add proposal's
-            // KeyPackage `Lifetime` against the injected hardened clock (plus the
-            // RFC 9420 max-range bound) BEFORE merging. process_message ran
-            // openmls's own `Lifetime::validate` on its un-injectable (wasm:
-            // unhardened) clock; this bracket is the hardened counterpart. On
-            // failure we return WITHOUT merging (via `?`), leaving the group on
+            // Security-model spec §9.7.1, the receiver: bound each Add
+            // proposal's KeyPackage `Lifetime` to the RFC 9420 maximum range
+            // BEFORE merging, reading no clock. On failure we return WITHOUT merging (via `?`), leaving the group on
             // its current epoch — fail-closed, consistent with the Remove path
             // above.
             //
@@ -906,7 +925,7 @@ pub fn decrypt_with_membership_changes(
             // sender key to the new member (§9.16.1). An Add with no wrapping key is
             // rejected pre-merge (via `?`), leaving the group on its current epoch.
             let (added_dids, added_wrapping_keys) =
-                recover_added_members_pre_merge(&staged_commit, clock)?;
+                recover_added_members_pre_merge(&staged_commit)?;
 
             // ADR-057: only an add-Commit stamps convergent MemberJoined leaves,
             // so only an add-Commit binds a convergent timestamp. Decode it from
@@ -940,8 +959,11 @@ pub fn decrypt_with_membership_changes(
                 committer_timestamp_secs,
             })
         }
-        ProcessedMessageContent::ProposalMessage(_)
-        | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+        ProcessedMessageContent::ProposalMessage(proposal)
+        | ProcessedMessageContent::ExternalJoinProposalMessage(proposal) => {
+            // §9.7.1, the receiver: an Add in a received Proposal gets the
+            // same clock-free range bound as an Add in a Commit.
+            validate_received_proposal(&proposal)?;
             // A bare proposal commits no membership change and stamps no leaf, so
             // it carries no convergent timestamp — the AAD is ignored here.
             Ok(InboundChange::Proposal { sender_did })
@@ -975,9 +997,10 @@ mod tests {
     use crate::credential::ScpCredential;
     use crate::group::{
         add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
-        generate_key_package_with_wrapping_key, join_group,
+        generate_key_package_with_wrapping_key, join_group, propose_add_member_bare,
     };
-    use scp_clock::{SystemClock, TestClock};
+    use openmls_basic_credential::SignatureKeyPair;
+    use scp_clock::{Clock, SystemClock, TestClock};
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -1220,10 +1243,10 @@ mod tests {
                 decrypt_with_sender_key(g, ct).map(drop)
             }),
             ("decrypt_with_sender_did", |g, ct| {
-                decrypt_with_sender_did(g, ct, &SystemClock).map(drop)
+                decrypt_with_sender_did(g, ct).map(drop)
             }),
             ("decrypt_with_membership_changes", |g, ct| {
-                decrypt_with_membership_changes(g, ct, &SystemClock).map(drop)
+                decrypt_with_membership_changes(g, ct).map(drop)
             }),
         ];
         let (mut alice_group, _bob_group) = setup_alice_bob();
@@ -1249,7 +1272,7 @@ mod tests {
         let ct_msg = encrypt(&mut alice_group, plaintext).unwrap();
         let ct_bytes = serialize_ciphertext(&ct_msg).unwrap();
 
-        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes, &SystemClock).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes).unwrap();
         assert!(
             matches!(&content, DecryptedContent::Application { .. }),
             "expected Application variant"
@@ -1304,7 +1327,7 @@ mod tests {
         let commit_bytes = commit_msg.tls_serialize_detached().unwrap();
 
         // Bob processes the Commit through decrypt_with_sender_did.
-        let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes, &SystemClock).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
         assert!(
             matches!(&content, DecryptedContent::Commit { .. }),
             "expected Commit variant"
@@ -1328,7 +1351,7 @@ mod tests {
         let plaintext = b"post-commit message";
         let ct_msg = encrypt(&mut alice_group, plaintext).unwrap();
         let ct_bytes = serialize_ciphertext(&ct_msg).unwrap();
-        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes, &SystemClock).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes).unwrap();
         assert!(
             matches!(&content, DecryptedContent::Application { .. }),
             "expected Application variant after Commit"
@@ -1373,8 +1396,7 @@ mod tests {
                 .unwrap();
 
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
-        let change =
-            decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &SystemClock).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap();
 
         match change {
             InboundChange::Commit {
@@ -1446,7 +1468,7 @@ mod tests {
         let add_carol_bytes = add_carol.commit.tls_serialize_detached().unwrap();
 
         let bob_epoch_before = bob_group.epoch().unwrap();
-        let err = decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes, &SystemClock)
+        let err = decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes)
             .expect_err("an add with no scp_wrapping_key must be rejected pre-merge");
         assert!(
             matches!(err, MlsError::ExtensionError(_)),
@@ -1501,7 +1523,7 @@ mod tests {
         .unwrap();
         let add_carol_bytes = add_carol.commit.tls_serialize_detached().unwrap();
         // Bob processes the add-Carol commit so his tree contains Carol.
-        decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes, &SystemClock).unwrap();
+        decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes).unwrap();
 
         // Alice removes Carol.
         let alice_own = alice_group.own_leaf_index().unwrap();
@@ -1524,8 +1546,7 @@ mod tests {
         // so we can prove the rejected remove did NOT advance it.
         let bob_epoch_before = bob_group.epoch().unwrap();
 
-        let change =
-            decrypt_with_membership_changes(&mut bob_group, &remove_bytes, &SystemClock).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &remove_bytes).unwrap();
         match change {
             InboundChange::UnsupportedMembershipChange {
                 sender_did,
@@ -1566,8 +1587,7 @@ mod tests {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let ct = encrypt(&mut alice_group, b"hi").unwrap();
         let ct_bytes = serialize_ciphertext(&ct).unwrap();
-        let change =
-            decrypt_with_membership_changes(&mut bob_group, &ct_bytes, &SystemClock).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &ct_bytes).unwrap();
         match change {
             InboundChange::Application {
                 plaintext,
@@ -1607,8 +1627,7 @@ mod tests {
         alice_g.merge_pending_commit(&alice_group.provider).unwrap();
         let commit_bytes = commit_msg.tls_serialize_detached().unwrap();
 
-        let change =
-            decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &SystemClock).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap();
         match change {
             InboundChange::Commit {
                 added_dids,
@@ -1652,92 +1671,207 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ADR-057 §Prereq-1: staged-commit Add-proposal Lifetime bracketing
+    // Security-model spec §9.7.1, the receiver: range-only, clock-free
     // -----------------------------------------------------------------------
     //
-    // A Commit whose Add proposal carries a KeyPackage with an expired Lifetime
-    // (relative to the injected hardened clock) must be refused BEFORE merging —
-    // the receiver's MLS epoch stays put (fail-closed), even though openmls's own
-    // internal validation (real clock) accepted the Add during process_message.
+    // A receiver bounds a received Add's KeyPackage `Lifetime` to the maximum
+    // range and reads no clock. An Add whose `not_after` the receiver's own
+    // clock has passed is merged; an over-range Add is refused before merging.
 
+    /// Carol's `KeyPackage` with a current `Lifetime` whose range exceeds the
+    /// maximum by one hour, minted through openmls's builder because SCP's own
+    /// minting never produces one.
+    #[allow(clippy::unwrap_used)]
+    fn carol_over_range_key_package() -> KeyPackage {
+        use crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+        let real_now = SystemClock.now_secs();
+        let provider = crate::provider::InMemoryMlsProvider::default();
+        let signer =
+            SignatureKeyPair::new(crate::group::SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        let cwk = CredentialWithKey {
+            credential: BasicCredential::new(test_credential("carol").to_bytes().unwrap()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        KeyPackage::builder()
+            .key_package_lifetime(Lifetime::init(
+                real_now - 3600,
+                real_now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 3600,
+            ))
+            .build(crate::group::SCP_CIPHERSUITE, &provider, &signer, cwk)
+            .unwrap()
+            .key_package()
+            .clone()
+    }
+
+    /// Alice commits an Add of `kp` through openmls's `add_members`, as a
+    /// non-SCP member could, since SCP's `add_member` refuses an over-range
+    /// `KeyPackage`. Returns the serialized Commit.
+    #[allow(clippy::unwrap_used)]
+    fn raw_add_commit(alice_group: &mut ScpMlsGroup, kp: KeyPackage) -> Vec<u8> {
+        let signer = alice_group.signer.as_ref().unwrap();
+        let g = alice_group.group.as_mut().unwrap();
+        let (commit, _welcome, _gi) = g.add_members(&alice_group.provider, signer, &[kp]).unwrap();
+        commit.tls_serialize_detached().unwrap()
+    }
+
+    /// Carol's `KeyPackage` (with a wrapping key) whose `not_after` lies one
+    /// day after the wall clock, so openmls's own wall-clock check passes, and
+    /// an adder clock seven days behind the wall clock, under which Carol keeps
+    /// eight days and the add-side minimum holds. Under the wall clock Carol
+    /// keeps less than the add-side minimum, which the function asserts: a
+    /// receiver that applied the adder's minimum would refuse this Add.
+    #[allow(clippy::unwrap_used)]
+    fn carol_short_of_minimum_and_adder_clock() -> (KeyPackage, TestClock) {
+        use crate::lifetime::{KEY_PACKAGE_LIFETIME_SECS, validate_key_package_lifetime_for_add};
+        const DAY: u64 = 24 * 60 * 60;
+        let real_now = SystemClock.now_secs();
+        let not_after = real_now + DAY;
+        let carol_clock = TestClock::new(not_after - KEY_PACKAGE_LIFETIME_SECS);
+        let (bundle, _s, _p) = generate_key_package_with_wrapping_key(
+            &test_credential("carol"),
+            Some(&[0xCC_u8; 32]),
+            &carol_clock,
+        )
+        .unwrap();
+        let kp = bundle.key_package().clone();
+        assert_eq!(kp.life_time().not_after(), not_after);
+        assert!(
+            validate_key_package_lifetime_for_add(kp.life_time(), &SystemClock).is_err(),
+            "under the wall clock Carol must be short of the add-side minimum"
+        );
+        (kp, TestClock::new(real_now - 7 * DAY))
+    }
+
+    /// A receiver merges an Add whose `KeyPackage` keeps less than the
+    /// add-side minimum under the receiver's (wall) clock: the minimum binds
+    /// the adder only, and the receiver checks the range alone (security-model
+    /// spec §9.7.1, the receiver).
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn decrypt_with_sender_did_rejects_expired_add_commit_without_merging() {
-        let real_now = SystemClock.now_secs();
+    fn decrypt_with_sender_did_merges_add_short_of_add_side_minimum() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let bob_epoch_before = bob_group.epoch().unwrap();
 
-        // Carol's KP is minted at real-now (not_after ~ real-now + 84d).
-        let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
-        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        let (carol_kp, adder_clock) = carol_short_of_minimum_and_adder_clock();
+        let add_carol = add_member(&mut alice_group, carol_kp.into(), &adder_clock).unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
 
-        // Bob processes with a clock 100 days ahead: Carol's KP is expired
-        // relative to the injected clock, so the add-commit is refused pre-merge.
-        let hundred_days = 100 * 24 * 60 * 60;
-        let future = scp_clock::TestClock::new(real_now + hundred_days);
-        let err = decrypt_with_sender_did(&mut bob_group, &commit_bytes, &future).unwrap_err();
+        let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
         assert!(
-            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
-            "expected KeyPackageLifetimeInvalid, got {err:?}"
+            matches!(content, DecryptedContent::Commit { .. }),
+            "got {content:?}"
         );
-        assert_eq!(
-            bob_group.epoch().unwrap(),
-            bob_epoch_before,
-            "a refused add-commit must NOT advance the receiver's epoch (no half-merge)"
+        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before + 1);
+    }
+
+    /// The `decrypt_with_membership_changes` counterpart: the Add merges and
+    /// reports Carol.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_merges_add_short_of_add_side_minimum() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        let (carol_kp, adder_clock) = carol_short_of_minimum_and_adder_clock();
+        let add_carol = add_member_with_convergent_timestamp(
+            &mut alice_group,
+            carol_kp.into(),
+            &adder_clock,
+            adder_clock.now_secs(),
+        )
+        .unwrap();
+        let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+
+        let change = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap();
+        let InboundChange::Commit { added_dids, .. } = change else {
+            panic!("expected Commit, got {change:?}");
+        };
+        assert_eq!(added_dids, vec!["did:dht:z6Mkcarol".to_owned()]);
+        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before + 1);
+    }
+
+    /// An Add Commit carrying an over-range `KeyPackage` is refused with
+    /// `ReceivedKeyPackageLifetimeRangeInvalid` by both receive functions, and
+    /// the receiver's epoch does not move.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn over_range_add_commit_is_refused_without_merging() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+        let commit_bytes = raw_add_commit(&mut alice_group, carol_over_range_key_package());
+        let err = decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap_err();
+        assert!(
+            matches!(err, MlsError::ReceivedKeyPackageLifetimeRangeInvalid { .. }),
+            "expected ReceivedKeyPackageLifetimeRangeInvalid, got {err:?}"
         );
+        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before);
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+        let commit_bytes = raw_add_commit(&mut alice_group, carol_over_range_key_package());
+        let err = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap_err();
+        assert!(
+            matches!(err, MlsError::ReceivedKeyPackageLifetimeRangeInvalid { .. }),
+            "expected ReceivedKeyPackageLifetimeRangeInvalid, got {err:?}"
+        );
+        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before);
 
         // The group stays usable on the old epoch.
         let ct = encrypt(&mut bob_group, b"still works").unwrap();
         let _ = serialize_ciphertext(&ct).unwrap();
     }
 
+    /// A bare Add proposal carrying an over-range `KeyPackage` is refused with
+    /// `ReceivedKeyPackageLifetimeRangeInvalid` by both receive functions, and
+    /// the receiver's epoch does not move.
     #[test]
-    #[allow(clippy::unwrap_used, clippy::panic)]
-    fn decrypt_with_membership_changes_rejects_expired_add_commit_without_merging() {
-        let real_now = SystemClock.now_secs();
+    #[allow(clippy::unwrap_used)]
+    fn over_range_add_proposal_is_refused() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let bob_epoch_before = bob_group.epoch().unwrap();
-
-        let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
-        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        // Alice adds Carol with the REAL clock (so her side accepts Carol's KP,
-        // whose not_after ~ real_now + 84d) but binds a convergent timestamp at
-        // `real_now + 90d`. Bob then receives with a clock at that same +90d
-        // value. The convergent timestamp in the AAD is adopted verbatim — there
-        // is no receiver-side clock verdict on it — so the only clock-sensitive
-        // check on this path is the MLS KeyPackage `Lifetime` bracket, which
-        // surfaces the *Lifetime* failure: Carol's KP is expired at +90d. This
-        // isolates the pre-merge Lifetime bracket; it is not a timestamp failure.
-        let ninety_days = 90 * 24 * 60 * 60;
-        let future_ts = real_now + ninety_days;
-        let add_carol = add_member_with_convergent_timestamp(
-            &mut alice_group,
-            carol_kp,
-            &SystemClock,
-            future_ts,
-        )
-        .unwrap();
-        let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
-
-        let future = TestClock::new(future_ts);
-        let err =
-            decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &future).unwrap_err();
+        let bytes =
+            propose_add_member_bare(&mut alice_group, &carol_over_range_key_package()).unwrap();
+        let err = decrypt_with_sender_did(&mut bob_group, &bytes).unwrap_err();
         assert!(
-            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
-            "expected KeyPackageLifetimeInvalid, got {err:?}"
+            matches!(err, MlsError::ReceivedKeyPackageLifetimeRangeInvalid { .. }),
+            "expected ReceivedKeyPackageLifetimeRangeInvalid, got {err:?}"
         );
-        assert_eq!(
-            bob_group.epoch().unwrap(),
-            bob_epoch_before,
-            "a refused add-commit must NOT advance the receiver's epoch (no half-merge)"
+        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before);
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+        let bytes =
+            propose_add_member_bare(&mut alice_group, &carol_over_range_key_package()).unwrap();
+        let err = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap_err();
+        assert!(
+            matches!(err, MlsError::ReceivedKeyPackageLifetimeRangeInvalid { .. }),
+            "expected ReceivedKeyPackageLifetimeRangeInvalid, got {err:?}"
+        );
+        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before);
+    }
+
+    /// A bare Add proposal carrying an in-range `KeyPackage` passes both
+    /// receive functions: the positive control for the refusal above.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn in_range_add_proposal_is_accepted() {
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let (carol_kp, _) = carol_short_of_minimum_and_adder_clock();
+        let bytes = propose_add_member_bare(&mut alice_group, &carol_kp).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &bytes).unwrap();
+        assert!(
+            matches!(content, DecryptedContent::Proposal { .. }),
+            "got {content:?}"
         );
 
-        let ct = encrypt(&mut bob_group, b"still works").unwrap();
-        let _ = serialize_ciphertext(&ct).unwrap();
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let (carol_kp, _) = carol_short_of_minimum_and_adder_clock();
+        let bytes = propose_add_member_bare(&mut alice_group, &carol_kp).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap();
+        assert!(
+            matches!(change, InboundChange::Proposal { .. }),
+            "got {change:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1754,7 +1888,7 @@ mod tests {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let ct = encrypt(&mut alice_group, b"no aad here").unwrap();
         let bytes = serialize_ciphertext(&ct).unwrap();
-        let change = decrypt_with_membership_changes(&mut bob_group, &bytes, &SystemClock).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap();
         assert!(
             matches!(change, InboundChange::Application { .. }),
             "a plain application message decodes without any AAD requirement, got {change:?}"
@@ -1782,8 +1916,7 @@ mod tests {
         let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
 
-        let err = decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &SystemClock)
-            .unwrap_err();
+        let err = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap_err();
         assert!(
             matches!(err, MlsError::ConvergentTimestampMissing),
             "an add-Commit with no convergent-timestamp AAD must be rejected as missing, got {err:?}"
@@ -1820,8 +1953,7 @@ mod tests {
         if let Some(byte) = bytes.last_mut() {
             *byte ^= 0xFF;
         }
-        let err =
-            decrypt_with_membership_changes(&mut bob_group, &bytes, &SystemClock).unwrap_err();
+        let err = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap_err();
         assert!(
             matches!(err, MlsError::DecryptionFailed(_)),
             "a forged add-Commit AAD must fail the AEAD tag (DecryptionFailed), got {err:?}"
@@ -1871,8 +2003,7 @@ mod tests {
         // Offset +5 is the first timestamp byte: magic[0..4] || version[4] || ts[5..13].
         bytes[aad_offset + 5] ^= 0xFF;
 
-        let err =
-            decrypt_with_membership_changes(&mut bob_group, &bytes, &SystemClock).unwrap_err();
+        let err = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap_err();
         assert!(
             matches!(err, MlsError::DecryptionFailed(_)),
             "flipping a byte inside the authenticated timestamp AAD must fail the AEAD \

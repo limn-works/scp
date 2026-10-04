@@ -461,7 +461,13 @@ pub(crate) async fn outlet_stream_open_impl(
     // Snapshot the bridge-owned per-handle outlet registry once (cheap Vec of
     // registrations); every subsequent outlet field is read off this clone, so
     // the handle's `outlet_registry` mutex is released before the runtime call.
-    let registry = { handle.outlet_registry.lock().await.clone() };
+    let registry = {
+        handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
     let registration = registry.get(&outlet_id).ok_or_else(|| ScpError::Outlet {
         msg: format!("outlet '{outlet_id}' not registered in context '{context_id}'"),
         code: codes::OUTLET_6002.to_owned(),
@@ -542,7 +548,14 @@ pub(crate) async fn outlet_stream_open_impl(
 
     // Snapshot the registered handler (an `Arc<dyn Fn>` — cloning is a refcount
     // bump) off the owned handle.
-    let handler = { handle.outlet_handlers.lock().await.get(&outlet_id).cloned() };
+    let handler = {
+        handle
+            .outlet_handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&outlet_id)
+            .cloned()
+    };
 
     // Clone the supervisor `Arc` out of the borrow so it outlives the later
     // `bi`-borrowing calls and the `'static` executor.
@@ -1272,7 +1285,13 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     // Snapshot the TARGET handle's per-context outlet registry once (cheap Vec of
     // registrations); every subsequent outlet field is read off this clone, so
     // the handle's `outlet_registry` mutex is released before the runtime call.
-    let registry = { target_handle.outlet_registry.lock().await.clone() };
+    let registry = {
+        target_handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
     let registration = registry
         .get(&outlet_registration_id)
         .ok_or_else(|| ScpError::Outlet {
@@ -1347,7 +1366,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
         target_handle
             .outlet_handlers
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&outlet_registration_id)
             .cloned()
     };

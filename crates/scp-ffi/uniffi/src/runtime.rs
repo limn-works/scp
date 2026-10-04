@@ -1104,8 +1104,7 @@ impl UniffiBridgeInstance {
     /// holds no role state for `context_id`, and the converted `ActorBusy`
     /// (`SCP-CTX-2130`), `ActorCrashed` (`SCP-CTX-2135`), or `ContextPoisoned`
     /// (`SCP-CTX-2134`) error when the context's actor is saturated, wedged,
-    /// mid-respawn, or poisoned, so a caller never reads an actor that did not
-    /// answer as an absent context.
+    /// mid-respawn, or poisoned.
     #[cfg(test)]
     pub(crate) async fn live_role_state(
         &self,
@@ -1282,11 +1281,7 @@ impl UniffiBridgeInstance {
         creator_did: &str,
         ceiling: &[String],
     ) -> UcanContextState {
-        // An empty `ceiling` yields an empty set, which grants nothing. The
-        // `default_ceiling()` fallback that stood here widened an empty list
-        // to eleven capabilities the context never declared; `context_create`
-        // refuses an empty ceiling with `SCP-VALID-7005`, so no context the
-        // supervisor serves declares one.
+        // An empty `ceiling` yields an empty set, which grants nothing.
         //
         // Ceiling-entry grammar enforcement (spec §5.3.1.1). This per-instance
         // UCAN-state cache is populated AFTER `context_create` already routed
