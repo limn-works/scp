@@ -75,6 +75,10 @@ concurrency:
   # queue batches 2-5 entries, so that interleaving is the common case.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
 jobs:
   check-draft:
     if: >-
@@ -160,7 +164,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - name: Generate rustdoc
         # FFI bridge methods like `scpid_sign` and `identity_*_link_attestation`
         # on `impl Scp` are feature-gated by `testing` so that
