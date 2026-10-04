@@ -227,9 +227,14 @@ pub const KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS: u64 =
 pub const KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS: u64 =
     KEY_PACKAGE_LIFETIME_MARGIN_SECS - crate::keypackage_attestation::CLOCK_SKEW_TOLERANCE_SECS;
 
-// The bound must leave the minting backdate room for the skew tolerance, or
-// SCP's own freshly minted `KeyPackage`s fail under a slightly slow adder.
-const _: () = assert!(KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS < KEY_PACKAGE_LIFETIME_MARGIN_SECS);
+// A freshly minted `KeyPackage` (`not_before = now - KEY_PACKAGE_LIFETIME_MARGIN_SECS`)
+// passes at an adder whose clock runs up to the skew tolerance slow only if
+// KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS + CLOCK_SKEW_TOLERANCE_SECS
+// <= KEY_PACKAGE_LIFETIME_MARGIN_SECS (security-model spec §9.18.7).
+const _: () = assert!(
+    KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS + crate::keypackage_attestation::CLOCK_SKEW_TOLERANCE_SECS
+        <= KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
 
 /// Mints a `KeyPackage` [`Lifetime`] from the injected [`Clock`].
 ///
