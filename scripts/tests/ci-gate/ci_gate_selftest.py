@@ -136,7 +136,7 @@ nothing:
                against the `merge_group` ref, so following that header would
                have left every queue entry waiting on a status no run reports.
   needs-condition
-               Four jobs build one bridge artifact each and upload it, and six
+               Five jobs build one bridge artifact each and upload it, and six
                jobs download what they build instead of compiling their own.
                GitHub skips a job when any job in its `needs` list is skipped,
                so a producer whose `if:` is narrower than one consumer's skips
@@ -170,11 +170,14 @@ nothing:
                "Re-run failed jobs" re-runs a failed consumer without its
                producer, so a consumer re-run a day after its run started
                failed its download while GitHub still offered the re-run.
-  xcframework-outputs
+  producer-outputs
                The XCFramework upload named `if-no-files-found: error` over
                three paths, one of them the tracked ScpBindings.swift, so the
                checkout always supplied a match and the option could not fail
-               the producer when build-xcframework.sh wrote nothing.
+               the producer when build-xcframework.sh wrote nothing. The
+               kotlin-test upload lists the UniFFI cdylib and the Kotlin
+               bindings, and a build that wrote one of them satisfies the
+               option the same way.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
                `#![deny(rustdoc::broken_intra_doc_links)]` and none of the other
@@ -203,6 +206,22 @@ nothing:
                no assertion. Both now sit in a fenced block or name the block
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
+  profile-env  ci.yml sets `CARGO_PROFILE_DEV_DEBUG: "0"` in its workflow-level
+               `env:`.
+               Swatinem/rust-cache hashes every `CARGO*` environment variable
+               its step sees into its cache key. A `CARGO_PROFILE_*` key in one
+               job's `env:` therefore gives that job a key no other member of
+               its `shared-key` group computes, so that job restores no entry
+               its group saved and compiles the group's dependencies from
+               scratch. A `CARGO_PROFILE_*` key in the `env:` of a step that runs
+               cargo makes cargo compile that step's units under a profile the
+               restored entry does not hold and rebuild each one.
+               Dropping the workflow-level key returns CI's dev-profile builds
+               to the root Cargo.toml's `line-tables-only` without any check
+               noticing.
+               compile-timings.yml times cargo builds, so the same rule holds
+               there: without the key it would time builds that carry line
+               tables.
   matrix-axis
                Job rust-test-optional-features runs its commands on three
                legs, one per value of a matrix `group` axis, and job
@@ -223,6 +242,17 @@ nothing:
                or workflow-level `env:` reading `secrets.GHCR_CACHE_TOKEN` in
                any letter case, or reading `toJSON(secrets)`, outside a job
                declaring `environment: docker-cache`.
+  push-writers
+               A writer that a push skips leaves its rust-cache, bridge-artifact, Gradle or
+               layer-cache entry stale with nothing going red, since the `ci`
+               aggregate evaluates that writer's own `if:`; a push-only skip
+               that leaks into a pull_request or merge_group run removes a gate
+               the same way. The check reports a cache-writing job some
+               merge_group run selects and the same push does not (for the
+               setup-bun cache, whose key names no job, that no push runs any
+               job writing it), a writer's
+               matrix that drops on push the leg its `save-if` names, and any
+               job whose `if:` answers a scenario differently from SCENARIOS.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -236,6 +266,7 @@ Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import os
 import re
@@ -251,6 +282,7 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 WORKFLOW = REPO / ".github/workflows/ci.yml"
+COMPILE_TIMINGS = REPO / ".github/workflows/compile-timings.yml"
 AGGREGATE = REPO / "scripts/ci-aggregate-result.py"
 
 # A ci.yml job whose work is a script or a lint finishes in under a minute; one
@@ -604,8 +636,79 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 # scripts/fix-round-check.sh names.
 EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 
-# Jobs whose `if:` is `github.event_name == 'push'`.
-PUSH_ONLY_JOBS = ("docker-image-cache",)
+# Jobs a `changes` filter output selects whose `if:` also reads
+# `github.event_name == 'push' && …`.
+PUSH_ONLY_FILTER_JOBS = ("docker-image-cache",)
+
+# Jobs whose `if:` is `github.event_name != 'push'` alone. None of
+# these writes a cache, so each runs on every pull_request and merge_group run and
+# skips on every push.
+NOT_ON_PUSH_JOBS = (
+    "agent-verdict-criterion",
+    "block-in-place",
+    "bridge-globals",
+    "bridge-instance-lifecycle",
+    "bridge-symmetry",
+    "ci-workflow-selftest",
+    "construction-pattern",
+    "deleted-primitives",
+    "doc-citations",
+    "doc-includes",
+    "error-codes",
+    "fail-closed-pre-rotation",
+    "fallback-registry",
+    "handle-affinity",
+    "handler-no-panic",
+    "no-mutable-globals-kotlin",
+    "no-mutable-globals-python",
+    "no-mutable-globals-rust",
+    "no-mutable-globals-ts",
+    "no-panic-abort",
+    "pyi-generated",
+    "protocol-deps",
+    "protocol-sync",
+    "saga-gating-granularity",
+    "sdk-coverage",
+    "shipped-feature-graph",
+    "toolchain-wiring",
+    "wasm-protocol",
+    "wasm-test",
+)
+
+# Jobs a `changes` filter output selects whose `if:` also reads
+# `github.event_name != 'push' && …`. The
+# filter jobs absent from this list write a cache on a push to `main` and run there
+# whenever their filters select them.
+NOT_ON_PUSH_FILTER_JOBS = (
+    "bridge-parity",
+    "bridge-parity-swift",
+    "docker-image",
+    "python-lint",
+    "python-test",
+    "rust-build-pyo3-production",
+    "rust-build-uniffi-production",
+    "rust-deny",
+    "rust-doc",
+    "rust-fmt",
+    "rust-test-napi-production",
+    "scaffold-typescript-web-check",
+    "swift-build-test",
+    "swift-lint",
+    "typescript-check",
+)
+
+
+def on_event(filter_runs: dict[str, bool], event: str) -> dict[str, bool]:
+    """Every conditional job's answer for one event, from the filter jobs' answers."""
+    push = event == "push"
+    runs = dict(filter_runs)
+    runs |= dict.fromkeys(NOT_ON_PUSH_FILTER_JOBS if push else PUSH_ONLY_FILTER_JOBS, False)
+    return (
+        runs
+        | dict.fromkeys(EVENT_ONLY_JOBS, event == "pull_request")
+        | dict.fromkeys(NOT_ON_PUSH_JOBS, not push)
+    )
+
 
 # Jobs a `changes` filter output selects.
 RUST_ONLY_RUNS = {
@@ -613,6 +716,7 @@ RUST_ONLY_RUNS = {
     "bridge-parity-kotlin": True,
     "bridge-parity-swift": True,
     "docker-image": True,
+    "docker-image-cache": True,
     "fuzz-build": False,
     "kotlin-lint": False,
     "kotlin-test": True,
@@ -645,6 +749,8 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
         "bridge-parity",
         "bridge-parity-kotlin",
         "bridge-parity-swift",
+        # Producer of the UniFFI cdylib bridge-parity-kotlin downloads.
+        "kotlin-test",
         "napi-addon",
         "pyo3-module",
         "pyo3-module-macos",
@@ -655,48 +761,89 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
     ),
     True,
 )
+# One filter per job clause: no job ORs two of swift, typescript and
+# scaffold-typescript-web together, so dropping any one of those clauses from a
+# job's `if:` changes that job's answer in this scenario. typescript-wasm sits
+# in its own scenario because scaffold-typescript-web-check ORs it with
+# scaffold-typescript-web.
+SWIFT_TYPESCRIPT = DOCS_ONLY | dict.fromkeys(
+    ("swift", "typescript", "scaffold-typescript-web"), "true"
+)
+SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+    (
+        "bridge-parity",
+        "bridge-parity-swift",
+        "napi-addon",
+        "pyo3-module",
+        "pyo3-module-macos",
+        "scaffold-typescript-web-check",
+        "swift-build-test",
+        "swift-lint",
+        "typescript-check",
+        "xcframework",
+    ),
+    True,
+)
+WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true"}
+WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+    ("scaffold-typescript-web-check", "typescript-wasm-check"), True
+)
 
 SCENARIOS = {
     "rust-only, pull_request": Scenario(
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=RUST_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, True)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(RUST_ONLY_RUNS, "pull_request"),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
         filters=DOCS_ONLY,
         event="pull_request",
-        runs=DOCS_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, True)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(DOCS_ONLY_RUNS, "pull_request"),
     ),
     "docs-only, push": Scenario(
         name="docs-only, push",
         filters=DOCS_ONLY,
         event="push",
-        runs=DOCS_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, False)
-        | dict.fromkeys(PUSH_ONLY_JOBS, True),
+        runs=on_event(DOCS_ONLY_RUNS, "push"),
+    ),
+    "rust-only, push": Scenario(
+        name="rust-only, push",
+        filters=RUST_ONLY,
+        event="push",
+        runs=on_event(RUST_ONLY_RUNS, "push"),
     ),
     "rust-only, merge_group": Scenario(
         name="rust-only, merge_group",
         filters=RUST_ONLY,
         event="merge_group",
-        runs=RUST_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, False)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(RUST_ONLY_RUNS, "merge_group"),
     ),
     "python-only, pull_request": Scenario(
         name="python-only, pull_request",
         filters=PYTHON_ONLY,
         event="pull_request",
-        runs=PYTHON_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, True)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(PYTHON_ONLY_RUNS, "pull_request"),
     ),
+    "python-only, push": Scenario(
+        name="python-only, push",
+        filters=PYTHON_ONLY,
+        event="push",
+        runs=on_event(PYTHON_ONLY_RUNS, "push"),
+    ),
+} | {
+    f"{label}, {event}": Scenario(
+        name=f"{label}, {event}",
+        filters=filters,
+        event=event,
+        runs=on_event(filter_runs, event),
+    )
+    for label, filters, filter_runs in (
+        ("swift-and-typescript", SWIFT_TYPESCRIPT, SWIFT_TYPESCRIPT_RUNS),
+        ("typescript-wasm-only", WASM_ONLY, WASM_ONLY_RUNS),
+    )
+    for event in ("pull_request", "merge_group")
 }
 
 failures: list[str] = []
@@ -1533,6 +1680,59 @@ def check_private_items_detects_a_dropped_flag(
                 "documents_private_items returned True over a command carrying no "
                 "--document-private-items, so it reads something other than the flag",
             )
+
+
+NO_CARGO_PATH = "PATH=$no_cargo_path"
+
+
+def no_cargo_gradle_calls(job: dict) -> list[str]:
+    """Each `./gradlew` command line in `job` that runs with cargo off PATH."""
+    return [
+        line
+        for step in job.get("steps", [])
+        for line in logical_lines(step.get("run", ""))
+        if NO_CARGO_PATH in line and "./gradlew" in line
+    ]
+
+
+def passes_no_daemon(line: str) -> bool:
+    """Report whether one `./gradlew` command line passes --no-daemon."""
+    return "--no-daemon" in line.split()
+
+
+def check_no_cargo_gradle_calls_skip_the_daemon(jobs: dict) -> None:
+    """kotlin-lint's cargo-free Gradle calls run without the shared daemon.
+
+    CRITERION: a Gradle daemon that an earlier step started can resolve `cargo`
+    against the PATH it started with, so a call that reuses it can reach the
+    `cargo metadata` fallback whatever PATH the shell passes. Each call that
+    strips cargo from PATH passes --no-daemon, and stripping the flag from each
+    one fails the predicate.
+    """
+    calls = no_cargo_gradle_calls(jobs["kotlin-lint"])
+    check(
+        "kotlin-lint runs ./gradlew with cargo off PATH",
+        len(calls) >= 2,
+        f"found {len(calls)} such calls; the skip check and the "
+        f"CARGO_TARGET_DIR loop each make one",
+    )
+    for line in calls:
+        check(
+            f"kotlin-lint: {line[:58]} passes --no-daemon",
+            passes_no_daemon(line),
+            "a reused daemon can resolve cargo against the PATH it started with",
+        )
+        stripped = " ".join(t for t in line.split() if t != "--no-daemon")
+        check(
+            f"kotlin-lint: {line[:40]} with --no-daemon removed -> reported",
+            not passes_no_daemon(stripped),
+            "the predicate accepted a call that reuses the daemon",
+        )
+    check(
+        "passes_no_daemon rejects a token that only starts with --no-daemon",
+        not passes_no_daemon("./gradlew --no-daemon-x detekt"),
+        "the predicate matched a prefix rather than the whole flag",
+    )
 
 
 def check_workspace_and_rustdoc_readers(documents: list[tuple[Path, dict]]) -> None:
@@ -3331,21 +3531,86 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
     return pinned
 
 
+# One token of an `if:` expression: an operator, a parenthesis, a quoted literal, a
+# dotted name, or a whole number. A `!` standing alone matches nothing here, and a
+# function call's name followed by `(` fails the grammar in parse_condition.
+CONDITION_TOKEN = re.compile(r"&&|\|\||==|!=|\(|\)|'[^']*'|[A-Za-z_][A-Za-z0-9_.-]*|[0-9]+")
+CONDITION_OPERATORS = frozenset(("&&", "||", "==", "!=", "(", ")"))
+
+
+@functools.lru_cache(maxsize=None)
+def parse_condition(expression: str) -> tuple:
+    """Parse one `if:` expression into a tree, raising ValueError outside the grammar.
+
+    A node is ("or" | "and", parts) or ("==" | "!=", left, right). The grammar is
+    the one every `if:` in these workflows uses: comparisons with `==` or `!=`,
+    joined by `&&` and `||`, with `&&` binding tighter, as it does in GitHub's
+    expression language, and parentheses grouping.
+    """
+    text = " ".join(str(expression).split())
+    tokens: list[str] = []
+    rest = text.lstrip()
+    while rest:
+        match = CONDITION_TOKEN.match(rest)
+        if match is None:
+            raise ValueError(f"expression this check cannot read: {text!r}")
+        tokens.append(match.group(0))
+        rest = rest[match.end() :].lstrip()
+    if not tokens:
+        raise ValueError(f"empty expression this check cannot read: {text!r}")
+
+    def chain(index: int, joiner: str, inner) -> tuple[tuple, int]:
+        node, index = inner(index)
+        parts = [node]
+        while index < len(tokens) and tokens[index] == joiner:
+            node, index = inner(index + 1)
+            parts.append(node)
+        if len(parts) == 1:
+            return parts[0], index
+        return ("or" if joiner == "||" else "and", tuple(parts)), index
+
+    def either(index: int) -> tuple[tuple, int]:
+        return chain(index, "||", both)
+
+    def both(index: int) -> tuple[tuple, int]:
+        return chain(index, "&&", comparison)
+
+    def comparison(index: int) -> tuple[tuple, int]:
+        if index < len(tokens) and tokens[index] == "(":
+            node, index = either(index + 1)
+            if index >= len(tokens) or tokens[index] != ")":
+                raise ValueError(f"unbalanced parenthesis this check cannot read: {text!r}")
+            return node, index + 1
+        if index + 3 > len(tokens):
+            raise ValueError(f"comparison this check cannot read: {text!r}")
+        left, operator, right = tokens[index : index + 3]
+        if (
+            operator not in ("==", "!=")
+            or left in CONDITION_OPERATORS
+            or right in CONDITION_OPERATORS
+        ):
+            raise ValueError(f"comparison this check cannot read: {text!r}")
+        return (operator, left, right), index + 3
+
+    tree, index = either(0)
+    if index != len(tokens):
+        raise ValueError(f"expression this check cannot read past {tokens[index]!r}: {text!r}")
+    return tree
+
+
 def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
     """Report whether one `if:` expression selects a job under one set of inputs.
 
     Written here rather than imported from scripts/ci-aggregate-result.py for the
     reason this file's closing paragraph gives: an assertion that calls the function
-    it judges agrees with that function however it behaves. The grammar is the one
-    every `if:` in these workflows uses — `LHS == 'literal'` clauses joined by `||`.
-    An expression outside it raises, which stops this check rather than guessing.
+    it judges agrees with that function however it behaves. parse_condition states
+    the grammar. An expression outside it raises, which stops this check rather than
+    guessing. Every operand is resolved whatever the other comparisons answer, so a
+    filter output `changes` never published raises even behind a false
+    `github.event_name != 'push' &&`.
     """
-    normalised = " ".join(str(expression).split())
-    if any(token in normalised for token in ("&&", "!", "(")):
-        raise ValueError(f"expression this check cannot read: {normalised!r}")
 
     def operand(token: str) -> str:
-        token = token.strip()
         quoted = re.fullmatch(r"'([^']*)'", token)
         if quoted:
             return quoted.group(1)
@@ -3370,13 +3635,15 @@ def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
             return outputs[key]
         raise ValueError(f"operand this check cannot read: {token!r}")
 
-    for clause in normalised.split("||"):
-        sides = clause.split("==")
-        if len(sides) != 2:
-            raise ValueError(f"clause this check cannot read: {clause!r}")
-        if operand(sides[0]) == operand(sides[1]):
-            return True
-    return False
+    def value(node: tuple) -> bool:
+        kind = node[0]
+        if kind in ("or", "and"):
+            results = [value(part) for part in node[1]]
+            return any(results) if kind == "or" else all(results)
+        left, right = operand(node[1]), operand(node[2])
+        return (left == right) if kind == "==" else (left != right)
+
+    return value(parse_condition(expression))
 
 
 def condition_assignments(doc: dict) -> list[tuple[dict[str, str], str]]:
@@ -3446,10 +3713,7 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
             # criterion binds hardest on it: every job in its `needs` list has to run
             # on every such run too. Stepping over it would exempt exactly the case
             # the criterion states, so substitute the constant-true expression,
-            # written in the grammar `selects` reads, and compare normally. The 30
-            # jobs in this shape today all depend on check-draft alone, whose own
-            # condition selects it on every event this enumeration presents, so the
-            # substitution reports nothing on the workflow as it stands.
+            # written in the grammar `selects` reads, and compare normally.
             condition = "true == 'true'"
         if RUNS_OVER_A_SKIPPED_DEPENDENCY.search(str(condition)):
             continue
@@ -3515,33 +3779,48 @@ def narrow_condition(expression: str, clause_fragment: str) -> str:
 
 
 def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
-    """Narrowing one producer's condition by one clause is caught above."""
-    narrowed = copy.deepcopy(doc)
-    producer = narrowed["jobs"]["pyo3-module"]
-    producer["if"] = narrow_condition(producer["if"], "outputs.kotlin")
-    gaps = dependency_condition_gaps(narrowed)
-    check(
-        "dropping the kotlin clause from pyo3-module is reported",
-        any("bridge-parity-kotlin runs and pyo3-module skips" in gap for gap in gaps),
-        f"a producer that no longer covers bridge-parity-kotlin went unreported: {gaps}",
-    )
-    # The mutant has to reach the union comparison, not the branch that reports an
-    # expression this grammar cannot read: that branch names every dependant of the
-    # mutated job whatever the comparison answers, which would let this control pass
-    # over a comparison that had been deleted.
-    check(
-        "the narrowed producer is reported by the comparison, not by a parse refusal",
-        not any("cannot decide" in gap for gap in gaps),
-        f"the mutant expression went unread: {gaps}",
-    )
+    """Narrowing one producer's condition by one clause is caught above.
+
+    Each (producer, clause) pair below is a producer whose `if:` carries that clause
+    for bridge-parity-kotlin alone: kotlin-test's own tests need `kotlin || rust`, so
+    its `python` clause is the one an edit scoped to the Kotlin lane would drop.
+    """
+    for producer_id, clause in (
+        ("pyo3-module", "outputs.kotlin"),
+        ("kotlin-test", "outputs.python"),
+    ):
+        narrowed = copy.deepcopy(doc)
+        producer = narrowed["jobs"][producer_id]
+        producer["if"] = narrow_condition(producer["if"], clause)
+        gaps = dependency_condition_gaps(narrowed)
+        check(
+            f"dropping the {clause} clause from {producer_id} is reported",
+            any(
+                f"bridge-parity-kotlin runs and {producer_id} skips" in gap
+                for gap in gaps
+            ),
+            f"a producer that no longer covers bridge-parity-kotlin went unreported: "
+            f"{gaps}",
+        )
+        # The mutant has to reach the union comparison, not the branch that reports an
+        # expression this grammar cannot read: that branch names every dependant of
+        # the mutated job whatever the comparison answers, which would let this
+        # control pass over a comparison that had been deleted.
+        check(
+            f"the narrowed {producer_id} is reported by the comparison, not by a "
+            f"parse refusal",
+            not any("cannot decide" in gap for gap in gaps),
+            f"the mutant expression went unread: {gaps}",
+        )
 
 
 def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> None:
     """A job with no `if:` whose dependency carries one is compared, not exempted."""
     mutated = copy.deepcopy(doc)
-    # Job error-codes carries `needs: [check-draft]` and no `if:`, so it runs on every
-    # run. Pointing it at a producer selected by one filter output gives the shape a
-    # later change would create by having a gate job download a built artifact.
+    # Job error-codes carries `needs: [check-draft]`. Removing its `if:` makes it run on
+    # every run, and pointing it at a producer selected by one filter output gives the
+    # shape a later change would create by having a gate job download a built artifact.
+    del mutated["jobs"]["error-codes"]["if"]
     mutated["jobs"]["error-codes"]["needs"] = ["check-draft", "pyo3-module"]
     gaps = dependency_condition_gaps(mutated)
     check(
@@ -3559,8 +3838,9 @@ def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> Non
     a skipped dependency. Exempting such a consumer would let the gap through to a
     later pull request's red aggregate exactly as an unexempted gap would, and would
     let it through silently, since the exemption runs before the branch that reports an expression this grammar
-    cannot read. Job `error-codes` carries `needs: [check-draft]` and no `if:`; adding
-    a producer selected by one filter output gives each mutant a pair to compare.
+    cannot read. Job `error-codes` carries `needs: [check-draft]`; replacing its `if:`
+    and adding a producer selected by one filter output gives each mutant a pair to
+    compare.
     """
     for expression, exempt in (
         ("success()", False),
@@ -4003,6 +4283,94 @@ def check_shared_uploads_outlive_the_rerun_window(doc: dict) -> None:
             )
 
 
+# The workflow-level key check_profile_env_is_workflow_level requires, and the value
+# that key must carry. See the `profile-env` entry in this file's docstring.
+WORKFLOW_PROFILE_KEY = "CARGO_PROFILE_DEV_DEBUG"
+WORKFLOW_PROFILE_VALUE = "0"
+CARGO_PROFILE_PREFIX = "CARGO_PROFILE_"
+
+
+def profile_env_gaps(doc: dict) -> list[str]:
+    """Return each way a workflow's `CARGO_PROFILE_*` environment breaks the rule.
+
+    CRITERION: the workflow-level `env:` sets WORKFLOW_PROFILE_KEY to
+    WORKFLOW_PROFILE_VALUE, and no job-level or step-level `env:` sets any key
+    starting with CARGO_PROFILE_PREFIX.
+
+    WHY: rust-cache hashes every `CARGO*` variable into its key, so a
+    `CARGO_PROFILE_*` value that differs between jobs splits a `shared-key`
+    group into entries no other member restores.
+    """
+    gaps: list[str] = []
+    workflow_env = doc.get("env") or {}
+    value = workflow_env.get(WORKFLOW_PROFILE_KEY)
+    if value is None or str(value) != WORKFLOW_PROFILE_VALUE:
+        gaps.append(
+            f"workflow env: {WORKFLOW_PROFILE_KEY}={value!r}, "
+            f"expected {WORKFLOW_PROFILE_VALUE!r}"
+        )
+    for job_id, job in sorted((doc.get("jobs") or {}).items()):
+        for key in sorted(job.get("env") or {}):
+            if str(key).startswith(CARGO_PROFILE_PREFIX):
+                gaps.append(f"job {job_id}: env sets {key}")
+        for index, step in enumerate(job.get("steps") or []):
+            for key in sorted(step.get("env") or {}):
+                if str(key).startswith(CARGO_PROFILE_PREFIX):
+                    label = step.get("name") or f"step {index}"
+                    gaps.append(f"job {job_id}, {label}: env sets {key}")
+    return gaps
+
+
+def check_profile_env_is_workflow_level(doc: dict, name: str) -> None:
+    gaps = profile_env_gaps(doc)
+    check(
+        f"{name}: {WORKFLOW_PROFILE_KEY} is set at workflow level and no job or "
+        f"step sets a {CARGO_PROFILE_PREFIX}* key",
+        not gaps,
+        f"{gaps}: a per-job value splits a rust-cache group, and a missing "
+        f"workflow-level value restores debug info to CI's dev-profile builds",
+    )
+    # Controls: each mutation below breaks one half of the rule and must be reported.
+    job_id = next(job_id for job_id, job in doc["jobs"].items() if job.get("steps"))
+    mutated = copy.deepcopy(doc)
+    mutated["jobs"][job_id].setdefault("env", {})[WORKFLOW_PROFILE_KEY] = "1"
+    check(
+        f'a job-level {WORKFLOW_PROFILE_KEY}: "1" on {job_id} is reported',
+        any(
+            gap == f"job {job_id}: env sets {WORKFLOW_PROFILE_KEY}"
+            for gap in profile_env_gaps(mutated)
+        ),
+        f"a {name} setting {WORKFLOW_PROFILE_KEY} on job {job_id} went unreported",
+    )
+    mutated = copy.deepcopy(doc)
+    mutated["jobs"][job_id]["steps"][0].setdefault("env", {})[
+        "CARGO_PROFILE_TEST_OPT_LEVEL"
+    ] = "1"
+    check(
+        f"a step-level CARGO_PROFILE_TEST_OPT_LEVEL on {job_id} is reported",
+        any(
+            gap.startswith(f"job {job_id}, ")
+            and gap.endswith("env sets CARGO_PROFILE_TEST_OPT_LEVEL")
+            for gap in profile_env_gaps(mutated)
+        ),
+        f"a {name} setting a CARGO_PROFILE_* key on a step of {job_id} went unreported",
+    )
+    mutated = copy.deepcopy(doc)
+    (mutated.get("env") or {}).pop(WORKFLOW_PROFILE_KEY, None)
+    check(
+        f"removing the workflow-level {WORKFLOW_PROFILE_KEY} is reported",
+        any(gap.startswith("workflow env: ") for gap in profile_env_gaps(mutated)),
+        f"a {name} without a workflow-level {WORKFLOW_PROFILE_KEY} went unreported",
+    )
+    mutated = copy.deepcopy(doc)
+    mutated.setdefault("env", {})[WORKFLOW_PROFILE_KEY] = "2"
+    check(
+        f'a workflow-level {WORKFLOW_PROFILE_KEY}: "2" is reported',
+        any(gap.startswith("workflow env: ") for gap in profile_env_gaps(mutated)),
+        f"a {name} setting {WORKFLOW_PROFILE_KEY} to 2 went unreported",
+    )
+
+
 def package_write_holders(doc: dict) -> list[str]:
     """Return `workflow` and every job id whose own `permissions:` grants package write.
 
@@ -4216,6 +4584,12 @@ ARTIFACT_KEY_JOB_FILE_INPUTS = {
     "xcframework": (
         ("bindings/swift/build-xcframework.sh", "the script that runs the build"),
     ),
+    "kotlin-test": (
+        (
+            "scripts/generate-uniffi-kotlin.sh",
+            "the script that generates the Kotlin bindings",
+        ),
+    ),
 }
 ARTIFACT_KEY_EXPRESSION_INPUTS = (
     ("runner.os", "the runner OS"),
@@ -4253,7 +4627,8 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
     entries in ARTIFACT_KEY_JOB_FILE_INPUTS inside a `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
     digest that key reads in a step before the restore that hashes the job's own
     definition out of ci.yml; restores, saves and uploads one path list; and saves under the key it
-    restored.
+    restored. Each entry in ARTIFACT_KEY_JOB_FILE_INPUTS for the job is listed, or
+    covered by a `/**` entry, under a paths-filter key that gates the job.
 
     WHY: on a key hit the producer skips its build and uploads what an earlier run
     built. A key that omits one input restores that earlier build after the input
@@ -4296,6 +4671,17 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
         ):
             if pattern not in hashed:
                 gaps.append(f"{job_id}: key hashes no {pattern} ({meaning})")
+        routed = {
+            entry
+            for step in paths_filter_steps(doc)
+            for key in gating_filter_keys(doc, doc["jobs"][job_id])
+            for entry in (step.filters.get(key) or [])
+        }
+        for pattern, meaning in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ()):
+            if pattern not in routed and not directory_covered(routed, pattern):
+                gaps.append(
+                    f"{job_id}: no paths filter gating the job lists {pattern} ({meaning})"
+                )
         expressions = re.findall(r"\$\{\{\s*([^}]*?)\s*\}\}", key)
         for context, meaning in ARTIFACT_KEY_EXPRESSION_INPUTS:
             if context not in expressions:
@@ -4367,8 +4753,8 @@ def check_artifact_cache_keys(doc: dict) -> None:
     )
     producers = bridge_producers(doc)
     check(
-        "ci.yml: the artifact cache check reads all four bridge producers",
-        {"napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
+        "ci.yml: the artifact cache check reads all five bridge producers",
+        {"kotlin-test", "napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
         <= set(producers),
         f"found {producers}",
     )
@@ -4398,6 +4784,33 @@ def check_artifact_cache_keys(doc: dict) -> None:
                     ),
                     f"a ci.yml whose {job_id} key omits {text} went unreported",
                 )
+        # Control: each job file input dropped from the filters gating the job is reported.
+        for pattern, _ in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ()):
+            mutated = copy.deepcopy(doc)
+            for job in mutated["jobs"].values():
+                for step in job.get("steps") or []:
+                    if not str(step.get("uses") or "").startswith("dorny/paths-filter"):
+                        continue
+                    filters = yaml.safe_load(step["with"]["filters"])
+                    step["with"]["filters"] = yaml.safe_dump(
+                        {
+                            key: [
+                                entry
+                                for entry in entries
+                                if entry != pattern
+                                and not directory_covered({entry}, pattern)
+                            ]
+                            for key, entries in filters.items()
+                        }
+                    )
+            check(
+                f"{job_id}: a filter set that does not route {pattern} is reported",
+                any(
+                    gap.startswith(f"{job_id}: no paths filter") and pattern in gap
+                    for gap in artifact_cache_key_gaps(mutated)
+                ),
+                f"a ci.yml whose filters omit {pattern} went unreported for {job_id}",
+            )
         # Control: the artifact-inputs step moved after the restore is reported.
         mutated = copy.deepcopy(doc)
         moved = mutated["jobs"][job_id]["steps"]
@@ -4645,45 +5058,156 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
         )
 
 
-def check_xcframework_outputs_are_verified(doc: dict) -> None:
-    """Run the xcframework job's verify step against each uploaded path gone or stale.
+# Each producer whose upload lists several paths, with the artifact it uploads, the
+# marker file the job touches before its build under RUNNER_TEMP, the uploaded paths the
+# checkout tracks (a cache hit that leaves a tracked path out cannot be detected,
+# because the checkout supplies it), and whether its verify step rejects a
+# zero-byte output (kotlin-test's two paths are files; the xcframework's include
+# directories).
+MULTI_PATH_PRODUCERS = (
+    (
+        "xcframework",
+        "swift-xcframework-dev",
+        "xcframework-build-start",
+        ("bindings/swift/Sources/SCP/Internal/ScpBindings.swift",),
+        False,
+    ),
+    ("kotlin-test", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", (), True),
+)
+# Uploaded paths that name a file rather than a directory.
+UPLOADED_FILE_SUFFIXES = (".swift", ".so", ".kt")
 
-    CRITERION: for every path the `swift-xcframework-dev` upload lists, the step
-    before that upload exits non-zero when the path is absent or holds nothing
-    newer than the marker the build step touches, and exits 0 when every path is
-    fresh. On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step
-    exits non-zero when an untracked path is absent and exits 0 when every path is
-    present.
+
+def multi_path_producer_gaps(doc: dict) -> list[str]:
+    """Name each job whose upload lists several paths but is not in the tuple, or
+    sits in the tuple with no such upload."""
+    uploaders = {
+        job_id
+        for job_id, job in (doc.get("jobs") or {}).items()
+        for step in job.get("steps") or []
+        if str(step.get("uses") or "").startswith("actions/upload-artifact")
+        and len(str((step.get("with") or {}).get("path") or "").split()) > 1
+    }
+    listed = {row[0] for row in MULTI_PATH_PRODUCERS}
+    return [
+        f"{job_id} uploads several paths and is missing from MULTI_PATH_PRODUCERS"
+        for job_id in sorted(uploaders - listed)
+    ] + [
+        f"{job_id} is in MULTI_PATH_PRODUCERS and has no upload listing several paths"
+        for job_id in sorted(listed - uploaders)
+    ]
+
+
+def check_multi_path_producers_are_listed(doc: dict) -> None:
+    """MULTI_PATH_PRODUCERS holds exactly the jobs whose upload lists several paths."""
+    gaps = multi_path_producer_gaps(doc)
+    check(
+        "MULTI_PATH_PRODUCERS equals the jobs whose upload lists several paths",
+        not gaps,
+        "; ".join(gaps),
+    )
+    mutated = copy.deepcopy(doc)
+    for step in mutated["jobs"]["napi-addon"]["steps"]:
+        if (step.get("with") or {}).get("name") == "napi-addon-linux":
+            step["with"]["path"] += "\nbindings/typescript/index.d.ts"
+    gaps = multi_path_producer_gaps(mutated)
+    check(
+        "a second path on napi-addon's upload is reported as missing from the tuple",
+        gaps
+        == [
+            "napi-addon uploads several paths and is missing from MULTI_PATH_PRODUCERS"
+        ],
+        f"got {gaps}",
+    )
+    mutated = copy.deepcopy(doc)
+    for step in mutated["jobs"]["kotlin-test"]["steps"]:
+        if (step.get("with") or {}).get("name") == "uniffi-kotlin-linux":
+            step["with"]["path"] = step["with"]["path"].split()[0]
+    gaps = multi_path_producer_gaps(mutated)
+    check(
+        "kotlin-test uploading one path is reported as extra in the tuple",
+        gaps
+        == [
+            (
+                "kotlin-test is in MULTI_PATH_PRODUCERS and has no upload listing "
+                "several paths"
+            )
+        ],
+        f"got {gaps}",
+    )
+
+
+def check_multi_path_outputs_are_verified(
+    doc: dict,
+    job_id: str,
+    artifact: str,
+    marker_name: str,
+    tracked: tuple[str, ...],
+    rejects_empty: bool,
+) -> None:
+    """Run a producer's verify step against each uploaded path gone or stale.
+
+    CRITERION: for every path the `artifact` upload lists, the step before that
+    upload exits non-zero when the path is absent or holds nothing newer than the
+    marker the job touches before its build, and exits 0 when every path is fresh.
+    On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step exits
+    non-zero when an untracked path is absent and exits 0 when every path is
+    present. When `rejects_empty` is set, the step also exits non-zero when a path
+    is a fresh zero-byte file, after a build and on a cache hit.
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
-    nothing. The upload lists the tracked ScpBindings.swift, so the checkout always
-    supplies a match and the option alone cannot fail the producer.
+    nothing. The xcframework upload lists the tracked ScpBindings.swift, so the
+    checkout always supplies a match, and a build that writes one of kotlin-test's
+    two paths satisfies the option, so the option alone cannot fail either producer.
     """
-    steps = doc["jobs"]["xcframework"]["steps"]
+    steps = doc["jobs"][job_id]["steps"]
     upload = next(
         i
         for i, step in enumerate(steps)
-        if (step.get("with") or {}).get("name") == "swift-xcframework-dev"
+        if (step.get("with") or {}).get("name") == artifact
     )
     script = steps[upload - 1].get("run") or ""
     paths = (steps[upload]["with"]["path"]).split()
+    check(
+        f"{job_id}: the {artifact} upload lists more than one path",
+        len(paths) > 1,
+        f"it lists {paths}",
+    )
+    marker_touched = any(
+        f'touch "$RUNNER_TEMP/{marker_name}"' in str(step.get("run") or "")
+        for step in steps[:upload]
+    )
+    check(
+        f"{job_id}: a step before the upload touches the {marker_name} marker",
+        marker_touched,
+        "the verify step compares against a marker no step writes",
+    )
     now = 1_000_000_000
 
-    def run_with(missing: str | None, stale: str | None, hit: bool = False) -> int:
+    def run_with(
+        missing: str | None,
+        stale: str | None,
+        hit: bool = False,
+        empty: str | None = None,
+    ) -> int:
         with tempfile.TemporaryDirectory() as root:
             runner_temp = Path(root, "runner-temp")
             runner_temp.mkdir()
             if not hit:
-                marker = runner_temp / "xcframework-build-start"
+                marker = runner_temp / marker_name
                 marker.touch()
                 os.utime(marker, (now, now))
             for path in paths:
                 if path == missing:
                     continue
                 target = Path(root, "tree", path)
-                file = target / "content" if target.suffix != ".swift" else target
+                file = (
+                    target
+                    if target.suffix in UPLOADED_FILE_SUFFIXES
+                    else target / "content"
+                )
                 file.parent.mkdir(parents=True, exist_ok=True)
-                file.touch()
+                file.write_text("" if path == empty else "built\n")
                 stamp = now - 100 if path == stale or hit else now + 100
                 for entry in {file, target}:
                     os.utime(entry, (stamp, stamp))
@@ -4700,35 +5224,46 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
             ).returncode
 
     check(
-        "xcframework: the verify step passes when the build wrote every output",
+        f"{job_id}: the verify step passes when the build wrote every output",
         run_with(None, None) == 0,
         "the verify step rejects a build that wrote every uploaded path",
     )
     for path in paths:
         check(
-            f"xcframework: a missing {path} fails the producer",
+            f"{job_id}: a missing {path} fails the producer",
             run_with(path, None) != 0,
             f"the verify step before the upload passes without {path}",
         )
         check(
-            f"xcframework: a {path} older than the build fails the producer",
+            f"{job_id}: a {path} older than the build fails the producer",
             run_with(None, path) != 0,
             f"the verify step before the upload passes over a stale {path}",
         )
     check(
-        "xcframework: on a cache hit the verify step passes when the restore wrote "
+        f"{job_id}: on a cache hit the verify step passes when the restore wrote "
         "every output",
         run_with(None, None, hit=True) == 0,
         "the verify step rejects a cache hit that restored every uploaded path",
     )
-    # The checkout supplies the tracked ScpBindings.swift, so CI cannot reach a hit
-    # that lacks it.
-    for path in (p for p in paths if not p.endswith("ScpBindings.swift")):
+    # The checkout supplies a tracked path, so CI cannot reach a hit that lacks it.
+    for path in (p for p in paths if p not in tracked):
         check(
-            f"xcframework: on a cache hit a missing {path} fails the producer",
+            f"{job_id}: on a cache hit a missing {path} fails the producer",
             run_with(path, None, hit=True) != 0,
             f"the verify step passes a cache hit without {path}",
         )
+    if rejects_empty:
+        for path in paths:
+            check(
+                f"{job_id}: a zero-byte {path} written by the build fails the producer",
+                run_with(None, None, empty=path) != 0,
+                f"the verify step before the upload passes over an empty {path}",
+            )
+            check(
+                f"{job_id}: on a cache hit a zero-byte {path} fails the producer",
+                run_with(None, None, hit=True, empty=path) != 0,
+                f"the verify step passes a cache hit that restored an empty {path}",
+            )
 
 
 def a_producer_and_an_unguarded_consumer(
@@ -4801,6 +5336,292 @@ def check_a_new_producer_reaches_the_napi_gate(doc: dict) -> None:
         f"a job downloading {artifact} and running its tests with no assertion "
         f"fragment went unreported: {gaps}",
     )
+
+
+def cache_write(step: dict) -> str | None:
+    """Name the cache one step writes, or None when it writes none.
+
+    A step writes a cache when a later run of any ref can restore what it saves:
+    a `Swatinem/rust-cache` step whose `save-if` is not the literal false, an
+    `actions/cache` or `actions/cache/save` step, a `gradle/actions/setup-gradle`
+    step that neither disables its cache nor sets `cache-read-only` to the literal
+    true (it writes on the default branch by default), a step exporting a layer
+    cache through `cache-to`, an `oven-sh/setup-bun` step that does not set
+    `no-cache` to the literal true (it caches the bun executable by default), and
+    a setup action given a `cache:` input. An input
+    written as an expression counts as writing, so an unreadable input errs toward
+    holding the job on push rather than toward skipping a writer.
+    """
+    uses = str(step.get("uses") or "")
+    action = uses.split("@", 1)[0]
+    inputs = step.get("with") or {}
+
+    def literal(name: str) -> str:
+        return str(inputs.get(name, "")).strip().lower()
+
+    if action == "Swatinem/rust-cache":
+        if literal("save-if") == "false":
+            return None
+        return f"rust-cache `{inputs.get('shared-key')}`"
+    if action in ("actions/cache", "actions/cache/save"):
+        return f"{action} `{inputs.get('key')}`"
+    if action == "gradle/actions/setup-gradle":
+        if literal("cache-disabled") == "true" or literal("cache-read-only") == "true":
+            return None
+        return "the Gradle user-home cache"
+    if action == "oven-sh/setup-bun":
+        if literal("no-cache") == "true":
+            return None
+        return "the setup-bun executable cache"
+    if "cache-to" in inputs:
+        return f"layer cache `{inputs['cache-to']}`"
+    if action.startswith("actions/setup-") and inputs.get("cache"):
+        return f"{action} cache `{inputs['cache']}`"
+    return None
+
+
+# Caches whose key names no job: setup-bun keys its entry by bun version, OS and
+# architecture, so a push that runs any one job writing it refreshes the entry
+# every other job restores.
+SHARED_KEY_CACHES = frozenset({"the setup-bun executable cache"})
+
+
+def cache_writers(doc: dict, shared: bool = True) -> dict[str, list[str]]:
+    """Map each job holding a cache-writing step to the caches it writes.
+
+    With `shared` false, the caches SHARED_KEY_CACHES names are left out.
+    """
+    writers: dict[str, list[str]] = {}
+    for job_id, job in doc["jobs"].items():
+        written = [
+            name
+            for step in job.get("steps") or []
+            if isinstance(step, dict)
+            for name in [cache_write(step)]
+            if name is not None and (shared or name not in SHARED_KEY_CACHES)
+        ]
+        if written:
+            writers[job_id] = written
+    return writers
+
+
+# A matrix value chosen by event: `${{ fromJSON(github.event_name == 'push' &&
+# '<push list>' || '<every other event's list>') }}`. Any other expression in a
+# writer's matrix is reported as unreadable.
+PUSH_MATRIX = re.compile(
+    r"^\$\{\{\s*fromJSON\(\s*github\.event_name\s*==\s*'push'\s*&&\s*'(\[[^']*\])'"
+    r"\s*\|\|\s*'(\[[^']*\])'\s*\)\s*\}\}$"
+)
+SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?")
+# A matrix axis a cache key expands, so that each value of the axis writes its own
+# entry: `shared-key: transport-optional-${{ matrix.group }}`.
+KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}")
+# A key that names the runner's platform, so each runner writes its own entry.
+# Swatinem/rust-cache puts the platform into every key without the text naming it.
+KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b")
+
+
+def push_runs_step(step: dict) -> bool:
+    """Report whether a push to `main` can run one step and meet its `save-if`.
+
+    The step's `if:` and its `save-if`, each with or without the `${{ … }}`
+    wrapper, are joined with `&&` and read with parse_condition's grammar.
+    `github.event_name` reads `push` and `github.ref` reads `refs/heads/main`.
+    Every other comparison that names some other name may come out either way,
+    and one pair of operands gets one answer wherever it appears. The step runs
+    on push when some choice of those answers makes the whole expression true.
+    An expression outside the grammar raises ValueError.
+    """
+    inputs = step.get("with") or {}
+    parts = []
+    for text in (step.get("if"), inputs.get("save-if")):
+        text = str(text or "").strip()
+        wrapped = re.fullmatch(r"\$\{\{(.*)\}\}", text, re.DOTALL)
+        text = (wrapped.group(1) if wrapped else text).strip()
+        if text:
+            parts.append(f"({text})")
+    if not parts:
+        return True
+    tree = parse_condition(" && ".join(parts))
+    known = {"github.event_name": "push", "github.ref": "refs/heads/main"}
+
+    def operand(token: str) -> str | None:
+        quoted = re.fullmatch(r"'([^']*)'", token)
+        if quoted:
+            return quoted.group(1)
+        if token in ("true", "false") or token.isdigit():
+            return token
+        return known.get(token)
+
+    free: list[tuple[str, ...]] = []
+
+    def collect(node: tuple) -> None:
+        if node[0] in ("or", "and"):
+            for part in node[1]:
+                collect(part)
+        elif None in (operand(node[1]), operand(node[2])):
+            pair = tuple(sorted((node[1], node[2])))
+            if pair not in free:
+                free.append(pair)
+
+    def value(node: tuple, answers: dict) -> bool:
+        if node[0] in ("or", "and"):
+            results = [value(part, answers) for part in node[1]]
+            return any(results) if node[0] == "or" else all(results)
+        left, right = operand(node[1]), operand(node[2])
+        if None in (left, right):
+            equal = answers[tuple(sorted((node[1], node[2])))]
+        else:
+            equal = left == right
+        return equal if node[0] == "==" else not equal
+
+    collect(tree)
+    return any(
+        value(tree, {pair: bool(mask >> index & 1) for index, pair in enumerate(free)})
+        for mask in range(2 ** len(free))
+    )
+
+
+def push_writer_gaps(doc: dict) -> list[str]:
+    """Return every way a push to `main` would skip a cache write.
+
+    CRITERION: a job holding a cache-writing step runs on a push to `main` wherever
+    a merge_group run with the same filter outputs runs it, and some push runs it at
+    all; a matrix leg that a writing step's `save-if` or `if:` names exists on push;
+    and every value that every other event runs on an axis a writing step's cache
+    key expands (`shared-key` or `key` holding `${{ matrix.<axis> }}`, or, for a
+    rust-cache step or a key holding `runner.os` or `runner.arch`, an axis the job's
+    `runs-on` names) also runs on push, because each such value names its own entry;
+    and push_runs_step finds that a push can meet each writing step's `if:` and
+    `save-if` together. A cache SHARED_KEY_CACHES
+    names needs only that some push runs some job writing it.
+
+    WHY: rust-cache and `actions/cache/save` write only on `refs/heads/main`, so a
+    writer that a push skips leaves its entry to go stale until eviction, and every
+    pull request and merge-queue run then compiles from a miss. Nothing goes red:
+    the `ci` aggregate evaluates the writer's own `if:`, which says skip. The jobs a
+    writer needs are dependency_condition_gaps' business, since GitHub skips a job
+    whose dependency skipped and that check enumerates the push event.
+    """
+    gaps: list[str] = []
+    assignments = condition_assignments(doc)
+    holders = cache_writers(doc)
+    for cache in sorted(SHARED_KEY_CACHES):
+        pushed = False
+        for job_id in sorted(job for job, written in holders.items() if cache in written):
+            condition = doc["jobs"][job_id].get("if") or "true == 'true'"
+            try:
+                pushed = pushed or any(
+                    selects(condition, outputs, event)
+                    for outputs, event in assignments
+                    if event == "push"
+                )
+            except ValueError as unreadable:
+                gaps.append(
+                    f"{job_id} writes {cache} and this check cannot decide whether a "
+                    f"push runs it ({unreadable})"
+                )
+                pushed = True
+        if not pushed and any(cache in written for written in holders.values()):
+            gaps.append(f"jobs write {cache} and no push to `main` runs any of them")
+    for job_id, written in sorted(cache_writers(doc, shared=False).items()):
+        job = doc["jobs"][job_id]
+        condition = job.get("if") or "true == 'true'"
+        caches = ", ".join(written)
+        try:
+            pushes = [
+                outputs
+                for outputs, event in assignments
+                if event == "push" and selects(condition, outputs, event)
+            ]
+            dropped = [
+                outputs
+                for outputs, event in assignments
+                if event == "merge_group"
+                and selects(condition, outputs, event)
+                and not selects(condition, outputs, "push")
+            ]
+        except ValueError as unreadable:
+            gaps.append(
+                f"{job_id} writes {caches} and this check cannot decide whether a "
+                f"push runs it ({unreadable})"
+            )
+            continue
+        if not pushes:
+            gaps.append(f"{job_id} writes {caches} and no push to `main` runs it")
+        elif dropped:
+            selected = sorted(key for key, on in dropped[0].items() if on == "true")
+            gaps.append(
+                f"{job_id} writes {caches}, and a push with filters "
+                f"{selected or ['none']} true skips it where a merge_group run with "
+                f"the same filters runs it"
+            )
+        matrix = (job.get("strategy") or {}).get("matrix") or {}
+        if not isinstance(matrix, dict):
+            gaps.append(f"{job_id} writes {caches} through a matrix this check cannot read")
+            continue
+        on_push: dict[str, list] = {}
+        elsewhere: dict[str, list] = {}
+        for key, values in matrix.items():
+            if isinstance(values, list):
+                on_push[key] = values
+                elsewhere[key] = values
+                continue
+            chosen = PUSH_MATRIX.match(str(values))
+            if chosen is None:
+                gaps.append(
+                    f"{job_id} writes {caches} and its matrix `{key}` is an expression "
+                    f"this check cannot read: {values!r}"
+                )
+                continue
+            push_values, other_values = (json.loads(group) for group in chosen.groups())
+            if not set(map(str, push_values)) <= set(map(str, other_values)):
+                gaps.append(
+                    f"{job_id}'s matrix `{key}` runs {push_values} on push, outside "
+                    f"the {other_values} every other event runs"
+                )
+            on_push[key] = push_values
+            elsewhere[key] = other_values
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict) or cache_write(step) is None:
+                continue
+            inputs = step.get("with") or {}
+            try:
+                if not push_runs_step(step):
+                    gaps.append(
+                        f"{job_id} saves {cache_write(step)} from a step whose `if:` "
+                        f"and `save-if` no push to `main` meets"
+                    )
+            except ValueError as unreadable:
+                gaps.append(
+                    f"{job_id} saves {cache_write(step)} from a step whose `if:` or "
+                    f"`save-if` this check cannot read ({unreadable})"
+                )
+            leg_conditions = f"{inputs.get('save-if', '')} {step.get('if') or ''}"
+            for key, value in SAVE_IF_MATRIX.findall(leg_conditions):
+                if key in on_push and value not in map(str, on_push[key]):
+                    gaps.append(
+                        f"{job_id} saves {cache_write(step)} only from matrix leg "
+                        f"`{key} == {value}`, and a push runs `{key}` over "
+                        f"{on_push[key]} alone"
+                    )
+            key_text = f"{inputs.get('shared-key', '')} {inputs.get('key', '')}"
+            key_axes = set(KEY_MATRIX_AXIS.findall(key_text))
+            action = str(step.get("uses") or "").split("@", 1)[0]
+            if action == "Swatinem/rust-cache" or KEY_RUNNER.search(key_text):
+                key_axes |= set(KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or "")))
+            for key in sorted(key_axes):
+                if key not in on_push:
+                    continue
+                pushed_values = set(map(str, on_push[key]))
+                unwritten = [v for v in elsewhere[key] if str(v) not in pushed_values]
+                if unwritten:
+                    gaps.append(
+                        f"{job_id} writes {cache_write(step)}, one entry per value of "
+                        f"matrix `{key}`, and a push never runs {unwritten}, so those "
+                        f"entries are never written"
+                    )
+    return gaps
 
 
 # A step's `if:` that selects one value of one matrix axis, with or without the
@@ -4904,6 +5725,574 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
                         f"step whose `if:` names it"
                     )
     return gaps
+
+
+def scenario_disagreements(doc: dict) -> list[str]:
+    """Return each (scenario, job) whose `if:` and SCENARIOS answer differently."""
+    found: list[str] = []
+    for scenario in SCENARIOS.values():
+        for job_id, expected in sorted(scenario.runs.items()):
+            condition = doc["jobs"].get(job_id, {}).get("if")
+            if condition is None:
+                continue
+            try:
+                actual = selects(condition, scenario.filters, scenario.event)
+            except ValueError as unreadable:
+                found.append(f"{scenario.name}: {job_id} unreadable ({unreadable})")
+                continue
+            if actual != expected:
+                found.append(
+                    f"{scenario.name}: {job_id} {'runs' if actual else 'skips'}, "
+                    f"SCENARIOS says it {'runs' if expected else 'skips'}"
+                )
+    return found
+
+
+def skipped_writers(doc: dict) -> list[str]:
+    """Return each job NOT_ON_PUSH_JOBS or NOT_ON_PUSH_FILTER_JOBS lists that writes a
+    cache SHARED_KEY_CACHES does not name."""
+    writers = cache_writers(doc, shared=False)
+    skipped = set(writers) & (set(NOT_ON_PUSH_JOBS) | set(NOT_ON_PUSH_FILTER_JOBS))
+    return [f"{job_id} writes {', '.join(writers[job_id])}" for job_id in sorted(skipped)]
+
+
+def check_push_runs_every_cache_writer(doc: dict) -> None:
+    writers = cache_writers(doc)
+    # The detector has to find the writers this workflow holds today, or the gap
+    # check below passes over an empty set.
+    for job_id in (
+        "bridge-parity-kotlin",
+        "docker-image-cache",
+        "fuzz-build",
+        "kotlin-lint",
+        "kotlin-test",
+        "napi-addon",
+        "pyo3-module",
+        "pyo3-module-macos",
+        "rust-clippy",
+        "rust-test",
+        "rust-test-macos",
+        "rust-test-optional-features",
+        "typescript-wasm-check",
+        "xcframework",
+    ):
+        check(f"{job_id} is read as a cache writer", job_id in writers, f"{writers}")
+    gaps = push_writer_gaps(doc)
+    check("ci.yml: a push to `main` runs every cache writer", not gaps, "; ".join(gaps))
+    for step, expected in (
+        ({"uses": "oven-sh/setup-bun@v2"}, True),
+        ({"uses": "oven-sh/setup-bun@v2", "with": {"no-cache": "false"}}, True),
+        ({"uses": "oven-sh/setup-bun@v2", "with": {"no-cache": True}}, False),
+    ):
+        check(
+            f"cache_write({step}) {'writes' if expected else 'writes nothing'}",
+            (cache_write(step) is not None) is expected,
+        )
+    skipped = skipped_writers(doc)
+    check("no job SCENARIOS skips on push writes a cache", not skipped, "; ".join(skipped))
+    disagreements = scenario_disagreements(doc)
+    check(
+        "every scenario's answer matches the job's own `if:`",
+        not disagreements,
+        "; ".join(disagreements),
+    )
+
+
+def check_push_writer_mutants(doc: dict) -> None:
+    """Each way of skipping a writer on push, or leaking a push skip, is reported."""
+    guarded = copy.deepcopy(doc)
+    clippy = guarded["jobs"]["rust-clippy"]
+    clippy["if"] = f"github.event_name != 'push' && ({clippy['if']})"
+    gaps = push_writer_gaps(guarded)
+    check(
+        "a push guard on writer rust-clippy is reported",
+        any(gap.startswith("rust-clippy writes") for gap in gaps)
+        and not any("cannot decide" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    check(
+        "a push guard on writer rust-clippy disagrees with SCENARIOS",
+        any(
+            "rust-only, push: rust-clippy skips" in found
+            for found in scenario_disagreements(guarded)
+        ),
+        f"{scenario_disagreements(guarded)}",
+    )
+
+    shard = copy.deepcopy(doc)
+    shard["jobs"]["rust-test"]["strategy"]["matrix"]["shard"] = (
+        "${{ fromJSON(github.event_name == 'push' && '[2]' || '[1, 2, 3, 4]') }}"
+    )
+    gaps = push_writer_gaps(shard)
+    check(
+        "a push matrix without the writing shard is reported",
+        any("rust-test saves" in gap for gap in gaps),
+        f"{gaps}",
+    )
+
+    # rust-test-optional-features writes one rust-cache entry per `group` value
+    # through its key, and rust-clippy one entry per `leg` value through a writing
+    # step gated on that leg. A push matrix dropping a value leaves its entry
+    # unwritten; a push matrix keeping every value leaves nothing to report.
+    # A job whose `runs-on` reads an `os` axis writes one rust-cache entry per `os`
+    # value, because rust-cache keys by platform. No job in ci.yml has such an axis
+    # (rust-test and rust-test-optional-features run on ubuntu-latest alone, and
+    # rust-test-macos on macos-latest alone), so the `os` cases give those two jobs
+    # an `os` axis over both runners, read by `runs-on`, before narrowing it.
+    def with_os_axis(source: dict, job_id: str) -> dict:
+        widened = copy.deepcopy(source)
+        job = widened["jobs"][job_id]
+        job["strategy"]["matrix"]["os"] = ["ubuntu-latest", "macos-latest"]
+        job["runs-on"] = "${{ matrix.os }}"
+        return widened
+
+    for job_id, axis, dropped_value, reported in (
+        (
+            "rust-test-optional-features",
+            "group",
+            "node-relay",
+            "one entry per value of matrix `group`, and a push never runs ['node-relay']",
+        ),
+        (
+            "rust-test",
+            "os",
+            "macos-latest",
+            "one entry per value of matrix `os`, and a push never runs ['macos-latest']",
+        ),
+        (
+            "rust-test-optional-features",
+            "os",
+            "macos-latest",
+            "one entry per value of matrix `os`, and a push never runs ['macos-latest']",
+        ),
+        ("rust-clippy", "leg", "examples", "only from matrix leg `leg == examples`"),
+    ):
+        base = with_os_axis(doc, job_id) if axis == "os" else doc
+        live_axis = base["jobs"][job_id]["strategy"]["matrix"][axis]
+        check(
+            f"{job_id}'s `{axis}` axis lists {dropped_value} for the push-matrix control",
+            isinstance(live_axis, list) and dropped_value in live_axis,
+            f"{live_axis!r}",
+        )
+        every = json.dumps(live_axis)
+        fewer = json.dumps([value for value in live_axis if value != dropped_value])
+        narrowed = copy.deepcopy(base)
+        narrowed["jobs"][job_id]["strategy"]["matrix"][axis] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && '{fewer}' || '{every}') }}}}"
+        )
+        gaps = push_writer_gaps(narrowed)
+        check(
+            f"a push matrix dropping {job_id}'s `{axis}` value {dropped_value} is reported",
+            any(gap.startswith(f"{job_id} ") and reported in gap for gap in gaps),
+            f"{gaps}",
+        )
+        whole = copy.deepcopy(base)
+        whole["jobs"][job_id]["strategy"]["matrix"][axis] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && '{every}' || '{every}') }}}}"
+        )
+        check(
+            f"a push matrix keeping every {job_id} `{axis}` value is not reported",
+            not any(gap.startswith(f"{job_id} ") for gap in push_writer_gaps(whole)),
+            f"{push_writer_gaps(whole)}",
+        )
+
+    # An actions/cache key splits by `runs-on` only when it names the platform.
+    for key, split in (("deps-${{ runner.os }}-v1", True), ("deps-v1", False)):
+        cached = with_os_axis(doc, "rust-test")
+        job = cached["jobs"]["rust-test"]
+        job["strategy"]["matrix"]["os"] = (
+            "${{ fromJSON(github.event_name == 'push' && '[\"ubuntu-latest\"]' "
+            "|| '[\"ubuntu-latest\", \"macos-latest\"]') }}"
+        )
+        job["steps"] = [
+            {"uses": "actions/cache@v4", "with": {"path": "deps", "key": key}}
+            if str(step.get("uses", "")).startswith("Swatinem/rust-cache")
+            else step
+            for step in job["steps"]
+        ]
+        gaps = push_writer_gaps(cached)
+        check(
+            f"an actions/cache key `{key}` on a push matrix dropping macos-latest is "
+            f"{'reported' if split else 'not reported'}",
+            any("matrix `os`" in gap for gap in gaps) is split,
+            f"{gaps}",
+        )
+
+    partial = copy.deepcopy(doc)
+    pyo3 = partial["jobs"]["pyo3-module"]
+    pyo3["if"] = pyo3["if"].replace(
+        "needs.changes.outputs.python == 'true' ||",
+        "(github.event_name != 'push' && needs.changes.outputs.python == 'true') ||",
+    )
+    gaps = push_writer_gaps(partial)
+    check(
+        "a push guard on one clause of writer pyo3-module is reported",
+        any(
+            gap.startswith("pyo3-module writes") and "skips it where a merge_group run" in gap
+            for gap in gaps
+        ),
+        f"{gaps}",
+    )
+
+    # A writing step's own `if:` or `save-if` can exclude push while its job runs.
+    def step_where(job: dict, predicate) -> dict:
+        return next(
+            step for step in job["steps"] if isinstance(step, dict) and predicate(step)
+        )
+
+    def clippy_workspace(job: dict) -> dict:
+        return step_where(job, lambda step: step.get("if") == "matrix.leg == 'workspace'")
+
+    def test_cache(job: dict) -> dict:
+        return step_where(
+            job, lambda step: str(step.get("uses", "")).startswith("Swatinem/rust-cache")
+        )
+
+    def pyo3_save(job: dict) -> dict:
+        return step_where(
+            job, lambda step: str(step.get("uses", "")).startswith("actions/cache/save")
+        )
+
+    no_push = "github.event_name != 'push'"
+    for label, job_id, locate, field, text, reported in (
+        (
+            "a push exclusion on rust-clippy's workspace rust-cache `if:`",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            f"matrix.leg == 'workspace' && {no_push}",
+            "no push to `main` meets",
+        ),
+        (
+            "a merge_group-only rust-test rust-cache `save-if`",
+            "rust-test",
+            test_cache,
+            "save-if",
+            "${{ github.event_name == 'merge_group' && matrix.shard == 1 }}",
+            "no push to `main` meets",
+        ),
+        (
+            "a push exclusion on pyo3-module's cache save `if:`",
+            "pyo3-module",
+            pyo3_save,
+            "if",
+            f"steps.artifact-cache.outputs.cache-hit != 'true' && {no_push}",
+            "no push to `main` meets",
+        ),
+        (
+            "a writing step condition that contradicts itself on one operand pair",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "matrix.leg == 'workspace' && matrix.leg != 'workspace'",
+            "no push to `main` meets",
+        ),
+        (
+            "a writing step `if:` outside the grammar",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "matrix.leg == 'workspace' && !cancelled()",
+            "this check cannot read",
+        ),
+        (
+            "a writing step `if:` that admits push alongside other events",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            f"matrix.leg == 'workspace' && ({no_push} || github.ref == 'refs/heads/main')",
+            None,
+        ),
+        (
+            "a rust-cache `save-if` naming a number and the main ref",
+            "rust-test",
+            test_cache,
+            "save-if",
+            "${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}",
+            None,
+        ),
+    ):
+        changed = copy.deepcopy(doc)
+        step = locate(changed["jobs"][job_id])
+        if field == "if":
+            step["if"] = text
+        else:
+            step.setdefault("with", {})[field] = text
+        gaps = [gap for gap in push_writer_gaps(changed) if gap.startswith(f"{job_id} ")]
+        if reported is None:
+            check(f"{label} is not reported", not gaps, f"{gaps}")
+        else:
+            check(
+                f"{label} is reported",
+                any(gap.startswith(f"{job_id} saves") and reported in gap for gap in gaps),
+                f"{gaps}",
+            )
+
+    push_shards = "${{ fromJSON(github.event_name == 'push' && '[1, 5]' || '[1, 2, 3, 4]') }}"
+    for label, key, value, reported in (
+        (
+            "a writer matrix that is one expression",
+            None,
+            "${{ fromJSON(inputs.matrix) }}",
+            "through a matrix this check cannot read",
+        ),
+        (
+            "a writer matrix key no pattern reads",
+            "shard",
+            "${{ fromJSON(inputs.shards) }}",
+            "matrix `shard` is an expression this check cannot read",
+        ),
+        (
+            "a push matrix leg outside every other event's legs",
+            "shard",
+            push_shards,
+            "rust-test's matrix `shard` runs [1, 5] on push",
+        ),
+    ):
+        changed = copy.deepcopy(doc)
+        strategy = changed["jobs"]["rust-test"]["strategy"]
+        if key is None:
+            strategy["matrix"] = value
+        else:
+            strategy["matrix"][key] = value
+        gaps = push_writer_gaps(changed)
+        check(f"{label} is reported", any(reported in gap for gap in gaps), f"{gaps}")
+    check(
+        "the unmutated rust-test matrix is read without a gap",
+        not any(gap.startswith("rust-test") for gap in push_writer_gaps(doc)),
+        f"{push_writer_gaps(doc)}",
+    )
+
+    writing = copy.deepcopy(doc)
+    writing["jobs"]["error-codes"].setdefault("steps", []).append(
+        {"uses": "actions/cache@v4", "with": {"key": "k", "path": "p"}}
+    )
+    check(
+        "a cache write in a job NOT_ON_PUSH_JOBS lists is reported",
+        any(found.startswith("error-codes writes") for found in skipped_writers(writing)),
+        f"{skipped_writers(writing)}",
+    )
+
+    bun = copy.deepcopy(doc)
+    bun["jobs"]["error-codes"].setdefault("steps", []).append(
+        {"uses": "oven-sh/setup-bun@v2"}
+    )
+    check(
+        "a setup-bun write in a push-skipped job is not reported while a push writes it",
+        not skipped_writers(bun) and not push_writer_gaps(bun),
+        f"{skipped_writers(bun)} {push_writer_gaps(bun)}",
+    )
+    for job in bun["jobs"].values():
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and str(step.get("uses", "")).startswith(
+                "oven-sh/setup-bun@"
+            ):
+                guard = job.get("if")
+                if guard is not None and "github.event_name != 'push'" not in guard:
+                    job["if"] = f"github.event_name != 'push' && ({guard})"
+                elif guard is None:
+                    job["if"] = "github.event_name != 'push'"
+    gaps = push_writer_gaps(bun)
+    check(
+        "no push running any setup-bun writer is reported",
+        any("setup-bun executable cache and no push" in gap for gap in gaps),
+        f"{gaps}",
+    )
+
+    draft = copy.deepcopy(doc)
+    gate = draft["jobs"]["check-draft"]
+    gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
+    gaps = dependency_condition_gaps(draft)
+    check(
+        "a push skip on check-draft, which every writer needs, is reported",
+        any("changes runs and check-draft skips on event push" in gap for gap in gaps),
+        f"{gaps}",
+    )
+
+    for job_id, event, scenario in (
+        ("rust-fmt", "merge_group", "rust-only, merge_group"),
+        ("error-codes", "pull_request", "docs-only, pull_request"),
+        ("swift-lint", "merge_group", "swift-and-typescript, merge_group"),
+        ("scaffold-typescript-web-check", "pull_request", "typescript-wasm-only, pull_request"),
+    ):
+        leaked = copy.deepcopy(doc)
+        current = leaked["jobs"][job_id]["if"]
+        leaked["jobs"][job_id]["if"] = current.replace(
+            "github.event_name != 'push'", f"github.event_name != '{event}'"
+        )
+        check(
+            f"{job_id} skipping on {event} disagrees with SCENARIOS",
+            any(
+                f"{scenario}: {job_id} skips" in found
+                for found in scenario_disagreements(leaked)
+            ),
+            f"{scenario_disagreements(leaked)}",
+        )
+
+    for job_id, clause, scenario in (
+        ("swift-build-test", "swift", "swift-and-typescript, merge_group"),
+        ("bridge-parity-swift", "swift", "swift-and-typescript, pull_request"),
+        ("bridge-parity", "typescript", "swift-and-typescript, merge_group"),
+        ("typescript-check", "typescript", "swift-and-typescript, pull_request"),
+        (
+            "scaffold-typescript-web-check",
+            "scaffold-typescript-web",
+            "swift-and-typescript, merge_group",
+        ),
+        ("scaffold-typescript-web-check", "typescript-wasm", "typescript-wasm-only, merge_group"),
+    ):
+        dropped = copy.deepcopy(doc)
+        current = dropped["jobs"][job_id]["if"]
+        text = f"needs.changes.outputs.{clause} == 'true'"
+        narrowed = re.sub(rf"\s*\|\|\s*{re.escape(text)}|{re.escape(text)}\s*\|\|\s*", "", current)
+        check(f"the {clause} clause is found in {job_id}'s `if:`", narrowed != current, current)
+        dropped["jobs"][job_id]["if"] = narrowed
+        check(
+            f"{job_id} without its {clause} clause disagrees with SCENARIOS",
+            any(
+                f"{scenario}: {job_id} skips" in found
+                for found in scenario_disagreements(dropped)
+            ),
+            f"{scenario_disagreements(dropped)}",
+        )
+
+    for condition, scenario in (
+        ("github.event_name == 'push'", "docs-only, push"),
+        ("needs.changes.outputs.rust == 'true'", "rust-only, pull_request"),
+    ):
+        widened = copy.deepcopy(doc)
+        widened["jobs"]["docker-image-cache"]["if"] = condition
+        check(
+            f"docker-image-cache on `{condition}` alone disagrees with SCENARIOS",
+            any(
+                f"{scenario}: docker-image-cache runs" in found
+                for found in scenario_disagreements(widened)
+            ),
+            f"{scenario_disagreements(widened)}",
+        )
+
+
+def check_condition_grammar() -> None:
+    """parse_condition reads the grammar ci.yml uses and refuses everything else."""
+    outputs = {"rust": "true", "python": "false"}
+    guarded = (
+        "github.event_name != 'push' && "
+        "(needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')"
+    )
+    for expression, event, expected in (
+        (guarded, "push", False),
+        (guarded, "pull_request", True),
+        (guarded, "merge_group", True),
+        # `&&` binds tighter than `||`.
+        (
+            "needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true' && github.event_name == 'push'",
+            "pull_request",
+            True,
+        ),
+        (
+            "(needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true') && github.event_name == 'push'",
+            "pull_request",
+            False,
+        ),
+    ):
+        check(
+            f"selects({expression!r}, {event}) is {expected}",
+            selects(expression, outputs, event) is expected,
+        )
+    for expression in (
+        "always()",
+        "!cancelled()",
+        "success() && needs.changes.outputs.rust == 'true'",
+        "(needs.changes.outputs.rust == 'true'",
+        "needs.changes.outputs.rust == 'true')",
+        "needs.changes.outputs.rust",
+        "needs.changes.outputs.rust == 'true' extra",
+        "github.event_name != 'push' && needs.changes.outputs.renamed == 'true'",
+        "",
+    ):
+        try:
+            selects(expression, outputs, "push")
+            refused = False
+        except ValueError:
+            refused = True
+        check(f"selects refuses {expression!r}", refused)
+
+
+def check_aggregate_grammar() -> None:
+    """scripts/ci-aggregate-result.py reads the same grammar and refuses the rest.
+
+    Each case runs the aggregate over a one-job workflow, so the verdict comes from
+    that script's evaluator and the expected answer from this function's table.
+    """
+    for expression, event, skipped_ok in (
+        ("github.event_name != 'push' && needs.changes.outputs.rust == 'true'", "push", True),
+        ("github.event_name != 'push' && needs.changes.outputs.rust == 'true'", "merge_group", False),
+        # With rust true, python false and the event pull_request, `&&` binding
+        # tighter than `||` selects this job; `||` binding tighter, or a
+        # left-to-right reading, skips it.
+        (
+            "needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true' && github.event_name == 'push'",
+            "pull_request",
+            False,
+        ),
+        # The parentheses turn the case above into a skip.
+        (
+            "(needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true') && github.event_name == 'push'",
+            "pull_request",
+            True,
+        ),
+    ):
+        code, out = run_one_job_aggregate(expression, event)
+        check(
+            f"aggregate over a skipped `{expression}` on {event} -> exit "
+            f"{0 if skipped_ok else 1}",
+            code == (0 if skipped_ok else 1),
+            f"exit {code}: {out}",
+        )
+    for expression in (
+        "!cancelled()",
+        "success() && needs.changes.outputs.rust == 'true'",
+        "(needs.changes.outputs.rust == 'true'",
+        "github.event_name != 'push' && needs.changes.outputs.renamed == 'true'",
+    ):
+        code, out = run_one_job_aggregate(expression, "push")
+        check(f"aggregate refuses `{expression}` -> exit 2", code == 2, f"exit {code}: {out}")
+
+
+def run_one_job_aggregate(expression: str, event: str) -> tuple[int, str]:
+    """Run the aggregate over a workflow holding one job with this `if:`, skipped."""
+    workflow = {
+        "jobs": {
+            "check-draft": {"runs-on": "ubuntu-latest"},
+            "changes": {"needs": "check-draft", "outputs": {"rust": "x", "python": "x"}},
+            "probe": {"needs": "changes", "if": expression},
+            "ci": {"if": "always()", "needs": ["check-draft", "changes", "probe"]},
+        }
+    }
+    needs = {
+        "check-draft": {"result": "success"},
+        "changes": {"result": "success", "outputs": {"rust": "true", "python": "false"}},
+        "probe": {"result": "skipped"},
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as handle:
+        yaml.safe_dump(workflow, handle)
+        path = handle.name
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(AGGREGATE), path],
+            env=dict(os.environ, NEEDS_JSON=json.dumps(needs), GITHUB_EVENT_NAME=event),
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            check=False,
+        )
+    finally:
+        os.unlink(path)
+    return proc.returncode, proc.stdout + proc.stderr
 
 
 def check_matrix_axes(path: Path, doc: dict) -> None:
@@ -5231,6 +6620,12 @@ def main() -> int:
     print("retention — a downloaded artifact outlives the re-run window")
     check_shared_uploads_outlive_the_rerun_window(workflow)
 
+    print("profile-env — CARGO_PROFILE_* is set for the whole workflow or not at all")
+    check_profile_env_is_workflow_level(workflow, "ci.yml")
+    check_profile_env_is_workflow_level(
+        yaml.safe_load(COMPILE_TIMINGS.read_text()), "compile-timings.yml"
+    )
+
     print(
         "artifact-key — a bridge producer reuses an artifact only for unchanged inputs"
     )
@@ -5242,8 +6637,15 @@ def main() -> int:
     )
     check_artifact_input_digests_fail_closed(workflow)
 
-    print("xcframework-outputs — the XCFramework producer fails on a missing output")
-    check_xcframework_outputs_are_verified(workflow)
+    print(
+        "producer-outputs — a producer uploading several paths fails on a missing "
+        "output"
+    )
+    check_multi_path_producers_are_listed(workflow)
+    for job_id, artifact, marker_name, tracked, rejects_empty in MULTI_PATH_PRODUCERS:
+        check_multi_path_outputs_are_verified(
+            workflow, job_id, artifact, marker_name, tracked, rejects_empty
+        )
 
     print("package-writers — no `packages: write`; the cache token stays in docker-cache")
     check_package_write_and_cache_token(workflow)
@@ -5253,6 +6655,12 @@ def main() -> int:
     check_dependency_conditions_detect_a_narrowed_producer(workflow)
     check_dependency_conditions_detect_a_conditionless_consumer(workflow)
     check_dependency_conditions_read_a_status_guarded_consumer(workflow)
+
+    print("push-writers — a push to `main` runs every cache writer, and only a push skips")
+    check_condition_grammar()
+    check_aggregate_grammar()
+    check_push_runs_every_cache_writer(workflow)
+    check_push_writer_mutants(workflow)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
@@ -5294,6 +6702,9 @@ def main() -> int:
     check_rustdoc_documents_private_items(documents)
     check_private_items_detects_a_dropped_flag(documents)
     check_workspace_and_rustdoc_readers(documents)
+
+    print("no-cargo-gradle — kotlin-lint's cargo-free Gradle calls skip the daemon")
+    check_no_cargo_gradle_calls_skip_the_daemon(jobs)
 
     print("merge-queue — a workflow that skips to a success status runs in the queue")
     check_merge_queue_triggers(documents)
@@ -5407,7 +6818,7 @@ def main() -> int:
     needs = build_needs(jobs, docs_pr)
     needs["error-codes"]["result"] = "skipped"
     code, out = run_aggregate(needs, docs_pr.event)
-    check("an unconditional job skipped -> exit 1", code == 1, out)
+    check("a job every pull request selects skipped -> exit 1", code == 1, out)
 
     needs = build_needs(jobs, docs_pr)
     needs["shipped-feature-graph"]["result"] = "failure"
@@ -5447,6 +6858,42 @@ def main() -> int:
     needs = build_needs(jobs, docs_push)
     code, out = run_aggregate(needs, docs_push.event)
     check("push event, a pull-request-only job skipped -> exit 0", code == 0, out)
+
+    print("push-skips")
+    # SCENARIOS states which jobs a push runs, so an
+    # aggregate given that skipped set must pass, every writer reported skipped
+    # must fail it, and a push-only skip reported on a pull_request or merge_group
+    # run must fail it. Each failing case names the job, so a verdict reached for
+    # another reason does not satisfy it.
+    rust_push = SCENARIOS["rust-only, push"]
+    python_push = SCENARIOS["python-only, push"]
+    for scenario in (docs_push, rust_push, python_push):
+        code, out = run_aggregate(build_needs(jobs, scenario), scenario.event)
+        check(f"{scenario.name}, every non-writer skipped -> exit 0", code == 0, out)
+    for scenario in (docs_push, rust_push):
+        for job_id in sorted(cache_writers(workflow)):
+            if not scenario.runs.get(job_id, True):
+                continue
+            needs = build_needs(jobs, scenario)
+            needs[job_id]["result"] = "skipped"
+            code, out = run_aggregate(needs, scenario.event)
+            check(
+                f"{scenario.name}, writer {job_id} skipped -> exit 1 naming it",
+                code == 1 and job_id in out,
+                f"exit {code}: {out}",
+            )
+    for scenario in (s for s in SCENARIOS.values() if s.event != "push"):
+        for job_id in NOT_ON_PUSH_JOBS + NOT_ON_PUSH_FILTER_JOBS:
+            if not scenario.runs[job_id]:
+                continue
+            needs = build_needs(jobs, scenario)
+            needs[job_id]["result"] = "skipped"
+            code, out = run_aggregate(needs, scenario.event)
+            check(
+                f"{scenario.name}, push-skipped {job_id} skipped -> exit 1 naming it",
+                code == 1 and job_id in out,
+                f"exit {code}: {out}",
+            )
 
     # merge_group names whichever event a merge queue runs, so it gates every
     # merge. cross-layer skips there because it diffs against a pull request's

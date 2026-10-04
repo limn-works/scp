@@ -19,6 +19,29 @@ env:
   # cache group.
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # Builds every dev-profile and test-profile unit in this workflow with no debug
+  # info, overriding the `debug = "line-tables-only"` that `[profile.dev]` in the root
+  # Cargo.toml sets. Without line tables each object file carries no
+  # DWARF sections, so the linker reads and writes less for every test binary and each
+  # `target/debug` entry rust-cache saves and restores is smaller. Release
+  # builds (`wasm-pack build`'s default `--release`) read `[profile.release]`, and
+  # the `--profile ci-bridge` builds of the four producers other than kotlin-test
+  # read `[profile.ci-bridge]`, which inherits `[profile.release]`; both ignore every
+  # `CARGO_PROFILE_DEV_*` variable.
+  #
+  # TRADE-OFF: a `RUST_BACKTRACE` frame prints a symbol name without `file:line`. A
+  # panic or failed assert still prints its `file:line`, because rustc embeds that
+  # through `std::panic::Location` at compile time and reads no debug info for it.
+  #
+  # This key and every other `CARGO_PROFILE_*` key belong here and in no job-level or
+  # step-level `env:`. rust-cache hashes every `CARGO*` variable into its cache key,
+  # so a value set in one job would split that job from the others in its cache group
+  # (see "Cargo cache groups" below). A value set on one step would compile that
+  # step's units under a profile the restored entry does not hold, so cargo would
+  # rebuild them. Check `profile-env` in scripts/tests/ci-gate/ci_gate_selftest.py
+  # rejects a missing workflow-level key and any job-level or step-level one, in this
+  # file and in compile-timings.yml.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 # ── Cargo cache groups ────────────────────────────────────────────────────────
 #
@@ -57,9 +80,8 @@ env:
 #
 #   workspace-debug   `target/debug` under build mode — rust-test (all four shards),
 #                     rust-test-napi-production, rust-build-pyo3-production,
-#                     rust-build-uniffi-production, kotlin-test, bridge-parity-kotlin
-#                     (whose one cargo command builds `scp-ffi-uniffi` under the dev
-#                     profile), fail-closed-pre-rotation, shipped-feature-graph; and
+#                     rust-build-uniffi-production, kotlin-test, fail-closed-pre-rotation,
+#                     shipped-feature-graph; and
 #                     rust-doc (its `cargo test --doc`) in part, as the paragraph after
 #                     this list says.
 #   workspace-check   `target/debug` under check mode and the workspace feature
@@ -80,7 +102,8 @@ env:
 #                     `target/ci-bridge` on Linux — pyo3-module, which runs
 #                     `maturin develop --profile ci-bridge`, and napi-addon, which runs
 #                     `cargo build -p scp-ffi-napi --profile ci-bridge`. The four
-#                     bridge producers build under the `ci-bridge` profile the root
+#                     producers other than kotlin-test (pyo3-module, pyo3-module-macos,
+#                     napi-addon and xcframework) build under the `ci-bridge` profile the root
 #                     Cargo.toml defines (SCP's crates at opt-level 1, dependencies at
 #                     opt-level 3). This group and the two `-ci-bridge` groups below
 #                     replaced `workspace-release`, `apple-uniffi` and `apple-parity`,
@@ -99,9 +122,9 @@ env:
 #                     they now download what the producers upload, so none of them
 #                     runs cargo and none of them reads a cargo cache.
 #                     bridge-parity-kotlin belonged to `workspace-release` for its `maturin develop
-#                     --release`; it now downloads the PyO3 module and restores
-#                     workspace-debug for its one remaining cargo command, the
-#                     dev-profile `scp-ffi-uniffi` build. The two members write one
+#                     --release`; it now downloads the PyO3 module from pyo3-module
+#                     and the UniFFI cdylib from kotlin-test, and runs no cargo
+#                     command. The two members write one
 #                     directory under two feature resolutions and share one entry,
 #                     which pyo3-module writes. `maturin develop` builds package
 #                     scp-ffi, so that entry holds the dependency tree both bridges
@@ -177,7 +200,7 @@ env:
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
 # comment on job fuzz-nightly says more). Fourteen groups per generation across the two
-# workflows, where the two together wrote thirty-six entries before. The four
+# workflows, where the two together wrote thirty-six entries before. The
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the
 # comment above job pyo3-module counts them.
 # `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
@@ -228,8 +251,7 @@ jobs:
     # `rust-toolchain.toml` selects the compiler for every lane below, not only the Rust
     # one: `pyo3-module` and `pyo3-module-macos` run `maturin develop`, `napi-addon` runs
     # `cargo build -p scp-ffi-napi`, the two wasm jobs run `wasm-pack build`, `kotlin-test`
-    # and `bridge-parity-kotlin` run `cargo build -p scp-ffi-uniffi`, and `xcframework`
-    # runs `build-xcframework.sh`. Every job those outputs guard is written
+    # runs `cargo build -p scp-ffi-uniffi`, and `xcframework` runs `build-xcframework.sh`. Every job those outputs guard is written
     # `if: needs.changes.outputs.<lane> == 'true'`, and the `ci` job that aggregates every
     # other job's result counts a skipped job as a pass, so a lane the pin does not reach
     # lets a version bump merge with nothing compiling on the new compiler.
@@ -382,6 +404,7 @@ jobs:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
+              - 'scripts/generate-uniffi-kotlin.sh'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
@@ -429,6 +452,7 @@ jobs:
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Error code conformance
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -447,6 +471,7 @@ jobs:
   # silent nullifier fallback, `Ok(_)` trips the assertion.
   fail-closed-pre-rotation:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Fail-closed pre-rotation (SCP-IDENT-1059)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -516,6 +541,7 @@ jobs:
   # to the allowlist to make this pass — fix the dependency edge.
   shipped-feature-graph:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Shipped-feature-graph (G1 prove-absence)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -566,6 +592,7 @@ jobs:
   # alternatives considered, and enforcement invariants.
   bridge-symmetry:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Bridge symmetry
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -584,6 +611,7 @@ jobs:
   # ── SDK coverage ─────────────────────────────────────────────────────
   sdk-coverage:
     needs: check-draft
+    if: github.event_name != 'push'
     name: SDK capability matrix
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -607,6 +635,7 @@ jobs:
   # ── Protocol enforcement ─────────────────────────────────────────────
   protocol-sync:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Protocol sync check
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -621,6 +650,7 @@ jobs:
   # ── Python stub parity ───────────────────────────────────────────────
   pyi-generated:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Python stub signature parity
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -645,6 +675,7 @@ jobs:
   # ── Construction pattern (ADR-052) ──────────────────────────────────────
   construction-pattern:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Construction pattern (ADR-052)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -657,6 +688,7 @@ jobs:
 
   protocol-deps:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Protocol deps check
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -668,6 +700,7 @@ jobs:
   # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
   bridge-globals:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / no-bridge-globals + OnceLock ratchet
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -680,6 +713,7 @@ jobs:
 
   fallback-registry:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / no-fallback-registry regression
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -689,6 +723,7 @@ jobs:
 
   handle-affinity:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / handle-affinity check
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -713,6 +748,7 @@ jobs:
   # comparison that would otherwise download the pin's 13 targets and could not disagree.
   toolchain-wiring:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / toolchain wiring
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -732,6 +768,12 @@ jobs:
       # cases commit through the real hook in throwaway repositories with `cargo` stubbed.
       - name: Run pre-commit merge cases
         run: bash scripts/tests/pre-commit-merge/run-tests.sh
+      # The hook lints the workspace members `scripts/pre-commit-clippy-scope.py` selects;
+      # its module docstring states the rule. These cases commit through the real hook with
+      # `cargo` stubbed and compare each recorded `cargo clippy` command with the one that
+      # rule requires.
+      - name: Run pre-commit clippy scope cases
+        run: bash scripts/tests/pre-commit-clippy-scope/run-tests.sh
       # The compile-steps check reads every workflow file with PyYAML, which
       # `actions/setup-python` does not ship, so the step before it installs the library.
       # The check holds every `Swatinem/rust-cache` step to the group shape the header
@@ -825,6 +867,7 @@ jobs:
   # One job per language to keep failure attribution obvious.
   no-mutable-globals-rust:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-globals (rust workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -834,6 +877,7 @@ jobs:
 
   no-mutable-globals-python:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-module-globals (python sdk)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -846,6 +890,7 @@ jobs:
 
   no-mutable-globals-ts:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-globals (typescript sdk)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -855,6 +900,7 @@ jobs:
 
   no-mutable-globals-kotlin:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-globals (kotlin sdk)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -874,6 +920,7 @@ jobs:
 
   block-in-place:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / block-in-place AST check + ratchet
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -895,6 +942,7 @@ jobs:
   # paths filter, because the `ci` aggregator counts a skipped job as a pass.
   doc-citations:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Docs / spec citations resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -918,6 +966,7 @@ jobs:
   # skipped job as a pass.
   doc-includes:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Docs / transcluded fragments match their owner
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -941,6 +990,7 @@ jobs:
   # a paths filter, because the `ci` aggregator counts a skipped job as a pass.
   agent-verdict-criterion:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Agents / every definition states a verdict criterion
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -955,6 +1005,7 @@ jobs:
 
   deleted-primitives:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / deleted primitives ban
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -964,6 +1015,7 @@ jobs:
 
   handler-no-panic:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / handler panic-family ban (ADR-049 §10)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -973,6 +1025,7 @@ jobs:
 
   no-panic-abort:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / no panic=abort in cdylib profiles
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -989,6 +1042,7 @@ jobs:
 
   saga-gating-granularity:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / saga gating granularity (ADR-049 §3a)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1005,6 +1059,7 @@ jobs:
 
   bridge-instance-lifecycle:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / BridgeInstance lifecycle drift
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1018,6 +1073,7 @@ jobs:
 
   wasm-protocol:
     needs: check-draft
+    if: github.event_name != 'push'
     name: WASM / protocol
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1037,6 +1093,7 @@ jobs:
 
   wasm-test:
     needs: check-draft
+    if: github.event_name != 'push'
     name: WASM / test
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1069,7 +1126,7 @@ jobs:
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / fmt
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1251,6 +1308,10 @@ jobs:
   # Only shard 1 writes the `workspace-debug` cache. All four legs compile the
   # same target directory, so any of them could, and naming one keeps the
   # entry's contents decided rather than raced.
+  #
+  # A push to `main` runs shard 1 alone, to write that cache. The
+  # merge queue already ran all four shards on the same commit, and shards 2-4
+  # write nothing a later run restores.
   rust-test:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1260,7 +1321,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: ${{ fromJSON(github.event_name == 'push' && '[1]' || '[1, 2, 3, 4]') }}
     steps:
       - name: Free disk space when the runner is short of it
         run: |
@@ -1597,7 +1658,7 @@ jobs:
   # regress (stop compiling, or stop running the export tests) unnoticed.
   rust-test-napi-production:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / test (napi production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1695,7 +1756,7 @@ jobs:
     needs: changes
     # `python` too: the `python` filter covers `bindings/python/pyproject.toml`,
     # whose `[tool.maturin] features` list the wheel step below builds.
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
+    if: github.event_name != 'push' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')
     name: Rust / build + fail-closed test (pyo3 production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1814,7 +1875,7 @@ jobs:
   # exactly as it did before.
   rust-build-uniffi-production:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / build + fail-closed test (uniffi production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1911,7 +1972,7 @@ jobs:
 
   rust-doc:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / doc
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1990,7 +2051,7 @@ jobs:
 
   rust-deny:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / deny
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -2045,7 +2106,7 @@ jobs:
   # token does not hold.
   docker-image:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -2086,14 +2147,13 @@ jobs:
           # A missing or unreadable cache only makes buildkit warn and build every layer.
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
 
-  # Builds the same image on every push to `main` and exports its layer cache; the
+  # Builds the same image and exports its layer cache; the
   # comment on job `docker-image` above says why the export lives in this job alone.
-  # Its `if:` reads only the event, because the `ci` gate cannot read a condition that
-  # joins the event to a filter output and a step-level filter condition would report
-  # success over zero work, so a push that changes no Rust still builds here.
+  # Its `if:` reads the `rust` filter that selects job `docker-image`, the job that
+  # reads the export, so a push that changes no Rust skips it.
   docker-image-cache:
     needs: changes
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image (cache export)
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -2154,6 +2214,15 @@ jobs:
   # pyo3-module-macos run concurrently instead, and bridge-parity-swift starts when the
   # slower of the two ends.
   #
+  # The UniFFI cdylib is the exception, and the measurement decides it: kotlin-test
+  # builds it and uploads it, and bridge-parity-kotlin waits for the whole of
+  # kotlin-test. In run 37177220484 bridge-parity-kotlin started when pyo3-module ended
+  # (5.0 min), spent 2.6 of its 4.4 min installing a toolchain, restoring the cargo
+  # cache and building that cdylib, and ended at 9.4 min, while kotlin-test ended at
+  # 6.1 min. Waiting for kotlin-test and downloading costs about 1.1 min of start time
+  # and saves the 2.6, and a separate producer job would pay its own checkout, cache
+  # restore and toolchain install for a build kotlin-test still needs before its tests.
+  #
   # WHICH FEATURE SETS ARE THE SAME, read out of the manifests rather than off the
   # command lines, because the four consumers spell one set three ways:
   #
@@ -2180,14 +2249,6 @@ jobs:
   #     here carries `scp-platform/testing`, which compiles the in-memory custody and
   #     attestation nullifiers, so handing one to those jobs would delete the property
   #     they exist to prove. They keep building their own.
-  #   * kotlin-test and bridge-parity-kotlin both run
-  #     `cargo build -p scp-ffi-uniffi --features testing` into `target/debug`, one
-  #     feature set on one runner OS. Neither consumes an uploaded copy, because
-  #     `generateUniffiBindings` in bindings/kotlin/scp-kt/build.gradle.kts runs
-  #     `scripts/generate-uniffi-kotlin.sh` WITHOUT `--skip-build` and `compileKotlin`
-  #     depends on that task, so each job's Gradle build compiles the crate again
-  #     whatever a download placed in `target/debug`. The explicit cargo step in each
-  #     job is what makes that second compile a fingerprint hit.
   #   * typescript-wasm-check and scaffold-typescript-web-check both run
   #     `bun run build` in bindings/typescript-wasm, which runs one `wasm-pack build`,
   #     on one runner OS. A producer would not pay for itself: that build took 1.8 min
@@ -2223,8 +2284,9 @@ jobs:
   #     dependency version), every Cargo.toml (features, profiles, workspace
   #     inheritance), `.cargo/**` (rustflags), all of `crates/**` (the sources of
   #     every crate any bridge reaches, hashed whole so that no hand-kept crate list
-  #     can go stale), bindings/python/pyproject.toml for the two PyO3 jobs, and
-  #     bindings/swift/build-xcframework.sh for job xcframework;
+  #     can go stale), bindings/python/pyproject.toml for the two PyO3 jobs,
+  #     bindings/swift/build-xcframework.sh for job xcframework, and
+  #     scripts/generate-uniffi-kotlin.sh for job kotlin-test;
   #   * a digest the `artifact-inputs` step computes over the job's own definition in
   #     this file (its build command and feature list), the workflow-level `env:`
   #     block every build inherits, the list of tracked paths under crates/
@@ -2240,20 +2302,18 @@ jobs:
   # for `save-if`: an entry a pull-request or merge-queue run wrote is readable by
   # that ref alone and would evict entries later runs read. No pull request can
   # place an artifact that `main` or another pull request restores. A push to `main`
-  # that misses on all four producers saves four entries; the four artifacts
-  # totalled about 102 MB in run 37154692160. scripts/tests/ci-gate/ci_gate_selftest.py
+  # that misses on all five producers saves five entries; the four artifacts other
+  # than kotlin-test's totalled about 102 MB in run 37154692160.
+  # scripts/tests/ci-gate/ci_gate_selftest.py
   # reports a producer whose key drops one of the file inputs above.
   pyo3-module:
     needs: changes
-    # The union of the three consumers' conditions: python-test reads
-    # `python || rust`, bridge-parity reads `python || typescript || rust`, and
-    # bridge-parity-kotlin reads `python || kotlin || rust`. GitHub skips a job whose
-    # `needs` holds a skipped job, so a producer selected by anything narrower than
-    # that union would turn a consumer that was supposed to run into a skip. The `ci`
-    # aggregator evaluates that consumer's own `if:`, finds it true, and fails the run
-    # on the skip; the needs-condition check in
-    # scripts/tests/ci-gate/ci_gate_selftest.py reports the narrowed union before any
-    # pull request reaches that failure.
+    # GitHub skips a job whose `needs` holds a skipped job, so a producer selected by
+    # anything narrower than the union of its consumers' conditions would turn a
+    # consumer that was supposed to run into a skip. The `ci` aggregator evaluates
+    # that consumer's own `if:`, finds it true, and fails the run on the skip; the
+    # needs-condition check in scripts/tests/ci-gate/ci_gate_selftest.py reports the
+    # narrowed union before any pull request reaches that failure.
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||
@@ -2365,8 +2425,7 @@ jobs:
 
   napi-addon:
     needs: changes
-    # The union of typescript-check (`typescript || rust`) and bridge-parity
-    # (`python || typescript || rust`). Dropping the `python` clause would skip this
+    # Dropping the `python` clause would skip this
     # job on a change confined to bindings/python and skip bridge-parity with it, so
     # the `ci` aggregator, which reads bridge-parity's own `if:` as true, would fail
     # every such pull request.
@@ -2458,8 +2517,6 @@ jobs:
 
   xcframework:
     needs: changes
-    # The union of swift-build-test (`swift || rust`) and bridge-parity-swift
-    # (`python || swift || rust`).
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
@@ -2582,7 +2639,7 @@ jobs:
 
   pyo3-module-macos:
     needs: changes
-    # bridge-parity-swift is the only consumer, and this job repeats its condition.
+    # bridge-parity-swift is the only consumer.
     # An Ubuntu build cannot serve it: a Python extension module is a native shared
     # object, and the one job pyo3-module publishes is an ELF `.so` built against
     # glibc for x86_64.
@@ -2666,7 +2723,7 @@ jobs:
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
     needs: changes
-    if: needs.changes.outputs.python == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.python == 'true'
     name: Python / lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -2711,8 +2768,9 @@ jobs:
     # cargo command, so it installs no Rust toolchain and reads no cargo cache.
     needs: [changes, pyo3-module]
     if: >-
-      needs.changes.outputs.python == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.rust == 'true')
     name: Python / test
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2820,8 +2878,9 @@ jobs:
     # command, so it installs no Rust toolchain and reads no cargo cache.
     needs: [changes, napi-addon]
     if: >-
-      needs.changes.outputs.typescript == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.rust == 'true')
     name: TypeScript / check + lint + test
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2995,8 +3054,9 @@ jobs:
   scaffold-typescript-web-check:
     needs: changes
     if: >-
-      needs.changes.outputs.scaffold-typescript-web == 'true' ||
-      needs.changes.outputs.typescript-wasm == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.scaffold-typescript-web == 'true' ||
+      needs.changes.outputs.typescript-wasm == 'true')
     name: TypeScript-web scaffold / build wasm dep + check + lint + build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -3128,6 +3188,74 @@ jobs:
       # whatever the caller asked to build. It compiles no Rust, which is why it
       # belongs in this job rather than in `kotlin-test`.
       - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
+      # `kotlin-test` and `bridge-parity-kotlin` pass `scp.uniffi.prebuiltBindings=true`
+      # with the bindings present, so neither reaches
+      # the property's failure branches or a relative directory. This step runs those
+      # cases against scp-kt/build.gradle.kts. No step of this job generates the
+      # bindings, so scp.kt is absent until the step writes a placeholder.
+      - name: Check scp.uniffi.prebuiltBindings and CARGO_TARGET_DIR resolution
+        env:
+          BINDINGS: scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+        run: |
+          set -euo pipefail
+          expect_failure() {
+            local message=$1
+            shift
+            local output
+            if output=$(./gradlew "$@" 2>&1); then
+              echo "::error::./gradlew $* exited 0; it must fail with: $message"
+              exit 1
+            fi
+            if ! grep -qF -- "$message" <<<"$output"; then
+              echo "$output"
+              echo "::error::./gradlew $* failed without: $message"
+              exit 1
+            fi
+          }
+          if [ -e "$BINDINGS" ]; then
+            echo "::error::$BINDINGS exists before this step; the missing-file case needs it absent"
+            exit 1
+          fi
+          expect_failure "scp.uniffi.prebuiltBindings is true and" \
+            :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=true
+          expect_failure "scp.uniffi.prebuiltBindings is 'yes'; it takes true or false" \
+            :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=yes
+          ./gradlew -q :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=false
+          mkdir -p "$(dirname "$BINDINGS")"
+          echo "// placeholder" > "$BINDINGS"
+          ./gradlew -q :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=true
+          # Gradle runs with cargo off PATH, so the `cargo metadata` fallback fails
+          # and only the branch that reads CARGO_TARGET_DIR can print the path.
+          # These calls pass --no-daemon, because a daemon that earlier steps
+          # started can resolve `cargo` against the PATH it started with.
+          no_cargo_path="$(dirname "$(command -v java)"):/usr/bin:/bin"
+          if PATH=$no_cargo_path command -v cargo >/dev/null; then
+            echo "::error::cargo is on $no_cargo_path, so the fallback could answer"
+            exit 1
+          fi
+          # `--dry-run` evaluates no onlyIf predicate, so this call executes the task.
+          # The onlyIf skip prints SKIPPED; without it the generator runs and fails,
+          # because cargo is off PATH.
+          skip_output=$(PATH=$no_cargo_path ./gradlew --no-daemon --console=plain \
+            :scp-kt:generateUniffiBindings -Pscp.uniffi.prebuiltBindings=true)
+          if ! grep -qF ":scp-kt:generateUniffiBindings SKIPPED" <<<"$skip_output"; then
+            echo "$skip_output"
+            echo "::error::generateUniffiBindings ran with scp.uniffi.prebuiltBindings=true"
+            exit 1
+          fi
+          rm "$BINDINGS"
+          for value in relative/target "$RUNNER_TEMP/absolute-target"; do
+            case $value in
+              /*) dir=$value ;;
+              *) dir=$GITHUB_WORKSPACE/$value ;;
+            esac
+            want="-Djna.library.path=$dir/debug:$dir/release"
+            got=$(CARGO_TARGET_DIR=$value PATH=$no_cargo_path ./gradlew --no-daemon -q :scp-kt:printJnaLibraryPath | tail -n 1)
+            if [ "$got" != "$want" ]; then
+              echo "::error::CARGO_TARGET_DIR=$value gave '$got', not '$want'"
+              exit 1
+            fi
+          done
       # `:scp-kt-android` declares detekt in its own build.gradle.kts and no job
       # invoked it, so every rule in ../detekt.yml — ForbiddenComment among them,
       # which is how this repository enforces its Kotlin stub policy — went
@@ -3141,12 +3269,18 @@ jobs:
 
   # ORs on `rust` for a reason spelled out above python-test: this job builds
   # a UniFFI cdylib and runs a Kotlin suite against it, and that cdylib
-  # reaches every Rust workspace crate through scp-core, while a `kotlin` filter
-  # names only bindings/kotlin/**, crates/scp-ffi/uniffi/** and
-  # crates/scp-ffi/common/**.
+  # reaches every Rust workspace crate through scp-core.
   kotlin-test:
     needs: changes
+    # This job is also the producer of artifact `uniffi-kotlin-linux`, the UniFFI cdylib
+    # and the Kotlin bindings generated from it, which bridge-parity-kotlin downloads.
+    # Its own tests need `kotlin || rust`; the `python` clause is there because
+    # bridge-parity-kotlin reads `python || kotlin || rust`, and GitHub skips a job whose
+    # `needs` holds a skipped job, so a narrower condition here would skip the Kotlin half
+    # of the parity harness on every change confined to bindings/python and fail the `ci`
+    # aggregator on that skip.
     if: >-
+      needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
       needs.changes.outputs.rust == 'true'
     name: Kotlin / test
@@ -3209,18 +3343,116 @@ jobs:
           echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
           echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
       - run: sdkmanager "platforms;android-35"
+      - name: Hash the artifact inputs no file glob covers
+        id: artifact-inputs
+        run: |
+          set -euo pipefail
+          job_definition=$(awk -v start="  ${GITHUB_JOB}:" \
+            '$0 == start {found = 1; print; next} found && /^  [^ #]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          if [ -z "$job_definition" ]; then
+            echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
+            exit 1
+          fi
+          workflow_env=$(awk '$0 == "env:" {found = 1; print; next} found && /^[^ #]/ {exit} found {print}' \
+            .github/workflows/ci.yml)
+          inputs="$RUNNER_TEMP/artifact-inputs"
+          {
+            printf '%s\n' "$job_definition"
+            printf '%s\n' "$workflow_env"
+            git ls-files -- crates
+            echo "image=${ImageOS:?ImageOS is unset}-${ImageVersion:?ImageVersion is unset}"
+            ldd --version 2>&1 | sed -n 1p
+            cc --version | sed -n 1p
+            dpkg-query -W -f='${Version}\n' libssl-dev
+          } > "$inputs"
+          digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # The key also hashes scripts/generate-uniffi-kotlin.sh, which runs uniffi-bindgen
+      # over the cdylib and so decides the bindings this cache holds.
+      - name: Restore the UniFFI cdylib and Kotlin bindings a run with the same inputs built
+        id: artifact-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/debug/libscp_ffi_uniffi.so
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**', 'scripts/generate-uniffi-kotlin.sh') }}-${{ steps.artifact-inputs.outputs.digest }}
+      - name: Mark the start of the build
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        run: touch "$RUNNER_TEMP/uniffi-kotlin-build-start"
       - uses: Swatinem/rust-cache@v2
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
           shared-key: workspace-debug
           save-if: false
       - name: Build UniFFI native library
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           cargo build -p scp-ffi-uniffi --features testing
       - name: Generate Kotlin bindings
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
+      # `if-no-files-found: error` on the upload below fires only when both paths
+      # together match nothing, so a build that wrote one of the two would publish half
+      # an artifact under a green producer. This step fails the producer when either
+      # path is absent or empty or, after a build, was not written by it. On a cache hit
+      # no build ran, so it checks presence alone.
+      # scripts/tests/ci-gate/ci_gate_selftest.py runs it against each path missing and
+      # each path stale.
+      - name: Verify the build wrote every uploaded output
+        env:
+          ARTIFACT_CACHE_HIT: ${{ steps.artifact-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          marker="$RUNNER_TEMP/uniffi-kotlin-build-start"
+          for output in \
+            target/debug/libscp_ffi_uniffi.so \
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt; do
+            if [ ! -s "$output" ] && [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
+              echo "::error::the cache restore reported a hit without writing $output"
+              exit 1
+            fi
+            if [ ! -s "$output" ]; then
+              echo "::error::the build exited 0 without writing $output"
+              exit 1
+            fi
+            if [ "${ARTIFACT_CACHE_HIT:-}" = true ]; then
+              continue
+            fi
+            if [ -z "$(find "$output" -newer "$marker" -print -quit)" ]; then
+              echo "::error::$output holds nothing written by this build"
+              exit 1
+            fi
+          done
+      - name: Upload UniFFI cdylib and Kotlin bindings
+        uses: actions/upload-artifact@v4
+        with:
+          # The two paths share no directory below the workspace, so upload-artifact
+          # takes the workspace as the artifact root and bridge-parity-kotlin restores
+          # both by downloading to `.`.
+          name: uniffi-kotlin-linux
+          path: |
+            target/debug/libscp_ffi_uniffi.so
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          retention-days: 30
+          if-no-files-found: error
+      - name: Save the UniFFI cdylib and Kotlin bindings under their input key
+        if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target/debug/libscp_ffi_uniffi.so
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
       - uses: gradle/actions/setup-gradle@v4
       - name: Run tests
         working-directory: bindings/kotlin
+        env:
+          # Read by `cargoTargetDir` in bindings/kotlin/scp-kt/build.gradle.kts in place
+          # of a `cargo metadata` call, which on a cache hit, where no cargo command has
+          # run, would make rustup install the pinned toolchain for that call alone.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           # Set JNA library path to find the compiled Rust cdylib
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -3229,13 +3461,19 @@ jobs:
           # `testDebugUnitTest`. Running the bare name `testDebugUnitTest`
           # therefore ran the Android unit tests alone and skipped every
           # `:scp-kt` test — including the real-FFI suites that exercise the
-          # compiled cdylib this job builds two steps above.
-          ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest
+          # compiled cdylib this job builds or restores above.
+          #
+          # `-Pscp.uniffi.prebuiltBindings=true` skips `generateUniffiBindings`, which
+          # would otherwise rebuild the crate, so these tests compile against the
+          # bindings this job uploads and load the cdylib it uploads.
+          # No PR or merge-queue run executes `generateUniffiBindings`; only
+          # build-matrix.yml and release.yml do.
+          ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
     needs: changes
-    if: needs.changes.outputs.swift == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.swift == 'true'
     name: Swift / lint + format
     runs-on: macos-latest
     timeout-minutes: 30
@@ -3264,8 +3502,9 @@ jobs:
     # reads no cargo cache.
     needs: [changes, xcframework]
     if: >-
-      needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.swift == 'true' ||
+      needs.changes.outputs.rust == 'true')
     name: Swift / build + test
     runs-on: macos-latest
     timeout-minutes: 60
@@ -3336,9 +3575,10 @@ jobs:
     # cache.
     needs: [changes, pyo3-module, napi-addon]
     if: >-
-      needs.changes.outputs.python == 'true' ||
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      needs.changes.outputs.rust == 'true')
     name: Cross-bridge runtime parity
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -3495,13 +3735,14 @@ jobs:
   # a pre-built UniFFI Kotlin binding tree on top of the Python + Rust
   # stack the parent bridge-parity job already carries.
   bridge-parity-kotlin:
-    # Job pyo3-module builds the PyO3 half of this harness. The UniFFI half stays in
-    # this job: `generateUniffiBindings` in bindings/kotlin/scp-kt/build.gradle.kts
-    # runs `scripts/generate-uniffi-kotlin.sh` without `--skip-build`, and
-    # `compileKotlin` depends on that task, so the installDist step below compiles
-    # `scp-ffi-uniffi` whatever a download placed in `target/debug`. The explicit
-    # cargo step is what turns that second compile into a fingerprint hit.
-    needs: [changes, pyo3-module]
+    # Job pyo3-module builds the PyO3 half of this harness, and job kotlin-test builds
+    # the UniFFI half: the `scp-ffi-uniffi --features testing` cdylib and the Kotlin
+    # bindings generated from it, uploaded together as `uniffi-kotlin-linux`. This job
+    # runs no cargo command, so it installs no Rust toolchain and reads no cargo cache.
+    # The installDist step passes `-Pscp.uniffi.prebuiltBindings=true`, which skips
+    # `generateUniffiBindings` in bindings/kotlin/scp-kt/build.gradle.kts; without it
+    # that task would rebuild the crate whatever the download placed in `target/debug`.
+    needs: [changes, pyo3-module, kotlin-test]
     if: >-
       needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.kotlin == 'true' ||
@@ -3510,20 +3751,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Free disk space when the runner is short of it
-        run: |
-          # Conditional for the reason job rust-test's copy of this step states in
-          # full: the image these jobs run on reports `/dev/root 145G 40G 105G 28% /`
-          # AFTER the deletions, so about 85 GB was free before them, against the
-          # ~12 GB this workspace needs. The deletions reclaimed space nothing was
-          # short of and cost between 21 s and 2 min 12 s per job.
-          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "available: ${AVAILABLE_GB}G"
-          if [ "$AVAILABLE_GB" -lt 40 ]; then
-            echo "under 40G — reclaiming the preinstalled SDK trees"
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            df -h /
-          fi
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
@@ -3532,22 +3759,20 @@ jobs:
         with:
           distribution: zulu
           java-version: "17"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # `workspace-debug`, not `workspace-ci-bridge`: the one cargo command left in
-          # this job builds `scp-ffi-uniffi` under the dev profile into `target/debug`,
-          # which is the directory and the compile mode that group holds. It read
-          # `workspace-release` while it also ran `maturin develop --release`, and job
-          # pyo3-module now builds that module instead. kotlin-test, which runs the same
-          # `cargo build -p scp-ffi-uniffi --features testing`, reads this group too.
-          shared-key: workspace-debug
-          save-if: false
       - uses: gradle/actions/setup-gradle@v4
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
           name: pyo3-module-linux
           path: bindings/python/scp_sdk
+      # The artifact root is the workspace (see the upload in kotlin-test), so `.`
+      # restores `target/debug/libscp_ffi_uniffi.so` and the generated `scp.kt` to the
+      # paths kotlin-test wrote them at. A missing artifact fails this step.
+      - name: Download UniFFI cdylib and Kotlin bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: uniffi-kotlin-linux
+          path: .
       - name: Python deps
         run: |
           python -m venv .venv
@@ -3573,11 +3798,19 @@ jobs:
               raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
           print('PyO3 extension carries the gated methods')
           "
-      - name: Build UniFFI cdylib
+      # A download that left either file out or empty fails here, naming the file,
+      # rather than as a Gradle compile error or a JNA load error in a later step.
+      - name: Assert the downloaded cdylib and bindings are present
         run: |
-          cargo build -p scp-ffi-uniffi --features testing
-      - name: Generate UniFFI Kotlin bindings
-        run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
+          set -euo pipefail
+          for output in \
+            target/debug/libscp_ffi_uniffi.so \
+            bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt; do
+            if [ ! -s "$output" ]; then
+              echo "::error::artifact uniffi-kotlin-linux placed nothing at $output"
+              exit 1
+            fi
+          done
       - name: Build Kotlin parity runner (installDist)
         # Uses the bindings/kotlin/gradlew wrapper against the runner
         # project; `-p` points Gradle at the runner's directory so its
@@ -3586,25 +3819,27 @@ jobs:
         # the Python harness launches directly — NOT via `gradle run`,
         # which would wire the Gradle daemon into the stdio pipe.
         #
-        # `-Pscp.uniffi.extraFeatures=testing` threads the `testing`
-        # cargo feature through scp-kt's `generateUniffiBindings` task
-        # (see build.gradle.kts). Without it, the task's invocation of
-        # `generate-uniffi-kotlin.sh --features=testing`
-        # would re-run `cargo build -p scp-ffi-uniffi` without
-        # `testing`, overwriting the dylib we just built (line above)
-        # with both features. The parity harness drives
+        # `-Pscp.uniffi.prebuiltBindings=true` reaches scp-kt through the
+        # composite build and skips its `generateUniffiBindings` task, so
+        # the runner compiles against the downloaded bindings, which
+        # uniffi-bindgen generated from the downloaded cdylib with
+        # `testing` enabled. The parity harness drives
         # `signed_at_override`, which is `#[cfg(feature = "testing")]`-
-        # gated — so the overwritten dylib rejects the parameter and
-        # the Kotlin job fails.
+        # gated, so bindings and a cdylib built without it fail the
+        # runner's compile or its calls.
         run: |
           bindings/kotlin/gradlew \
             -p bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner \
             installDist --no-daemon \
-            -Pscp.uniffi.extraFeatures=testing
+            -Pscp.uniffi.prebuiltBindings=true
       - name: Run parity tests (UniFFI Kotlin only)
         env:
           # JNA loads the UniFFI cdylib via the system library path.
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+          # The kotlin_runner fixture reads this instead of running `cargo metadata`,
+          # which on this toolchain-less job would make rustup install the pinned
+          # channel.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
           # Explicit runner-binary override (conftest also falls back
           # to the default installDist output; this makes CI failures
           # easier to diagnose by pinning the path).
@@ -3626,9 +3861,10 @@ jobs:
     # installs no Rust toolchain and reads no cargo cache.
     needs: [changes, pyo3-module-macos, xcframework]
     if: >-
-      needs.changes.outputs.python == 'true' ||
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      needs.changes.outputs.rust == 'true')
     name: Cross-bridge runtime parity (UniFFI Swift)
     runs-on: macos-latest
     timeout-minutes: 60
@@ -3715,6 +3951,7 @@ jobs:
   # reads a command.
   ci-workflow-selftest:
     needs: check-draft
+    if: github.event_name != 'push'
     name: CI workflow / self-test
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -3760,6 +3997,9 @@ jobs:
   # decides per job whether that job was supposed to run by evaluating its
   # own `if:` condition against a `changes` job's filter outputs. A job that
   # was supposed to run and did not report success fails this gate.
+  #
+  # scripts/tests/ci-gate/ci_gate_selftest.py reports a cache writer, or a job a
+  # writer needs, that a push would skip.
   ci:
     if: always()
     needs:

@@ -385,11 +385,10 @@ pub async fn apply_tier_change(
     // cannot obtain. A consumer is therefore optional in practice, and because
     // the receiver stays alive the channel never closes, so `send().await` does
     // not fail on a full queue: it PARKS. The 17th address change would then
-    // block this task forever inside `apply_tier_change`, which (a) stops tier
+    // block this task forever inside `apply_tier_change`, which stops tier
     // re-evaluation entirely — freezing the advertised address and leaving
     // `.well-known/scp` handing every peer a dead endpoint, the exact defect
-    // this module exists to close — and (b) hangs `shutdown()`, whose
-    // `stop_and_wait` joins on the task future being dropped. This stream is
+    // this module exists to close. This stream is
     // OBSERVABILITY; reachability must never be a hostage to whether anyone is
     // draining it.
     if previous_relay_url != new_relay_url

@@ -1583,7 +1583,7 @@ No §16.13 meta-tests run at this tier — they exercise the simulation harness 
 
 ### 16.15.2 Tier 2 — Merge Gate
 
-**Trigger:** Merge queue entry or push to `main`.
+**Trigger:** Merge queue entry.
 **Target:** < 10 minutes.
 **Purpose:** Required to merge. Exercises the harness and protocol integration.
 
