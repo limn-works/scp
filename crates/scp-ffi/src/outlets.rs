@@ -3308,6 +3308,113 @@ mod tests {
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
+    /// Builds the interface JSON `outlet_interface_accept` takes, offered from
+    /// `some-source` to `target_context`.
+    fn offered_interface_json(target_context: &str, outlet_id: &str) -> String {
+        serde_json::json!({
+            "source_context": "some-source",
+            "target_context": target_context,
+            "outlet_id": outlet_id,
+            "rate_limit": null,
+            "inbound_rate_limit": null,
+            "per_caller_rate_limit": null,
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "outbound_policy": null,
+            "inbound_policy": null,
+        })
+        .to_string()
+    }
+
+    /// `outlet_interface_expose` and `outlet_interface_accept` read the roles
+    /// from the supervisor. The supervisor ceiling omits `role:assign`, so the
+    /// creator lacks `RoleAssign` there, while a bridge copy built from
+    /// `default_ceiling()` grants it. Both entry points must refuse.
+    #[test]
+    fn interface_expose_and_accept_refuse_when_the_supervisor_ceiling_omits_role_assign() {
+        let creator = "did:dht:z6MkInterfaceNoRoleAssign";
+        let (scp, ctx_id) = live_scp(
+            "interface-no-role-assign",
+            creator,
+            &["messages:write", "outlet:register"],
+        );
+        pyo3::prepare_freethreaded_python();
+        let outlet_id = Python::with_gil(|py| {
+            let dict = registration_dict(py, "no-role-assign-probe", creator);
+            scp.outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect("a ceiling carrying outlet:register must admit registration")
+        });
+
+        let expose_err = scp
+            .outlet_interface_expose(&ctx_id, &outlet_id, "target-context", None)
+            .expect_err("a creator without RoleAssign in the supervisor must not expose")
+            .to_string();
+        assert!(
+            expose_err.contains("admin capability required") && expose_err.contains(creator),
+            "the expose refusal must be the admin check on the creator: {expose_err}"
+        );
+
+        let accept_err = scp
+            .outlet_interface_accept(&ctx_id, &offered_interface_json(&ctx_id, &outlet_id))
+            .expect_err("a creator without RoleAssign in the supervisor must not accept")
+            .to_string();
+        assert!(
+            accept_err.contains("admin capability required") && accept_err.contains(creator),
+            "the accept refusal must be the admin check on the creator: {accept_err}"
+        );
+        crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// `outlet_interface_expose` and `outlet_interface_accept` pass the
+    /// SUPERVISOR's creator to the admin check. The FFI state is registered
+    /// under one DID and the supervisor context is created under another, so
+    /// the registering DID holds no role in the supervisor and the
+    /// supervisor's creator holds none in a bridge copy. Both entry points
+    /// must admit the supervisor's creator.
+    #[test]
+    fn interface_expose_and_accept_admit_the_supervisor_creator() {
+        crate::init_runtime().ok();
+        let ffi_creator = "did:dht:z6MkInterfaceFfiCreator";
+        let supervisor_creator = "did:dht:z6MkInterfaceSupervisorCreator";
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let bi = &*scp.inner;
+        let ctx_id = format!("interface-creator-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
+        crate::runtime::create_supervisor_context_for_test(
+            bi,
+            &ctx_id,
+            supervisor_creator,
+            &[
+                "messages:write".to_owned(),
+                "outlet:register".to_owned(),
+                "role:assign".to_owned(),
+            ],
+        );
+        pyo3::prepare_freethreaded_python();
+        let outlet_id = Python::with_gil(|py| {
+            let dict = registration_dict(py, "supervisor-creator-probe", supervisor_creator);
+            scp.outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect("a ceiling carrying outlet:register must admit registration")
+        });
+
+        let exposed = scp
+            .outlet_interface_expose(&ctx_id, &outlet_id, "target-context", None)
+            .expect("the supervisor's creator holds RoleAssign and must expose");
+        assert!(
+            exposed.contains("\"approved_by_source\":true"),
+            "the exposed interface must carry the source approval: {exposed}"
+        );
+
+        let accepted = scp
+            .outlet_interface_accept(&ctx_id, &offered_interface_json(&ctx_id, &outlet_id))
+            .expect("the supervisor's creator holds RoleAssign and must accept");
+        assert!(
+            accepted.contains("\"approved_by_target\":true"),
+            "the accepted interface must carry the target approval: {accepted}"
+        );
+        crate::runtime::remove_context(bi, &ctx_id);
+    }
+
     /// Every single-context outlet entry point that decides authorization
     /// refuses a context whose supervisor actor is gone, with the entry point's
     /// own code and a refusal that withholds the lifecycle state.

@@ -153,9 +153,7 @@ impl PyContextHandle {
     /// send, receive, and every operation the supervisor answers read the
     /// supervisor and refuse a context whose actor the watchdog poisoned or
     /// found crashed; polling this getter may still report the last-known
-    /// non-terminal state. An operation the bridge serves from its own state
-    /// (UCAN mint, delegate and validate; MCP capability checks)
-    /// does not read the supervisor and does not refuse such a context. Join,
+    /// non-terminal state. Join,
     /// leave, send, and receive refuse a poisoned context with `SCP-CTX-2134`
     /// `ContextPoisoned`, as every operation the supervisor answers does, and
     /// surface a crashed or mid-respawn actor as `SCP-CTX-2135`
