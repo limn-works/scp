@@ -2272,8 +2272,7 @@ impl TierReEvalHandle {
     /// Fire-and-forget cancel signal. Used by the unit tests in this module to
     /// tear down a directly-spawned task once their assertions are done; the
     /// production teardown path ([`ApplicationNode::shutdown`]) uses
-    /// [`stop_and_wait`](Self::stop_and_wait) instead, which additionally joins
-    /// the task so its captured `Arc`s are released deterministically.
+    /// [`stop_and_wait`](Self::stop_and_wait) instead.
     #[cfg(test)]
     fn stop(&self) {
         let _ = self.cancel_tx.send(true);
@@ -6517,6 +6516,26 @@ mod tests {
         );
     }
 
+    /// A caller running in a task on the node's own one-worker runtime holds
+    /// that worker, so it must hand the worker off while it waits; otherwise
+    /// neither the tier task nor the join forwarder can run before the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stop_and_wait_on_a_runtime_worker_returns_after_task_drops_its_captures() {
+        let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        }]));
+        let (handle, dropped) = slow_drop_tier_task(strategy, Duration::from_hours(1));
+
+        tokio::spawn(async move { handle.stop_and_wait() })
+            .await
+            .expect("stop_and_wait does not panic on a runtime worker");
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_and_wait on a runtime worker returned before the tier task's captured publisher was dropped"
+        );
+    }
+
     /// The FFI bridges' shape: the node's task runs on a multi-thread runtime,
     /// and `stop_and_wait` is called from a host thread that never entered any
     /// runtime. It must still return only after the task's captures dropped.
@@ -6702,13 +6721,16 @@ mod tests {
             .enable_all()
             .build()
             .expect("current-thread runtime builds");
-        let (handle, _dropped) = {
+        let (mut handle, _dropped) = {
             let _entered = runtime.enter();
             let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
                 external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
             }]));
             slow_drop_tier_task(strategy, Duration::from_hours(1))
         };
+        // Far above the 30 s receive bound below, so a wait on the undriven
+        // join cannot end at the deadline in time to pass.
+        handle.stop_deadline = Duration::from_hours(1);
         let (returned_tx, returned_rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
