@@ -105,10 +105,11 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 /// spawn-from-Welcome entrypoint) and deliberately NOT implemented now.
 pub struct ProductionMlsBackend {
     /// Injected hardened [`Clock`] used to stamp `KeyPackage` / group-leaf
-    /// `Lifetime`s on generation and to re-validate accepted `Lifetime`s on the
-    /// receive/add paths and the joiner's own `KeyPackage` on a Welcome join
-    /// (ADR-057 §Prereq-1); another member's Welcome tree leaf is checked for
-    /// range only and reads no clock. In production this is the SAME
+    /// `Lifetime`s on generation, to check a `KeyPackage` an adder adds
+    /// (current, with the add-side minimum remaining lifetime), and to check
+    /// the joiner's own `KeyPackage` on a Welcome join (ADR-057 §Prereq-1). A
+    /// received Add and another member's Welcome tree leaf are checked for
+    /// range only and read no clock. In production this is the SAME
     /// `Arc` the owning `NodeMlsFactory` and the actor-deps clock share, so
     /// there is one hardened clock per node — never openmls's internal one.
     clock: Arc<dyn Clock>,
@@ -1112,13 +1113,15 @@ mod tests {
         );
     }
 
-    /// Security-model spec §9.7.1, the receiver, on the native path: a
-    /// receiving backend whose injected clock stands past an added
-    /// `KeyPackage`'s `not_after` still merges the add Commit through
-    /// `process_commit`, because a receiver checks the received `Lifetime`'s
-    /// range only and reads no clock. The wall clock stays inside Carol's
-    /// `Lifetime`, so openmls's own wall-clock check passes and only an
-    /// injected-clock check on receive could refuse.
+    /// Security-model spec §9.7.1, the receiver, on
+    /// `MlsBackend::process_commit`: a receiving backend whose injected clock
+    /// stands past an added `KeyPackage`'s `not_after` still merges the add
+    /// Commit, because a receiver checks the received `Lifetime`'s range only
+    /// and reads no clock. The wall clock stays inside Carol's `Lifetime`, so
+    /// openmls's own wall-clock check passes and only an injected-clock check
+    /// on receive could refuse. No production receive path calls
+    /// `process_commit`; the native receive path, `decrypt_and_dispatch`, has
+    /// its own tests among the supervisor tests.
     #[tokio::test]
     async fn process_commit_merges_add_expired_under_receiver_injected_clock() {
         use scp_clock::TestClock;

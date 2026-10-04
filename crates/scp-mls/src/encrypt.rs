@@ -71,16 +71,17 @@ use crate::wrapping_extension::extract_wrapping_key;
 /// switch for either check. Security-model spec §9.7.1 forbids a receiver to
 /// reject an Add by its own clock; SCP's own receive-side check is range-only
 /// (`validate_received_key_package_lifetime_range`). SCP carries no openmls
-/// patch: the adder's `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` keeps
-/// openmls's check from firing on any Commit an SCP relay delivers within its
-/// retention, and §9.7.1 lists the cases in which it still refuses one, each
-/// surfacing here as [`MlsError::DecryptionFailed`].
+/// patch: the adder's `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` bounds
+/// openmls's check, and the residual-case list of §9.7.1 names every case in
+/// which it still refuses a Commit, each surfacing here as
+/// [`MlsError::DecryptionFailed`].
 ///
-/// Future path (ADR-057 §Prereq-1, the residual bullet): once openmls exposes a
-/// receive-side lifetime policy (upstream issue openmls/openmls#2232 proposes one for
-/// `validate_leaf_node`), pass the policy that skips the current-time check
-/// here, on this call, so openmls's clock no longer takes part in a receive
-/// decision.
+/// Future path (ADR-057 Prerequisite 1, the future-path bullet under the
+/// residual bullet): once openmls takes a receive-side lifetime policy or a
+/// caller-supplied time, pass one here, on this call, that covers both of
+/// openmls's reads, `KeyPackageIn::validate` and `validate_leaf_node`. A
+/// policy that covers only `validate_leaf_node` leaves openmls's clock in the
+/// receive decision through `KeyPackageIn::validate`.
 fn process_inbound(
     g: &mut MlsGroup,
     provider: &crate::InMemoryMlsProvider,

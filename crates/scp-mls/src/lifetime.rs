@@ -92,9 +92,9 @@
 //!   before the merge and in a received Proposal. SCP's own check there is
 //!   range-only and reads no clock. SCP carries no openmls patch, so
 //!   openmls's receive-side clock check still runs; the adder's
-//!   [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] keeps it from firing on any
-//!   Commit an SCP relay delivers within its retention (§9.7.1, openmls's own
-//!   receive-side clock check, lists the cases in which it still refuses one).
+//!   [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] bounds it, and the
+//!   residual-case list of security-model spec §9.7.1 names every case in
+//!   which it still refuses a Commit.
 //! - Welcome tree leaves, range only: [`crate::group::join_group_from_bytes`]
 //!   builds the staged Welcome through
 //!   `StagedWelcome::build_from_welcome(...)?.skip_lifetime_validation().build()`,
@@ -197,9 +197,11 @@ pub const KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS: u64 =
 /// `KeyPackage` current, and at least the relay maximum blob TTL
 /// (`MAX_BLOB_TTL`, 7 days, §9.18.11) plus the same margin, so openmls's
 /// receive-side `Lifetime` check refuses no Commit that an SCP relay delivers
-/// within its retention. Neither bound lives in this crate: `scp-runtime`
+/// within its retention for an expired `not_after`; the residual-case list of
+/// security-model spec §9.7.1 names every case in which that check still
+/// refuses a Commit. Neither bound lives in this crate: `scp-runtime`
 /// const-asserts the first against its invitation TTL, and `scp-client`
-/// const-asserts the second against `scp_relay_client::protocol::MAX_BLOB_TTL`.
+/// const-asserts the second against `scp_relay_client::MAX_BLOB_TTL`.
 pub const KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS: u64 =
     7 * 24 * 60 * 60 + KEY_PACKAGE_LIFETIME_MARGIN_SECS;
 

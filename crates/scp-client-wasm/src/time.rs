@@ -66,9 +66,9 @@
 //!   accepted on an add. On the receive path SCP's verdict is the range
 //!   check, which reads no clock; openmls's own check is the only clock check
 //!   there, so a `Date.now()` override can only add rejections and can make an
-//!   honest add-Commit fail. The adder's minimum remaining lifetime keeps
-//!   openmls's check from refusing an add-Commit a relay delivers within its
-//!   retention.
+//!   honest add-Commit fail. The adder's minimum remaining lifetime bounds
+//!   openmls's check, and the residual-case list of security-model spec
+//!   §9.7.1 names every case in which it still refuses an add-Commit.
 //!   Page same-origin integrity (CSP/SRI/COOP/COEP) stays load-bearing for
 //!   every `Lifetime` decision, because a script that runs before this module
 //!   initializes shifts the captured clock too. The residual closes when
