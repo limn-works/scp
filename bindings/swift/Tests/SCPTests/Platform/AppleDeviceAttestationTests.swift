@@ -1816,9 +1816,6 @@
             await expectCode("SCP-ATTEST-9023", from: "attest") { () async throws(ScpError) -> Data in
                 try await harness.adapter.attest(challenge: challenge, deviceId: deviceId)
             }
-            // An assertion with a key Apple attested succeeds, so `invalidKey`
-            // from the probe names a rejected key. Keeping it would fail every
-            // later `attest` against a dead key.
             #expect(harness.defaults.string(forKey: keyIdDefaultsKey) == nil)
             #expect(harness.defaults.string(forKey: attestedKeyIdDefaultsKey) == nil)
             #expect(service.generateAssertionCall?.clientDataHash == keyProbeInput)
