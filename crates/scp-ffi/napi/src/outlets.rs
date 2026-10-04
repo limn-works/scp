@@ -33,10 +33,7 @@ fn outlet_refusal(code: &'static str) -> impl Fn(String) -> ScpNapiError + Copy 
 ///
 /// ADR-016 step 8 compares the token's grants against the context's capability
 /// ceiling, and step 4 anchors the chain on the context creator. Both come from
-/// `role_state`, which every caller reads from the supervisor actor through
-/// [`crate::runtime::active_role_state_before_authz`], never
-/// from the bridge copies (`UcanContextStateCore.ceiling_strings` and
-/// `UcanContextStateCore.creator_did`), so a context no actor serves refuses.
+/// `role_state`.
 pub(crate) fn validate_ucan_for_outlet(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
@@ -857,10 +854,7 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// Key (spec §6.2.4 "Signer authorization": the receipt key MUST be the one
 /// authorized to act for `target_context_id`).
 ///
-/// Every caller passes the `creator_did` of the role state it read from the
-/// supervisor actor, never the creator a context handle recorded: this call
-/// chooses the authority a cross-context saga signs as, and a context no actor
-/// serves must refuse to sign. `context_id` is carried only for the error message.
+/// `context_id` is carried only for the error message.
 pub(crate) async fn resolve_context_signing_key(
     bi: &crate::runtime::NapiBridgeInstance,
     creator_did: &str,

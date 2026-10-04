@@ -8691,8 +8691,7 @@ mod tests {
     /// refuses it too.
     ///
     /// Each entry point runs the lifecycle gate before the role-state read, so
-    /// after the despawn the three refusals come from that gate; the direct
-    /// `live_role_state` assertion covers the read the gate shadows.
+    /// after the despawn the three refusals come from that gate.
     /// `outlet_register_follows_the_supervisor_ceiling_not_the_bridge_copy`
     /// covers the value the read returns for registration.
     #[cfg(feature = "testing")]
@@ -9110,7 +9109,7 @@ mod tests {
     /// exercised alone.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn every_outlet_entry_point_refuses_a_resident_actor_in_closing() {
+    async fn called_outlet_entry_points_refuse_a_resident_actor_in_closing() {
         use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let (bi, closing, token, _capability, owner_did, _holder_did) = active_context_with_token(

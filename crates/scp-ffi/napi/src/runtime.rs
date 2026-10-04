@@ -1888,8 +1888,7 @@ pub async fn sync_role_state_from_manager(
 /// AUTHENTICATED context params carried by a joined
 /// [`ContextHandle`](scp_core::context::ContextHandle).
 ///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/outlet capability-check ceiling string set. Used by
+/// Peer of [`sync_role_state_from_manager`] (which syncs role state). Used by
 /// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
 /// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
 /// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
@@ -2078,14 +2077,6 @@ where
 /// supervisor actor reports `Active`, and withholds the lifecycle state from
 /// the refusal.
 ///
-/// The UCAN entry points in `ucan.rs` (`ucan_validate_on`, `ucan_evaluate_on`,
-/// `ucan_mint_on`, `ucan_delegate_on`, `ucan_revoke_on`) and the outlet entry
-/// points in `outlets.rs` and `outlet_stream.rs` that read role state take
-/// their ceiling, roles and creator from this function. The bridge copies
-/// (`UcanContextState.role_state`, `UcanContextStateCore.ceiling_strings` and
-/// `UcanContextStateCore.creator_did`) refresh only when THIS bridge performs
-/// the mutation.
-///
 /// The function resolves the bridge's supervisor once and hands it to
 /// `active_role_state_on`, which runs both reads and takes no
 /// `&NapiBridgeInstance`, so neither read can resolve the supervisor again. The
@@ -2199,11 +2190,7 @@ fn withheld_refusal(verb: &str) -> String {
 
 /// Reads a context's role state from that context's supervisor actor.
 ///
-/// A read that decides an authorization question before the caller is
-/// authorized goes through [`active_role_state_before_authz`] instead, which
-/// withholds every failure. This form reports each failure as itself, for a
-/// caller that has already passed its authorization check, such as the
-/// streaming-saga recovery after its invoker check.
+/// Reports each failure as itself.
 ///
 /// Fails closed. A context whose actor returns no role state yields
 /// [`ScpNapiError::Context`] with `SCP-CTX-2023`; no caller receives a
