@@ -4714,7 +4714,9 @@ def check_multi_path_producers_are_listed(doc: dict) -> None:
     check(
         "a second path on napi-addon's upload is reported as missing from the tuple",
         gaps
-        == ["napi-addon uploads several paths and is missing from MULTI_PATH_PRODUCERS"],
+        == [
+            "napi-addon uploads several paths and is missing from MULTI_PATH_PRODUCERS"
+        ],
         f"got {gaps}",
     )
     mutated = copy.deepcopy(doc)
@@ -4726,8 +4728,10 @@ def check_multi_path_producers_are_listed(doc: dict) -> None:
         "kotlin-test uploading one path is reported as extra in the tuple",
         gaps
         == [
-            "kotlin-test is in MULTI_PATH_PRODUCERS and has no upload listing "
-            "several paths"
+            (
+                "kotlin-test is in MULTI_PATH_PRODUCERS and has no upload listing "
+                "several paths"
+            )
         ],
         f"got {gaps}",
     )
