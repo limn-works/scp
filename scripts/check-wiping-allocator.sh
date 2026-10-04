@@ -11,9 +11,10 @@
 #    reason. An unclassified target fails, so a new artifact cannot ship without
 #    someone deciding whether it installs the allocator. A SHIPPED or DEV_TOOLS
 #    entry that names no real target fails too.
-# 2. Every package in check-shipped-feature-graph.sh's ARTIFACTS list that has a
-#    bin, cdylib or staticlib target has each such target in SHIPPED (or the
-#    target is a DEV_TOOLS entry), so the two closed lists cannot drift apart.
+# 2. Every cdylib and staticlib target of a package in
+#    check-shipped-feature-graph.sh's ARTIFACTS list is in SHIPPED. Only a bin
+#    target may be a DEV_TOOLS entry, so a shipped library cannot be filed as a
+#    build-time tool.
 # 3. Each SHIPPED target's crate root carries `use scp_alloc as _;` at column 0,
 #    with no attribute (`#[cfg(...)]`, `#[cfg_attr(...)]`, anything) on the
 #    lines above it. rustc loads a dependency only when the crate names it, so
@@ -111,15 +112,68 @@ artifact_targets() { # <metadata json>
     | [$p.name, .name, .src_path] | @tsv' "$1"
 }
 
-# 0 when `use scp_alloc as _;` sits at column 0 and the nearest non-blank,
-# non-comment line above it is not an attribute.
+# Artifact targets as `<package>\t<target>\t<kind,kind,...>` lines.
+artifact_target_kinds() { # <metadata json>
+  jq -r '.packages[] as $p | $p.targets[]
+    | select(any(.kind[]; . == "bin" or . == "cdylib" or . == "staticlib"))
+    | [$p.name, .name, (.kind | join(","))] | @tsv' "$1"
+}
+
+# 0 when `use scp_alloc as _;` sits at column 0 outside any comment and no
+# attribute applies to it. Comments are stripped first (`//` to end of line, and
+# `/* ... */` across lines, nested as Rust nests them), so an install line inside
+# a block comment is not one. An attribute is tracked by its bracket depth until
+# its closing `]`, so a `#[cfg(...)]` spread over several lines still applies to
+# the item after it. An outer attribute (`#[...]`) or a crate-level
+# `#![cfg...]` before the install line, with only blank or comment lines between
+# them, fails the check. A `[` inside a string in an attribute leaves the depth
+# open, which fails the check rather than passing it.
 root_installs_allocator() { # <file>
   awk -v want="$INSTALL_LINE" '
-    {
-      if ($0 == want) {
-        if (prev ~ /^[[:space:]]*#\[/ || prev ~ /^[[:space:]]*#!\[cfg/) { bad = 1 } else { ok = 1 }
+    function strip_comments(line,    out, i, c, two) {
+      out = ""
+      for (i = 1; i <= length(line); i++) {
+        two = substr(line, i, 2)
+        if (block > 0) {
+          if (two == "/*") { block++; i++ } else if (two == "*/") { block--; i++ }
+          continue
+        }
+        if (two == "//") break
+        if (two == "/*") { block = 1; i++; continue }
+        out = out substr(line, i, 1)
       }
-      if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^[[:space:]]*\/\//) { prev = $0 }
+      return out
+    }
+    function bracket_delta(s,    opens, closes) {
+      opens = gsub(/\[/, "[", s)
+      closes = gsub(/\]/, "]", s)
+      return opens - closes
+    }
+    {
+      code = strip_comments($0)
+      trimmed = code
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", trimmed)
+      if (trimmed == "") next
+      if (depth > 0) {
+        depth += bracket_delta(code)
+        if (depth < 0) depth = 0
+        next
+      }
+      if (trimmed ~ /^#\[/ || trimmed ~ /^#!\[[[:space:]]*cfg/) {
+        pending = 1
+        depth = bracket_delta(code)
+        if (depth < 0) depth = 0
+        next
+      }
+      if (trimmed ~ /^#!\[/) {
+        depth = bracket_delta(code)
+        if (depth < 0) depth = 0
+        next
+      }
+      if ($0 == want && code == want) {
+        if (pending) { bad = 1 } else { ok = 1 }
+      }
+      pending = 0
     }
     END { exit (ok && !bad) ? 0 : 1 }
   ' "$1"
@@ -165,20 +219,23 @@ run_checks() { # <root> <metadata json>
     [[ "$found" -eq 1 ]] || fail "$entry is listed but cargo metadata reports no such bin/cdylib/staticlib target"
   done
 
-  echo ">> every shipped-feature-graph ARTIFACTS package with an artifact target is SHIPPED"
+  echo ">> every cdylib and staticlib of a shipped-feature-graph ARTIFACTS package is SHIPPED"
   if [[ ! -f "$root/$FEATURE_GRAPH_REL" ]]; then
     fail "$FEATURE_GRAPH_REL is missing, so the ARTIFACTS cross-check cannot run"
   else
-    local artifact_pkg
+    local artifact_pkg kinds
     while IFS= read -r artifact_pkg; do
       [[ -n "$artifact_pkg" ]] || continue
-      while IFS=$'\t' read -r pkg target src; do
+      while IFS=$'\t' read -r pkg target kinds; do
         [[ "$pkg" == "$artifact_pkg" ]] || continue
         key="$pkg:$target"
-        if ! shipped_has "$key" && ! dev_tool_has "$key"; then
-          fail "$key belongs to ARTIFACTS package $pkg but is not in SHIPPED"
-        fi
-      done < <(artifact_targets "$metadata")
+        case ",$kinds," in
+          *,cdylib,* | *,staticlib,*)
+            shipped_has "$key" \
+              || fail "$key is a library artifact ($kinds) of ARTIFACTS package $pkg but is not in SHIPPED; only a bin target may be a DEV_TOOLS entry"
+            ;;
+        esac
+      done < <(artifact_target_kinds "$metadata")
     done < <(artifact_packages "$root/$FEATURE_GRAPH_REL")
   fi
 
@@ -258,6 +315,7 @@ ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-core|"
   "scp-node|"
+  "scp-ffi-uniffi|"
 )
 EOF
   cat > "$d/$ALLOC_LIB_REL" <<EOF
@@ -322,6 +380,18 @@ run_fixtures() {
   run_fixture "$d"; rc=$?
   expect "an install line nested in a module fails" FAIL "$rc"
 
+  d="$base/multilinecfg"; make_fixture "$d"
+  sed -i.bak 's/^use scp_alloc as _;$/#[cfg(all(\n    not(debug_assertions),\n    target_os = "linux",\n))]\nuse scp_alloc as _;/' "$d/crates/scp-relay/src/scp-relay.rs"
+  grep -q '^))]$' "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — multi-line cfg fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  run_fixture "$d"; rc=$?
+  expect "an install line after a multi-line cfg ending in ))] fails" FAIL "$rc"
+
+  d="$base/blockcomment"; make_fixture "$d"
+  sed -i.bak 's|^use scp_alloc as _;$|/*\nuse scp_alloc as _;\n*/|' "$d/crates/scp-relay/src/scp-relay.rs"
+  grep -q '^/\*$' "$d/crates/scp-relay/src/scp-relay.rs" || { echo "   FAIL — block-comment fixture not written"; fixture_failures=$((fixture_failures + 1)); }
+  run_fixture "$d"; rc=$?
+  expect "an install line inside a /* */ block comment fails" FAIL "$rc"
+
   d="$base/othertype"; make_fixture "$d"
   sed -i.bak 's/^static WIPING_ALLOCATOR: .*$/static WIPING_ALLOCATOR: std::alloc::System = std::alloc::System;/' "$d/$ALLOC_LIB_REL"
   run_fixture "$d"; rc=$?
@@ -355,6 +425,12 @@ run_fixtures() {
     "$d/metadata.json" > "$d/m.json" && mv "$d/m.json" "$d/metadata.json"
   run_fixture "$d"; rc=$?
   expect "an ARTIFACTS package whose cdylib is not SHIPPED fails" FAIL "$rc"
+
+  d="$base/devcdylib"; make_fixture "$d"
+  jq '(.packages[] | select(.name == "scp-ffi-uniffi") | .targets[] | select(.name == "uniffi-bindgen") | .kind) = ["cdylib"]' \
+    "$d/metadata.json" > "$d/m.json" && mv "$d/m.json" "$d/metadata.json"
+  run_fixture "$d"; rc=$?
+  expect "an ARTIFACTS cdylib classified as a DEV_TOOLS entry fails" FAIL "$rc"
 
   d="$base/stale"; make_fixture "$d"
   jq '.packages |= map(select(.name != "scp-client-wasm"))' "$d/metadata.json" > "$d/m.json" && mv "$d/m.json" "$d/metadata.json"
