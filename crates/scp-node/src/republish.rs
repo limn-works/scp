@@ -436,8 +436,7 @@ impl<D: DhtClient + 'static> RepublishCycle for SelfDidRepublishing<D> {
     /// off-runtime, so it is used only when the caller is already on a worker of
     /// this cycle's own multi-thread runtime — the case where blocking makes
     /// teardown deterministic. Every other caller gets a spawn onto the same
-    /// runtime. Mirrors `TierReEvalHandle::stop_and_wait`, including its
-    /// runtime-flavor check, and its fallback that still aborts.
+    /// runtime.
     fn stop_and_wait(&self) {
         // Synchronous and unconditional: after this line no re-seed can start an
         // arm, whether or not the stop below gets to run promptly.
