@@ -3061,7 +3061,7 @@ pub fn decrypt_and_dispatch(
             "no MLS crypto state for decrypt (context has no group)".to_string(),
         )
     })?;
-    let open_result = cs.open(&*deps.clock, context_id_bytes, context_id, encrypted_blob)?;
+    let open_result = cs.open(context_id_bytes, context_id, encrypted_blob)?;
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {

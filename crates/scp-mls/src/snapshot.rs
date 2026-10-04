@@ -459,7 +459,7 @@ mod tests {
         // Alice sends a plain application message (ADR-011: `MessageSent` is not a
         // convergent leaf, so it binds no AAD); the RESTORED Bob must decrypt it.
         let ct = serialize_ciphertext(&encrypt(&mut alice, b"after restore").unwrap()).unwrap();
-        match decrypt_with_membership_changes(&mut restored_bob, &ct, &SystemClock).unwrap() {
+        match decrypt_with_membership_changes(&mut restored_bob, &ct).unwrap() {
             crate::InboundChange::Application { plaintext, .. } => {
                 assert_eq!(plaintext, b"after restore");
             }

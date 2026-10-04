@@ -119,6 +119,16 @@ const _: fn() = || {
     guard::<PersistedPendingJoin>();
 };
 
+// Security-model spec §9.18.7: the adder's minimum remaining KeyPackage
+// lifetime covers the relay maximum blob TTL plus the lifetime margin, so
+// openmls's receive-side wall-clock `Lifetime` check refuses no add-Commit an
+// SCP relay delivers within its retention. This crate sees both scp-mls and
+// scp-relay-client. `u64::from` is not const, so the widening is `as`.
+const _: () = assert!(
+    scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
+        >= scp_relay_client::MAX_BLOB_TTL as u64 + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
+
 /// The result of adding a member: the wire bytes the driver must distribute.
 ///
 /// `commit` goes to all *existing* members. They apply it via
@@ -1280,7 +1290,7 @@ impl ScpClient {
     ///   context (§9.9.3). Returns `false` (no application payload was produced).
     /// - **No-add Commit** (e.g. a self-update) → advances the MLS epoch, stamps
     ///   no leaf, records no member. Returns `false`.
-    /// - **Bare proposal** → cached by `scp-mls`; no leaf, returns `false`.
+    /// - **Bare proposal** → not stored; no leaf, returns `false`.
     ///
     /// # Convergent-timestamp authentication (ADR-057)
     ///
@@ -1353,10 +1363,6 @@ impl ScpClient {
         ciphertext: &[u8],
         channel: RecvChannel,
     ) -> Result<ReceiveOutput, ClientError> {
-        // ADR-057 §Prereq-1: captured before the `state` mutable borrow so the
-        // hardened clock (used to re-validate any add-Commit's KeyPackage
-        // `Lifetime`) and the mutable context borrow do not alias `self`.
-        let clock = Arc::clone(&self.clock);
         // This member's own DID — needed for the self-collision check in the
         // §9.10.4 ingest, and as the `local_did` when it seals its own sender key to
         // a member a bystander add introduces (INVARIANT 2).
@@ -1364,8 +1370,8 @@ impl ScpClient {
         let state = self.context_mut(context_id)?;
         // Any successful `decrypt_message` mutates persistent MLS state — it
         // ratchets forward (application), merges a staged commit (add Commit),
-        // installs an incoming sender key (management distribution), or caches a
-        // proposal in the provider store. So every non-error outcome is persisted
+        // installs an incoming sender key (management distribution), or ratchets
+        // past a proposal. So every non-error outcome is persisted
         // after the `state` borrow ends. Only the rejected Remove-bearing Commit
         // (which `scp-mls` dropped BEFORE merging, leaving MLS + SCP state
         // unchanged) returns without a write.
@@ -1380,9 +1386,7 @@ impl ScpClient {
         // out-of-order/too-early announcement, content/channel mismatch) propagate;
         // `handle_relay_frame` categorizes them into benign drops + counters, and a
         // direct caller of `receive_message` sees them.
-        let decrypted = state
-            .crypto
-            .decrypt_message(ciphertext, clock.as_ref(), channel)?;
+        let decrypted = state.crypto.decrypt_message(ciphertext, channel)?;
         let outcome = match decrypted {
             Inbound::Application {
                 sender_did,

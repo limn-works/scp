@@ -46,7 +46,7 @@ use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use scp_mls::error::MlsError;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use scp_mls::validate_key_package_lifetime;
+use scp_mls::{validate_key_package_lifetime, validate_key_package_lifetime_for_add};
 
 /// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
 /// single-use backstop). Value at `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`
@@ -492,7 +492,7 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         ciphertext: &[u8],
     ) -> Result<DecryptedContent, MlsError> {
-        decrypt_with_sender_did(group, ciphertext, self.clock.as_ref())
+        decrypt_with_sender_did(group, ciphertext)
     }
 
     async fn process_commit(
@@ -503,7 +503,7 @@ impl MlsBackend for ProductionMlsBackend {
         // `decrypt_commit` refuses a non-Commit before decrypting it, so a
         // refused application message or Proposal consumes no ratchet
         // generation, then merges a Commit through `decrypt_with_sender_did`.
-        scp_mls::encrypt::decrypt_commit(group, commit_bytes, self.clock.as_ref())
+        scp_mls::encrypt::decrypt_commit(group, commit_bytes)
     }
 
     async fn advance_epoch(
@@ -543,8 +543,10 @@ impl MlsBackend for ProductionMlsBackend {
         // hardened clock (threaded in as `clock`, not read from backend state —
         // SCP-CRYPTOMOVE-000c) and enforce the RFC 9420 max-range bound
         // openmls's `validate` never applies. Additive hardening; never
-        // replaces openmls.
-        validate_key_package_lifetime(validated.life_time(), clock)?;
+        // replaces openmls. Every caller is an add path, so the add-side
+        // minimum remaining lifetime applies too (security-model spec §9.7.1,
+        // the adder).
+        validate_key_package_lifetime_for_add(validated.life_time(), clock)?;
 
         // Guard the SCP ciphersuite invariant: any KP using a non-SCP
         // ciphersuite MUST be rejected even if OpenMLS validates it against
@@ -1738,6 +1740,41 @@ mod tests {
             matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
             "expired lifetime under the injected clock must return \
              KeyPackageLifetimeInvalid, got: {err:?}"
+        );
+    }
+
+    /// Security-model spec §9.7.1, the adder: `validate_key_package` (every
+    /// caller is an add path) accepts a `KeyPackage` with exactly the minimum
+    /// remaining lifetime under the injected clock and refuses one a second
+    /// short of it.
+    #[tokio::test]
+    async fn validate_key_package_enforces_min_remaining_lifetime_boundary() {
+        use scp_clock::TestClock;
+        use scp_mls::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+
+        // Mint at a pinned present so `not_after` is known exactly.
+        let minted_at = SystemClock.now_secs();
+        let backend = ProductionMlsBackend::new(Arc::new(TestClock::new(minted_at)));
+        let generated = backend
+            .generate_key_package(&test_credential("dave-boundary"), None)
+            .await
+            .unwrap();
+        let not_after = minted_at + KEY_PACKAGE_LIFETIME_SECS;
+
+        let at_min = TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+        backend
+            .validate_key_package(&generated.key_package_bytes, &at_min)
+            .await
+            .unwrap();
+
+        let past_min = TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1);
+        let err = backend
+            .validate_key_package(&generated.key_package_bytes, &past_min)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { not_after: na, .. } if na == not_after),
+            "one second short of the minimum must be KeyPackageLifetimeInvalid, got: {err:?}"
         );
     }
 

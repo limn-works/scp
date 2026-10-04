@@ -1123,6 +1123,15 @@ pub struct CrossContextOutletInvocationRequest {
 /// 7-day default).
 const INVITATION_TTL_SECS: u32 = 7 * 24 * 60 * 60;
 
+// Security-model spec §9.18.7: the adder's minimum remaining KeyPackage
+// lifetime covers the InvitationBundle relay TTL plus the lifetime margin, so a
+// joiner fetching its Welcome while the relay still holds the bundle finds its
+// own KeyPackage current. `u64::from` is not const, so the widening is `as`.
+const _: () = assert!(
+    scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
+        >= INVITATION_TTL_SECS as u64 + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
+
 /// Outcome of [`Supervisor::invite_member`].
 ///
 /// An extensible enum with a SINGLE variant today. `invite_member` currently
