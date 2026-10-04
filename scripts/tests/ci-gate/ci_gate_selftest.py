@@ -4584,7 +4584,7 @@ def check_matrix_groups(path: Path, doc: dict) -> None:
 
 
 def check_matrix_group_controls(doc: dict) -> None:
-    """Three mutants of the live job, each of which the check must report.
+    """Four mutants of the live job, each of which the check must report.
 
     Each mutates rust-test-optional-features in ci.yml, the job whose split
     prompted the check, so a control fails if that job loses its group axis as
@@ -4636,6 +4636,31 @@ def check_matrix_group_controls(doc: dict) -> None:
         "deleting platform-testing from the matrix list is reported",
         any("names group 'platform-testing'" in gap for gap in gaps),
         f"steps left without a leg went unreported: {gaps}",
+    )
+
+    no_cargo = copy.deepcopy(doc)
+    platform_steps = [
+        step
+        for step in no_cargo["jobs"][job_id]["steps"]
+        if GROUP_CONDITION.match(str(step.get("if") or ""))
+        and GROUP_CONDITION.match(str(step["if"])).group(1) == "platform-testing"
+    ]
+    for step in platform_steps:
+        step["run"] = "echo skipped\n"
+    gaps = matrix_group_gaps(no_cargo)
+    check(
+        "a matrix group whose gated steps run no cargo is reported",
+        bool(platform_steps)
+        and any("'platform-testing' has no step running cargo" in gap for gap in gaps),
+        f"platform-testing steps with no cargo line went unreported "
+        f"({len(platform_steps)} step(s) rewritten): {gaps}",
+    )
+    check(
+        "step_runs_cargo reads a cargo line and rejects a script without one",
+        step_runs_cargo({"run": "export X=1\ncargo nextest run -p scp-platform\n"})
+        and not step_runs_cargo({"run": "echo cargo nextest run\n"})
+        and not step_runs_cargo({"run": "echo skipped\n"}),
+        "step_runs_cargo misread a script with or without a leading cargo command",
     )
 
 
