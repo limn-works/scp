@@ -591,12 +591,14 @@ class SCP:
         :param timeout: Maximum seconds to wait for in-flight tasks
             (float — fractional seconds are preserved to millisecond
             resolution before crossing the FFI boundary).
-        :raises ContextError: If the tokio runtime is unavailable.
-        :raises ValidationError: With ``SCP-STORAGE-8005`` when the durable
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
             store still holds its advisory lock after the call.
         """
         millis = self._shutdown_millis(timeout)
-        await asyncio.to_thread(self._native.shutdown, millis)
+        try:
+            await asyncio.to_thread(self._native.shutdown, millis)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     def __enter__(self) -> SCP:
         """Enter the synchronous context-manager scope — returns ``self``."""
@@ -613,9 +615,20 @@ class SCP:
         Calls ``_native.shutdown`` directly — the PyO3 bridge already
         runs ``block_on`` internally, so the sync path is correct here.
         Async callers should use :meth:`__aexit__` / ``async with``.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        self._native.shutdown(self._shutdown_millis(5.0))
+        del exc_type, tb
+        try:
+            self._native.shutdown(self._shutdown_millis(5.0))
+        except Exception as shutdown_exc:
+            coded = _coded_bridge_error(shutdown_exc)
+            if exc is None:
+                raise coded from shutdown_exc
+            logger.warning("SCP shutdown on with-scope exit failed: %s", coded)
 
     async def __aenter__(self) -> SCP:
         """Enter the asynchronous context-manager scope — returns ``self``."""
@@ -631,9 +644,19 @@ class SCP:
 
         Awaits :meth:`shutdown` so the event loop keeps running while
         the tokio runtime drains in-flight tasks.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``async with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        await self.shutdown()
+        del exc_type, tb
+        try:
+            await self.shutdown()
+        except ScpError as shutdown_exc:
+            if exc is None:
+                raise
+            logger.warning("SCP shutdown on async-with exit failed: %s", shutdown_exc)
 
     # ------------------------------------------------------------------
     # Operation methods — 159 bridge delegators (PyO3 → asyncio.to_thread)
