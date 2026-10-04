@@ -11123,7 +11123,8 @@ impl Scp {
                 // resolved authoritatively by the supervisor's first-writer-wins
                 // spawn lock below.
                 //
-                // FLAG-1: the Occupied dedup is keyed on
+                // FLAG-1: the caller no longer supplies a ceiling, so occupy with the
+                // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on
                 // `context_id`, so the "detect a duplicate BEFORE consuming the
                 // single-use KeyPackage" crash-safety is preserved regardless of the
                 // ceiling. The AUTHENTICATED ceiling is re-synced from the joined
@@ -11158,7 +11159,8 @@ impl Scp {
                 };
 
                 // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-                // signed params. The authoritative ceiling lives in the bundle
+                // signed params, overwriting the DEFAULT ceiling used for the
+                // reversible occupy. The authoritative ceiling lives in the bundle
                 // the creator signed — never in caller input. Runs AFTER the
                 // irreversible commit; the UCAN state was just occupied (and not
                 // removed on this success path), so the sync targets a live entry.
