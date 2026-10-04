@@ -2088,8 +2088,7 @@ where
 /// role state takes its ceiling, roles and creator from this function: the
 /// UCAN entry points in `ucan.rs` (`ucan_validate_on`, `ucan_evaluate_on`,
 /// `ucan_mint_on`, `ucan_delegate_on`, `ucan_revoke_on`) and the outlet entry
-/// points in `outlets.rs` and `outlet_stream.rs`. ADR-024 makes the
-/// supervisor's role state the one a decision reads; the bridge copies
+/// points in `outlets.rs` and `outlet_stream.rs`. The bridge copies
 /// (`UcanContextState.role_state`, `UcanContextStateCore.ceiling_strings` and
 /// `UcanContextStateCore.creator_did`) refresh only when THIS bridge performs
 /// the mutation.

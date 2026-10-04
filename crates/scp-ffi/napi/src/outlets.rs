@@ -1362,8 +1362,7 @@ pub(crate) async fn outlet_session_invoke_on(
 
 /// Per-bridge-instance implementation of [`Scp::outlet_session_close`](crate::scp::Scp::outlet_session_close).
 ///
-/// Carries no lifecycle gate, unlike the outlet entry points that decide an
-/// authorization question: this one authorizes nothing and removes one session
+/// Carries no lifecycle gate: this one authorizes nothing and removes one session
 /// entry the bridge itself owns, so refusing it in a `Closing` or `Expired`
 /// context would keep the entry until `context_close_on` releases the whole
 /// `UcanContextState`.
@@ -1540,8 +1539,7 @@ pub(crate) async fn outlet_interface_accept_on(
 
 /// Per-bridge-instance implementation of [`Scp::outlet_interface_revoke`](crate::scp::Scp::outlet_interface_revoke).
 ///
-/// Carries no lifecycle gate, unlike the outlet entry points that decide an
-/// authorization question: this one reads no context state and grants
+/// Carries no lifecycle gate: this one reads no context state and grants
 /// nothing. It builds an `InterfaceRevoked` event from the interface id and the
 /// clock and hands it back for the caller to distribute, so gating it would
 /// deny a member the record of a revocation without withholding any capability.
