@@ -3279,25 +3279,82 @@ jobs:
               exit 1
             fi
           done
-      # `generateUniffiBindings` builds the scp-ffi-uniffi cdylib with the cargo
-      # features `scp.uniffi.cargoFeatures` names, and with the crate's default
-      # (production) features when a build passes no such property. This step
-      # fails when a default adds a feature to that command, when the property
-      # accepts a value that is not a cargo feature list, and when
-      # `:scp-kt:test` runs against a library built without `testing`.
+      # check_release_file reads each non-comment line of a workflow file that
+      # contains `gradle` in any case, with `\` continuations joined and each
+      # `${{ ... }}` expression read as one word. It fails unless the line is
+      # `./gradlew` followed only by task paths and `-P<key>=<value>` tokens, runs
+      # `:scp-kt:printUniffiCargoFeatures` with that line's `-P` tokens, and fails
+      # unless the printed entry is a `scp-ffi-uniffi|` entry of ARTIFACTS in
+      # scripts/check-shipped-feature-graph.sh. It also fails on a file with no such
+      # line. The step runs it on release.yml and build-matrix.yml, and on planted
+      # files that must fail.
+      - name: Check the UniFFI cargo features of every release Gradle invocation
+        run: |
+          set -euo pipefail
+          gated=$(sed -n '/^ARTIFACTS=(/,/^)/p' ../../scripts/check-shipped-feature-graph.sh \
+            | sed -n 's/^[[:space:]]*"\(scp-ffi-uniffi|[^"]*\)"$/\1/p')
+          if [ -z "$gated" ]; then
+            echo "::error::ARTIFACTS in scripts/check-shipped-feature-graph.sh has no scp-ffi-uniffi entry"
+            exit 1
+          fi
+          check_release_file() {
+            local file=$1 line token got count=0
+            local -a tokens props
+            while IFS= read -r line; do
+              line=$(sed -E 's/\$\{\{[^}]*\}\}/X/g; s/^[[:space:]]*(run:[[:space:]]*)?//' <<<"$line")
+              read -ra tokens <<<"$line"
+              if [ "${tokens[0]:-}" != "./gradlew" ]; then
+                echo "$file: cannot read the Gradle arguments of: $line" >&2
+                return 1
+              fi
+              props=()
+              for token in "${tokens[@]:1}"; do
+                if [[ "$token" =~ ^-P[A-Za-z0-9._-]+=[A-Za-z0-9._,/-]*$ ]]; then
+                  props+=("$token")
+                elif ! [[ "$token" =~ ^:[A-Za-z0-9:_-]+$ ]]; then
+                  echo "$file: cannot read the Gradle argument '$token' of: $line" >&2
+                  return 1
+                fi
+              done
+              if ! got=$(./gradlew -q :scp-kt:printUniffiCargoFeatures ${props[@]+"${props[@]}"} | tail -n 1); then
+                echo "$file: printUniffiCargoFeatures failed for: $line" >&2
+                return 1
+              fi
+              if ! grep -qxF -- "$got" <<<"$gated"; then
+                echo "$file: '$line' builds '$got', which ARTIFACTS does not carry" >&2
+                return 1
+              fi
+              count=$((count + 1))
+            done < <(awk '{ sub(/\r$/, "") } /^[[:space:]]*#/ { next }
+                          { if (sub(/\\$/, "")) { buf = buf $0 " "; next } print buf $0; buf = "" }' "$file" \
+                       | grep -i gradle || true)
+            if [ "$count" -eq 0 ]; then
+              echo "$file: no line runs ./gradlew" >&2
+              return 1
+            fi
+          }
+          for file in ../../.github/workflows/release.yml ../../.github/workflows/build-matrix.yml; do
+            if ! check_release_file "$file"; then
+              echo "::error::$file runs a Gradle build this step cannot show to be production-only"
+              exit 1
+            fi
+          done
+          planted=$(mktemp -d)
+          printf '%s\n' 'run: ./gradlew :scp-kt:jar -Pscp.uniffi.cargoFeatures=testing' > "$planted/features.yml"
+          printf '%s\n' 'run: |' "  ./gradlew :scp-kt:jar \\" '    -Pscp.uniffi.prebuiltBindings=true' > "$planted/prebuilt.yml"
+          printf '%s\n' 'run: ./gradlew :scp-kt:jar && ./gradlew :scp-kt:jar' > "$planted/chained.yml"
+          printf '%s\n' 'run: cd bindings/kotlin && ./gradlew :scp-kt:jar' > "$planted/prefixed.yml"
+          printf '%s\n' 'run: cargo build -p scp-ffi-uniffi' > "$planted/none.yml"
+          for file in "$planted"/*.yml; do
+            if check_release_file "$file" 2>/dev/null; then
+              echo "::error::check_release_file accepted the planted $(basename "$file")"
+              exit 1
+            fi
+          done
+          rm -rf "$planted"
       - name: Check scp.uniffi.cargoFeatures
         run: |
           set -euo pipefail
-          expect_command() {
-            local want=$1
-            shift
-            local got
-            got=$(./gradlew -q :scp-kt:printUniffiGeneratorCommand "$@" | tail -n 1)
-            if [ "$got" != "$want" ]; then
-              echo "::error::./gradlew :scp-kt:printUniffiGeneratorCommand $* gave '$got', not '$want'"
-              exit 1
-            fi
-          }
           expect_failure() {
             local message=$1
             shift
@@ -3312,10 +3369,15 @@ jobs:
               exit 1
             fi
           }
-          expect_command "./scripts/generate-uniffi-kotlin.sh"
-          expect_command "./scripts/generate-uniffi-kotlin.sh --features=testing" -Pscp.uniffi.cargoFeatures=testing
+          got=$(./gradlew -q :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.cargoFeatures=testing | tail -n 1)
+          if [ "$got" != "scp-ffi-uniffi|--features testing" ]; then
+            echo "::error::printUniffiCargoFeatures -Pscp.uniffi.cargoFeatures=testing printed '$got'"
+            exit 1
+          fi
           expect_failure "scp.uniffi.cargoFeatures is 'testing;rm'; it takes a comma-separated list of cargo feature names" \
-            :scp-kt:printUniffiGeneratorCommand "-Pscp.uniffi.cargoFeatures=testing;rm"
+            :scp-kt:printUniffiCargoFeatures "-Pscp.uniffi.cargoFeatures=testing;rm"
+          expect_failure "scp.uniffi.prebuiltBindings is true, so generateUniffiBindings builds nothing" \
+            :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.prebuiltBindings=true
           expect_failure ":scp-kt:test needs a cdylib built with the testing feature; pass -Pscp.uniffi.cargoFeatures=testing" \
             :scp-kt:test --dry-run
           ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=testing

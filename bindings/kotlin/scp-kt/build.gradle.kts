@@ -306,12 +306,24 @@ tasks.register<Exec>("generateUniffiBindings") {
     outputs.dir(uniffiBindingsDir)
 }
 
-// Prints the command `generateUniffiBindings` runs.
-tasks.register("printUniffiGeneratorCommand") {
+// Prints `scp-ffi-uniffi|` followed by the arguments `generateUniffiBindings` passes
+// the generator, each `--features=<list>` written `--features <list>`. With
+// `scp.uniffi.prebuiltBindings=true` that task does not run, so this task fails.
+tasks.register("printUniffiCargoFeatures") {
     group = "help"
-    description = "Print the command generateUniffiBindings runs"
-    val command = tasks.named<Exec>("generateUniffiBindings").map { it.commandLine.joinToString(" ") }
-    doLast { println(command.get()) }
+    description = "Print the scp-ffi-uniffi cargo arguments generateUniffiBindings passes the generator"
+    val generatorArgs = tasks.named<Exec>("generateUniffiBindings").map { it.commandLine.drop(1) }
+    val prebuiltBindings = uniffiPrebuiltBindings
+    doLast {
+        if (prebuiltBindings == "true") {
+            throw GradleException("scp.uniffi.prebuiltBindings is true, so generateUniffiBindings builds nothing")
+        }
+        val cargoArgs =
+            generatorArgs.get().joinToString(" ") { arg ->
+                if (arg.startsWith("--features=")) "--features ${arg.removePrefix("--features=")}" else arg
+            }
+        println("scp-ffi-uniffi|$cargoArgs")
+    }
 }
 
 // uniffiTestGuard: `:scp-kt:test` loads the cdylib under cargo's target directory
