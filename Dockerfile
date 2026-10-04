@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Builds the `scp-relay` and `scp-node` binaries into a Debian runtime image.
 #
 # WHERE THE RUST VERSION COMES FROM. This file names none. `rust-toolchain.toml` — the
@@ -29,15 +30,38 @@
 # was a bookworm image, while `rust:1.98.0-slim` is a trixie one. Move both stages
 # together or neither.
 
+# cargo-chef comes from its upstream release at a pinned version, checked against the
+# sha256 that release publishes in `sha256.sum`, instead of from `cargo install`. The
+# install compiled cargo-chef from source in 46 s whenever the chef stage rebuilt, and it
+# took whatever version crates.io served that day. The musl build is static, so it runs
+# on bookworm's glibc and on any other. One stage per architecture, because the URL and
+# checksum differ per target; BuildKit builds only the stage `TARGETARCH` selects. To move
+# the pin, change the version in both URLs and both checksums together.
+ARG TARGETARCH
+FROM scratch AS cargo-chef-amd64
+ADD --checksum=sha256:aca691abfbfbbe00d482e0ed2249eec3091b65e96a0ce92947fb5b254d48b16d \
+    https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.78/cargo-chef-x86_64-unknown-linux-musl.tar.xz \
+    /cargo-chef.tar.xz
+FROM scratch AS cargo-chef-arm64
+ADD --checksum=sha256:cd59b90fce5fa84c4189648fec33404ec5491791eebdb812df5e7fca8336408d \
+    https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.78/cargo-chef-aarch64-unknown-linux-musl.tar.xz \
+    /cargo-chef.tar.xz
+FROM cargo-chef-${TARGETARCH} AS cargo-chef
+
 # Stage 1: Chef — install the pinned toolchain and cargo-chef
 FROM rust:slim-bookworm AS chef
 WORKDIR /app
 # Build-script dependencies of `scp-relay` and `scp-node` that the slim image omits:
 # `aws-lc-sys` runs cmake, `ring` runs perl, and `libsqlite3-sys` compiles SQLCipher,
-# whose amalgamation includes <openssl/crypto.h> and links against libcrypto.
+# whose amalgamation includes <openssl/crypto.h> and links against libcrypto. `xz-utils`
+# unpacks the cargo-chef release archive.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake perl pkg-config libssl-dev \
+    && apt-get install -y --no-install-recommends cmake perl pkg-config libssl-dev xz-utils \
     && rm -rf /var/lib/apt/lists/*
+# Before the pin is copied in, so moving the Rust version does not redo this layer.
+COPY --from=cargo-chef /cargo-chef.tar.xz /tmp/cargo-chef.tar.xz
+RUN tar -xJf /tmp/cargo-chef.tar.xz -C /usr/local/bin --strip-components=1 --wildcards '*/cargo-chef' \
+    && rm /tmp/cargo-chef.tar.xz
 # Copy the pin before the first cargo command, so rustup installs the pinned compiler
 # here and every stage inheriting from `chef` finds it already present. This layer
 # rebuilds when the pin changes and at no other time.
@@ -48,7 +72,6 @@ COPY rust-toolchain.toml rust-toolchain.toml
 RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
     got="$(rustc --version | cut -d' ' -f2)"; \
     [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
-RUN cargo install cargo-chef
 
 # Stage 2: Planner — generate recipe
 FROM chef AS planner

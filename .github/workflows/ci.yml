@@ -1842,13 +1842,26 @@ jobs:
   # at `docker build`.
   #
   # The build reaches the release compile of both binaries, so it is the slowest job
-  # here; the gha cache keeps a re-run that changes no dependency to the final stage.
+  # here; the layer cache keeps a run that changes no dependency to the final compile.
+  #
+  # WHY THE LAYER CACHE LIVES IN GHCR AND NOT THE ACTIONS CACHE. The Actions cache holds
+  # 10 GB per repository and evicts the least recently used entry when it goes over. The
+  # `Swatinem/rust-cache` entries every run restores held about 8.6 GB on their own, so
+  # the buildkit blobs, which only this job reads, were evicted first: a main run found
+  # the cache manifest but none of its blobs and rebuilt from `WORKDIR` down, and a pull
+  # request run an hour after a main export failed with `blob sha256:…: not found` on the
+  # cook layer and recompiled every dependency. A registry is outside that cap.
+  # `packages: write` lets a push to `main` write the cache; a pull request and a merge
+  # group read it, because `cache-to` is set on a push only.
   docker-image:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     steps:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
       # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
@@ -1869,19 +1882,26 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
+      # A pull request from a fork gets a read-only token, which still reads the cache.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          # Read the cache everywhere; write it only from a push to `main`. A cache
-          # written on a pull-request ref is readable only by that pull request, and it
-          # would evict entries from the 10 GB repository cap that the 22
-          # `Swatinem/rust-cache` steps in this workflow and the 2 in
-          # `.github/workflows/fuzz.yml` share. `ignore-error` so a cache-service
-          # failure cannot fail the build check: this job answers whether the image
-          # builds.
-          cache-from: type=gha,scope=docker-image
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
+          # Read the cache everywhere; write it only from a push to `main`, so every run
+          # reads what `main` built and no pull request can plant a layer another run
+          # reuses. `mode=max` keeps the chef and builder stages, which hold the
+          # toolchain, cargo-chef, and the cooked dependencies; the final stage alone
+          # holds none of them. `image-manifest=true` stores the cache as an OCI image
+          # manifest, the form GHCR accepts. `ignore-error` so a registry failure cannot
+          # fail the build check: this job answers whether the image builds. A missing
+          # or unreadable cache only makes buildkit warn and build every layer.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
+          cache-to: ${{ github.event_name == 'push' && format('type=registry,ref=ghcr.io/{0}/buildcache:docker-image,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true', github.repository) || '' }}
 
   # ── Shared bridge artifacts ─────────────────────────────────────────
   #
