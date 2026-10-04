@@ -680,7 +680,10 @@ impl ScpClient {
     /// [`ClientError::ContextAlreadyExists`] if already joined,
     /// [`ClientError::Mls`] / [`ClientError::EventLog`] on Welcome processing,
     /// replay failure (a replay stream that does not chain cleanly is rejected),
-    /// or a sender-key seal failure, or [`ClientError::StorageBackend`] if
+    /// or a sender-key seal failure. Returns [`ClientError::Mls`] carrying
+    /// [`MlsError::KeyPackageLifetimeInvalid`] when this member's own `KeyPackage`
+    /// is not current under the injected clock; the durable pending blob stays,
+    /// as on every failed join. Returns [`ClientError::StorageBackend`] if
     /// persisting the joined context or deleting the consumed pending blob fails. A
     /// persist failure **poisons** the freshly-joined context (its state advanced
     /// in memory but was not durably recorded); reconstruct via [`Self::new`],
@@ -738,6 +741,17 @@ impl ScpClient {
         // `join_group_from_bytes` is the wire-path variant: it deserializes the
         // Welcome (as `MlsMessageIn`) internally, so the driver never has to
         // name the inbound MLS message type.
+        //
+        // ADR-057 §Prereq-1: the injected clock reaches only this member's OWN
+        // leaf; other members' tree leaves keep only the range bound. The own
+        // KeyPackage must be current under the injected clock, and
+        // `join_group_from_bytes` checks that before it returns a group. On a
+        // rejection the joined group is dropped unadopted and the durable
+        // pending blob stays, as on every failed join, whether the KeyPackage
+        // reads as expired or as not yet valid: the injected clock can be wrong
+        // in either direction (the browser `WasmClock` reads the wall clock,
+        // which can move backwards), so a reconstruct through `Self::new` under
+        // a correct clock can still complete the join.
         let mls_group = join_group_from_bytes(
             welcome_bytes,
             pending.provider,
