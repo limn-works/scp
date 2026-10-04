@@ -203,6 +203,14 @@ nothing:
                no assertion. Both now sit in a fenced block or name the block
                that holds the command, and a check rejects a `cargo doc` naming
                `--features` on any Markdown line no shell fence encloses.
+  package-writers
+               Job docker-image-cache writes the Docker layer cache to the
+               ghcr.io tag `buildcache:docker-image`, and job docker-image reads
+               it, so any job holding `packages: write` whose `if:` admits a
+               pull request or merge group run could overwrite what `main`
+               reads. The check reports such a job, reading a job's own
+               `permissions:` or, when it has none, the workflow-level block,
+               and counts `write-all` at either level as `packages: write`.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
