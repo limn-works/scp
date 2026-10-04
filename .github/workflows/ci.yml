@@ -1230,10 +1230,8 @@ jobs:
   #
   # ── Why this job runs on Linux in four shards ───────────────────────────────
   #
-  # Linux only. No workspace crate outside scp-transport and scp-platform
-  # carries code or a dependency gated on macOS, so a macOS leg compiled the
-  # same source and ran the same tests a second time. Job rust-test-macos tests
-  # those two crates on macOS.
+  # Linux only. Job rust-test-macos tests scp-transport and scp-platform on
+  # macOS.
   #
   # Measured on run 34721754678, whose log line
   # `Restored from cache key "v0-rust-rust-test-Linux-x64-…" full match: true.`
@@ -1324,8 +1322,7 @@ jobs:
   # of execution on the warm run cited above. Sharding rust-test four ways would
   # have repeated all of it four times.
   #
-  # Linux only, like rust-test. Job rust-test-macos reruns this job's
-  # scp-transport and scp-platform commands on macOS.
+  # Linux only, like rust-test.
   #
   # ── Why this job gets its own cache group and does not fold into rust-test ──
   #
@@ -1528,25 +1525,25 @@ jobs:
           cargo check -p scp-testing --lib
           cargo check -p scp-testing --lib --features testing
 
-  # ── macOS tests of the two crates with macOS-gated code ─────────────────────
+  # ── macOS tests of scp-transport and scp-platform ───────────────────────────
   #
   # scp-transport picks its default `TransportProfile` per `target_os`
   # (src/profile.rs, and the macOS assertion in src/config.rs), and its `udp`
   # listener sets SO_REUSEPORT, whose kernel behaviour differs between Darwin
   # and Linux. scp-platform links SQLCipher against CommonCrypto on Apple
-  # targets and against a vendored OpenSSL elsewhere (the
-  # `cfg(not(target_vendor = "apple"))` dependency in its Cargo.toml), and its
-  # SQLite storage takes an `fs2` advisory file lock, whose semantics differ
-  # between the two kernels. Every other crate's tests run on
+  # targets, and its SQLite storage takes an `fs2` advisory file lock, whose
+  # semantics differ between the two kernels. Every other crate's tests run on
   # Linux only, in jobs rust-test and rust-test-optional-features.
   #
   # The scp-transport commands are the transport group's commands from job
   # rust-test-optional-features, without its `startup::tests` run: that run
   # parses backend names and compiles the PostgreSQL and S3 clients, and none
-  # of it depends on the operating system. The scp-platform commands are the
-  # platform-testing group's three `apple`/`sync` runs plus a fourth over the
-  # crate's remaining tests under the same features, which rust-test's macOS
-  # leg used to run under the workspace feature set.
+  # of it depends on the operating system. A last scp-transport command runs
+  # the crate's tests under `sqlite-blob,redb-blob,startup`, the features
+  # scp-node and scp-relay turn on for it under `--workspace`. The scp-platform
+  # commands are the platform-testing group's three `apple`/`sync` runs plus a
+  # fourth over the crate's remaining tests under the same features, which
+  # rust-test's macOS leg used to run under the workspace feature set.
   rust-test-macos:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1576,6 +1573,9 @@ jobs:
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --test webrtc_roundtrip
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^nostr::/)'
           cargo nextest run --no-tests=fail -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --lib -E 'test(/^webrtc::/)'
+          # Every scp-transport test under the features scp-node and scp-relay
+          # turn on for it.
+          cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,startup
       - name: Run scp-platform tests
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"

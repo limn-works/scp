@@ -77,9 +77,9 @@
 #      203 ms from queue to scan finished for a 16 KB binary, and 0 further assessments
 #      on later execs of the same bytes. That cost per binary is small, but the link step
 #      is not, and a workspace nextest links dozens. On 2026-09-11 that queue reached 31
-#      minutes per item and a fix round died inside it. Fourteen jobs of
+#      minutes per item and a fix round died inside it. Jobs of
 #      `.github/workflows/ci.yml` run one of those three commands on the pushed head.
-#      Twelve name the command themselves: `rust-test`, `rust-test-optional-features`,
+#      These name the command themselves: `rust-test`, `rust-test-optional-features`,
 #      `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`,
 #      `rust-build-uniffi-production`, `rust-doc` (which runs `cargo test --workspace
 #      --doc`), `fail-closed-pre-rotation`, `kotlin-test` and `typescript-check` (each of
