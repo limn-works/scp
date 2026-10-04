@@ -1539,6 +1539,49 @@ def check_private_items_detects_a_dropped_flag(
             )
 
 
+NO_CARGO_PATH = "PATH=$no_cargo_path"
+
+
+def no_cargo_gradle_calls(job: dict) -> list[str]:
+    """Each `./gradlew` command line in `job` that runs with cargo off PATH."""
+    return [
+        line
+        for step in job.get("steps", [])
+        for line in logical_lines(step.get("run", ""))
+        if NO_CARGO_PATH in line and "./gradlew" in line
+    ]
+
+
+def check_no_cargo_gradle_calls_skip_the_daemon(jobs: dict) -> None:
+    """kotlin-lint's cargo-free Gradle calls run without the shared daemon.
+
+    CRITERION: a Gradle daemon that an earlier step started can resolve `cargo`
+    against the PATH it started with, so a call that reuses it can reach the
+    `cargo metadata` fallback whatever PATH the shell passes. Each call that
+    strips cargo from PATH passes --no-daemon, and stripping the flag from each
+    one fails the predicate.
+    """
+    calls = no_cargo_gradle_calls(jobs["kotlin-lint"])
+    check(
+        "kotlin-lint runs ./gradlew with cargo off PATH",
+        len(calls) >= 2,
+        f"found {len(calls)} such calls; the skip check and the "
+        f"CARGO_TARGET_DIR loop each make one",
+    )
+    for line in calls:
+        check(
+            f"kotlin-lint: {line[:58]} passes --no-daemon",
+            "--no-daemon" in line.split(),
+            "a reused daemon can resolve cargo against the PATH it started with",
+        )
+        stripped = " ".join(t for t in line.split() if t != "--no-daemon")
+        check(
+            f"kotlin-lint: {line[:40]} with --no-daemon removed -> reported",
+            "--no-daemon" not in stripped.split(),
+            "the predicate accepted a call that reuses the daemon",
+        )
+
+
 def check_workspace_and_rustdoc_readers(documents: list[tuple[Path, dict]]) -> None:
     """The two checks above read the jobs this file says they read.
 
@@ -5486,6 +5529,9 @@ def main() -> int:
     check_rustdoc_documents_private_items(documents)
     check_private_items_detects_a_dropped_flag(documents)
     check_workspace_and_rustdoc_readers(documents)
+
+    print("no-cargo-gradle — kotlin-lint's cargo-free Gradle calls skip the daemon")
+    check_no_cargo_gradle_calls_skip_the_daemon(jobs)
 
     print("merge-queue — a workflow that skips to a success status runs in the queue")
     check_merge_queue_triggers(documents)

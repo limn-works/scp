@@ -3121,6 +3121,8 @@ jobs:
           ./gradlew -q :scp-kt:compileKotlin --dry-run -Pscp.uniffi.prebuiltBindings=true
           # Gradle runs with cargo off PATH, so the `cargo metadata` fallback fails
           # and only the branch that reads CARGO_TARGET_DIR can print the path.
+          # These calls pass --no-daemon, because a daemon that earlier steps
+          # started can resolve `cargo` against the PATH it started with.
           no_cargo_path="$(dirname "$(command -v java)"):/usr/bin:/bin"
           if PATH=$no_cargo_path command -v cargo >/dev/null; then
             echo "::error::cargo is on $no_cargo_path, so the fallback could answer"
@@ -3129,7 +3131,7 @@ jobs:
           # `--dry-run` evaluates no onlyIf predicate, so this call executes the task.
           # The onlyIf skip prints SKIPPED; without it the generator runs and fails,
           # because cargo is off PATH.
-          skip_output=$(PATH=$no_cargo_path ./gradlew --console=plain \
+          skip_output=$(PATH=$no_cargo_path ./gradlew --no-daemon --console=plain \
             :scp-kt:generateUniffiBindings -Pscp.uniffi.prebuiltBindings=true)
           if ! grep -qF ":scp-kt:generateUniffiBindings SKIPPED" <<<"$skip_output"; then
             echo "$skip_output"
@@ -3143,7 +3145,7 @@ jobs:
               *) dir=$GITHUB_WORKSPACE/$value ;;
             esac
             want="-Djna.library.path=$dir/debug:$dir/release"
-            got=$(CARGO_TARGET_DIR=$value PATH=$no_cargo_path ./gradlew -q :scp-kt:printJnaLibraryPath | tail -n 1)
+            got=$(CARGO_TARGET_DIR=$value PATH=$no_cargo_path ./gradlew --no-daemon -q :scp-kt:printJnaLibraryPath | tail -n 1)
             if [ "$got" != "$want" ]; then
               echo "::error::CARGO_TARGET_DIR=$value gave '$got', not '$want'"
               exit 1
@@ -3162,9 +3164,7 @@ jobs:
 
   # ORs on `rust` for a reason spelled out above python-test: this job builds
   # a UniFFI cdylib and runs a Kotlin suite against it, and that cdylib
-  # reaches every Rust workspace crate through scp-core, while a `kotlin` filter
-  # names only bindings/kotlin/**, crates/scp-ffi/uniffi/** and
-  # crates/scp-ffi/common/**.
+  # reaches every Rust workspace crate through scp-core.
   kotlin-test:
     needs: changes
     # This job is also the producer of artifact `uniffi-kotlin-linux`, the UniFFI cdylib
