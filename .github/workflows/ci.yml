@@ -35,11 +35,9 @@ env:
 # WHAT THE TWO INPUTS DO. `shared-key` replaces the job id in the key, so the jobs that
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
-# every merge-queue run can read. Together they take this workflow from eighteen entries
-# per generation to eight, and they put those eight on the ref that every run reads.
+# every merge-queue run can read.
 #
-# THE GROUPS, one per (target directory a job writes, compile mode of its dependency
-# units, runner OS). Cargo hashes the compile mode into every artifact's metadata
+# THE GROUPS. Cargo hashes the compile mode into every artifact's metadata
 # suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,
 # which compile each dependency to an `.rmeta` in check mode, share no artifact with
 # `cargo build` and `cargo nextest`, which compile the same dependency to an `.rlib` in
@@ -68,7 +66,7 @@ env:
 #                     scripts/check-examples-compile.sh and is the only member.
 #   clippy-packages   `target/debug` under check mode and the feature resolution of
 #                     each `-p` command it runs — rust-clippy's `packages` leg, the
-#                     only member. None of its eight commands resolves the workspace
+#                     only member. None of its commands resolves the workspace
 #                     feature set, so the `workspace-check` entry holds few of its units.
 #   workspace-release `target/release` on Linux — pyo3-module, which runs
 #                     `maturin develop --release`, and napi-addon, which runs
@@ -1052,7 +1050,7 @@ jobs:
   # Measured on the 2026-10-04 runs, the single job spent 53 s restoring its cache
   # and then about 6.5 min in three serial blocks of work that share no compiled
   # output: the `--workspace` sweep (87 s), scripts/check-examples-compile.sh
-  # (about 77 s), and eight per-package feature commands (about 4 min). Each leg
+  # (about 77 s), and the per-package feature commands (about 4 min). Each leg
   # runs one block, so the job takes as long as its longest leg rather than the
   # sum. Every command the single job ran runs on exactly one leg, with the
   # flags and features it had there.
