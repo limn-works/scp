@@ -1809,19 +1809,20 @@ pub fn read_live_context_state(
 /// caller. The outlet PRD's SCP-OUT-031 PR-2a note records the rule this
 /// function keeps: the raw lifecycle state never reaches an FFI caller before
 /// authorization. The function makes two mailbox round trips, the lifecycle
-/// state read and then the [`live_role_state`] read, and a fault can land
-/// between them. The refusal therefore reads the same for every non-`Active`
+/// state read and then the role-state read, and a fault can land between
+/// them. The refusal therefore reads the same for every non-`Active`
 /// state, for a context no actor serves, and for an actor fault either read
 /// meets: a context mid-respawn or past a failed respawn (`ActorCrashed`), a
 /// poisoned context (`ContextPoisoned`), an actor that did not answer (`ActorBusy`),
 /// and an actor that returned no role state refuse with the same text and the
 /// caller's code, and the text never names the context.
 ///
-/// The function resolves the bridge's supervisor and runs the lifecycle read
-/// on it before it applies that rule, and returns their errors unchanged: a
-/// suspended bridge, a bridge with no `ContextManager` attached, and a failed
-/// sync-to-async bridge describe the caller's bridge or runtime, not the
-/// context.
+/// The function resolves the bridge's supervisor once and runs both reads on
+/// that one supervisor, so a suspend that lands after the resolution reaches
+/// neither read. It returns the resolution error and each read's
+/// sync-to-async bridge error unchanged: a suspended bridge, a bridge with no
+/// `ContextManager` attached, and a failed sync-to-async bridge describe the
+/// caller's bridge or runtime, not the context.
 ///
 /// `mk_err` wraps the refusal message in the error variant and the error code
 /// the calling entry point reports.
@@ -1835,8 +1836,8 @@ pub fn read_live_context_state(
 ///
 /// Returns the [`supervisor`] error unchanged when the bridge is suspended or
 /// has no `ContextManager` attached, and the `block_on_supervisor_query`
-/// error unchanged when the lifecycle read cannot reach the supervisor from
-/// this thread.
+/// error unchanged when either read cannot reach the supervisor from this
+/// thread.
 pub fn active_role_state_before_authz<F>(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1847,20 +1848,24 @@ where
     F: FnOnce(String) -> ScpPyError,
 {
     let sup = Arc::clone(supervisor(bi)?);
+    let lifecycle_sup = Arc::clone(&sup);
     let ctx = context_id.to_owned();
     let state =
-        block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
-            .map_err(ScpPyError::from);
-    withhold_before_authz(state, || live_role_state(bi, context_id), verb, mk_err)
+        block_on_supervisor_query(
+            async move { lifecycle_sup.read_context_state_checked(&ctx).await },
+        )?
+        .map_err(ScpPyError::from);
+    withhold_before_authz(state, || role_state_on(sup, context_id), verb, mk_err)
 }
 
 /// Applies the [`active_role_state_before_authz`] refusal rule to a lifecycle
 /// state answer and a role-state read: `read_role_state` runs only after
-/// `state` reads `Active`, and every other outcome of either becomes the one
-/// withheld refusal `mk_err` builds.
+/// `state` reads `Active`. An outer `Err` from `read_role_state` is a
+/// sync-to-async bridge failure and returns unchanged; every other outcome of
+/// either becomes the one withheld refusal `mk_err` builds.
 fn withhold_before_authz<F>(
     state: Result<Option<scp_core::context::ContextState>, ScpPyError>,
-    read_role_state: impl FnOnce() -> Result<ContextRoleState, ScpPyError>,
+    read_role_state: impl FnOnce() -> Result<Result<ContextRoleState, ScpPyError>, ScpPyError>,
     verb: &str,
     mk_err: F,
 ) -> Result<ContextRoleState, ScpPyError>
@@ -1877,7 +1882,7 @@ where
         Ok(Some(scp_core::context::ContextState::Active)) => {}
         Ok(Some(_) | None) | Err(_) => return Err(mk_err(refusal())),
     }
-    read_role_state().map_err(|_| mk_err(refusal()))
+    read_role_state()?.map_err(|_| mk_err(refusal()))
 }
 
 /// Reads a context's role state from that context's supervisor actor.
@@ -1907,17 +1912,36 @@ pub fn live_role_state(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<ContextRoleState, ScpPyError> {
-    let sup = Arc::clone(supervisor(bi)?);
+    role_state_on(Arc::clone(supervisor(bi)?), context_id)?
+}
+
+/// Reads `context_id`'s role state from `sup`, a supervisor the caller has
+/// already resolved.
+///
+/// The outer `Err` is a sync-to-async bridge failure; the inner `Result` holds
+/// the supervisor's answer.
+///
+/// # Errors
+///
+/// Returns the `block_on_supervisor_query` error as the outer `Err`. Returns
+/// as the inner `Err` the converted `ActorBusy`, `ActorCrashed`, or
+/// `ContextPoisoned` error, and `ScpPyError::ContextError` with `SCP-CTX-2023`
+/// when the supervisor holds no role state for `context_id`.
+fn role_state_on(
+    sup: Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+) -> Result<Result<ContextRoleState, ScpPyError>, ScpPyError> {
     let ctx = context_id.to_owned();
-    block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })??.ok_or_else(
-        || ScpPyError::ContextError {
+    let answer = block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })?;
+    Ok(answer.map_err(ScpPyError::from).and_then(|role_state| {
+        role_state.ok_or_else(|| ScpPyError::ContextError {
             message: format!(
                 "context '{context_id}' has no live supervisor role state — refusing to \
                  authorize against an absent membership record"
             ),
             code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
-        },
-    )
+        })
+    }))
 }
 
 /// Returns the IDs of all registered contexts where the given DID is a member.
@@ -3941,7 +3965,8 @@ mod tests {
     /// converted `ActorCrashed`, `ContextPoisoned` and `ActorBusy` errors, and
     /// the absent-role-state refusal that names the context) refuses with the
     /// withheld text and the caller's code, and the role state a successful
-    /// read returns passes through unchanged.
+    /// read returns passes through unchanged. A sync-to-async bridge failure of
+    /// the role-state read (the outer `Err`) returns unchanged.
     #[test]
     fn pre_authz_gate_withholds_a_role_state_read_that_fails_after_active() {
         let creator = "did:dht:z6MkGateRoleReadFails";
@@ -3974,10 +3999,10 @@ mod tests {
             let err = withhold_before_authz(
                 active(),
                 || {
-                    Err(ScpPyError::ContextError {
+                    Ok(Err(ScpPyError::ContextError {
                         message,
                         code: code.to_owned(),
-                    })
+                    }))
                 },
                 "validate a UCAN in context",
                 caller_err,
@@ -3999,9 +4024,24 @@ mod tests {
             );
         }
 
+        let bridge_fault = "live supervisor query ended before the supervisor answered";
+        let unchanged = withhold_before_authz(
+            active(),
+            || Err(ScpPyError::context(bridge_fault.to_owned())),
+            "validate a UCAN in context",
+            caller_err,
+        )
+        .expect_err("a failed sync-to-async bridge must refuse");
+        let text = unchanged.to_string();
+        assert!(
+            text.contains(bridge_fault)
+                && !text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a sync-to-async bridge failure must return unchanged, not withheld: {text}"
+        );
+
         let passed = withhold_before_authz(
             active(),
-            || Ok(role_state.clone()),
+            || Ok(Ok(role_state.clone())),
             "validate a UCAN in context",
             caller_err,
         )
@@ -4018,7 +4058,7 @@ mod tests {
             Ok(Some(scp_core::context::ContextState::Closing)),
             || {
                 role_read_ran.set(true);
-                Ok(role_state.clone())
+                Ok(Ok(role_state.clone()))
             },
             "validate a UCAN in context",
             caller_err,
@@ -4033,6 +4073,34 @@ mod tests {
                 .to_string()
                 .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
             "a Closing context must refuse with the withheld text: {refused}"
+        );
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `role_state_on` reads from the supervisor it is handed and never resolves
+    /// the bridge's supervisor again, so a bridge suspended after the gate
+    /// resolved its supervisor still gets the supervisor's answer. A read that
+    /// resolved the supervisor again would return the suspended-bridge error,
+    /// which the gate withholds as a context refusal.
+    #[test]
+    fn role_state_read_runs_on_the_resolved_supervisor_after_a_suspend() {
+        let creator = "did:dht:z6MkRoleReadResolvedSup";
+        let (bi, ctx_id) = live_state_fixture("role-read-resolved", creator, &["messages:read"]);
+        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+        bi.core.suspend().expect("suspend");
+
+        let suspended = live_role_state(&bi, &ctx_id)
+            .expect_err("a fresh resolution on a suspended bridge must refuse");
+        assert!(
+            suspended.to_string().contains("bridge is suspended"),
+            "a fresh resolution must return the suspended-bridge error: {suspended}"
+        );
+        let role_state = role_state_on(sup, &ctx_id)
+            .expect("the sync-to-async bridge answers")
+            .expect("the resolved supervisor answers after the suspend");
+        assert_eq!(
+            role_state.creator_did, creator,
+            "the read must return the resolved supervisor's role state"
         );
         remove_context(&bi, &ctx_id);
     }
