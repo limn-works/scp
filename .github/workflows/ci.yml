@@ -386,6 +386,7 @@ jobs:
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Error code conformance
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -404,6 +405,7 @@ jobs:
   # silent nullifier fallback, `Ok(_)` trips the assertion.
   fail-closed-pre-rotation:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Fail-closed pre-rotation (SCP-IDENT-1059)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -474,6 +476,7 @@ jobs:
   # to the allowlist to make this pass — fix the dependency edge.
   shipped-feature-graph:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Shipped-feature-graph (G1 prove-absence)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -525,6 +528,7 @@ jobs:
   # alternatives considered, and enforcement invariants.
   bridge-symmetry:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Bridge symmetry
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -543,6 +547,7 @@ jobs:
   # ── SDK coverage ─────────────────────────────────────────────────────
   sdk-coverage:
     needs: check-draft
+    if: github.event_name != 'push'
     name: SDK capability matrix
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -566,6 +571,7 @@ jobs:
   # ── Protocol enforcement ─────────────────────────────────────────────
   protocol-sync:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Protocol sync check
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -580,6 +586,7 @@ jobs:
   # ── Python stub parity ───────────────────────────────────────────────
   pyi-generated:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Python stub signature parity
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -604,6 +611,7 @@ jobs:
   # ── Construction pattern (ADR-052) ──────────────────────────────────────
   construction-pattern:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Construction pattern (ADR-052)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -616,6 +624,7 @@ jobs:
 
   protocol-deps:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Protocol deps check
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -628,6 +637,7 @@ jobs:
   # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
   bridge-globals:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / no-bridge-globals + OnceLock ratchet
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -640,6 +650,7 @@ jobs:
 
   fallback-registry:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / no-fallback-registry regression
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -649,6 +660,7 @@ jobs:
 
   handle-affinity:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / handle-affinity check
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -673,6 +685,7 @@ jobs:
   # comparison that would otherwise download the pin's 13 targets and could not disagree.
   toolchain-wiring:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / toolchain wiring
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -786,6 +799,7 @@ jobs:
   # One job per language to keep failure attribution obvious.
   no-mutable-globals-rust:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-globals (rust workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -795,6 +809,7 @@ jobs:
 
   no-mutable-globals-python:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-module-globals (python sdk)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -807,6 +822,7 @@ jobs:
 
   no-mutable-globals-ts:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-globals (typescript sdk)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -816,6 +832,7 @@ jobs:
 
   no-mutable-globals-kotlin:
     needs: check-draft
+    if: github.event_name != 'push'
     name: enforcement / no-mutable-globals (kotlin sdk)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -835,6 +852,7 @@ jobs:
 
   block-in-place:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / block-in-place AST check + ratchet
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -856,6 +874,7 @@ jobs:
   # paths filter, because the `ci` aggregator counts a skipped job as a pass.
   doc-citations:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Docs / spec citations resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -879,6 +898,7 @@ jobs:
   # skipped job as a pass.
   doc-includes:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Docs / transcluded fragments match their owner
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -902,6 +922,7 @@ jobs:
   # a paths filter, because the `ci` aggregator counts a skipped job as a pass.
   agent-verdict-criterion:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Agents / every definition states a verdict criterion
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -916,6 +937,7 @@ jobs:
 
   deleted-primitives:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / deleted primitives ban
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -925,6 +947,7 @@ jobs:
 
   handler-no-panic:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / handler panic-family ban (ADR-049 §10)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -934,6 +957,7 @@ jobs:
 
   no-panic-abort:
     needs: check-draft
+    if: github.event_name != 'push'
     name: FFI / no panic=abort in cdylib profiles
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -950,6 +974,7 @@ jobs:
 
   saga-gating-granularity:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / saga gating granularity (ADR-049 §3a)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -966,6 +991,7 @@ jobs:
 
   bridge-instance-lifecycle:
     needs: check-draft
+    if: github.event_name != 'push'
     name: Actor / BridgeInstance lifecycle drift
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -979,6 +1005,7 @@ jobs:
 
   wasm-protocol:
     needs: check-draft
+    if: github.event_name != 'push'
     name: WASM / protocol
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1001,6 +1028,7 @@ jobs:
 
   wasm-test:
     needs: check-draft
+    if: github.event_name != 'push'
     name: WASM / test
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1036,7 +1064,7 @@ jobs:
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / fmt
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1221,6 +1249,10 @@ jobs:
   # Only shard 1 writes the `workspace-debug` cache. All four legs compile the
   # same target directory, so any of them could, and naming one keeps the
   # entry's contents decided rather than raced.
+  #
+  # A push to `main` runs shard 1 alone, on each OS, to write that cache. The
+  # merge queue already ran all four shards on the same commit, and shards 2-4
+  # write nothing a later run restores.
   rust-test:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -1231,7 +1263,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        shard: [1, 2, 3, 4]
+        shard: ${{ fromJSON(github.event_name == 'push' && '[1]' || '[1, 2, 3, 4]') }}
     steps:
       - name: Free disk space when the runner is short of it
         if: runner.os == 'Linux'
@@ -1480,7 +1512,7 @@ jobs:
   # regress (stop compiling, or stop running the export tests) unnoticed.
   rust-test-napi-production:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / test (napi production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1579,7 +1611,7 @@ jobs:
     needs: changes
     # `python` too: the `python` filter covers `bindings/python/pyproject.toml`,
     # whose `[tool.maturin] features` list the wheel step below builds.
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
+    if: github.event_name != 'push' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')
     name: Rust / build + fail-closed test (pyo3 production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1699,7 +1731,7 @@ jobs:
   # exactly as it did before.
   rust-build-uniffi-production:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / build + fail-closed test (uniffi production config)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1797,7 +1829,7 @@ jobs:
 
   rust-doc:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / doc
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1877,7 +1909,7 @@ jobs:
 
   rust-deny:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Rust / deny
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1932,7 +1964,7 @@ jobs:
   # token does not hold.
   docker-image:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -1975,9 +2007,7 @@ jobs:
 
   # Builds the same image on every push to `main` and exports its layer cache; the
   # comment on job `docker-image` above says why the export lives in this job alone.
-  # Its `if:` reads only the event, because the `ci` gate cannot read a condition that
-  # joins the event to a filter output and a step-level filter condition would report
-  # success over zero work, so a push that changes no Rust still builds here.
+  # Its `if:` reads only the event, so a push that changes no Rust still builds here.
   docker-image-cache:
     needs: changes
     if: github.event_name == 'push'
@@ -2561,7 +2591,7 @@ jobs:
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:
     needs: changes
-    if: needs.changes.outputs.python == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.python == 'true'
     name: Python / lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -2606,8 +2636,9 @@ jobs:
     # cargo command, so it installs no Rust toolchain and reads no cargo cache.
     needs: [changes, pyo3-module]
     if: >-
-      needs.changes.outputs.python == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.rust == 'true')
     name: Python / test
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2715,8 +2746,9 @@ jobs:
     # command, so it installs no Rust toolchain and reads no cargo cache.
     needs: [changes, napi-addon]
     if: >-
-      needs.changes.outputs.typescript == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.rust == 'true')
     name: TypeScript / check + lint + test
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -2893,8 +2925,9 @@ jobs:
   scaffold-typescript-web-check:
     needs: changes
     if: >-
-      needs.changes.outputs.scaffold-typescript-web == 'true' ||
-      needs.changes.outputs.typescript-wasm == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.scaffold-typescript-web == 'true' ||
+      needs.changes.outputs.typescript-wasm == 'true')
     name: TypeScript-web scaffold / build wasm dep + check + lint + build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -3137,7 +3170,7 @@ jobs:
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
     needs: changes
-    if: needs.changes.outputs.swift == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.swift == 'true'
     name: Swift / lint + format
     runs-on: macos-latest
     timeout-minutes: 30
@@ -3166,8 +3199,9 @@ jobs:
     # reads no cargo cache.
     needs: [changes, xcframework]
     if: >-
-      needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      github.event_name != 'push' &&
+      (needs.changes.outputs.swift == 'true' ||
+      needs.changes.outputs.rust == 'true')
     name: Swift / build + test
     runs-on: macos-latest
     timeout-minutes: 60
@@ -3238,9 +3272,10 @@ jobs:
     # cache.
     needs: [changes, pyo3-module, napi-addon]
     if: >-
-      needs.changes.outputs.python == 'true' ||
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.typescript == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      needs.changes.outputs.rust == 'true')
     name: Cross-bridge runtime parity
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -3529,9 +3564,10 @@ jobs:
     # installs no Rust toolchain and reads no cargo cache.
     needs: [changes, pyo3-module-macos, xcframework]
     if: >-
-      needs.changes.outputs.python == 'true' ||
+      github.event_name != 'push' &&
+      (needs.changes.outputs.python == 'true' ||
       needs.changes.outputs.swift == 'true' ||
-      needs.changes.outputs.rust == 'true'
+      needs.changes.outputs.rust == 'true')
     name: Cross-bridge runtime parity (UniFFI Swift)
     runs-on: macos-latest
     timeout-minutes: 60
@@ -3618,6 +3654,7 @@ jobs:
   # reads a command.
   ci-workflow-selftest:
     needs: check-draft
+    if: github.event_name != 'push'
     name: CI workflow / self-test
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -3663,6 +3700,13 @@ jobs:
   # decides per job whether that job was supposed to run by evaluating its
   # own `if:` condition against a `changes` job's filter outputs. A job that
   # was supposed to run and did not report success fails this gate.
+  #
+  # A push to `main` runs only the jobs that write a cache another run restores,
+  # and the jobs those need. Every other job's `if:` reads
+  # `github.event_name != 'push'`: the merge queue already ran it on the same
+  # commit, and a push run takes macOS runners from pull-request runs.
+  # scripts/tests/ci-gate/ci_gate_selftest.py reports a cache writer, or a job a
+  # writer needs, that a push would skip.
   ci:
     if: always()
     needs:

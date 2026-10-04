@@ -518,7 +518,7 @@ Unit tests and conformance macro suites (`transport_conformance!()`, `storage_co
 
 ### Tier 2 — Merge Gate
 
-Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+Merge queue entry. Target: < 10 minutes. Required to merge. A push to `main` runs only the jobs in `.github/workflows/ci.yml` that write a cache another run restores, and the jobs those need, because the merge queue already ran every job on the same commit.
 
 | Job | Runs on | Command |
 |-----|---------|---------|

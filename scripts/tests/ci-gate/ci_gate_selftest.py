@@ -212,6 +212,18 @@ nothing:
                or workflow-level `env:` reading `secrets.GHCR_CACHE_TOKEN` in
                any letter case, or reading `toJSON(secrets)`, outside a job
                declaring `environment: docker-cache`.
+  push-writers
+               A push to `main` runs only the jobs that write a cache another
+               run restores, and the jobs those need, because the merge queue
+               already ran every other job on the same commit. A writer that a
+               push skips leaves its rust-cache, bridge-artifact, Gradle or
+               layer-cache entry stale with nothing going red, since the `ci`
+               aggregate evaluates that writer's own `if:`; a push-only skip
+               that leaks into a pull_request or merge_group run removes a gate
+               the same way. The check reports a cache-writing job some
+               merge_group run selects and the same push does not, a writer's
+               matrix that drops on push the leg its `save-if` names, and any
+               job whose `if:` answers a scenario differently from SCENARIOS.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -225,6 +237,7 @@ Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import os
 import re
@@ -596,6 +609,80 @@ EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
 # Jobs whose `if:` is `github.event_name == 'push'`.
 PUSH_ONLY_JOBS = ("docker-image-cache",)
 
+# Jobs whose `if:` is `github.event_name != 'push'` alone. A push to `main` runs
+# only the jobs that write a cache another run restores, and the jobs those need,
+# because the merge queue already ran every other job on the same commit. None of
+# these writes a cache, so each runs on every pull_request and merge_group run and
+# skips on every push.
+NOT_ON_PUSH_JOBS = (
+    "agent-verdict-criterion",
+    "block-in-place",
+    "bridge-globals",
+    "bridge-instance-lifecycle",
+    "bridge-symmetry",
+    "ci-workflow-selftest",
+    "construction-pattern",
+    "deleted-primitives",
+    "doc-citations",
+    "doc-includes",
+    "error-codes",
+    "fail-closed-pre-rotation",
+    "fallback-registry",
+    "handle-affinity",
+    "handler-no-panic",
+    "no-mutable-globals-kotlin",
+    "no-mutable-globals-python",
+    "no-mutable-globals-rust",
+    "no-mutable-globals-ts",
+    "no-panic-abort",
+    "pyi-generated",
+    "protocol-deps",
+    "protocol-sync",
+    "saga-gating-granularity",
+    "sdk-coverage",
+    "shipped-feature-graph",
+    "toolchain-wiring",
+    "wasm-protocol",
+    "wasm-test",
+)
+
+# Jobs a `changes` filter output selects whose `if:` also reads
+# `github.event_name != 'push' && …`, for the reason NOT_ON_PUSH_JOBS gives. The
+# filter jobs absent from this list write a cache on a push to `main` and run there
+# whenever their filters select them.
+NOT_ON_PUSH_FILTER_JOBS = (
+    "bridge-parity",
+    "bridge-parity-swift",
+    "docker-image",
+    "python-lint",
+    "python-test",
+    "rust-build-pyo3-production",
+    "rust-build-uniffi-production",
+    "rust-deny",
+    "rust-doc",
+    "rust-fmt",
+    "rust-test-napi-production",
+    "scaffold-typescript-web-check",
+    "swift-build-test",
+    "swift-lint",
+    "typescript-check",
+)
+
+
+def on_event(filter_runs: dict[str, bool], event: str) -> dict[str, bool]:
+    """Every conditional job's answer for one event, from the filter jobs' answers."""
+    push = event == "push"
+    runs = dict(filter_runs)
+    if push:
+        runs |= dict.fromkeys(NOT_ON_PUSH_FILTER_JOBS, False)
+    return (
+        runs
+        | dict.fromkeys(EVENT_ONLY_JOBS, event == "pull_request")
+        | dict.fromkeys(PUSH_ONLY_JOBS, push)
+        | dict.fromkeys(NOT_ON_PUSH_JOBS, not push)
+    )
+
+
 # Jobs a `changes` filter output selects.
 RUST_ONLY_RUNS = {
     "bridge-parity": True,
@@ -649,41 +736,43 @@ SCENARIOS = {
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=RUST_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, True)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(RUST_ONLY_RUNS, "pull_request"),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
         filters=DOCS_ONLY,
         event="pull_request",
-        runs=DOCS_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, True)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(DOCS_ONLY_RUNS, "pull_request"),
     ),
     "docs-only, push": Scenario(
         name="docs-only, push",
         filters=DOCS_ONLY,
         event="push",
-        runs=DOCS_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, False)
-        | dict.fromkeys(PUSH_ONLY_JOBS, True),
+        runs=on_event(DOCS_ONLY_RUNS, "push"),
+    ),
+    "rust-only, push": Scenario(
+        name="rust-only, push",
+        filters=RUST_ONLY,
+        event="push",
+        runs=on_event(RUST_ONLY_RUNS, "push"),
     ),
     "rust-only, merge_group": Scenario(
         name="rust-only, merge_group",
         filters=RUST_ONLY,
         event="merge_group",
-        runs=RUST_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, False)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(RUST_ONLY_RUNS, "merge_group"),
     ),
     "python-only, pull_request": Scenario(
         name="python-only, pull_request",
         filters=PYTHON_ONLY,
         event="pull_request",
-        runs=PYTHON_ONLY_RUNS
-        | dict.fromkeys(EVENT_ONLY_JOBS, True)
-        | dict.fromkeys(PUSH_ONLY_JOBS, False),
+        runs=on_event(PYTHON_ONLY_RUNS, "pull_request"),
+    ),
+    "python-only, push": Scenario(
+        name="python-only, push",
+        filters=PYTHON_ONLY,
+        event="push",
+        runs=on_event(PYTHON_ONLY_RUNS, "push"),
     ),
 }
 
@@ -3319,21 +3408,86 @@ def collect_pinned_nightlies(doc: dict) -> set[str]:
     return pinned
 
 
+# One token of an `if:` expression: an operator, a parenthesis, a quoted literal, or a
+# dotted name. A `!` standing alone matches nothing here, and a function call's name
+# followed by `(` fails the grammar in parse_condition.
+CONDITION_TOKEN = re.compile(r"&&|\|\||==|!=|\(|\)|'[^']*'|[A-Za-z_][A-Za-z0-9_.-]*")
+CONDITION_OPERATORS = frozenset(("&&", "||", "==", "!=", "(", ")"))
+
+
+@functools.lru_cache(maxsize=None)
+def parse_condition(expression: str) -> tuple:
+    """Parse one `if:` expression into a tree, raising ValueError outside the grammar.
+
+    A node is ("or" | "and", parts) or ("==" | "!=", left, right). The grammar is
+    the one every `if:` in these workflows uses: comparisons with `==` or `!=`,
+    joined by `&&` and `||`, with `&&` binding tighter, as it does in GitHub's
+    expression language, and parentheses grouping.
+    """
+    text = " ".join(str(expression).split())
+    tokens: list[str] = []
+    rest = text.lstrip()
+    while rest:
+        match = CONDITION_TOKEN.match(rest)
+        if match is None:
+            raise ValueError(f"expression this check cannot read: {text!r}")
+        tokens.append(match.group(0))
+        rest = rest[match.end() :].lstrip()
+    if not tokens:
+        raise ValueError(f"empty expression this check cannot read: {text!r}")
+
+    def chain(index: int, joiner: str, inner) -> tuple[tuple, int]:
+        node, index = inner(index)
+        parts = [node]
+        while index < len(tokens) and tokens[index] == joiner:
+            node, index = inner(index + 1)
+            parts.append(node)
+        if len(parts) == 1:
+            return parts[0], index
+        return ("or" if joiner == "||" else "and", tuple(parts)), index
+
+    def either(index: int) -> tuple[tuple, int]:
+        return chain(index, "||", both)
+
+    def both(index: int) -> tuple[tuple, int]:
+        return chain(index, "&&", comparison)
+
+    def comparison(index: int) -> tuple[tuple, int]:
+        if index < len(tokens) and tokens[index] == "(":
+            node, index = either(index + 1)
+            if index >= len(tokens) or tokens[index] != ")":
+                raise ValueError(f"unbalanced parenthesis this check cannot read: {text!r}")
+            return node, index + 1
+        if index + 3 > len(tokens):
+            raise ValueError(f"comparison this check cannot read: {text!r}")
+        left, operator, right = tokens[index : index + 3]
+        if (
+            operator not in ("==", "!=")
+            or left in CONDITION_OPERATORS
+            or right in CONDITION_OPERATORS
+        ):
+            raise ValueError(f"comparison this check cannot read: {text!r}")
+        return (operator, left, right), index + 3
+
+    tree, index = either(0)
+    if index != len(tokens):
+        raise ValueError(f"expression this check cannot read past {tokens[index]!r}: {text!r}")
+    return tree
+
+
 def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
     """Report whether one `if:` expression selects a job under one set of inputs.
 
     Written here rather than imported from scripts/ci-aggregate-result.py for the
     reason this file's closing paragraph gives: an assertion that calls the function
-    it judges agrees with that function however it behaves. The grammar is the one
-    every `if:` in these workflows uses — `LHS == 'literal'` clauses joined by `||`.
-    An expression outside it raises, which stops this check rather than guessing.
+    it judges agrees with that function however it behaves. parse_condition states
+    the grammar. An expression outside it raises, which stops this check rather than
+    guessing. Every operand is resolved whatever the other comparisons answer, so a
+    filter output `changes` never published raises even behind a false
+    `github.event_name != 'push' &&`.
     """
-    normalised = " ".join(str(expression).split())
-    if any(token in normalised for token in ("&&", "!", "(")):
-        raise ValueError(f"expression this check cannot read: {normalised!r}")
 
     def operand(token: str) -> str:
-        token = token.strip()
         quoted = re.fullmatch(r"'([^']*)'", token)
         if quoted:
             return quoted.group(1)
@@ -3358,13 +3512,15 @@ def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
             return outputs[key]
         raise ValueError(f"operand this check cannot read: {token!r}")
 
-    for clause in normalised.split("||"):
-        sides = clause.split("==")
-        if len(sides) != 2:
-            raise ValueError(f"clause this check cannot read: {clause!r}")
-        if operand(sides[0]) == operand(sides[1]):
-            return True
-    return False
+    def value(node: tuple) -> bool:
+        kind = node[0]
+        if kind in ("or", "and"):
+            results = [value(part) for part in node[1]]
+            return any(results) if kind == "or" else all(results)
+        left, right = operand(node[1]), operand(node[2])
+        return (left == right) if kind == "==" else (left != right)
+
+    return value(parse_condition(expression))
 
 
 def condition_assignments(doc: dict) -> list[tuple[dict[str, str], str]]:
@@ -3434,10 +3590,7 @@ def dependency_condition_gaps(doc: dict) -> list[str]:
             # criterion binds hardest on it: every job in its `needs` list has to run
             # on every such run too. Stepping over it would exempt exactly the case
             # the criterion states, so substitute the constant-true expression,
-            # written in the grammar `selects` reads, and compare normally. The 30
-            # jobs in this shape today all depend on check-draft alone, whose own
-            # condition selects it on every event this enumeration presents, so the
-            # substitution reports nothing on the workflow as it stands.
+            # written in the grammar `selects` reads, and compare normally.
             condition = "true == 'true'"
         if RUNS_OVER_A_SKIPPED_DEPENDENCY.search(str(condition)):
             continue
@@ -3527,9 +3680,10 @@ def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
 def check_dependency_conditions_detect_a_conditionless_consumer(doc: dict) -> None:
     """A job with no `if:` whose dependency carries one is compared, not exempted."""
     mutated = copy.deepcopy(doc)
-    # Job error-codes carries `needs: [check-draft]` and no `if:`, so it runs on every
-    # run. Pointing it at a producer selected by one filter output gives the shape a
-    # later change would create by having a gate job download a built artifact.
+    # Job error-codes carries `needs: [check-draft]`. Removing its `if:` makes it run on
+    # every run, and pointing it at a producer selected by one filter output gives the
+    # shape a later change would create by having a gate job download a built artifact.
+    del mutated["jobs"]["error-codes"]["if"]
     mutated["jobs"]["error-codes"]["needs"] = ["check-draft", "pyo3-module"]
     gaps = dependency_condition_gaps(mutated)
     check(
@@ -3547,8 +3701,9 @@ def check_dependency_conditions_read_a_status_guarded_consumer(doc: dict) -> Non
     a skipped dependency. Exempting such a consumer would let the gap through to a
     later pull request's red aggregate exactly as an unexempted gap would, and would
     let it through silently, since the exemption runs before the branch that reports an expression this grammar
-    cannot read. Job `error-codes` carries `needs: [check-draft]` and no `if:`; adding
-    a producer selected by one filter output gives each mutant a pair to compare.
+    cannot read. Job `error-codes` carries `needs: [check-draft]`; replacing its `if:`
+    and adding a producer selected by one filter output gives each mutant a pair to
+    compare.
     """
     for expression, exempt in (
         ("success()", False),
@@ -4791,6 +4946,392 @@ def check_a_new_producer_reaches_the_napi_gate(doc: dict) -> None:
     )
 
 
+def cache_write(step: dict) -> str | None:
+    """Name the cache one step writes, or None when it writes none.
+
+    A step writes a cache when a later run of any ref can restore what it saves:
+    a `Swatinem/rust-cache` step whose `save-if` is not the literal false, an
+    `actions/cache` or `actions/cache/save` step, a `gradle/actions/setup-gradle`
+    step that neither disables its cache nor sets `cache-read-only` to the literal
+    true (it writes on the default branch by default), a step exporting a layer
+    cache through `cache-to`, and a setup action given a `cache:` input. An input
+    written as an expression counts as writing, so an unreadable input errs toward
+    holding the job on push rather than toward skipping a writer.
+    """
+    uses = str(step.get("uses") or "")
+    action = uses.split("@", 1)[0]
+    inputs = step.get("with") or {}
+
+    def literal(name: str) -> str:
+        return str(inputs.get(name, "")).strip().lower()
+
+    if action == "Swatinem/rust-cache":
+        if literal("save-if") == "false":
+            return None
+        return f"rust-cache `{inputs.get('shared-key')}`"
+    if action in ("actions/cache", "actions/cache/save"):
+        return f"{action} `{inputs.get('key')}`"
+    if action == "gradle/actions/setup-gradle":
+        if literal("cache-disabled") == "true" or literal("cache-read-only") == "true":
+            return None
+        return "the Gradle user-home cache"
+    if "cache-to" in inputs:
+        return f"layer cache `{inputs['cache-to']}`"
+    if action.startswith("actions/setup-") and inputs.get("cache"):
+        return f"{action} cache `{inputs['cache']}`"
+    return None
+
+
+def cache_writers(doc: dict) -> dict[str, list[str]]:
+    """Map each job holding a cache-writing step to the caches it writes."""
+    writers: dict[str, list[str]] = {}
+    for job_id, job in doc["jobs"].items():
+        written = [
+            name
+            for step in job.get("steps") or []
+            if isinstance(step, dict)
+            for name in [cache_write(step)]
+            if name is not None
+        ]
+        if written:
+            writers[job_id] = written
+    return writers
+
+
+# A matrix value chosen by event: `${{ fromJSON(github.event_name == 'push' &&
+# '<push list>' || '<every other event's list>') }}`. Any other expression in a
+# writer's matrix is reported as unreadable.
+PUSH_MATRIX = re.compile(
+    r"^\$\{\{\s*fromJSON\(\s*github\.event_name\s*==\s*'push'\s*&&\s*'(\[[^']*\])'"
+    r"\s*\|\|\s*'(\[[^']*\])'\s*\)\s*\}\}$"
+)
+SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?")
+
+
+def push_writer_gaps(doc: dict) -> list[str]:
+    """Return every way a push to `main` would skip a cache write.
+
+    CRITERION: a job holding a cache-writing step runs on a push to `main` wherever
+    a merge_group run with the same filter outputs runs it, and some push runs it at
+    all; and a matrix leg a writer's `save-if` names exists on push.
+
+    WHY: rust-cache and `actions/cache/save` write only on `refs/heads/main`, so a
+    writer that a push skips leaves its entry to go stale until eviction, and every
+    pull request and merge-queue run then compiles from a miss. Nothing goes red:
+    the `ci` aggregate evaluates the writer's own `if:`, which says skip. The jobs a
+    writer needs are dependency_condition_gaps' business, since GitHub skips a job
+    whose dependency skipped and that check enumerates the push event.
+    """
+    gaps: list[str] = []
+    assignments = condition_assignments(doc)
+    for job_id, written in sorted(cache_writers(doc).items()):
+        job = doc["jobs"][job_id]
+        condition = job.get("if") or "true == 'true'"
+        caches = ", ".join(written)
+        try:
+            pushes = [
+                outputs
+                for outputs, event in assignments
+                if event == "push" and selects(condition, outputs, event)
+            ]
+            dropped = [
+                outputs
+                for outputs, event in assignments
+                if event == "merge_group"
+                and selects(condition, outputs, event)
+                and not selects(condition, outputs, "push")
+            ]
+        except ValueError as unreadable:
+            gaps.append(
+                f"{job_id} writes {caches} and this check cannot decide whether a "
+                f"push runs it ({unreadable})"
+            )
+            continue
+        if not pushes:
+            gaps.append(f"{job_id} writes {caches} and no push to `main` runs it")
+        elif dropped:
+            selected = sorted(key for key, on in dropped[0].items() if on == "true")
+            gaps.append(
+                f"{job_id} writes {caches}, and a push with filters "
+                f"{selected or ['none']} true skips it where a merge_group run with "
+                f"the same filters runs it"
+            )
+        matrix = (job.get("strategy") or {}).get("matrix") or {}
+        if not isinstance(matrix, dict):
+            gaps.append(f"{job_id} writes {caches} through a matrix this check cannot read")
+            continue
+        on_push: dict[str, list] = {}
+        for key, values in matrix.items():
+            if isinstance(values, list):
+                on_push[key] = values
+                continue
+            chosen = PUSH_MATRIX.match(str(values))
+            if chosen is None:
+                gaps.append(
+                    f"{job_id} writes {caches} and its matrix `{key}` is an expression "
+                    f"this check cannot read: {values!r}"
+                )
+                continue
+            push_values, other_values = (json.loads(group) for group in chosen.groups())
+            if not set(map(str, push_values)) <= set(map(str, other_values)):
+                gaps.append(
+                    f"{job_id}'s matrix `{key}` runs {push_values} on push, outside "
+                    f"the {other_values} every other event runs"
+                )
+            on_push[key] = push_values
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict) or cache_write(step) is None:
+                continue
+            save_if = str((step.get("with") or {}).get("save-if", ""))
+            for key, value in SAVE_IF_MATRIX.findall(save_if):
+                if key in on_push and value not in map(str, on_push[key]):
+                    gaps.append(
+                        f"{job_id} saves {cache_write(step)} only from matrix leg "
+                        f"`{key} == {value}`, and a push runs `{key}` over "
+                        f"{on_push[key]} alone"
+                    )
+    return gaps
+
+
+def scenario_disagreements(doc: dict) -> list[str]:
+    """Return each (scenario, job) whose `if:` and SCENARIOS answer differently."""
+    found: list[str] = []
+    for scenario in SCENARIOS.values():
+        for job_id, expected in sorted(scenario.runs.items()):
+            condition = doc["jobs"].get(job_id, {}).get("if")
+            if condition is None:
+                continue
+            try:
+                actual = selects(condition, scenario.filters, scenario.event)
+            except ValueError as unreadable:
+                found.append(f"{scenario.name}: {job_id} unreadable ({unreadable})")
+                continue
+            if actual != expected:
+                found.append(
+                    f"{scenario.name}: {job_id} {'runs' if actual else 'skips'}, "
+                    f"SCENARIOS says it {'runs' if expected else 'skips'}"
+                )
+    return found
+
+
+def check_push_runs_every_cache_writer(doc: dict) -> None:
+    writers = cache_writers(doc)
+    # The detector has to find the writers this workflow holds today, or the gap
+    # check below passes over an empty set.
+    for job_id in (
+        "bridge-parity-kotlin",
+        "docker-image-cache",
+        "fuzz-build",
+        "kotlin-lint",
+        "kotlin-test",
+        "napi-addon",
+        "pyo3-module",
+        "pyo3-module-macos",
+        "rust-clippy",
+        "rust-test",
+        "rust-test-optional-features",
+        "typescript-wasm-check",
+        "xcframework",
+    ):
+        check(f"{job_id} is read as a cache writer", job_id in writers, f"{writers}")
+    gaps = push_writer_gaps(doc)
+    check("ci.yml: a push to `main` runs every cache writer", not gaps, "; ".join(gaps))
+    skipped_writers = sorted(
+        set(writers) & (set(NOT_ON_PUSH_JOBS) | set(NOT_ON_PUSH_FILTER_JOBS))
+    )
+    check(
+        "no job SCENARIOS skips on push writes a cache",
+        not skipped_writers,
+        f"{skipped_writers} write {[writers[job] for job in skipped_writers]}",
+    )
+    disagreements = scenario_disagreements(doc)
+    check(
+        "every scenario's answer matches the job's own `if:`",
+        not disagreements,
+        "; ".join(disagreements),
+    )
+
+
+def check_push_writer_mutants(doc: dict) -> None:
+    """Each way of skipping a writer on push, or leaking a push skip, is reported."""
+    guarded = copy.deepcopy(doc)
+    clippy = guarded["jobs"]["rust-clippy"]
+    clippy["if"] = f"github.event_name != 'push' && ({clippy['if']})"
+    gaps = push_writer_gaps(guarded)
+    check(
+        "a push guard on writer rust-clippy is reported",
+        any(gap.startswith("rust-clippy writes") for gap in gaps)
+        and not any("cannot decide" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    check(
+        "a push guard on writer rust-clippy disagrees with SCENARIOS",
+        any(
+            "rust-only, push: rust-clippy skips" in found
+            for found in scenario_disagreements(guarded)
+        ),
+        f"{scenario_disagreements(guarded)}",
+    )
+
+    shard = copy.deepcopy(doc)
+    shard["jobs"]["rust-test"]["strategy"]["matrix"]["shard"] = (
+        "${{ fromJSON(github.event_name == 'push' && '[2]' || '[1, 2, 3, 4]') }}"
+    )
+    gaps = push_writer_gaps(shard)
+    check(
+        "a push matrix without the writing shard is reported",
+        any("rust-test saves" in gap for gap in gaps),
+        f"{gaps}",
+    )
+
+    draft = copy.deepcopy(doc)
+    gate = draft["jobs"]["check-draft"]
+    gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
+    gaps = dependency_condition_gaps(draft)
+    check(
+        "a push skip on check-draft, which every writer needs, is reported",
+        any("changes runs and check-draft skips on event push" in gap for gap in gaps),
+        f"{gaps}",
+    )
+
+    for job_id, event, scenario in (
+        ("rust-fmt", "merge_group", "rust-only, merge_group"),
+        ("error-codes", "pull_request", "docs-only, pull_request"),
+    ):
+        leaked = copy.deepcopy(doc)
+        current = leaked["jobs"][job_id]["if"]
+        leaked["jobs"][job_id]["if"] = current.replace(
+            "github.event_name != 'push'", f"github.event_name != '{event}'"
+        )
+        check(
+            f"{job_id} skipping on {event} disagrees with SCENARIOS",
+            any(
+                f"{scenario}: {job_id} skips" in found
+                for found in scenario_disagreements(leaked)
+            ),
+            f"{scenario_disagreements(leaked)}",
+        )
+
+
+def check_condition_grammar() -> None:
+    """parse_condition reads the grammar ci.yml uses and refuses everything else."""
+    outputs = {"rust": "true", "python": "false"}
+    guarded = (
+        "github.event_name != 'push' && "
+        "(needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')"
+    )
+    for expression, event, expected in (
+        (guarded, "push", False),
+        (guarded, "pull_request", True),
+        (guarded, "merge_group", True),
+        # `&&` binds tighter than `||`.
+        (
+            "needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true' && github.event_name == 'push'",
+            "pull_request",
+            True,
+        ),
+        (
+            "(needs.changes.outputs.rust == 'true' || "
+            "needs.changes.outputs.python == 'true') && github.event_name == 'push'",
+            "pull_request",
+            False,
+        ),
+    ):
+        check(
+            f"selects({expression!r}, {event}) is {expected}",
+            selects(expression, outputs, event) is expected,
+        )
+    for expression in (
+        "always()",
+        "!cancelled()",
+        "success() && needs.changes.outputs.rust == 'true'",
+        "(needs.changes.outputs.rust == 'true'",
+        "needs.changes.outputs.rust == 'true')",
+        "needs.changes.outputs.rust",
+        "needs.changes.outputs.rust == 'true' extra",
+        "github.event_name != 'push' && needs.changes.outputs.renamed == 'true'",
+        "",
+    ):
+        try:
+            selects(expression, outputs, "push")
+            refused = False
+        except ValueError:
+            refused = True
+        check(f"selects refuses {expression!r}", refused)
+
+
+def check_aggregate_grammar() -> None:
+    """scripts/ci-aggregate-result.py reads the same grammar and refuses the rest.
+
+    Each case runs the aggregate over a one-job workflow, so the verdict comes from
+    that script's evaluator and the expected answer from this function's table.
+    """
+    for expression, event, skipped_ok in (
+        ("github.event_name != 'push' && needs.changes.outputs.rust == 'true'", "push", True),
+        ("github.event_name != 'push' && needs.changes.outputs.rust == 'true'", "merge_group", False),
+        (
+            "needs.changes.outputs.python == 'true' || "
+            "needs.changes.outputs.rust == 'true' && github.event_name == 'push'",
+            "pull_request",
+            True,
+        ),
+        (
+            "(needs.changes.outputs.python == 'true' || "
+            "needs.changes.outputs.rust == 'true') && github.event_name != 'push'",
+            "pull_request",
+            False,
+        ),
+    ):
+        code, out = run_one_job_aggregate(expression, event)
+        check(
+            f"aggregate over a skipped `{expression}` on {event} -> exit "
+            f"{0 if skipped_ok else 1}",
+            code == (0 if skipped_ok else 1),
+            f"exit {code}: {out}",
+        )
+    for expression in (
+        "!cancelled()",
+        "success() && needs.changes.outputs.rust == 'true'",
+        "(needs.changes.outputs.rust == 'true'",
+        "github.event_name != 'push' && needs.changes.outputs.renamed == 'true'",
+    ):
+        code, out = run_one_job_aggregate(expression, "push")
+        check(f"aggregate refuses `{expression}` -> exit 2", code == 2, f"exit {code}: {out}")
+
+
+def run_one_job_aggregate(expression: str, event: str) -> tuple[int, str]:
+    """Run the aggregate over a workflow holding one job with this `if:`, skipped."""
+    workflow = {
+        "jobs": {
+            "check-draft": {"runs-on": "ubuntu-latest"},
+            "changes": {"needs": "check-draft", "outputs": {"rust": "x", "python": "x"}},
+            "probe": {"needs": "changes", "if": expression},
+            "ci": {"if": "always()", "needs": ["check-draft", "changes", "probe"]},
+        }
+    }
+    needs = {
+        "check-draft": {"result": "success"},
+        "changes": {"result": "success", "outputs": {"rust": "true", "python": "false"}},
+        "probe": {"result": "skipped"},
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as handle:
+        yaml.safe_dump(workflow, handle)
+        path = handle.name
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(AGGREGATE), path],
+            env=dict(os.environ, NEEDS_JSON=json.dumps(needs), GITHUB_EVENT_NAME=event),
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            check=False,
+        )
+    finally:
+        os.unlink(path)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -4948,6 +5489,12 @@ def main() -> int:
     check_dependency_conditions_detect_a_conditionless_consumer(workflow)
     check_dependency_conditions_read_a_status_guarded_consumer(workflow)
 
+    print("push-writers — a push to `main` runs every cache writer, and only a push skips")
+    check_condition_grammar()
+    check_aggregate_grammar()
+    check_push_runs_every_cache_writer(workflow)
+    check_push_writer_mutants(workflow)
+
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
     declared = set(jobs["ci"]["needs"])
@@ -5101,7 +5648,7 @@ def main() -> int:
     needs = build_needs(jobs, docs_pr)
     needs["error-codes"]["result"] = "skipped"
     code, out = run_aggregate(needs, docs_pr.event)
-    check("an unconditional job skipped -> exit 1", code == 1, out)
+    check("a job every pull request selects skipped -> exit 1", code == 1, out)
 
     needs = build_needs(jobs, docs_pr)
     needs["shipped-feature-graph"]["result"] = "failure"
@@ -5141,6 +5688,43 @@ def main() -> int:
     needs = build_needs(jobs, docs_push)
     code, out = run_aggregate(needs, docs_push.event)
     check("push event, a pull-request-only job skipped -> exit 0", code == 0, out)
+
+    print("push-skips — a push skips every job but the cache writers, and only a push")
+    # A push to `main` runs only the jobs that write a cache another run restores,
+    # and the jobs those need. SCENARIOS states which jobs those are, so an
+    # aggregate given that skipped set must pass, every writer reported skipped
+    # must fail it, and a push-only skip reported on a pull_request or merge_group
+    # run must fail it. Each failing case names the job, so a verdict reached for
+    # another reason does not satisfy it.
+    rust_push = SCENARIOS["rust-only, push"]
+    python_push = SCENARIOS["python-only, push"]
+    for scenario in (docs_push, rust_push, python_push):
+        code, out = run_aggregate(build_needs(jobs, scenario), scenario.event)
+        check(f"{scenario.name}, every non-writer skipped -> exit 0", code == 0, out)
+    for scenario in (docs_push, rust_push):
+        for job_id in sorted(cache_writers(workflow)):
+            if not scenario.runs.get(job_id, True):
+                continue
+            needs = build_needs(jobs, scenario)
+            needs[job_id]["result"] = "skipped"
+            code, out = run_aggregate(needs, scenario.event)
+            check(
+                f"{scenario.name}, writer {job_id} skipped -> exit 1 naming it",
+                code == 1 and job_id in out,
+                f"exit {code}: {out}",
+            )
+    for scenario in (rust_pr, rust_merge):
+        for job_id in NOT_ON_PUSH_JOBS + NOT_ON_PUSH_FILTER_JOBS:
+            if not scenario.runs[job_id]:
+                continue
+            needs = build_needs(jobs, scenario)
+            needs[job_id]["result"] = "skipped"
+            code, out = run_aggregate(needs, scenario.event)
+            check(
+                f"{scenario.name}, push-skipped {job_id} skipped -> exit 1 naming it",
+                code == 1 and job_id in out,
+                f"exit {code}: {out}",
+            )
 
     # merge_group names whichever event a merge queue runs, so it gates every
     # merge. cross-layer skips there because it diffs against a pull request's
