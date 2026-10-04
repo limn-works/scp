@@ -319,8 +319,8 @@ class ScpViewModelTest {
     // An inline bridge runs a post-clear leave and its onCleanupFailure call inside
     // trackContext only while no other cleanup coroutine holds the failure lock. When one
     // does, trackContext returns with the call still pending, and the call later runs on
-    // the thread that released the lock. The KDoc on trackContext, onCleared, and
-    // onCleanupFailure states this exception; this method keeps that statement true.
+    // the thread that released the lock. The KDoc on trackContext states this
+    // exception; this method keeps that statement true.
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     fun `an inline-bridge failure waits for a running onCleanupFailure and runs on its thread`() {
