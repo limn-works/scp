@@ -2230,10 +2230,7 @@ struct TierReEvalHandle {
     /// dropped, on every exit path (normal return, cancellation, panic, abort).
     /// Awaiting it therefore blocks until every `Arc` the future captured,
     /// including the `DidMethod`/`KeyCustody` clones held by the republish path,
-    /// has been released. That is what makes
-    /// [`shutdown`](ApplicationNode::shutdown) drop the custody handle (and its
-    /// `SqliteStorage` advisory lock) before the caller re-opens the same
-    /// storage path, e.g. on a node restart.
+    /// has been released.
     ///
     /// A value the future owns is no such witness: a sender moved into a local
     /// of the task body drops when the body returns, before the runtime drops
@@ -2256,7 +2253,7 @@ struct TierReEvalHandle {
     /// `republish.rs` gives).
     runtime: tokio::runtime::Handle,
     /// How long [`stop_and_wait`](Self::stop_and_wait) waits for the task to
-    /// end before it aborts the task and returns (ADR-048 §5 bounded wait).
+    /// end before it aborts the task and returns.
     /// [`TIER_TASK_STOP_DEADLINE`] in production.
     stop_deadline: Duration,
 }
@@ -2282,8 +2279,7 @@ impl TierReEvalHandle {
         let _ = self.cancel_tx.send(true);
     }
 
-    /// Signals the background task to stop and blocks until its future — and
-    /// every `Arc` it captured — has been dropped.
+    /// Signals the background task to stop.
     ///
     /// The task runs on the stored [`runtime`](Self::runtime). When that runtime
     /// is multi-thread, its workers drive the task while this thread waits up to
@@ -2293,7 +2289,8 @@ impl TierReEvalHandle {
     /// this returns without waiting further, so the task's captures can outlive
     /// the return, e.g. when the task is blocked on a host-language custody
     /// callback that needs the thread this caller holds (the GIL, the JS main
-    /// thread).
+    /// thread). If the runtime is shutting down, the wait can end before the
+    /// task's future drops; that case is logged at warn.
     ///
     /// A caller on a `current_thread` runtime gets a best-effort `abort()` +
     /// cancel signal instead: `block_in_place` panics there, and waiting without
@@ -2306,8 +2303,6 @@ impl TierReEvalHandle {
     fn stop_and_wait(&self) {
         let _ = self.cancel_tx.send(true);
         let Some(task) = self.take_task() else {
-            // Already waited once; the task future has already been awaited to
-            // completion (or a prior fallback aborted it). Nothing to join.
             return;
         };
         let multi_thread = tokio::runtime::RuntimeFlavor::MultiThread;
@@ -2345,7 +2340,14 @@ impl TierReEvalHandle {
             }
             // A cancelled join: only runtime shutdown can cancel the task once
             // its handle is taken, and that drops the future too.
-            Ok(Ok(()) | Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Ok(Ok(()) | Err(_)) => {}
+            // The forwarder was dropped without sending, which runtime shutdown
+            // can do before it drops the tier task's future.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!(
+                    "tier re-evaluation task join was not observed: its runtime dropped the join forwarder"
+                );
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 abort.abort();
                 tracing::warn!(
@@ -6533,13 +6535,76 @@ mod tests {
             slow_drop_tier_task(strategy, Duration::from_hours(1))
         };
 
-        std::thread::spawn(move || handle.stop_and_wait())
-            .join()
-            .expect("stop_and_wait does not panic off-runtime");
+        let warnings = std::thread::spawn(move || {
+            let warnings = Arc::new(WarnCounter::default());
+            tracing::subscriber::with_default(Arc::clone(&warnings), || handle.stop_and_wait());
+            warnings.count()
+        })
+        .join()
+        .expect("stop_and_wait does not panic off-runtime");
 
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "stop_and_wait returned before the tier task's captured publisher was dropped"
+        );
+        assert_eq!(warnings, 0, "a completed join logged a warning");
+    }
+
+    /// Counts the WARN events emitted on the thread it is the default
+    /// subscriber for.
+    #[derive(Default)]
+    struct WarnCounter(std::sync::atomic::AtomicUsize);
+
+    impl WarnCounter {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Once the task's runtime has shut down, the join forwarder is dropped
+    /// without sending, so `stop_and_wait` never observes a join. It must log
+    /// that at warn rather than return as if the join had completed.
+    #[test]
+    fn stop_and_wait_logs_a_warning_when_its_runtime_has_shut_down() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime builds");
+        let (handle, _dropped) = {
+            let _entered = runtime.enter();
+            let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Stun {
+                external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+            }]));
+            slow_drop_tier_task(strategy, Duration::from_hours(1))
+        };
+        drop(runtime);
+        let warnings = Arc::new(WarnCounter::default());
+
+        tracing::subscriber::with_default(Arc::clone(&warnings), || handle.stop_and_wait());
+
+        assert_eq!(
+            warnings.count(),
+            1,
+            "stop_and_wait did not log the unobserved join"
         );
     }
 
@@ -6570,10 +6635,10 @@ mod tests {
     }
 
     /// A task stuck inside a re-evaluation never sees the cancel signal. An
-    /// off-runtime caller (the FFI bridges' shape) must still get control back
-    /// once the stop deadline passes (ADR-048 §5), not block forever.
+    /// off-runtime caller (the FFI bridges' shape) must still get control back, not
+    /// block forever.
     #[test]
-    fn stop_and_wait_off_runtime_returns_at_the_deadline_when_the_task_is_stuck() {
+    fn stop_and_wait_off_runtime_returns_when_the_task_is_stuck() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -6600,14 +6665,14 @@ mod tests {
 
         returned_rx
             .recv_timeout(Duration::from_secs(30))
-            .expect("stop_and_wait returned at its deadline instead of waiting on a stuck task");
+            .expect("stop_and_wait did not return within 30 s on a stuck task");
     }
 
     /// A `current_thread` caller cannot block: with the task on a multi-thread
     /// runtime, `stop_and_wait` called inside a `current_thread` runtime must
-    /// abort and return instead of panicking in `block_in_place`.
+    /// return instead of panicking in `block_in_place`.
     #[test]
-    fn stop_and_wait_from_current_thread_caller_aborts_without_panicking() {
+    fn stop_and_wait_from_current_thread_caller_does_not_panic() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -6629,10 +6694,10 @@ mod tests {
 
     /// A task spawned on a `current_thread` runtime advances only while that
     /// runtime's owner drives it. Here the owner is blocked waiting on the
-    /// caller thread, so `stop_and_wait` must abort and return rather than block
-    /// on a join nothing will drive.
+    /// caller thread, so `stop_and_wait` must return rather than block on a join
+    /// nothing will drive.
     #[test]
-    fn stop_and_wait_on_current_thread_runtime_task_aborts_without_blocking() {
+    fn stop_and_wait_on_current_thread_runtime_task_returns() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6653,7 +6718,7 @@ mod tests {
 
         returned_rx
             .recv_timeout(Duration::from_secs(30))
-            .expect("stop_and_wait returned instead of blocking on an undriven join");
+            .expect("stop_and_wait did not return within 30 s; it blocked on an undriven join");
     }
 
     #[tokio::test]
