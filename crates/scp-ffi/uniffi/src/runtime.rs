@@ -21,7 +21,7 @@
 //!    is mandatory, spec §17.6) constructs a fresh `UniffiBridgeInstance`;
 //!    per-instance setup (e.g. `init_context_manager_with_did`, transport
 //!    setup) happens lazily on the first `Scp::identity_create` /
-//!    `context_create` / `context_join` call.
+//!    `context_create` call.
 //! 2. `Scp::method(...)` delegates to methods on
 //!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
 //!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
@@ -808,9 +808,7 @@ impl UniffiBridgeInstance {
         self.core
             .try_supervisor()
             .ok_or_else(|| crate::ScpError::Context {
-                msg: "ContextManager not yet attached — call context_create, \
-                      context_import, or init_context_manager first"
-                    .to_owned(),
+                msg: "ContextManager not yet attached".to_owned(),
                 code: codes::CTX_2000.to_owned(),
             })
     }

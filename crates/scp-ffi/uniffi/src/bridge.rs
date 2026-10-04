@@ -10478,7 +10478,7 @@ impl Scp {
 
                 // reserve_key_package can be a node's FIRST context op (it joins
                 // before it ever creates), so ensure the supervisor is attached
-                // first — the same idempotent init context_join performs.
+                // first.
                 bi.init_context_manager_with_did(&identity.did);
 
                 let sup = bi.context_manager_or_error()?;
@@ -10591,8 +10591,7 @@ impl Scp {
 
                 // spawn-from-Welcome always stands up an ENCRYPTED context; ensure
                 // the node's supervisor is attached first (this may be the joiner's
-                // first context op — the same idempotent init context_join
-                // performs).
+                // first context op).
                 bi.init_context_manager_with_did(&identity.did);
 
                 // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing
