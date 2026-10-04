@@ -80,10 +80,6 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: Builder — cook deps then build
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# The cook compiles SQLCipher, and `.cargo/config.toml` sets the build flag it needs
-# (lookaside off); without the file here the cook builds it once without the flag and
-# the final build compiles it again.
-COPY .cargo/config.toml .cargo/config.toml
 # Cook only the two binaries' dependencies. Cooking the whole workspace pulls in
 # `scp-ffi`, whose `pyo3-build-config` build script fails with "no Python 3.x
 # interpreter found" — and this image ships neither Python bindings nor a Python.

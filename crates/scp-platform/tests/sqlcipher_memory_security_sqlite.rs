@@ -16,7 +16,7 @@ use scp_platform::sqlite::SqliteStorage;
 /// cipher_memory_security` reports it on a fresh probe connection: `"1"` once
 /// a connection has turned it on and `SQLCipher`'s allocator has run.
 fn memory_security() -> String {
-    let probe = rusqlite::Connection::open_in_memory().expect("probe connection should open");
+    let probe = scp_sqlite_pools::open_in_memory().expect("probe connection should open");
     probe
         .query_row("PRAGMA cipher_memory_security", [], |row| row.get(0))
         .expect("SQLCipher should report cipher_memory_security")

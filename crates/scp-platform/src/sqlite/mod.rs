@@ -145,10 +145,12 @@ impl SqliteStorage {
         })?;
 
         let db_path = dir.join("scp.db");
-        let conn = Connection::open(&db_path)
+        // `scp_sqlite_pools::open` refuses unless SQLite's page-cache bulk
+        // block and this connection's lookaside pool are both off, so every
+        // block holding the key, a statement, a bound value, or a decrypted
+        // page is freed through SQLCipher's allocator (spec section 17.6).
+        let conn = scp_sqlite_pools::open(&db_path)
             .map_err(|e| PlatformError::StorageError(format!("failed to open database: {e}")))?;
-        crate::sqlcipher_lookaside::require_lookaside_off(&conn)
-            .map_err(PlatformError::StorageError)?;
 
         // Apply SQLCipher pragmas (spec section 17.6).
         // The hex key format is `PRAGMA key = "x'<hex>'"` — a double-quoted
@@ -158,10 +160,10 @@ impl SqliteStorage {
         // `cipher_memory_security` comes first: SQLCipher allocates with the C
         // library's `malloc`, which the wiping global allocator never sees, and
         // the pragma makes SQLCipher wipe each block its allocator frees from
-        // then on. The key statement's blocks reach that allocator only because
-        // the lookaside pool is off (checked above); the connection keeps no
-        // freed block unwiped (§17.6, and §9.15 of the security-model spec,
-        // freed heap memory).
+        // then on. The key statement's blocks and the decrypted pages reach
+        // that allocator only because both SQLite pools are off (proven by the
+        // open above); the connection keeps no freed block unwiped (§17.6, and
+        // §9.15 of the security-model spec, freed heap memory).
         let mut hex_key = hex::encode(key);
         let mut pragma_sql = format!(
             "PRAGMA cipher_memory_security = ON;\n\
@@ -705,6 +707,36 @@ impl<T> OptionalResult<T> for Result<T, rusqlite::Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The constructor's own connection serves nothing from `SQLite`'s
+    /// lookaside pool after its key statement and an insert with bound values
+    /// (spec §17.6, `SQLCipher` configuration).
+    #[test]
+    fn connection_serves_nothing_from_lookaside() {
+        let dir = TempDir::new().expect("tempdir should succeed");
+        let storage = SqliteStorage::new(dir.path(), &[0xAB; 32]).expect("new should succeed");
+        let conn = storage
+            .conn
+            .lock()
+            .expect("connection lock should not be poisoned");
+        conn.execute_batch("CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)")
+            .expect("probe table should be created");
+        conn.execute(
+            "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
+            rusqlite::params!["a-key", vec![0x5A_u8; 64]],
+        )
+        .expect("insert should run");
+        let used = scp_sqlite_pools::lookaside_use(&conn).expect("lookaside status should read");
+        drop(conn);
+        assert_eq!(
+            used,
+            scp_sqlite_pools::LookasideUse {
+                slots_high_water: 0,
+                hits: 0
+            },
+            "no lookaside slot may hold the key statement or the bound values"
+        );
+    }
 
     #[test]
     fn prefix_successor_normal() {

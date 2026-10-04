@@ -78,7 +78,7 @@ impl SqliteBlobStore {
     ///
     /// Returns [`StorageError::Internal`] if the database cannot be opened.
     pub fn open_with_clock(path: &Path, clock: ClockFn) -> Result<Self, StorageError> {
-        let conn = Connection::open(path)
+        let conn = scp_sqlite_pools::open(path)
             .map_err(|e| StorageError::Internal(format!("sqlite open: {e}")))?;
         Self::init_connection(conn, clock)
     }
@@ -99,7 +99,7 @@ impl SqliteBlobStore {
     ///
     /// Returns [`StorageError::Internal`] if the database cannot be opened.
     pub fn in_memory_with_clock(clock: ClockFn) -> Result<Self, StorageError> {
-        let conn = Connection::open_in_memory()
+        let conn = scp_sqlite_pools::open_in_memory()
             .map_err(|e| StorageError::Internal(format!("sqlite open: {e}")))?;
         Self::init_connection(conn, clock)
     }
@@ -116,10 +116,10 @@ impl SqliteBlobStore {
         // SQLCipher connection too. `cipher_memory_security` makes SQLCipher
         // wipe every block its allocator frees; its `malloc` heap is outside
         // the wiping global allocator. A block reaches that allocator only
-        // because the lookaside pool is off, which the check below confirms
-        // before the first other statement (spec §17.6, and §9.15 of the
+        // because SQLite's page-cache bulk block and the connection's
+        // lookaside pool are off, which `scp_sqlite_pools` proved before
+        // handing the connection over (spec §17.6, and §9.15 of the
         // security-model spec, freed heap memory).
-        super::sqlcipher_lookaside::require_lookaside_off(&conn).map_err(StorageError::Internal)?;
         conn.execute_batch(
             "PRAGMA cipher_memory_security = ON;
              PRAGMA journal_mode = WAL;
@@ -350,5 +350,49 @@ impl BlobStorage for SqliteBlobStore {
             .map_err(|e| StorageError::Internal(format!("sqlite count: {e}")))?;
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(count as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each constructor's own connection serves nothing from `SQLite`'s
+    /// lookaside pool after its pragmas and an insert with bound values
+    /// (spec §17.6, `SQLCipher` configuration).
+    fn assert_serves_nothing_from_lookaside(
+        store: &SqliteBlobStore,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = store.conn.blocking_lock();
+        conn.execute_batch("CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)")?;
+        conn.execute(
+            "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
+            rusqlite::params!["a-key", vec![0x5A_u8; 64]],
+        )?;
+        let used = scp_sqlite_pools::lookaside_use(&conn)?;
+        drop(conn);
+        assert_eq!(
+            used,
+            scp_sqlite_pools::LookasideUse {
+                slots_high_water: 0,
+                hits: 0
+            },
+            "no lookaside slot may hold the key statement or the bound values"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn file_connection_serves_nothing_from_lookaside() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = SqliteBlobStore::open(&dir.path().join("blobs.db"))?;
+        assert_serves_nothing_from_lookaside(&store)
+    }
+
+    #[test]
+    fn in_memory_connection_serves_nothing_from_lookaside() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let store = SqliteBlobStore::in_memory()?;
+        assert_serves_nothing_from_lookaside(&store)
     }
 }

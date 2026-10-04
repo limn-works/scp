@@ -49,8 +49,6 @@ pub mod relay_querier;
 #[cfg(feature = "s3-blob")]
 pub mod s3_blob;
 pub mod server;
-#[cfg(any(feature = "combined", feature = "sqlite-blob"))]
-pub(crate) mod sqlcipher_lookaside;
 #[cfg(feature = "sqlite-blob")]
 pub mod sqlite_blob;
 pub mod storage;

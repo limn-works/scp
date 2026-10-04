@@ -87,21 +87,22 @@ impl AppleStorage {
         }
 
         let db_path = dir.join("scp.db");
-        let conn = Connection::open(&db_path).map_err(|e| {
+        // Refuses unless SQLite's page-cache bulk block and this connection's
+        // lookaside pool are both off (spec section 17.6).
+        let conn = scp_sqlite_pools::open(&db_path).map_err(|e| {
             PlatformError::StorageError(format!(
                 "failed to open database at {}: {e}",
                 db_path.display()
             ))
         })?;
-        crate::sqlcipher_lookaside::require_lookaside_off(&conn)
-            .map_err(PlatformError::StorageError)?;
 
         // Apply `SQLCipher` encryption key as hex-encoded PRAGMA.
         // `cipher_memory_security` comes first so `SQLCipher` wipes every block
         // its allocator frees from then on; its `malloc` heap is outside the
-        // wiping global allocator. The key statement's blocks reach that
-        // allocator only because the lookaside pool is off (checked above)
-        // (spec §17.6, and §9.15 of the security-model spec, freed heap memory).
+        // wiping global allocator. The key statement's blocks and the decrypted
+        // pages reach that allocator only because both SQLite pools are off
+        // (proven by the open above) (spec §17.6, and §9.15 of the
+        // security-model spec, freed heap memory).
         let mut hex_key = hex::encode(encryption_key);
         let mut pragma_sql = format!(
             "PRAGMA cipher_memory_security = ON;\
@@ -341,6 +342,32 @@ mod tests {
         let key = [0x42u8; 32];
         let storage = AppleStorage::open(&dir, &key).unwrap();
         (storage, dir)
+    }
+
+    /// The constructor's own connection serves nothing from `SQLite`'s
+    /// lookaside pool after its key statement and an insert with bound values
+    /// (spec §17.6, `SQLCipher` configuration).
+    #[test]
+    fn connection_serves_nothing_from_lookaside() {
+        let (storage, _dir) = test_storage();
+        let conn = storage.conn.blocking_lock();
+        conn.execute_batch("CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)")
+            .expect("probe table should be created");
+        conn.execute(
+            "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
+            rusqlite::params!["a-key", vec![0x5A_u8; 64]],
+        )
+        .expect("insert should run");
+        let used = scp_sqlite_pools::lookaside_use(&conn).expect("lookaside status should read");
+        drop(conn);
+        assert_eq!(
+            used,
+            scp_sqlite_pools::LookasideUse {
+                slots_high_water: 0,
+                hits: 0
+            },
+            "no lookaside slot may hold the key statement or the bound values"
+        );
     }
 
     #[tokio::test]
