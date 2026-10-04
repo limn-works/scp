@@ -933,7 +933,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     .await
     .expect(
         "the node must build over the SHARED root storage handle without a \
-         lock conflict (os error 35)",
+         lock conflict",
     );
 
     // -- The REAL document-derived governance resolver over the node's shared

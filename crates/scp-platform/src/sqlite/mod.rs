@@ -266,8 +266,8 @@ impl SqliteStorage {
     /// call `close` only once every task that can write through this store
     /// has exited. The FFI bridges call it from the shared
     /// `scp_ffi_common::bridge_instance` shutdown only after the
-    /// Supervisor's tracked tasks drain inside the shutdown deadline
-    /// (ADR-048 §5 amendment, ADR-049 Decision 16).
+    /// Supervisor's tracked tasks drain (ADR-048 §5 amendment, ADR-049
+    /// Decision 16).
     ///
     /// A poisoned mutex is recovered with
     /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner): a

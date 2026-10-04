@@ -309,6 +309,13 @@ fn inject_did_meta(html: &str, did: &str) -> String {
 /// Returns a [`SelfHostError`] if any stage fails: relay connect, DID
 /// registration, context creation, asset publish, key resolution, projection
 /// enable, or deploy commit.
+///
+/// Returns [`SelfHostError::DrainTimedOut`] when the Supervisor drain exceeds
+/// [`SELF_HOST_DRAIN_DEADLINE`]; the caller must then leave the storage behind
+/// `durable` open. Its `cause` is `Some` when a stage
+/// failed before the drain, and `None` when the deploy had already committed:
+/// a `None` cause means the assets are published, so a retry would publish a
+/// second deploy.
 pub async fn deploy_site<S, C>(
     node: &ApplicationNode<S>,
     params: DeploySiteParams<'_, C>,
@@ -384,6 +391,10 @@ impl SelfHostDeployer {
     ///
     /// Returns a [`SelfHostError`] if relay connect, DID/context registration,
     /// context creation, key resolution, or projection enable fails.
+    /// Returns [`SelfHostError::DrainTimedOut`], carrying that failure as its
+    /// `cause`, when the Supervisor drain after the failure exceeds
+    /// [`SELF_HOST_DRAIN_DEADLINE`]; the caller must then leave the storage
+    /// behind `durable` open.
     // Provider-bootstrap entry: each argument is a distinct, required provider
     // the loopback supervisor needs (node, identity, hostname, signing key,
     // governance resolver, durable providers). The durable saga journal and the
@@ -1381,7 +1392,7 @@ where
     // -- Root storage + custody. The single root `SqliteStorage` handle owns the
     //    advisory lock on `{dir}/scp.db.lock`; it is shared via `Arc::clone`
     //    between the BEP44 sequence store and the node builder so there is
-    //    exactly one lock holder (a second open would fail with os error 35). --
+    //    exactly one lock holder. --
     let node_storage_arc = Arc::new(open_sqlite(&storage_dir, &storage_key)?);
     let custody_storage = open_sqlite(&storage_dir.join("custody"), &storage_key)?;
     let custody = Arc::new(
@@ -2498,18 +2509,24 @@ where
     .await;
     match started {
         Ok(deployer) => Ok((deployer, mls_inner)),
+        Err(e) => Err(deployer_setup_failure(e, &mls_inner)),
+    }
+}
+
+/// Maps a failed [`SelfHostDeployer::start`] onto [`HostSiteError`] and
+/// settles the MLS store behind it.
+fn deployer_setup_failure(e: SelfHostError, mls_store: &SqliteStorage) -> HostSiteError {
+    match e {
         // The drain timed out, so a tracked task may still write: leave the
         // store open.
-        Err(e @ SelfHostError::DrainTimedOut { .. }) => {
-            Err(HostSiteError::DeployerSetup(e.to_string()))
-        }
-        Err(e) => {
+        e @ SelfHostError::DrainTimedOut { .. } => HostSiteError::Drain(e),
+        e => {
             // `start` drained any Supervisor it built before failing, so the
             // store has no writer left.
-            if let Err(close) = mls_inner.close() {
+            if let Err(close) = mls_store.close() {
                 tracing::error!(error = %close, "MLS SQLite store did not close after a failed deployer setup");
             }
-            Err(HostSiteError::DeployerSetup(e.to_string()))
+            HostSiteError::DeployerSetup(e.to_string())
         }
     }
 }
@@ -2731,6 +2748,50 @@ mod tests {
         assert!(!is_missing_backend(&other));
         let other_config = HostSiteError::InvalidConfig("x".to_owned());
         assert!(!is_missing_backend(&other_config));
+    }
+
+    /// A setup drain timeout reaches the caller as the typed
+    /// `HostSiteError::Drain` and leaves the MLS store open with its lock; any
+    /// other setup failure is `DeployerSetup` and closes the store.
+    #[test]
+    fn deployer_setup_failure_keeps_store_open_only_on_drain_timeout() {
+        let key = [7u8; 32];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mls");
+        let store = SqliteStorage::new(&dir, &key).expect("open store");
+
+        let timed_out = SelfHostError::DrainTimedOut {
+            deadline: SELF_HOST_DRAIN_DEADLINE,
+            cause: Some("x".to_owned()),
+        };
+        let err = deployer_setup_failure(timed_out, &store);
+        assert!(
+            matches!(
+                err,
+                HostSiteError::Drain(SelfHostError::DrainTimedOut { .. })
+            ),
+            "a setup drain timeout must be HostSiteError::Drain, got {err:?}"
+        );
+        assert!(
+            matches!(
+                SqliteStorage::new(&dir, &key),
+                Err(scp_platform::PlatformError::StorageLockHeld { .. })
+            ),
+            "the store must keep its lock after a setup drain timeout"
+        );
+
+        let failed = SelfHostError::CommitDeploy("y".to_owned());
+        let err = deployer_setup_failure(failed, &store);
+        assert!(
+            matches!(&err, HostSiteError::DeployerSetup(m) if m == "failed to commit deploy: y"),
+            "a drained setup failure must be DeployerSetup, got {err:?}"
+        );
+        let reopened = SqliteStorage::new(&dir, &key);
+        assert!(
+            reopened.is_ok(),
+            "the store must release its lock after a drained setup failure: {:?}",
+            reopened.err()
+        );
     }
 
     /// On a build without `testing`, `host_site_until` over an empty storage

@@ -498,7 +498,7 @@ fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> Sqli
 /// that single handle is shared by every root-DB consumer (the BEP44 sequence
 /// store AND the `ApplicationNode` builder). Opening a second `SqliteStorage`
 /// against the same root directory while this one is alive fails with an
-/// advisory-lock conflict (os error 35) — see `SqliteStorage::new`. Sharing the
+/// advisory-lock conflict — see `SqliteStorage::new`. Sharing the
 /// one handle via `Arc::clone` (which implements [`Storage`]/[`EncryptedStorage`]
 /// through the blanket `Arc<T>` impls) keeps exactly one lock holder.
 async fn init_persistent_storage(
@@ -560,7 +560,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // the single root `SqliteStorage` handle it opens (held alive via
     // `node_storage_arc`) is the ONLY root handle and is reused for both the BEP44
     // sequence store and the node builder. Reopening the root DB while that handle
-    // is alive would fail with an advisory-lock conflict (os error 35).
+    // is alive would fail with an advisory-lock conflict.
     let (storage_dir, _storage_key, node_storage_arc, custody) =
         init_persistent_storage(storage_path).await;
 
@@ -604,7 +604,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 sequence_store,
             );
             // Reuse the single root handle (shared via `Arc`) rather than reopening,
-            // which would conflict on the advisory lock (os error 35).
+            // which would conflict on the advisory lock.
             run_node_with(
                 domain,
                 http_addr,
@@ -636,7 +636,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 }
             };
             // Reuse the single root handle (shared via `Arc`) rather than reopening,
-            // which would conflict on the advisory lock (os error 35).
+            // which would conflict on the advisory lock.
             run_node_with(
                 domain,
                 http_addr,
