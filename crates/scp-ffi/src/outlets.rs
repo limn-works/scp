@@ -3255,7 +3255,7 @@ mod tests {
     /// `outlet_interface_expose` reads the lifecycle state, the roles, and the
     /// creator from the supervisor, so a context no supervisor actor serves
     /// refuses at the lifecycle gate with `SCP-OUTLET-6030`, the code its NAPI
-    /// and `UniFFI` twins report. A copy-reading path admitted it.
+    /// and `UniFFI` twins report.
     #[test]
     fn interface_expose_refuses_without_supervisor_role_state() {
         let creator = "did:dht:z6MkExposeNoActor";
@@ -3276,7 +3276,7 @@ mod tests {
     /// `outlet_interface_accept` reads the lifecycle state, the roles, and the
     /// creator from the supervisor, so a context no supervisor actor serves
     /// refuses at the lifecycle gate with `SCP-OUTLET-6032`, the code its NAPI
-    /// and `UniFFI` twins report. A copy-reading path admitted it.
+    /// and `UniFFI` twins report.
     #[test]
     fn interface_accept_refuses_without_supervisor_role_state() {
         let creator = "did:dht:z6MkAcceptNoActor";
