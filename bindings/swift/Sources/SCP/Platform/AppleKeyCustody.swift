@@ -186,11 +186,12 @@ private nonisolated struct KeyMetadata: Codable {
 
 /// Apple Keychain-backed key custody provider for SCP Ed25519 and X25519 keys.
 ///
-/// Implements the `KeyCustodyProvider` callback interface defined in the
-/// UniFFI bridge (`crates/scp-ffi/uniffi/src/bridge.rs`). Swift passes an
-/// instance of this class into the Rust engine at `SCP.init()` time; all
-/// signing and key-agreement operations are dispatched from Rust through the
-/// UniFFI boundary into this class.
+/// ADR-025, the Apple platform adapter, requires this class to conform to the
+/// UniFFI `KeyCustodyProvider` callback interface in
+/// `crates/scp-ffi/uniffi/src/lib.rs`. This class does not conform yet: its
+/// methods throw `PlatformError`, while that callback interface declares
+/// `ScpError` as its error type. Acceptance criterion 4 of ADR-025 records
+/// this gap.
 ///
 /// ## Key storage
 ///
@@ -474,7 +475,7 @@ public final class AppleKeyCustody: Sendable {
     }
 }
 
-// MARK: - KeyCustodyProvider conformance
+// MARK: - Key custody operations
 
 public extension AppleKeyCustody {
     // MARK: generateKeypair

@@ -5434,14 +5434,14 @@
       "severity": "major",
       "status": "in-progress",
       "files": [
-        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift"
+        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift",
+        "bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift"
       ],
-      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter hands App Attest the 32-byte `challenge` it receives unchanged and throws on an unsupported device instead of returning the synthetic token. On the minting side no Rust code meets the requirements of ADR-025 acceptance criterion 3 that fall outside the adapter, because no Rust code yet holds or calls the `DeviceAttestationProvider` callback: nothing computes `D`, passes `D` to `attest`, publishes the attestation object, strips `attStmt.receipt` from it, re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`, computes the assertion digest `A`, or passes `A` to `assertRequest`. No code verifies an attestation against Apple's root, so the criterion \"A reader verifies the attestation offline against Apple's App Attestation Root CA\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.",
+      "description": "Implement the Apple App Attest device attestation adapter as the Swift class `AppleDeviceAttestation` in `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift`. ADR-025, the Apple platform adapter, decides that the Apple adapter is a set of Swift classes conforming to the UniFFI callback interfaces, so no Rust file holds the App Attest calls. A Rust `DeviceAttestation` implementation that calls the adapter through the UniFFI `DeviceAttestationProvider` callback is still missing, and criterion 1 waits on it; GitHub issue #2515, \"Implement DeviceAttestation in Rust over the UniFFI DeviceAttestationProvider callback (SCP-095 criterion 1)\", tracks it. An earlier revision of this description named `scp-platform/apple/app_attest.rs`; that file never existed, and ADR-025 places the adapter in Swift.\n\nApp Attest integration: attestation flow, key binding, and App Attest error handling. App Attest provides hardware-backed device attestation. Under `09-security-model.md` §9.3.1 each reader verifies the attestation offline, and no relay and no Apple endpoint verifies it; SCP-316, the device-attestation reader story, specifies that reader, and no code implements it yet.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter hands App Attest the 32-byte `challenge` it receives unchanged and throws on an unsupported device instead of returning the synthetic token. On the minting side no Rust code meets the requirements of ADR-025 acceptance criterion 3 that fall outside the adapter, because no Rust code yet holds or calls the `DeviceAttestationProvider` callback: nothing computes `D`, passes `D` to `attest`, publishes the attestation object, strips `attStmt.receipt` from it, re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`, computes the assertion digest `A`, or passes `A` to `assertRequest`. No code verifies an attestation against Apple's root, so the criterion \"A reader verifies the attestation offline against Apple's App Attestation Root CA\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.\n\nRevision on 2026-10-04: this revision deleted acceptance criterion 4 and its action item, which required the adapter to read Apple's risk metric, because `09-security-model.md` §9.3.1 states that only a server-to-server call to Apple can use the App Attest receipt behind that metric, which no peer makes. The same revision deleted this description's claim that a server verifies the attestation, because §9.3.1 has each reader verify it offline, and deleted the sentence that called ADR-025 a stub, because ADR-025 is decided. `details.criteriaStatus` names the evidence for each of the five remaining criteria.",
       "acceptanceCriteria": [
         "Implements DeviceAttestation trait for Apple platforms",
         "Attestation request generates App Attest attestation object",
         "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
-        "Fraud metric handling integrated (risk metric from Apple)",
         "Attestation bound to specific key material",
         "Tests pass with App Attest sandbox environment"
       ],
@@ -5449,7 +5449,6 @@
         "Implement DeviceAttestation::attest() using App Attest API (DCAppAttestService)",
         "Leave verification to the reader of `09-security-model.md` §9.3.1, a pure function in `scp-protocol` (SCP-316); the adapter implements no verify method",
         "Handle attestation key generation and binding to SCP identity",
-        "Implement fraud metric extraction and reporting",
         "Handle App Attest error cases (unsupported device, service unavailable)",
         "Write integration tests using App Attest sandbox"
       ],
@@ -5468,13 +5467,41 @@
         }
       ],
       "details": {
-        "stubADR": true,
+        "stubADR": false,
         "adr": "ADR-025",
         "protocolSections": [
           "§9.15"
         ],
         "expectedDecisions": {
-          "appAttest": "Attestation flow, server-side verification, fraud metric handling"
+          "appAttest": "Attestation flow, offline verification by every reader under `09-security-model.md` §9.3.1, no receipt exchange with Apple"
+        },
+        "criteriaStatus": {
+          "assessedOn": "2026-10-04",
+          "assessedAgainst": "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift and bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift, after the change that generates and attests a replacement key when the stored key carries an attestation record",
+          "met": [
+            {
+              "criterion": "Attestation request generates App Attest attestation object",
+              "evidence": "`AppleDeviceAttestation.attest(challenge:deviceId:)` checks that `challenge` is 32 bytes, calls `DCAppAttestService.attestKey(_:clientDataHash:)` with `challenge` as `clientDataHash` unchanged, and returns the raw CBOR attestation object Apple signed. `attestForwardsChallenge` pins the unchanged `clientDataHash` under two different `deviceId` values and the raw return value; `attestRejectsWrongLengthChallenge` pins `SCP-ATTEST-9026` for a 0-, 31- and 33-byte `challenge`, with no key generated and no App Attest call. `AppleDeviceAttestation` is the only adapter that implements this criterion: `AndroidDeviceAttestation`, the other class conforming to a `DeviceAttestationProvider` interface, requests a Play Integrity token under SCP-111, the Play Integrity adapter story."
+            },
+            {
+              "criterion": "Attestation bound to specific key material",
+              "evidence": "`AppleDeviceAttestation` runs each `attest` and `assertRequest` body, key generation included, inside `AppAttestCallSerializer`, one call at a time. `attest` hands `attestKey` the key ID stored under `dev.limn.scp.appAttest.replacementKeyId` first, then the key ID stored under `dev.limn.scp.appAttest.keyId` while no attestation record under `dev.limn.scp.appAttest.attestedKeyId` names it, and otherwise generates a key, which it stores as the replacement while the stored key carries a record, because Apple attests one key once. When `attestKey` returns an attestation object, the adapter records that key ID as attested and makes a replacement key the stored key, so `assertRequest` passes `generateAssertion` the key of the latest successful attestation. When `attestKey` answers `DCError.invalidKey`, `probeKey(_:after:call:)` asks Apple for an assertion with that key over the key-probe input `K`: an assertion records and keeps a stored key and discards a replacement key, with `SCP-ATTEST-9021`; `invalidKey` discards that key ID, with `SCP-ATTEST-9023`; every other answer keeps the key. `AppAttestKeyStateGuard` attaches one lock and one call serializer to the `UserDefaults` object that holds the key state, so every adapter over that object takes that pair. `AppleDeviceAttestationTests.swift` pins these with `concurrentAttestsGenerateOneKey`, `appAttestCallsNeverOverlap`, `adaptersShareKeyStatePerDefaultsObject`, `attestReplacesAttestedKey`, `repeatedAttestReplacesKey`, `concurrentAttestReplacesAttestedKey`, `adaptersSharingDefaultsAttestEachKeyOnce`, `failedReplacementKeepsAttestedKey`, `rejectedReplacementKeepsAttestedKey`, `alreadyAttestedReplacementKeepsAttestedKey`, `rejectedStoredKeyPromotesReplacement`, `attestProbeFindsAlreadyAttestedKey`, `attestDiscardsRejectedKey`, `attestProbeKeepsKeyOnEveryOtherAnswer`, `assertRequestDiscardsRejectedKey`, `assertRequestKeepsUnattestedKey` and `assertRequestKeepsKeyOnServerUnavailable`. `AppleDeviceAttestation` is the only adapter that implements this criterion."
+            }
+          ],
+          "unmet": [
+            {
+              "criterion": "Implements DeviceAttestation trait for Apple platforms",
+              "evidence": "No Rust code implements the `DeviceAttestation` trait over the Apple adapter. `DeviceAttestation` in `crates/scp-platform/src/traits.rs` declares `attest(&self)`, which takes no argument and returns a `DeviceAttestationToken`, and `verify(&self, token)`. `DeviceAttestationProvider` in `crates/scp-ffi/uniffi/src/lib.rs`, the UniFFI callback interface `AppleDeviceAttestation` conforms to, declares `attest(challenge, device_id)` returning bytes and `assert_request(request_hash)`, so its method set differs from the trait's. The only implementation of `DeviceAttestation` under `crates/` is the `testing`-gated `InMemoryDeviceAttestation` in `crates/scp-platform/src/testing/attestation.rs`. No Rust code holds or calls a `DeviceAttestationProvider`, and no Swift code under `bindings/swift/Sources` constructs or calls `AppleDeviceAttestation`: outside `AppleDeviceAttestation.swift`, the name appears under `bindings/swift/Sources` only in a doc comment in `AppleKeyCustody.swift` and a doc comment in the generated `Internal/ScpBindings.swift`, so no production path reaches `attest(challenge:deviceId:)` or `assertRequest(requestHash:)`. GitHub issue #2515, \"Implement DeviceAttestation in Rust over the UniFFI DeviceAttestationProvider callback (SCP-095 criterion 1)\", tracks that implementation."
+            },
+            {
+              "criterion": "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
+              "evidence": "`AppleDeviceAttestation` carries no verifier, because the maintainer ruled on 2026-09-26 that reading-side verification belongs to the keri workstream. `09-security-model.md` §9.3.1 states how a reader verifies an App Attest attestation. SCP-316, still pending, specifies that reader, and no file under `crates/` or `bindings/` implements it."
+            },
+            {
+              "criterion": "Tests pass with App Attest sandbox environment",
+              "evidence": "`AppleDeviceAttestationTests.swift` drives the adapter with `ScriptedAppAttestService`, `CountingAppAttestService`, `OverlapDetectingAppAttestService` and `RecordingAppAttestService`, `DCAppAttestService` subclasses that override `isSupported` and the App Attest methods each one scripts. No test contacts Apple's App Attest sandbox, and no test runs on a physical device."
+            }
+          ]
         }
       }
     },
