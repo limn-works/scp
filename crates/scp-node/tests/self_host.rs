@@ -256,7 +256,8 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
     );
     // Durable saga journal + `mls_storage` view bound into one `DurableProviders`
     // over the SAME `Arc<SqliteStorage>`, exactly as the production binary does.
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
 
     // -- Embedded default site (index.html + style.css + app.js), with the node
     //    DID injected into the index <head>, just like production.
@@ -295,6 +296,18 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         committed, expected_count,
         "commit_deploy must report exactly the number of published assets"
     );
+
+    // -- `deploy_site` drained its Supervisor before returning (ADR-049
+    //    Decision 16): no tracked task still holds the MLS store, so the store
+    //    closes and its directory reopens on the first attempt (spec §17.6).
+    assert_eq!(
+        Arc::strong_count(&mls_inner),
+        1,
+        "deploy_site must leave no task holding the MLS store"
+    );
+    mls_inner.close().expect("the drained MLS store must close");
+    SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
+        .expect("the MLS directory must reopen on the first attempt after deploy_site");
 
     // -- Fetch /index.html back over HTTP from the node's real projection router.
     let routing_hex = scp_node::routing_id_hex(&context_id);
@@ -1569,4 +1582,61 @@ async fn external_participant_access_is_cryptographic() {
     assert_relay_view_is_ciphertext(&built, &routing_id, "external-participant").await;
 
     built.node.shutdown();
+}
+
+/// ADR-049 Decision 16 for a long-lived deployer: `shutdown` drains the
+/// Supervisor so no tracked task outlives it, every later deploy fails, and
+/// once the deployer drops the MLS store has no other holder, so it closes and
+/// its directory reopens on the first attempt (spec §17.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_host_deployer_shutdown_drains_before_store_close() {
+    let built = build_self_host_node().await;
+    let node_did = built.node.identity().did().to_owned();
+    let context_id = self_host_context_id(&node_did);
+    let mls_dir = built.storage_dir.join("mls");
+    let mls_inner = Arc::new(
+        SqliteStorage::new(&mls_dir, built.storage_key.as_ref()).expect("MLS SQLite should open"),
+    );
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
+    let deployer = scp_node::SelfHostDeployer::start(
+        &built.node,
+        node_did.clone(),
+        context_id,
+        "selfhost.scp.local".to_owned(),
+        built.node.identity().identity().active_signing_key,
+        built.key_resolver(),
+        durable,
+    )
+    .await
+    .expect("deployer setup should succeed");
+    deploy_through(&deployer, &built, "selfhost-drain-run-1").await;
+
+    deployer
+        .shutdown()
+        .await
+        .expect("an idle Supervisor drains within the deadline");
+    let assets = scp_node::embedded_assets(Some(&node_did));
+    assert!(
+        deployer
+            .deploy(
+                &built.node,
+                "selfhost-drain-run-2",
+                built.custody.as_ref(),
+                &assets
+            )
+            .await
+            .is_err(),
+        "a deploy after shutdown must fail"
+    );
+
+    drop(deployer);
+    assert_eq!(
+        Arc::strong_count(&mls_inner),
+        1,
+        "no tracked task may hold the MLS store after the drain"
+    );
+    mls_inner.close().expect("the drained MLS store must close");
+    SqliteStorage::new(&mls_dir, built.storage_key.as_ref())
+        .expect("the MLS directory must reopen on the first attempt");
 }

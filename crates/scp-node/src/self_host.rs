@@ -109,6 +109,48 @@ pub enum SelfHostError {
         /// Number of assets that were published.
         expected: usize,
     },
+    /// The Supervisor's tracked tasks did not all exit within
+    /// [`SELF_HOST_DRAIN_DEADLINE`]. The caller must not close the storage the
+    /// deployer's `DurableProviders` wrap: a task may still write through it.
+    #[error(
+        "supervisor drain did not finish within {deadline:?}{}",
+        cause.as_deref().map(|c| format!(" (draining after: {c})")).unwrap_or_default()
+    )]
+    DrainTimedOut {
+        /// The drain deadline that expired.
+        deadline: Duration,
+        /// The setup error that started the drain, when one did.
+        cause: Option<String>,
+    },
+}
+
+/// How long a self-host drain waits for the Supervisor's tracked
+/// tasks to exit.
+pub const SELF_HOST_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Drains `supervisor` (ADR-049 Decision 16) and reports whether every
+/// tracked task exited within [`SELF_HOST_DRAIN_DEADLINE`].
+async fn drained_within_deadline(supervisor: &scp_core::context::supervisor::Supervisor) -> bool {
+    tokio::time::timeout(SELF_HOST_DRAIN_DEADLINE, supervisor.shutdown_all_contexts())
+        .await
+        .is_ok()
+}
+
+/// Drains `supervisor` on a path failing with `cause`. Returns `cause` when
+/// the drain finishes, and [`SelfHostError::DrainTimedOut`] carrying it when
+/// the drain does not.
+async fn drain_after_failure(
+    supervisor: &scp_core::context::supervisor::Supervisor,
+    cause: SelfHostError,
+) -> SelfHostError {
+    if drained_within_deadline(supervisor).await {
+        cause
+    } else {
+        SelfHostError::DrainTimedOut {
+            deadline: SELF_HOST_DRAIN_DEADLINE,
+            cause: Some(cause.to_string()),
+        }
+    }
 }
 
 /// Parameters for [`deploy_site`].
@@ -301,8 +343,10 @@ where
     let deploy_result = deployer.deploy(node, &deploy_id, custody, assets).await;
     // The caller owns the storage behind `durable`; drain before handing it
     // back so no tracked task outlives this call (ADR-049 Decision 16).
-    deployer.shutdown().await;
-    deploy_result
+    match deploy_result {
+        Ok(committed) => deployer.shutdown().await.map(|()| committed),
+        Err(e) => Err(drain_after_failure(&deployer.supervisor, e).await),
+    }
 }
 
 /// A long-lived self-host site deployer bound to ONE in-process supervisor and
@@ -409,8 +453,7 @@ impl SelfHostDeployer {
         }
         .await;
         if let Err(e) = setup {
-            supervisor.shutdown_all_contexts().await;
-            return Err(e);
+            return Err(drain_after_failure(&supervisor, e).await);
         }
 
         Ok(Self {
@@ -422,14 +465,27 @@ impl SelfHostDeployer {
     }
 
     /// Drains the deployer's Supervisor: stops its context and key-package
-    /// actors, refuses further spawns, and waits for every tracked task to
-    /// exit (ADR-049 Decision 16). The owner calls this before it closes the
-    /// storage the deployer's `DurableProviders` wrap. Every later [`deploy`]
-    /// fails, because the Supervisor serves no context.
+    /// actors, refuses further spawns, and waits up to
+    /// [`SELF_HOST_DRAIN_DEADLINE`] for every tracked task to exit (ADR-049
+    /// Decision 16). The owner calls this before it closes the storage the
+    /// deployer's `DurableProviders` wrap. Every later [`deploy`] fails,
+    /// because the Supervisor serves no context.
+    ///
+    /// # Errors
+    ///
+    /// [`SelfHostError::DrainTimedOut`] when a tracked task is still running
+    /// at the deadline; the owner must then leave the storage open.
     ///
     /// [`deploy`]: Self::deploy
-    pub async fn shutdown(&self) {
-        self.supervisor.shutdown_all_contexts().await;
+    pub async fn shutdown(&self) -> Result<(), SelfHostError> {
+        if drained_within_deadline(&self.supervisor).await {
+            Ok(())
+        } else {
+            Err(SelfHostError::DrainTimedOut {
+                deadline: SELF_HOST_DRAIN_DEADLINE,
+                cause: None,
+            })
+        }
     }
 
     /// Publishes `assets` under `deploy_id` through the reused supervisor/group
@@ -690,10 +746,12 @@ where
         durable,
     );
 
-    supervisor
-        .register_local_did(author_did.clone())
-        .await
-        .map_err(|e| SelfHostError::RegisterDid(e.to_string()))?;
+    if let Err(e) = supervisor.register_local_did(author_did.clone()).await {
+        // Drain before failing, so no tracked task outlives the caller's
+        // storage (ADR-049 Decision 16).
+        let cause = SelfHostError::RegisterDid(e.to_string());
+        return Err(drain_after_failure(&supervisor, cause).await);
+    }
 
     Ok(supervisor)
 }
@@ -1095,6 +1153,11 @@ pub enum HostSiteError {
     /// Supervisor drained. The store keeps its connection and advisory lock.
     #[error("storage close error: {0}")]
     StorageClose(String),
+    /// The deployer's Supervisor did not drain within
+    /// [`SELF_HOST_DRAIN_DEADLINE`], so the MLS store was left open and keeps
+    /// its connection and advisory lock.
+    #[error("self-host deployer drain error: {0}")]
+    Drain(SelfHostError),
     /// The persistent key custody backend failed to initialize.
     #[error("key custody error: {0}")]
     Custody(String),
@@ -1675,13 +1738,15 @@ where
 ///
 /// # Errors
 ///
-/// [`HostSiteError::StorageClose`] when the store refuses to close; it keeps
-/// its connection and advisory lock.
+/// [`HostSiteError::Drain`] when the Supervisor does not drain within
+/// [`SELF_HOST_DRAIN_DEADLINE`], and [`HostSiteError::StorageClose`] when the
+/// store refuses to close; in both cases the store keeps its connection and
+/// advisory lock.
 async fn retire_deployer(
     deployer: &SelfHostDeployer,
     mls_store: &SqliteStorage,
 ) -> Result<(), HostSiteError> {
-    deployer.shutdown().await;
+    deployer.shutdown().await.map_err(HostSiteError::Drain)?;
     mls_store.close().map_err(|e| {
         HostSiteError::StorageClose(format!("failed to close MLS SQLite storage: {e}"))
     })
@@ -2433,9 +2498,14 @@ where
     .await;
     match started {
         Ok(deployer) => Ok((deployer, mls_inner)),
+        // The drain timed out, so a tracked task may still write: leave the
+        // store open.
+        Err(e @ SelfHostError::DrainTimedOut { .. }) => {
+            Err(HostSiteError::DeployerSetup(e.to_string()))
+        }
         Err(e) => {
-            // `start` drained its Supervisor before failing, so the store has
-            // no writer left.
+            // `start` drained any Supervisor it built before failing, so the
+            // store has no writer left.
             if let Err(close) = mls_inner.close() {
                 tracing::error!(error = %close, "MLS SQLite store did not close after a failed deployer setup");
             }

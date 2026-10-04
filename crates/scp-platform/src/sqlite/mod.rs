@@ -142,19 +142,7 @@ impl SqliteStorage {
                     lock_path.display()
                 ))
             })?;
-        FileExt::try_lock_exclusive(&lock_file).map_err(|e| {
-            // Contention is the typed lock-still-held condition (spec §17.6);
-            // any other `flock(2)` / `LockFileEx` failure is an I/O fault on
-            // the lock file and stays a generic storage error.
-            if e.kind() == fs2::lock_contended_error().kind() {
-                PlatformError::StorageLockHeld {
-                    dir: dir.display().to_string(),
-                    lock_path: lock_path.display().to_string(),
-                }
-            } else {
-                PlatformError::StorageError(format!("failed to lock {}: {e}", lock_path.display()))
-            }
-        })?;
+        FileExt::try_lock_exclusive(&lock_file).map_err(|e| lock_error(&e, dir, &lock_path))?;
 
         let db_path = dir.join("scp.db");
         let conn = Connection::open(&db_path)
@@ -543,13 +531,37 @@ fn prefix_successor(prefix: &str) -> Option<String> {
     None
 }
 
-/// Acquires the connection lock, mapping poison errors to
-/// [`PlatformError::StorageError`].
+/// Classifies a failed `try_lock_exclusive` on `lock_path`. Contention is the
+/// typed lock-still-held condition (spec §17.6); any other lock failure is an
+/// I/O fault on the lock file and stays a generic storage error. The OS error
+/// code is compared, not the `ErrorKind`: std maps the Windows contention code
+/// to no specific kind, so a kind comparison also matches unrelated
+/// uncategorized failures.
+fn lock_error(e: &std::io::Error, dir: &Path, lock_path: &Path) -> PlatformError {
+    let contended = fs2::lock_contended_error().raw_os_error();
+    if contended.is_some() && e.raw_os_error() == contended {
+        PlatformError::StorageLockHeld {
+            dir: dir.display().to_string(),
+            lock_path: lock_path.display().to_string(),
+        }
+    } else {
+        PlatformError::StorageError(format!("failed to lock {}: {e}", lock_path.display()))
+    }
+}
+
+/// Acquires the connection lock. A poisoned mutex maps to
+/// [`PlatformError::StorageClosed`] once [`SqliteStorage::close`] has taken
+/// the connection, and to [`PlatformError::StorageError`] before that.
 fn lock_conn(
     conn: &Mutex<Option<Connection>>,
 ) -> Result<std::sync::MutexGuard<'_, Option<Connection>>, PlatformError> {
-    conn.lock()
-        .map_err(|e| PlatformError::StorageError(format!("mutex poisoned: {e}")))
+    conn.lock().map_err(|e| {
+        if e.get_ref().is_none() {
+            PlatformError::StorageClosed
+        } else {
+            PlatformError::StorageError(format!("mutex poisoned: {e}"))
+        }
+    })
 }
 
 /// Returns the open connection behind a held guard, or
@@ -1092,5 +1104,67 @@ mod tests {
             store.retrieve("k/live").await,
             Err(PlatformError::StorageClosed)
         ));
+    }
+
+    /// Only the OS contention code is the typed lock-held condition. An error
+    /// with the same `ErrorKind` but no OS code, or a different OS code, is a
+    /// generic storage error.
+    #[test]
+    fn lock_error_matches_the_contention_os_code_only() {
+        let dir = Path::new("/d");
+        let lock_path = Path::new("/d/scp.db.lock");
+        let contended = fs2::lock_contended_error();
+
+        assert!(matches!(
+            lock_error(&contended, dir, lock_path),
+            PlatformError::StorageLockHeld { .. }
+        ));
+        let same_kind = std::io::Error::new(contended.kind(), "same kind, no OS code");
+        assert!(matches!(
+            lock_error(&same_kind, dir, lock_path),
+            PlatformError::StorageError(_)
+        ));
+        let other_code = std::io::Error::from_raw_os_error(9);
+        assert_ne!(other_code.raw_os_error(), contended.raw_os_error());
+        assert!(matches!(
+            lock_error(&other_code, dir, lock_path),
+            PlatformError::StorageError(_)
+        ));
+    }
+
+    /// A poisoned connection mutex refuses operations with a generic storage
+    /// error while the connection is open, and with the typed closed-store
+    /// error once `close()` has taken it.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn poisoned_mutex_after_close_reports_storage_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = [9u8; 32];
+        let store = SqliteStorage::new(tmp.path(), &key).expect("open must succeed");
+
+        let poisoner = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _guard = store.conn.lock().unwrap();
+                panic!("poison the connection mutex");
+            })
+            .join()
+        });
+        assert!(poisoner.is_err(), "the poisoning thread must panic");
+        assert!(store.conn.is_poisoned());
+
+        assert!(matches!(
+            store.store("k", b"v").await,
+            Err(PlatformError::StorageError(_))
+        ));
+        store.close().expect("close recovers a poisoned mutex");
+        assert!(matches!(
+            store.store("k", b"v").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        assert!(matches!(
+            store.retrieve("k").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        SqliteStorage::new(tmp.path(), &key).expect("reopen after close must succeed");
     }
 }
