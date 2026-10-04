@@ -4822,6 +4822,8 @@ def main() -> int:
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)
+
+    print("package-writers — only a push-only job holds `packages: write`")
     check_package_writers_run_only_on_push(workflow)
 
     print("needs-condition — a job's dependencies run wherever the job does")
