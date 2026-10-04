@@ -3395,11 +3395,8 @@ mod tests {
     /// supervisor actor is gone, with the entry point's own code and a refusal
     /// that withholds the lifecycle state.
     ///
-    /// None of the seven carried a lifecycle gate. A TTL expiry despawns the actor, and the
-    /// bridge's FFI state for the context stays registered until a close
-    /// releases it, so `with_context` alone admitted each call. Each assertion
-    /// pins the entry point's code, so dropping any one gate turns this test
-    /// red.
+    /// Each assertion pins the entry point's code, so dropping any one gate
+    /// turns this test red.
     #[test]
     fn single_context_outlet_entry_points_refuse_once_the_actor_is_despawned() {
         let creator = "did:dht:z6MkOutletGatesDespawned";
@@ -3505,9 +3502,7 @@ mod tests {
     }
 
     /// The unary `outlet_invoke_cross_context` gates its SOURCE axis on the
-    /// source context's supervisor actor. It carried no lifecycle gate at all,
-    /// so a source context the supervisor had stopped serving reached the UCAN
-    /// pipeline.
+    /// source context's supervisor actor.
     #[test]
     fn cross_context_invoke_refuses_a_source_context_no_actor_serves() {
         let creator = "did:dht:z6MkXctxUnarySourceNoActor";
