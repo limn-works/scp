@@ -211,3 +211,63 @@ fn word_multiple_block_is_wiped() {
         std::alloc::dealloc(ptr, layout);
     });
 }
+
+/// An inner allocator that hands out every block filled with `FILL`, as a
+/// reused block that held a secret would arrive, and keeps the trait's default
+/// `alloc_zeroed`, which zeroes what its own `alloc` returns.
+struct Dirty;
+
+// SAFETY: `alloc` and `dealloc` forward to `System`; `alloc` then writes only
+// inside the block `System` returned.
+unsafe impl GlobalAlloc for Dirty {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded unchanged; the caller upholds `alloc`'s contract.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            // SAFETY: `ptr` heads a live block of `layout.size()` bytes.
+            unsafe { ptr.write_bytes(FILL, layout.size()) };
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: forwarded unchanged; the caller upholds `dealloc`'s contract.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+/// Copies the `len` bytes at `ptr`.
+///
+/// # Safety
+///
+/// `ptr` must head a live block of at least `len` initialized bytes.
+unsafe fn bytes(ptr: *const u8, len: usize) -> Vec<u8> {
+    // SAFETY: the caller's contract.
+    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+}
+
+#[test]
+fn alloc_zeroed_returns_zeros_when_the_inner_alloc_is_dirty() {
+    let allocator = WipingAllocator::new(Dirty);
+    let layout = Layout::from_size_align(64, 8).unwrap_or_else(|_| Layout::new::<u64>());
+    assert_eq!(layout.size(), 64);
+
+    // Control: a plain `alloc` through the wrapper returns the dirty bytes, so
+    // the zeros below come from `alloc_zeroed`, not from a clean inner block.
+    // SAFETY: `layout` has nonzero size.
+    let dirty = unsafe { allocator.alloc(layout) };
+    assert!(!dirty.is_null());
+    // SAFETY: `Dirty::alloc` initialized all `layout.size()` bytes.
+    assert_eq!(unsafe { bytes(dirty, layout.size()) }, vec![FILL; 64]);
+    // SAFETY: `dirty` came from `allocator.alloc` with `layout`.
+    unsafe { allocator.dealloc(dirty, layout) };
+
+    // SAFETY: `layout` has nonzero size.
+    let zeroed = unsafe { allocator.alloc_zeroed(layout) };
+    assert!(!zeroed.is_null());
+    // SAFETY: `alloc_zeroed` initialized all `layout.size()` bytes.
+    let got = unsafe { bytes(zeroed, layout.size()) };
+    // SAFETY: `zeroed` came from `allocator.alloc_zeroed` with `layout`.
+    unsafe { allocator.dealloc(zeroed, layout) };
+    assert_eq!(got, vec![0u8; 64], "alloc_zeroed must return only zeros");
+}
