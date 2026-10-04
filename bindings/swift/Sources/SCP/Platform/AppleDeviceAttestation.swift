@@ -1,5 +1,6 @@
 #if os(iOS) || os(macOS)
 
+    import CryptoKit
     import DeviceCheck
     import Foundation
     import os
@@ -19,9 +20,9 @@
         /// The platform App Attest service returned an error no other case
         /// names: any error from `generateKey` other than
         /// `DCError.featureUnsupported`, `DCError.serverUnavailable` included;
-        /// any error from `attestKey` other than `DCError.featureUnsupported`
-        /// and `DCError.serverUnavailable`, `DCError.invalidKey` included; or
-        /// any error from `generateAssertion` other than
+        /// any error from `attestKey` other than `DCError.featureUnsupported`,
+        /// `DCError.serverUnavailable` and `DCError.invalidKey`; or any error
+        /// from `generateAssertion`, the key probe's included, other than
         /// `DCError.featureUnsupported`, `DCError.serverUnavailable` and
         /// `DCError.invalidKey`. Or the caller's task was cancelled
         /// while its App Attest call waited in the queue or for Apple's
@@ -44,9 +45,12 @@
         /// stored one or because the adapter discarded a rejected key's ID
         /// (`keyRejected`); call `attest` first.
         case keyNotFound
-        /// The stored App Attest key carries this adapter's attestation
-        /// record, so `attest(challenge:deviceId:)` called no App Attest
-        /// method.
+        /// Apple already attested the stored App Attest key. Either the key
+        /// carries this adapter's attestation record, so
+        /// `attest(challenge:deviceId:)` called no App Attest method, or
+        /// `attestKey` answered `DCError.invalidKey` for a key with no record
+        /// and the key probe's assertion with that key succeeded, so the
+        /// adapter wrote the record.
         ///
         /// Apple attests one key once: `DCError.h` lists a call to
         /// `attestKey:clientDataHash:completionHandler:` for a key already
@@ -69,20 +73,23 @@
         /// record cannot tell these apart, so the adapter keeps the key and
         /// asserts neither cause. The case name names the first cause only,
         /// and does not mean `attest(challenge:deviceId:)` can attest the
-        /// key: for a key Apple's service rejected, `attestKey` answers
-        /// `DCError.invalidKey`, which throws `SCP-ATTEST-9001`.
+        /// key: for a key Apple's service rejected, `attestKey` and the key
+        /// probe's `generateAssertion` both answer `DCError.invalidKey`, which
+        /// throws `SCP-ATTEST-9023`.
         case keyNotAttested(String)
-        /// Apple answered `generateAssertion` with `DCError.invalidKey` for a
-        /// stored key that carries an attestation record, so Apple's App
-        /// Attest service rejected the key, and the adapter discarded its key
-        /// ID and record.
+        /// Apple's App Attest service rejected the stored key, and the
+        /// adapter discarded its key ID and record. Either `generateAssertion`
+        /// answered `DCError.invalidKey` for a stored key that carries an
+        /// attestation record, or `attestKey` answered `DCError.invalidKey`
+        /// for a key with no record and the key probe's assertion with that
+        /// key answered `DCError.invalidKey` too.
         ///
         /// `DCError.h` lists an App Attest service rejecting the key as one
         /// cause of `DCError.invalidKey`. A later
         /// `attest(challenge:deviceId:)` generates a new key.
         case keyRejected(String)
-        /// Apple answered `attestKey` or `generateAssertion` with
-        /// `DCError.serverUnavailable`.
+        /// Apple answered `attestKey` or `generateAssertion`, the key probe's
+        /// included, with `DCError.serverUnavailable`.
         ///
         /// For `attestKey`, `DCError.h` describes this code as a failed
         /// attempt to contact the App Attest service and instructs a caller
@@ -184,9 +191,15 @@
     ///
     /// `classify(_:keyId:operation:)` maps each App Attest error to an
     /// `AttestationError` case and states which errors keep the stored key
-    /// and which discard it. Only `generateAssertion` answering
-    /// `DCError.invalidKey` for a key that carries an attestation record
-    /// discards the key ID and its record (`SCP-ATTEST-9023`).
+    /// and which discard it. An `attestKey` answer of `DCError.invalidKey`
+    /// leads to the key probe instead: `probeKey(_:after:call:)` asks
+    /// `generateAssertion` for an assertion with that key over the
+    /// client data `K` of `09-security-model.md` §9.3.1, discards the
+    /// assertion, and reads from Apple's answer whether Apple attested the
+    /// key or rejected it. Two answers discard the key ID and its record
+    /// (`SCP-ATTEST-9023`): `generateAssertion` answering
+    /// `DCError.invalidKey` for a key that carries an attestation record,
+    /// and the key probe's assertion answering `DCError.invalidKey`.
     ///
     /// Attestation steps (per ADR-025 acceptance criterion 3):
     /// 1. `generateKey` — creates a Secure Enclave key via App Attest service.
@@ -237,15 +250,17 @@
     /// for no other call.
     ///
     /// One serialized call is the whole of one `attest` (`generateKey`, when
-    /// no key ID is stored, then `attestKey`) or one `assertRequest`
-    /// (`generateAssertion`). It ends at the first of four events: its
-    /// key-ID read ends it without an App Attest call, with `SCP-ATTEST-9020`
+    /// no key ID is stored, then `attestKey`, then the key probe's
+    /// `generateAssertion` when `attestKey` answers `DCError.invalidKey`) or
+    /// one `assertRequest` (`generateAssertion`). It ends at the first of
+    /// four events: its key-ID read ends it without an App Attest call, with `SCP-ATTEST-9020`
     /// when an `assertRequest` reads no stored key ID and with
     /// `SCP-ATTEST-9021` when an `attest` reads a stored key that carries an
     /// attestation record; Apple's
     /// answers end it (every answer from its App Attest methods except a
     /// `generateKey` answer that carries a key ID and no error, which leads
-    /// to `attestKey`); `appAttestCallTimeLimit` (25 seconds from
+    /// to `attestKey`, and an `attestKey` answer of `DCError.invalidKey`,
+    /// which leads to the key probe); `appAttestCallTimeLimit` (25 seconds from
     /// the call's start) passes; or the caller's task is cancelled. On the
     /// time limit the caller gets `SCP-ATTEST-9027`; on
     /// cancellation it gets `SCP-ATTEST-9001`, through
@@ -393,7 +408,8 @@
         /// - Throws: `ScpError.Identity` carrying `SCP-ATTEST-9019` for
         ///   `AttestationError.unsupported`, `SCP-ATTEST-9026` for
         ///   `AttestationError.invalidClientDataHash`, `SCP-ATTEST-9021` for
-        ///   `AttestationError.keyAlreadyAttested`, `SCP-ATTEST-9024` for
+        ///   `AttestationError.keyAlreadyAttested`, `SCP-ATTEST-9023` for
+        ///   `AttestationError.keyRejected`, `SCP-ATTEST-9024` for
         ///   `AttestationError.serverUnavailable`, `SCP-ATTEST-9001` for
         ///   `AttestationError.serviceError`, `SCP-ATTEST-9025` for
         ///   `AttestationError.internalError`, or `SCP-ATTEST-9027` for
@@ -439,7 +455,10 @@
         ///    `AttestationError.keyAlreadyAttested`, before any App Attest
         ///    call.
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)` with
-        ///    `challenge` as `clientDataHash`, unchanged.
+        ///    `challenge` as `clientDataHash`, unchanged. When it answers
+        ///    `DCError.invalidKey`, runs the key probe
+        ///    `probeKey(_:after:call:)` inside the same serialized call and
+        ///    throws the case the probe's answer gives.
         /// 4. Records the key ID as attested and returns the raw CBOR
         ///    attestation object Apple signed.
         ///
@@ -450,37 +469,49 @@
         ///
         /// When `DCAppAttestService.isSupported` is `false`, as on simulator,
         /// this method throws `AttestationError.unsupported`, calls no App
-        /// Attest method, and returns no bytes. When `generateKey` or
-        /// `attestKey` answers with `DCError.featureUnsupported`, it throws the
-        /// same error after that call, and returns no bytes.
+        /// Attest method, and returns no bytes. When `generateKey`, `attestKey`
+        /// or the key probe's `generateAssertion` answers with
+        /// `DCError.featureUnsupported`, it throws the same error after that
+        /// call, and returns no bytes.
         ///
         /// - Parameters:
         ///   - challenge: The 32-byte §9.3.1 binding digest `D`.
         ///   - deviceId: Not read by this adapter.
         /// - Returns: The raw CBOR attestation object Apple signed.
         /// - Throws: `AttestationError.unsupported` when
-        ///   `DCAppAttestService.isSupported` is `false`, or when `generateKey`
-        ///   or `attestKey` answers with `DCError.featureUnsupported`.
+        ///   `DCAppAttestService.isSupported` is `false`, or when `generateKey`,
+        ///   `attestKey` or the key probe's `generateAssertion` answers with
+        ///   `DCError.featureUnsupported`.
         ///   `AttestationError.invalidClientDataHash` when App Attest is supported
         ///   and `challenge` is not 32 bytes; this method then generates no
         ///   key and calls no App Attest method.
         ///   `AttestationError.keyAlreadyAttested` when the stored key carries
         ///   an attestation record; this method then calls no App Attest
-        ///   method and keeps the key and its record.
-        ///   `AttestationError.serverUnavailable` when `attestKey` answers
-        ///   with `DCError.serverUnavailable`; this method keeps the key, so a
-        ///   retry uses the same key, as `DCError.h` instructs.
+        ///   method and keeps the key and its record. Also when `attestKey`
+        ///   answers with `DCError.invalidKey` and the key probe's assertion
+        ///   succeeds; this method then keeps the key and records it as
+        ///   attested.
+        ///   `AttestationError.keyRejected` when `attestKey` and the key
+        ///   probe's assertion both answer with `DCError.invalidKey`; this
+        ///   method then discards the key ID.
+        ///   `AttestationError.serverUnavailable` when `attestKey`, or the key
+        ///   probe's assertion after an `attestKey` answer of
+        ///   `DCError.invalidKey`, answers with `DCError.serverUnavailable`;
+        ///   this method keeps the key, so a retry uses the same key, as
+        ///   `DCError.h` instructs.
         ///   `AttestationError.serviceError` when `generateKey` answers with
         ///   any error other than `DCError.featureUnsupported`,
-        ///   `DCError.serverUnavailable` included, when `attestKey` answers
-        ///   with any other error, `DCError.invalidKey` included, or
+        ///   `DCError.serverUnavailable` included, when `attestKey` or the key
+        ///   probe's assertion answers with an error no other case names, or
         ///   when the caller's task is cancelled while the call is queued or
-        ///   outstanding. `classify(_:keyId:operation:)` states why
-        ///   `attestKey`'s `DCError.invalidKey` keeps the key.
-        ///   `AttestationError.internalError` when `generateKey` or `attestKey`
-        ///   answers with neither a value nor an error.
-        ///   `AttestationError.timedOut` when `generateKey` and `attestKey`
-        ///   together take longer than `appAttestCallTimeLimit`.
+        ///   outstanding.
+        ///   `AttestationError.internalError` when `generateKey`, `attestKey`
+        ///   or the key probe's assertion answers with neither a value nor an
+        ///   error. After `attestKey` answers, every case but `keyRejected`
+        ///   keeps the key.
+        ///   `AttestationError.timedOut` when `generateKey`, `attestKey` and
+        ///   the key probe's assertion together take longer than
+        ///   `appAttestCallTimeLimit`.
         func attestReportingAttestationError(
             challenge: Data,
             deviceId _: Data
@@ -639,10 +670,19 @@
         /// limit or the caller's cancellation ended `call` reaches no caller.
         ///
         /// The attestation record is written only when Apple's answer ends
-        /// `call`, so a key is recorded as attested exactly when its
-        /// attestation object reaches the caller.
+        /// `call`: here when the attestation object reaches the caller, and
+        /// in `probeKey(_:after:call:)` when the key probe shows Apple
+        /// attested the key. An answer of `DCError.invalidKey` does not end
+        /// `call`; it hands the key probe to `issue(_:)`, which starts the
+        /// probe only while `call` is open.
         private func requestAttestation(keyId: String, challenge: Data, call: AppAttestCall) {
             service.attestKey(keyId, clientDataHash: challenge) { [self] attestation, error in
+                if let error, (error as? DCError)?.code == .invalidKey {
+                    call.issue {
+                        probeKey(keyId, after: error, call: call)
+                    }
+                    return
+                }
                 call.end {
                     if let error {
                         return .failure(classify(error, keyId: keyId, operation: .attestation))
@@ -690,7 +730,6 @@
         /// | --- | --- | --- | --- | --- |
         /// | `generateAssertion` | `invalidKey` | none | `keyNotAttested` | kept |
         /// | `generateAssertion` | `invalidKey` | present | `keyRejected` | discarded |
-        /// | `attestKey` | `invalidKey` | none | `serviceError` | kept |
         /// | either | `serverUnavailable` | any | `serverUnavailable` | kept |
         /// | either | `featureUnsupported` | any | `unsupported` | kept |
         /// | either | any other | any | `serviceError` | kept |
@@ -700,15 +739,18 @@
         /// `generateKey` answer of `DCError.serverUnavailable` or
         /// `DCError.invalidKey` gives `serviceError`.
         ///
-        /// `attest` hands `attestKey` only a key with no attestation record,
-        /// so a record cannot tell apart the two conditions `attestKey`'s
-        /// `invalidKey` can name: a key Apple attested whose record was never
-        /// written, and a key Apple's service rejected. The adapter keeps
-        /// that key and reports `serviceError`. A key with no record that
-        /// `generateAssertion` answers with `invalidKey` is likewise either
-        /// unattested or a rejected key whose record was never written, so
-        /// the adapter keeps it and reports `keyNotAttested`, whose message
-        /// names both causes.
+        /// An `attestKey` answer of `invalidKey` does not reach this method
+        /// either. `attest` hands `attestKey` only a key with no attestation
+        /// record, so a record cannot tell apart the two conditions that
+        /// answer can name: a key Apple attested whose record was never
+        /// written, and a key Apple's service rejected.
+        /// `requestAttestation(keyId:challenge:call:)` therefore hands that
+        /// answer to the key probe, `probeKey(_:after:call:)`, whose own
+        /// table says what each probe answer gives. A key with no record that
+        /// `generateAssertion` answers with `invalidKey` is either unattested
+        /// or a rejected key whose record was never written, so the adapter
+        /// keeps it and reports `keyNotAttested`, whose message names both
+        /// causes.
         ///
         /// **What makes the attestation record a sound input.** The record
         /// describes the key App Attest holds only while no other call writes
@@ -734,6 +776,77 @@
                 return rejectKey(keyId, error)
             default:
                 return .fromAppAttest(error, call: operation.method)
+            }
+        }
+
+        /// The client data of the key probe's assertion: the key-probe input
+        /// `K = SHA-256("SCP-APP-ATTEST-KEY-PROBE-V1")` of
+        /// `09-security-model.md` §9.3.1, whose separator §9.18.2 registers.
+        /// `K`'s preimage differs from the preimages of the binding digest
+        /// `D` and the assertion digest `A`, so `K` equals neither short of a
+        /// SHA-256 collision. Apple signs it with the stored key, and this
+        /// adapter discards that assertion.
+        private static let keyProbeClientDataHash = Data(SHA256.hash(data: Data("SCP-APP-ATTEST-KEY-PROBE-V1".utf8)))
+
+        /// Ask Apple for an assertion over `keyProbeClientDataHash` with a
+        /// key `attestKey` answered `DCError.invalidKey` for, discard that
+        /// assertion, and end `call` with what Apple's answer shows.
+        ///
+        /// `DCError.h` lists two conditions under which `attestKey` answers
+        /// `DCError.invalidKey` for a key with no attestation record: Apple
+        /// already attested the key, or Apple's service rejected it. An
+        /// assertion with an attested key succeeds, and an assertion with a
+        /// rejected key answers `DCError.invalidKey`, so the probe's answer
+        /// tells the two apart:
+        ///
+        /// | Probe answer | Case | Key |
+        /// | --- | --- | --- |
+        /// | an assertion | `keyAlreadyAttested` | kept, recorded as attested |
+        /// | `invalidKey` | `keyRejected` | discarded |
+        /// | `serverUnavailable` | `serverUnavailable` | kept |
+        /// | `featureUnsupported` | `unsupported` | kept |
+        /// | any other error | `serviceError` | kept |
+        /// | neither an assertion nor an error | `internalError` | kept |
+        ///
+        /// The probe runs inside `call`, under the time limit of the `attest`
+        /// that led to it, and its answer writes the record or discards the
+        /// key ID only when that answer ends `call`, so an answer that
+        /// arrives after the time limit or a cancellation writes neither.
+        private func probeKey(_ keyId: String, after attestError: Error, call: AppAttestCall) {
+            service.generateAssertion(keyId, clientDataHash: Self.keyProbeClientDataHash) { [self] assertion, probeError in
+                call.end {
+                    if let probeError {
+                        switch (probeError as? DCError)?.code {
+                        case .invalidKey:
+                            return .failure(rejectKey(keyId, attestError))
+                        case .serverUnavailable:
+                            return .failure(.serverUnavailable(
+                                "attestKey answered DCError.invalidKey, and the key probe's generateAssertion, which "
+                                    + "tells an attested key from a rejected one, answered DCError.serverUnavailable; "
+                                    + "this adapter kept the key for a retry: \(probeError.localizedDescription)"
+                            ))
+                        case .featureUnsupported:
+                            return .failure(.fromAppAttest(probeError, call: "generateAssertion"))
+                        default:
+                            return .failure(.serviceError(
+                                "attestKey answered DCError.invalidKey, and the key probe's generateAssertion, which "
+                                    + "tells an attested key from a rejected one, failed; this adapter kept the key: "
+                                    + probeError.localizedDescription
+                            ))
+                        }
+                    }
+                    if assertion != nil {
+                        markKeyAttested(keyId)
+                        return .failure(.keyAlreadyAttested(
+                            "attestKey answered DCError.invalidKey and an assertion with the stored key succeeded, "
+                                + "so Apple already attested that key; this adapter kept the key and recorded it as "
+                                + "attested: \(attestError.localizedDescription)"
+                        ))
+                    }
+                    return .failure(.internalError(
+                        "the key probe's generateAssertion returned neither assertion nor error"
+                    ))
+                }
             }
         }
 
@@ -777,9 +890,10 @@
         /// Thread-safe: protected by `lock`.
         ///
         /// - Parameter keyId: A key ID whose `attestKey` call returned an
-        ///   attestation object. The record is written only while `keyId` is
-        ///   still the stored key ID, so it never names a key ID this adapter
-        ///   no longer stores.
+        ///   attestation object, or whose key probe assertion succeeded after
+        ///   `attestKey` answered `DCError.invalidKey`. The record is written
+        ///   only while `keyId` is still the stored key ID, so it never names
+        ///   a key ID this adapter no longer stores.
         private func markKeyAttested(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
