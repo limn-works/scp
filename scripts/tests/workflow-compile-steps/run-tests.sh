@@ -18,12 +18,13 @@
 #     from build-xcframework.sh and the Swift job of build-matrix.yml), one whose
 #     `--library` sits under `target/release` (the Android job's path that no step
 #     produced), one that passes no `--library`, and one under the custom `--profile
-#     ci-bridge` whose `--library` sits under `target/<triple>/release`. It passes a
+#     ci-bridge` whose `--library` sits under `target/<triple>/release`, and one under
+#     the built-in `--profile test` whose `--library` sits under `target/test`. It passes a
 #     `cargo run` whose flags name the library's directory, with `--release --target`,
 #     with `--profile release` behind a `+toolchain` selector, with `--profile ci-bridge
 #     --target` reading `target/<triple>/ci-bridge`, and with a bare `cargo run` reading
-#     `target/debug`,
-#     and it joins backslash-continued lines before reading a command.
+#     `target/debug`, with `--profile test` reading `target/debug` and `--profile bench`
+#     reading `target/release`, and it joins backslash-continued lines before reading a command.
 #
 # Each case is a directory under ./fixtures/ that the check reads through
 # `--workflows-dir`. Exit 0 when every case matches its expectation, 1 otherwise.
@@ -56,9 +57,11 @@ FIXTURES=(
     "bad-bindgen-path-nothing-wrote"
     "bad-bindgen-no-library"
     "bad-bindgen-custom-profile-release-path"
+    "bad-bindgen-test-profile-own-name"
 )
 EXPECTED_EXITS=(
     "0"
+    "1"
     "1"
     "1"
     "1"
@@ -82,6 +85,7 @@ EXPECTED_SUBSTRINGS=(
     "writes target/debug/ and the \`--library\` it reads is target/release/libscp_ffi_uniffi.so"
     "passes no \`--library\`"
     "writes target/aarch64-apple-darwin/ci-bridge/ and the \`--library\` it reads is target/aarch64-apple-darwin/release/libscp_ffi_uniffi.dylib"
+    "writes target/debug/ and the \`--library\` it reads is target/test/libscp_ffi_uniffi.so"
 )
 
 passed=0
@@ -126,11 +130,11 @@ done
 set +e
 good_output="$("$PYTHON" "$CHECK" --workflows-dir "$FIXTURES_DIR/good-groups-and-bindgen" 2>&1)"
 set -e
-if [[ "$good_output" == *"OK: 4 uniffi-bindgen step(s)"* ]]; then
-    echo "PASS [good-groups-and-bindgen counts four bindgen steps]"
+if [[ "$good_output" == *"OK: 6 uniffi-bindgen step(s)"* ]]; then
+    echo "PASS [good-groups-and-bindgen counts six bindgen steps]"
     passed=$((passed + 1))
 else
-    echo "FAIL [good-groups-and-bindgen counts four bindgen steps]: $good_output" >&2
+    echo "FAIL [good-groups-and-bindgen counts six bindgen steps]: $good_output" >&2
     failed=$((failed + 1))
 fi
 

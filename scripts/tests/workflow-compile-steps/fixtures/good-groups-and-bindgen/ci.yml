@@ -1,6 +1,6 @@
 # Three groups, one writer each, on main — the build-mode and check-mode jobs that
 # write one `target/debug` hold two of them, and a job whose commands span both modes
-# restores both groups, one step each; three uniffi-bindgen steps whose `cargo run`
+# restores both groups, one step each; six uniffi-bindgen steps whose `cargo run`
 # flags name the directory the `--library` sits in.
 name: Good
 on: push
@@ -88,3 +88,15 @@ jobs:
           cargo run --profile ci-bridge --target aarch64-apple-darwin -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
             --library target/aarch64-apple-darwin/ci-bridge/libscp_ffi_uniffi.dylib \
             --language swift
+  built-in-profiles:
+    runs-on: ubuntu-latest
+    steps:
+      # Cargo writes `debug` for the built-in `test` profile and `release` for `bench`.
+      - run: |
+          cargo run --profile test -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/debug/libscp_ffi_uniffi.so \
+            --language kotlin
+      - run: |
+          cargo run --profile bench -p scp-ffi-uniffi --bin uniffi-bindgen -- generate \
+            --library target/release/libscp_ffi_uniffi.so \
+            --language kotlin

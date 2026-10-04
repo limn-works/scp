@@ -80,10 +80,11 @@ env:
 #                     `v0-rust-workspace-release-…` with `full match: true` and
 #                     compiled every dependency (6m49s). Those two jobs are the
 #                     only members. python-test, typescript-check and bridge-parity
-#                     ran one or both of those commands and belonged to this group;
+#                     ran the `--release` form of one or both of those commands and
+#                     belonged to `workspace-release`;
 #                     they now download what the producers upload, so none of them
 #                     runs cargo and none of them reads a cargo cache.
-#                     bridge-parity-kotlin belonged to it for its `maturin develop
+#                     bridge-parity-kotlin belonged to `workspace-release` for its `maturin develop
 #                     --release`; it now downloads the PyO3 module and restores
 #                     workspace-debug for its one remaining cargo command, the
 #                     dev-profile `scp-ffi-uniffi` build. The two members write one
@@ -97,8 +98,9 @@ env:
 #                     would cache those three and would also store a second copy of
 #                     the shared tree, which is nearly all of `target/ci-bridge`,
 #                     against the 10 GB repository cap the paragraph below counts, so
-#                     the group keeps one writer. bridge-parity wrote this entry
-#                     before this arrangement and ran both commands, so what it wrote
+#                     the group keeps one writer. bridge-parity wrote the
+#                     `workspace-release` entry before this arrangement and ran both
+#                     `--release` commands, so what it wrote
 #                     did cover the NAPI dependencies.
 #   transport-optional
 #                     `target/debug` again, but under a feature resolution no
@@ -119,8 +121,9 @@ env:
 #   apple-uniffi-ci-bridge
 #                     `target/aarch64-apple-darwin/ci-bridge` — xcframework, which runs
 #                     `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`
-#                     for both macOS jobs that read an XCFramework. swift-build-test ran that script and
-#                     wrote this entry; it downloads the result instead and reads no
+#                     for both macOS jobs that read an XCFramework. swift-build-test
+#                     ran `build-xcframework.sh --dev` and wrote the `apple-uniffi`
+#                     entry; it downloads the result instead and reads no
 #                     cargo cache.
 #   apple-parity-ci-bridge
 #                     `target/ci-bridge` on macOS — pyo3-module-macos, which runs
@@ -3325,7 +3328,7 @@ jobs:
           # this job builds `scp-ffi-uniffi` under the dev profile into `target/debug`,
           # which is the directory and the compile mode that group holds. It read
           # `workspace-release` while it also ran `maturin develop --release`, and job
-          # pyo3-module now runs that command instead. kotlin-test, which runs the same
+          # pyo3-module now builds that module instead. kotlin-test, which runs the same
           # `cargo build -p scp-ffi-uniffi --features testing`, reads this group too.
           shared-key: workspace-debug
           save-if: false
