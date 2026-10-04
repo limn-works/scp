@@ -168,12 +168,11 @@ abstract class ScpViewModel : ViewModel() {
      *   as this one's on another thread. [onCleanupFailure] calls never overlap.
      *
      * What this method does not guarantee: that `leave` calls have finished. The cleanup
-     * coroutine starts on the calling thread. When the bridge's I/O dispatcher dispatches (the
-     * default `Dispatchers.IO` does), this method never waits on a `leave` that is still
-     * running. Cleanup is best-effort — those calls run to completion only if a process
-     * outlives them. Blocking until they finish is not an option: [onCleared] runs on an
-     * Android main thread, and blocking that thread on FFI calls both risks an ANR and
-     * deadlocks whenever an injected dispatcher schedules its work onto a blocked thread.
+     * coroutine starts on the calling thread. Cleanup is best-effort — those calls run to
+     * completion only if a process outlives them. Blocking until they finish is not an option:
+     * [onCleared] runs on an Android main thread, and blocking that thread on FFI calls both
+     * risks an ANR and deadlocks whenever an injected dispatcher schedules its work onto a
+     * blocked thread.
      *
      * Uses a dedicated [cleanupScope] because `viewModelScope` is already cancelled before
      * [onCleared] is called, so a coroutine launched there would be dropped without running.
