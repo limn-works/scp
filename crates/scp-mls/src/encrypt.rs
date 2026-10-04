@@ -994,7 +994,7 @@ mod tests {
     use crate::credential::ScpCredential;
     use crate::group::{
         add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
-        generate_key_package_with_wrapping_key, join_group,
+        generate_key_package_with_wrapping_key, join_group, propose_add_member_bare,
     };
     use openmls_basic_credential::SignatureKeyPair;
     use scp_clock::{Clock, SystemClock, TestClock};
@@ -1711,18 +1711,6 @@ mod tests {
         commit.tls_serialize_detached().unwrap()
     }
 
-    /// Alice sends a bare Add proposal of `kp` through openmls's
-    /// `propose_add_member`. Returns the serialized Proposal.
-    #[allow(clippy::unwrap_used)]
-    fn raw_add_proposal(alice_group: &mut ScpMlsGroup, kp: &KeyPackage) -> Vec<u8> {
-        let signer = alice_group.signer.as_ref().unwrap();
-        let g = alice_group.group.as_mut().unwrap();
-        let (proposal, _ref) = g
-            .propose_add_member(&alice_group.provider, signer, kp)
-            .unwrap();
-        proposal.tls_serialize_detached().unwrap()
-    }
-
     /// Carol's `KeyPackage` (with a wrapping key) whose `not_after` lies one
     /// day after the wall clock, so openmls's own wall-clock check passes, and
     /// an adder clock seven days behind the wall clock, under which Carol keeps
@@ -1838,7 +1826,8 @@ mod tests {
     fn over_range_add_proposal_is_refused() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let bob_epoch_before = bob_group.epoch().unwrap();
-        let bytes = raw_add_proposal(&mut alice_group, &carol_over_range_key_package());
+        let bytes =
+            propose_add_member_bare(&mut alice_group, &carol_over_range_key_package()).unwrap();
         let err = decrypt_with_sender_did(&mut bob_group, &bytes).unwrap_err();
         assert!(
             matches!(err, MlsError::ReceivedKeyPackageLifetimeRangeInvalid { .. }),
@@ -1848,7 +1837,8 @@ mod tests {
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let bob_epoch_before = bob_group.epoch().unwrap();
-        let bytes = raw_add_proposal(&mut alice_group, &carol_over_range_key_package());
+        let bytes =
+            propose_add_member_bare(&mut alice_group, &carol_over_range_key_package()).unwrap();
         let err = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap_err();
         assert!(
             matches!(err, MlsError::ReceivedKeyPackageLifetimeRangeInvalid { .. }),
@@ -1864,7 +1854,7 @@ mod tests {
     fn in_range_add_proposal_is_accepted() {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let (carol_kp, _) = carol_short_of_minimum_and_adder_clock();
-        let bytes = raw_add_proposal(&mut alice_group, &carol_kp);
+        let bytes = propose_add_member_bare(&mut alice_group, &carol_kp).unwrap();
         let content = decrypt_with_sender_did(&mut bob_group, &bytes).unwrap();
         assert!(
             matches!(content, DecryptedContent::Proposal { .. }),
@@ -1873,7 +1863,7 @@ mod tests {
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let (carol_kp, _) = carol_short_of_minimum_and_adder_clock();
-        let bytes = raw_add_proposal(&mut alice_group, &carol_kp);
+        let bytes = propose_add_member_bare(&mut alice_group, &carol_kp).unwrap();
         let change = decrypt_with_membership_changes(&mut bob_group, &bytes).unwrap();
         assert!(
             matches!(change, InboundChange::Proposal { .. }),
