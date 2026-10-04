@@ -61,6 +61,7 @@ pub mod keypackage_attestation;
 pub mod lifetime;
 pub mod provider;
 pub mod ratchet;
+pub mod secret_msgpack;
 pub mod snapshot;
 pub mod wrapping_extension;
 

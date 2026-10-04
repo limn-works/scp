@@ -181,7 +181,7 @@ mod tests {
             epoch_coordination_records: Vec::new(),
             grace_entries: Vec::new(),
             needs_reconnect: false,
-            mls_crypto_state: Vec::new(),
+            mls_crypto_state: crate::context::state::MlsCryptoState::default(),
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
             consequence_rules: Vec::new(),

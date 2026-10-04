@@ -60,6 +60,7 @@ permissions:
 env:
   VERSION: ${{ inputs.version }}
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 # Only one release at a time
 concurrency:
@@ -77,9 +78,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
 
       - uses: taiki-e/install-action@nextest
 
@@ -447,9 +445,6 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
 
       # Publish order matters: dependencies first
       - name: Publish scp-clock

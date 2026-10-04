@@ -43,6 +43,7 @@ scp-event-log = { path = "../crates/scp-event-log" }
 scp-clock = { path = "../crates/scp-clock" }
 scp-did = { path = "../crates/scp-did" }
 scp-mls = { path = "../crates/scp-mls" }
+zeroize = "1"
 
 # Tier 1 — Wire Format Parsers
 [[bin]]

@@ -341,27 +341,19 @@ impl std::fmt::Display for KpRef {
 /// Durable KP record: the publishable public bytes + the private signer-state.
 /// Persisted under `scp-kp/{identity}/{kp_ref}`.
 ///
-/// The `signer_state` field holds private signing/HPKE join material. A
-/// transient `PersistedKeyPackage` (built to serialize a record, or parsed back
-/// out during reconcile) would otherwise drop its `signer_state` un-zeroed. The
-/// hand-written [`Drop`] zeroes that private field on every drop while leaving
-/// the on-disk serde format (plain `Vec<u8>` fields) unchanged. `public_bytes`
-/// is publishable and not zeroed.
+/// The `signer_state` field holds private signing/HPKE join material, so it
+/// is `Zeroizing`: a transient `PersistedKeyPackage` (built to serialize a
+/// record, or parsed back out during reconcile) wipes it on every drop.
+/// zeroize's `serde` impls delegate to the inner `Vec<u8>`, so the record
+/// encodes as it did with a plain `Vec<u8>` field. `public_bytes` is
+/// publishable and not zeroed.
 #[derive(Serialize, Deserialize)]
 struct PersistedKeyPackage {
     /// TLS-serialized public KeyPackage bytes (publishable).
     public_bytes: Vec<u8>,
-    /// Opaque private signer-state (the join material). Held in `Zeroizing`
-    /// in memory; at rest it lives in `mls_storage` and is deleted on
-    /// consume/cancel. Zeroed on drop via the `Drop` impl below.
-    signer_state: Vec<u8>,
-}
-
-impl Drop for PersistedKeyPackage {
-    fn drop(&mut self) {
-        // Zero the private join material; `public_bytes` is publishable.
-        zeroize::Zeroize::zeroize(&mut self.signer_state);
-    }
+    /// Opaque private signer-state (the join material). At rest it lives in
+    /// `mls_storage` and is deleted on consume/cancel.
+    signer_state: Zeroizing<Vec<u8>>,
 }
 
 /// Durable reservation record. Persisted under
@@ -477,7 +469,9 @@ pub enum KeyPackageCommand {
     /// integrator SHOULD simply retry `ConfirmConsume` with the SAME
     /// `reservation_id`. The retry is idempotent for the DURABLE CONSUME: the
     /// re-run inner join hits the already-written consumed-init-key marker
-    /// (`MlsError::KeyPackageReplay`), which the handler recognizes as its OWN
+    /// (`MlsError::KeyPackageReplay`, which `join_from_welcome` returns before
+    /// any lifetime check, so also once the KeyPackage has expired under
+    /// either clock), which the handler recognizes as its OWN
     /// prior completion and finishes the durable consume (delete + tombstone +
     /// cleanup). Single-use still holds across the retry, and the retry can
     /// NEVER be coerced into a second or DIFFERENT join: an alternate welcome's
@@ -505,6 +499,29 @@ pub enum KeyPackageCommand {
     /// of this reservation, so it is surfaced as `KeyPackageReplay` — never a
     /// spurious `Ok` — closing the false-success chain a re-pool could otherwise
     /// ride.
+    ///
+    /// # Errors
+    ///
+    /// A failed inner join maps through `map_join_error`, and the reservation
+    /// is kept:
+    /// - [`ContextError::KeyPackageReplay`]: the reserved KeyPackage's init
+    ///   key is already consumed and this reservation's KP record still exists,
+    ///   so the marker is not this reservation's own prior completion.
+    /// - [`ContextError::InvalidKeyPackage`]: the joiner's own reserved
+    ///   KeyPackage is not current, under the injected clock or openmls's
+    ///   clock, or its `Lifetime` range is empty, inverted or over the maximum
+    ///   (`MlsError::KeyPackageLifetimeInvalid`). Cancel the reservation, or
+    ///   retry after correcting the clock.
+    /// - [`ContextError::CryptoFailed`]: every other join failure, chiefly a
+    ///   Welcome or ratchet tree from the sender that the join rejects,
+    ///   including another member's out-of-range tree leaf
+    ///   (`MlsError::TreeLeafLifetimeRangeInvalid`). A retry with the same
+    ///   Welcome reaches the same rejection; wait for another Welcome. A
+    ///   failure to read or write the consumed-init-key store also maps here.
+    ///
+    /// Outside the join, an unknown or already-completed reservation, and an
+    /// own-prior-completion retry, are [`ContextError::InvalidState`]; a failed
+    /// KP-record or tombstone write is [`ContextError::PersistenceFailed`].
     ConfirmConsume {
         /// The reservation ID returned by [`Self::Reserve`].
         reservation_id: ReservationId,
@@ -837,20 +854,34 @@ impl KeyPackageStoreActor {
     }
 
     /// Map an [`MlsError`] from the fused join to a typed [`ContextError`].
-    /// A replay rejection (the crypto-layer consumed-init-key backstop) maps to
-    /// the dedicated [`ContextError::KeyPackageReplay`] — distinct from
-    /// [`ContextError::InvalidState`] (which also means "unknown reservation")
-    /// so a caller can detect a security-relevant single-use replay. Everything
-    /// else is a crypto failure, including a Welcome whose tree holds a
-    /// KeyPackage-sourced leaf that fails the injected-clock or maximum-range
-    /// lifetime check (ADR-057 §Prereq-1): that is the sender's tree, not the
-    /// caller's KeyPackage, so it is not [`ContextError::InvalidKeyPackage`].
-    /// No dedicated error variant for a rejected Welcome exists yet.
+    /// Each lifetime variant names one party's leaf (ADR-057 §Prereq-1):
+    ///
+    /// - A replay rejection (the crypto-layer consumed-init-key backstop) maps
+    ///   to the dedicated [`ContextError::KeyPackageReplay`], distinct from
+    ///   [`ContextError::InvalidState`] (which also means "unknown
+    ///   reservation"), so a caller can detect a security-relevant single-use
+    ///   replay.
+    /// - [`MlsError::KeyPackageLifetimeInvalid`] names the caller's OWN reserved
+    ///   KeyPackage: its `Lifetime` is expired or not yet valid under the
+    ///   injected clock (or under openmls's internal clock in the native
+    ///   backend), or its range is empty, inverted or over the maximum. It
+    ///   maps to [`ContextError::InvalidKeyPackage`]. The native backend
+    ///   checks the injected clock before openmls's, so an expired own
+    ///   KeyPackage is `InvalidKeyPackage` whichever clock reads it, never
+    ///   `CryptoFailed`.
+    /// - [`MlsError::TreeLeafLifetimeRangeInvalid`] names ANOTHER member's leaf
+    ///   in the sender's tree whose range is empty, inverted or over the
+    ///   maximum. It is not the caller's KeyPackage, so it maps, with every
+    ///   other error, to [`ContextError::CryptoFailed`]. No dedicated error
+    ///   variant for a rejected Welcome exists yet.
     fn map_join_error(e: &MlsError) -> ContextError {
         match e {
             MlsError::KeyPackageReplay => ContextError::KeyPackageReplay(
                 "key package already consumed (init-key replay rejected)".to_owned(),
             ),
+            own @ MlsError::KeyPackageLifetimeInvalid { .. } => {
+                ContextError::InvalidKeyPackage(format!("join from welcome: {own}"))
+            }
             other => ContextError::CryptoFailed(format!("join from welcome: {other}")),
         }
     }
@@ -972,9 +1003,10 @@ impl KeyPackageStoreActor {
         }
     }
 
-    /// Persist one KP record (public + private signer-state). The MessagePack
-    /// scratch buffer carries the private signer-state, so it is wrapped in
-    /// [`Zeroizing`] (mirrors `serialize_signer_state`).
+    /// Persist one KP record (public + private signer-state). The `MessagePack`
+    /// buffer carries the private signer-state, so it is encoded into one
+    /// exactly-sized buffer wiped on drop (security model spec §9.15 step 2;
+    /// mirrors `serialize_signer_state`).
     async fn persist_kp_record(
         &self,
         kp_ref: &KpRef,
@@ -983,12 +1015,10 @@ impl KeyPackageStoreActor {
     ) -> Result<(), ContextError> {
         let record = PersistedKeyPackage {
             public_bytes: public_bytes.to_vec(),
-            signer_state: signer_state.to_vec(),
+            signer_state: Zeroizing::new(signer_state.to_vec()),
         };
-        let bytes = Zeroizing::new(
-            rmp_serde::to_vec_named(&record)
-                .map_err(|e| ContextError::PersistenceFailed(format!("kp record encode: {e}")))?,
-        );
+        let bytes = scp_mls::secret_msgpack::encode_named(&record)
+            .map_err(|e| ContextError::PersistenceFailed(format!("kp record encode: {e}")))?;
         self.mls_storage
             .store(&self.kp_record_key(kp_ref), &bytes)
             .await
@@ -1389,8 +1419,9 @@ impl KeyPackageStoreActor {
                         return Err(Self::map_join_error(&e));
                     }
                 } else {
-                    // Ordinary crypto failure (bad/duplicate welcome). Join failed —
-                    // KP NOT burned; reservation stays for retry/cancel.
+                    // Ordinary join failure (a bad or duplicate Welcome, or the own
+                    // KeyPackage's `Lifetime` rejected). Join failed — KP NOT
+                    // burned; reservation stays for retry/cancel.
                     return Err(Self::map_join_error(&e));
                 }
                 // Own-prior-completion (replay + KP record already absent): there is
@@ -2064,7 +2095,10 @@ impl KeyPackageStoreActor {
             let Some(bytes) = rec else {
                 continue; // record gone (consumed/cancelled) — not restorable.
             };
-            let mut parsed: PersistedKeyPackage = match rmp_serde::from_slice(&bytes) {
+            let PersistedKeyPackage {
+                public_bytes,
+                signer_state,
+            } = match rmp_serde::from_slice(&bytes) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(
@@ -2076,18 +2110,15 @@ impl KeyPackageStoreActor {
                     continue;
                 }
             };
-            // `PersistedKeyPackage` has a `Drop` that zeroes its private
-            // `signer_state`, so its fields cannot be moved out by value. Take
-            // each field out via `mem::take` (leaving an empty Vec the Drop
-            // harmlessly zeroes) so the private bytes move into the actor's
-            // `Zeroizing` home without an un-zeroed copy.
+            // Both fields move into the actor's records without a copy; an
+            // excluded consumed record drops its `Zeroizing` signer-state.
             if let Some((rid, reserved_at_ms)) = reserved_by_ref.remove(&kp_ref) {
                 self.reserved.insert(
                     rid,
                     ReservedKeyPackage {
                         kp_ref: kp_ref.clone(),
-                        public_bytes: std::mem::take(&mut parsed.public_bytes),
-                        signer_state: Zeroizing::new(std::mem::take(&mut parsed.signer_state)),
+                        public_bytes,
+                        signer_state,
                         reserved_at_ms,
                     },
                 );
@@ -2118,8 +2149,8 @@ impl KeyPackageStoreActor {
             } else {
                 self.pool.push(PooledKeyPackage {
                     kp_ref,
-                    public_bytes: std::mem::take(&mut parsed.public_bytes),
-                    signer_state: Zeroizing::new(std::mem::take(&mut parsed.signer_state)),
+                    public_bytes,
+                    signer_state,
                 });
             }
         }

@@ -15,4 +15,8 @@ future-size-threshold = 16512
 
 # ----- Disallowed methods -----
 # now_secs/now_millis are private to scp-clock — the compiler enforces
-# this directly. No clippy disallowed-methods entries needed.
+# this directly, so they need no entry here.
+disallowed-methods = [
+  { path = "openmls_basic_credential::SignatureKeyPair::store", reason = "writes the MLS signer's private key into provider storage, which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
+  { path = "openmls_traits::storage::StorageProvider::write_signature_key_pair", reason = "stores the MLS signer's private key in provider storage (the trait method `SignatureKeyPair::store` calls), which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
+]

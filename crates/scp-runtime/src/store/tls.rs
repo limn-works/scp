@@ -52,7 +52,7 @@ impl<S: Storage> ProtocolRepository<S> {
     ) -> Result<(), StoreError> {
         self.store_value(CERT_CHAIN_KEY, &certificate_chain_pem.to_owned())
             .await?;
-        self.store_value_zeroize(PRIVATE_KEY_KEY, &private_key_pem.to_owned())
+        self.store_value_zeroize(PRIVATE_KEY_KEY, private_key_pem)
             .await?;
         Ok(())
     }

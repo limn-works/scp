@@ -550,7 +550,13 @@ mod tests {
         // Bob processes the Carol-add commit to advance to epoch 2.
         let commit_bytes = crate::ratchet::serialize_mls_message(&add_carol.commit).unwrap();
         let mut grace_store = crate::epoch_grace::EpochGraceStore::new();
-        crate::ratchet::process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        crate::ratchet::process_commit(
+            &mut bob_group,
+            &commit_bytes,
+            &mut grace_store,
+            &SystemClock,
+        )
+        .unwrap();
 
         assert_eq!(
             alice_group.epoch().unwrap(),

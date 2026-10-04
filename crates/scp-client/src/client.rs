@@ -93,19 +93,31 @@ struct PendingJoin {
 #[derive(Serialize, Deserialize)]
 struct PersistedPendingJoin {
     /// The `scp-mls` `serialize_pending_join` blob (provider + signer + bindings).
-    mls_blob: Vec<u8>,
+    /// Held in [`Zeroizing`] because it carries the signer's private key and the
+    /// `KeyPackage`'s private init and encryption keys: it is wiped when the
+    /// record drops (security model spec §9.15 step 2). zeroize's `serde`
+    /// feature encodes it as the plain byte sequence a `Vec<u8>` field encodes as.
+    mls_blob: Zeroizing<Vec<u8>>,
     /// The published wrapping public key.
     wrapping_public: [u8; 32],
-    /// The matching wrapping secret. Zeroized after reconstruction.
-    wrapping_secret: [u8; 32],
+    /// The matching wrapping secret, wiped when the record drops; it encodes
+    /// as the plain array a `[u8; 32]` field encodes as.
+    wrapping_secret: Zeroizing<[u8; 32]>,
 }
 
 impl Drop for PersistedPendingJoin {
     fn drop(&mut self) {
-        use zeroize::Zeroize as _;
-        self.wrapping_secret.zeroize();
+        // Exists only as a move guard: `wrapping_secret` is inline, so restore must
+        // `mem::take` it, which zeroes its slot, and a partial move out is a
+        // compile error (E0509). Every field wipes itself through its type.
     }
 }
+
+#[expect(drop_bounds, reason = "asserts the E0509 move guard")]
+const _: fn() = || {
+    const fn guard<T: Drop>() {}
+    guard::<PersistedPendingJoin>();
+};
 
 /// The result of adding a member: the wire bytes the driver must distribute.
 ///
@@ -517,19 +529,23 @@ impl ScpClient {
         // swapped pending blob cannot silently drive this identity into a group
         // under another leaf, nor bind this key package to the wrong context. The
         // bindings are verified on restore ([`Self::restore_from_storage`]).
+        // The blob's wiping buffer moves (no copy) into
+        // `PersistedPendingJoin::mls_blob`, which is `Zeroizing` too.
         let mls_blob = serialize_pending_join(&provider, &signer, self.signer.did(), context_id)?;
-        let pending_blob = {
-            let persisted = PersistedPendingJoin {
-                mls_blob,
-                wrapping_public,
-                wrapping_secret: *wrapping_secret,
-            };
-            rmp_serde::to_vec_named(&persisted).map_err(|e| {
-                ClientError::StorageCorrupt(format!("serializing pending join: {e}"))
-            })?
-        };
+        // One exactly-sized buffer, wiped on drop, so no outgrown encoding
+        // buffer holding the signer or the wrapping secret is freed unwiped
+        // (security model spec §9.15 step 2).
+        let mut pending_blob = scp_mls::secret_msgpack::encode_named(&PersistedPendingJoin {
+            mls_blob,
+            wrapping_public,
+            wrapping_secret: wrapping_secret.clone(),
+        })
+        .map_err(|e| ClientError::StorageCorrupt(format!("serializing pending join: {e}")))?;
         self.storage
-            .put(&Self::pending_key(context_id), pending_blob)
+            .put(
+                &Self::pending_key(context_id),
+                std::mem::take(&mut *pending_blob),
+            )
             .map_err(|e| {
                 ClientError::StorageBackend(format!(
                     "persisting pending join for context '{context_id}': {e}"
@@ -680,7 +696,10 @@ impl ScpClient {
     /// [`ClientError::ContextAlreadyExists`] if already joined,
     /// [`ClientError::Mls`] / [`ClientError::EventLog`] on Welcome processing,
     /// replay failure (a replay stream that does not chain cleanly is rejected),
-    /// or a sender-key seal failure, or [`ClientError::StorageBackend`] if
+    /// or a sender-key seal failure. Returns [`ClientError::Mls`] carrying
+    /// [`MlsError::KeyPackageLifetimeInvalid`] when this member's own `KeyPackage`
+    /// is not current under the injected clock; the durable pending blob stays,
+    /// as on every failed join. Returns [`ClientError::StorageBackend`] if
     /// persisting the joined context or deleting the consumed pending blob fails. A
     /// persist failure **poisons** the freshly-joined context (its state advanced
     /// in memory but was not durably recorded); reconstruct via [`Self::new`],
@@ -738,6 +757,17 @@ impl ScpClient {
         // `join_group_from_bytes` is the wire-path variant: it deserializes the
         // Welcome (as `MlsMessageIn`) internally, so the driver never has to
         // name the inbound MLS message type.
+        //
+        // ADR-057 §Prereq-1: the injected clock reaches only this member's OWN
+        // leaf; other members' tree leaves keep only the range bound. The own
+        // KeyPackage must be current under the injected clock, and
+        // `join_group_from_bytes` checks that before it returns a group. On a
+        // rejection the joined group is dropped unadopted and the durable
+        // pending blob stays, as on every failed join, whether the KeyPackage
+        // reads as expired or as not yet valid: the injected clock can be wrong
+        // in either direction (the browser `WasmClock` reads the wall clock,
+        // which can move backwards), so a reconstruct through `Self::new` under
+        // a correct clock can still complete the join.
         let mls_group = join_group_from_bytes(
             welcome_bytes,
             pending.provider,
@@ -1796,7 +1826,7 @@ impl ScpClient {
     /// storage. Pure "do the write" half of [`Self::persist_context`]; the poison
     /// bookkeeping lives in the caller.
     fn build_and_put(&self, context_id: &str) -> Result<(), ClientError> {
-        let blob = {
+        let mut blob = {
             let state = self
                 .contexts
                 .get(context_id)
@@ -1804,7 +1834,7 @@ impl ScpClient {
             ContextSnapshot::capture(context_id, self.signer.did(), state)?.to_bytes()?
         };
         self.storage
-            .put(&Self::ctx_key(context_id), blob)
+            .put(&Self::ctx_key(context_id), std::mem::take(&mut *blob))
             .map_err(|e| {
                 ClientError::StorageBackend(format!("persisting context '{context_id}': {e}"))
             })
@@ -1868,13 +1898,15 @@ impl ScpClient {
             }
             let blob = self.read_listed_key(&key)?;
             // Unwrap the scp-client pending envelope (the scp-mls blob + the
-            // published wrapping keypair). The wrapping secret is zeroized when the
-            // `PersistedPendingJoin` drops at the end of this iteration.
-            let persisted: PersistedPendingJoin = rmp_serde::from_slice(&blob).map_err(|e| {
-                ClientError::StorageCorrupt(format!(
-                    "deserializing pending join under key '{key}': {e}"
-                ))
-            })?;
+            // published wrapping keypair). The wrapping secret moves out below,
+            // leaving zeros in `persisted`'s slot; `persisted` wipes the blob
+            // when it drops at the end of this iteration.
+            let mut persisted: PersistedPendingJoin =
+                rmp_serde::from_slice(&blob).map_err(|e| {
+                    ClientError::StorageCorrupt(format!(
+                        "deserializing pending join under key '{key}': {e}"
+                    ))
+                })?;
             // `restore_pending_join` returns the identity + context the blob was
             // bound to at capture; verify BOTH here, fail closed. A swapped blob
             // that belongs to another identity is an identity confusion
@@ -1901,7 +1933,7 @@ impl ScpClient {
                     signer,
                     provider,
                     wrapping_public: persisted.wrapping_public,
-                    wrapping_secret: Zeroizing::new(persisted.wrapping_secret),
+                    wrapping_secret: std::mem::take(&mut persisted.wrapping_secret),
                 },
             ));
         }
@@ -2068,6 +2100,44 @@ fn key_package_member_did(
     // the key packages `add_member` accepts.
     let did = key_package_in_did(&key_package_in, ProtocolVersion::Mls10, clock)?;
     Ok(did)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod pending_join_encoding_tests {
+    use super::*;
+
+    fn record() -> PersistedPendingJoin {
+        PersistedPendingJoin {
+            mls_blob: Zeroizing::new(vec![0xA5; 300]),
+            wrapping_public: [0x11; 32],
+            wrapping_secret: Zeroizing::new([0x5A; 32]),
+        }
+    }
+
+    /// The `Zeroizing` blob and wrapping secret encode as the `MessagePack` a
+    /// plain `Vec<u8>` and `[u8; 32]` field encode as, and decode back to the
+    /// same bytes.
+    #[test]
+    fn mls_blob_encodes_like_a_plain_byte_vector() {
+        #[derive(Serialize)]
+        struct Plain {
+            mls_blob: Vec<u8>,
+            wrapping_public: [u8; 32],
+            wrapping_secret: [u8; 32],
+        }
+        let persisted = record();
+        let plain = Plain {
+            mls_blob: persisted.mls_blob.to_vec(),
+            wrapping_public: persisted.wrapping_public,
+            wrapping_secret: *persisted.wrapping_secret,
+        };
+        let bytes = scp_mls::secret_msgpack::encode_named(&persisted).unwrap();
+        assert_eq!(*bytes, rmp_serde::to_vec_named(&plain).unwrap());
+        let back: PersistedPendingJoin = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(*back.mls_blob, *persisted.mls_blob);
+        assert_eq!(*back.wrapping_secret, *persisted.wrapping_secret);
+    }
 }
 
 #[cfg(test)]

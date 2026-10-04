@@ -21,7 +21,6 @@ derives the version from that file:
 | `cargo`, `rustup` | natively, for any command run inside the repository; rustup installs the `channel`, `components`, and `targets` the file names on first use |
 | `Dockerfile` | copies the file into the builder image before the first cargo command; the base tag names a Debian release only |
 | `templates/personal-relay/README.md` | its `COPY . .` brings the file into the image, for the same reason |
-| the CI workflows | their `dtolnay/rust-toolchain@stable` steps select no version — that action reads no toolchain file — so each one installs rustup's `stable` and runs `rustup default stable`, and rustup then applies `rust-toolchain.toml` as a directory override, which beats the default |
 
 `fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs, because
 cargo-fuzz does not run on stable. rustup applies the toolchain file of the directory a
@@ -94,12 +93,12 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
 | `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
-| `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --release`, `napi-addon` runs `cargo build -p scp-ffi-napi --release`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev`, and `bridge-parity-kotlin` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
-| `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --release` and `pyo3-module` runs `maturin develop --release`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
+| `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --profile ci-bridge`, `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, and `bridge-parity-kotlin` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
+| `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
 | `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
-| `kotlin` | `kotlin-test` and `bridge-parity-kotlin` run `cargo build -p scp-ffi-uniffi --features testing`, and `pyo3-module` runs `maturin develop --release`, whose upload `bridge-parity-kotlin` downloads |
-| `swift` | `xcframework` runs `bindings/swift/build-xcframework.sh --dev`, which calls `cargo build`, and `pyo3-module-macos` runs `maturin develop --release`; `swift-build-test` downloads the XCFramework and `bridge-parity-swift` downloads both |
+| `kotlin` | `kotlin-test` and `bridge-parity-kotlin` run `cargo build -p scp-ffi-uniffi --features testing`, and `pyo3-module` runs `maturin develop --profile ci-bridge`, whose upload `bridge-parity-kotlin` downloads |
+| `swift` | `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, which calls `cargo build`, and `pyo3-module-macos` runs `maturin develop --profile ci-bridge`; `swift-build-test` downloads the XCFramework and `bridge-parity-swift` downloads both |
 
 Rather than list the pin in seven filters, the `changes` job declares one `toolchain`
 filter and ORs it into every lane's output, so the workflow names each file that filter
@@ -192,7 +191,11 @@ against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36.
 #![forbid(unsafe_code)]
 ```
 
-Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace. If an FFI bridge crate requires unsafe (e.g., cbindgen C ABI), it is the sole exception and must document every `unsafe` block with a `// SAFETY:` comment explaining the invariant.
+Every crate sets `#![forbid(unsafe_code)]` at the crate root. Unsafe code is forbidden across the entire workspace, with two exceptions, and each exception documents every `unsafe` block with a `// SAFETY:` comment explaining the invariant:
+- an FFI bridge crate that requires unsafe (e.g., cbindgen C ABI);
+- `crates/scp-alloc`, the wiping global allocator, whose crate root sets `#![deny(unsafe_code)]` and allows unsafe only on its `GlobalAlloc` implementation and on the wipe routine that implementation calls.
+
+`crates/scp-alloc/src/lib.rs` holds the workspace's one `#[global_allocator]` static. The crate root of each shipped binary and cdylib (`scp-node`, `scp-relay`, `scp-ffi`, `scp-ffi-napi`, `scp-ffi-uniffi`, and `scp-client-wasm`) links that static with `use scp_alloc as _;` and defines no global allocator of its own, because §9.15 of the security-model spec (freed heap memory) requires every shipped artifact to wipe each heap block before freeing it.
 
 Additional enforced rules:
 - No `unwrap()` or `expect()` in library code — use `?` with typed errors
