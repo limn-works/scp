@@ -663,7 +663,7 @@ Every push to a PR branch. Target: < 3 minutes. Must pass before review.
 
 ### Tier 2 — Merge Gate
 
-Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+Merge queue entry. Target: < 10 minutes. Required to merge.
 
 | Check | All SDKs |
 |-------|----------|

@@ -521,7 +521,7 @@ Unit tests and conformance macro suites (`transport_conformance!()`, `storage_co
 
 ### Tier 2 — Merge Gate
 
-Merge queue entry or push to `main`. Target: < 10 minutes. Required to merge.
+Merge queue entry. Target: < 10 minutes. Required to merge.
 
 | Job | Runs on | Command |
 |-----|---------|---------|
