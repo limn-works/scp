@@ -5542,10 +5542,9 @@ async fn ucan_mint_impl(
             // token for the context, because a context the supervisor stopped
             // serving grants no new authority. The issuer is the context
             // creator, and the ceiling bounds what a mint may grant. The gate
-            // returns both from the supervisor actor, so a `ModifyCeiling`
-            // governance action binds the very next mint, and a context no
-            // actor serves refuses. A ceiling this bridge recorded at
-            // registration would grant what the supervisor already withdrew.
+            // returns both from the supervisor actor, and a context no actor
+            // serves refuses. A ceiling this bridge recorded at registration
+            // would grant what the supervisor already withdrew.
             let role_state = bi
                 .require_active_context_before_authz(
                     &handle.context_id,
@@ -5686,8 +5685,7 @@ async fn ucan_delegate_impl(
             // token for the context, because a context the supervisor stopped
             // serving grants no new authority. The ceiling bounds what a
             // delegation may pass on. The gate returns it from the supervisor
-            // actor, so a `ModifyCeiling` governance action binds the very
-            // next delegation. `context_create` refuses an empty ceiling with
+            // actor. `context_create` refuses an empty ceiling with
             // `SCP-VALID-7005`, so no `default_ceiling()` fallback widens it.
             let ceiling = Some(
                 bi.require_active_context_before_authz(
@@ -15625,8 +15623,7 @@ impl Scp {
                     .await?;
                 // ADR-016 step 8 compares the token's grants against the context's
                 // capability ceiling, and step 4 anchors the chain on the context
-                // creator. Both come from the supervisor actor, so a `ModifyCeiling`
-                // governance action binds the very next call.
+                // creator. Both come from the supervisor actor.
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
                 // Ensure UCAN state is registered for this context on this instance.
@@ -15806,8 +15803,7 @@ impl Scp {
                     .await?;
                 // ADR-016 step 8 compares the token's grants against the context's
                 // capability ceiling, and step 4 anchors the chain on the context
-                // creator. Both come from the supervisor actor, so a `ModifyCeiling`
-                // governance action binds the very next call.
+                // creator. Both come from the supervisor actor.
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
                 // Ensure UCAN state is registered for this context on this instance.
