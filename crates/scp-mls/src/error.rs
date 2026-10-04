@@ -116,7 +116,9 @@ pub enum MlsError {
     /// or exceeds the RFC 9420 maximum acceptable range (ADR-057 §Prereq-1);
     /// on an add path, also when less than
     /// [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`](crate::lifetime::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS)
-    /// remains (security-model spec §9.7.1, the adder).
+    /// remains or `not_before` is later than `now -`
+    /// [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`](crate::lifetime::KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS)
+    /// (security-model spec §9.7.1, the adder).
     /// The variant has two sources:
     /// - [`validate_key_package_lifetime`](crate::lifetime::validate_key_package_lifetime)
     ///   and

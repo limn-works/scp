@@ -106,7 +106,8 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 pub struct ProductionMlsBackend {
     /// Injected hardened [`Clock`] used to stamp `KeyPackage` / group-leaf
     /// `Lifetime`s on generation, to check a `KeyPackage` an adder adds
-    /// (current, with the add-side minimum remaining lifetime), and to check
+    /// (current, with the add-side minimum remaining lifetime and minimum
+    /// `not_before` age), and to check
     /// the joiner's own `KeyPackage` on a Welcome join (ADR-057 §Prereq-1). A
     /// received Add and another member's Welcome tree leaf are checked for
     /// range only and read no clock. In production this is the SAME
@@ -545,8 +546,8 @@ impl MlsBackend for ProductionMlsBackend {
         // SCP-CRYPTOMOVE-000c) and enforce the RFC 9420 max-range bound
         // openmls's `validate` never applies. Additive hardening; never
         // replaces openmls. Every caller is an add path, so the add-side
-        // minimum remaining lifetime applies too (security-model spec §9.7.1,
-        // the adder).
+        // minimum remaining lifetime and minimum `not_before` age apply too
+        // (security-model spec §9.7.1, the adder).
         validate_key_package_lifetime_for_add(validated.life_time(), clock)?;
 
         // Guard the SCP ciphersuite invariant: any KP using a non-SCP

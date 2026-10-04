@@ -71,8 +71,8 @@ use crate::wrapping_extension::extract_wrapping_key;
 /// switch for either check. Security-model spec §9.7.1 forbids a receiver to
 /// reject an Add by its own clock; SCP's own receive-side check is range-only
 /// (`validate_received_key_package_lifetime_range`). SCP carries no openmls
-/// patch: the adder's `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` bounds
-/// openmls's check, and the residual-case list of §9.7.1 names every case in
+/// patch: the adder's `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` and
+/// `KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS` bound openmls's check, and the residual-case list of §9.7.1 names every case in
 /// which it still refuses a Commit, each surfacing here as
 /// [`MlsError::DecryptionFailed`].
 ///

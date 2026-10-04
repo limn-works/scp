@@ -608,7 +608,9 @@ pub struct AddMemberResult {
 ///   re-validated against this hardened clock — and checked for the RFC 9420
 ///   maximum-range bound openmls never applies (ADR-057 §Prereq-1) and for at
 ///   least [`KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`](crate::lifetime::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS)
-///   remaining (security-model spec §9.7.1, the adder).
+///   remaining and a `not_before` at least
+///   [`KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`](crate::lifetime::KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS)
+///   old (security-model spec §9.7.1, the adder).
 ///
 /// # Returns
 ///
@@ -620,7 +622,8 @@ pub struct AddMemberResult {
 /// Returns [`MlsError::AddMemberFailed`] if `OpenMLS` rejects the add operation.
 /// Returns [`MlsError::KeyPackageLifetimeInvalid`] if the accepted key package's
 /// `Lifetime` fails validation against the injected clock (expired, not yet
-/// valid, over-long range, or less than the minimum remaining lifetime).
+/// valid, over-long range, less than the minimum remaining lifetime, or a
+/// `not_before` younger than the minimum age).
 /// Returns [`MlsError::MergePendingCommitFailed`] if committing fails.
 ///
 /// See ADR-001 acceptance criterion 2.
@@ -640,10 +643,11 @@ pub fn add_member(
     // and enforce the RFC 9420 maximum-range bound openmls's `validate` never
     // applies. This is additive hardening — it never replaces openmls's check.
     // Security-model spec §9.7.1, the adder: also require the minimum remaining
-    // lifetime, so no Commit a relay delivers within its retention carries a
+    // lifetime and the minimum `not_before` age, so no Commit a relay delivers within its retention carries a
     // KeyPackage expired under a receiver whose clock runs at most one hour
-    // ahead of this adder's (openmls checks a received Add against the
-    // receiver's wall clock; §9.7.1 lists the residual cases).
+    // ahead of this adder's, and every receiver whose clock runs at most
+    // 3,300 s behind it has reached `not_before` (openmls checks a received
+    // Add against the receiver's wall clock; §9.7.1 lists the residual cases).
     validate_key_package_lifetime_for_add(verified_key_package.life_time(), clock)?;
 
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
@@ -831,7 +835,7 @@ pub fn key_package_in_did(
 /// Returns [`MlsError::AddMemberFailed`] if the key package fails validation,
 /// [`MlsError::KeyPackageLifetimeInvalid`] if the accepted `Lifetime` fails the
 /// hardened-clock re-validation, including the add-side minimum remaining
-/// lifetime, or [`MlsError::ExtensionError`] if the leaf
+/// lifetime and minimum `not_before` age, or [`MlsError::ExtensionError`] if the leaf
 /// carries no (or a malformed) `scp_wrapping_key` extension.
 pub fn key_package_in_wrapping_key(
     key_package: &KeyPackageIn,

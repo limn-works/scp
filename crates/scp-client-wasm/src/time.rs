@@ -38,8 +38,10 @@
 //!   *adds* is re-validated after `KeyPackageIn::validate` against the injected
 //!   hardened clock (`scp_mls::lifetime::validate_key_package_lifetime_for_add`):
 //!   the current time lies within its `Lifetime`, its range is within the RFC
-//!   9420 maximum openmls never enforces, and at least
-//!   `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` (7 days + 1 hour) remains
+//!   9420 maximum openmls never enforces, its `not_before` lies at least
+//!   `KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS` (3,300 s) before the current time,
+//!   and at least `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` (7 days + 1 hour)
+//!   remains
 //!   (security-model spec §9.7.1, the adder).
 //! - **The receive side reads no clock.** An Add received in a Commit or a
 //!   Proposal is checked for range only
@@ -66,7 +68,8 @@
 //!   accepted on an add. On the receive path SCP's verdict is the range
 //!   check, which reads no clock; openmls's own check is the only clock check
 //!   there, so a `Date.now()` override can only add rejections and can make an
-//!   honest add-Commit fail. The adder's minimum remaining lifetime bounds
+//!   honest add-Commit fail. The adder's minimum remaining lifetime and
+//!   minimum `not_before` age bound
 //!   openmls's check, and the residual-case list of security-model spec
 //!   §9.7.1 names every case in which it still refuses an add-Commit.
 //!   Page same-origin integrity (CSP/SRI/COOP/COEP) stays load-bearing for
