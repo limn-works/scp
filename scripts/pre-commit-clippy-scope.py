@@ -27,8 +27,10 @@ and `deny.toml` is read by cargo-deny, not by clippy.
 
 Otherwise the script selects each workspace member that holds a changed path, of any file
 type, because a crate can read a non-Rust file in its directory with `include_str!`. A
-commit that deletes or moves a file outside a member's directory does not select a member
-that reads that file with `include_str!` or `include_bytes!`. The script then adds every
+commit that deletes or moves a file does not select a member that reads that file with
+`include_str!` or `include_bytes!` unless that member holds the file or the walk below
+reaches it from the member that holds the file; a file in no member's directory selects
+no member. The script then adds every
 workspace member that depends on a selected member, directly or transitively, as
 `Graph.affected` defines the walk, and prints `-p <name>` for each. It keeps only the
 `--features` entries whose package is selected.
