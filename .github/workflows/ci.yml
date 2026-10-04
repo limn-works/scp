@@ -25,8 +25,8 @@ env:
   # DWARF sections, so the linker reads and writes less for every test binary and each
   # `target/debug` entry rust-cache saves and restores is smaller. Release
   # builds (`wasm-pack build`'s default `--release`) read `[profile.release]`, and
-  # the four bridge producers' `--profile ci-bridge` builds read
-  # `[profile.ci-bridge]`, which inherits `[profile.release]`; both ignore every
+  # the `--profile ci-bridge` builds of the four producers other than kotlin-test
+  # read `[profile.ci-bridge]`, which inherits `[profile.release]`; both ignore every
   # `CARGO_PROFILE_DEV_*` variable.
   #
   # TRADE-OFF: a `RUST_BACKTRACE` frame prints a symbol name without `file:line`. A
