@@ -873,17 +873,19 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 32 files named
-# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other two with
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 33 files named
+# `check-*`. This list names 31 of them, and GATES_NOT_RUN below names the other two with
 # the reason each is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
 # unnoticed.
 #
-# TWO GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
+# THREE GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
 # graph.sh` runs eleven `cargo tree` resolutions and `scripts/check-protocol-deps.sh` runs
 # one, and `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run
 # measured them at 12.9 seconds and 391 ms while another worktree held that lock.
+# `scripts/check-wiping-allocator.sh` runs one `cargo metadata --no-deps`, which resolves
+# no dependency and compiles nothing.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
 # list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the
@@ -923,6 +925,7 @@ GATES=(
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
     scripts/check-toolchain-wiring.sh
+    scripts/check-wiping-allocator.sh
     scripts/check-workflow-compile-steps.py
 )
 

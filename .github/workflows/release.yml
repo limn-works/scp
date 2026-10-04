@@ -177,6 +177,7 @@ jobs:
         id: tags
         run: |
           TAGS=(
+            "scp-alloc@${{ env.VERSION }}"
             "scp-clock@${{ env.VERSION }}"
             "scp-crypto@${{ env.VERSION }}"
             "scp-did@${{ env.VERSION }}"
@@ -446,7 +447,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Publish order matters: dependencies first
+      # Publish order matters: dependencies first. scp-alloc goes first: it has
+      # no dependencies, and scp-node and scp-relay pin it (09-security-model.md
+      # §9.15, freed heap memory).
+      - name: Publish scp-alloc
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-alloc --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
       - name: Publish scp-clock
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
