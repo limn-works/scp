@@ -3618,8 +3618,8 @@ pub type CaveatPostInputCheck<'a> = Box<
 /// Returns a `mpsc::Receiver<OutletStreamChunk>` that yields the chunks
 /// produced by the executor (`Data` / `Progress`), terminated by a
 /// single terminal chunk (`End` on success, `Error { terminal: true }`
-/// on failure). The framework spawns a tokio task that drives the
-/// executor and pumps chunks into the channel.
+/// on failure). The framework starts a task through `spawn_task` that drives
+/// the executor and pumps chunks into the channel.
 ///
 /// This is the streaming counterpart of the unary
 /// [`invoke_outlet_aggregating`] (best-effort *outlet stream* mode per
@@ -3681,6 +3681,9 @@ pub async fn invoke_outlet<E>(
     // the per-chunk-signature preimage. `[0u8; 32]` for legacy / test
     // callers; production paths supply the real binding.
     caveats_binding: [u8; 32],
+    // Starts the streaming executor task. The Supervisor's open paths spawn it
+    // onto the Supervisor's task tracker (ADR-049 Decision 16).
+    spawn_task: &(dyn Fn(super::dispatch::StreamTask) + Send + Sync),
 ) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -3772,7 +3775,7 @@ where
         signing_ctx,
         memory_scope,
     };
-    tokio::spawn(run_streaming_executor_task(task_inputs));
+    spawn_task(Box::pin(run_streaming_executor_task(task_inputs)));
 
     Ok(chunk_rx)
 }
@@ -7270,6 +7273,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -7311,6 +7315,72 @@ mod tests {
         }
     }
 
+    /// `invoke_outlet` starts its executor only through `spawn_task`: while the
+    /// caller holds the task unstarted, the stream yields no chunk, and once the
+    /// caller runs the task the stream completes.
+    #[tokio::test]
+    async fn invoke_outlet_runs_its_executor_only_through_spawn_task() {
+        struct EchoExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for EchoExecutor {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(input)
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> = std::sync::Arc::new(EchoExecutor);
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            test_signer(),
+            [0u8; 32],
+            &move |task| task_tx.send(task).expect("the test holds the receiver"),
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let task = task_rx
+            .try_recv()
+            .expect("invoke_outlet handed its executor task to spawn_task");
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no chunk arrives while the executor task is not started"
+        );
+        tokio::spawn(task);
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        assert!(
+            matches!(
+                chunks.last().map(|c| &c.payload),
+                Some(ChunkPayload::End { .. })
+            ),
+            "the started task completes the stream, got {chunks:?}"
+        );
+    }
+
     /// Item 4 (fail-closed provenance): the terminal `End` chunk's provenance
     /// MUST carry the hosting context's REAL `memory_scope`, not a hardcoded
     /// `Full`. The prior `placeholder_data_provenance` stamped `Full`
@@ -7346,6 +7416,7 @@ mod tests {
                 None,
                 test_signer(),
                 [0u8; 32],
+                &|task| drop(tokio::spawn(task)),
             )
             .await
             .expect("invoke_outlet should accept a well-formed open");
@@ -7466,6 +7537,7 @@ mod tests {
             None,
             failing_signer,
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("open succeeds; the signing failure surfaces during the pump");
@@ -7595,6 +7667,7 @@ mod tests {
             None,
             signer,
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("open succeeds; the terminal signing failure surfaces during the pump");
@@ -7677,6 +7750,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -7757,6 +7831,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -7824,6 +7899,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("synchronous validation must pass before the panic fires");
@@ -7950,6 +8026,7 @@ mod tests {
             None,
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8027,6 +8104,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8096,6 +8174,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8171,6 +8250,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8245,6 +8325,7 @@ mod tests {
             Some(sink),
             test_signer(),
             [0u8; 32],
+            &|task| drop(tokio::spawn(task)),
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -8836,6 +8917,7 @@ mod tests {
                 Some(b_sink),
                 signer,
                 CB,
+                &|task| drop(tokio::spawn(task)),
             )
             .await
             .expect("B open");
@@ -9382,6 +9464,7 @@ mod tests {
                     None,
                     test_signer(),
                     [0u8; 32],
+                    &|task| drop(tokio::spawn(task)),
                 )
                 .await;
             drop(out);

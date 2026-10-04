@@ -3708,8 +3708,7 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// (ADR-049 Decision 16, supervisor task drain).
 ///
 /// Steps, in order:
-/// 1. Set the closed flag. ADR-049 Decision 16 item 2 names the spawns it
-///    refuses with [`ContextError::SupervisorShutDown`](scp_protocol::context::ContextError::SupervisorShutDown).
+/// 1. Set the closed flag.
 /// 2. Snapshot the actor registry under the write lock. A spawner that
 ///    passed the closed-flag check registers under the same lock, so the
 ///    snapshot holds every actor that can still be spawned.
@@ -3726,14 +3725,19 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// 5. Clear the standing-context index, the local-DID registry, and the
 ///    per-identity wrapping keys.
 /// 6. Close the task tracker and await it.
+/// 7. Drop each swept context's floor-registry entry. A despawned actor whose
+///    `ShutdownSelf` was not delivered or not answered keeps running its
+///    mailbox backlog until step 6 has awaited it, and each persist it makes
+///    reads its floors from this registry.
 ///
 /// Used by
 /// [`Supervisor::shutdown_all_contexts`](crate::context::supervisor::Supervisor::shutdown_all_contexts)
 /// (and its sync wrapper) for process exit and test teardown. Does NOT
 /// send leave messages or notify remote peers.
 pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
-    let removed_count = shutdown_sweep(supervisor).await;
+    let context_ids = shutdown_sweep(supervisor).await;
     supervisor.await_tracked_tasks().await;
+    let removed_count = reap_swept_floors(supervisor, &context_ids);
     tracing::info!(
         removed_count,
         "shutdown: removed all contexts, stopped key-package actors, and drained every \
@@ -3741,9 +3745,9 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
     );
 }
 
-/// Steps 1 to 5 of [`shutdown_all_contexts`]; returns how many context actors
-/// the sweep despawned.
-async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> usize {
+/// Steps 1 to 5 of [`shutdown_all_contexts`]; returns the ids of the context
+/// actors the sweep despawned.
+async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> Vec<String> {
     use std::collections::{HashMap, HashSet};
 
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
@@ -3804,12 +3808,7 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
         // lookup still reports the poison until an operator clears it or the
         // process restarts.
         supervisor.reap_crash_window(ctx_id);
-        // Drop the authoritative Class-M floor registry entry on the same
-        // teardown sweep (ADR-049) — the floor-registry twin of the crash-window
-        // reap above, keeping the registry floors' lifecycle aligned 1:1 with
-        // crash_windows.
-        let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
-        supervisor.remove_context_floors(&ctx_id_bytes);
+        // The floor-registry entry is dropped in step 7, after the drain.
         // Drop the per-context stream admission-tracker registry entry on the
         // same teardown sweep (spec §5.4.5).
         supervisor.reap_stream_admission(ctx_id);
@@ -3837,6 +3836,20 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
     // end with their actor's task. Every other supervisor-held task (actor
     // watchdogs, the context-gauge refresh, the streaming saga seal task,
     // the streaming settlement tasks) is on the tracker, which step 6 awaits.
+    context_ids
+}
+
+/// Step 7 of [`shutdown_all_contexts`]: drops the floor-registry entry of each
+/// swept context and returns how many contexts were swept. Runs only after the
+/// tracker drain has finished, so no actor task is left to persist a snapshot
+/// that would export the absent entry as empty floors.
+fn reap_swept_floors(
+    supervisor: &crate::context::supervisor::Supervisor,
+    context_ids: &[String],
+) -> usize {
+    for ctx_id in context_ids {
+        supervisor.remove_context_floors(&crate::context::state::context_id_to_bytes(ctx_id));
+    }
     context_ids.len()
 }
 
@@ -3859,9 +3872,9 @@ const SYNC_SHUTDOWN_DRAIN_BOUND: std::time::Duration = std::time::Duration::from
 /// when called outside a tokio runtime: nothing was shut down and nothing was
 /// drained, so the caller must not close the storage backend. The same error
 /// when the tracker drain has not finished within
-/// [`SYNC_SHUTDOWN_DRAIN_BOUND`]: every actor was still despawned and every
-/// registry cleared, but supervisor tasks may still hold storage, so the
-/// caller must not close the storage backend.
+/// [`SYNC_SHUTDOWN_DRAIN_BOUND`]: every actor was still despawned, but
+/// supervisor tasks may still hold storage, so the caller must not close the
+/// storage backend.
 pub fn shutdown_all_contexts_sync(
     supervisor: &crate::context::supervisor::Supervisor,
 ) -> Result<(), scp_protocol::context::ContextError> {
@@ -3877,18 +3890,18 @@ fn shutdown_all_contexts_sync_within(
         Ok(handle) => {
             // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown allowlist — the bridge's blocking shutdown path cannot .await.
             let shutdown = async {
-                let removed_count = shutdown_sweep(supervisor).await;
+                let context_ids = shutdown_sweep(supervisor).await;
                 let drained = tokio::time::timeout(bound, supervisor.await_tracked_tasks()).await;
-                (removed_count, drained)
+                (context_ids, drained)
             };
-            let (removed_count, drained) =
-                tokio::task::block_in_place(|| handle.block_on(shutdown)); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
+            let (context_ids, drained) = tokio::task::block_in_place(|| handle.block_on(shutdown)); // ci-allow: block-on: ADR-049 §7 FFI sync-shutdown
             drained.map_err(|_elapsed| {
                 scp_protocol::context::ContextError::InvalidState(format!(
                     "shutdown_all_contexts_sync: the drain did not finish within {bound:?}; \
                      tracked tasks still run, so the storage backend must stay open"
                 ))
             })?;
+            let removed_count = reap_swept_floors(supervisor, &context_ids);
             tracing::info!(
                 removed_count,
                 "shutdown: removed all contexts, stopped key-package actors, and drained every \
@@ -3962,6 +3975,84 @@ mod shutdown_sweep_tests {
             assert!(rx.recv().await.is_some(), "ShutdownSelf was delivered");
             assert!(rx.recv().await.is_none(), "the despawn closed the inbox");
         }
+    }
+
+    /// An actor that never answers `ShutdownSelf` keeps running until the drain
+    /// awaits it. A persist it makes on its way out still reads the context's
+    /// floors from the registry, and only after the drain does the shutdown
+    /// drop the registry entry.
+    #[tokio::test(start_paused = true)]
+    async fn floors_outlive_an_unanswering_actor_until_the_drain_ends() {
+        use crate::context::actor::commands::LifecycleCommand;
+
+        let sup = supervisor();
+        let ctx_id = "ab".repeat(32);
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_id);
+        sup.check_and_advance_sender_epoch(&ctx_bytes, "floor-sender", 7, u64::MAX)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        sup.register_actor_handle_for_test(&ctx_id, ContextActorHandle::from_sender(tx));
+        let actor_sup = Arc::clone(&sup);
+        let actor = sup
+            .spawn_tracked("unanswering actor", async move {
+                let mut held_replies = Vec::new();
+                while let Some(cmd) = rx.recv().await {
+                    if let ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply }) = cmd
+                    {
+                        held_replies.push(reply);
+                    }
+                }
+                // The inbox closed on the despawn: model the persist of a
+                // command the actor was still running.
+                (actor_sup.export_sender_key_epochs(&ctx_bytes), held_replies)
+            })
+            .expect("spawn before shutdown");
+
+        shutdown_all_contexts(&sup).await;
+
+        assert!(actor.is_finished(), "the drain awaited the actor task");
+        let (seen, held_replies) = actor.await.expect("the actor task does not panic");
+        assert_eq!(
+            held_replies.len(),
+            1,
+            "the actor held the one ShutdownSelf unanswered"
+        );
+        assert_eq!(
+            seen,
+            vec![("floor-sender".to_owned(), 7)],
+            "the actor's last persist read the advanced floor, not an empty export"
+        );
+        assert!(
+            sup.export_sender_key_epochs(&ctx_bytes).is_empty(),
+            "the shutdown dropped the floor entry after the drain"
+        );
+    }
+
+    /// A sync shutdown whose drain times out leaves the floor entry in place,
+    /// because the tracked tasks it abandoned may still persist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_shutdown_keeps_floors_when_the_drain_stalls() {
+        let sup = supervisor();
+        let ctx_id = "cd".repeat(32);
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_id);
+        sup.check_and_advance_sender_epoch(&ctx_bytes, "floor-sender", 3, u64::MAX)
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx);
+        sup.register_actor_handle_for_test(&ctx_id, ContextActorHandle::from_sender(tx));
+        sup.spawn_tracked("never-exiting probe", std::future::pending::<()>())
+            .expect("spawn before shutdown");
+
+        let result = shutdown_all_contexts_sync_within(&sup, Duration::from_millis(200));
+        assert!(
+            result.is_err(),
+            "the stalled drain is abandoned, got {result:?}"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_bytes),
+            vec![("floor-sender".to_owned(), 3)],
+            "the floor entry survives an abandoned drain"
+        );
     }
 
     /// The sync wrapper's deadline bounds only the tracker drain: an actor

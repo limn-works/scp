@@ -2392,6 +2392,7 @@ where
         // with the signer in `SharedSessionState::operator_signer`.
         Arc::clone(&params.operator_signer),
         params.identity.caveats_binding,
+        spawn_pump,
     )
     .await
     .map_err(|err| {
