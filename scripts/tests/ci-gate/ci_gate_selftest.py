@@ -4254,7 +4254,9 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
     CRITERION: each bridge producer's `artifact-inputs` step exits non-zero when any
     command in ARTIFACT_INPUT_TOOLS whose output it hashes fails or when ImageOS is
     unset, exits 0 and writes a digest when every command succeeds, and writes a
-    different digest when the workflow-level env: block changes.
+    different digest when the workflow-level env: block changes, at its top or below
+    the column-0 comments that follow it, or when the job's own definition changes
+    below a comment indented as a job key.
 
     WHY: a tool that fails puts nothing into the digest, so the key stops encoding
     that tool's version, and a later change to the tool restores an artifact the
@@ -4263,6 +4265,9 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
     """
     workflow = WORKFLOW.read_text()
     probed = workflow.replace("\nenv:\n", f"\nenv:\n{ARTIFACT_ENV_PROBE}", 1)
+    # YAML keeps env: open across the column-0 comments below it, so a variable
+    # written just above `jobs:` is still inherited by every build.
+    probed_low = workflow.replace("\njobs:\n", f"\n{ARTIFACT_ENV_PROBE}jobs:\n", 1)
     for job_id in bridge_producers(doc):
         steps = doc["jobs"][job_id]["steps"]
         step = next((s for s in steps if s.get("id") == "artifact-inputs"), None) or {}
@@ -4312,6 +4317,55 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
             probed != workflow and probed_output != output,
             f"adding {ARTIFACT_ENV_PROBE.strip()!r} to the workflow env left the "
             f"digest at {output!r}",
+        )
+        _, low_output = run_artifact_inputs_step(step, job_id, None, workflow=probed_low)
+        check(
+            f"{job_id}: an env variable below the comments after env: changes the digest",
+            probed_low != workflow and low_output != output,
+            f"adding {ARTIFACT_ENV_PROBE.strip()!r} above jobs: left the digest at "
+            f"{output!r}",
+        )
+        # A job key written below a comment at job-key indent is still part of the
+        # job, so two values of that key must give two digests.
+        header = f"\n  {job_id}:\n"
+        job_probes = [
+            workflow.replace(
+                header, f"{header}  # probe\n    continue-on-error: {value}\n", 1
+            )
+            for value in ("false", "true")
+        ]
+        job_outputs = [
+            run_artifact_inputs_step(step, job_id, None, workflow=w)[1]
+            for w in job_probes
+        ]
+        check(
+            f"{job_id}: a job key below a job-indent comment changes the digest",
+            job_probes[0] != workflow and job_outputs[0] != job_outputs[1],
+            f"changing a key below a comment in job {job_id} left the digest at "
+            f"{job_outputs[0]!r}",
+        )
+        # Control: extraction that stops at any column-0 or job-indent line, comments
+        # included, misses both probes above.
+        comment_stop = script.replace("/^[^ #]/", "/^[^ ]/").replace(
+            "/^  [^ #]/", "/^  [^ ]/"
+        )
+        _, stop_plain = run_artifact_inputs_step(step, job_id, None, script=comment_stop)
+        _, stop_low = run_artifact_inputs_step(
+            step, job_id, None, script=comment_stop, workflow=probed_low
+        )
+        stop_jobs = [
+            run_artifact_inputs_step(
+                step, job_id, None, script=comment_stop, workflow=w
+            )[1]
+            for w in job_probes
+        ]
+        check(
+            f"{job_id}: a step whose extraction stops at a comment is reported",
+            comment_stop != script
+            and stop_low == stop_plain
+            and stop_jobs[0] == stop_jobs[1],
+            "extraction that stops at a comment still saw a variable or job key "
+            "written below one",
         )
         # Control: the step with its workflow-env line removed is reported.
         without_env = "\n".join(
