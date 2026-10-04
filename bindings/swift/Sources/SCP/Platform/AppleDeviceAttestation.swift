@@ -782,8 +782,8 @@
         /// `09-security-model.md` §9.3.1, whose separator §9.18.2 registers.
         /// `K`'s preimage differs from the preimages of the binding digest
         /// `D` and the assertion digest `A`, so `K` equals neither short of a
-        /// SHA-256 collision. Apple signs it with the stored key, and this
-        /// adapter discards that assertion.
+        /// SHA-256 collision. This adapter discards Apple's assertion over
+        /// `K`.
         private static let keyProbeClientDataHash = Data(SHA256.hash(data: Data("SCP-APP-ATTEST-KEY-PROBE-V1".utf8)))
 
         /// Ask Apple for an assertion over `keyProbeClientDataHash` with a
