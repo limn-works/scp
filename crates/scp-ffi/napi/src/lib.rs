@@ -68,6 +68,10 @@
 // implementation detail — the generated code is correct.
 #![allow(clippy::trailing_empty_array)]
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;

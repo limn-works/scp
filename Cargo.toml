@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/scp-alloc",
     "crates/scp-clock",
     "crates/scp-crypto",
     "crates/scp-did",
