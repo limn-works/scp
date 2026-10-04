@@ -1837,7 +1837,7 @@ pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
 ///
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
-/// the NAPI-side copy used by UCAN/outlet capability checks stays current.
+/// the NAPI-side copy stays current.
 ///
 /// # Errors
 ///
@@ -1888,8 +1888,7 @@ pub async fn sync_role_state_from_manager(
 /// AUTHENTICATED context params carried by a joined
 /// [`ContextHandle`](scp_core::context::ContextHandle).
 ///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/outlet capability-check ceiling string set. Used by
+/// Peer of [`sync_role_state_from_manager`] (which syncs role state). Used by
 /// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
 /// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
 /// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
@@ -2028,11 +2027,7 @@ where
 /// Refuses `verb` unless `context_id`'s supervisor actor reports `Active`, and
 /// withholds the lifecycle state from the refusal.
 ///
-/// The UCAN entry points in `ucan.rs` (`ucan_validate_on`, `ucan_evaluate_on`,
-/// `ucan_mint_on`, `ucan_delegate_on`, `ucan_revoke_on`) gate through this form
-/// rather than [`require_active_context`], because each one runs the gate
-/// before it authorizes the caller. The outlet PRD's SCP-OUT-031 PR-2a note
-/// records the rule this form keeps: the raw lifecycle state never reaches an
+/// The outlet PRD's SCP-OUT-031 PR-2a note records the rule this form keeps: the raw lifecycle state never reaches an
 /// FFI caller before authorization. The refusal therefore reads the same for
 /// every non-`Active` state, for a context no actor serves, and for a state
 /// read that failed: a closing or closed context, a context mid-respawn or
@@ -2078,43 +2073,110 @@ where
     }
 }
 
-/// Applies the [`require_active_context_before_authz`] refusal rule to a
-/// supervisor read an entry point makes after that gate passed.
+/// Reads `context_id`'s role state for an authorization decision after its
+/// supervisor actor reports `Active`, and withholds the lifecycle state from
+/// the refusal.
 ///
-/// The gate and the later [`live_role_state`] read are two mailbox round trips,
-/// and a close, a crash, or a saturated mailbox can land between them. A read
-/// that fails there would otherwise hand the caller the context id (the
-/// absent-role-state text names it) or the actor's fault code
-/// (`SCP-CTX-2130`, `SCP-CTX-2135`, `SCP-CTX-2134`) before authorization, so
-/// each such failure becomes the same withheld refusal `mk_err` builds. The cause
-/// goes to the `debug` log, where an operator can still read it.
+/// The function resolves the bridge's supervisor once and hands it to
+/// `active_role_state_on`, which runs both reads and takes no
+/// `&NapiBridgeInstance`, so neither read can resolve the supervisor again. The
+/// two reads are two mailbox round trips, and a close, a crash, or a saturated
+/// mailbox can land between them. The outlet PRD's SCP-OUT-031 PR-2a note
+/// records the rule this function keeps: the raw lifecycle state never reaches
+/// an FFI caller before authorization. The refusal therefore reads the same
+/// for every non-`Active` state, for a context no actor serves, for an actor
+/// fault either read meets (`ActorBusy`, `ActorCrashed`, `ContextPoisoned`),
+/// and for an actor that returned no role state: each refuses with the same
+/// text and the caller's code, and the text never names the context. The
+/// cause goes to the `debug` log, where an operator can still read it.
+///
+/// `mk_err` wraps the refusal message in the error variant and the error code
+/// the calling entry point reports.
 ///
 /// # Errors
 ///
-/// Returns [`ScpNapiError::Context`] with `SCP-CTX-2000` when `read` is an
-/// error and `bi` is suspended or holds no supervisor, as the gate does.
-/// Returns whatever `mk_err` builds when `read` is any other error.
-pub fn withhold_read_before_authz<T, F>(
+/// Returns whatever `mk_err` builds when the supervisor reports any state other
+/// than `Active`, when no actor serves `context_id`, when either read fails,
+/// and when the supervisor holds no role state for `context_id`. Returns
+/// [`ScpNapiError::Context`] with `SCP-CTX-2000` when this bridge has no
+/// supervisor or is suspended (call `resume()` and retry); that refusal
+/// describes this bridge's own state, not the context, so it passes through
+/// unchanged.
+pub async fn active_role_state_before_authz<F>(
     bi: &NapiBridgeInstance,
     context_id: &str,
-    read: Result<T, ScpNapiError>,
     verb: &str,
     mk_err: F,
-) -> Result<T, ScpNapiError>
+) -> Result<ContextRoleState, ScpNapiError>
 where
     F: FnOnce(String) -> ScpNapiError,
 {
-    read.map_err(|e| {
-        if let Err(bridge_local) = typed_supervisor(bi) {
-            return bridge_local;
-        }
-        tracing::debug!(
-            context_id,
-            error = %e,
-            "supervisor read after the pre-authorization gate failed; withholding the cause"
-        );
-        mk_err(withheld_refusal(verb))
-    })
+    active_role_state_on(Arc::clone(typed_supervisor(bi)?), context_id, verb, mk_err).await
+}
+
+/// Runs both [`active_role_state_before_authz`] reads, the lifecycle state
+/// read and then the role-state read, on `sup`, the supervisor that function
+/// resolved.
+async fn active_role_state_on<F>(
+    sup: Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    verb: &str,
+    mk_err: F,
+) -> Result<ContextRoleState, ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+{
+    let state = sup
+        .read_context_state_checked(context_id)
+        .await
+        .map_err(ScpNapiError::from);
+    withhold_before_authz(
+        context_id,
+        state,
+        || async move {
+            sup.get_role_state_checked(context_id)
+                .await
+                .map_err(ScpNapiError::from)
+        },
+        verb,
+        mk_err,
+    )
+    .await
+}
+
+/// Applies the [`active_role_state_before_authz`] refusal rule to a lifecycle
+/// state answer and a role-state read: `read_role_state` runs only after
+/// `state` reads `Active`. Every outcome other than an `Active` state followed
+/// by a present role state becomes the one withheld refusal `mk_err` builds,
+/// and its cause goes to the `debug` log.
+async fn withhold_before_authz<F, R, Fut>(
+    context_id: &str,
+    state: Result<Option<scp_core::context::ContextState>, ScpNapiError>,
+    read_role_state: R,
+    verb: &str,
+    mk_err: F,
+) -> Result<ContextRoleState, ScpNapiError>
+where
+    F: FnOnce(String) -> ScpNapiError,
+    R: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ContextRoleState>, ScpNapiError>>,
+{
+    let cause = match state {
+        Ok(Some(scp_core::context::ContextState::Active)) => match read_role_state().await {
+            Ok(Some(role_state)) => return Ok(role_state),
+            Ok(None) => "the supervisor holds no role state".to_owned(),
+            Err(e) => format!("role-state read failed: {e}"),
+        },
+        Ok(Some(other)) => format!("lifecycle state is {}", context_state_str(&other)),
+        Ok(None) => "no actor serves the context".to_owned(),
+        Err(e) => format!("lifecycle read failed: {e}"),
+    };
+    tracing::debug!(
+        context_id,
+        cause = %cause,
+        "pre-authorization gate refused; withholding the cause from the caller"
+    );
+    Err(mk_err(withheld_refusal(verb)))
 }
 
 /// The refusal text both pre-authorization forms report: `verb` plus the
@@ -2128,16 +2190,7 @@ fn withheld_refusal(verb: &str) -> String {
 
 /// Reads a context's role state from that context's supervisor actor.
 ///
-/// The UCAN entry points in `ucan.rs` read the capability ceiling and the
-/// context creator through this function at the moment they decide, never
-/// through the bridge copies `UcanContextState.role_state`,
-/// `UcanContextStateCore.ceiling_strings` and `UcanContextStateCore.creator_did`.
-/// ADR-016 step 8 compares a token's grants against the context's ceiling and
-/// step 4 checks that the chain's root issuer is the context creator. A
-/// bridge-local copy only refreshes when THIS bridge performs the mutation, so
-/// a `ModifyCeiling` or a membership change the supervisor applied by another
-/// route leaves a copy that still grants authority the supervisor already
-/// withdrew.
+/// Reports each failure as itself.
 ///
 /// Fails closed. A context whose actor returns no role state yields
 /// [`ScpNapiError::Context`] with `SCP-CTX-2023`; no caller receives a
@@ -2166,26 +2219,6 @@ pub async fn live_role_state(
             ),
             code: codes::CTX_2023.to_owned(),
         })
-}
-
-/// Reads a context's capability ceiling from that context's supervisor actor,
-/// as the `{resource}:{action}` UCAN capability names ADR-016 step 8 compares a
-/// token's grants against.
-///
-/// A caller that also needs the creator or the membership calls
-/// [`live_role_state`] once and derives the ceiling from it.
-///
-/// # Errors
-///
-/// Returns every error [`live_role_state`] returns.
-pub async fn live_ceiling_strings(
-    bi: &NapiBridgeInstance,
-    context_id: &str,
-) -> Result<HashSet<String>, ScpNapiError> {
-    Ok(live_role_state(bi, context_id)
-        .await?
-        .ceiling()
-        .to_ucan_string_set())
 }
 
 /// Renders a [`ContextState`](scp_core::context::ContextState) as the lowercase
@@ -2366,6 +2399,51 @@ pub(crate) async fn create_supervisor_context_with_ceiling_for_test(
         })
         .collect::<napi::Result<Vec<_>>>()?;
     create_supervisor_context_with_capabilities(bi, context_id, creator_did, ceiling).await
+}
+
+/// The creator [`narrow_bridge_copy_for_test`] writes into a bridge copy. No
+/// identity and no supervisor context carries it.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) const NARROWED_COPY_CREATOR: &str = "did:dht:z6MkNapiNarrowedBridgeCopyCreator";
+
+/// Overwrites the bridge copy of `context_id`'s role state
+/// (`UcanContextState::role_state`, `core.ceiling_strings` and
+/// `core.creator_did`) with a `messages:read`-only ceiling and
+/// [`NARROWED_COPY_CREATOR`] as the creator.
+///
+/// An entry point that still passes after this call took its ceiling, roles
+/// and creator from the supervisor: the copy would refuse it.
+///
+/// # Errors
+///
+/// Returns the registry error when `context_id` has no bridge copy. The
+/// calling test fails on it, because it is a broken fixture rather than a
+/// condition under test.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) fn narrow_bridge_copy_for_test(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpNapiError> {
+    let ceiling = scp_core::context::roles::CapabilityCeiling::new([
+        scp_core::context::roles::Capability::MessagesRead,
+    ]);
+    let role_state = ContextRoleState::new(
+        context_id,
+        NARROWED_COPY_CREATOR,
+        ceiling.clone(),
+        Vec::new(),
+        &SystemClock,
+    )
+    .map_err(|e| ScpNapiError::Validation {
+        message: format!("narrowed role state does not build: {e}"),
+        code: codes::VALID_7004.to_owned(),
+    })?;
+    with_context(bi, context_id, |rt| {
+        rt.core.ceiling_strings = ceiling.to_ucan_string_set();
+        NARROWED_COPY_CREATOR.clone_into(&mut rt.core.creator_did);
+        rt.role_state = role_state;
+        Ok(())
+    })
 }
 
 /// The shared body of the two supervisor-context test fixtures.
@@ -2884,6 +2962,10 @@ mod tests {
         require_active_context_before_authz(&bi, &active, "probe", caller_refusal)
             .await
             .expect("the gate must admit an Active context");
+        let role_state = active_role_state_before_authz(&bi, &active, "probe", caller_refusal)
+            .await
+            .expect("the gate-and-read must admit an Active context");
+        assert_eq!(role_state.creator_did, creator);
 
         for fault in [
             "absent",
@@ -2906,27 +2988,34 @@ mod tests {
                 _ => {}
             }
 
-            let err = require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+            let gate_err =
+                require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
+                    .await
+                    .expect_err("the gate must refuse a context that is not Active");
+            let read_err = active_role_state_before_authz(&bi, &ctx_id, "probe", caller_refusal)
                 .await
-                .expect_err("the gate must refuse a context that is not Active");
-            let text = err.to_string();
-            assert!(
-                text.contains(&format!(
-                    "cannot probe: {}",
-                    scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
-                )) && text.contains(codes::VALID_7004),
-                "the refusal must carry the withheld text and the caller's code ({fault}): {text}"
-            );
-            for leaked in [
-                ctx_id.as_str(),
-                codes::CTX_2130,
-                codes::CTX_2134,
-                codes::CTX_2135,
-            ] {
+                .expect_err("the gate-and-read must refuse a context that is not Active");
+            for (form, err) in [("gate", gate_err), ("gate-and-read", read_err)] {
+                let text = err.to_string();
                 assert!(
-                    !text.contains(leaked),
-                    "the refusal must not disclose {leaked:?} ({fault}): {text}"
+                    text.contains(&format!(
+                        "cannot probe: {}",
+                        scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                    )) && text.contains(codes::VALID_7004),
+                    "the {form} refusal must carry the withheld text and the caller's code \
+                     ({fault}): {text}"
                 );
+                for leaked in [
+                    ctx_id.as_str(),
+                    codes::CTX_2130,
+                    codes::CTX_2134,
+                    codes::CTX_2135,
+                ] {
+                    assert!(
+                        !text.contains(leaked),
+                        "the {form} refusal must not disclose {leaked:?} ({fault}): {text}"
+                    );
+                }
             }
         }
     }
@@ -2974,17 +3063,17 @@ mod tests {
             .expect("the gate must admit the Active context after resume");
     }
 
-    /// A supervisor read that fails after the gate passed becomes the same
-    /// withheld refusal, and a read that succeeds passes through unchanged.
+    /// A role-state read that fails after the lifecycle state read `Active`
+    /// becomes the same withheld refusal, a read that finds no role state does
+    /// too, and a read that succeeds passes through unchanged.
     ///
     /// Each input carries what a raw failure would hand an unauthorized
     /// caller: the context id the absent-role-state refusal names, or an actor
     /// fault code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_read_that_fails_after_the_gate_is_withheld() {
-        let bi = NapiBridgeInstance::new_napi();
-        init_supervisor_for_test_on(&bi);
         let ctx_id = "ctx-withheld-after-gate";
+        let active = || Ok(Some(scp_core::context::ContextState::Active));
         for raw in [
             ScpNapiError::Context {
                 message: format!("context '{ctx_id}' has no live supervisor role state"),
@@ -3001,9 +3090,15 @@ mod tests {
             )),
         ] {
             let raw_text = raw.to_string();
-            let err =
-                withhold_read_before_authz::<(), _>(&bi, ctx_id, Err(raw), "probe", caller_refusal)
-                    .expect_err("a failed read must stay a refusal");
+            let err = withhold_before_authz(
+                ctx_id,
+                active(),
+                || async { Err(raw) },
+                "probe",
+                caller_refusal,
+            )
+            .await
+            .expect_err("a failed read must stay a refusal");
             let text = err.to_string();
             assert!(
                 text.contains(&format!(
@@ -3018,30 +3113,51 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            withhold_read_before_authz(&bi, ctx_id, Ok(7_u8), "probe", caller_refusal)
-                .expect("a successful read passes through"),
-            7
+        let err = withhold_before_authz(
+            ctx_id,
+            active(),
+            || async { Ok(None) },
+            "probe",
+            caller_refusal,
+        )
+        .await
+        .expect_err("an absent role state must stay a refusal");
+        assert!(
+            err.to_string().contains(&format!(
+                "cannot probe: {}",
+                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+            )) && !err.to_string().contains(ctx_id),
+            "an absent role state must be the withheld refusal: {err}"
         );
+
+        let creator = "did:key:z6MkNapiWithholdPassThrough";
+        let role_state =
+            ContextRoleState::new(ctx_id, creator, default_ceiling(), Vec::new(), &SystemClock)
+                .expect("default role state");
+        let passed = withhold_before_authz(
+            ctx_id,
+            active(),
+            || async { Ok(Some(role_state)) },
+            "probe",
+            caller_refusal,
+        )
+        .await
+        .expect("a successful read passes through");
+        assert_eq!(passed.creator_did, creator);
     }
 
-    /// A read that fails while the bridge is suspended, or on a bridge with no
-    /// supervisor, keeps the bridge-local `SCP-CTX-2000` refusal the gate
-    /// passes through, so the caller reads "call `resume()`" rather than
-    /// "context is not active". Once the bridge resumes, the same failed read
-    /// is withheld again.
+    /// The gate-and-read keeps the bridge-local `SCP-CTX-2000` refusal on a
+    /// bridge with no supervisor and on a suspended bridge, so the caller reads
+    /// "call `resume()`" rather than "context is not active". Once the bridge
+    /// resumes, a context with no role state is withheld again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_read_that_fails_on_a_suspended_bridge_keeps_the_ctx_2000_refusal() {
         let ctx_id = "ctx-suspended-after-gate";
-        let raw = || ScpNapiError::Context {
-            message: format!("context '{ctx_id}' has no live supervisor role state"),
-            code: codes::CTX_2023.to_owned(),
-        };
 
         let bare = NapiBridgeInstance::new_napi();
-        let err =
-            withhold_read_before_authz::<(), _>(&bare, ctx_id, Err(raw()), "probe", caller_refusal)
-                .expect_err("a bridge with no supervisor must refuse");
+        let err = active_role_state_before_authz(&bare, ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a bridge with no supervisor must refuse");
         assert!(
             matches!(&err, ScpNapiError::Context { code, message }
                 if code == codes::CTX_2000 && message.contains("Supervisor not yet attached")),
@@ -3051,9 +3167,9 @@ mod tests {
         let bi = NapiBridgeInstance::new_napi();
         init_supervisor_for_test_on(&bi);
         bi.core.suspend().expect("suspend");
-        let err =
-            withhold_read_before_authz::<(), _>(&bi, ctx_id, Err(raw()), "probe", caller_refusal)
-                .expect_err("a suspended bridge must refuse");
+        let err = active_role_state_before_authz(&bi, ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a suspended bridge must refuse");
         assert!(
             matches!(&err, ScpNapiError::Context { code, message }
                 if code == codes::CTX_2000 && message.contains("bridge is suspended")),
@@ -3066,15 +3182,15 @@ mod tests {
         );
 
         bi.core.resume().await.expect("resume");
-        let err =
-            withhold_read_before_authz::<(), _>(&bi, ctx_id, Err(raw()), "probe", caller_refusal)
-                .expect_err("a failed read must stay a refusal");
+        let err = active_role_state_before_authz(&bi, ctx_id, "probe", caller_refusal)
+            .await
+            .expect_err("a context no actor serves must stay a refusal");
         assert!(
             err.to_string().contains(&format!(
                 "cannot probe: {}",
                 scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
             )) && err.to_string().contains(codes::VALID_7004),
-            "after resume the failed read must be withheld again: {err}"
+            "after resume the refusal must be withheld again: {err}"
         );
     }
 
@@ -3103,9 +3219,7 @@ mod tests {
             .expect("an Active context answers");
         assert_eq!(role_state.creator_did, creator);
         assert_eq!(
-            live_ceiling_strings(&bi, &active)
-                .await
-                .expect("an Active context answers"),
+            role_state.ceiling().to_ucan_string_set(),
             HashSet::from(["messages:read".to_owned()]),
         );
 

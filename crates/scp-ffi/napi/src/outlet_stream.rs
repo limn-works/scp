@@ -417,7 +417,6 @@ pub(crate) async fn outlet_stream_open_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let input_json_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Outlet {
@@ -425,6 +424,24 @@ pub(crate) async fn outlet_stream_open_on(
             code: codes::OUTLET_6002.to_owned(),
         })
     })?;
+
+    // The supervisor actor answers the lifecycle question before the UCAN
+    // pipeline reads the live role state, so a context no actor serves refuses
+    // with the same withheld text as every other non-`Active` state — see
+    // `crate::runtime::active_role_state_before_authz`.
+    let open_refusal = |message: String| ScpNapiError::Outlet {
+        message,
+        code: codes::OUTLET_6005.to_owned(),
+    };
+    let role_state = crate::runtime::active_role_state_before_authz(
+        bi,
+        &context_id,
+        "open outlet stream in context",
+        open_refusal,
+    )
+    .await
+    .map_err(napi::Error::from)?;
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Primary authorization: the full 11-step ADR-016 UCAN pipeline over the
     // bridge-owned per-context UCAN state — IDENTICAL to `outlet_invoke_on`. The
@@ -444,6 +461,7 @@ pub(crate) async fn outlet_stream_open_on(
         &caller_did,
         &ucan_token,
         &proof_resolver,
+        &role_state,
     )
     .map_err(napi::Error::from)?;
 
@@ -1148,17 +1166,14 @@ pub(crate) async fn outlet_streaming_saga_open_on(
 
     let caller_context_id = source_handle.context_id();
     let target_context_id = target_handle.context_id();
-    let caller_creator_did = source_handle.creator_did();
-    let target_creator_did = target_handle.creator_did();
 
     // Both contexts MUST be Active before this money-moving open touches any
     // state. Read the AUTHORITATIVE lifecycle state from the per-context
-    // supervisor actor (`read_context_state`) — NOT the bridge-cached
+    // supervisor actor (`Supervisor::read_context_state_checked`) — NOT the bridge-cached
     // `NapiContextHandle::state()`, which LAGS: on close the core handle flips to
     // `Closing` immediately, but the FFI cache stays `"active"` until the async
     // finalize completes. A stale-cache read would let a `Closing` context (actor
-    // alive, members intact) pass this gate and DEBIT ESCROW. Mirrors the PyO3
-    // reference's authoritative `read_context_state`. A missing actor (`None`) is
+    // alive, members intact) pass this gate and DEBIT ESCROW. A missing actor is
     // treated as non-active (fail-closed).
     //
     // TARGET axis: DEFENSE-IN-DEPTH (#2196). CALLER/source axis: still primary.
@@ -1174,30 +1189,36 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     // non-active source from initiating the saga. Both checked BEFORE input
     // validation, the caller-principal binding, and the saga drive, so a
     // non-active context is rejected before any receiver is handed out.
-    // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis).
-    let supervisor = crate::runtime::supervisor(bi)?;
-    let source_state = supervisor.read_context_state(&caller_context_id).await;
-    if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: caller context in \
-                 {source_state:?} state"
-            ),
-            code: codes::OUTLET_6010.to_owned(),
-        }
-        .into());
-    }
-    let target_state = supervisor.read_context_state(&target_context_id).await;
-    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: target context in \
-                 {target_state:?} state"
-            ),
-            code: codes::OUTLET_6011.to_owned(),
-        }
-        .into());
-    }
+    // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis). Both gates
+    // run before the caller-principal binding, so both withhold the lifecycle
+    // state (see `crate::runtime::active_role_state_before_authz`). The caller
+    // gate also reads the creator the caller side signs as, and the target gate
+    // reads the role state step (c) authorizes against.
+    let caller_refusal = |message: String| ScpNapiError::Outlet {
+        message,
+        code: codes::OUTLET_6010.to_owned(),
+    };
+    let target_refusal = |message: String| ScpNapiError::Outlet {
+        message,
+        code: codes::OUTLET_6011.to_owned(),
+    };
+    let caller_creator_did = crate::runtime::active_role_state_before_authz(
+        bi,
+        &caller_context_id,
+        "start cross-context streaming saga from caller context",
+        caller_refusal,
+    )
+    .await
+    .map_err(napi::Error::from)?
+    .creator_did;
+    let target_role_state = crate::runtime::active_role_state_before_authz(
+        bi,
+        &target_context_id,
+        "start cross-context streaming saga into target context",
+        target_refusal,
+    )
+    .await
+    .map_err(napi::Error::from)?;
 
     // ----- (a) validate inputs ------------------------------------------------
     validate_context_id(&caller_context_id)
@@ -1229,8 +1250,8 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     //
     // Runs before ANY per-context state mutation or outlet read, so an
     // unauthenticated caller is rejected before it can touch B's state (identical
-    // to the `PyO3` reference's ordering). `supervisor` was resolved above for the
-    // authoritative lifecycle gate; reuse it.
+    // to the `PyO3` reference's ordering).
+    let supervisor = crate::runtime::supervisor(bi)?;
     crate::outlets::enforce_caller_principal_binding(
         bi,
         supervisor,
@@ -1265,6 +1286,7 @@ pub(crate) async fn outlet_streaming_saga_open_on(
         &caller_did,
         &ucan_token,
         &proof_resolver,
+        &target_role_state,
     )
     .map_err(napi::Error::from)?;
 
@@ -1422,9 +1444,15 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     };
 
     // ----- (d) signing keys: each co-resident context's Active Signing Key ----
-    let target_signing_key =
-        crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
-            .await?;
+    //
+    // Each side signs as the creator its supervisor actor reported to that
+    // side's gate at the top of this function.
+    let target_signing_key = crate::outlets::resolve_context_signing_key(
+        bi,
+        &target_role_state.creator_did,
+        &target_context_id,
+    )
+    .await?;
     let caller_signing_key =
         crate::outlets::resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id)
             .await?;
@@ -1601,11 +1629,12 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
     }
 
     // Resolve the TARGET context's Active Signing Key per-call from custody
-    // (never envelope-asserted): its creator_did off the per-context FFI state,
-    // then the raw signing key via the shared saga resolver.
-    let target_creator_did =
-        crate::runtime::with_context(bi, &target_context_id, |rt| Ok(rt.core.creator_did.clone()))
-            .map_err(napi::Error::from)?;
+    // (never envelope-asserted). Recovery runs after the invoker check above,
+    // so a failed read is reported as itself.
+    let target_creator_did = crate::runtime::live_role_state(bi, &target_context_id)
+        .await
+        .map_err(napi::Error::from)?
+        .creator_did;
     let target_key =
         crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
             .await?;
