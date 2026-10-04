@@ -21,7 +21,6 @@ derives the version from that file:
 | `cargo`, `rustup` | natively, for any command run inside the repository; rustup installs the `channel`, `components`, and `targets` the file names on first use |
 | `Dockerfile` | copies the file into the builder image before the first cargo command; the base tag names a Debian release only |
 | `templates/personal-relay/README.md` | its `COPY . .` brings the file into the image, for the same reason |
-| the CI workflows | their `dtolnay/rust-toolchain@stable` steps select no version — that action reads no toolchain file — so each one installs rustup's `stable` and runs `rustup default stable`, and rustup then applies `rust-toolchain.toml` as a directory override, which beats the default |
 
 `fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs, because
 cargo-fuzz does not run on stable. rustup applies the toolchain file of the directory a
