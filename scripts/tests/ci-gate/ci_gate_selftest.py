@@ -3984,6 +3984,16 @@ ARTIFACT_KEY_FILE_INPUTS = (
     (".cargo/**", "the repository's cargo config"),
     ("crates/**", "the sources of every crate a bridge reaches"),
 )
+# The build input outside crates/ that one producer reads, keyed by job id.
+ARTIFACT_KEY_JOB_FILE_INPUTS = {
+    "pyo3-module": (("bindings/python/pyproject.toml", "the [tool.maturin] features"),),
+    "pyo3-module-macos": (
+        ("bindings/python/pyproject.toml", "the [tool.maturin] features"),
+    ),
+    "xcframework": (
+        ("bindings/swift/build-xcframework.sh", "the script that runs the build"),
+    ),
+}
 ARTIFACT_KEY_EXPRESSION_INPUTS = (
     ("runner.os", "the runner OS"),
     ("runner.arch", "the runner architecture"),
@@ -4016,8 +4026,8 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
 
     CRITERION: every ci.yml job that uploads an artifact another ci.yml job downloads
     restores that artifact with `actions/cache/restore` under a key that names the
-    version literal, each file pattern in ARTIFACT_KEY_FILE_INPUTS inside a
-    `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
+    version literal, each file pattern in ARTIFACT_KEY_FILE_INPUTS and the job's
+    entries in ARTIFACT_KEY_JOB_FILE_INPUTS inside a `hashFiles` call, and each context in ARTIFACT_KEY_EXPRESSION_INPUTS; computes the
     digest that key reads in a step that hashes the job's own definition out of
     ci.yml; restores, saves and uploads one path list; and saves under the key it
     restored.
@@ -4058,7 +4068,9 @@ def artifact_cache_key_gaps(doc: dict) -> list[str]:
             gaps.append(
                 f"{job_id}: key carries no bridge-artifact-v<N> version literal"
             )
-        for pattern, meaning in ARTIFACT_KEY_FILE_INPUTS:
+        for pattern, meaning in (
+            ARTIFACT_KEY_FILE_INPUTS + ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ())
+        ):
             if pattern not in hashed:
                 gaps.append(f"{job_id}: key hashes no {pattern} ({meaning})")
         expressions = re.findall(r"\$\{\{\s*([^}]*?)\s*\}\}", key)
@@ -4134,12 +4146,13 @@ def check_artifact_cache_keys(doc: dict) -> None:
         f"found {producers}",
     )
     # Control: each producer, with each input removed from its key in turn, is reported.
-    removable = (
-        [pattern for pattern, _ in ARTIFACT_KEY_FILE_INPUTS]
-        + [context for context, _ in ARTIFACT_KEY_EXPRESSION_INPUTS]
-        + ["version"]
-    )
     for job_id in producers:
+        removable = (
+            [pattern for pattern, _ in ARTIFACT_KEY_FILE_INPUTS]
+            + [pattern for pattern, _ in ARTIFACT_KEY_JOB_FILE_INPUTS.get(job_id, ())]
+            + [context for context, _ in ARTIFACT_KEY_EXPRESSION_INPUTS]
+            + ["version"]
+        )
         for index, step in enumerate(doc["jobs"][job_id]["steps"]):
             if not str(step.get("uses") or "").startswith("actions/cache/restore"):
                 continue
@@ -4160,13 +4173,98 @@ def check_artifact_cache_keys(doc: dict) -> None:
                 )
 
 
+ARTIFACT_INPUT_TOOLS = ("git", "python", "maturin", "ldd", "xcodebuild", "xcrun")
+
+
+def run_artifact_inputs_step(
+    script: str, job_id: str, failing: str | None
+) -> tuple[int, str]:
+    """Run an artifact-inputs step with every tool stubbed and `failing` exiting 1.
+
+    Return the exit code and what the step wrote to GITHUB_OUTPUT.
+    """
+    with tempfile.TemporaryDirectory() as root:
+        tree = Path(root, "tree")
+        (tree / ".github/workflows").mkdir(parents=True)
+        (tree / ".github/workflows/ci.yml").write_text(WORKFLOW.read_text())
+        (tree / ".venv/bin").mkdir(parents=True)
+        (tree / ".venv/bin/activate").write_text("")
+        stubs = Path(root, "stubs")
+        stubs.mkdir()
+        for tool in ARTIFACT_INPUT_TOOLS:
+            body = "exit 1" if tool == failing else f"echo {tool}-stub"
+            (stubs / tool).write_text(f"#!/bin/sh\n{body}\n")
+            (stubs / tool).chmod(0o755)
+        runner_temp = Path(root, "runner-temp")
+        runner_temp.mkdir()
+        output = Path(root, "github-output")
+        output.write_text("")
+        script_file = Path(root, "step.sh")
+        script_file.write_text(script)
+        env = {
+            **os.environ,
+            "PATH": f"{stubs}{os.pathsep}{os.environ.get('PATH', '')}",
+            "GITHUB_JOB": job_id,
+            "GITHUB_OUTPUT": str(output),
+            "RUNNER_TEMP": str(runner_temp),
+        }
+        # The shell GitHub runs a `run:` step under on Linux and macOS runners.
+        shell = ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+        code = subprocess.run(
+            [*shell, str(script_file)],
+            cwd=tree,
+            env=env,
+            capture_output=True,
+            check=False,
+        ).returncode
+        return code, output.read_text()
+
+
+def check_artifact_input_digests_fail_closed(doc: dict) -> None:
+    """Run each producer's artifact-inputs step with each tool it calls failing.
+
+    CRITERION: each bridge producer's `artifact-inputs` step exits non-zero when any
+    command in ARTIFACT_INPUT_TOOLS whose output it hashes fails, and exits 0 and
+    writes a digest when every command succeeds.
+
+    WHY: a tool that fails puts nothing into the digest, so the key stops encoding
+    that tool's version, and a later change to the tool restores an artifact the
+    earlier version built.
+    """
+    for job_id in bridge_producers(doc):
+        steps = doc["jobs"][job_id]["steps"]
+        step = next((s for s in steps if s.get("id") == "artifact-inputs"), None)
+        script = str((step or {}).get("run") or "")
+        tools = [
+            tool
+            for tool in ARTIFACT_INPUT_TOOLS
+            if re.search(rf"^\s*{tool}\b", script, re.MULTILINE)
+        ]
+        code, output = run_artifact_inputs_step(script, job_id, None)
+        check(
+            f"{job_id}: the artifact-inputs step writes a digest when every tool runs",
+            bool(tools)
+            and code == 0
+            and re.fullmatch(r"digest=[0-9a-f]{64}\n", output) is not None,
+            f"exit {code}, output {output!r}, tools {tools}",
+        )
+        for tool in tools:
+            code, _ = run_artifact_inputs_step(script, job_id, tool)
+            check(
+                f"{job_id}: the artifact-inputs step fails when {tool} fails",
+                code != 0,
+                f"the step hashed a failed {tool} and exited 0",
+            )
+
+
 def check_xcframework_outputs_are_verified(doc: dict) -> None:
     """Run the xcframework job's verify step against each uploaded path gone or stale.
 
     CRITERION: for every path the `swift-xcframework-dev` upload lists, the step
     before that upload exits non-zero when the path is absent or holds nothing
     newer than the marker the build step touches, and exits 0 when every path is
-    fresh.
+    fresh. On a cache hit (ARTIFACT_CACHE_HIT=true, no build, no marker) the step
+    exits non-zero when a path is absent and exits 0 when every path is present.
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
     nothing. The upload lists the tracked ScpBindings.swift, so the checkout always
@@ -4182,13 +4280,14 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
     paths = (steps[upload]["with"]["path"]).split()
     now = 1_000_000_000
 
-    def run_with(missing: str | None, stale: str | None) -> int:
+    def run_with(missing: str | None, stale: str | None, hit: bool = False) -> int:
         with tempfile.TemporaryDirectory() as root:
             runner_temp = Path(root, "runner-temp")
             runner_temp.mkdir()
-            marker = runner_temp / "xcframework-build-start"
-            marker.touch()
-            os.utime(marker, (now, now))
+            if not hit:
+                marker = runner_temp / "xcframework-build-start"
+                marker.touch()
+                os.utime(marker, (now, now))
             for path in paths:
                 if path == missing:
                     continue
@@ -4196,10 +4295,13 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
                 file = target / "content" if target.suffix != ".swift" else target
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.touch()
-                stamp = now - 100 if path == stale else now + 100
+                stamp = now - 100 if path == stale or hit else now + 100
                 for entry in {file, target}:
                     os.utime(entry, (stamp, stamp))
             env = {**os.environ, "RUNNER_TEMP": str(runner_temp)}
+            env.pop("ARTIFACT_CACHE_HIT", None)
+            if hit:
+                env["ARTIFACT_CACHE_HIT"] = "true"
             return subprocess.run(
                 ["bash", "-c", script],
                 cwd=Path(root, "tree"),
@@ -4223,6 +4325,18 @@ def check_xcframework_outputs_are_verified(doc: dict) -> None:
             f"xcframework: a {path} older than the build fails the producer",
             run_with(None, path) != 0,
             f"the verify step before the upload passes over a stale {path}",
+        )
+    check(
+        "xcframework: on a cache hit the verify step passes when the restore wrote "
+        "every output",
+        run_with(None, None, hit=True) == 0,
+        "the verify step rejects a cache hit that restored every uploaded path",
+    )
+    for path in paths:
+        check(
+            f"xcframework: on a cache hit a missing {path} fails the producer",
+            run_with(path, None, hit=True) != 0,
+            f"the verify step passes a cache hit without {path}",
         )
 
 
@@ -4436,6 +4550,9 @@ def main() -> int:
         "artifact-key — a bridge producer reuses an artifact only for unchanged inputs"
     )
     check_artifact_cache_keys(workflow)
+
+    print("artifact-digest — an artifact-inputs step fails when a hashed tool fails")
+    check_artifact_input_digests_fail_closed(workflow)
 
     print("xcframework-outputs — the XCFramework producer fails on a missing output")
     check_xcframework_outputs_are_verified(workflow)

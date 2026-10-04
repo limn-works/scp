@@ -131,7 +131,9 @@ env:
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
 # comment on job fuzz-nightly says more). Nine groups per generation across the two
-# workflows, where the two together wrote thirty-six entries before.
+# workflows, where the two together wrote thirty-six entries before. The four
+# bridge-artifact entries the producer jobs save are not rust-cache groups; the
+# comment above job pyo3-module counts them.
 # `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
 # rust-cache step in any workflow that names no `shared-key` or no `save-if`, and any
 # group with zero or with two writers or with a writer off `main`.
@@ -153,7 +155,7 @@ env:
 # artifact, so cargo rebuilds each workspace crate regardless and the entry would carry
 # ~1 GB that never produces a hit.
 #
-# A cache decides how long a job takes and never what it reports: cargo compares
+# A rust-cache entry decides how long a job takes and never what it reports: cargo compares
 # fingerprints against every restored artifact and recompiles what does not match. A
 # group named wrong costs a miss, never a wrong result.
 
@@ -1991,7 +1993,10 @@ jobs:
   # save, because GitHub lets only the `gh-readonly-queue/…` ref that wrote an entry
   # read it, and no later run uses that ref. A
   # pull-request entry is readable by that pull request alone, so no pull request
-  # can place an artifact that `main` or another pull request restores. No workflow
+  # can place an artifact that `main` or another pull request restores. A run that
+  # misses on all four producers saves four entries, which totalled about 102 MB in
+  # run 37154692160, against the 10 GB repository cap the cache section at the top of
+  # this file counts. No workflow
   # under .github/workflows/ restores a `bridge-artifact-` key, so nothing a release
   # publishes passes through this cache. scripts/tests/ci-gate/ci_gate_selftest.py
   # reports a producer whose key drops one of the file inputs above.
@@ -2052,16 +2057,16 @@ jobs:
             exit 1
           fi
           source .venv/bin/activate
-          digest=$(
-            {
-              printf '%s\n' "$job_definition"
-              git ls-files -- crates
-              echo "image=${ImageOS:-unset}"
-              python -VV
-              maturin --version
-              ldd --version 2>&1 | sed -n 1p
-            } | shasum -a 256 | cut -d ' ' -f 1
-          )
+          inputs="$RUNNER_TEMP/artifact-inputs"
+          {
+            printf '%s\n' "$job_definition"
+            git ls-files -- crates
+            echo "image=${ImageOS:-unset}"
+            python -VV
+            maturin --version
+            ldd --version 2>&1 | sed -n 1p
+          } > "$inputs"
+          digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the PyO3 module a run with the same inputs built
         id: artifact-cache
@@ -2153,14 +2158,14 @@ jobs:
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
-          digest=$(
-            {
-              printf '%s\n' "$job_definition"
-              git ls-files -- crates
-              echo "image=${ImageOS:-unset}"
-              ldd --version 2>&1 | sed -n 1p
-            } | shasum -a 256 | cut -d ' ' -f 1
-          )
+          inputs="$RUNNER_TEMP/artifact-inputs"
+          {
+            printf '%s\n' "$job_definition"
+            git ls-files -- crates
+            echo "image=${ImageOS:-unset}"
+            ldd --version 2>&1 | sed -n 1p
+          } > "$inputs"
+          digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the NAPI addon a run with the same inputs built
         id: artifact-cache
@@ -2231,15 +2236,15 @@ jobs:
             echo "::error::.github/workflows/ci.yml defines no job ${GITHUB_JOB}"
             exit 1
           fi
-          digest=$(
-            {
-              printf '%s\n' "$job_definition"
-              git ls-files -- crates
-              echo "image=${ImageOS:-unset}"
-              xcodebuild -version
-              xcrun --sdk macosx --show-sdk-version
-            } | shasum -a 256 | cut -d ' ' -f 1
-          )
+          inputs="$RUNNER_TEMP/artifact-inputs"
+          {
+            printf '%s\n' "$job_definition"
+            git ls-files -- crates
+            echo "image=${ImageOS:-unset}"
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+          } > "$inputs"
+          digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the XCFramework a run with the same inputs built
         id: artifact-cache
@@ -2270,8 +2275,8 @@ jobs:
       # any uploaded path is absent or holds nothing written after the build began.
       # scripts/tests/ci-gate/ci_gate_selftest.py runs it against each path missing
       # and each path stale. On a cache hit no build ran, so the step checks presence
-      # alone: the restore wrote the three paths a verified build saved, and their
-      # timestamps predate this run's marker.
+      # alone. ScpBindings.swift is tracked, so on a hit the checkout supplies it and
+      # the presence check cannot detect a restore that left it out.
       - name: Verify the build wrote every uploaded output
         env:
           ARTIFACT_CACHE_HIT: ${{ steps.artifact-cache.outputs.cache-hit }}
@@ -2363,17 +2368,17 @@ jobs:
             exit 1
           fi
           source .venv/bin/activate
-          digest=$(
-            {
-              printf '%s\n' "$job_definition"
-              git ls-files -- crates
-              echo "image=${ImageOS:-unset}"
-              python -VV
-              maturin --version
-              xcodebuild -version
-              xcrun --sdk macosx --show-sdk-version
-            } | shasum -a 256 | cut -d ' ' -f 1
-          )
+          inputs="$RUNNER_TEMP/artifact-inputs"
+          {
+            printf '%s\n' "$job_definition"
+            git ls-files -- crates
+            echo "image=${ImageOS:-unset}"
+            python -VV
+            maturin --version
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+          } > "$inputs"
+          digest=$(shasum -a 256 < "$inputs" | cut -d ' ' -f 1)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Restore the PyO3 module a run with the same inputs built
         id: artifact-cache
