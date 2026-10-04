@@ -2485,15 +2485,14 @@ impl CoreFields {
         // swaps this flag; whichever call wins is the one that runs
         // cleanup.
         if self.shutdown.swap(true, Ordering::SeqCst) {
-            let durable_store_open = match store_closer {
-                None => false,
-                Some(_) => {
-                    let mut released = self.durable_store_released.subscribe();
-                    !matches!(
-                        tokio::time::timeout(timeout, released.wait_for(|closed| *closed)).await,
-                        Ok(Ok(_))
-                    )
-                }
+            let durable_store_open = if store_closer.is_some() {
+                let mut released = self.durable_store_released.subscribe();
+                !matches!(
+                    tokio::time::timeout(timeout, released.wait_for(|closed| *closed)).await,
+                    Ok(Ok(_))
+                )
+            } else {
+                false
             };
             return Err(ShutdownError::AlreadyShutDown { durable_store_open });
         }
@@ -5495,12 +5494,12 @@ mod tests {
     fn recording_closer(
         result: Result<(), scp_platform::PlatformError>,
         ran: &Arc<AtomicBool>,
-    ) -> Option<DurableStoreCloser> {
+    ) -> DurableStoreCloser {
         let ran = Arc::clone(ran);
-        Some(Box::new(move || {
+        Box::new(move || {
             ran.store(true, Ordering::SeqCst);
             result
-        }))
+        })
     }
 
     /// A repeat shutdown reports the store released only after an earlier
@@ -5512,12 +5511,12 @@ mod tests {
         let closed = CoreFields::new();
         let ran = Arc::new(AtomicBool::new(false));
         closed
-            .shutdown_core_async(Duration::from_secs(1), recording_closer(Ok(()), &ran))
+            .shutdown_core_async(Duration::from_secs(1), Some(recording_closer(Ok(()), &ran)))
             .await
             .unwrap();
         assert!(ran.load(Ordering::SeqCst));
         let err = closed
-            .shutdown_core_async(Duration::ZERO, recording_closer(Ok(()), &unused))
+            .shutdown_core_async(Duration::ZERO, Some(recording_closer(Ok(()), &unused)))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5532,13 +5531,16 @@ mod tests {
         let first = refused
             .shutdown_core_async(
                 Duration::from_secs(1),
-                recording_closer(Err(close_err), &ran),
+                Some(recording_closer(Err(close_err), &ran)),
             )
             .await
             .unwrap_err();
         assert!(matches!(first, ShutdownError::DurableStoreClose(_)));
         let err = refused
-            .shutdown_core_async(Duration::from_millis(20), recording_closer(Ok(()), &unused))
+            .shutdown_core_async(
+                Duration::from_millis(20),
+                Some(recording_closer(Ok(()), &unused)),
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5552,7 +5554,7 @@ mod tests {
         let sync = CoreFields::new();
         sync.shutdown();
         let err = sync
-            .shutdown_core_async(Duration::ZERO, recording_closer(Ok(()), &unused))
+            .shutdown_core_async(Duration::ZERO, Some(recording_closer(Ok(()), &unused)))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5594,7 +5596,10 @@ mod tests {
 
         let unused = Arc::new(AtomicBool::new(false));
         let err = instance
-            .shutdown_core_async(Duration::from_millis(20), recording_closer(Ok(()), &unused))
+            .shutdown_core_async(
+                Duration::from_millis(20),
+                Some(recording_closer(Ok(()), &unused)),
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5609,7 +5614,10 @@ mod tests {
             let unused = Arc::clone(&unused);
             tokio::spawn(async move {
                 instance
-                    .shutdown_core_async(Duration::from_secs(10), recording_closer(Ok(()), &unused))
+                    .shutdown_core_async(
+                        Duration::from_secs(10),
+                        Some(recording_closer(Ok(()), &unused)),
+                    )
                     .await
             })
         };
