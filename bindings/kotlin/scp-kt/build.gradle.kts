@@ -259,13 +259,7 @@ listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
 // which are its production features. The `testing` feature compiles the in-memory
 // custody arm and the `signed_at_override` parity affordance, both security
 // nullifiers that §17.17.2 of the persistence spec requires absent from a shipped
-// artifact, and `release.yml` publishes the JAR and AAR this project builds. So
-// `testing` reaches a build only when the caller names it: `:scp-kt:test` refuses to
-// run without it (see `uniffiTestGuard` below), and no release-workflow Gradle line
-// may pass it, which `scripts/check-shipped-feature-graph.sh` asserts. That gate also
-// pins every line below that reads this property, names a cargo feature flag, or
-// invokes the generator, so an edit to any of them fails it until the gate's
-// declarations change in the same review.
+// artifact. So `testing` reaches a build only when the caller names it.
 // ---------------------------------------------------------------------------
 val uniffiCargoFeatures: String = providers.gradleProperty("scp.uniffi.cargoFeatures").getOrElse("")
 if (!Regex("([A-Za-z0-9_/-]+(,[A-Za-z0-9_/-]+)*)?").matches(uniffiCargoFeatures)) {
@@ -312,10 +306,7 @@ tasks.register<Exec>("generateUniffiBindings") {
     outputs.dir(uniffiBindingsDir)
 }
 
-// Prints the command `generateUniffiBindings` runs. The `kotlin-lint` job in
-// `.github/workflows/ci.yml` runs it with and without `scp.uniffi.cargoFeatures` and
-// compares the output with the expected command, so a default that adds a feature
-// fails that job.
+// Prints the command `generateUniffiBindings` runs.
 tasks.register("printUniffiGeneratorCommand") {
     group = "help"
     description = "Print the command generateUniffiBindings runs"
@@ -330,8 +321,7 @@ tasks.register("printUniffiGeneratorCommand") {
 // `testing` in `scp.uniffi.cargoFeatures` would load a production library and fail
 // suite by suite with SCP-IDENT-1008. This check fails the build before any task
 // runs instead. With `scp.uniffi.prebuiltBindings=true` another step built the
-// library, and that step names its own features: the `kotlin-test` job in
-// `.github/workflows/ci.yml` builds it with `--features testing`.
+// library, and that step names its own features.
 gradle.taskGraph.whenReady {
     val testTask = tasks.test.get()
     if (hasTask(testTask) && uniffiPrebuiltBindings != "true" && "testing" !in uniffiCargoFeatures.split(",")) {

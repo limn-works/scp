@@ -3281,12 +3281,10 @@ jobs:
           done
       # `generateUniffiBindings` builds the scp-ffi-uniffi cdylib with the cargo
       # features `scp.uniffi.cargoFeatures` names, and with the crate's default
-      # (production) features when a build passes no such property. The
-      # `kotlin-aar` job in build-matrix.yml and the `publish-maven` job in
-      # release.yml pass none, so the JAR and AAR they build carry production
-      # bindings. This step fails when a default adds a feature to that command,
-      # when the property accepts a value that is not a cargo feature list, and
-      # when `:scp-kt:test` runs against a library built without `testing`.
+      # (production) features when a build passes no such property. This step
+      # fails when a default adds a feature to that command, when the property
+      # accepts a value that is not a cargo feature list, and when
+      # `:scp-kt:test` runs against a library built without `testing`.
       - name: Check scp.uniffi.cargoFeatures
         run: |
           set -euo pipefail

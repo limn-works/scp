@@ -432,18 +432,27 @@ EOF
 # attribute, so that line fails too.
 #
 # The derivation holds only while the build chain forwards the property and
-# adds no feature of its own. DECLARED_UNIFFI_CHAIN_LINES therefore pins every
-# line of every tracked Gradle build file and gradle.properties file under
-# bindings/kotlin, and of the generator script, that can change the feature list
-# the generator hands cargo. The criterion: a line belongs to that set when it
-# reads or writes a value that reaches cargo's feature selection on the
-# generator path. uniffi_chain_lines finds those lines by five indicators —
-# a cargo feature-selection flag in any spelling cargo's option grammar admits
-# for a short or long option, the property name, the generator script's name,
-# and the script's `FEATURES` variable. A line one of those indicators matches
-# and this list omits fails the gate, and so does a declared line no chain file
-# still carries. A comment line (one starting with `//`, `#`, `*`, or `/*`)
-# runs nothing and is not read.
+# adds no feature of its own. DECLARED_UNIFFI_CHAIN_LINES pins the chain lines
+# uniffi_chain_lines reads, so an edit to one of them fails the gate until the
+# declaration changes in the same review, and so does a declared line no chain
+# file still carries. The chain files are the tracked Gradle build files and
+# gradle.properties files under bindings/kotlin, and the generator script.
+# uniffi_chain_lines reads:
+#   - the generator script whole, as its git blob hash, so an edit to any of its
+#     lines, comments included, is read;
+#   - every line of a gradle.properties file except a blank line and a line
+#     whose first character is `#` or `!`;
+#   - in a Gradle build file, every line of the `generateUniffiBindings`
+#     registration, from the line that starts
+#     `tasks.register<Exec>("generateUniffiBindings")` to the next line that
+#     starts with `}`, except a blank line and a line that starts with `//`;
+#   - elsewhere in a Gradle build file, each line that does not start with `//`
+#     and that one of these indicators matches: a cargo feature-selection flag in
+#     any spelling cargo's option grammar admits for a short or long option,
+#     `scp.uniffi.` (the prefix of both properties), the generator script's
+#     name, the task's name, an identifier that starts with `uniffi` and an
+#     uppercase letter, `FEATURES`, and `Exec`. A build-file line outside the
+#     registration that no indicator matches is not read.
 #
 # Each declared line is `<repository-relative file>|<line>`, with the line
 # normalized the way normalize_shipping_lines normalizes a shipping line.
@@ -454,16 +463,47 @@ UNIFFI_GENERATOR_SCRIPT="scripts/generate-uniffi-kotlin.sh"
 # `read -d ''` takes the heredoc verbatim; `$(cat <<'EOF' ...)` would hand the
 # parser the unbalanced `)` of the generator's case pattern.
 read -r -d '' DECLARED_UNIFFI_CHAIN_LINES <<'EOF' || true
+bindings/kotlin/gradle.properties|android.useAndroidX=true
+bindings/kotlin/scp-kt/build.gradle.kts|"false" -> Unit
 bindings/kotlin/scp-kt/build.gradle.kts|"pass -Pscp.uniffi.cargoFeatures=testing",
 bindings/kotlin/scp-kt/build.gradle.kts|"scp.uniffi.cargoFeatures is '$uniffiCargoFeatures'; it takes a comma-separated list of cargo feature names",
+bindings/kotlin/scp-kt/build.gradle.kts|"scp.uniffi.prebuiltBindings is '$prebuiltBindings'; it takes true or false",
+bindings/kotlin/scp-kt/build.gradle.kts|"scp.uniffi.prebuiltBindings is true and $generatedBindings does not exist",
+bindings/kotlin/scp-kt/build.gradle.kts|"true" -> {
+bindings/kotlin/scp-kt/build.gradle.kts|)
+bindings/kotlin/scp-kt/build.gradle.kts|appendLine("These tasks read src/main/kotlin without an ordering edge to generateUniffiBindings:")
+bindings/kotlin/scp-kt/build.gradle.kts|appendLine("task consumes the generated bindings, or mustRunAfter(\"generateUniffiBindings\")")
+bindings/kotlin/scp-kt/build.gradle.kts|appendLine("the generator shares its build. Add dependsOn(\"generateUniffiBindings\") when the")
 bindings/kotlin/scp-kt/build.gradle.kts|commandLine(listOf("./scripts/generate-uniffi-kotlin.sh") + uniffiFeatureArgs)
+bindings/kotlin/scp-kt/build.gradle.kts|dependsOn("generateUniffiBindings")
+bindings/kotlin/scp-kt/build.gradle.kts|description = "Assert every task reading src/main/kotlin is ordered after generateUniffiBindings"
+bindings/kotlin/scp-kt/build.gradle.kts|description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
+bindings/kotlin/scp-kt/build.gradle.kts|description = "Print the command generateUniffiBindings runs"
+bindings/kotlin/scp-kt/build.gradle.kts|else -> throw GradleException(
+bindings/kotlin/scp-kt/build.gradle.kts|group = "codegen"
+bindings/kotlin/scp-kt/build.gradle.kts|if (!Regex("([A-Za-z0-9_/-]+(,[A-Za-z0-9_/-]+)*)?").matches(uniffiCargoFeatures)) {
+bindings/kotlin/scp-kt/build.gradle.kts|if (!generatedBindings.isFile) {
+bindings/kotlin/scp-kt/build.gradle.kts|if (hasTask(testTask) && uniffiPrebuiltBindings != "true" && "testing" !in uniffiCargoFeatures.split(",")) {
+bindings/kotlin/scp-kt/build.gradle.kts|inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))
+bindings/kotlin/scp-kt/build.gradle.kts|inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
+bindings/kotlin/scp-kt/build.gradle.kts|mustRunAfter("generateUniffiBindings")
+bindings/kotlin/scp-kt/build.gradle.kts|onlyIf("scp.uniffi.prebuiltBindings is not true") { prebuiltBindings != "true" }
+bindings/kotlin/scp-kt/build.gradle.kts|outputs.dir(uniffiBindingsDir)
+bindings/kotlin/scp-kt/build.gradle.kts|suppressedFiles.from(uniffiBindingsDir)
+bindings/kotlin/scp-kt/build.gradle.kts|tasks.register<Exec>("generateUniffiBindings") {
+bindings/kotlin/scp-kt/build.gradle.kts|throw GradleException(
+bindings/kotlin/scp-kt/build.gradle.kts|val command = tasks.named<Exec>("generateUniffiBindings").map { it.commandLine.joinToString(" ") }
+bindings/kotlin/scp-kt/build.gradle.kts|val generatedBindings = uniffiBindingsDir.resolve("uniffi/scp/scp.kt")
+bindings/kotlin/scp-kt/build.gradle.kts|val generator = projectTasks.getByName("generateUniffiBindings")
+bindings/kotlin/scp-kt/build.gradle.kts|val prebuiltBindings = uniffiPrebuiltBindings
+bindings/kotlin/scp-kt/build.gradle.kts|val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
 bindings/kotlin/scp-kt/build.gradle.kts|val uniffiCargoFeatures: String = providers.gradleProperty("scp.uniffi.cargoFeatures").getOrElse("")
 bindings/kotlin/scp-kt/build.gradle.kts|val uniffiFeatureArgs = if (uniffiCargoFeatures.isEmpty()) emptyList() else listOf("--features=$uniffiCargoFeatures")
-scripts/generate-uniffi-kotlin.sh|--features=*) FEATURES="${arg#--features=}" ;;
-scripts/generate-uniffi-kotlin.sh|BINDGEN_ARGS+=(--features "$FEATURES")
-scripts/generate-uniffi-kotlin.sh|CARGO_ARGS+=(--features "$FEATURES")
-scripts/generate-uniffi-kotlin.sh|FEATURES=""
-scripts/generate-uniffi-kotlin.sh|if [[ -n "$FEATURES" ]]; then
+bindings/kotlin/scp-kt/build.gradle.kts|val uniffiPrebuiltBindings: String = providers.gradleProperty("scp.uniffi.prebuiltBindings").getOrElse("false")
+bindings/kotlin/scp-kt/build.gradle.kts|when (prebuiltBindings) {
+bindings/kotlin/scp-kt/build.gradle.kts|workingDir = rootProject.projectDir.parentFile.parentFile
+bindings/kotlin/scp-kt/build.gradle.kts|}
+scripts/generate-uniffi-kotlin.sh|git-blob 3932a553751ff12cbe450b252f4abed31e586a81
 EOF
 
 # Nullifier features / crates used ONLY as positive-control fixture inputs and by
@@ -1669,9 +1709,10 @@ $(printf '%s\n' "$dm_tree" | sed -E -n 's/^(scp-[a-z0-9-]+) v[0-9].*/\1/p')"
 
 # ---------------------------------------------------------------------------
 # uniffi_chain_lines <file>...
-#   Prints `<file>|<line>` for every non-comment line of each file that one of
-#   the indicators named above DECLARED_UNIFFI_CHAIN_LINES matches, normalized
-#   the way normalize_shipping_lines normalizes a line, sorted and unique. A
+#   Prints `<file>|<line>` for each line of each file that the list above
+#   DECLARED_UNIFFI_CHAIN_LINES says it reads, normalized the way
+#   normalize_shipping_lines normalizes a line, and `<file>|git-blob <hash>` for
+#   a `.sh` file, sorted and unique. A
 #   file that does not exist fails, so a renamed build file cannot drop out of
 #   the comparison.
 # ---------------------------------------------------------------------------
@@ -1684,10 +1725,21 @@ uniffi_chain_lines() {
     fi
   done
   for file in "$@"; do
-    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' "$file" \
-      | grep -vE '^(//|#|\*|/\*)' \
-      | grep -E -- '--features|--all-features|--no-default-features|(^|[^A-Za-z0-9_-])-[A-Za-z]*F|scp\.uniffi\.cargoFeatures|generate-uniffi-kotlin\.sh|(^|[^A-Za-z0-9_])FEATURES([^A-Za-z0-9_]|$)' \
-      | sed "s#^#${file}|#" || true
+    case "$file" in
+      *.sh)
+        printf '%s|git-blob %s\n' "$file" "$(git hash-object --no-filters "$file")" ;;
+      *.properties)
+        sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' "$file" \
+          | grep -vE '^([#!]|$)' | sed "s#^#${file}|#" || true ;;
+      *)
+        awk '/^tasks\.register<Exec>\("generateUniffiBindings"\)/ { block = 1 }
+             { print (block ? "B" : "O") $0 }
+             block && /^}/ { block = 0 }' "$file" \
+          | sed -E 's/^([BO])[[:space:]]+/\1/; s/[[:space:]]+$//; s/[[:space:]]+/ /g' \
+          | grep -vE '^[BO](//|$)' \
+          | grep -E -- '^B|--features|--all-features|--no-default-features|(^|[^A-Za-z0-9_-])-[A-Za-z]*F|scp\.uniffi\.|generate-uniffi-kotlin\.sh|generateUniffiBindings|(^|[^A-Za-z0-9_])(uniffi[A-Z][A-Za-z0-9_]*|FEATURES|Exec)([^A-Za-z0-9_]|$)' \
+          | sed -E "s#^[BO]#${file}|#" || true ;;
+    esac
   done | sort -u
 }
 
@@ -2296,6 +2348,37 @@ TREE
   printf '%s\n' '#!/usr/bin/env bash' 'FEATURES="testing"' > "$gradle_dir/generate.sh"
   ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_declared" "$gradle_build" "$gradle_dir/generate.sh" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(gradle-drift) the assertion REJECTS a generator line that sets FEATURES" "FAIL" "$rc"
+  local gradle_generator gradle_generator_declared gradle_plant
+  gradle_generator="$gradle_dir/generate-uniffi-kotlin.sh"
+  cp "$UNIFFI_GENERATOR_SCRIPT" "$gradle_generator"
+  gradle_generator_declared="$(printf '%s\n' "$DECLARED_UNIFFI_CHAIN_LINES" \
+    | sed -n "s#^$UNIFFI_GENERATOR_SCRIPT|#${gradle_generator}|#p")"
+  ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_generator_declared" "$gradle_generator" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(gradle-drift) the assertion ACCEPTS the shipped generator script" "PASS" "$rc"
+  printf '%s\n' '        *) FEATURES="testing" ;;' >> "$gradle_generator"
+  ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_generator_declared" "$gradle_generator" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(gradle-drift) the assertion REJECTS a generator with an added '*)' case arm" "FAIL" "$rc"
+  printf '%s\n' '# scp.uniffi.prebuiltBindings=true' '! scp.uniffi.cargoFeatures=testing' > "$gradle_dir/gradle.properties"
+  ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_declared" "$gradle_build" "$gradle_dir/gradle.properties" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(gradle-drift) the assertion ACCEPTS a gradle.properties whose property lines are comments" "PASS" "$rc"
+  printf '%s\n' 'scp.uniffi.prebuiltBindings=true' > "$gradle_dir/gradle.properties"
+  ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_declared" "$gradle_build" "$gradle_dir/gradle.properties" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(gradle-drift) the assertion REJECTS a gradle.properties that sets the prebuilt property" "FAIL" "$rc"
+  for gradle_plant in \
+    'PASS|    // args("--features=testing")' \
+    'FAIL|    /* parity */ args("--features=testing")' \
+    'FAIL|    *arrayOf("--features=testing"),' \
+    'FAIL|    args("--verbose")' \
+    'FAIL|    environment("RUSTFLAGS", "--cfg feature=\"testing\"")'; do
+    gradle_planted="${gradle_plant#*|}" awk '{ print } /^    commandLine\(listOf\("\.\/scripts\/generate-uniffi-kotlin\.sh"\) \+ uniffiFeatureArgs\)$/ { print ENVIRON["gradle_planted"] }' \
+      bindings/kotlin/scp-kt/build.gradle.kts > "$gradle_build"
+    ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_declared" "$gradle_build" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+    expect "(gradle-drift) a generateUniffiBindings registration with the added line '${gradle_plant#*|}'" "${gradle_plant%%|*}" "$rc"
+  done
+  sed 's#getOrElse("false")$#getOrElse("true")#' bindings/kotlin/scp-kt/build.gradle.kts > "$gradle_build"
+  ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_declared" "$gradle_build" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
+  expect "(gradle-drift) the assertion REJECTS a build file whose prebuilt-bindings default is true" "FAIL" "$rc"
+  cp bindings/kotlin/scp-kt/build.gradle.kts "$gradle_build"
   sed -i.bak 's#^\([[:space:]]*\)commandLine(listOf("./scripts/generate-uniffi-kotlin.sh") + uniffiFeatureArgs)#\1commandLine("./scripts/generate-uniffi-kotlin.sh", "--features=testing")#' "$gradle_build"
   ( fixture_failures=0; assert_gradle_release_builds_are_gated './gradlew :scp-kt:jar' "$gradle_declared" "$gradle_build" >/dev/null 2>&1; exit "$fixture_failures" ); rc=$?
   expect "(gradle-drift) the assertion REJECTS a build file that hardcodes --features=testing" "FAIL" "$rc"
