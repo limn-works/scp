@@ -256,8 +256,9 @@ nothing:
   macos-bridges
                A pull request runs the four macOS bridge jobs (xcframework,
                pyo3-module-macos, swift-build-test and bridge-parity-swift)
-               only when a changed path matches the `swift` or `python` filter,
-               and a merge_group run and a push also run them on `rust`. A
+               when the `swift` output is true, and all but swift-build-test
+               when the `python` output is true, and a merge_group run also
+               runs them on `rust`. A
                condition that reads `rust` on pull requests too puts all four
                back on every Rust pull request; one that drops `rust` from the
                merge queue lands a Rust change no macOS bridge job ran; and a
@@ -756,11 +757,10 @@ RUST_ONLY_RUNS = {
     "xcframework": True,
 }
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
-# The four macOS bridge jobs read the `rust` output on every event but pull_request,
-# so a Rust-only pull request skips all four while a Rust-only merge_group run runs
-# all four and a Rust-only push runs the two producers among them, xcframework and
-# pyo3-module-macos. MACOS_BRIDGE_PATH_CASES below states the same rule per changed
-# path.
+# A Rust-only pull request skips the four macOS bridge jobs, while a Rust-only
+# merge_group run runs all four and a Rust-only push runs the two producers among
+# them, xcframework and pyo3-module-macos. MACOS_BRIDGE_PATH_CASES below states the
+# same rule per changed path.
 MACOS_BRIDGE_JOBS = (
     "bridge-parity-swift",
     "pyo3-module-macos",
@@ -6186,9 +6186,11 @@ def check_push_writer_mutants(doc: dict) -> None:
 
 
 # CRITERION for macos_bridge_gaps: on a pull_request event, each of the four macOS
-# bridge jobs runs only when a changed path matches the `swift` filter or the
-# `python` filter, which between them hold bindings/swift/**, bindings/python/**,
-# crates/scp-ffi/uniffi/**, crates/scp-ffi/common/** and crates/scp-ffi/src/**; on a
+# bridge jobs runs only when the `changes` job's `swift` output or `python` output is
+# true; those outputs read the `swift` and `python` filters, which between them hold
+# bindings/swift/**, bindings/python/**, crates/scp-ffi/uniffi/**,
+# crates/scp-ffi/common/** and crates/scp-ffi/src/**, and each ORs in the
+# `toolchain` filter; on a
 # merge_group event each also runs on the `rust` output; on a push the two producers
 # also run on `rust`, because each writes a cache.
 #

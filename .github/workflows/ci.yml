@@ -2467,21 +2467,19 @@ jobs:
           path: target/ci-bridge/libscp_ffi_napi.so
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
-  # The four macOS bridge jobs (xcframework, pyo3-module-macos, swift-build-test and
-  # bridge-parity-swift) read the `rust` output on every event but pull_request. On a
-  # pull_request event they run when a changed path matches the `swift` filter
-  # (bindings/swift/**, crates/scp-ffi/uniffi/** and crates/scp-ffi/common/**), the
-  # `python` filter (bindings/python/**, crates/scp-ffi/src/** and
-  # crates/scp-ffi/common/**), or the `toolchain` filter both of those outputs OR in.
+  # On a pull_request event the four macOS bridge jobs (xcframework,
+  # pyo3-module-macos, swift-build-test and bridge-parity-swift) run when a changed
+  # path matches the `swift` filter (bindings/swift/**, crates/scp-ffi/uniffi/** and
+  # crates/scp-ffi/common/**), the `python` filter (bindings/python/**,
+  # crates/scp-ffi/src/** and crates/scp-ffi/common/**), or the `toolchain` filter
+  # both of those outputs OR in; swift-build-test reads the `swift` output only.
   # On a merge_group event they also run on `rust`, so the merge queue runs them on
   # every Rust change it lands, and on a push to `main` the two producers among them
   # also run on `rust`, because each writes a cache.
   #
   # TRADE-OFF: a pull request confined to Rust crates outside those directories
   # skips all four, so a change that breaks the Swift bridge, or the PyO3 module on
-  # macOS, fails in the merge queue rather than on the pull request. In exchange a
-  # pull request whose changed paths match neither filter waits on none of these
-  # four macOS jobs.
+  # macOS, fails in the merge queue rather than on the pull request.
   xcframework:
     needs: changes
     if: >-
