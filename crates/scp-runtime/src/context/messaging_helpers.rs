@@ -2546,10 +2546,12 @@ pub fn build_snapshot_for_persist(
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
-        Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
+        Ok(crypto_state) => {
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
+        }
         Err(e) => {
             snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = Vec::new();
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -2582,7 +2584,9 @@ pub fn build_snapshot_for_persist(
 /// The sole caller is `Supervisor::spawn_actor_from_welcome`, which the FFI
 /// slice (pull request #2036) wired to production bridge consumers.
 #[must_use]
-pub const fn welcome_snapshot_crypto_is_durable(export: &Result<Vec<u8>, ContextError>) -> bool {
+pub(super) fn welcome_snapshot_crypto_is_durable(
+    export: &Result<zeroize::Zeroizing<Vec<u8>>, ContextError>,
+) -> bool {
     matches!(export, Ok(blob) if !blob.is_empty())
 }
 
@@ -2809,7 +2813,7 @@ pub fn build_snapshot_from_state(
         epoch_coordination_records: state.epoch.coordinator.records().to_vec(),
         grace_entries,
         needs_reconnect: state.epoch.needs_reconnect,
-        mls_crypto_state: Vec::new(),
+        mls_crypto_state: crate::context::state::MlsCryptoState::default(),
         migration_state: state.migration_state.clone(),
         access_key_store: state.access.access_key_store.clone(),
         consequence_rules: state.governance.consequence_rules.clone(),

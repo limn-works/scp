@@ -800,15 +800,16 @@ fn malformed_welcome_join_leaves_no_half_built_context() {
 }
 
 // ===========================================================================
-// 12b. A Welcome whose tree holds a leaf expired under the joiner's injected
-//      clock is rejected and leaves NO context (ADR-057 §Prereq-1)
+// 12b. A Welcome whose tree holds a member leaf that expired under the
+//      joiner's clock joins (ADR-057 §Prereq-1: Welcome tree leaves are
+//      range-checked only)
 // ===========================================================================
 
 #[test]
-fn welcome_with_tree_leaf_expired_under_joiner_clock_is_rejected() {
+fn welcome_with_member_leaf_expired_under_joiner_clock_joins() {
     use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
-    let real_now = SystemClock.now_secs();
     let relay = Relay::new();
+    let real_now = SystemClock.now_secs();
 
     let mut alice = relay.party_with(
         Arc::new(LocalSigner::active(ALICE_DID)),
@@ -817,15 +818,15 @@ fn welcome_with_tree_leaf_expired_under_joiner_clock_is_rejected() {
     );
     alice.client.create_context(CTX).expect("Alice creates");
 
-    // Carol's KeyPackage is minted with her clock set so her leaf expires at
-    // `real_now + 600`, inside the window openmls's real-clock check accepts.
-    // Carol never commits, so her leaf keeps its KeyPackage `Lifetime` into
-    // Bob's tree; Alice's own leaf turns `Commit`-sourced when her add
-    // commits with a path.
+    // Carol's leaf expires at `real_now + 600`, so it is current under the
+    // real clock openmls reads when Alice adds her. Carol never commits, so
+    // her leaf keeps its KeyPackage `Lifetime` into Bob's tree; Alice's own
+    // leaf turns `Commit`-sourced when her add commits with a path.
+    let carol_not_after = real_now + 600;
     let mut carol = relay.party_with(
         Arc::new(LocalSigner::active(CAROL_DID)),
         Arc::new(MemoryStorage::new()),
-        Arc::new(TestClock::new(real_now - KEY_PACKAGE_LIFETIME_SECS + 600)),
+        Arc::new(TestClock::new(carol_not_after - KEY_PACKAGE_LIFETIME_SECS)),
     );
     let carol_kp = carol
         .client
@@ -834,14 +835,21 @@ fn welcome_with_tree_leaf_expired_under_joiner_clock_is_rejected() {
     alice
         .client
         .add_member(CTX, &carol_kp)
-        .expect("Alice adds Carol");
+        .expect("Alice adds Carol while her leaf is current");
 
-    // Bob's injected clock reads `real_now + 1200`: Carol's leaf is expired
-    // under it, while Bob's own leaf is valid.
+    // Bob's clock reads `real_now + 1200`, past Carol's `not_after`. His own
+    // KeyPackage is minted from that clock with `not_before` back-dated by
+    // `KEY_PACKAGE_LIFETIME_MARGIN_SECS` (one hour), so it is current under
+    // both his clock and the real clock openmls reads.
+    let bob_clock_now = real_now + 1200;
+    assert!(
+        carol_not_after < bob_clock_now,
+        "Carol's leaf is expired under Bob's clock"
+    );
     let mut bob = relay.party_with(
         Arc::new(LocalSigner::active(BOB_DID)),
         Arc::new(MemoryStorage::new()),
-        Arc::new(TestClock::new(real_now + 1200)),
+        Arc::new(TestClock::new(bob_clock_now)),
     );
     let bob_kp = bob
         .client
@@ -852,30 +860,19 @@ fn welcome_with_tree_leaf_expired_under_joiner_clock_is_rejected() {
         .add_member(CTX, &bob_kp)
         .expect("Alice adds Bob");
 
-    let err = bob
-        .client
+    bob.client
         .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
-        .expect_err("a Welcome whose tree holds an expired leaf must be rejected");
-    match err {
-        ClientError::Mls(scp_mls::error::MlsError::KeyPackageLifetimeInvalid {
-            not_after,
-            now,
-            ..
-        }) => {
-            assert_eq!(not_after, real_now + 600, "the rejected leaf is Carol's");
-            assert_eq!(
-                now,
-                real_now + 1200,
-                "validated against Bob's injected clock"
-            );
-        }
-        other => panic!("expected Mls(KeyPackageLifetimeInvalid), got {other:?}"),
-    }
+        .expect("a Welcome whose tree holds a member leaf expired under Bob's clock joins");
 
-    // Fail-closed: Bob holds NO context.
-    assert_eq!(bob.client.member_dids(CTX), None);
-    assert!(bob.client.mls_epoch(CTX).is_err());
-    assert_eq!(bob.client.event_log_root(CTX), None);
+    assert!(
+        bob.client.member_dids(CTX).is_some(),
+        "Bob holds the joined context"
+    );
+    assert_eq!(
+        bob.client.mls_epoch(CTX).expect("Bob's epoch"),
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        "Bob joins at Alice's epoch"
+    );
 }
 
 // ===========================================================================
@@ -966,6 +963,133 @@ fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
         bob2.client.event_log_root(CTX),
         alice.client.event_log_root(CTX),
         "the recovered join replayed Alice's log to the same Merkle root"
+    );
+}
+
+// ===========================================================================
+// 13b. A joiner whose OWN KeyPackage is not current under its injected clock is
+//      rejected (ADR-057 §Prereq-1: only other members' tree leaves are
+//      range-only)
+// ===========================================================================
+
+/// What [`join_with_own_clock_moved`] returns: Bob's join result, Alice's add
+/// output (the Welcome Bob joined from), the relay, Alice, and Bob's storage.
+type OwnClockJoin = (
+    Result<Vec<scp_client::SenderKeyDistribution>, ClientError>,
+    scp_client::AddMemberOutput,
+    Relay,
+    Party,
+    Arc<dyn Storage>,
+);
+
+/// Alice adds Bob while Bob's `KeyPackage` is current under the real clock,
+/// the clock openmls checks the Add against. `move_bob_clock` then sets Bob's
+/// injected clock (it receives the clock and the real time the `KeyPackage`
+/// was minted at), and Bob joins.
+fn join_with_own_clock_moved(move_bob_clock: impl FnOnce(&TestClock, u64)) -> OwnClockJoin {
+    let real_now = SystemClock.now_secs();
+    let relay = Relay::new();
+    let mut alice = relay.party_with(
+        Arc::new(LocalSigner::active(ALICE_DID)),
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestClock::new(real_now)),
+    );
+    alice.client.create_context(CTX).expect("Alice creates");
+
+    let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let bob_clock = Arc::new(TestClock::new(real_now));
+    let mut bob = relay.party_with(
+        Arc::new(LocalSigner::active(BOB_DID)),
+        Arc::clone(&bob_storage),
+        Arc::clone(&bob_clock) as Arc<dyn Clock>,
+    );
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob while his KeyPackage is current");
+
+    move_bob_clock(&bob_clock, real_now);
+    let joined =
+        bob.client
+            .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys);
+    assert_eq!(
+        bob.client.member_dids(CTX),
+        None,
+        "a rejected own-KeyPackage join leaves no context"
+    );
+    (joined, add, relay, alice, bob_storage)
+}
+
+/// Reconstructs Bob over `storage` with a clock at the real time.
+fn reconstruct_bob(relay: &Relay, storage: &Arc<dyn Storage>) -> Party {
+    relay.party_with(
+        Arc::new(LocalSigner::active(BOB_DID)),
+        Arc::clone(storage),
+        Arc::new(TestClock::new(SystemClock.now_secs())),
+    )
+}
+
+#[test]
+fn join_rejects_own_key_package_expired_under_skewed_clock_and_keeps_pending() {
+    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+    let (joined, add, relay, alice, bob_storage) = join_with_own_clock_moved(|clock, real_now| {
+        // A clock skewed forward past Bob's `not_after`
+        // (`real_now + KEY_PACKAGE_LIFETIME_SECS`).
+        clock.set(real_now + KEY_PACKAGE_LIFETIME_SECS + 1);
+    });
+    let err = joined.expect_err("an own KeyPackage expired under Bob's clock must be rejected");
+    assert!(
+        matches!(
+            err,
+            ClientError::Mls(scp_mls::MlsError::KeyPackageLifetimeInvalid { not_after, now, .. })
+                if not_after <= now
+        ),
+        "expired own KeyPackage, got: {err:?}"
+    );
+
+    // The skew was a clock error, not a real expiry: the pending blob is kept, so
+    // a reconstruct under a correct clock joins.
+    let mut bob2 = reconstruct_bob(&relay, &bob_storage);
+    bob2.client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .expect("the kept pending blob joins once Bob's clock is correct");
+    assert_eq!(
+        bob2.client.mls_epoch(CTX).expect("Bob's epoch"),
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        "the retried join reaches Alice's epoch"
+    );
+}
+
+#[test]
+fn join_rejects_own_key_package_not_yet_valid_and_keeps_pending() {
+    use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_MARGIN_SECS;
+    let (joined, add, relay, alice, bob_storage) = join_with_own_clock_moved(|clock, real_now| {
+        // Bob's `not_before` is `real_now - KEY_PACKAGE_LIFETIME_MARGIN_SECS`.
+        clock.set(real_now - KEY_PACKAGE_LIFETIME_MARGIN_SECS - 1);
+    });
+    let err = joined.expect_err("a not-yet-valid own KeyPackage must be rejected");
+    assert!(
+        matches!(
+            err,
+            ClientError::Mls(scp_mls::MlsError::KeyPackageLifetimeInvalid { not_before, now, .. })
+                if now < not_before
+        ),
+        "not-yet-valid own KeyPackage, got: {err:?}"
+    );
+
+    // The pending blob is kept, so a reconstruct with a current clock joins.
+    let mut bob2 = reconstruct_bob(&relay, &bob_storage);
+    bob2.client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .expect("the kept pending blob joins once Bob's clock is current");
+    assert_eq!(
+        bob2.client.mls_epoch(CTX).expect("Bob's epoch"),
+        alice.client.mls_epoch(CTX).expect("Alice's epoch"),
+        "the retried join reaches Alice's epoch"
     );
 }
 

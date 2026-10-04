@@ -35,11 +35,9 @@ env:
 # WHAT THE TWO INPUTS DO. `shared-key` replaces the job id in the key, so the jobs that
 # compile the same crate graph into the same target directory read and write one entry.
 # `save-if` restricts writing to a push to `main`, whose entries every pull request and
-# every merge-queue run can read. Together they take this workflow from eighteen entries
-# per generation to eight, and they put those eight on the ref that every run reads.
+# every merge-queue run can read.
 #
-# THE GROUPS, one per (target directory a job writes, compile mode of its dependency
-# units, runner OS). Cargo hashes the compile mode into every artifact's metadata
+# THE GROUPS. Cargo hashes the compile mode into every artifact's metadata
 # suffix beside the profile and the feature set, so `cargo clippy` and `cargo doc`,
 # which compile each dependency to an `.rmeta` in check mode, share no artifact with
 # `cargo build` and `cargo nextest`, which compile the same dependency to an `.rlib` in
@@ -55,20 +53,44 @@ env:
 #                     shipped-feature-graph; and
 #                     rust-doc (its `cargo test --doc`) in part, as the paragraph after
 #                     this list says.
-#   workspace-check   `target/debug` under check mode — rust-clippy, whose five
-#                     `cargo clippy` commands compile every dependency to an `.rmeta`,
-#                     and rust-doc in part (its `cargo doc --no-deps`, whose dependency
-#                     units cargo compiles in check mode as well). rust-doc restores both
-#                     groups, one rust-cache step each, because its two commands read
-#                     two disjoint artifact sets out of the one directory.
-#   workspace-release `target/release` on Linux — pyo3-module, which runs
-#                     `maturin develop --release`, and napi-addon, which runs
-#                     `cargo build -p scp-ffi-napi --release`. Those two jobs are the
+#   workspace-check   `target/debug` under check mode and the workspace feature
+#                     resolution — rust-clippy's `workspace` leg, whose
+#                     `cargo clippy --workspace` command compiles every dependency to an
+#                     `.rmeta`, and rust-doc in part (its `cargo doc --no-deps`, whose
+#                     dependency units cargo compiles in check mode as well). rust-doc
+#                     restores both groups, one rust-cache step each, because its two
+#                     commands read two disjoint artifact sets out of the one directory.
+#   clippy-examples   `target/debug` under check mode, one package's dev-target feature
+#                     set at a time — rust-clippy's `examples` leg, which runs
+#                     scripts/check-examples-compile.sh and is the only member.
+#   clippy-packages   `target/debug` under check mode and the feature resolution of
+#                     each `-p` command it runs — rust-clippy's `packages` leg, the
+#                     only member. None of its commands resolves the workspace
+#                     feature set, so the `workspace-check` entry holds few of its units.
+#   workspace-ci-bridge
+#                     `target/ci-bridge` on Linux — pyo3-module, which runs
+#                     `maturin develop --profile ci-bridge`, and napi-addon, which runs
+#                     `cargo build -p scp-ffi-napi --profile ci-bridge`. The four
+#                     producers other than kotlin-test (pyo3-module, pyo3-module-macos,
+#                     napi-addon and xcframework) build under the `ci-bridge` profile the root
+#                     Cargo.toml defines (SCP's crates at opt-level 1, dependencies at
+#                     opt-level 3). This group and the two `-ci-bridge` groups below
+#                     replaced `workspace-release`, `apple-uniffi` and `apple-parity`,
+#                     which held `--release` output, when the producers moved to the
+#                     profile. Keeping the old names would have stalled each group:
+#                     rust-cache's key hashes no `[profile]` table, so the old entry
+#                     matched the new key in full, restored a `target/release` the
+#                     profile never reads, and a full match skips the save, so `main`
+#                     would never have written the `target/ci-bridge` entry. Measured
+#                     on the pull request's run: napi-addon restored
+#                     `v0-rust-workspace-release-…` with `full match: true` and
+#                     compiled every dependency (6m49s). Those two jobs are the
 #                     only members. python-test, typescript-check and bridge-parity
-#                     ran one or both of those commands and belonged to this group;
+#                     ran the `--release` form of one or both of those commands and
+#                     belonged to `workspace-release`;
 #                     they now download what the producers upload, so none of them
 #                     runs cargo and none of them reads a cargo cache.
-#                     bridge-parity-kotlin belonged to it for its `maturin develop
+#                     bridge-parity-kotlin belonged to `workspace-release` for its `maturin develop
 #                     --release`; it now downloads the PyO3 module from pyo3-module
 #                     and the UniFFI cdylib from kotlin-test, and runs no cargo
 #                     command. The two members write one
@@ -80,10 +102,11 @@ env:
 #                     of this workspace — napi, napi-derive and napi-build — which
 #                     napi-addon compiles on each run that builds the addon. Giving napi-addon a second group
 #                     would cache those three and would also store a second copy of
-#                     the shared tree, which is nearly all of `target/release`,
+#                     the shared tree, which is nearly all of `target/ci-bridge`,
 #                     against the 10 GB repository cap the paragraph below counts, so
-#                     the group keeps one writer. bridge-parity wrote this entry
-#                     before this arrangement and ran both commands, so what it wrote
+#                     the group keeps one writer. bridge-parity wrote the
+#                     `workspace-release` entry before this arrangement and ran both
+#                     `--release` commands, so what it wrote
 #                     did cover the NAPI dependencies.
 #   transport-optional
 #                     `target/debug` again, but under a feature resolution no
@@ -101,16 +124,19 @@ env:
 #                     `wasm-pack build`. Jobs wasm-protocol and wasm-test read this
 #                     group for its registry alone, because both compile under the dev
 #                     profile; each step below says so where it sits.
-#   apple-uniffi      `target/aarch64-apple-darwin/release` — xcframework, which runs
-#                     `bindings/swift/build-xcframework.sh --dev` for both macOS jobs
-#                     that read an XCFramework. swift-build-test ran that script and
-#                     wrote this entry; it downloads the result instead and reads no
+#   apple-uniffi-ci-bridge
+#                     `target/aarch64-apple-darwin/ci-bridge` — xcframework, which runs
+#                     `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`
+#                     for both macOS jobs that read an XCFramework. swift-build-test
+#                     ran `build-xcframework.sh --dev` and wrote the `apple-uniffi`
+#                     entry; it downloads the result instead and reads no
 #                     cargo cache.
-#   apple-parity      `target/release` on macOS — pyo3-module-macos, which runs
-#                     `maturin develop --release` for bridge-parity-swift. The name
-#                     stays as bridge-parity-swift wrote it, because renaming a group
-#                     abandons the entry `main` holds under the old name and makes the
-#                     next run compile cold.
+#   apple-parity-ci-bridge
+#                     `target/ci-bridge` on macOS — pyo3-module-macos, which runs
+#                     `maturin develop --profile ci-bridge` for bridge-parity-swift.
+#                     A rename abandons the entry `main` holds under the old name, so
+#                     a group keeps its name unless, as here, that entry holds a
+#                     directory its members no longer read.
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
@@ -124,12 +150,12 @@ env:
 # neither entry holds those units under rust-doc's feature resolution, and
 # rust-doc recompiles them on every run because it saves no entry. No group
 # holds rust-doc's resolution: the recompile costs one job's minutes, and a
-# ninth entry per generation would cost cache space that every run shares.
+# further entry per generation would cost cache space that every run shares.
 #
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
-# comment on job fuzz-nightly says more). Nine groups per generation across the two
+# comment on job fuzz-nightly says more). Eleven groups per generation across the two
 # workflows, where the two together wrote thirty-six entries before. The four
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the
 # comment above job pyo3-module counts them.
@@ -143,9 +169,11 @@ env:
 # `save-if` at its default would let the shortest job in a group decide the entry's
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
 # and it finishes eleven minutes before rust-test. The producers are rust-test
-# (workspace-debug), rust-clippy (workspace-check), rust-test-optional-features
-# (transport-optional), pyo3-module (workspace-release), typescript-wasm-check
-# (wasm32), xcframework (apple-uniffi), pyo3-module-macos (apple-parity) and
+# (workspace-debug), rust-clippy's three legs (workspace-check, clippy-examples and
+# clippy-packages, one each), rust-test-optional-features
+# (transport-optional), pyo3-module (workspace-ci-bridge), typescript-wasm-check
+# (wasm32), xcframework (apple-uniffi-ci-bridge), pyo3-module-macos
+# (apple-parity-ci-bridge) and
 # fuzz-build (fuzz): in each group, the job that compiles the most of that directory
 # under that mode.
 #
@@ -1038,12 +1066,29 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # ── Why this job is a three-leg matrix ──────────────────────────────────────
+  #
+  # Measured on the 2026-10-04 runs, the single job spent 53 s restoring its cache
+  # and then about 6.5 min in three serial blocks of work: the `--workspace`
+  # sweep (87 s), scripts/check-examples-compile.sh (about 77 s), and the
+  # per-package feature commands (about 4 min). Each leg
+  # runs one block, so the job takes as long as its longest leg rather than the
+  # sum. Every command the single job ran runs on exactly one leg, with the
+  # flags and features it had there.
+  #
+  # Each leg compiles under its own feature resolution, so each restores and
+  # writes its own rust-cache group (the group listing at the top of this file
+  # names all three), and only `main` writes.
   rust-clippy:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / clippy
+    name: Rust / clippy (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [workspace, examples, packages]
     steps:
       - name: Free disk space when the runner is short of it
         run: |
@@ -1066,23 +1111,41 @@ jobs:
       # scripts/check-examples-compile.sh parses cargo metadata with jq, which
       # the runner image ships. This step fails the job by name if an image drops it.
       - name: Require jq
+        if: matrix.leg == 'examples'
         run: command -v jq || { echo "::error::jq is not on PATH; scripts/check-examples-compile.sh needs it"; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Writes the `workspace-check` group. The five `cargo clippy` commands below
-      # compile every dependency in check mode, to an `.rmeta` under a metadata hash
-      # that includes the mode, so the `workspace-debug` entry rust-test writes under build
-      # mode holds nothing this job can restore: reading that entry gave this job the
+      # Writes the `workspace-check` group. The `--workspace` sweep compiles every
+      # dependency in check mode, to an `.rmeta` under a metadata hash that includes
+      # the mode, so the `workspace-debug` entry rust-test writes under build mode
+      # holds nothing this leg can restore: reading that entry gave this job the
       # registry and a `Checking` line for every one of the ~650 dependencies on every
-      # run. This job is the one that compiles the most of `target/debug` in check
-      # mode, so it is the group's producer; rust-doc reads the group for its
-      # `cargo doc`.
+      # run. This leg is the one that compiles the most of `target/debug` in check
+      # mode under the workspace feature resolution, so it is the group's producer;
+      # rust-doc reads the group for its `cargo doc`.
       - uses: Swatinem/rust-cache@v2
+        if: matrix.leg == 'workspace'
         with:
           shared-key: workspace-check
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run clippy
+      # Writes the `clippy-examples` group: scripts/check-examples-compile.sh lints
+      # each example target alone, one package's dev-target feature set at a time,
+      # a resolution the `workspace-check` entry does not hold.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.leg == 'examples'
+        with:
+          shared-key: clippy-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Writes the `clippy-packages` group: each `-p` command below resolves features
+      # over one package's subgraph under the features it names.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.leg == 'packages'
+        with:
+          shared-key: clippy-packages
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run clippy over the workspace
+        if: matrix.leg == 'workspace'
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Enable testing for scp-ffi-uniffi so that the
@@ -1090,9 +1153,22 @@ jobs:
           # builds (iOS XCFramework, Android .aar) MUST NOT enable this
           # feature. See GitHub issue #88.
           cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant -- -D warnings
+      - name: Run the examples gate
+        if: matrix.leg == 'examples'
+        run: |
+          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # Asserts two things: every example target compiles and its example
+          # source holds no construct the script's source scan rejects, and every
+          # published examples/*.rs is some target's source. The script header
+          # states what the check cannot prove; do not restate it here.
+          bash scripts/check-examples-compile.sh
+      - name: Run clippy over per-package feature sets
+        if: matrix.leg == 'packages'
+        run: |
+          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # The optional network transports (quic, http3, udp, coap) are not in
           # the default feature set and are not activated by --workspace, so the
-          # sweep above never lints them. They rotted undetected for months
+          # workspace leg's sweep never lints them. They rotted undetected for months
           # (the quic feature stopped compiling). Lint them explicitly so a
           # broken optional transport fails CI. They co-compile (openssl-backed
           # udp/coap alongside ring-backed quic/http3), so a single combined
@@ -1103,7 +1179,7 @@ jobs:
           # tests and both adapter modules went unlinted and unrun.
           cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
           # Job rust-test-optional-features also runs code behind four more
-          # feature sets that no command above activates: scp-node's quic test
+          # feature sets that no other command of this job activates: scp-node's quic test
           # files and its http3/udp well_known arms, scp-platform's `apple`
           # SQLCipher adapter and `sync` storage module, and scp-testing's
           # persistence_advanced tests. That job denies no warnings, so these
@@ -1111,14 +1187,9 @@ jobs:
           cargo clippy -p scp-node --features quic,http3,udp,testing --all-targets -- -D warnings
           cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
           cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
-          # Asserts two things: every example target compiles and its example
-          # source holds no construct the script's source scan rejects, and every
-          # published examples/*.rs is some target's source. The script header
-          # states what the check cannot prove; do not restate it here.
-          bash scripts/check-examples-compile.sh
           # scp-node and scp-relay compile the PostgreSQL and S3 blob backends
           # only under their off-by-default `cloud-blobs` feature, which the
-          # --workspace sweep above leaves off. The first command lints the
+          # --workspace sweep of the workspace leg leaves off. The first command lints the
           # backends' own modules and their `#[ignore]`d unit tests, which need a
           # live PostgreSQL or S3 endpoint to run; the second and third lint each
           # binary's cloud-blobs build and its backend-selection test, which job
@@ -1133,6 +1204,7 @@ jobs:
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
       # workspaces, each carrying a defect the gate must reject or a layout it must accept.
       - name: Run examples-compile cases
+        if: matrix.leg == 'examples'
         run: bash scripts/tests/examples-compile/run-tests.sh
 
   # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
@@ -1842,13 +1914,50 @@ jobs:
   # at `docker build`.
   #
   # The build reaches the release compile of both binaries, so it is the slowest job
-  # here; the gha cache keeps a re-run that changes no dependency to the final stage.
+  # here; the layer cache keeps a run that changes no dependency to the final compile.
+  #
+  # WHY THE LAYER CACHE LIVES IN GHCR AND NOT THE ACTIONS CACHE. The Actions cache holds
+  # 10 GB per repository and evicts the least recently used entry when it goes over. The
+  # `Swatinem/rust-cache` entries every run restores held about 8.6 GB on their own, so
+  # the buildkit blobs, which only this job reads, were evicted first: a main run found
+  # the cache manifest but none of its blobs and rebuilt from `WORKDIR` down, and a pull
+  # request run an hour after a main export failed with `blob sha256:…: not found` on the
+  # cook layer and recompiled every dependency. The repository's Actions cache, measured
+  # for this change, held 10.68 GB against that 10 GB limit. A registry is outside that
+  # cap.
+  #
+  # The Actions cache has one advantage the registry lacks: GitHub scopes its entries
+  # by branch, so a pull-request branch cannot write an entry `main` reads. A registry
+  # tag has no such scoping, which is why the export needs the main-only token below.
+  #
+  # Move the layer cache back to the Actions cache when either holds:
+  # (a) the repository's Actions cache total, read from
+  #     `gh api repos/{owner}/{repo}/actions/cache/usage`, plus the size of the Docker
+  #     layer export, the sum of the layer `size` fields in the manifest that
+  #     `docker buildx imagetools inspect --raw ghcr.io/<repository>/buildcache:docker-image`
+  #     prints, stays under the repository's cache limit, because other changes
+  #     shrank the Rust cache entries or GitHub raised the limit;
+  # (b) the main-only token arrangement can no longer be kept: the token cannot be
+  #     renewed, or the `docker-cache` environment loses its rule that admits only
+  #     branch `main`.
+  #
+  # WHO CAN WRITE THE CACHE. This job holds `packages: read` and builds without
+  # exporting. Job `docker-image-cache`, the only job that exports, declares
+  # environment `docker-cache`, whose deployment rule admits only branch `main`, and
+  # logs in with that environment's `GHCR_CACHE_TOKEN`, a classic token holding only
+  # `write:packages`; no job in this file holds `packages: write`. Each export moves the
+  # tag and leaves the manifest it replaced as an untagged package version, and no job
+  # in this file deletes those versions: deleting one needs `delete:packages`, which the
+  # token does not hold.
   docker-image:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
     steps:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
       # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
@@ -1869,19 +1978,63 @@ jobs:
           fi
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
+      # `continue-on-error` so a failed login cannot fail the build check.
+      - uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          # Read the cache everywhere; write it only from a push to `main`. A cache
-          # written on a pull-request ref is readable only by that pull request, and it
-          # would evict entries from the 10 GB repository cap that the
-          # `Swatinem/rust-cache` steps in this workflow and the 2 in
-          # `.github/workflows/fuzz.yml` share. `ignore-error` so a cache-service
-          # failure cannot fail the build check: this job answers whether the image
-          # builds.
-          cache-from: type=gha,scope=docker-image
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-image,ignore-error=true' || '' }}
+          # A missing or unreadable cache only makes buildkit warn and build every layer.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
+
+  # Builds the same image on every push to `main` and exports its layer cache; the
+  # comment on job `docker-image` above says why the export lives in this job alone.
+  # Its `if:` reads only the event, because the `ci` gate cannot read a condition that
+  # joins the event to a filter output and a step-level filter condition would report
+  # success over zero work, so a push that changes no Rust still builds here.
+  docker-image-cache:
+    needs: changes
+    if: github.event_name == 'push'
+    name: Docker / relay and node image (cache export)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: docker-cache
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # Job `docker-image`'s copy of this step says why it is conditional.
+      - name: Free disk space when the runner is short of it
+        run: |
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_CACHE_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          # `mode=max` keeps the chef and builder stages, which hold the toolchain,
+          # cargo-chef, and the cooked dependencies; the final stage alone holds none of
+          # them. `image-manifest=true` stores the cache as an OCI image manifest.
+          # A missing or unreadable cache only makes buildkit warn and build every layer.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}/buildcache:docker-image,mode=max,image-manifest=true,oci-mediatypes=true
 
   # ── Shared bridge artifacts ─────────────────────────────────────────
   #
@@ -2083,7 +2236,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: workspace-release
+          shared-key: workspace-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -2097,7 +2250,7 @@ jobs:
           # resolution, and same-process governance vote verification would
           # fail-close to "unknown voter" (ADR-062 §Decision 1 gated the in-memory
           # DHT nullifier behind `testing`; the functional test harness opts in).
-          maturin develop --release --features testing
+          maturin develop --profile ci-bridge --features testing
       - name: Upload PyO3 native module
         uses: actions/upload-artifact@v4
         with:
@@ -2180,14 +2333,14 @@ jobs:
         id: artifact-cache
         uses: actions/cache/restore@v4
         with:
-          path: target/release/libscp_ffi_napi.so
+          path: target/ci-bridge/libscp_ffi_napi.so
           key: bridge-artifact-v1-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '**/Cargo.toml', '.cargo/**', 'crates/**') }}-${{ steps.artifact-inputs.outputs.digest }}
       - uses: dtolnay/rust-toolchain@stable
         if: steps.artifact-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: workspace-release
+          shared-key: workspace-ci-bridge
           save-if: false
       - name: Build NAPI native addon
         if: steps.artifact-cache.outputs.cache-hit != 'true'
@@ -2201,19 +2354,19 @@ jobs:
           # (ADR-062 §Decision 1 gated the in-memory DHT nullifier behind `testing`).
           # crates/scp-ffi/napi/Cargo.toml opens that feature's list with
           # `scp-core/testing`, so this one flag is the set both consumers spelled.
-          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing
+          cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing
       - name: Upload NAPI native addon
         uses: actions/upload-artifact@v4
         with:
           name: napi-addon-linux
-          path: target/release/libscp_ffi_napi.so
+          path: target/ci-bridge/libscp_ffi_napi.so
           retention-days: 30
           if-no-files-found: error
       - name: Save the NAPI addon under its input key
         if: steps.artifact-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
-          path: target/release/libscp_ffi_napi.so
+          path: target/ci-bridge/libscp_ffi_napi.so
           key: ${{ steps.artifact-cache.outputs.cache-primary-key }}
 
   xcframework:
@@ -2229,11 +2382,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      # No `swift-actions/setup-swift` step: `build-xcframework.sh` runs cargo,
-      # `xcodebuild -create-xcframework` and `lipo`, and compiles no Swift. The two
-      # consumers install the Swift toolchain, because they are the jobs that run
-      # `swift build`. Leaving it out of this job saves the 1.0-1.1 min that step took
-      # in each macOS job of run 34805871209.
+      # `build-xcframework.sh` runs cargo, `xcodebuild -create-xcframework` and `lipo`,
+      # and compiles no Swift. No macOS job installs a Swift toolchain: the two
+      # consumers that run `swift build` use the one the runner image ships, and each
+      # prints `swift --version`.
       - name: Hash the artifact inputs no file glob covers
         id: artifact-inputs
         run: |
@@ -2272,13 +2424,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: apple-uniffi
+          shared-key: apple-uniffi-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build XCFramework (dev mode — macOS arm64 only)
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           touch "$RUNNER_TEMP/xcframework-build-start"
-          bindings/swift/build-xcframework.sh --dev
+          bindings/swift/build-xcframework.sh --dev --profile ci-bridge
       # The upload below cannot fail on its own: `if-no-files-found: error` fires only
       # when all three paths together match nothing, and ScpBindings.swift is tracked,
       # so the checkout always supplies one match. A script that exited 0 without
@@ -2406,14 +2558,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         with:
-          shared-key: apple-parity
+          shared-key: apple-parity-ci-bridge
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build PyO3 native module
         if: steps.artifact-cache.outputs.cache-hit != 'true'
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features testing
+          maturin develop --profile ci-bridge --features testing
       - name: Upload PyO3 native module
         uses: actions/upload-artifact@v4
         with:
@@ -2599,7 +2751,7 @@ jobs:
           # Into the directory the wiring step below reads, so that step keeps its
           # one source of truth for the cdylib's path.
           name: napi-addon-linux
-          path: target/release
+          path: target/ci-bridge
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install
@@ -2616,10 +2768,10 @@ jobs:
           PKG_DIR="bindings/typescript/node_modules/${NAPI_PKG}"
           mkdir -p "$PKG_DIR"
           # The cargo build produces a cdylib; copy and rename to .node for NAPI loading
-          LIB_FILE="target/release/libscp_ffi_napi.so"
+          LIB_FILE="target/ci-bridge/libscp_ffi_napi.so"
           if [ ! -f "$LIB_FILE" ]; then
             echo "ERROR: cdylib not found at $LIB_FILE"
-            ls -la target/release/libscp_ffi_napi* 2>/dev/null || true
+            ls -la target/ci-bridge/libscp_ffi_napi* 2>/dev/null || true
             exit 1
           fi
           cp "$LIB_FILE" "$PKG_DIR/index.node"
@@ -2632,7 +2784,7 @@ jobs:
       # that does not load, would leave `bun test` exiting 0 over zero executed NAPI
       # assertions, which is the `zero-test` shape
       # scripts/tests/ci-gate/ci_gate_selftest.py names. The `[ ! -f ]` check above
-      # reads whether target/release holds the cdylib and never resolves the package.
+      # reads whether target/ci-bridge holds the cdylib and never resolves the package.
       # This step runs the SDK loader and the native constructor, so such an addon
       # fails the job here, and it reads the two methods the `server` and
       # `testing` feature lists compile onto the native class, so a build missing
@@ -2657,7 +2809,7 @@ jobs:
             const loaderRequire = createRequire(process.cwd() + "/src/internal/native.ts");
             const resolved = loaderRequire.resolve(pkg);
             const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
-            const downloaded = "../../target/release/libscp_ffi_napi.so";
+            const downloaded = "../../target/ci-bridge/libscp_ffi_napi.so";
             if (digest(resolved) !== digest(downloaded)) {
               throw new Error(resolved + " is not the downloaded addon " + downloaded);
             }
@@ -3203,9 +3355,11 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.2"
+      # The Swift toolchain is the one the runner image ships, not a pinned download:
+      # Swift 6.2, the minimum Package.swift declares, is not tested. This step records
+      # which toolchain the build and tests below ran on.
+      - name: Print Swift toolchain version
+        run: swift --version
       - name: Download XCFramework and generated bindings
         uses: actions/download-artifact@v4
         with:
@@ -3313,7 +3467,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: napi-addon-linux
-          path: target/release
+          path: target/ci-bridge
       - name: Python deps
         run: |
           python -m venv .venv
@@ -3352,10 +3506,10 @@ jobs:
           esac
           PKG_DIR="bindings/typescript/node_modules/${NAPI_PKG}"
           mkdir -p "$PKG_DIR"
-          LIB_FILE="target/release/libscp_ffi_napi.so"
+          LIB_FILE="target/ci-bridge/libscp_ffi_napi.so"
           if [ ! -f "$LIB_FILE" ]; then
             echo "ERROR: cdylib not found at $LIB_FILE"
-            ls -la target/release/libscp_ffi_napi* 2>/dev/null || true
+            ls -la target/ci-bridge/libscp_ffi_napi* 2>/dev/null || true
             exit 1
           fi
           cp "$LIB_FILE" "$PKG_DIR/index.node"
@@ -3382,7 +3536,7 @@ jobs:
             const loaderRequire = createRequire(process.cwd() + "/src/internal/native.ts");
             const resolved = loaderRequire.resolve(pkg);
             const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
-            const downloaded = "../../target/release/libscp_ffi_napi.so";
+            const downloaded = "../../target/ci-bridge/libscp_ffi_napi.so";
             if (digest(resolved) !== digest(downloaded)) {
               throw new Error(resolved + " is not the downloaded addon " + downloaded);
             }
@@ -3562,9 +3716,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.2"
+      # The Swift toolchain is the one the runner image ships; see job swift-build-test.
+      - name: Print Swift toolchain version
+        run: swift --version
       - name: Download PyO3 native module
         uses: actions/download-artifact@v4
         with:
@@ -3600,13 +3754,17 @@ jobs:
               raise SystemExit('the native SCP class is missing ' + ', '.join(missing) + ', so this extension was built without the feature that method needs')
           print('PyO3 extension carries the gated methods')
           "
+      # Debug, not release: the runner only decodes JSON-RPC frames and calls the UniFFI
+      # bindings, whose work runs in the prebuilt Rust static library, and no parity
+      # case asserts on timing, so an optimized Swift build buys nothing for its
+      # compile time.
       - name: Build Swift parity runner
         run: |
           cd bindings/python/tests/bridge_parity/helpers/swift_bridge_runner
-          swift build -c release
+          swift build
       - name: Run parity tests (UniFFI Swift only)
         env:
-          SCP_PARITY_SWIFT_RUNNER: ${{ github.workspace }}/bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/release/swift-bridge-runner
+          SCP_PARITY_SWIFT_RUNNER: ${{ github.workspace }}/bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/debug/swift-bridge-runner
         run: |
           source .venv/bin/activate
           cd bindings/python
@@ -3714,6 +3872,7 @@ jobs:
       - toolchain-wiring
       - fix-round-check-selftest
       - docker-image
+      - docker-image-cache
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts

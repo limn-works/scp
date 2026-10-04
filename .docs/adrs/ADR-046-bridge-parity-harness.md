@@ -193,10 +193,10 @@ A new job in `.github/workflows/ci.yml`:
 - Sets up Python 3.12 and Bun. The job installs no Rust toolchain, because it
   runs no cargo command.
 - Downloads the PyO3 extension module that job `pyo3-module` built with
-  `maturin develop --release --features testing` and uploaded as artifact
+  `maturin develop --profile ci-bridge --features testing` and uploaded as artifact
   `pyo3-module-linux`.
 - Downloads the NAPI addon that job `napi-addon` built with
-  `cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing` and
+  `cargo build -p scp-ffi-napi --profile ci-bridge --features scp-ffi-napi/testing` and
   uploaded as artifact `napi-addon-linux`, then wires the addon into
   `bindings/typescript/node_modules/` mirroring `typescript-check`.
 - Runs `pytest tests/bridge_parity/ -v -m parity -k "napi"` from

@@ -1071,10 +1071,12 @@ fn persist_state_best_effort<'d, 'c>(
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
-        Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
+        Ok(crypto_state) => {
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
+        }
         Err(e) => {
             snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = Vec::new();
+            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,

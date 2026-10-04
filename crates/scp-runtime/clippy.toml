@@ -47,3 +47,12 @@ disallowed-types = [
     { path = "tokio::sync::Mutex", reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock, OnceLock/AtomicU64/DashMap, or the actor-owned &mut PerContextState. Sanctioned exceptions carry an #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 12 allow-list: …\")]." },
     { path = "tokio::sync::RwLock", reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock, OnceLock/AtomicU64/DashMap, or the actor-owned &mut PerContextState. Sanctioned exceptions carry an #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 12 allow-list: …\")]." },
 ]
+
+# Clippy reads only the configuration file nearest the crate, so the workspace
+# `.clippy.toml` does not apply here; these entries repeat its ban.
+# `crypto::mls::storage::tests::signer_write_is_refused_and_stores_nothing`
+# carries a control `expect` per entry that fails when the entry is missing.
+disallowed-methods = [
+    { path = "openmls_basic_credential::SignatureKeyPair::store", reason = "writes the MLS signer's private key into provider storage, which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
+    { path = "openmls_traits::storage::StorageProvider::write_signature_key_pair", reason = "stores the MLS signer's private key in provider storage (the trait method `SignatureKeyPair::store` calls), which snapshots persist and restores re-inject; every openmls operation SCP calls takes the signer as an argument, so it is never stored (security model spec §9.15)" },
+]
