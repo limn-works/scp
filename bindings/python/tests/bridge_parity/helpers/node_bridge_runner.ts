@@ -410,6 +410,11 @@ async function opIdentityCreate(
   };
 }
 
+// Every create declares a non-empty ceiling: the NAPI bridge rejects an
+// absent or null one with SCP-VALID-7004 and an empty one with SCP-VALID-7005
+// (construction.md M2).
+const PARITY_CEILING = ["messages:read", "messages:write"];
+
 async function opContextCreate(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
@@ -417,6 +422,7 @@ async function opContextCreate(
   const params = (req.args.params as Record<string, unknown>) ?? {
     name: "parity-test",
     mode: "encrypted",
+    ceiling: PARITY_CEILING,
   };
   const scp = await newNapiScp();
   const identity = await scp.identityCreate("in_memory");
@@ -514,7 +520,7 @@ async function opEventLogAppend(
   const identity = await scp.identityCreate("in_memory");
   const handle = await scp.contextCreate(
     identity,
-    JSON.stringify({ name: "parity-elog", mode: "encrypted" }),
+    JSON.stringify({ name: "parity-elog", mode: "encrypted", ceiling: PARITY_CEILING }),
   );
   const events = await scp.eventLogQuery(handle, undefined);
   const first = events[0];
@@ -724,7 +730,7 @@ async function opEventLogQueryFiltered(
   const filter = (req.args.filter as Record<string, unknown>) ?? {
     event_type: "ContextCreated",
   };
-  const params = { name: "parity-elog-f", mode: "encrypted" };
+  const params = { name: "parity-elog-f", mode: "encrypted", ceiling: PARITY_CEILING };
   const scp = await newNapiScp();
   const identity = await scp.identityCreate("in_memory");
   const handle = await scp.contextCreate(identity, JSON.stringify(params));

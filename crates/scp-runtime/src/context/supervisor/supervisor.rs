@@ -13348,7 +13348,12 @@ impl Supervisor {
     /// Returns
     /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
     /// if the supervisor's providers are not wired or context creation
-    /// fails. A dropped reply channel maps to
+    /// fails, and
+    /// [`ContextCreationError::StateTransition`](scp_protocol::context::builder::ContextCreationError::StateTransition)
+    /// wrapping
+    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+    /// when `params.ceiling` is empty (construction.md M2); the context is
+    /// not created. A dropped reply channel maps to
     /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed).
     pub async fn create_context(
         self: &Arc<Self>,
@@ -14798,7 +14803,9 @@ impl Supervisor {
     /// when the config carries a bilateral peer (see above). Otherwise
     /// propagates
     /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
-    /// from [`Self::create_context`].
+    /// from [`Self::create_context`], including the
+    /// [`ContextError::CeilingRequired`](scp_protocol::context::ContextError::CeilingRequired)
+    /// rejection of an empty ceiling.
     pub async fn create(
         self: &Arc<Self>,
         context_id: String,
@@ -21462,7 +21469,10 @@ mod tests {
             let result = sup
                 .create_context(
                     ctx_id.to_owned(),
-                    scp_protocol::context::ContextParams::default(),
+                    scp_protocol::context::ContextParams {
+                        ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                        ..scp_protocol::context::ContextParams::default()
+                    },
                     DID(creator.to_owned()),
                     None,
                 )
@@ -21495,7 +21505,10 @@ mod tests {
         let handle = sup
             .create_context(
                 ctx_id.to_owned(),
-                scp_protocol::context::ContextParams::default(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..scp_protocol::context::ContextParams::default()
+                },
                 DID(creator.to_owned()),
                 None,
             )
@@ -21980,7 +21993,13 @@ mod tests {
         let sup = Arc::new(Supervisor::for_query_shim());
         let id = hex::encode([0xC1u8; 32]);
         poison_crash_window(&sup, &id);
-        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (cmd, rx) = reply_order_create(
+            &id,
+            ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..ContextParams::default()
+            },
+        );
         let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
         assert!(reply.is_err(), "a create without providers fails");
         assert!(
@@ -21997,7 +22016,13 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
         let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
         poison_crash_window(&sup, &id);
-        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (cmd, rx) = reply_order_create(
+            &id,
+            ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..ContextParams::default()
+            },
+        );
         let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
         assert!(reply.is_err(), "a create over a closed snapshot is refused");
         assert!(
@@ -22010,7 +22035,13 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
         let sup = supervisor_with_clock_and_persistence(clock, Box::new(ErringLoadPersistence));
         poison_crash_window(&sup, &id);
-        let (cmd, rx) = reply_order_create(&id, ContextParams::default());
+        let (cmd, rx) = reply_order_create(
+            &id,
+            ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..ContextParams::default()
+            },
+        );
         let (seen, reply) = state_read_at_reply(&sup, &id, rx, cmd).await;
         assert!(
             reply.is_err(),
@@ -22029,6 +22060,7 @@ mod tests {
         poison_crash_window(&sup, &id);
         let params = ContextParams {
             min_protocol_version: Some((9, 0)),
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
         let (cmd, rx) = reply_order_create(&id, params);
@@ -23381,7 +23413,10 @@ mod tests {
         let created = sup
             .create_context(
                 context_id.clone(),
-                scp_protocol::context::ContextParams::default(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..scp_protocol::context::ContextParams::default()
+                },
                 creator,
                 None,
             )

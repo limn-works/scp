@@ -535,6 +535,11 @@ pub const CTX_2095: &str = "SCP-CTX-2095";
 ///
 /// Maps from `ContextError::NotPseudonymousContext`.
 pub const CTX_2096: &str = "SCP-CTX-2096";
+/// Actor busy (ADR-049 §10).
+///
+/// Maps from `ContextError::ActorBusy` in each bridge's error translator; that
+/// variant's doc states its producers and retry behaviour.
+pub const CTX_2130: &str = "SCP-CTX-2130";
 /// Context poisoned: its actor exceeded the respawn budget (ADR-049 §10).
 ///
 /// No longer respawned; the context is dormant until an operator clears the

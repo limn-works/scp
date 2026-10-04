@@ -1302,6 +1302,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         mode: ContextMode::Broadcast,
         // Broadcast contexts only support `MemoryScope::Full`.
         memory_scope: scp_protocol::context::params::MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
         ..ContextParams::default()
     };
     sup.create_context(
