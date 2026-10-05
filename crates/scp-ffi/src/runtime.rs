@@ -1949,18 +1949,64 @@ fn role_state_on(
     }))
 }
 
-/// Returns the IDs of all registered contexts where the given DID is a member.
+/// Returns the ID and the role state of each registered context whose
+/// supervisor actor lists `member_did` as a member.
 ///
-/// Used by `py_mcp_load_contexts` to return locally known contexts when
-/// relay transport is not yet wired. Returns an empty Vec if no contexts
-/// match.
-#[must_use]
-pub fn context_ids_for_member(bi: &PyBridgeInstance, member_did: &str) -> Vec<String> {
-    ffi_state_registry(bi)
+/// Reads each registered context's role state from the supervisor actor once
+/// (ADR-049 §10) and returns the role state it matched against. With no
+/// registered context it returns an empty Vec without resolving the
+/// supervisor.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable or
+/// the sync-to-async bridge to it fails. Returns the converted `ActorBusy`,
+/// `ActorCrashed`, or `ContextPoisoned` error when a registered context's
+/// actor does not answer, so an actor that did not answer never drops its
+/// context from the result.
+pub fn member_context_role_states(
+    bi: &PyBridgeInstance,
+    member_did: &str,
+) -> Result<Vec<(String, ContextRoleState)>, ScpPyError> {
+    let ids: Vec<String> = ffi_state_registry(bi)
         .iter()
-        .filter(|entry| entry.value().role_state.members.contains(member_did))
         .map(|entry| entry.key().clone())
-        .collect()
+        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sup = Arc::clone(supervisor(bi)?);
+    let mut matched = Vec::new();
+    for id in ids {
+        let sup = Arc::clone(&sup);
+        let ctx = id.clone();
+        let answer =
+            block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })?
+                .map_err(ScpPyError::from)?;
+        if let Some(role_state) = answer.filter(|rs| rs.members.contains(member_did)) {
+            matched.push((id, role_state));
+        }
+    }
+    Ok(matched)
+}
+
+/// Records `member` with the `member` role in `context_id`'s supervisor
+/// actor.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when no supervisor is attached, the
+/// tokio runtime is absent, or the supervisor refuses the insert.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) fn insert_supervisor_member_for_test(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    member: &str,
+) -> Result<(), ScpPyError> {
+    let sup = Arc::clone(supervisor(bi)?);
+    let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+    rt.block_on(sup.test_insert_member(context_id, scp_did::DID(member.to_owned()), "member"))
+        .map_err(|e| ScpPyError::context(e.to_string()))
 }
 
 /// Registers an outlet handler for a specific outlet in a context.
@@ -4154,6 +4200,100 @@ mod tests {
         assert!(
             err.contains("SCP-CTX-2130") && !err.contains("no live supervisor role state"),
             "an unreachable actor must read as busy, not absent: {err}"
+        );
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `member_context_role_states` reports a member the supervisor actor records,
+    /// with no write to the bridge copy.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn member_context_role_states_reads_supervisor_membership() {
+        let creator = "did:dht:z6MkIdsForMemberCreator";
+        let member = "did:dht:z6MkIdsForMemberJoiner";
+        let (bi, ctx_id) = live_state_fixture("ids-for-member", creator, &["messages:read"]);
+
+        assert!(
+            !member_context_role_states(&bi, member)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &ctx_id),
+            "precondition: the member is not in the context yet"
+        );
+
+        insert_supervisor_member_for_test(&bi, &ctx_id, member)
+            .expect("supervisor must record the member");
+
+        let matched = member_context_role_states(&bi, member).unwrap();
+        let (_, role_state) = matched
+            .iter()
+            .find(|(id, _)| id == &ctx_id)
+            .expect("a member the supervisor recorded must be reported, with no bridge-side write");
+        assert!(
+            role_state.members.contains(member) && role_state.creator_did == creator,
+            "the returned role state must be the supervisor's, which lists the member"
+        );
+        assert!(
+            !with_ffi_state(&bi, &ctx_id, |st| Ok(st
+                .role_state
+                .members
+                .contains(member)))
+            .unwrap(),
+            "precondition of the assertion above: the bridge copy never lists the member"
+        );
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `member_context_role_states` refuses when a context is registered but no
+    /// supervisor is attached, instead of answering from the bridge copy.
+    #[test]
+    fn member_context_role_states_fails_closed_without_a_supervisor() {
+        crate::init_runtime().ok();
+        let bi = Arc::new(PyBridgeInstance::new_py());
+        let ctx_id = unique_ctx_id("ids-no-supervisor");
+        let creator = "did:dht:z6MkIdsNoSupervisor";
+        register_ffi_state(&bi, &ctx_id, creator, &[]).unwrap();
+        assert!(
+            with_ffi_state(&bi, &ctx_id, |st| Ok(st
+                .role_state
+                .members
+                .contains(creator)))
+            .unwrap(),
+            "precondition: the bridge copy lists the creator"
+        );
+
+        member_context_role_states(&bi, creator)
+            .expect_err("a registered context with no supervisor must refuse, not answer");
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `member_context_role_states` returns the actor's `ActorBusy` error when a
+    /// registered context's actor does not answer, instead of dropping that
+    /// context from the result.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn member_context_role_states_propagates_an_unreachable_actor() {
+        let creator = "did:dht:z6MkIdsBusyCreator";
+        let (bi, ctx_id) = live_state_fixture("ids-busy", creator, &["messages:read"]);
+        assert!(
+            member_context_role_states(&bi, creator)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &ctx_id),
+            "precondition: the creator's context is reported while its actor answers"
+        );
+        supervisor(&bi)
+            .expect("supervisor")
+            .test_make_actor_unreachable(&ctx_id);
+
+        let err = format!(
+            "{:?}",
+            member_context_role_states(&bi, creator)
+                .expect_err("an unreachable actor must refuse, not drop its context")
+        );
+        assert!(
+            err.contains("SCP-CTX-2130"),
+            "the refusal must carry the actor's busy code: {err}"
         );
         remove_context(&bi, &ctx_id);
     }
