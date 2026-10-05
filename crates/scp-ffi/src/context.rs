@@ -56,12 +56,10 @@ const fn context_state_str(state: &scp_core::context::ContextState) -> &'static 
 /// What `context_close` does after its first live lifecycle read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseDecision {
-    /// The supervisor reports `Active`: dispatch `CloseContext`, then release
-    /// this bridge's state for the id.
+    /// The supervisor reports `Active`: dispatch `CloseContext`.
     Dispatch,
     /// No actor serves the context, or the supervisor reports `Closed`,
-    /// `Expired` or `Tombstoned`: release this bridge's state for the id
-    /// without a dispatch.
+    /// `Expired` or `Tombstoned`: skip the dispatch.
     ReleaseWithoutDispatch,
 }
 
@@ -101,16 +99,18 @@ fn close_decision(state: Option<&scp_core::context::ContextState>) -> PyResult<C
 ///
 /// The re-read permits the release when no actor serves the context, when
 /// the supervisor reports `Closed`, `Expired` or `Tombstoned`, and, after a
-/// `CloseContext` dispatch, when it reports `Closing`.
+/// `CloseContext` dispatch, when it reports `Closing` or the re-read fails:
+/// the dispatch succeeded before the re-read ran, so a failed re-read is no
+/// evidence that the close did not happen.
 ///
 /// The re-read and the removal are two steps, and nothing stops a readmit
 /// from landing between them.
 ///
 /// # Errors
 ///
-/// Returns the re-read's error, `RuntimeError` when the re-read reports
-/// `Active`, and `RuntimeError` naming the state for every other state, and
-/// removes nothing in each case.
+/// Returns the re-read's error when no dispatch preceded it, `RuntimeError`
+/// when the re-read reports `Active`, and `RuntimeError` naming the state for
+/// every other state, and removes nothing in each case.
 fn release_after_close_reread(
     bi: &crate::runtime::PyBridgeInstance,
     context_id: &str,
@@ -118,7 +118,21 @@ fn release_after_close_reread(
     reread: Result<Option<scp_core::context::ContextState>, crate::error::ScpPyError>,
 ) -> PyResult<()> {
     use scp_core::context::ContextState;
-    match (decision, reread?.as_ref()) {
+    let reread = match (decision, reread) {
+        (CloseDecision::Dispatch, Err(e)) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "context_close: lifecycle re-read after a successful CloseContext dispatch \
+                 failed; releasing this bridge's state"
+            );
+            crate::runtime::remove_context(bi, context_id);
+            return Ok(());
+        }
+        (CloseDecision::ReleaseWithoutDispatch, Err(e)) => return Err(e.into()),
+        (_, Ok(state)) => state,
+    };
+    match (decision, reread.as_ref()) {
         (
             CloseDecision::Dispatch | CloseDecision::ReleaseWithoutDispatch,
             None | Some(ContextState::Closed | ContextState::Expired | ContextState::Tombstoned),
@@ -3617,25 +3631,25 @@ impl crate::scp::PyScp {
     ///
     /// When no actor serves the context, or the supervisor reports it
     /// `closed`, `expired` or `tombstoned`, the call skips the supervisor
-    /// dispatch and only releases this bridge's state for the id.
+    /// dispatch.
     ///
     /// # Errors
     ///
     /// Returns `RuntimeError` naming the state if the supervisor reports the
     /// context `creating`, `closing`, `migrating_out` or `poisoned`, and
     /// releases nothing.
-    /// Returns the error of the supervisor read this call takes after the
-    /// dispatch, or in place of it, and releases nothing; a `RuntimeError`
-    /// when that read reports the context `active`; and a `RuntimeError`
-    /// naming the state when it reports any state this call does not release.
+    /// Returns the error of the supervisor read this call takes in place of
+    /// the dispatch, and releases nothing.
+    /// Returns a `RuntimeError` when the supervisor read this call takes after
+    /// the dispatch, or in place of it, reports the context `active`, and a
+    /// `RuntimeError` naming the state when that read reports any state this
+    /// call does not release; it releases nothing in either case.
     /// Returns `ContextError` with code `SCP-CTX-2135` (`ActorCrashed`) if the
     /// supervisor holds no actor for the context because the actor is
-    /// mid-respawn or its last respawn failed; the close succeeds once the
-    /// respawn completes or the operator's `clear_poison` revives the context.
+    /// mid-respawn or its last respawn failed.
     /// Returns `ContextError` whose message carries `SCP-CTX-2130` if the
     /// supervisor still holds an actor for the context and that actor did not
-    /// answer the state read: an unanswered read is not evidence that the
-    /// close already happened, so the call refuses and the caller retries it.
+    /// answer the state read.
     /// Returns `ContextError` with code `SCP-CTX-2001` and releases nothing if
     /// the supervisor reported the context `active` and the close dispatch
     /// then found no actor for it: a respawn can produce that answer for a
@@ -8485,8 +8499,9 @@ mod tests {
     }
 
     /// A close's release removes this bridge's state only on a re-read that
-    /// permits it, and keeps the state on every other re-read, a failed one
-    /// included.
+    /// permits it, and keeps the state on every other re-read. A failed
+    /// re-read keeps the state when no dispatch preceded it and releases it
+    /// after a dispatch.
     ///
     /// The `match` below has no wildcard, so a new `ContextState` variant fails
     /// to compile here until this table states its outcome.
@@ -8535,14 +8550,14 @@ mod tests {
                 ),
             ] {
                 let (released, err) = run(decision, Err(crate::error::ScpPyError::from(error)));
-                assert!(
-                    !released,
-                    "{decision:?}: a failed re-read must keep the state"
+                assert_eq!(
+                    released,
+                    decision == CloseDecision::Dispatch,
+                    "{decision:?}: a failed re-read releases only after a dispatch ({marker})"
                 );
-                let err = err.unwrap_or_default();
                 assert!(
-                    err.contains(marker),
-                    "{decision:?}: the re-read's own error must reach the caller, got {err}"
+                    released || err.as_deref().is_some_and(|e| e.contains(marker)),
+                    "{decision:?}: the re-read's own error must reach the caller, got {err:?}"
                 );
             }
             for state in [
