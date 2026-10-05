@@ -211,11 +211,13 @@ fn close_context_on(
     // layer -- the full runtime will implement the cooperative closing window).
     // This writes the handle's cached snapshot, which the `state` getter
     // reports; the gate above read the supervisor rather than this string.
+    // The close has already happened, so a poisoned lock is recovered rather
+    // than failing the call and skipping the `SystemClose` delivery below.
     {
         let mut cached_state = handle
             .state
             .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         "closed".clone_into(&mut cached_state);
     }
 
@@ -235,9 +237,8 @@ fn close_context_on(
 /// # Errors
 ///
 /// Returns the dispatch's `ContextError` converted through
-/// `ScpPyError::from`, which gives `ContextNotRegistered` code `SCP-CTX-2001`,
-/// and a `ContextError` with code `SCP-CTX-2000` when the actor's reply was
-/// dropped.
+/// `ScpPyError::from`, and a `ContextError` with code `SCP-CTX-2000` when the
+/// actor's reply was dropped.
 fn check_close_dispatch_outcome(
     outcome: Result<
         Result<scp_core::context::ttl::CloseResult, scp_core::context::ContextError>,
@@ -3575,9 +3576,10 @@ impl crate::scp::PyScp {
     ///   (`ActorCrashed`) for the causes `Supervisor::read_context_state_checked`
     ///   documents.
     ///
-    /// Returns `ContextError` carrying the dispatch's code and releases nothing
-    /// if the `CloseContext` dispatch fails: `SCP-CTX-2001` when the dispatch
-    /// finds no actor, and `SCP-CTX-2000` when the actor's reply is dropped.
+    /// If the `CloseContext` dispatch fails, it releases nothing and returns
+    /// the dispatch's `ContextError` converted through `ScpPyError::from`, or
+    /// `ContextError` with code `SCP-CTX-2000` when the actor's reply is
+    /// dropped.
     ///
     /// After the dispatch succeeds or is skipped, it returns `ContextError`
     /// with code `SCP-CTX-2017` and releases nothing if the supervisor read
@@ -8199,10 +8201,9 @@ mod tests {
         );
     }
 
-    /// A failed `CloseContext` dispatch fails the close with a coded
-    /// `ContextError`: `ContextNotRegistered` carries `SCP-CTX-2001`,
-    /// `ContextPoisoned` `SCP-CTX-2134`, `ActorCrashed` `SCP-CTX-2135`, a
-    /// denial its embedded code, and a dropped reply `SCP-CTX-2000`.
+    /// A failed `CloseContext` dispatch fails the close with the code of the
+    /// dispatch error converted through `ScpPyError::from`, and a dropped
+    /// reply fails it with `SCP-CTX-2000`.
     #[test]
     fn close_dispatch_that_fails_returns_its_code() {
         use scp_core::context::ContextError as CE;
@@ -8340,6 +8341,43 @@ mod tests {
         assert_eq!(handle.state().expect("state"), "closed");
     }
 
+    /// A close whose dispatch succeeds finishes, and writes the handle's
+    /// cached string, even when that string's lock is poisoned.
+    ///
+    /// The lock is written after the release, so a close that failed on a
+    /// poisoned lock would report an error for a close the supervisor already
+    /// ran, and this case would fail.
+    #[test]
+    fn close_finishes_when_the_handle_state_lock_is_poisoned() {
+        let creator = "did:dht:z6MkPoisonedLockCreator";
+        let (scp, handle) = lifecycle_fixture("ab", creator);
+        let state = Arc::clone(&handle.state);
+        std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison the handle's state lock");
+        })
+        .join()
+        .expect_err("the poisoning thread must panic");
+        assert!(
+            handle.state.is_poisoned(),
+            "the fixture must poison the lock"
+        );
+
+        scp.context_close(&handle, creator)
+            .expect("close must finish on a poisoned state lock");
+        assert!(
+            !crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+            "the close must release the bridge state"
+        );
+        assert_eq!(
+            *handle
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "closed"
+        );
+    }
+
     /// A close whose lifecycle read reports `Expired` or `Tombstoned` succeeds
     /// without a dispatch and releases this bridge's state for the id.
     ///
@@ -8456,8 +8494,7 @@ mod tests {
     /// `Active`.
     ///
     /// The context sits in its closing window, and the close is handed an
-    /// `Active` first read, so it dispatches. `ttl::close_context` refuses a
-    /// context that is not `Active`, so the dispatch fails while the
+    /// `Active` first read, so it dispatches, and the dispatch fails while the
     /// supervisor reports `Closing`. A close that released on a failed
     /// dispatch removes the bridge state here and fails this case.
     #[test]
