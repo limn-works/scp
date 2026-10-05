@@ -1049,9 +1049,9 @@ impl UniffiBridgeInstance {
             // `SCP-CTX-2134` code on its next per-context operation, so the
             // gate surfaces `ContextPoisoned` rather than the operation's own
             // non-active code.
-            Some(scp_core::context::ContextState::Poisoned) => Err(crate::ScpError::from(
-                scp_core::context::ContextError::ContextPoisoned(context_id.to_owned()),
-            )),
+            Some(scp_core::context::ContextState::Poisoned) => {
+                Err(context_poisoned_error(context_id))
+            }
             Some(other) => Err(mk_err(format!(
                 "cannot {verb} in '{}' state -- context must be active",
                 scp_ffi_common::context_state_str(&other)
@@ -1184,16 +1184,15 @@ impl UniffiBridgeInstance {
     /// and no-op if `context_id` carries a release mark.
     ///
     /// The release-mark check and the insert run while this call holds the
-    /// release-mark lock.
+    /// registry entry for `context_id` and then the release-mark lock.
     #[allow(dead_code)]
     pub fn ensure_ucan_registered(&self, context_id: &str, creator_did: &str, ceiling: &[String]) {
+        let entry = self.ucan_registry.entry(context_id.to_owned());
         let marks = self.lock_release_marks();
         if marks.contains_key(context_id) {
             return;
         }
-        self.ucan_registry
-            .entry(context_id.to_owned())
-            .or_insert_with(|| Self::build_ucan_context_state(context_id, creator_did, ceiling));
+        entry.or_insert_with(|| Self::build_ucan_context_state(context_id, creator_did, ceiling));
         drop(marks);
     }
 
@@ -1262,11 +1261,20 @@ impl UniffiBridgeInstance {
     /// Marks `context_id` released, and removes its UCAN state and its
     /// known-context entry, under one hold of the release-mark lock.
     pub fn release_ucan_state(&self, context_id: &str) {
+        let entry = self.ucan_registry.entry(context_id.to_owned());
         let mut marks = self.lock_release_marks();
         Self::set_release_mark(&mut marks, context_id, 0);
-        self.ucan_registry.remove(context_id);
+        Self::remove_registry_entry(entry);
         self.core.remove_known_context(context_id);
         drop(marks);
+    }
+
+    /// Removes the UCAN state `entry` holds, if any, and releases the
+    /// registry shard lock `entry` holds.
+    fn remove_registry_entry(entry: dashmap::mapref::entry::Entry<'_, String, UcanContextState>) {
+        if let dashmap::mapref::entry::Entry::Occupied(occupied) = entry {
+            occupied.remove();
+        }
     }
 
     /// Marks `context_id` released with one unsettled close.
@@ -1294,12 +1302,13 @@ impl UniffiBridgeInstance {
         context_id: &str,
         teardown: impl FnOnce(),
     ) -> bool {
+        let entry = self.ucan_registry.entry(context_id.to_owned());
         let mut marks = self.lock_release_marks();
         let Some(mark) = marks.get_mut(context_id) else {
             return false;
         };
         mark.in_flight = mark.in_flight.saturating_sub(1);
-        self.ucan_registry.remove(context_id);
+        Self::remove_registry_entry(entry);
         self.core.remove_known_context(context_id);
         teardown();
         drop(marks);
@@ -1712,6 +1721,14 @@ impl scp_core::context::persistence::ContextPersistence for ArcContextPersistenc
 /// `1024` matches the documented default shared with the `PyO3` reference
 /// bridge.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Builds the `ContextPoisoned` error (`SCP-CTX-2134`, ADR-049 §10) for
+/// `context_id`.
+pub(crate) fn context_poisoned_error(context_id: &str) -> crate::ScpError {
+    crate::ScpError::from(scp_core::context::ContextError::ContextPoisoned(
+        context_id.to_owned(),
+    ))
+}
 
 /// Mark count at which marking a new id first removes the earliest mark that
 /// has no unsettled close.

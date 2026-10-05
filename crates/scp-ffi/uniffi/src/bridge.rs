@@ -11741,8 +11741,9 @@ impl Scp {
     /// capability; this function runs no capability check of its own. When
     /// no actor serves the context, or the actor reports `Closed`, `Expired`,
     /// or `Tombstoned`, it skips the dispatch and only releases this bridge's
-    /// per-context state. It refuses every other state with `SCP-CTX-2017`
-    /// and keeps that state, and it propagates a failed state read.
+    /// per-context state. It refuses `Poisoned` with `SCP-CTX-2134` and every
+    /// other state with `SCP-CTX-2017`, keeps that state, and propagates a
+    /// failed state read.
     ///
     /// The release marks the id. When a re-read after the mark reports
     /// `Active`, or a readmit clears the mark before the release removes the
@@ -11793,13 +11794,7 @@ impl Scp {
                         });
                     }
                     Some(CoreContextState::Poisoned) => {
-                        return Err(ScpError::Context {
-                            msg: "cannot close context in 'poisoned' state -- the crash \
-                                  watchdog took the context out of service; this bridge keeps \
-                                  its revocation list and nonce state for the context"
-                                .to_owned(),
-                            code: codes::CTX_2017.to_owned(),
-                        });
+                        return Err(crate::runtime::context_poisoned_error(&handle.context_id));
                     }
                     Some(other) => {
                         let name = scp_ffi_common::context_state_str(&other);
@@ -21266,6 +21261,79 @@ mod tests {
         );
     }
 
+    /// A release, a close's removal or an ensure that waits on a UCAN
+    /// registry entry another caller holds does not hold the release-mark lock while it waits: a
+    /// readmit, a mark and an ensure on other ids finish, and the waiting
+    /// release completes once the entry is freed.
+    #[test]
+    fn registry_entry_wait_holds_no_release_lock() {
+        let scp = scp_test();
+        let held = scp_ffi_common::generate_context_id();
+        scp.inner.ensure_ucan_registered(&held, "did:dht:test", &[]);
+        let guard = scp
+            .inner
+            .ucan_registry
+            .get_mut(&held)
+            .expect("the held id has UCAN state");
+
+        let waiters: Vec<_> = (0..3)
+            .map(|i| {
+                let bi = Arc::clone(&scp.inner);
+                let id = held.clone();
+                std::thread::spawn(move || match i {
+                    0 => bi.release_ucan_state(&id),
+                    1 => bi.ensure_ucan_registered(&id, "did:dht:test", &[]),
+                    _ => {
+                        bi.remove_ucan_state_while_released(&id, || {});
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            waiters.iter().all(|w| !w.is_finished()),
+            "the release, removal and ensure on the held id must wait for its entry"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bi = Arc::clone(&scp.inner);
+        // An id in another registry shard than the held one.
+        let other = std::iter::repeat_with(scp_ffi_common::generate_context_id)
+            .find(|id| {
+                !matches!(
+                    scp.inner.ucan_registry.try_get(id),
+                    dashmap::try_result::TryResult::Locked
+                )
+            })
+            .expect("repeat_with never ends");
+        let other_id = other.clone();
+        let other_thread = std::thread::spawn(move || {
+            bi.mark_released(&other_id);
+            bi.readmit_context(&other_id);
+            bi.ensure_ucan_registered(&other_id, "did:dht:test", &[]);
+            tx.send(()).expect("the test thread is waiting");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("mark, readmit and ensure on another id must not wait on the held entry");
+        other_thread
+            .join()
+            .expect("the other-id thread must not panic");
+        assert!(scp.inner.with_ucan_state(&other, |_| ()).is_some());
+
+        drop(guard);
+        for waiter in waiters {
+            waiter.join().expect("a waiter must not panic");
+        }
+        assert!(
+            has_release_mark(&scp.inner, &held),
+            "the release must mark the held id once its entry is freed"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&held, |_| ()).is_none(),
+            "the marked id must hold no UCAN state, whichever waiter ran first"
+        );
+    }
+
     /// `ensure_ucan_registered_while_active` builds UCAN state for a context
     /// the supervisor reports `Active`, and builds none for an id no actor
     /// serves, which is what an evicted release mark leaves behind.
@@ -21520,8 +21588,8 @@ mod tests {
         }
     }
 
-    /// A close of a poisoned context refuses and keeps the bridge's
-    /// per-context UCAN state. The creator holds `context:close` and gets the
+    /// A close of a poisoned context refuses with `SCP-CTX-2134` and keeps
+    /// the bridge's per-context UCAN state. The creator holds `context:close` and gets the
     /// same refusal.
     #[test]
     #[cfg(feature = "testing")]
@@ -21554,9 +21622,7 @@ mod tests {
             .block_on(scp.context_close(Arc::clone(&handle), identity))
             .expect_err("close of a poisoned context must refuse");
         assert!(
-            matches!(&err, ScpError::Context { code, msg }
-                if code == codes::CTX_2017
-                    && msg.contains("cannot close context in 'poisoned' state")),
+            matches!(&err, ScpError::Context { code, .. } if code == codes::CTX_2134),
             "unexpected refusal: {err:?}"
         );
         assert!(
@@ -23197,10 +23263,6 @@ mod tests {
         assert_eq!(view.event_log_root, hex::encode([7u8; 32]));
     }
 
-    /// Builds a synthetic `ContextHandle` stamped with `scp`'s own
-    /// `instance_id` so the per-instance handle-affinity check accepts
-    /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
-    /// which only worked against the deleted process-wide default.
     /// Returns whether `context_id` carries a release mark on `bi`.
     fn has_release_mark(bi: &crate::runtime::UniffiBridgeInstance, context_id: &str) -> bool {
         bi.released_contexts
@@ -23209,6 +23271,10 @@ mod tests {
             .contains_key(context_id)
     }
 
+    /// Builds a synthetic `ContextHandle` stamped with `scp`'s own
+    /// `instance_id` so the per-instance handle-affinity check accepts
+    /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
+    /// which only worked against the deleted process-wide default.
     fn test_handle_for(scp: &Arc<crate::scp::Scp>) -> Arc<ContextHandle> {
         test_handle_with(scp, "did:dht:z6MkTestUser", Vec::new())
     }
