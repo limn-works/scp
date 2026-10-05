@@ -299,6 +299,24 @@ fn no_pre_rotation_backend() -> ScpError {
     }
 }
 
+/// Tears down a committed Welcome join, re-marks the id released, and returns
+/// the join's `CTX_2040` error.
+async fn tear_down_vanished_join(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    context_id: &str,
+) -> ScpError {
+    sup.discard_joined_context(context_id).await;
+    bi.release_ucan_state(context_id);
+    ScpError::Context {
+        msg: format!(
+            "UCAN state for context '{context_id}' vanished after the join committed; the \
+             just-committed actor was torn down to avoid a stranded context"
+        ),
+        code: codes::CTX_2040.to_owned(),
+    }
+}
+
 /// Selects the DHT client that key-rotation / agent-key / migration operations
 /// should publish their UPDATED DID document into, **failing closed**.
 ///
@@ -5374,29 +5392,34 @@ impl McpUniFfiBridgeProvider {
         }
         let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
-        // Ensure UCAN state is registered for this context, and read the
-        // outlet's registered kind so the UCAN check selects the correct
-        // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
-        // is released before entering with_ucan_state (a different DashMap).
-        // A handle removed since the lookup above is a denial for the same
-        // reason.
-        let outlet_kind_for_ucan = {
+        // Read the outlet's registered kind so the UCAN check selects the
+        // correct split stem (SCP-OUT-014), then ensure UCAN state is
+        // registered for this context. Scope the DashMap Ref so the shard
+        // lock is released before `ensure_ucan_registered` and
+        // `with_ucan_state` run. A handle removed since the lookup above is a
+        // denial for the same reason.
+        let (outlet_kind_for_ucan, creator_did, handle_ceiling) = {
             let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
                 AccessRefusal::Denied(format!(
                     "outlet '{outlet_name}' not registered in context '{context_id}'"
                 ))
             })?;
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
             let registry = handle
                 .outlet_registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
+            let kind = registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
                 AccessRefusal::Denied(format!(
                     "outlet '{outlet_name}' not registered in context '{context_id}'"
                 ))
-            })?
+            })?;
+            (
+                kind,
+                handle.creator_did.clone(),
+                handle.ceiling_strings.clone(),
+            )
         };
+        bi.ensure_ucan_registered(context_id, &creator_did, &handle_ceiling);
 
         // ADR-016 step 8 compares the token's grants against the ceiling in
         // `role_state`, and the chain check anchors on its `creator_did`. The
@@ -5789,9 +5812,13 @@ impl McpUniFfiBridgeProvider {
 
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
-        // Ensure UCAN state is registered before appending the event.
-        if let Some(handle) = context_handle_registry(&bi).get(context_id) {
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
+        // Ensure UCAN state is registered before appending the event. The
+        // handle Ref is dropped before `ensure_ucan_registered` runs.
+        let registered_handle = context_handle_registry(&bi)
+            .get(context_id)
+            .map(|handle| (handle.creator_did.clone(), handle.ceiling_strings.clone()));
+        if let Some((creator_did, handle_ceiling)) = registered_handle {
+            bi.ensure_ucan_registered(context_id, &creator_did, &handle_ceiling);
         }
 
         let append_result = bi.with_ucan_state(context_id, |ucan_state| {
@@ -6338,12 +6365,14 @@ async fn event_log_checkpoint_impl(
                 })?;
 
             // Ensure UCAN state (which contains the event log) is registered
-            // on this bridge instance.
-            bi.ensure_ucan_registered(
+            // on this bridge instance while the supervisor reports the context
+            // `Active`.
+            bi.ensure_ucan_registered_while_active(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
-            );
+            )
+            .await?;
 
             let sender_did = scp_did::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
@@ -6463,12 +6492,14 @@ async fn event_log_checkpoint_by_did_impl(
                 })?;
 
             // Ensure UCAN state (which contains the event log) is registered
-            // on this bridge instance.
-            bi.ensure_ucan_registered(
+            // on this bridge instance while the supervisor reports the context
+            // `Active`.
+            bi.ensure_ucan_registered_while_active(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
-            );
+            )
+            .await?;
 
             let sender_did = scp_did::DID(did);
             let context_id = handle.context_id.clone();
@@ -11250,6 +11281,10 @@ impl Scp {
                     }
                 };
 
+                // The supervisor serves the id again, so clear any release
+                // mark a prior close left on it.
+                bi.readmit_context(&context_id);
+
                 // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
                 // signed params, overwriting the DEFAULT ceiling used for the
                 // reversible occupy. The authoritative ceiling lives in the bundle
@@ -11257,18 +11292,16 @@ impl Scp {
                 // irreversible commit; the UCAN state was just occupied (and not
                 // removed on this success path), so the sync targets a live entry.
                 //
-                // BLACK-2JF-01 — post-irreversible-commit compensation: the sync
-                // fails ONLY if a concurrent close/leave removed the just-occupied
-                // UCAN state in the window since the spawn returned. A close/leave
-                // does NOT despawn the runtime actor, so returning `Err` here
-                // without tearing the actor down would strand a live, orphaned
-                // actor for a join that never fully materialized at the bridge.
+                // BLACK-2JF-01 — post-irreversible-commit compensation: when
+                // the sync finds no UCAN state, returning `Err` here without
+                // tearing the actor down would strand a live, orphaned actor
+                // for a join that never fully materialized at the bridge.
                 // Compensate with the COMPLETE teardown (`discard_joined_context`):
                 // it removes the actor handle AND destroys the resident MLS group
                 // AND deletes the durable Class-S snapshot the join persisted — a
                 // bare `despawn_actor` would leave the crypto group and snapshot
                 // behind, resurrecting the context on restart and blocking a fresh
-                // re-join. Then purge residual UCAN state and surface the error.
+                // re-join. Then re-mark the id released and surface the error.
                 let authed_ceiling: std::collections::HashSet<String> = joined
                     .params()
                     .ceiling
@@ -11281,16 +11314,7 @@ impl Scp {
                     })
                     .is_none()
                 {
-                    sup.discard_joined_context(&context_id).await;
-                    bi.remove_ucan_state(&context_id);
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "UCAN state for context '{context_id}' vanished before the \
-                             authenticated ceiling could be synced; the just-committed actor was \
-                             torn down to avoid a stranded context"
-                        ),
-                        code: codes::CTX_2040.to_owned(),
-                    });
+                    return Err(tear_down_vanished_join(&bi, sup, &context_id).await);
                 }
 
                 // Runtime join committed. Build and register the FFI context handle
@@ -11709,9 +11733,22 @@ impl Scp {
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
     ///
-    /// Authorization is enforced by the `ContextManager` (which delegates
-    /// to `ttl::close_context` checking the `ContextClose` capability) —
-    /// no bridge-layer auth check.
+    /// Reads the context's lifecycle state from its supervisor actor, not
+    /// from the handle's cached state. On `Active` it dispatches
+    /// `CloseContext`, whose `ttl::close_context` checks the `ContextClose`
+    /// capability; this function runs no capability check of its own. When
+    /// no actor serves the context, or the actor reports `Closed`, `Expired`,
+    /// or `Tombstoned`, it skips the dispatch and only releases this bridge's
+    /// per-context state. It refuses `Poisoned` with `SCP-CTX-2134` and every
+    /// other state with `SCP-CTX-2017`, keeps that state, and propagates a
+    /// failed state read.
+    ///
+    /// The release marks the id. When a re-read after the mark reports
+    /// `Active`, or a readmit clears the mark before the release removes the
+    /// state, this function removes nothing, leaves the handle's cached state
+    /// unchanged, and refuses with `SCP-CTX-2017`. When that re-read fails,
+    /// it removes nothing, leaves the handle's cached state unchanged, and
+    /// returns the read's error.
     pub async fn context_close(
         &self,
         handle: Arc<ContextHandle>,
@@ -11728,35 +11765,59 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                // Authorization is enforced by the ContextManager (which delegates
-                // to ttl::close_context checking the ContextClose capability). No
-                // bridge-layer auth check — the ContextManager is authoritative.
                 let identity_did = identity.did.clone();
 
-                let mut state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Context {
-                        msg: format!(
-                            "cannot close context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::CTX_2017.to_owned(),
-                    });
-                }
-
-                // Route through the ADR-049 lifecycle dispatch surface. The
-                // actor mailbox preserves byte-identical close semantics; the
-                // Supervisor is the authoritative auth layer (ttl::close_context
-                // ContextClose capability check).
-                let sup = bi.context_manager_or_error()?;
-                let core_handle = scp_core::context::ContextHandle::new(
-                    handle.context_id.clone(),
-                    scp_core::context::ContextParams::default(),
-                );
-                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
-
-                let initiator_did: scp_did::DID = identity_did.clone().into();
+                // `scp_core::context::ContextState` is the supervisor's enum;
+                // the UniFFI-exported `ContextState` is a separate type.
+                use scp_core::context::ContextState as CoreContextState;
+                let close_already_happened = match bi
+                    .read_live_context_state(&handle.context_id)
+                    .await?
                 {
+                    None
+                    | Some(
+                        CoreContextState::Closed
+                        | CoreContextState::Expired
+                        | CoreContextState::Tombstoned,
+                    ) => true,
+                    Some(CoreContextState::Active) => false,
+                    Some(CoreContextState::Closing) => {
+                        return Err(ScpError::Context {
+                            msg: "cannot close context in 'closing' state -- the context is \
+                                  inside its cooperative closing window; call finalize_close \
+                                  to reach Closed, then close to release any state this \
+                                  bridge still holds for the context"
+                                .to_owned(),
+                            code: codes::CTX_2017.to_owned(),
+                        });
+                    }
+                    Some(CoreContextState::Poisoned) => {
+                        return Err(crate::runtime::context_poisoned_error(&handle.context_id));
+                    }
+                    Some(other) => {
+                        let name = scp_ffi_common::context_state_str(&other);
+                        return Err(ScpError::Context {
+                            msg: format!(
+                                "cannot close context in '{name}' state -- context must be active"
+                            ),
+                            code: codes::CTX_2017.to_owned(),
+                        });
+                    }
+                };
+                let mut state = handle.state.lock().await;
+
+                // Route through the ADR-049 lifecycle dispatch surface; the
+                // actor's `ttl::close_context` checks the `ContextClose`
+                // capability.
+                if !close_already_happened {
+                    let sup = bi.context_manager_or_error()?;
+                    let core_handle = scp_core::context::ContextHandle::new(
+                        handle.context_id.clone(),
+                        scp_core::context::ContextParams::default(),
+                    );
+                    let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
+
+                    let initiator_did: scp_did::DID = identity_did.clone().into();
                     use scp_core::context::actor::commands::{
                         CloseContextPayload, LifecycleCommand,
                     };
@@ -11795,15 +11856,24 @@ impl Scp {
                 // issued from here either (relay_urls / blob_ids were always empty),
                 // so nothing observable is lost by removing this block.
 
-                // Clean up per-context UCAN state on this instance.
-                bi.remove_ucan_state(&handle.context_id);
-
-                // Clean up per-context bridge connector state and economy state.
-                bi.core.remove_bridge_state(&handle.context_id);
-                bi.core.remove_economy_state(&handle.context_id);
-
-                // Deregister the context handle from the MCP lookup registry.
-                deregister_context_handle(&bi, &handle.context_id);
+                // Mark the id and, unless the re-read reports `Active` or this
+                // close's mark no longer stands, release this instance's UCAN,
+                // connector and economy state and the MCP handle registration
+                // under the release-mark lock.
+                let released = bi
+                    .release_ucan_state_unless_readmitted(&handle.context_id, || {
+                        bi.core.remove_bridge_state(&handle.context_id);
+                        bi.core.remove_economy_state(&handle.context_id);
+                        deregister_context_handle(&bi, &handle.context_id);
+                    })
+                    .await?;
+                if !released {
+                    return Err(ScpError::Context {
+                        msg: "this close released none of the context's state on this bridge"
+                            .to_owned(),
+                        code: codes::CTX_2017.to_owned(),
+                    });
+                }
 
                 *state = ContextState::Closed;
                 drop(state);
@@ -12040,7 +12110,6 @@ impl Scp {
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
-        let proposal_id_log = hex::encode(proposal_id);
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
 
@@ -12117,22 +12186,6 @@ impl Scp {
                 code: codes::CTX_2032.to_owned(),
             })??;
 
-        // Re-sync role state from ContextManager after governance execution (#796).
-        // Governance actions may modify roles/membership; without this sync the
-        // Swift/Kotlin SDKs see stale role state for UCAN/outlet capability checks.
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                proposal_id = %proposal_id_log,
-                error = %e,
-                "failed to sync role state after governance execution"
-            );
-        }
-
         // Sync FFI handle state for migration transitions (§5.11A).
         match result.as_str() {
             "MigrationProposed" => {
@@ -12168,7 +12221,7 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
 
-        let (result, action_name) = runtime()
+        let result = runtime()
             .spawn(async move {
                 let action: scp_core::context::governance::GovernanceAction =
                     serde_json::from_str(&action_json)?;
@@ -12180,7 +12233,6 @@ impl Scp {
                         code: codes::CTX_2041.to_owned(),
                     },
                 )?;
-                let action_name = action.variant_name();
                 let did = scp_did::DID(proposer_did);
                 let manager = bi.context_manager_or_error()?;
                 let outcome = manager
@@ -12195,26 +12247,13 @@ impl Scp {
                     "status": format!("{:?}", outcome.status),
                     "execution_result": result_str,
                 });
-                Ok::<_, ScpError>((response.to_string(), action_name))
+                Ok::<_, ScpError>(response.to_string())
             })
             .await
             .map_err(|e| ScpError::Context {
                 msg: format!("tokio task join error during governance proposal: {e}"),
                 code: codes::CTX_2041.to_owned(),
             })??;
-
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                action = action_name,
-                error = %e,
-                "failed to sync role state after governance proposal"
-            );
-        }
 
         Ok(result)
     }
@@ -12238,7 +12277,7 @@ impl Scp {
         let context_id = handle.context_id.clone();
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
-        let result = runtime()
+        runtime()
             .spawn(async move {
                 let did = scp_did::DID(voter_did);
                 let sup = bi.context_manager_or_error()?;
@@ -12273,21 +12312,7 @@ impl Scp {
             .map_err(|e| ScpError::Context {
                 msg: format!("tokio task join error during governance approval: {e}"),
                 code: codes::CTX_2042.to_owned(),
-            })?;
-
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                error = %e,
-                "failed to sync role state after governance approval"
-            );
-        }
-
-        result
+            })?
     }
 
     /// Per-instance equivalent of the free-function `governance_reject`.
@@ -12309,7 +12334,7 @@ impl Scp {
         let context_id = handle.context_id.clone();
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
-        let result = runtime()
+        runtime()
             .spawn(async move {
                 let did = scp_did::DID(voter_did);
                 let sup = bi.context_manager_or_error()?;
@@ -12344,21 +12369,7 @@ impl Scp {
             .map_err(|e| ScpError::Context {
                 msg: format!("tokio task join error during governance rejection: {e}"),
                 code: codes::CTX_2043.to_owned(),
-            })?;
-
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                error = %e,
-                "failed to sync role state after governance rejection"
-            );
-        }
-
-        result
+            })?
     }
 
     /// Per-instance equivalent of the free-function `governance_withdraw`.
@@ -12379,7 +12390,7 @@ impl Scp {
         let context_id = handle.context_id.clone();
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
-        let result = runtime()
+        runtime()
             .spawn(async move {
                 let did = scp_did::DID(voter_did);
                 let manager = bi.context_manager_or_error()?;
@@ -12394,21 +12405,7 @@ impl Scp {
             .map_err(|e| ScpError::Context {
                 msg: format!("tokio task join error during governance withdrawal: {e}"),
                 code: codes::CTX_2044.to_owned(),
-            })?;
-
-        if let Err(e) = self
-            .inner
-            .sync_role_state_from_manager(&handle.context_id)
-            .await
-        {
-            tracing::warn!(
-                context_id = %handle.context_id,
-                error = %e,
-                "failed to sync role state after governance withdrawal"
-            );
-        }
-
-        result
+            })?
     }
 
     /// Per-instance equivalent of the free-function `governance_get_proposal`.
@@ -12773,7 +12770,9 @@ impl Scp {
                         msg: format!("restore_context shim reply dropped: {e}"),
                         code: codes::CTX_2064.to_owned(),
                     })?
-                    .map_err(ScpError::from)
+                    .map_err(ScpError::from)?;
+                bi.readmit_context(&ctx_id);
+                Ok(())
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -12794,6 +12793,9 @@ impl Scp {
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
                 let restored = sup.restore_on_startup().await.map_err(ScpError::from)?;
+                for context_id in &restored {
+                    bi.readmit_context(context_id);
+                }
 
                 serde_json::to_string(&restored).map_err(|e| ScpError::Context {
                     msg: format!("serialization failed: {e}"),
@@ -15625,12 +15627,14 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                // Ensure UCAN state (which contains the event log) is registered.
-                bi.ensure_ucan_registered(
+                // Ensure UCAN state (which contains the event log) is registered
+                // while the supervisor reports the context `Active`.
+                bi.ensure_ucan_registered_while_active(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )
+                .await?;
 
                 // Parse optional filter JSON.
                 let filter: Option<serde_json::Value> =
@@ -15908,12 +15912,14 @@ impl Scp {
                 })?;
 
                 // Ensure UCAN state (which contains the event log) is registered
-                // on this instance.
-                bi.ensure_ucan_registered(
+                // on this instance while the supervisor reports the context
+                // `Active`.
+                bi.ensure_ucan_registered_while_active(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )
+                .await?;
 
                 match claim_type {
                     "inclusion" => {
@@ -19876,6 +19882,7 @@ impl Scp {
                 sup.import_context(export, &verifying_key, Some(local_pseudonym))
                     .await
                     .map_err(ScpError::from)?;
+                bi.readmit_context(&context_id);
 
                 // §9.10.4: emit a PseudonymAnnouncement so existing members
                 // learn this importer's per-context routing ID. Encrypted
@@ -20296,6 +20303,20 @@ mod tests {
     // -----------------------------------------------------------------------
     // ADR-049 Phase 2J: reserve_key_package / context_join_from_welcome
     // -----------------------------------------------------------------------
+
+    /// `encrypted_join_test_params` with a ceiling that holds `context:close`,
+    /// so the creator can close the context.
+    #[cfg(feature = "testing")]
+    fn closable_test_params() -> ContextParams {
+        ContextParams {
+            ceiling: vec![
+                "messages:read".to_owned(),
+                "messages:write".to_owned(),
+                "context:close".to_owned(),
+            ],
+            ..encrypted_join_test_params()
+        }
+    }
 
     /// Minimal ENCRYPTED single-admin params for the 2J join-side tests.
     #[cfg(feature = "testing")]
@@ -20868,6 +20889,9 @@ mod tests {
             .expect("identity_create failed");
         let creator_did = identity.did();
         let context_id = scp_ffi_common::generate_context_id();
+        // A close released this id before the join, so the release mark must
+        // survive the failed join: only a committed spawn readmits the id.
+        scp.inner.release_ucan_state(&context_id);
 
         // Custodied joiner + well-formed 32-byte `enc` clears the pseudonym gate
         // AND the enc-length check, so the join reaches the irreversible spawn —
@@ -20894,6 +20918,1064 @@ mod tests {
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
             "UCAN state must be rolled back after a failed spawn"
+        );
+        assert!(
+            has_release_mark(&scp.inner, &context_id),
+            "a failed join must not clear the release mark a close left"
+        );
+        scp.inner
+            .ensure_ucan_registered(&context_id, &creator_did, &[]);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "a released id must not get an empty revocation list rebuilt after a failed join"
+        );
+    }
+
+    /// A release that re-reads `Active` clears its own mark and removes
+    /// nothing, so the context keeps the revocations it recorded; a release
+    /// against an id no actor serves keeps the mark.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let active = handle.context_id();
+        scp.inner
+            .ensure_ucan_registered(&active, &identity.did(), &[]);
+        scp.inner
+            .with_ucan_state(&active, |state| {
+                state
+                    .revocation_list
+                    .revoke("revoked-while-active".to_owned());
+            })
+            .expect("the Active context must have UCAN state");
+
+        assert!(
+            !rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&active, || {})
+            )
+            .expect("the re-read of an Active context must succeed"),
+            "a release on an Active context must report the readmit"
+        );
+        assert!(!has_release_mark(&scp.inner, &active));
+        assert_eq!(
+            scp.inner.with_ucan_state(&active, |state| state
+                .revocation_list
+                .is_revoked("revoked-while-active")),
+            Some(true),
+            "a revocation the Active context recorded must survive the release"
+        );
+
+        let absent = scp_ffi_common::generate_context_id();
+        assert!(
+            rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&absent, || {})
+            )
+            .expect("the re-read of an id no actor serves must succeed")
+        );
+        assert!(
+            has_release_mark(&scp.inner, &absent),
+            "a release on an id no actor serves must keep the mark"
+        );
+    }
+
+    /// A release whose re-read fails returns the read's error, keeps the mark,
+    /// and removes nothing, so the revocations the context recorded survive.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_release_returns_the_error_of_a_failed_re_read_and_keeps_the_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let context_id = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed")
+            .context_id();
+        scp.inner
+            .with_ucan_state(&context_id, |state| {
+                state
+                    .revocation_list
+                    .revoke("revoked-before-the-failed-read".to_owned());
+            })
+            .expect("the created context must have UCAN state");
+        scp.inner
+            .context_manager_or_error()
+            .expect("test supervisor must be attached")
+            .test_make_actor_unreachable(&context_id);
+
+        let err = rt
+            .block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&context_id, || {}),
+            )
+            .expect_err("a failed re-read must reach the caller");
+        assert!(
+            err.to_string().contains("SCP-CTX-2130"),
+            "the release must report the actor-busy code, got: {err}"
+        );
+        assert!(
+            has_release_mark(&scp.inner, &context_id),
+            "a failed re-read must keep the mark"
+        );
+        assert_eq!(
+            scp.inner.with_ucan_state(&context_id, |state| state
+                .revocation_list
+                .is_revoked("revoked-before-the-failed-read")),
+            Some(true),
+            "a failed re-read must remove nothing"
+        );
+    }
+
+    /// The vanished-join teardown re-marks the id even though the join's
+    /// readmit had cleared the close's mark, so no UCAN state is rebuilt for
+    /// an id no actor serves.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn a_vanished_join_teardown_re_marks_the_id_its_readmit_cleared() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        rt.block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create initializes the supervisor");
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner.release_ucan_state(&ctx_id);
+        scp.inner.readmit_context(&ctx_id);
+
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("the supervisor is initialized");
+        let err = rt.block_on(super::tear_down_vanished_join(&scp.inner, sup, &ctx_id));
+        assert!(
+            matches!(err, ScpError::Context { ref code, .. } if code == codes::CTX_2040),
+            "the teardown must surface CTX_2040, got {err:?}"
+        );
+        assert!(
+            has_release_mark(&scp.inner, &ctx_id),
+            "the teardown must re-mark the id the join's readmit cleared"
+        );
+        scp.inner
+            .ensure_ucan_registered(&ctx_id, &identity.did(), &[]);
+        assert!(
+            scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none(),
+            "no UCAN state may be rebuilt for a torn-down join"
+        );
+    }
+
+    /// A readmit that clears the release mark before the removal runs leaves
+    /// the state in place, skips the teardown, and reports `false`; while the
+    /// mark stands, the removal takes the state, runs the teardown, and
+    /// reports `true`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_removal_skips_state_a_readmit_already_claimed() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner
+            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        scp.inner
+            .with_ucan_state(&ctx_id, |state| {
+                state
+                    .revocation_list
+                    .revoke("revoked-after-readmit".to_owned());
+            })
+            .expect("the registered context must have UCAN state");
+
+        let ticket = scp.inner.mark_released(&ctx_id);
+        scp.inner.readmit_context(&ctx_id);
+        let mut torn_down = false;
+        assert!(
+            !scp.inner
+                .remove_ucan_state_while_released(ticket, || torn_down = true),
+            "a removal after a readmit must report that the mark was gone"
+        );
+        assert!(
+            !torn_down,
+            "a removal after a readmit must skip the teardown"
+        );
+        assert_eq!(
+            scp.inner.with_ucan_state(&ctx_id, |state| state
+                .revocation_list
+                .is_revoked("revoked-after-readmit")),
+            Some(true),
+            "the readmitted context's revocation must survive the removal"
+        );
+
+        let ticket = scp.inner.mark_released(&ctx_id);
+        assert!(
+            scp.inner
+                .remove_ucan_state_while_released(ticket, || torn_down = true),
+            "a removal while the mark stands must report it"
+        );
+        assert!(
+            torn_down,
+            "a removal while the mark stands must run the teardown"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none(),
+            "the removal must take the state while the mark stands"
+        );
+    }
+
+    /// A close whose mark a readmit cleared does not tear down under a mark
+    /// a later close set after the readmit, and does not settle that later
+    /// close; the later close still tears down under its own mark.
+    #[test]
+    fn stale_close_skips_a_mark_set_after_a_readmit() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        let stale = scp.inner.mark_released(&ctx_id);
+        scp.inner.readmit_context(&ctx_id);
+        scp.inner
+            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        let later = scp.inner.mark_released(&ctx_id);
+        let in_flight = || {
+            scp.inner
+                .released_contexts
+                .lock()
+                .expect("marks lock")
+                .get(&ctx_id)
+                .map(|mark| mark.in_flight)
+        };
+
+        let mut torn_down = false;
+        assert!(
+            !scp.inner
+                .remove_ucan_state_while_released(stale, || torn_down = true),
+            "a close whose mark a readmit cleared must not remove under a later mark"
+        );
+        assert!(!torn_down, "the stale close must skip the teardown");
+        assert!(
+            scp.inner.with_ucan_state(&ctx_id, |_| ()).is_some(),
+            "the readmitted context's state must survive the stale close"
+        );
+        assert_eq!(
+            in_flight(),
+            Some(1),
+            "the stale close must not settle the later close"
+        );
+
+        assert!(
+            scp.inner
+                .remove_ucan_state_while_released(later, || torn_down = true),
+            "the later close must remove under its own mark"
+        );
+        assert!(torn_down, "the later close must run the teardown");
+        assert!(scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none());
+        assert_eq!(in_flight(), Some(0));
+    }
+
+    /// Two closes that join one standing mark share its generation: each
+    /// removal finds the mark and settles only its own close.
+    #[test]
+    fn closes_joining_one_mark_share_its_generation() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        let first = scp.inner.mark_released(&ctx_id);
+        let second = scp.inner.mark_released(&ctx_id);
+        let in_flight = || {
+            scp.inner
+                .released_contexts
+                .lock()
+                .expect("marks lock")
+                .get(&ctx_id)
+                .map(|mark| mark.in_flight)
+        };
+        assert_eq!(in_flight(), Some(2));
+        assert!(scp.inner.remove_ucan_state_while_released(first, || {}));
+        assert_eq!(
+            in_flight(),
+            Some(1),
+            "the first removal must settle only its own close"
+        );
+        assert!(
+            scp.inner.remove_ucan_state_while_released(second, || {}),
+            "a second close that joined the same mark must still find it"
+        );
+        assert_eq!(in_flight(), Some(0));
+    }
+
+    /// A close whose re-read reports `Active` settles only its own close: the
+    /// mark stays while another close that joined it is unsettled, and that
+    /// close still finds the mark; a lone close's `Active` re-read clears it.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn active_re_read_keeps_a_mark_another_close_holds() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let active = handle.context_id();
+
+        let pending = scp.inner.mark_released(&active);
+        assert!(
+            !rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&active, || {})
+            )
+            .expect("the re-read of an Active context must succeed")
+        );
+        assert!(
+            has_release_mark(&scp.inner, &active),
+            "an Active re-read must keep a mark another close has not settled"
+        );
+        assert!(
+            scp.inner.remove_ucan_state_while_released(pending, || {}),
+            "the pending close must still find the mark it joined"
+        );
+
+        scp.inner.readmit_context(&active);
+        assert!(
+            !rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&active, || {})
+            )
+            .expect("the re-read of an Active context must succeed")
+        );
+        assert!(
+            !has_release_mark(&scp.inner, &active),
+            "a lone close's Active re-read must clear its mark"
+        );
+    }
+
+    /// Marking a new id at `MAX_RELEASED_CONTEXTS` marks evicts the earliest
+    /// mark with no unsettled close; re-marking an id that already holds a
+    /// mark evicts none, and a mark whose close is unsettled is never evicted.
+    #[test]
+    fn marking_past_the_cap_evicts_the_earliest_settled_mark() {
+        use crate::runtime::{MAX_RELEASED_CONTEXTS, ReleaseMark};
+
+        let scp = scp_test();
+        let now = std::time::Instant::now();
+        let earlier = now
+            .checked_sub(std::time::Duration::from_secs(2))
+            .expect("two seconds before now is representable");
+        let middle = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before now is representable");
+        let mark_count = || {
+            scp.inner
+                .released_contexts
+                .lock()
+                .expect("marks lock")
+                .len()
+        };
+        {
+            let mut marks = scp.inner.released_contexts.lock().expect("marks lock");
+            marks.insert(
+                "earliest-in-flight".to_owned(),
+                ReleaseMark {
+                    at: earlier,
+                    in_flight: 1,
+                    generation: 0,
+                },
+            );
+            marks.insert(
+                "earliest-settled".to_owned(),
+                ReleaseMark {
+                    at: middle,
+                    in_flight: 0,
+                    generation: 0,
+                },
+            );
+            for i in 2..MAX_RELEASED_CONTEXTS {
+                marks.insert(
+                    format!("mark-{i}"),
+                    ReleaseMark {
+                        at: now,
+                        in_flight: 0,
+                        generation: 0,
+                    },
+                );
+            }
+        }
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
+
+        let _ticket = scp.inner.mark_released("mark-2");
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
+        assert!(
+            has_release_mark(&scp.inner, "earliest-settled"),
+            "re-marking a marked id must evict nothing"
+        );
+
+        scp.inner.release_ucan_state("newest");
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
+        assert!(has_release_mark(&scp.inner, "newest"));
+        assert!(
+            has_release_mark(&scp.inner, "earliest-in-flight"),
+            "a mark whose close is unsettled must not be evicted"
+        );
+        assert!(
+            !has_release_mark(&scp.inner, "earliest-settled"),
+            "a new mark at the cap must evict the earliest settled mark"
+        );
+
+        {
+            let mut marks = scp.inner.released_contexts.lock().expect("marks lock");
+            for mark in marks.values_mut() {
+                mark.in_flight = 1;
+            }
+        }
+        scp.inner.release_ucan_state("over-the-cap");
+        assert_eq!(
+            mark_count(),
+            MAX_RELEASED_CONTEXTS + 1,
+            "with every close unsettled, a new mark must evict none"
+        );
+    }
+
+    /// A close's teardown runs while it holds the release-mark lock and no
+    /// UCAN registry guard: a readmit started during the teardown waits for
+    /// it to finish, and the registry entry for the id is not locked.
+    #[test]
+    fn close_teardown_holds_the_release_lock_and_no_registry_guard() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner
+            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        let ticket = scp.inner.mark_released(&ctx_id);
+
+        let readmitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readmit_thread = None;
+        let removed = scp.inner.remove_ucan_state_while_released(ticket, || {
+            assert!(
+                !matches!(
+                    scp.inner.ucan_registry.try_get(&ctx_id),
+                    dashmap::try_result::TryResult::Locked
+                ),
+                "the teardown must run with no UCAN registry guard on the id"
+            );
+            let bi = Arc::clone(&scp.inner);
+            let id = ctx_id.clone();
+            let flag = Arc::clone(&readmitted);
+            readmit_thread = Some(std::thread::spawn(move || {
+                bi.readmit_context(&id);
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !readmitted.load(std::sync::atomic::Ordering::SeqCst),
+                "a readmit must wait for the teardown that holds the release-mark lock"
+            );
+        });
+        assert!(removed, "the removal must report the standing mark");
+        readmit_thread
+            .expect("the teardown started the readmit")
+            .join()
+            .expect("the readmit thread must not panic");
+        assert!(readmitted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !has_release_mark(&scp.inner, &ctx_id),
+            "the readmit must clear the mark once the teardown finished"
+        );
+    }
+
+    /// A release, a close's removal or an ensure that waits on a UCAN
+    /// registry entry another caller holds does not hold the release-mark lock while it waits: a
+    /// readmit, a mark and an ensure on other ids finish, and the waiting
+    /// release completes once the entry is freed.
+    #[test]
+    fn registry_entry_wait_holds_no_release_lock() {
+        let scp = scp_test();
+        let held = scp_ffi_common::generate_context_id();
+        scp.inner.ensure_ucan_registered(&held, "did:dht:test", &[]);
+        let guard = scp
+            .inner
+            .ucan_registry
+            .get_mut(&held)
+            .expect("the held id has UCAN state");
+
+        let waiters: Vec<_> = (0..3)
+            .map(|i| {
+                let bi = Arc::clone(&scp.inner);
+                let id = held.clone();
+                std::thread::spawn(move || match i {
+                    0 => bi.release_ucan_state(&id),
+                    1 => bi.ensure_ucan_registered(&id, "did:dht:test", &[]),
+                    _ => {
+                        let ticket = bi.mark_released(&id);
+                        bi.remove_ucan_state_while_released(ticket, || {});
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            waiters.iter().all(|w| !w.is_finished()),
+            "the release, removal and ensure on the held id must wait for its entry"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bi = Arc::clone(&scp.inner);
+        // An id in another registry shard than the held one.
+        let other = std::iter::repeat_with(scp_ffi_common::generate_context_id)
+            .find(|id| {
+                !matches!(
+                    scp.inner.ucan_registry.try_get(id),
+                    dashmap::try_result::TryResult::Locked
+                )
+            })
+            .expect("repeat_with never ends");
+        let other_id = other.clone();
+        let other_thread = std::thread::spawn(move || {
+            let _ticket = bi.mark_released(&other_id);
+            bi.readmit_context(&other_id);
+            bi.ensure_ucan_registered(&other_id, "did:dht:test", &[]);
+            tx.send(()).expect("the test thread is waiting");
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("mark, readmit and ensure on another id must not wait on the held entry");
+        other_thread
+            .join()
+            .expect("the other-id thread must not panic");
+        assert!(scp.inner.with_ucan_state(&other, |_| ()).is_some());
+
+        drop(guard);
+        for waiter in waiters {
+            waiter.join().expect("a waiter must not panic");
+        }
+        assert!(
+            has_release_mark(&scp.inner, &held),
+            "the release must mark the held id once its entry is freed"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&held, |_| ()).is_none(),
+            "the marked id must hold no UCAN state, whichever waiter ran first"
+        );
+    }
+
+    /// `ensure_ucan_registered_while_active` builds UCAN state for a context
+    /// the supervisor reports `Active`, and builds none for an id no actor
+    /// serves or for a closed context whose release mark is gone.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ensure_while_active_builds_only_for_an_active_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let active = handle.context_id();
+        scp.inner.remove_ucan_state(&active);
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active(&active, &identity.did(), &[]),
+        )
+        .expect("the read of an Active context must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&active, |_| ()).is_some(),
+            "an Active context must get UCAN state"
+        );
+
+        let absent = scp_ffi_common::generate_context_id();
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active(&absent, &identity.did(), &[]),
+        )
+        .expect("the read of an id no actor serves must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&absent, |_| ()).is_none(),
+            "an id no actor serves must not get UCAN state"
+        );
+        assert!(
+            !has_release_mark(&scp.inner, &absent),
+            "the id carries no mark, so only the supervisor read refused it"
+        );
+
+        let closed_handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), closable_test_params()))
+            .expect("context_create should succeed");
+        let closed = closed_handle.context_id();
+        rt.block_on(scp.context_close(Arc::clone(&closed_handle), Arc::clone(&identity)))
+            .expect("close of an Active context must succeed");
+        let closed_state = rt
+            .block_on(scp.inner.read_live_context_state(&closed))
+            .expect("the read of a closed context must succeed");
+        assert!(
+            closed_state.is_some() && closed_state != Some(scp_core::context::ContextState::Active),
+            "the closed context's actor must stay resident in a non-Active state, got {closed_state:?}"
+        );
+        scp.inner.readmit_context(&closed);
+        scp.inner.remove_ucan_state(&closed);
+        assert!(!has_release_mark(&scp.inner, &closed));
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active(&closed, &identity.did(), &[]),
+        )
+        .expect("the read of a closed context must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&closed, |_| ()).is_none(),
+            "a closed context whose mark is gone must not get UCAN state"
+        );
+    }
+
+    /// A close whose supervisor re-read fails settles its mark's unsettled
+    /// close, so the bound may evict that mark later.
+    #[test]
+    fn a_failed_close_re_read_settles_its_mark() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner.core.suspend().expect("suspend");
+        let result = runtime().block_on(
+            scp.inner
+                .release_ucan_state_unless_readmitted(&ctx_id, || {}),
+        );
+        assert!(result.is_err(), "a suspended bridge's re-read must fail");
+        let mark = *scp
+            .inner
+            .released_contexts
+            .lock()
+            .expect("marks lock")
+            .get(&ctx_id)
+            .expect("a failed re-read keeps the mark");
+        assert_eq!(mark.in_flight, 0, "a failed re-read must settle its close");
+    }
+
+    /// A close of a context whose actor the supervisor despawned succeeds,
+    /// releases and marks the per-context UCAN state, deregisters the MCP
+    /// handle, and records `Closed`, although the handle's cached state still
+    /// read `Active`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_of_a_context_no_actor_serves_releases_its_bridge_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        assert!(scp.inner.with_ucan_state(&context_id, |_| ()).is_some());
+        assert!(context_handle_registry(&scp.inner).contains_key(&context_id));
+
+        rt.block_on(async {
+            scp.inner
+                .context_manager_or_error()
+                .expect("supervisor")
+                .despawn_actor(&context_id)
+                .await
+        });
+
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("close of a despawned context must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "close must release the per-context UCAN state"
+        );
+        assert!(
+            has_release_mark(&scp.inner, &context_id),
+            "close must mark the released id"
+        );
+        assert!(
+            !context_handle_registry(&scp.inner).contains_key(&context_id),
+            "close must deregister the MCP handle"
+        );
+        assert!(matches!(
+            *rt.block_on(handle.state.lock()),
+            ContextState::Closed
+        ));
+    }
+
+    /// A close refuses a context in its cooperative closing window and
+    /// releases none of that context's UCAN state.
+    ///
+    /// The closing arm refuses before any capability check, so the outsider
+    /// this test uses gets the state refusal, not a capability refusal.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_closing_context_and_keeps_its_bridge_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed for the creator");
+        let outsider = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed for the outsider");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), closable_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        // The creator's close drives the supervisor into the closing window
+        // and releases the state, so clear the mark and re-register it: this
+        // case asks what a close does to a live entry.
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&creator)))
+            .expect("the creator's close should succeed");
+        scp.inner.readmit_context(&context_id);
+        scp.inner
+            .ensure_ucan_registered(&context_id, &creator.did(), &[]);
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&context_id))
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closing),
+            "the creator's close must leave the supervisor inside the closing window"
+        );
+
+        let err = rt
+            .block_on(scp.context_close(Arc::clone(&handle), outsider))
+            .expect_err("close must refuse a context inside its closing window");
+        assert!(
+            matches!(&err, ScpError::Context { code, msg }
+                if code == codes::CTX_2017 && msg.contains("'closing'")),
+            "close reported: {err:?}"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a refused close must leave the per-context UCAN state registered"
+        );
+    }
+
+    /// A close refuses a context whose actor the supervisor still holds but
+    /// this bridge could not reach, and releases none of its bridge state.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_whose_actor_this_bridge_cannot_reach() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        scp.inner
+            .context_manager_or_error()
+            .expect("test supervisor must be attached")
+            .test_make_actor_unreachable(&context_id);
+
+        let err = rt
+            .block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect_err("a close must refuse a context whose actor did not answer");
+        assert!(
+            err.to_string().contains("SCP-CTX-2130"),
+            "the refusal must report the actor-busy code, got: {err}"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a refused close must leave the per-context UCAN state registered"
+        );
+        assert!(
+            !has_release_mark(&scp.inner, &context_id),
+            "a refused close must not mark the id"
+        );
+        assert!(
+            matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
+            "a refused close must not write the handle's cached state"
+        );
+    }
+
+    /// A close refuses a context whose actor the crash watchdog is
+    /// respawning, and a context whose last respawn failed below the poison
+    /// threshold, and releases none of either context's bridge state.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_context_the_crash_watchdog_has_not_recovered() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        for mid_respawn in [true, false] {
+            let handle = rt
+                .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+                .expect("context_create should succeed");
+            let context_id = handle.context_id();
+            let sup = Arc::clone(
+                scp.inner
+                    .context_manager_or_error()
+                    .expect("test supervisor must be attached"),
+            );
+            if mid_respawn {
+                rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
+            } else {
+                rt.block_on(sup.test_fail_context_respawn(&context_id));
+            }
+
+            let err = rt
+                .block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+                .expect_err("a close must refuse a context the watchdog has not recovered");
+            assert!(
+                err.to_string().contains("SCP-CTX-2135"),
+                "the refusal must report the actor-crashed code (mid_respawn={mid_respawn}), \
+                 got: {err}"
+            );
+            assert!(
+                scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+                "a refused close must leave the per-context UCAN state registered \
+                 (mid_respawn={mid_respawn})"
+            );
+            assert!(
+                !has_release_mark(&scp.inner, &context_id),
+                "a refused close must not mark the id (mid_respawn={mid_respawn})"
+            );
+            assert!(
+                matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
+                "a refused close must not write the handle's cached state"
+            );
+        }
+    }
+
+    /// A close of a poisoned context refuses with `SCP-CTX-2134` and keeps
+    /// the bridge's per-context UCAN state. The creator holds `context:close` and gets the
+    /// same refusal.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn close_refuses_a_poisoned_context_and_keeps_its_bridge_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), closable_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        assert!(scp.inner.with_ucan_state(&context_id, |_| ()).is_some());
+
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("test supervisor must be attached"),
+        );
+        rt.block_on(sup.test_poison_context(&context_id));
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&context_id))
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Poisoned),
+            "the fixture must leave the supervisor reporting Poisoned"
+        );
+
+        let err = rt
+            .block_on(scp.context_close(Arc::clone(&handle), identity))
+            .expect_err("close of a poisoned context must refuse");
+        assert!(
+            matches!(&err, ScpError::Context { code, .. } if code == codes::CTX_2134),
+            "unexpected refusal: {err:?}"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a refused close must keep the per-context UCAN state"
+        );
+        assert!(
+            matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
+            "a refused close must not write the handle's cached state"
+        );
+    }
+
+    /// A token revoked before a close stays refused after the close released
+    /// the context's revocation list, and `ensure_ucan_registered` builds no
+    /// state for the released id until `readmit_context` clears the mark.
+    ///
+    /// `finalize_close` takes the context to `Closed`, and the actor stays
+    /// resident and still answers the role-state read, so the refusal comes
+    /// from the lifecycle gate, not from a missing role state.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn revoked_token_stays_refused_after_a_close_released_the_revocation_list() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), closable_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let audience = "did:dht:z6MkUniffiRevokedAcrossClose".to_owned();
+
+        let minted = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&handle),
+                audience.clone(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("the creator's mint should succeed");
+        let token = minted.encoded.clone();
+        let capability = minted
+            .data
+            .capabilities
+            .first()
+            .expect("the minted token carries its capability")
+            .clone();
+
+        rt.block_on(scp.ucan_validate(
+            Arc::clone(&handle),
+            token.clone(),
+            capability.clone(),
+            audience.clone(),
+            None,
+        ))
+        .expect("an unrevoked token must validate while the context is active");
+        rt.block_on(scp.ucan_revoke(Arc::clone(&handle), token.clone(), identity.did()))
+            .expect("the creator may revoke a token the creator issued");
+
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("the creator's close should succeed");
+        rt.block_on(scp.finalize_close(Arc::clone(&handle)))
+            .expect("finalize should take the context from closing to closed");
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&context_id))
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closed),
+            "the actor must stay resident and report closed"
+        );
+        assert!(
+            rt.block_on(scp.inner.live_role_state(&context_id)).is_ok(),
+            "the closed actor still answers the role-state read"
+        );
+
+        let err = rt
+            .block_on(scp.ucan_validate(Arc::clone(&handle), token, capability, audience, None))
+            .expect_err("a token revoked before the close must not validate after it");
+        assert!(
+            matches!(&err, ScpError::Context { code, msg }
+                if code == codes::CTX_2023
+                    && msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && !msg.contains("Closed")),
+            "the validation must refuse at the lifecycle gate and withhold the state: {err:?}"
+        );
+
+        scp.inner
+            .ensure_ucan_registered(&context_id, &identity.did(), &[]);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "ensure_ucan_registered must not rebuild a released context's state"
+        );
+        scp.inner.readmit_context(&context_id);
+        scp.inner
+            .ensure_ucan_registered(&context_id, &identity.did(), &[]);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "a readmitted context builds fresh state again"
+        );
+    }
+
+    /// An import of a context a close released clears the release mark, so
+    /// the imported context gets UCAN state again.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_import_readmits_an_id_a_close_released() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), closable_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let export_data = rt
+            .block_on(scp.context_export(Arc::clone(&handle)))
+            .expect("context_export should succeed");
+
+        rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("the creator's close should succeed");
+        rt.block_on(scp.finalize_close(Arc::clone(&handle)))
+            .expect("finalize should take the context from closing to closed");
+        assert!(has_release_mark(&scp.inner, &context_id));
+
+        let imported_id = rt
+            .block_on(scp.context_import(export_data, Arc::clone(&identity)))
+            .expect("context_import should replace the closed actor");
+        assert_eq!(imported_id, context_id);
+        assert!(
+            !has_release_mark(&scp.inner, &context_id),
+            "the import must clear the release mark"
+        );
+        scp.inner
+            .ensure_ucan_registered(&context_id, &identity.did(), &[]);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "the imported context must get UCAN state"
+        );
+    }
+
+    /// `restore_context` and `restore_all_contexts` clear the release mark on
+    /// each id they restore.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn restore_readmits_the_ids_it_restores() {
+        let rt = runtime();
+        // `restore_context` reads the snapshot the persistence provider holds;
+        // only the Sqlite backend attaches one.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let scp = crate::scp::Scp::with_storage(crate::StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: crate::runtime::SqliteKeyMaterial::Raw {
+                key: vec![0x11u8; 32],
+            },
+        })
+        .expect("sqlite storage must construct");
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let one = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed")
+            .context_id();
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("test supervisor must be attached"),
+        );
+        // Persist the snapshot `restore_context` reads; the actor writes it only
+        // on a coalesced flush or its final drain.
+        rt.block_on(sup.flush_all_contexts())
+            .expect("flush_all_contexts must succeed");
+        rt.block_on(sup.despawn_actor(&one));
+        scp.inner.release_ucan_state(&one);
+        rt.block_on(scp.restore_context(one.clone()))
+            .expect("restore_context should restore the despawned context");
+        assert!(
+            !has_release_mark(&scp.inner, &one),
+            "restore_context must clear the release mark"
+        );
+
+        let all = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed")
+            .context_id();
+        rt.block_on(sup.flush_all_contexts())
+            .expect("flush_all_contexts must succeed");
+        rt.block_on(sup.despawn_actor(&all));
+        scp.inner.release_ucan_state(&all);
+        let restored = rt
+            .block_on(scp.restore_all_contexts())
+            .expect("restore_all_contexts should succeed");
+        assert!(
+            restored.contains(&all),
+            "restore_all_contexts restored: {restored}"
+        );
+        assert!(
+            !has_release_mark(&scp.inner, &all),
+            "restore_all_contexts must clear the release mark"
         );
     }
 
@@ -21235,6 +22317,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A Welcome join that commits clears the release mark a close left on
+    /// the id, so the joined context gets UCAN state.
+    ///
+    /// The creator and the invitee share this instance, so the test removes
+    /// the creator's actor, handle and UCAN state before the join, leaving
+    /// only the release mark.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn a_committed_welcome_join_readmits_an_id_a_close_released() {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed for the creator");
+        let invitee = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed for the invitee");
+        let mut params = encrypted_join_test_params();
+        params.ceiling.push("governance:propose".to_owned());
+        let context_id = rt
+            .block_on(scp.context_create(Arc::clone(&creator), params))
+            .expect("context_create should succeed")
+            .context_id();
+        let reservation = rt
+            .block_on(scp.reserve_key_package(Arc::clone(&invitee)))
+            .expect("reserve_key_package should succeed");
+        let InviteMemberOutcome::Sealed { bundle, .. } = rt
+            .block_on(scp.invite_member(
+                Arc::clone(&creator),
+                context_id.clone(),
+                invitee.did(),
+                reservation.key_package_public,
+                Vec::new(),
+            ))
+            .expect("invite_member should seal a bundle");
+
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("test supervisor must be attached"),
+        );
+        rt.block_on(sup.discard_joined_context(&context_id));
+        deregister_context_handle(&scp.inner, &context_id);
+        scp.inner.release_ucan_state(&context_id);
+
+        rt.block_on(scp.context_join_from_welcome(
+            Arc::clone(&invitee),
+            bundle,
+            reservation.reservation_id,
+        ))
+        .expect("the Welcome join should commit");
+        assert!(
+            !has_release_mark(&scp.inner, &context_id),
+            "a committed Welcome join must clear the release mark"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "the joined context must have UCAN state"
+        );
     }
 
     /// A context already active on this instance collides at the atomic UCAN
@@ -22270,6 +23413,14 @@ mod tests {
         assert!(!view.attestation_count_anchored);
         assert_eq!(view.computed_at, 42);
         assert_eq!(view.event_log_root, hex::encode([7u8; 32]));
+    }
+
+    /// Returns whether `context_id` carries a release mark on `bi`.
+    fn has_release_mark(bi: &crate::runtime::UniffiBridgeInstance, context_id: &str) -> bool {
+        bi.released_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(context_id)
     }
 
     /// Builds a synthetic `ContextHandle` stamped with `scp`'s own
@@ -28921,11 +30072,12 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A synthetic handle stamped with this instance's id; the checkpoint
-        // impl registers fresh UCAN state (event log) for the context, so no
-        // full `context_create` is required. Custody comes from `identity`, not
-        // the handle.
+        // A synthetic handle stamped with this instance's id, with UCAN state
+        // (event log) registered for it here, so no full `context_create` is
+        // required. Custody comes from `identity`, not the handle.
         let handle = test_handle_for(&scp);
+        scp.inner
+            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
 
         let checkpoint = event_log_checkpoint_impl(Arc::clone(&scp.inner), handle, identity, 0u64)
             .await
@@ -28958,11 +30110,12 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A synthetic handle stamped with this instance's id; the checkpoint
-        // impl registers fresh UCAN state (event log) for the context, so no
-        // full `context_create` is required. Custody comes from `identity`, not
-        // the handle.
+        // A synthetic handle stamped with this instance's id, with UCAN state
+        // (event log) registered for it here, so no full `context_create` is
+        // required. Custody comes from `identity`, not the handle.
         let handle = test_handle_for(&scp);
+        scp.inner
+            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
 
         // Pass the identity's own DID so the `did == identity.did` binding
         // (VALID_7000) is satisfied — the production happy path.
@@ -29011,6 +30164,8 @@ mod tests {
             .await
             .expect("identity_create");
         let handle = test_handle_for(&scp);
+        scp.inner
+            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
 
         // Mismatch: a different, syntactically valid DID is rejected because it
         // does not match the signing identity's DID.
