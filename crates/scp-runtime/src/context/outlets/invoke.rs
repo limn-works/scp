@@ -1762,9 +1762,7 @@ pub struct EconomicPolicySnapshot {
 /// The dispatch pump fires this from inside its spawned `tokio` task at the
 /// settlement block (gated by the `pump_exited` flag so it fires at most
 /// once). Because it runs ON the pump's tokio task, the implementation MUST
-/// NOT `block_on` — the production native-bridge impls hold a
-/// [`tokio::runtime::Handle`] and `Handle::spawn` the async
-/// `ContextManager::outlet_stream_settle`. The trait is `Send + Sync` so it
+/// NOT `block_on`. The trait is `Send + Sync` so it
 /// can be shared into the spawned pump task without an extra mutex.
 ///
 /// `None` (no sink wired) disables settlement — the legacy / test open
@@ -1772,8 +1770,7 @@ pub struct EconomicPolicySnapshot {
 /// `(billed, refund)` are still surfaced via the `StreamCloseSummary` for
 /// those callers.
 pub trait StreamSettlementSink: Send + Sync {
-    /// Settles the stream's economics exactly once. MUST NOT block — spawn
-    /// the async settlement onto a runtime handle.
+    /// Settles the stream's economics exactly once. MUST NOT block.
     fn settle(&self, settlement: StreamSettlement);
 
     /// Fix-D — durably persist the crash-recovery
@@ -5752,8 +5749,7 @@ where
 {
     // Taken first, so an open refused by shutdown has reserved nothing, and the
     // bridge task below spawns through it without a second refusal point after
-    // B's stream is open (ADR-049 Decision 16, item 2). The refusal reaches the
-    // caller as the same-context open's `SupervisorShutDown` rejection does.
+    // B's stream is open (ADR-049 Decision 16, item 2).
     let spawner = supervisor
         .tracked_spawner("open cross-context outlet stream")
         .map_err(|_refused| {
@@ -9256,9 +9252,8 @@ mod tests {
         }
 
         /// Once shutdown has begun, a cross-context open is refused before the
-        /// registry lookup with the same non-retryable `ContextNotActive`
-        /// surface the same-context open's `SupervisorShutDown` rejection maps
-        /// to, never `ExecutionFailed` (the handler-panic surface).
+        /// registry lookup with `ContextNotActive`, never `ExecutionFailed`
+        /// (the handler-panic surface).
         #[tokio::test]
         async fn closed_spawn_gate_refuses_cross_context_open_as_context_not_active() {
             let result = cross_context_with_gate(true).await;

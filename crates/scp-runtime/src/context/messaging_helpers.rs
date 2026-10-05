@@ -2524,6 +2524,11 @@ async fn persist_finalized_send(
 /// `dyn FnMut` sink), so a `&PerContextState` held across an `.await` makes the
 /// actor future `!Send` and fails `tokio::spawn`. Building the snapshot first
 /// keeps the borrow off the await point (ADR-049 Decision 7).
+///
+/// # Errors
+///
+/// Returns [`ContextError::SupervisorShutDown`] when the Supervisor has
+/// dropped, so no sender-epoch or receive-sequence floor export exists.
 pub fn build_snapshot_for_persist(
     state: &PerContextState,
     deps: &ActorDeps,
@@ -2673,7 +2678,9 @@ pub fn persist_state_best_effort<'d, 'c>(
 /// # Errors
 ///
 /// Returns [`ContextError::PersistenceFailed`] if the underlying
-/// `persist_context` write fails.
+/// `persist_context` write fails, and [`ContextError::SupervisorShutDown`] when
+/// [`build_snapshot_for_persist`] returns it.
+///
 /// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
 ///
 /// SYNC fn returning a future (see [`persist_state_best_effort`] for the full

@@ -4511,6 +4511,62 @@ mod restore_reconcile_tests {
         );
     }
 
+    /// ADR-049 Decision 16: an import that reaches the actor spawn after
+    /// shutdown has begun returns the typed `SupervisorShutDown`
+    /// (SCP-CTX-2138), not a flattened `MembershipFailed`. The same import on a
+    /// live Supervisor succeeds.
+    #[tokio::test]
+    async fn import_after_shutdown_keeps_supervisor_shut_down() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let import_on = |closed: bool, ctx_id: &'static str| async move {
+            let (mut snapshot, _) = harvest_snapshot(ctx_id, false).await;
+            // The export carries no event log, which recomputes to the zero
+            // root; the signed snapshot field must match it.
+            snapshot.event_log_merkle_root = [0u8; 32];
+            let creator = DID("did:dht:z6MkHarvestCreator".to_owned());
+            let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+            let export = crate::context::export_import::create_export(
+                snapshot,
+                Vec::new(),
+                creator.clone(),
+                crate::context::export_import::ExportScope::Full,
+                &scp_clock::SystemClock,
+                |hash: &[u8; 32]| {
+                    Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+                },
+            )
+            .expect("build a signed export");
+            let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+                CapturingPersistence::default(),
+            ))));
+            // The deps are built before shutdown, as an import already past
+            // `build_actor_deps` holds them when shutdown begins.
+            let deps = supervisor
+                .build_actor_deps(&creator)
+                .await
+                .expect("build_actor_deps");
+            if closed {
+                supervisor.shutdown_all_contexts().await;
+            }
+            lifecycle_helpers::import_context(
+                &deps,
+                export,
+                &signing_key.verifying_key(),
+                Some([7u8; 32]),
+            )
+            .await
+        };
+        import_on(false, "import-live")
+            .await
+            .expect("import on a live supervisor succeeds");
+        let imported = import_on(true, "import-closed").await;
+        assert!(
+            matches!(imported, Err(ContextError::SupervisorShutDown(_))),
+            "import after shutdown must keep SupervisorShutDown; got {imported:?}"
+        );
+    }
+
     /// A duplicate id is an actor-spawn failure other than shutdown: create
     /// still flattens it to `CreationFailed`.
     #[tokio::test]
