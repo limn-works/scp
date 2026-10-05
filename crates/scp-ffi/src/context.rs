@@ -8599,6 +8599,46 @@ mod tests {
         assert!(!registry().contains_key(active.context_id()));
     }
 
+    /// `release_context_unless_readmitted` removes this bridge's state and
+    /// returns `true` when the lifecycle re-read fails, here because the
+    /// context's actor does not answer (SCP-CTX-2130).
+    #[test]
+    #[cfg(feature = "testing")]
+    fn release_unless_readmitted_releases_on_a_failed_re_read() {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let creator = "did:dht:z6MkReleaseOnFailedReRead";
+        let context_id = format!("c5{}", "0".repeat(56));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::register_context(&bi, &context_id, creator, &[])
+            .expect("fixture registration");
+        crate::runtime::create_supervisor_context_for_test(
+            &bi,
+            &context_id,
+            creator,
+            &super::default_ceiling_strings(),
+        );
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        sup.test_make_actor_unreachable(&context_id);
+
+        let read_err =
+            crate::runtime::read_live_context_state_on(std::sync::Arc::clone(&sup), &context_id)
+                .expect_err("the re-read of an unreachable actor must fail");
+        assert!(
+            read_err.to_string().contains("SCP-CTX-2130"),
+            "the re-read must fail with the actor-busy code, got: {read_err}"
+        );
+
+        assert!(
+            crate::runtime::release_context_unless_readmitted(&bi, &sup, &context_id),
+            "a failed re-read must release"
+        );
+        assert!(
+            !crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
+            "a failed re-read must remove this bridge's state"
+        );
+    }
+
     /// A close refuses a context the supervisor holds in the cooperative
     /// closing window of ADR-008, the context lifecycle state machine, and
     /// releases none of that context's bridge state.
