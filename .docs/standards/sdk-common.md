@@ -259,7 +259,7 @@ constant).
 | `SCP-CTX-2085` | `scp-client-wasm` (browser participant) | Driver invariant violation / malformed driver argument (`ClientError::Driver`) |
 | `SCP-CTX-2086` | `scp-client-wasm` (browser participant) | No retained pending join material — join must reconstruct from the durable snapshot (`ClientError::NoPendingJoinMaterial`). (Sits at 2086 because 2080/2081 are taken by the Kotlin SDK.) |
 | `SCP-CTX-2095` | native FFI-common registry + Swift + Kotlin + ts-native + `scp-client-wasm` (**shared meaning, all surfaces**) | Pseudonym registry empty — peers have not announced routing IDs (§9.10.4); native `ContextError::PseudonymRegistryEmpty`, browser `ClientError::PseudonymRegistryEmpty` |
-| `SCP-CTX-2138` | native FFI-common registry | Operation refused because the owning Supervisor began shutdown or dropped; the operation did nothing (`ContextError::SupervisorShutDown`, ADR-049 Decision 16 item 2) — NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2138` | native FFI-common registry | Operation refused because the owning Supervisor began shutdown or dropped (`ContextError::SupervisorShutDown`, ADR-049 Decision 16 items 2 and 4) — NOT emitted by `scp-client-wasm` |
 | `SCP-CTX-2139` | native FFI-common registry | Outlet stream or streaming saga that the Supervisor had opened, dropped unregistered because bridge shutdown began; the operation had started (ADR-049 Decision 16 item 2) — NOT emitted by `scp-client-wasm` |
 | `SCP-CRYPTO-4010` | native FFI-common registry (also Kotlin SDK) | MLS group create error — native meaning; NOT emitted by `scp-client-wasm` |
 | `SCP-CRYPTO-4020` | `scp-client-wasm` (browser participant) | Sender-key (§9.16) layer failure (`ClientError::SenderKey`) |
