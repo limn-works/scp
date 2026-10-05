@@ -1992,21 +1992,20 @@ pub fn context_ids_for_member(
 /// Records `member` with the `member` role in `context_id`'s supervisor
 /// actor.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when no supervisor is attached, the tokio runtime is absent, or
-/// the supervisor refuses the insert.
+/// Returns `ScpPyError::ContextError` when no supervisor is attached, the
+/// tokio runtime is absent, or the supervisor refuses the insert.
 #[cfg(all(test, feature = "testing"))]
-#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
 pub(crate) fn insert_supervisor_member_for_test(
     bi: &PyBridgeInstance,
     context_id: &str,
     member: &str,
-) {
-    let sup = Arc::clone(supervisor(bi).expect("fixture supervisor"));
-    let rt = super::runtime().expect("tokio runtime");
+) -> Result<(), ScpPyError> {
+    let sup = Arc::clone(supervisor(bi)?);
+    let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
     rt.block_on(sup.test_insert_member(context_id, scp_did::DID(member.to_owned()), "member"))
-        .expect("supervisor must record the member");
+        .map_err(|e| ScpPyError::context(e.to_string()))
 }
 
 /// Registers an outlet handler for a specific outlet in a context.
@@ -4220,7 +4219,8 @@ mod tests {
             "precondition: the member is not in the context yet"
         );
 
-        insert_supervisor_member_for_test(&bi, &ctx_id, member);
+        insert_supervisor_member_for_test(&bi, &ctx_id, member)
+            .expect("supervisor must record the member");
 
         assert!(
             context_ids_for_member(&bi, member)

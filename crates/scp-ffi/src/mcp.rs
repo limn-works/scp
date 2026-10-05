@@ -1500,10 +1500,8 @@ fn mcp_server_bundle(
 /// state (`FfiBridgeProvider::held_role_state`), which blocks the transport
 /// task's thread until the actor answers. On a current-thread runtime that
 /// thread is the only one that could run the actor, so every gated request
-/// would fail. A gate looks the supervisor up on each request, so a server
-/// served before `init_context_manager` attaches one starts failing every
-/// gated request at that moment; the check therefore refuses a current-thread
-/// runtime whether or not a supervisor is attached at serve time, and
+/// would fail. The check refuses a current-thread runtime whether or not a
+/// supervisor is attached at serve time, and
 /// `py_mcp_serve` fails instead of returning a handle to such a server. The
 /// bridge runtime falls back to current-thread only when the multi-thread
 /// build fails (`crate::init_runtime`).
@@ -3000,7 +2998,8 @@ mod tests {
         // The member is recorded on the supervisor, where `validate_capability`
         // reads membership.
         let member = "did:dht:z6MkMemberNoInvoke";
-        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member);
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member)
+            .expect("supervisor must record the member");
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3043,7 +3042,8 @@ mod tests {
         // role grants none.
         let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
         let member = "did:dht:z6MkMemberInvokeOrder";
-        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member);
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member)
+            .expect("supervisor must record the member");
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3498,7 +3498,8 @@ mod tests {
         let bi = __bi();
         let ctx_id =
             setup_supervised_context(&bi, &issuer.did, true, &["messages:read", "outlet:call:*"]);
-        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, agent);
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, agent)
+            .expect("supervisor must record the member");
         register_sum_handler(&bi, &ctx_id);
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3613,7 +3614,8 @@ mod tests {
             &issuer.did,
             &["messages:read", "outlet:call:*"],
         );
-        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, agent);
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, agent)
+            .expect("supervisor must record the member");
         crate::runtime::with_context(&bi, &ctx_id, |rt| {
             rt.ceiling_strings.clear();
             Ok(())
@@ -3947,7 +3949,8 @@ mod tests {
         let member = "did:dht:z6MkLoadContextsJoiner";
         let bi = __bi();
         let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
-        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member);
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member)
+            .expect("supervisor must record the member");
         let scp = crate::scp::PyScp {
             inner: Arc::clone(&bi),
         };
@@ -5743,8 +5746,7 @@ mod tests {
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 
-    /// The reads that return data fail, and the access gates deny with a
-    /// message naming the missing supervisor.
+    /// The access gates deny with a message naming the missing supervisor.
     #[test]
     fn provider_gates_refuse_without_a_supervisor_pyo3() {
         use scp_mcp::server::ResourceKind;
