@@ -2735,27 +2735,6 @@ pub fn remove_context(bi: &PyBridgeInstance, context_id: &str) {
     remove_ffi_state(bi, context_id);
 }
 
-/// Re-reads the supervisor and removes `context_id`'s [`FfiBridgeState`] only
-/// when the re-read does not report `Active`.
-///
-/// On an `Active` re-read this removes nothing and returns `false`, so the
-/// live context keeps its revocation list, nonce tracker, outlets, and
-/// sessions. Any other answer, a failed read included, removes the state and
-/// returns `true`.
-///
-/// The re-read and the removal are two steps, and nothing stops a readmit
-/// from landing between them.
-pub fn release_context_unless_readmitted(bi: &PyBridgeInstance, context_id: &str) -> bool {
-    if matches!(
-        read_live_context_state(bi, context_id),
-        Ok(Some(scp_core::context::ContextState::Active))
-    ) {
-        return false;
-    }
-    remove_context(bi, context_id);
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Registry statistics and cleanup (issue #108)
 // ---------------------------------------------------------------------------
