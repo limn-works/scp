@@ -1316,10 +1316,6 @@ pub(crate) async fn reserve_key_package_on(
 
 /// Tears down a committed Welcome join whose bridge state a concurrent close
 /// removed, and returns the join's `CTX_2040` error.
-///
-/// The close that removed the state marked the id, and the join's readmit may
-/// have cleared that mark. No actor serves the id after the teardown, so this
-/// re-marks it, and `ensure_registered` refuses to rebuild UCAN state for it.
 async fn tear_down_vanished_join(
     bi: &crate::runtime::NapiBridgeInstance,
     sup: &scp_core::context::supervisor::Supervisor,
@@ -1481,9 +1477,7 @@ pub(crate) async fn context_join_from_welcome_on(
     };
 
     // The supervisor serves the id again, so a release mark a prior close left
-    // no longer applies. A close landing after this line re-marks the id, and
-    // the presence probe below catches it; the probe's teardown re-marks the
-    // id in either order.
+    // no longer applies.
     crate::runtime::readmit_context(bi, &sealed.context_id);
 
     // BLACK-2JF-01, post-irreversible-commit compensation: the presence probe

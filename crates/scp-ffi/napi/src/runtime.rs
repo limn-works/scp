@@ -2446,8 +2446,8 @@ pub(crate) const NARROWED_COPY_CREATOR: &str = "did:dht:z6MkNapiNarrowedBridgeCo
 /// (`core.ceiling_strings` and `core.creator_did`) with a `messages:read`-only
 /// ceiling and [`NARROWED_COPY_CREATOR`] as the creator.
 ///
-/// An entry point that still passes after this call took its ceiling, roles
-/// and creator from the supervisor: the copy would refuse it.
+/// An entry point that still passes after this call took its ceiling and
+/// creator from the supervisor: the copy would refuse it.
 ///
 /// # Errors
 ///
