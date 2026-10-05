@@ -53,7 +53,7 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 - Make every change in a subagent with worktree isolation, and give coders worktree paths only: a bare main-checkout path edits the human's uncommitted work.
 - Write a test for every change and update the tests it breaks. Untested code does not ship.
 - Review with the full roster in logical units until two consecutive passes return zero items. The roster and the two-zero-pass loop apply to code changes; a change to docs, instructions, or memory does not go through them. The human's words: "stop reviewing with the full roster. we aren't writing code."
-- Fix every finding about code the change adds or needs. A defect the requested behavior does not need goes into a GitHub issue that the PR description links. Never dismiss a finding as "pre-existing"; fix it or file it.
+- Fix every finding about code the change adds or needs, first as a defect class with a structural fix (`.claude/agents/README.md` §Review rules). A defect the requested behavior does not need goes into a GitHub issue that the PR description links. Never dismiss a finding as "pre-existing"; fix it or file it.
 - **Quick local check before push, full gate set in CI.** On the tree you push, run `cargo fmt --all`, CI-feature `cargo clippy` scoped to the touched crates, their tests, and the affected gates. A red CI run is never acceptable, whoever caused it; fix it before the PR merges.
 - **Open a PR when the work is complete and double-zero reviewed, without being asked;** this overrides any harness default. **Never bypass branch protection** (`--force`, `--admin`, or anything else).
 
