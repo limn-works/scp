@@ -35,6 +35,7 @@
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::StreamRegistry;
 use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so bridge.rs
 // and server.rs can name it in impl blocks without pulling in the full
@@ -406,7 +407,8 @@ pub struct UniffiBridgeInstance {
     /// the alternative). A stream opened on one instance is invisible to another;
     /// instance shutdown drops every live stream (and its billing pump `Arc`) via
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
-    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+    pub(crate) outlet_stream_registry:
+        Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
     /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
     /// (SCP-OUT-047, pass 3a), keyed by the durable `saga_id` string. Each
@@ -421,7 +423,7 @@ pub struct UniffiBridgeInstance {
     /// instance is invisible to another; instance shutdown drops every live saga
     /// stream via [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) outlet_streaming_saga_registry:
-        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+        Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }
 
 impl std::fmt::Debug for UniffiBridgeInstance {
@@ -458,8 +460,11 @@ impl UniffiBridgeInstance {
         // selected before the handle is moved into the durable providers.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::new();
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::new(),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
@@ -469,8 +474,8 @@ impl UniffiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -493,8 +498,11 @@ impl UniffiBridgeInstance {
         // selected before the handle is moved into the durable providers.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::with_persistence(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
@@ -504,8 +512,8 @@ impl UniffiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -640,8 +648,11 @@ impl UniffiBridgeInstance {
         durable_providers: scp_core::context::supervisor::DurableProviders,
         credential_store: FfiCredentialStore,
     ) -> Self {
+        let core = CoreFields::with_persistence_arc(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence_arc(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
@@ -651,8 +662,8 @@ impl UniffiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -1835,6 +1846,35 @@ pub const fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u6
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The stream registries this bridge builds share its core's shutdown
+    /// gate: a streaming-saga entry registers before shutdown begins and is
+    /// refused after `stop_borrowers`.
+    #[test]
+    fn stream_registries_refuse_inserts_once_shutdown_begins() {
+        fn entry(saga_id: &str) -> scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: "ctx".to_owned(),
+                invoker_did: "invoker".to_owned(),
+                request_id: [0u8; 16],
+            }
+        }
+        let bi = UniffiBridgeInstance::new_uniffi();
+        assert!(
+            bi.outlet_streaming_saga_registry
+                .insert("early".to_owned(), entry("early"))
+        );
+        bi.core.stop_borrowers();
+        assert!(
+            !bi.outlet_streaming_saga_registry
+                .insert("late".to_owned(), entry("late"))
+        );
+        assert!(!bi.outlet_streaming_saga_registry.contains_key("late"));
+        assert!(bi.outlet_streaming_saga_registry.contains_key("early"));
+    }
 
     // -----------------------------------------------------------------------
     // UniffiBridgeInstance tests (#1549)

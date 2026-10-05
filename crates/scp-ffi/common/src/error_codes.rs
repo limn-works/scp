@@ -582,6 +582,12 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 /// `shutdown_all_contexts`, or has dropped, so it refused to start the
 /// operation (ADR-049 Decision 16, supervisor task drain).
 ///
+/// A bridge also returns this code, built by
+/// [`late_registration_refusal`](crate::bridge_instance::late_registration_refusal),
+/// when it refuses to register a stream or streaming saga that the Supervisor
+/// had already opened, because bridge shutdown began first. That operation
+/// started before the refusal.
+///
 /// Distinct from the generic `CTX_2001` catch-all so a caller can tell an
 /// operation refused by shutdown apart from a failure of the operation
 /// itself. Construct a new `SCP` instance to continue.

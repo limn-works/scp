@@ -71,6 +71,7 @@ use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::StreamRegistry;
 use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
@@ -514,7 +515,8 @@ pub struct PyBridgeInstance {
     /// invisible to another, and instance shutdown drops every live stream
     /// with the `Arc`. Entries are evicted when `poll_next` observes the
     /// terminal (channel-closed) sentinel.
-    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+    pub(crate) outlet_stream_registry:
+        Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
     /// Per-instance active cross-context streaming-saga registry (§5.4.5,
     /// SCP-OUT-047).
@@ -532,7 +534,7 @@ pub struct PyBridgeInstance {
     /// from `outlet_stream_registry` (same-context streams) so the two surfaces
     /// never collide on a handle id.
     pub(crate) outlet_streaming_saga_registry:
-        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+        Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 
     /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
     ///
@@ -550,16 +552,19 @@ impl PyBridgeInstance {
     /// `instance_id`, a fresh `CancellationToken`, and an empty `JoinSet`.
     #[must_use]
     pub fn new_py() -> Self {
+        let core = CoreFields::new();
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::new(),
+            core,
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
             ffi_bridge_state: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
@@ -592,16 +597,19 @@ impl PyBridgeInstance {
     /// provider they used to build the eventual `ContextManager`.
     #[must_use]
     pub fn with_persistence_py(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
+        let core = CoreFields::with_persistence(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence(persistence),
+            core,
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
             ffi_bridge_state: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
@@ -681,16 +689,19 @@ impl PyBridgeInstance {
                 let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                 let persistence: Arc<dyn ContextPersistence + Send + Sync> =
                     Arc::new(ProtocolRepositoryContextBridge::new(repo));
+                let core = CoreFields::with_persistence_arc(persistence);
+                let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+                let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
                 let instance = Self {
-                    core: CoreFields::with_persistence_arc(persistence),
+                    core,
                     identity_registry: Arc::new(DashMap::new()),
                     storage_provider: OnceLock::new(),
                     ffi_bridge_state: Arc::new(DashMap::new()),
                     mcp_server_registry: Arc::new(DashMap::new()),
                     mcp_client_registry: Arc::new(DashMap::new()),
                     connected_relay_url: RwLock::new(None),
-                    outlet_stream_registry: Arc::new(DashMap::new()),
-                    outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+                    outlet_stream_registry,
+                    outlet_streaming_saga_registry,
                     #[cfg(feature = "testing")]
                     network: std::sync::Mutex::new(None),
                 };
@@ -2807,6 +2818,35 @@ pub fn remove_identity_if_present(bi: &PyBridgeInstance, did: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The stream registries this bridge builds share its core's shutdown
+    /// gate: a streaming-saga entry registers before shutdown begins and is
+    /// refused after `stop_borrowers`.
+    #[test]
+    fn stream_registries_refuse_inserts_once_shutdown_begins() {
+        fn entry(saga_id: &str) -> scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: "ctx".to_owned(),
+                invoker_did: "invoker".to_owned(),
+                request_id: [0u8; 16],
+            }
+        }
+        let bi = PyBridgeInstance::new_py();
+        assert!(
+            bi.outlet_streaming_saga_registry
+                .insert("early".to_owned(), entry("early"))
+        );
+        bi.core.stop_borrowers();
+        assert!(
+            !bi.outlet_streaming_saga_registry
+                .insert("late".to_owned(), entry("late"))
+        );
+        assert!(!bi.outlet_streaming_saga_registry.contains_key("late"));
+        assert!(bi.outlet_streaming_saga_registry.contains_key("early"));
+    }
     // Test-harness key-custody nullifier: used only by the `#[cfg(feature =
     // "testing")]` identity-registry tests below. Gated so the shipped
     // (no-`testing`) test lane — which exists now that this module carries

@@ -20,6 +20,7 @@
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::StreamRegistry;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `napi_check_handle!` macro can refer to it as `$crate::runtime::CoreFields`
 // without each caller importing the full `scp_ffi_common` path.
@@ -364,7 +365,8 @@ pub struct NapiBridgeInstance {
     /// shutdown drops every live stream with the `Arc`. Cleared by
     /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_stream_registry`.
-    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+    pub(crate) outlet_stream_registry:
+        Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
     /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
     /// (SCP-OUT-047, pass 3a).
@@ -380,7 +382,7 @@ pub struct NapiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_streaming_saga_registry`.
     pub(crate) outlet_streaming_saga_registry:
-        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+        Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
@@ -426,8 +428,11 @@ impl NapiBridgeInstance {
         // the handle is moved into `durable_providers_from_handle`.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::new();
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::new(),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
@@ -438,8 +443,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -459,8 +464,11 @@ impl NapiBridgeInstance {
         // selected before the handle is moved into the durable providers.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::with_persistence(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
@@ -471,8 +479,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -589,8 +597,11 @@ impl NapiBridgeInstance {
         durable_providers: scp_core::context::supervisor::DurableProviders,
         credential_store: FfiCredentialStore,
     ) -> Self {
+        let core = CoreFields::with_persistence_arc(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence_arc(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
@@ -601,8 +612,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -2655,6 +2666,35 @@ impl ContextPersistence for ArcContextPersistence {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The stream registries this bridge builds share its core's shutdown
+    /// gate: a streaming-saga entry registers before shutdown begins and is
+    /// refused after `stop_borrowers`.
+    #[test]
+    fn stream_registries_refuse_inserts_once_shutdown_begins() {
+        fn entry(saga_id: &str) -> scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: "ctx".to_owned(),
+                invoker_did: "invoker".to_owned(),
+                request_id: [0u8; 16],
+            }
+        }
+        let bi = NapiBridgeInstance::new_napi();
+        assert!(
+            bi.outlet_streaming_saga_registry
+                .insert("early".to_owned(), entry("early"))
+        );
+        bi.core.stop_borrowers();
+        assert!(
+            !bi.outlet_streaming_saga_registry
+                .insert("late".to_owned(), entry("late"))
+        );
+        assert!(!bi.outlet_streaming_saga_registry.contains_key("late"));
+        assert!(bi.outlet_streaming_saga_registry.contains_key("early"));
+    }
 
     // -----------------------------------------------------------------------
     // BridgeInstance tests (#1549)

@@ -153,6 +153,111 @@ pub trait InstanceBorrower: Send + Sync {
     fn stopped(&self) -> bool;
 }
 
+/// A bridge's stream or streaming-saga registry, which
+/// [`BridgeInstanceCore::release_streams`] clears.
+///
+/// [`insert`](Self::insert) is the only way to add an entry, and it refuses
+/// once shutdown of the [`CoreFields`] passed to [`new`](Self::new) has begun,
+/// so no bridge open site can register a stream behind shutdown's back.
+pub struct StreamRegistry<K, V> {
+    entries: DashMap<K, V>,
+    closed: Arc<AtomicBool>,
+}
+
+impl<K: Eq + std::hash::Hash, V> StreamRegistry<K, V> {
+    /// An empty registry whose inserts refuse once `core`'s shutdown begins.
+    #[must_use]
+    pub fn new(core: &CoreFields) -> Self {
+        Self {
+            entries: DashMap::new(),
+            closed: Arc::clone(&core.stream_registration_closed),
+        }
+    }
+
+    /// Inserts `value` under `key` unless shutdown has begun, and returns
+    /// whether the entry stayed registered.
+    ///
+    /// Returns `false`, with the entry removed again, when the check that
+    /// follows the insert finds shutdown begun: [`CoreFields::stop_borrowers`]
+    /// has run, or the instance is shutting down.
+    /// [`BridgeInstanceCore::shutdown`] calls [`CoreFields::stop_borrowers`]
+    /// before `release_streams`, so an entry this inserts is either cleared by
+    /// that release or removed here.
+    pub fn insert(&self, key: K, value: V) -> bool
+    where
+        K: Clone,
+    {
+        let removal = key.clone();
+        self.entries.insert(key, value);
+        let begun = self.closed.load(Ordering::SeqCst);
+        if begun {
+            self.entries.remove(&removal);
+        }
+        !begun
+    }
+
+    /// The entry under `key`, if registered.
+    pub fn get<Q>(&self, key: &Q) -> Option<dashmap::mapref::one::Ref<'_, K, V>>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.entries.get(key)
+    }
+
+    /// Removes and returns the entry under `key`, if registered.
+    pub fn remove<Q>(&self, key: &Q) -> Option<(K, V)>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.entries.remove(key)
+    }
+
+    /// Whether an entry is registered under `key`.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.entries.contains_key(key)
+    }
+
+    /// Whether no entry is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Removes every entry.
+    pub fn clear(&self) {
+        self.entries.clear();
+    }
+}
+
+/// The code and message for a refused late registration.
+///
+/// A bridge returns them when [`StreamRegistry::insert`] refuses a stream or
+/// streaming saga that the Supervisor had already opened. `saga_id` names a
+/// streaming saga; `None` means an outlet stream.
+#[must_use]
+pub fn late_registration_refusal(saga_id: Option<&str>) -> (&'static str, String) {
+    let message = saga_id.map_or_else(
+        || {
+            "outlet stream opened, then dropped unregistered: bridge shutdown began \
+             before the bridge registered it"
+                .to_owned()
+        },
+        |id| {
+            format!(
+                "streaming saga {id} started, then its receiver was dropped unregistered: \
+                 bridge shutdown began before the bridge registered it"
+            )
+        },
+    );
+    (crate::error_codes::CTX_2138, message)
+}
+
 /// Registry backing [`CoreFields::register_borrower`] and
 /// [`CoreFields::stop_borrowers`].
 ///
@@ -602,6 +707,10 @@ pub struct CoreFields {
     /// advisory `flock(2)`. See [`InstanceBorrower`] for why that order
     /// matters.
     borrowers: Mutex<BorrowerRegistry>,
+    /// Set once shutdown begins, by [`stop_borrowers`](Self::stop_borrowers)
+    /// or by either shutdown transition, and never cleared. Every
+    /// [`StreamRegistry`] built from this instance reads it on insert.
+    stream_registration_closed: Arc<AtomicBool>,
 }
 
 impl Default for CoreFields {
@@ -660,6 +769,7 @@ impl CoreFields {
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
             borrowers: Mutex::new(BorrowerRegistry::default()),
+            stream_registration_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -749,6 +859,7 @@ impl CoreFields {
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
             borrowers: Mutex::new(BorrowerRegistry::default()),
+            stream_registration_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1204,6 +1315,8 @@ impl CoreFields {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             registry.closed = true;
+            self.stream_registration_closed
+                .store(true, Ordering::SeqCst);
             std::mem::take(&mut registry.entries)
         };
         let mut still_running = 0usize;
@@ -1224,33 +1337,19 @@ impl CoreFields {
         }
     }
 
-    /// Inserts `value` under `key` into a stream registry that
-    /// [`BridgeInstanceCore::release_streams`] clears, unless shutdown has
-    /// begun.
-    ///
-    /// Returns `false`, with the entry removed again, when the check that
-    /// follows the insert finds shutdown begun: [`Self::stop_borrowers`] has
-    /// run, or the instance is shut down. [`BridgeInstanceCore::shutdown`]
-    /// calls [`Self::stop_borrowers`] before `release_streams`, so
-    /// an entry this inserts is either cleared by that release or removed
-    /// here, and no stream opened during shutdown holds its pump on the
-    /// Supervisor's tracker past the drain.
-    pub fn insert_stream_entry<K, V>(&self, registry: &DashMap<K, V>, key: K, value: V) -> bool
+    /// Inserts `value` under `key` into `registry` through
+    /// [`StreamRegistry::insert`], the registry's only insert, and returns
+    /// whether the entry stayed registered.
+    pub fn insert_stream_entry<K, V>(
+        &self,
+        registry: &StreamRegistry<K, V>,
+        key: K,
+        value: V,
+    ) -> bool
     where
         K: Eq + std::hash::Hash + Clone,
     {
-        let removal = key.clone();
-        registry.insert(key, value);
-        let begun = self
-            .borrowers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .closed
-            || self.is_shutdown();
-        if begun {
-            registry.remove(&removal);
-        }
-        !begun
+        registry.insert(key, value)
     }
 
     /// Suspends the bridge instance.
@@ -2520,6 +2619,8 @@ impl CoreFields {
         // Idempotent terminal transition. The sync `shutdown()` path also
         // swaps this flag; whichever call wins is the one that runs
         // cleanup.
+        self.stream_registration_closed
+            .store(true, Ordering::SeqCst);
         if self.shutdown.swap(true, Ordering::SeqCst) {
             let durable_store_open = if store_closer.is_some() {
                 let mut state = self.durable_store_state.subscribe();
@@ -3592,27 +3693,50 @@ mod tests {
     }
 
     /// A stream entry inserted before shutdown begins stays registered; one
-    /// inserted after `stop_borrowers`, or after the instance shut down, is
-    /// removed and reported refused.
-    #[test]
-    fn insert_stream_entry_refuses_once_shutdown_begins() {
+    /// inserted after `stop_borrowers`, or after either shutdown transition,
+    /// is removed and reported refused, whether it arrives through
+    /// `StreamRegistry::insert` or `CoreFields::insert_stream_entry`.
+    #[tokio::test]
+    async fn stream_registry_insert_refuses_once_shutdown_begins() {
         let instance = CoreFields::new();
-        let registry: DashMap<String, u8> = DashMap::new();
-        assert!(instance.insert_stream_entry(&registry, "live".to_owned(), 1));
-        assert!(registry.contains_key("live"));
+        let registry: StreamRegistry<String, u8> = StreamRegistry::new(&instance);
+        assert!(registry.insert("live".to_owned(), 1));
+        assert!(instance.insert_stream_entry(&registry, "live-2".to_owned(), 1));
+        assert!(registry.contains_key("live") && registry.contains_key("live-2"));
 
         instance.stop_borrowers();
-        assert!(!instance.insert_stream_entry(&registry, "late".to_owned(), 2));
-        assert!(!registry.contains_key("late"));
+        assert!(!registry.insert("late".to_owned(), 2));
+        assert!(!instance.insert_stream_entry(&registry, "late-2".to_owned(), 2));
+        assert!(!registry.contains_key("late") && !registry.contains_key("late-2"));
         assert!(
             registry.contains_key("live"),
-            "only the late entry is removed"
+            "only the late entries are removed"
         );
 
         let shut = CoreFields::new();
+        let shut_registry: StreamRegistry<String, u8> = StreamRegistry::new(&shut);
         shut.shutdown();
-        assert!(!shut.insert_stream_entry(&registry, "after".to_owned(), 3));
-        assert!(!registry.contains_key("after"));
+        assert!(!shut_registry.insert("after".to_owned(), 3));
+        assert!(shut_registry.is_empty());
+
+        let drained = CoreFields::new();
+        let drained_registry: StreamRegistry<String, u8> = StreamRegistry::new(&drained);
+        let _ = drained
+            .shutdown_core_async(Duration::from_millis(50), None)
+            .await;
+        assert!(!drained_registry.insert("after-drain".to_owned(), 4));
+        assert!(drained_registry.is_empty());
+    }
+
+    /// The late-registration refusal carries `SCP-CTX-2138`, and a saga's
+    /// refusal names the saga.
+    #[test]
+    fn late_registration_refusal_names_code_and_saga() {
+        let (code, _) = late_registration_refusal(None);
+        assert_eq!(code, crate::error_codes::CTX_2138);
+        let (code, message) = late_registration_refusal(Some("saga-late-1"));
+        assert_eq!(code, crate::error_codes::CTX_2138);
+        assert!(message.contains("saga-late-1"), "{message}");
     }
 
     #[test]

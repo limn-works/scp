@@ -318,30 +318,24 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpPyError {
 }
 
 /// The error for a stream the Supervisor opened but the bridge refused to
-/// register because bridge shutdown had begun. The open had already reserved
-/// escrow and started its pump, so this is the Context class with
-/// `SCP-CTX-2138`.
+/// register because bridge shutdown had begun, built from
+/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
 fn late_shutdown_stream_err() -> ScpPyError {
+    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(None);
     ScpPyError::ContextError {
-        message: "outlet stream opened, then dropped unregistered: bridge shutdown began \
-                  before the bridge registered it"
-            .to_owned(),
-        code: scp_ffi_common::error_codes::CTX_2138.to_owned(),
+        message,
+        code: code.to_owned(),
     }
 }
 
 /// The error for a streaming saga the Supervisor started but the bridge
-/// refused to register because bridge shutdown had begun. The saga had already
-/// staged its Prepare phase, so this is the Context class with `SCP-CTX-2138`
-/// and the saga id, not the `SagaAborted` class of the Supervisor's own
-/// refusal, which comes before anything is staged.
+/// refused to register because bridge shutdown had begun, built from
+/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
 fn late_shutdown_saga_err(saga_id: &str) -> ScpPyError {
+    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(Some(saga_id));
     ScpPyError::ContextError {
-        message: format!(
-            "streaming saga {saga_id} started, then its receiver was dropped unregistered: \
-             bridge shutdown began before the bridge registered it"
-        ),
-        code: scp_ffi_common::error_codes::CTX_2138.to_owned(),
+        message,
+        code: code.to_owned(),
     }
 }
 
