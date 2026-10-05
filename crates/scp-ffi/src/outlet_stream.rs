@@ -2086,47 +2086,51 @@ mod late_shutdown_refusal_tests {
     use super::{late_shutdown_saga_err, late_shutdown_stream_err, open_rejection_to_err};
     use crate::error::ScpPyError;
 
+    /// The code of a `ContextError`, or `None` for any other class.
+    fn context_error_code(err: ScpPyError) -> Option<String> {
+        match err {
+            ScpPyError::ContextError { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// The code and back-off hint of a `SagaAborted`, or `None` for any
+    /// other class.
+    fn saga_aborted_parts(err: ScpPyError) -> Option<(String, Option<u64>)> {
+        match err {
+            ScpPyError::SagaAborted {
+                code,
+                retry_after_ms,
+                ..
+            } => Some((code, retry_after_ms)),
+            _ => None,
+        }
+    }
+
     /// A stream or streaming saga the bridge refuses to register once bridge
     /// shutdown has begun reaches the caller as the same error class and code
     /// as the Supervisor's own shutdown refusal of that operation.
     #[test]
     fn late_shutdown_refusals_match_supervisor_refusal_class() {
-        let supervisor_open = open_rejection_to_err(&OpenStreamRejection::SupervisorShutDown);
-        let (
-            ScpPyError::ContextError { code: late, .. },
-            ScpPyError::ContextError {
-                code: supervisor, ..
-            },
-        ) = (late_shutdown_stream_err(), supervisor_open)
-        else {
-            panic!("both stream refusals must be the ContextError class");
-        };
-        assert_eq!(late, supervisor);
-        assert_eq!(late, codes::CTX_2138);
-
-        let supervisor_saga = crate::outlets::map_saga_error(
-            scp_core::context::supervisor::SagaError::SupervisorShutDown {
-                message: "start cross-context streaming saga".to_owned(),
-            },
+        let late_stream = context_error_code(late_shutdown_stream_err());
+        assert_eq!(late_stream.as_deref(), Some(codes::CTX_2138));
+        assert_eq!(
+            late_stream,
+            context_error_code(open_rejection_to_err(
+                &OpenStreamRejection::SupervisorShutDown
+            ))
         );
-        let (
-            ScpPyError::SagaAborted {
-                code: late,
-                retry_after_ms: late_retry,
-                ..
-            },
-            ScpPyError::SagaAborted {
-                code: supervisor,
-                retry_after_ms: supervisor_retry,
-                ..
-            },
-        ) = (late_shutdown_saga_err(), supervisor_saga)
-        else {
-            panic!("both streaming-saga refusals must be the SagaAborted class");
-        };
-        assert_eq!(late, supervisor);
-        assert_eq!(late, codes::CTX_2138);
-        assert_eq!(late_retry, supervisor_retry);
+
+        let late_saga = saga_aborted_parts(late_shutdown_saga_err());
+        assert_eq!(late_saga, Some((codes::CTX_2138.to_owned(), None)));
+        assert_eq!(
+            late_saga,
+            saga_aborted_parts(crate::outlets::map_saga_error(
+                scp_core::context::supervisor::SagaError::SupervisorShutDown {
+                    message: "start cross-context streaming saga".to_owned(),
+                },
+            ))
+        );
     }
 
     /// The `ContextError` translation the saga refusal used before is not
@@ -2136,6 +2140,6 @@ mod late_shutdown_refusal_tests {
         let context: ScpPyError =
             scp_core::context::ContextError::SupervisorShutDown("open streaming saga".to_owned())
                 .into();
-        assert!(!matches!(context, ScpPyError::SagaAborted { .. }));
+        assert_eq!(saga_aborted_parts(context), None);
     }
 }
