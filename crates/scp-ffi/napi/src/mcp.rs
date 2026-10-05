@@ -477,8 +477,8 @@ impl Drop for StdioMcpTransport {
 /// Implements `ContextProvider` for one bridge instance. With a supervisor
 /// attached, the provider reads each context's role state and event log from
 /// the actor ([`live_role_state`] and `context_events`). With no supervisor
-/// attached, every role-state read fails, and it reads the event log from the
-/// bridge's per-context state. It reads the
+/// attached, its access gates deny, every other role-state read fails, and it
+/// reads the event log from the bridge's per-context state. It reads the
 /// outlet registry from the bridge's per-context state in either case. A read
 /// that fails returns an error, never an empty roster, log or outlet list.
 struct McpNapiBridgeProvider {
@@ -520,7 +520,26 @@ fn live_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
 ) -> Result<scp_core::context::roles::ContextRoleState, String> {
-    held_role_state(bi, context_id)?.ok_or_else(|| absent_context_message(context_id))
+    supervised_role_state(bi, context_id)?.ok_or_else(|| absent_context_message(bi, context_id))
+}
+
+/// Reads `context_id`'s role state as [`held_role_state`] does, and fails
+/// instead of answering `Ok(None)` when no supervisor is attached.
+///
+/// # Errors
+///
+/// Fails when no supervisor is attached, and wherever [`held_role_state`]
+/// fails.
+fn supervised_role_state(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
+    if bi.core.try_supervisor().is_none() {
+        return Err(format!(
+            "cannot read the role state of context '{context_id}': no supervisor is attached"
+        ));
+    }
+    held_role_state(bi, context_id)
 }
 
 /// Reads `context_id`'s role state as [`live_role_state`] does, for an access
@@ -529,7 +548,8 @@ fn live_role_state(
 /// # Errors
 ///
 /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
-/// when the actor holds no such context: the
+/// when the actor holds no such context, and when no supervisor is attached,
+/// with a message naming the missing supervisor: the
 /// agent holds no grant in a context this instance does not hold, so
 /// `resources/list` omits it. Returns
 /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
@@ -542,25 +562,32 @@ fn gate_role_state(
     use scp_mcp::server::AccessRefusal;
     match held_role_state(bi, context_id) {
         Ok(Some(role_state)) => Ok(role_state),
-        Ok(None) => Err(AccessRefusal::Denied(absent_context_message(context_id))),
+        Ok(None) => Err(AccessRefusal::Denied(absent_context_message(
+            bi, context_id,
+        ))),
         Err(e) => Err(AccessRefusal::Unreadable(e)),
     }
 }
 
-/// The message for a `context_id` the supervisor does not hold.
-fn absent_context_message(context_id: &str) -> String {
-    format!("context '{context_id}' is not held by the supervisor")
+/// Says why no role state of `context_id` was found: no supervisor is
+/// attached, or the supervisor holds no such context.
+fn absent_context_message(bi: &NapiBridgeInstance, context_id: &str) -> String {
+    if bi.core.try_supervisor().is_some() {
+        format!("context '{context_id}' is not held by the supervisor")
+    } else {
+        format!("context '{context_id}' cannot be read: no supervisor is attached")
+    }
 }
 
 /// Reads `context_id`'s current role state from the context's supervisor
 /// actor, and separates the two outcomes [`live_role_state`] merges:
 /// `Ok(None)` when the actor holds no such context, and `Err` when the read
-/// itself failed.
+/// itself failed. With no supervisor attached it returns `Ok(None)` and reads
+/// no bridge copy.
 ///
 /// # Errors
 ///
-/// Fails when no supervisor is attached, and when the actor cannot be asked
-/// or does not answer: from a
+/// Fails when the actor cannot be asked or does not answer: from a
 /// current-thread runtime, or when
 /// `Supervisor::get_role_state_checked`
 /// fails, which it does for a busy actor and for a context the crash watchdog
@@ -569,16 +596,13 @@ fn held_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
 ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
-    let Some(supervisor) = bi.core.try_supervisor() else {
-        return Err(format!(
-            "cannot read the role state of context '{context_id}': no supervisor is attached"
-        ));
+    let Some(sup) = bi.core.try_supervisor() else {
+        return Ok(None);
     };
-    let supervisor = Arc::clone(supervisor);
+    let sup = Arc::clone(sup);
     let id = context_id.to_owned();
     let query = async move {
-        supervisor
-            .get_role_state_checked(&id)
+        sup.get_role_state_checked(&id)
             .await
             .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
     };
@@ -618,7 +642,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         let bi = self.upgrade_bi()?;
         let mut served = Vec::new();
         for id in &self.context_ids {
-            if held_role_state(&bi, id)?
+            if supervised_role_state(&bi, id)?
                 .is_some_and(|role_state| role_state.members.contains(&self.agent_did))
             {
                 served.push(id.clone());
@@ -631,12 +655,14 @@ impl ContextProvider for McpNapiBridgeProvider {
         // A context nobody holds has no role for the agent; a dropped bridge
         // or a failed read is an error, never `None`.
         let bi = self.upgrade_bi()?;
-        Ok(held_role_state(&bi, context_id)?.and_then(|role_state| {
-            role_state
-                .assignments
-                .get(&self.agent_did)
-                .map(|assignment| assignment.role_name.clone())
-        }))
+        Ok(
+            supervised_role_state(&bi, context_id)?.and_then(|role_state| {
+                role_state
+                    .assignments
+                    .get(&self.agent_did)
+                    .map(|assignment| assignment.role_name.clone())
+            }),
+        )
     }
 
     fn agent_did(&self) -> &str {
@@ -658,7 +684,7 @@ impl ContextProvider for McpNapiBridgeProvider {
             // `ensure_registered` first, so a context the supervisor holds with
             // no entry here has had no outlet registered through this bridge,
             // and its registry is empty.
-            return match held_role_state(&bi, context_id)? {
+            return match supervised_role_state(&bi, context_id)? {
                 Some(_) => Ok(Vec::new()),
                 None => Err(format!(
                     "context '{context_id}' is held neither by the supervisor nor by \
@@ -858,8 +884,8 @@ async fn run_mcp_stdio_server(
 /// `tools.listChanged`), rejects `resources/subscribe`, and sends no
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
 /// rather than accepted-and-never-delivered. Serving is not failed: the server
-/// still serves `resources/list|read`, from the actor when a supervisor is
-/// attached and from the bridge state when none is. Failing outright would
+/// still answers `resources/list|read`, which read role state from the actor
+/// and fail while no supervisor is attached. Failing outright would
 /// deny working functionality over an optional feature. This server lists no
 /// tools with or without a supervisor (`OUTLET_INVOCATION_UNAVAILABLE`).
 ///
@@ -896,7 +922,8 @@ fn mcp_server_bundle(
 /// calling `resume()` later does not add subscriptions or `list_changed`
 /// notifications to a running server; stop it and serve again to get them.
 /// Authorization and `resources/list|read` read role state from the actor on
-/// every request and fail while no supervisor is attached, so attaching a
+/// every request; while no supervisor is attached, authorization denies and
+/// `resources/list|read` fail, so attaching a
 /// supervisor changes which contexts a running server serves from the next
 /// request on.
 #[allow(clippy::unused_async)]
@@ -3107,9 +3134,10 @@ mod tests {
         );
     }
 
-    /// With no supervisor attached, every role-state read the provider makes
-    /// fails, and the access gate reports the read as unreadable: the bridge
-    /// state holds no role state, so no gate decides from it.
+    /// With no supervisor attached, every provider read that returns role-state
+    /// data fails, and the access gate denies with a message naming the missing
+    /// supervisor: the bridge state holds no role state, so nothing is read
+    /// from it.
     #[test]
     fn role_state_reads_fail_closed_without_a_supervisor_napi() {
         use scp_mcp::server::{AccessRefusal, ContextProvider as _, ResourceKind};
@@ -3142,7 +3170,7 @@ mod tests {
                 .validate_resource_access(SUB_CTX, kind)
                 .expect_err("no gate grants access without a supervisor");
             assert!(
-                matches!(&refusal, AccessRefusal::Unreadable(msg) if msg.contains("no supervisor is attached")),
+                matches!(&refusal, AccessRefusal::Denied(msg) if msg.contains("no supervisor is attached")),
                 "{kind:?}: {refusal}"
             );
         }
