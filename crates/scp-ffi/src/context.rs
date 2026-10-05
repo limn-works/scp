@@ -3114,8 +3114,7 @@ impl crate::scp::PyScp {
         // and needs no rollback. spawn-from-Welcome always stands up an ENCRYPTED
         // context, so the routing id is the joiner's derived §9.10.4 pseudonym
         // (`local_pseudonym` is `Copy`, still valid after the request move). The
-        // member is the JOINER (`owning_did`), matching the role-state member
-        // inserted above so `context_ids_for_member` / discovery agree.
+        // member is the JOINER (`owning_did`).
         {
             let relay_url = match self.transport_status() {
                 Ok(status) => status.relay_url,

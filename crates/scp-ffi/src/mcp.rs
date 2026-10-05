@@ -27,9 +27,9 @@
 //! - **Server side**: `FfiBridgeProvider` implements
 //!   [`scp_mcp::server::ContextProvider`]. It reads outlet registrations
 //!   from the bridge's copy of each context in the scp-ffi runtime registry,
-//!   and role state and the event-log summary from the supervisor actor while
-//!   a supervisor is attached, from that bridge copy otherwise. The MCP
-//!   server is run
+//!   role state from the supervisor actor, and the event-log summary from
+//!   the supervisor actor while a supervisor is attached, from that bridge
+//!   copy otherwise. The MCP server is run
 //!   on the tokio runtime via [`scp_mcp::stdio::run_stdio`] or
 //!   [`scp_mcp::sse::run_sse`].
 //!
@@ -303,9 +303,11 @@ const FFI_OUTLET_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_M
 /// Outlet registrations come from the bridge's copy of each context in the
 /// runtime registry managed by `crates/scp-ffi/src/runtime.rs`. Role state
 /// (every role, resource and outlet gate, `active_context_ids`, `agent_role`
-/// and `context_members`) and the top level of `context_events` come from the
-/// supervisor actor while a supervisor is attached, and from that bridge copy
-/// otherwise.
+/// and `context_members`) comes from the supervisor actor. While no
+/// supervisor is attached, the reads that return role state fail and the
+/// access gates refuse. The top level of
+/// `context_events` comes from the supervisor actor while a supervisor is
+/// attached, and from that bridge copy otherwise.
 struct FfiBridgeProvider {
     /// Weak reference to the bridge instance whose runtime registry and
     /// supervisor this provider reads.
@@ -384,22 +386,37 @@ impl FfiBridgeProvider {
     /// calls, so a write-back could replace a newer copy with the older
     /// snapshot this call read.
     ///
-    /// With no supervisor attached there is no actor and no inbound path, so
-    /// the copy is the context's only role state and is read as it stands.
-    ///
     /// # Errors
     ///
-    /// Fails when the actor does not hold the context or cannot be asked, and,
-    /// with no supervisor attached, when the bridge holds no copy of the
-    /// context. The message for an absent context names whichever of the two
-    /// held nothing. [`Self::gate_role_state`] keeps those two failures apart
-    /// for the access gates.
+    /// Fails when no supervisor is attached, and when the actor does not hold
+    /// the context or cannot be asked. [`Self::gate_role_state`] keeps an
+    /// absent context apart from a failed read for the access gates.
     fn live_role_state(
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,
     ) -> Result<scp_core::context::roles::ContextRoleState, String> {
-        Self::held_role_state(bi, context_id)?
+        Self::supervised_role_state(bi, context_id)?
             .ok_or_else(|| Self::absent_context_message(bi, context_id))
+    }
+
+    /// Reads `context_id`'s role state as [`Self::held_role_state`] does, and
+    /// fails instead of answering `Ok(None)` when no supervisor is attached.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no supervisor is attached, and wherever
+    /// [`Self::held_role_state`] fails.
+    fn supervised_role_state(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: &str,
+    ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
+        if bi.core.try_supervisor().is_none() {
+            return Err(format!(
+                "role state of context '{context_id}' could not be read: no supervisor is \
+                 attached"
+            ));
+        }
+        Self::held_role_state(bi, context_id)
     }
 
     /// Reads `context_id`'s role state as [`Self::live_role_state`] does, for
@@ -408,7 +425,8 @@ impl FfiBridgeProvider {
     /// # Errors
     ///
     /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
-    /// when the actor (with no supervisor, the bridge) holds no such context:
+    /// when the actor holds no such context, and when no supervisor is
+    /// attached, with a message naming the missing supervisor:
     /// the agent holds no grant in a context this instance does not hold, so
     /// `tools/list` and `resources/list` omit it. Returns
     /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
@@ -428,23 +446,21 @@ impl FfiBridgeProvider {
         }
     }
 
-    /// Names the holder that has no `context_id`: the supervisor when one is
-    /// attached, otherwise this bridge.
+    /// Says why no role state of `context_id` was found: no supervisor is
+    /// attached, or the supervisor holds no such context.
     fn absent_context_message(bi: &crate::runtime::PyBridgeInstance, context_id: &str) -> String {
         if bi.core.try_supervisor().is_some() {
             format!("context '{context_id}' is not held by the supervisor")
         } else {
-            format!(
-                "context '{context_id}' is not held by this bridge, and no supervisor is attached"
-            )
+            format!("context '{context_id}' cannot be read: no supervisor is attached")
         }
     }
 
-    /// Reads `context_id`'s current role state from the source
-    /// [`Self::live_role_state`] names, and separates the two outcomes that
-    /// function merges: `Ok(None)` when the actor holds no such context (with
-    /// no supervisor, when the bridge holds no copy), and `Err` when the read
-    /// itself failed.
+    /// Reads `context_id`'s current role state from the supervisor actor, and
+    /// separates the two outcomes [`Self::live_role_state`] merges: `Ok(None)`
+    /// when the actor holds no such context, and `Err` when the read itself
+    /// failed. With no supervisor attached it returns `Ok(None)` and reads no
+    /// bridge copy.
     ///
     /// # Errors
     ///
@@ -457,19 +473,13 @@ impl FfiBridgeProvider {
         bi: &crate::runtime::PyBridgeInstance,
         context_id: &str,
     ) -> Result<Option<scp_core::context::roles::ContextRoleState>, String> {
-        let Some(supervisor) = bi.core.try_supervisor() else {
-            // The closure cannot fail, so an error from `with_context` means
-            // the bridge holds no copy of the context.
-            return Ok(crate::runtime::with_context(bi, context_id, |rt| {
-                Ok(rt.role_state.clone())
-            })
-            .ok());
+        let Some(sup) = bi.core.try_supervisor() else {
+            return Ok(None);
         };
-        let supervisor = Arc::clone(supervisor);
+        let sup = Arc::clone(sup);
         let id = context_id.to_owned();
         let query = async move {
-            supervisor
-                .get_role_state_checked(&id)
+            sup.get_role_state_checked(&id)
                 .await
                 .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
         };
@@ -491,16 +501,59 @@ impl FfiBridgeProvider {
         }
     }
 
+    /// Asks the supervisor actor whether `context_id` is `Active` (ADR-049
+    /// §10), through [`crate::runtime::active_role_state_before_authz`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+    /// with the withheld SCP-CTX-2023 refusal when the context is not
+    /// `Active` or its actor does not answer, because the agent is not yet
+    /// authorized to learn which. Returns
+    /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
+    /// when the bridge is suspended, has no supervisor attached, or cannot
+    /// bridge to the supervisor's runtime.
+    fn require_active(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: &str,
+    ) -> Result<(), scp_mcp::server::AccessRefusal> {
+        use scp_mcp::server::AccessRefusal;
+        let withheld = std::cell::Cell::new(false);
+        crate::runtime::active_role_state_before_authz(
+            bi,
+            context_id,
+            "invoke outlet in context",
+            |message| {
+                withheld.set(true);
+                ScpPyError::ContextError {
+                    message,
+                    code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+                }
+            },
+        )
+        .map(drop)
+        .map_err(|e| {
+            if withheld.get() {
+                AccessRefusal::Denied(format!("{e}"))
+            } else {
+                AccessRefusal::Unreadable(format!("{e}"))
+            }
+        })
+    }
+
     /// Decides whether the agent may invoke `outlet_name` in `context_id`,
-    /// given the context's current role state: the role-state capability
-    /// check, then the UCAN check. The role-state check runs first because
-    /// an Invoke check's UCAN step records the token's nonce, and a refusal
+    /// given the context's current role state: the lifecycle check, the
+    /// role-state capability check, then the UCAN check. The lifecycle check
+    /// asks the supervisor actor whether the context is `Active` (ADR-049
+    /// §10). The role-state check runs before the UCAN check because an
+    /// Invoke check's UCAN step records the token's nonce, and a refusal
     /// after that record would spend the agent's token without running an
     /// outlet.
     ///
     /// # Errors
     ///
-    /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
+    /// Returns the refusal of [`Self::require_active`], then
+    /// [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
     /// naming the check that refused the invocation, and
     /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
     /// when the agent's proof tokens cannot be read, so a failed read never
@@ -514,6 +567,7 @@ impl FfiBridgeProvider {
         check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
+        Self::require_active(bi, context_id)?;
         let Some(token) = self.agent_ucan_token.as_ref() else {
             tracing::warn!(
                 agent = %self.agent_did,
@@ -584,6 +638,10 @@ impl FfiBridgeProvider {
                     AccessRefusal::Unreadable(format!("failed to build proof resolver: {e}"))
                 })?;
 
+        // ADR-016 step 8 reads the ceiling and the chain check anchors on the
+        // creator; both come from `role_state`, the supervisor actor's answer.
+        let ceiling_strings = role_state.ceiling().to_ucan_string_set();
+
         // The closure's `Ok` carries the UCAN decision, so an `Err` from
         // `with_context` is a failed read of the bridge's context copy.
         let decision = crate::runtime::with_context(bi, context_id, |rt| {
@@ -614,8 +672,8 @@ impl FfiBridgeProvider {
                 nonce_tracker: &mut nonce_adapter,
                 revocation_checker: &revocation_checker,
                 proof_resolver: &proof_resolver,
-                ceiling: &rt.ceiling_strings,
-                context_creator_did: &rt.creator_did,
+                ceiling: &ceiling_strings,
+                context_creator_did: &role_state.creator_did,
                 presenting_agent_did: &self.agent_did,
                 clock_skew_tolerance_secs:
                     scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -662,7 +720,7 @@ impl ContextProvider for FfiBridgeProvider {
         let bi = self.upgrade_bi()?;
         let mut served = Vec::new();
         for id in &self.context_ids {
-            if Self::held_role_state(&bi, id)?
+            if Self::supervised_role_state(&bi, id)?
                 .is_some_and(|role_state| role_state.members.contains(&self.agent_did))
             {
                 served.push(id.clone());
@@ -677,7 +735,7 @@ impl ContextProvider for FfiBridgeProvider {
         // a failed read is an error, never `None`.
         let bi = self.upgrade_bi()?;
         Ok(
-            Self::held_role_state(&bi, context_id)?.and_then(|role_state| {
+            Self::supervised_role_state(&bi, context_id)?.and_then(|role_state| {
                 role_state
                     .assignments
                     .get(&self.agent_did)
@@ -697,10 +755,9 @@ impl ContextProvider for FfiBridgeProvider {
         // Outlets register only on the bridge copy, and only this bridge's
         // create and join paths register a copy, so a context the actor holds
         // by any other path has no copy here and no outlet registered through
-        // this bridge: its registry is empty. With no supervisor the copy is
-        // the context's only state, so `held_role_state` finds no context.
+        // this bridge: its registry is empty.
         if !crate::runtime::ffi_state_registry(&bi).contains_key(context_id) {
-            return match Self::held_role_state(&bi, context_id)? {
+            return match Self::supervised_role_state(&bi, context_id)? {
                 Some(_) => Ok(Vec::new()),
                 None => Err(format!(
                     "context '{context_id}' is held neither by the supervisor nor by \
@@ -1493,9 +1550,9 @@ fn generate_handle_id(prefix: &str) -> String {
 ///
 /// Creates an MCP server backed by a `FfiBridgeProvider`, which reads outlet
 /// registrations from the bridge's copy of each context in the scp-ffi
-/// runtime registry, and role state and the event-log summary from the
-/// supervisor actor while a supervisor is attached, from that bridge copy
-/// otherwise. For `"stdio"`
+/// runtime registry, role state from the supervisor actor, and the event-log
+/// summary from the supervisor actor while a supervisor is attached, from
+/// that bridge copy otherwise. For `"stdio"`
 /// transport, the server processes JSON-RPC messages via a tokio task. For
 /// `"sse"` transport, the server binds a loopback HTTP server on an ephemeral
 /// port behind a per-server bearer token. This function returns neither the
@@ -1510,8 +1567,8 @@ fn generate_handle_id(prefix: &str) -> String {
 /// running server; stop it and serve again to get them. Every other request reads the instance's state when it arrives:
 /// `tools/call` fails while no supervisor is attached or the instance is
 /// suspended, and stops failing for those reasons once both end; every
-/// access gate reads the actor's role state while a supervisor is attached
-/// and the bridge's copy of the context otherwise.
+/// access gate reads the actor's role state, and refuses while no
+/// supervisor is attached.
 ///
 /// # Arguments
 ///
@@ -2142,9 +2199,13 @@ impl crate::scp::PyScp {
 /// Results are deduplicated by context ID. Each result dict contains:
 /// - `context_id` -- The context identifier.
 /// - `source` -- `"local"`, `"relay"`, or `"local+relay"`.
-/// - `creator_did` -- The context creator's DID (if available from runtime).
-/// - `member_count` -- Number of members (if available from runtime).
-/// - `outlet_count` -- Number of registered outlets (if available from runtime).
+/// - `creator_did` -- The context creator's DID, from the supervisor actor.
+/// - `member_count` -- Number of members, from the supervisor actor.
+/// - `outlet_count` -- Number of outlets registered on this bridge's copy of
+///   the context.
+///
+/// The last three are present only when the supervisor actor answers for the
+/// context and this bridge holds a copy of it.
 /// - `relay_active` -- `True` if the relay returned blobs for this context.
 ///
 /// # Arguments
@@ -2159,7 +2220,10 @@ impl crate::scp::PyScp {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the relay query fails fatally (transient
+/// Raises `ContextError` if a context is registered while the bridge is
+/// suspended or has no supervisor attached, or a registered context's actor
+/// does not answer the membership
+/// read. Raises `TransportError` if the relay query fails fatally (transient
 /// failures are handled by falling back to local-only).
 ///
 /// See SCP-213, ADR-015 in `.docs/adrs/phase-3.md`.
@@ -2175,7 +2239,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         validate::validate_did(identity_did)?;
         // Step 1: Collect contexts from the local runtime registry.
-        let local_context_ids = crate::runtime::context_ids_for_member(bi, identity_did);
+        let local_context_ids = crate::runtime::context_ids_for_member(bi, identity_did)?;
 
         // Step 2: Collect contexts from the known-contexts registry.
         let known = crate::runtime::known_contexts_for_member_on(bi, identity_did);
@@ -2201,17 +2265,16 @@ impl crate::scp::PyScp {
             }
             dict.set_item("relay_active", relay_active)?;
 
-            // Enrich with creator DID and member count from runtime state.
-            if let Ok(info) = crate::runtime::with_context(bi, ctx_id, |rt| {
-                Ok((
-                    rt.creator_did.clone(),
-                    rt.role_state.members.len(),
-                    rt.outlet_registry.len(),
-                ))
-            }) {
-                dict.set_item("creator_did", info.0)?;
-                dict.set_item("member_count", info.1)?;
-                dict.set_item("outlet_count", info.2)?;
+            // Enrich with the creator DID and the member count the supervisor
+            // actor holds, plus the outlet count of the bridge's registry.
+            let outlet_count =
+                crate::runtime::with_context(bi, ctx_id, |rt| Ok(rt.outlet_registry.len()));
+            if let (Ok(role_state), Ok(outlet_count)) =
+                (crate::runtime::live_role_state(bi, ctx_id), outlet_count)
+            {
+                dict.set_item("creator_did", role_state.creator_did)?;
+                dict.set_item("member_count", role_state.members.len())?;
+                dict.set_item("outlet_count", outlet_count)?;
             }
 
             results.push(dict.into());
@@ -2694,8 +2757,8 @@ mod tests {
         // inside the provider upgrades successfully (#1549 round-2).
         let bi = __bi();
         let creator = "did:dht:z6MkTest";
-        let live_a = setup_unsupervised_context(&bi, creator, false);
-        let live_b = setup_unsupervised_context(&bi, creator, false);
+        let live_a = setup_supervised_context(&bi, creator, false, &["messages:read"]);
+        let live_b = setup_supervised_context(&bi, creator, false, &["messages:read"]);
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2761,7 +2824,7 @@ mod tests {
     /// Attaches a supervisor, as `register_context` does, and the supervisor
     /// does not hold the context, so the provider's role-state gates deny it
     /// (see `provider_gates_follow_the_actor_not_the_bridge_copy_pyo3`). Tests
-    /// of those gates use [`setup_unsupervised_context`].
+    /// of those gates use [`setup_supervised_context`].
     ///
     /// Callers must pass the same `bi` they use for subsequent registry lookups;
     /// each `PyBridgeInstance` has its own `instance_id` and context registry.
@@ -2774,9 +2837,22 @@ mod tests {
         setup_unsupervised_context(bi, creator_did, with_outlet)
     }
 
-    /// [`setup_test_context`] without the supervisor: with no actor, the FFI
-    /// copy of the role state is the context's only role state, so the
-    /// provider's gates read it as it stands.
+    /// [`setup_test_context`] with the context also created on the supervisor,
+    /// with `creator_did` as its creator and `ceiling` as its ceiling, which
+    /// the creator holds as admin.
+    fn setup_supervised_context(
+        bi: &crate::runtime::PyBridgeInstance,
+        creator_did: &str,
+        with_outlet: bool,
+        ceiling: &[&str],
+    ) -> String {
+        let ctx_id = setup_test_context(bi, creator_did, with_outlet);
+        hold_on_actor(bi, &ctx_id, creator_did, ceiling);
+        ctx_id
+    }
+
+    /// [`setup_test_context`] without the supervisor: the bridge holds a copy
+    /// of the context and no supervisor is attached.
     fn setup_unsupervised_context(
         bi: &crate::runtime::PyBridgeInstance,
         creator_did: &str,
@@ -2841,7 +2917,7 @@ mod tests {
     fn ffi_bridge_provider_validate_capability_rejects_missing_ucan() {
         let creator = "did:dht:z6MkCreatorValCap";
         let bi = __bi();
-        let ctx_id = setup_unsupervised_context(&bi, creator, true);
+        let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2877,7 +2953,8 @@ mod tests {
     fn ffi_bridge_provider_outlet_grant_read_failure_is_unreadable_not_denied() {
         let creator = "did:dht:z6MkCreatorGrantRead";
         let bi = __bi();
-        let ctx_id = setup_unsupervised_context(&bi, creator, true);
+        let ctx_id =
+            setup_supervised_context(&bi, creator, true, &["messages:read", "outlet:call:*"]);
         let provider = |proofs: Option<Vec<String>>| FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
@@ -2915,28 +2992,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::validate_capability — rejects unauthorized member
-    // without UCAN token (#319)
+    // FfiBridgeProvider::validate_capability — rejects a member who presents no
+    // UCAN token (#319)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_validate_capability_rejects_unauthorized() {
+    #[cfg(feature = "testing")]
+    fn ffi_bridge_provider_validate_capability_rejects_a_member_without_a_token() {
         let creator = "did:dht:z6MkCreatorValCapReject";
         let bi = __bi();
-        let ctx_id = setup_unsupervised_context(&bi, creator, true);
+        let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
 
-        // Add a member with no OutletCall capability.
+        // The member is recorded on the supervisor, where `validate_capability`
+        // reads membership.
         let member = "did:dht:z6MkMemberNoInvoke";
-        crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            rt.role_state.members.insert(member.to_owned());
-            let mut caps = std::collections::HashSet::new();
-            caps.insert(scp_core::context::roles::Capability::MessagesRead);
-            rt.role_state
-                .member_capabilities
-                .insert(member.to_owned(), caps);
-            Ok(())
-        })
-        .unwrap();
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member);
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2971,21 +3041,15 @@ mod tests {
     /// here is unparseable, so a UCAN step that ran first would refuse with
     /// "UCAN authorization failed" instead of the role-state refusal.
     #[test]
+    #[cfg(feature = "testing")]
     fn ffi_bridge_provider_invoke_role_refusal_precedes_ucan_step() {
         let creator = "did:dht:z6MkCreatorInvokeOrder";
         let bi = __bi();
-        let ctx_id = setup_unsupervised_context(&bi, creator, true);
+        // The actor's ceiling carries no outlet capability, so its `member`
+        // role grants none.
+        let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
         let member = "did:dht:z6MkMemberInvokeOrder";
-        crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            rt.role_state.members.insert(member.to_owned());
-            let mut caps = std::collections::HashSet::new();
-            caps.insert(scp_core::context::roles::Capability::MessagesRead);
-            rt.role_state
-                .member_capabilities
-                .insert(member.to_owned(), caps);
-            Ok(())
-        })
-        .unwrap();
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member);
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3464,59 +3528,26 @@ mod tests {
     /// Probe records nothing, so probing first leaves the token unspent. Had
     /// `invoke_outlet` passed the Probe check, the second call would run.
     ///
-    /// The bridge copy names the token's issuer as the context's creator, so
-    /// the UCAN step accepts the root token; the actor names the agent as the
-    /// creator holding `outlet:call:*`, so the role-state check passes.
+    /// The actor names the token's issuer as the context's creator, so the
+    /// UCAN step accepts the root token, and records the agent as a member
+    /// whose `member` role takes `outlet:call:*` from the ceiling, so the
+    /// role-state check passes.
     #[test]
+    #[cfg(feature = "testing")]
     fn invoke_outlet_records_the_token_nonce_and_refuses_its_replay() {
-        use scp_platform::traits::KeyCustody as _;
-        crate::init_runtime().ok();
-        let runtime = crate::runtime().unwrap();
-        let custody = scp_platform::testing::InMemoryKeyCustody::new();
-        let key = runtime
-            .block_on(custody.generate_keypair(scp_platform::traits::KeyType::Ed25519))
-            .unwrap();
-        let mut public_key = [0_u8; 32];
-        public_key.copy_from_slice(
-            runtime
-                .block_on(custody.public_key(&key))
-                .unwrap()
-                .as_bytes(),
-        );
-        let issuer = scp_did::did_dht_from_public_key(&public_key).0;
+        let issuer = TestIssuer::new();
         let agent = "did:dht:z6MkAgentReplayedToken";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, &issuer, true);
-        hold_on_actor(&bi, &ctx_id, agent, &["messages:read", "outlet:call:*"]);
+        let ctx_id =
+            setup_supervised_context(&bi, &issuer.did, true, &["messages:read", "outlet:call:*"]);
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, agent);
         register_sum_handler(&bi, &ctx_id);
-        let capabilities = vec!["outlet:call:*".to_owned()];
-        let params = scp_core::crypto::ucan::mint::MintParams {
-            issuer_did: &issuer,
-            issuer_key: &key,
-            audience_did: agent,
-            context_id: &ctx_id,
-            capabilities: &capabilities,
-            lifetime_secs: 3600,
-            not_before: None,
-            proofs: vec![],
-            facts: None,
-            key_scope: None,
-            signing_key_id: None,
-            ceiling: None,
-        };
-        let token = runtime
-            .block_on(scp_core::crypto::ucan::mint::mint_ucan(
-                &params,
-                &custody,
-                &scp_clock::SystemClock,
-            ))
-            .unwrap();
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: agent.to_owned(),
             context_ids: vec![ctx_id.clone()],
             outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: Some(token.encoded),
+            agent_ucan_token: Some(issuer.mint_outlet_call_all(agent, &ctx_id)),
             agent_proof_tokens: None,
         };
         for _ in 0..2 {
@@ -3542,6 +3573,195 @@ mod tests {
                 )) if msg.contains("UCAN authorization failed")
             ),
             "a replayed token must be refused by the UCAN step: {replayed:?}"
+        );
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// An Ed25519 key in an in-memory custody, and the `did:dht` DID it
+    /// controls, for tests that mint a root UCAN.
+    #[cfg(feature = "testing")]
+    struct TestIssuer {
+        custody: scp_platform::testing::InMemoryKeyCustody,
+        key: scp_platform::traits::KeyHandle,
+        did: String,
+    }
+
+    #[cfg(feature = "testing")]
+    impl TestIssuer {
+        fn new() -> Self {
+            use scp_platform::traits::KeyCustody as _;
+            crate::init_runtime().ok();
+            let runtime = crate::runtime().unwrap();
+            let custody = scp_platform::testing::InMemoryKeyCustody::new();
+            let key = runtime
+                .block_on(custody.generate_keypair(scp_platform::traits::KeyType::Ed25519))
+                .unwrap();
+            let mut public_key = [0_u8; 32];
+            public_key.copy_from_slice(
+                runtime
+                    .block_on(custody.public_key(&key))
+                    .unwrap()
+                    .as_bytes(),
+            );
+            let did = scp_did::did_dht_from_public_key(&public_key).0;
+            Self { custody, key, did }
+        }
+
+        /// Mints a root UCAN granting `agent` `outlet:call:*` in `ctx_id`, and
+        /// returns it encoded.
+        fn mint_outlet_call_all(&self, agent: &str, ctx_id: &str) -> String {
+            let capabilities = vec!["outlet:call:*".to_owned()];
+            let params = scp_core::crypto::ucan::mint::MintParams {
+                issuer_did: &self.did,
+                issuer_key: &self.key,
+                audience_did: agent,
+                context_id: ctx_id,
+                capabilities: &capabilities,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+                ceiling: None,
+            };
+            crate::runtime()
+                .unwrap()
+                .block_on(scp_core::crypto::ucan::mint::mint_ucan(
+                    &params,
+                    &self.custody,
+                    &scp_clock::SystemClock,
+                ))
+                .unwrap()
+                .encoded
+        }
+    }
+
+    /// The UCAN step of `validate_capability` takes the ceiling and the
+    /// creator from the supervisor actor. The bridge copy names a different
+    /// creator and carries an empty ceiling, so a UCAN step that read the
+    /// copy would refuse the token the actor's creator issued.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn validate_capability_ucan_step_reads_the_supervisor_ceiling_and_creator() {
+        let issuer = TestIssuer::new();
+        let agent = "did:dht:z6MkAgentLiveUcanAnchor";
+        let copy_creator = "did:dht:z6MkCopyCreatorLiveUcanAnchor";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, copy_creator, true);
+        hold_on_actor(
+            &bi,
+            &ctx_id,
+            &issuer.did,
+            &["messages:read", "outlet:call:*"],
+        );
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, agent);
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            rt.ceiling_strings.clear();
+            Ok(())
+        })
+        .unwrap();
+        let (copy_ceiling_empty, copy_creator_now) =
+            crate::runtime::with_context(&bi, &ctx_id, |rt| {
+                Ok((rt.ceiling_strings.is_empty(), rt.creator_did.clone()))
+            })
+            .unwrap();
+        assert!(
+            copy_ceiling_empty && copy_creator_now == copy_creator,
+            "precondition: the copy's ceiling is empty and its creator is not the issuer"
+        );
+
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: agent.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: Some(issuer.mint_outlet_call_all(agent, &ctx_id)),
+            agent_proof_tokens: None,
+        };
+        provider
+            .validate_capability(
+                &ctx_id,
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
+            .expect("the actor's creator issued the token within the actor's ceiling");
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// `outlet_grant` asks the actor whether the context is `Active` before
+    /// its role-state and UCAN checks. Once the actor stops answering, the
+    /// grant refuses with the withheld lifecycle denial, which names neither
+    /// the busy actor, its error code, nor the context, even though the role
+    /// state it is handed still grants the agent.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn outlet_grant_withholds_the_state_of_an_unreachable_actor() {
+        let creator = "did:dht:z6MkCreatorUnreachableActor";
+        let bi = __bi();
+        let ctx_id =
+            setup_supervised_context(&bi, creator, true, &["messages:read", "outlet:call:*"]);
+        let mut provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
+        provider.agent_ucan_token = Some("not-a-ucan".to_owned());
+        let role_state = crate::runtime::live_role_state(&bi, &ctx_id).unwrap();
+        let grant = || {
+            provider.outlet_grant(
+                &bi,
+                &role_state,
+                &ctx_id,
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
+        };
+        let reached = grant().unwrap_err();
+        assert!(
+            matches!(&reached, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
+            "precondition: with the actor answering, the grant reaches the UCAN step: {reached}"
+        );
+
+        crate::runtime::supervisor(&bi)
+            .unwrap()
+            .test_make_actor_unreachable(&ctx_id);
+        let refusal = grant().unwrap_err();
+        assert!(
+            matches!(
+                &refusal,
+                scp_mcp::server::AccessRefusal::Denied(msg)
+                    if msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && msg.contains(scp_ffi_common::error_codes::CTX_2023)
+                        && !msg.contains("SCP-CTX-2130")
+                        && !msg.contains(&ctx_id)
+            ),
+            "an unreachable actor must read as the withheld denial: {refusal}"
+        );
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// `outlet_grant` passes a missing supervisor through its lifecycle check
+    /// as a failed read, not as the withheld denial: the bridge cannot ask
+    /// any actor, which says nothing about the context.
+    #[test]
+    fn outlet_grant_reports_a_missing_supervisor_as_unreadable() {
+        let creator = "did:dht:z6MkCreatorGrantNoSupervisor";
+        let bi = __bi();
+        let ctx_id = setup_unsupervised_context(&bi, creator, true);
+        let mut provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
+        provider.agent_ucan_token = Some("not-a-ucan".to_owned());
+        let role_state =
+            crate::runtime::with_context(&bi, &ctx_id, |rt| Ok(rt.role_state.clone())).unwrap();
+        let refusal = provider
+            .outlet_grant(
+                &bi,
+                &role_state,
+                &ctx_id,
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, scp_mcp::server::AccessRefusal::Unreadable(msg)
+                if !msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)),
+            "a missing supervisor must be a failed read: {refusal}"
         );
         crate::runtime::remove_context(&bi, &ctx_id);
     }
@@ -3738,22 +3958,101 @@ mod tests {
     fn load_contexts_returns_local_contexts() {
         let creator = "did:dht:z6MkCreatorLoadCtx";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, creator, true);
+        let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
 
         // Since py_mcp_load_contexts requires Python, we test the underlying
         // runtime function directly.
-        let ids = crate::runtime::context_ids_for_member(&bi, creator);
+        let ids = crate::runtime::context_ids_for_member(&bi, creator).unwrap();
         assert!(
             ids.contains(&ctx_id),
             "creator should be a member of the context"
         );
 
         // Non-member should not see the context.
-        let other_ids = crate::runtime::context_ids_for_member(&bi, "did:dht:z6MkNobody");
+        let other_ids = crate::runtime::context_ids_for_member(&bi, "did:dht:z6MkNobody").unwrap();
         assert!(
             !other_ids.contains(&ctx_id),
             "non-member should not see the context"
         );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// `py_mcp_load_contexts` lists a context by the membership the supervisor
+    /// actor holds, and reports the actor's member count and creator. The
+    /// member is recorded only on the actor, so a copy-reading implementation
+    /// omits the context.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn mcp_load_contexts_reports_the_supervisor_member_count() {
+        let creator = "did:dht:z6MkLoadContextsCreator";
+        let member = "did:dht:z6MkLoadContextsJoiner";
+        let bi = __bi();
+        let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
+        crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, member);
+        let scp = crate::scp::PyScp {
+            inner: Arc::clone(&bi),
+        };
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let contexts = scp
+                .py_mcp_load_contexts(py, member, "")
+                .expect("load_contexts must succeed");
+            let entry = contexts
+                .iter()
+                .map(|entry| entry.bind(py).downcast::<PyDict>().unwrap().clone())
+                .find(|dict| {
+                    dict.get_item("context_id")
+                        .unwrap()
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap()
+                        == ctx_id
+                })
+                .expect("the member's context must be listed");
+            let member_count: usize = entry
+                .get_item("member_count")
+                .unwrap()
+                .expect("member_count must be reported")
+                .extract()
+                .unwrap();
+            let creator_did: String = entry
+                .get_item("creator_did")
+                .unwrap()
+                .expect("creator_did must be reported")
+                .extract()
+                .unwrap();
+            assert_eq!(
+                member_count, 2,
+                "the count must include the creator and the actor-recorded member"
+            );
+            assert_eq!(creator_did, creator);
+        });
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// `py_mcp_load_contexts` fails while a context is registered and no
+    /// supervisor is attached, instead of listing contexts from the bridge
+    /// copy.
+    #[test]
+    fn mcp_load_contexts_fails_closed_without_a_supervisor() {
+        crate::init_runtime().ok();
+        let creator = "did:dht:z6MkLoadContextsNoSupervisor";
+        let bi = __bi();
+        let ctx_id = setup_unsupervised_context(&bi, creator, false);
+        let scp = crate::scp::PyScp {
+            inner: Arc::clone(&bi),
+        };
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(
+                scp.py_mcp_load_contexts(py, creator, "").is_err(),
+                "no supervisor must fail the listing, not answer from the bridge copy"
+            );
+        });
 
         crate::runtime::remove_context(&bi, &ctx_id);
     }
@@ -5195,7 +5494,7 @@ mod tests {
 
         let creator = "did:dht:z6MkCreatorResAccess";
         let bi = __bi();
-        let ctx_id = setup_unsupervised_context(&bi, creator, false);
+        let ctx_id = setup_supervised_context(&bi, creator, false, &["messages:read"]);
 
         let provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
         for kind in [
@@ -5260,7 +5559,7 @@ mod tests {
     fn mcp_subscribe_rejected_when_no_event_source_wired_pyo3() {
         let creator = "did:dht:z6MkSubUnwired";
         let bi = __bi();
-        let ctx_id = setup_unsupervised_context(&bi, creator, false);
+        let ctx_id = setup_supervised_context(&bi, creator, false, &["messages:read"]);
         let uri = format!("scp://{ctx_id}/events");
 
         let mut server = McpServer::new(pyo3_mcp_provider(&bi, &ctx_id, creator));
@@ -5307,7 +5606,7 @@ mod tests {
     fn mcp_subscribe_produces_notifications_when_event_source_wired_pyo3() {
         let creator = "did:dht:z6MkSubWired";
         let bi = __bi();
-        let ctx_id = setup_unsupervised_context(&bi, creator, false);
+        let ctx_id = setup_supervised_context(&bi, creator, false, &["messages:read"]);
         let uri = format!("scp://{ctx_id}/events");
 
         // A channel of the supervisor's event type stands in for its receiver;
@@ -5486,13 +5785,86 @@ mod tests {
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 
-    /// With a supervisor attached, every MCP gate answers from the actor's
-    /// role state, not from the bridge's copy. The copy is resynced only by the
-    /// bridge's own join, leave and governance calls, so a revocation or
-    /// removal the actor applies from an inbound commit leaves the copy still
-    /// granting. Here the copy names the agent as a member and the actor holds
-    /// no such context — the state after the actor drops a context the agent
-    /// was removed from — so every gate must deny.
+    /// With no supervisor attached, no MCP gate answers from the bridge's
+    /// copy, though the copy names the agent as a member. The reads that
+    /// return data fail, and the access gates deny with a message naming the
+    /// missing supervisor.
+    #[test]
+    fn provider_gates_refuse_without_a_supervisor_pyo3() {
+        use scp_mcp::server::ResourceKind;
+
+        crate::init_runtime().ok();
+        let agent = "did:dht:z6MkGatesNoSupervisorAgent";
+        let bi = __bi();
+        let ctx_id = setup_unsupervised_context(&bi, agent, false);
+        let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |rt| Ok(rt
+                .role_state
+                .members
+                .contains(agent)))
+            .unwrap(),
+            "precondition: the bridge copy names the agent as a member"
+        );
+
+        assert!(
+            provider
+                .active_context_ids()
+                .expect_err("no supervisor must fail the participation read")
+                .contains("no supervisor is attached")
+        );
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            let refusal = provider
+                .validate_resource_access(&ctx_id, kind)
+                .expect_err("no supervisor must refuse the resource");
+            assert!(
+                matches!(
+                    &refusal,
+                    scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("no supervisor is attached")
+                ),
+                "with no supervisor the {kind:?} refusal must name the missing supervisor, got: {refusal}"
+            );
+        }
+        for check in [
+            scp_mcp::server::CapabilityCheck::Probe,
+            scp_mcp::server::CapabilityCheck::Invoke,
+        ] {
+            let refusal = provider
+                .validate_capability(&ctx_id, "any-outlet", check)
+                .expect_err("no supervisor must refuse the tool");
+            assert!(
+                matches!(
+                    &refusal,
+                    scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("no supervisor is attached")
+                ),
+                "with no supervisor the {check:?} refusal must name the missing supervisor, got: {refusal}"
+            );
+        }
+        assert!(
+            provider
+                .context_members(&ctx_id)
+                .expect_err("no supervisor must fail the roster read")
+                .contains("no supervisor is attached")
+        );
+        assert!(
+            provider
+                .agent_role(&ctx_id)
+                .expect_err("no supervisor must fail the role read")
+                .contains("no supervisor is attached")
+        );
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Every MCP gate answers from the actor's role state, never from the
+    /// bridge's copy. The copy is resynced only by the bridge's own join,
+    /// leave and governance calls, so a revocation or removal the actor
+    /// applies from an inbound commit leaves the copy still granting. Here the
+    /// actor exists and holds no such context, the state after the actor drops
+    /// a context the agent was removed from, so every gate must deny.
     #[test]
     fn provider_gates_follow_the_actor_not_the_bridge_copy_pyo3() {
         use scp_mcp::server::ResourceKind;
@@ -5502,40 +5874,16 @@ mod tests {
         let bi = __bi();
         let ctx_id = setup_unsupervised_context(&bi, agent, false);
         let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
-
-        // No supervisor: the copy is the context's only role state, and a
-        // context the bridge holds no copy of is reported as such, not as one
-        // a supervisor lacks.
-        assert_eq!(provider.active_context_ids().unwrap(), vec![ctx_id.clone()]);
-        let denial = provider
-            .validate_resource_access("ctx-the-bridge-never-held", ResourceKind::Events)
-            .expect_err("a context the bridge holds no copy of must not be readable");
-        assert!(
-            matches!(
-                &denial,
-                scp_mcp::server::AccessRefusal::Denied(msg)
-                    if msg.contains("not held by this bridge, and no supervisor is attached")
-            ),
-            "with no supervisor an absent context is a denial naming the bridge, not a \
-             failed read, got: {denial}"
-        );
-        assert!(provider.context_members(&ctx_id).is_ok());
-        assert!(
-            provider
-                .agent_role(&ctx_id)
-                .expect("the role state reads")
-                .is_some()
-        );
-        assert!(
-            provider
-                .validate_resource_access(&ctx_id, ResourceKind::Events)
-                .is_ok()
-        );
-
-        // The actor now exists and does not hold the context; the copy still
-        // names the agent as a member.
         crate::runtime::init_context_manager_for_test(&bi);
         assert!(crate::runtime::supervisor(&bi).is_ok());
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |rt| Ok(rt
+                .role_state
+                .members
+                .contains(agent)))
+            .unwrap(),
+            "precondition: the bridge copy names the agent as a member"
+        );
 
         assert!(
             provider.active_context_ids().unwrap().is_empty(),
@@ -5987,8 +6335,9 @@ mod tests {
     /// `mcp_server_bundle`, the function `py_mcp_serve` builds its server with,
     /// returns the unwired bundle, whose server advertises
     /// `resources.subscribe: false`, and reads `resources/list` through the
-    /// provider type that entry point builds over the same instance, so a
-    /// provider that served nothing without a supervisor fails here.
+    /// provider type that entry point builds over the same instance: with no
+    /// supervisor the role-state read fails, so the list fails instead of
+    /// answering from the bridge copy.
     #[test]
     fn missing_supervisor_degrades_subscriptions_not_the_whole_server_pyo3() {
         crate::init_runtime().ok();
@@ -6022,22 +6371,11 @@ mod tests {
         let _ = initialize_and_read_subscribe_flag(&mut server);
         let listed = server
             .handle_request(&mcp_request("resources/list", serde_json::json!({})))
-            .expect("resources/list must produce a response")
-            .result
-            .expect("resources/list must succeed without a supervisor");
-        let uris: Vec<&str> = listed["resources"]
-            .as_array()
-            .expect("resources must be an array")
-            .iter()
-            .filter_map(|r| r["uri"].as_str())
-            .collect();
-        let expected: Vec<String> = ["events", "members", "tools"]
-            .iter()
-            .map(|kind| format!("scp://{ctx_id}/{kind}"))
-            .collect();
-        assert_eq!(
-            uris, expected,
-            "a missing supervisor must leave resources/list serving the context"
+            .expect("resources/list must produce a response");
+        assert!(
+            listed.result.is_none() && listed.error.is_some(),
+            "with no supervisor resources/list must fail, not answer from the bridge \
+             copy: {listed:?}"
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);
