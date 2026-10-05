@@ -260,8 +260,23 @@ listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
 // custody arm and the `signed_at_override` parity affordance, both security
 // nullifiers that §17.17.2 of the persistence spec requires absent from a shipped
 // artifact. So `testing` reaches a build only when the caller names it.
+//
+// The value is read from the `-P` arguments of the outermost Gradle invocation
+// (the root build's, when this build is included in a composite). The build fails
+// when Gradle resolves the property to a different value, which happens when an
+// `ORG_GRADLE_PROJECT_` environment variable, an `org.gradle.project.` system
+// property or a gradle.properties file sets it and the command line does not.
 // ---------------------------------------------------------------------------
-val uniffiCargoFeatures: String = providers.gradleProperty("scp.uniffi.cargoFeatures").getOrElse("")
+val uniffiCargoFeatures: String =
+    generateSequence(gradle) { it.parent }.last()
+        .startParameter.projectProperties["scp.uniffi.cargoFeatures"] ?: ""
+val resolvedUniffiCargoFeatures: String = providers.gradleProperty("scp.uniffi.cargoFeatures").getOrElse("")
+if (resolvedUniffiCargoFeatures != uniffiCargoFeatures) {
+    throw GradleException(
+        "scp.uniffi.cargoFeatures resolves to '$resolvedUniffiCargoFeatures' but the command line passes " +
+            "'$uniffiCargoFeatures'; pass it only as -Pscp.uniffi.cargoFeatures=<list>",
+    )
+}
 if (!Regex("([A-Za-z0-9_/-]+(,[A-Za-z0-9_/-]+)*)?").matches(uniffiCargoFeatures)) {
     throw GradleException(
         "scp.uniffi.cargoFeatures is '$uniffiCargoFeatures'; it takes a comma-separated list of cargo feature names",
@@ -333,7 +348,16 @@ tasks.register("printUniffiCargoFeatures") {
 // `testing` in `scp.uniffi.cargoFeatures` would load a production library and fail
 // suite by suite with SCP-IDENT-1008. This check fails the build before any task
 // runs instead.
+//
+// uniffiPublishGuard: a build whose task graph holds a task that publishes to a
+// Maven repository fails when `scp.uniffi.cargoFeatures` names `testing`.
 gradle.taskGraph.whenReady {
+    val publishTask = allTasks.firstOrNull { it is PublishToMavenRepository }
+    if (publishTask != null && "testing" in uniffiCargoFeatures.split(",")) {
+        throw GradleException(
+            "${publishTask.path} publishes to a Maven repository, and scp.uniffi.cargoFeatures names testing",
+        )
+    }
     val testTask = tasks.test.get()
     if (hasTask(testTask) && uniffiPrebuiltBindings != "true" && "testing" !in uniffiCargoFeatures.split(",")) {
         throw GradleException(

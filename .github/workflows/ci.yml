@@ -3293,7 +3293,7 @@ jobs:
       # scripts/check-shipped-feature-graph.sh. It also fails on a file with no such
       # line. The step runs it on release.yml and build-matrix.yml, and on planted
       # files that must fail.
-      - name: Check the UniFFI cargo features of every release Gradle invocation
+      - name: Check the UniFFI cargo features of the release workflows' ./gradlew lines
         run: |
           set -euo pipefail
           gated=$(sed -n '/^ARTIFACTS=(/,/^)/p' ../../scripts/check-shipped-feature-graph.sh \
@@ -3383,13 +3383,13 @@ jobs:
             local message=$1
             shift
             local output
-            if output=$(./gradlew "$@" 2>&1); then
-              echo "::error::./gradlew $* exited 0; it must fail with: $message"
+            if output=$("$@" 2>&1); then
+              echo "::error::$* exited 0; it must fail with: $message"
               exit 1
             fi
             if ! grep -qF -- "$message" <<<"$output"; then
               echo "$output"
-              echo "::error::./gradlew $* failed without: $message"
+              echo "::error::$* failed without: $message"
               exit 1
             fi
           }
@@ -3399,12 +3399,25 @@ jobs:
             exit 1
           fi
           expect_failure "scp.uniffi.cargoFeatures is 'testing;rm'; it takes a comma-separated list of cargo feature names" \
-            :scp-kt:printUniffiCargoFeatures "-Pscp.uniffi.cargoFeatures=testing;rm"
+            ./gradlew :scp-kt:printUniffiCargoFeatures "-Pscp.uniffi.cargoFeatures=testing;rm"
           expect_failure "scp.uniffi.prebuiltBindings is true, so generateUniffiBindings builds nothing" \
-            :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.prebuiltBindings=true
+            ./gradlew :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.prebuiltBindings=true
           expect_failure ":scp-kt:test needs a cdylib built with the testing feature; pass -Pscp.uniffi.cargoFeatures=testing" \
-            :scp-kt:test --dry-run
+            ./gradlew :scp-kt:test --dry-run
           ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=testing
+          expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
+            env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing ./gradlew :scp-kt:printUniffiCargoFeatures
+          expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
+            ./gradlew -Dorg.gradle.project.scp.uniffi.cargoFeatures=testing :scp-kt:printUniffiCargoFeatures
+          got=$(env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing \
+            ./gradlew -q :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.cargoFeatures=testing | tail -n 1)
+          if [ "$got" != "scp-ffi-uniffi|--features testing" ]; then
+            echo "::error::printUniffiCargoFeatures with the same value in the environment and on the command line printed '$got'"
+            exit 1
+          fi
+          expect_failure ":scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository publishes to a Maven repository, and scp.uniffi.cargoFeatures names testing" \
+            ./gradlew :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository --dry-run -Pscp.uniffi.cargoFeatures=testing
+          ./gradlew -q :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository --dry-run
       # `:scp-kt-android` declares detekt in its own build.gradle.kts and no job
       # invoked it, so every rule in ../detekt.yml — ForbiddenComment among them,
       # which is how this repository enforces its Kotlin stub policy — went

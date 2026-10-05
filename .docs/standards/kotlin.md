@@ -101,8 +101,7 @@ style:
 # Build (`build` runs the tests, so it takes the same opt-in as `test`)
 ./gradlew build -Pscp.uniffi.cargoFeatures=testing
 
-# Test (the tests load a cdylib built with the `testing` feature; a build
-# without this property generates production bindings and `:scp-kt:test` refuses to run)
+# Test (the tests load a cdylib built with the `testing` feature)
 ./gradlew test -Pscp.uniffi.cargoFeatures=testing
 
 # Publish to Maven Local
