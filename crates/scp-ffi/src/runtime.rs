@@ -2738,25 +2738,13 @@ pub fn remove_context(bi: &PyBridgeInstance, context_id: &str) {
 /// Re-reads the supervisor and removes `context_id`'s [`FfiBridgeState`] only
 /// when the re-read does not report `Active`.
 ///
-/// `context_close` decides from a lifecycle read taken before it releases, so
-/// an import or restore can return the id to `Active` in between. On an
-/// `Active` re-read this removes nothing and returns `false`, so the live
-/// context keeps its revocation list, nonce tracker, outlets, and sessions.
-/// Any other answer, a failed read included, removes the state and returns
-/// `true`.
+/// On an `Active` re-read this removes nothing and returns `false`, so the
+/// live context keeps its revocation list, nonce tracker, outlets, and
+/// sessions. Any other answer, a failed read included, removes the state and
+/// returns `true`.
 ///
 /// The re-read and the removal are two steps, and nothing stops a readmit
-/// from landing between them. That window fails closed on this bridge, so it
-/// carries no release mark of the kind the NAPI and `UniFFI` bridges use:
-/// - `context_import` and `restore_context` register no `FfiBridgeState`, so
-///   an id they return to `Active` after the re-read is left with none, the
-///   same state either call leaves on any id. Outlet dispatch and UCAN
-///   issue, revoke, and validate refuse it.
-/// - `context_join_from_welcome` registers its `FfiBridgeState` before it
-///   spawns the joined actor. A removal between the registration and the
-///   spawn leaves the joined context `Active` with no `FfiBridgeState`, so
-///   outlet dispatch and UCAN issue, revoke, and validate refuse that context
-///   on this bridge.
+/// from landing between them.
 pub fn release_context_unless_readmitted(bi: &PyBridgeInstance, context_id: &str) -> bool {
     if matches!(
         read_live_context_state(bi, context_id),
