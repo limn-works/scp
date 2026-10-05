@@ -3336,8 +3336,17 @@ jobs:
               ./gradlew -Dorg.gradle.project.scp.uniffi.cargoFeatures=testing "$publish"
             ./gradlew -q "$publish" --dry-run
           done
-          ./gradlew -q :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository --dry-run
-          ./gradlew -q :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository --dry-run
+          for publish in :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository \
+            :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository; do
+            guard="$publish publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty"
+            mkdir -p "$(dirname "$bindings")"
+            echo "// placeholder" > "$bindings"
+            expect_failure "$guard" ./gradlew "$publish" -Pscp.uniffi.cargoFeatures=testing
+            expect_failure "$guard" ./gradlew "$publish" -Pscp.uniffi.prebuiltBindings=true
+            rm "$bindings"
+            expect_failure "$guard" ./gradlew "$publish" -x generateUniffiBindings
+            ./gradlew -q "$publish" --dry-run
+          done
       - name: Check the Scp-Uniffi attributes in the scp-kt JAR manifest
         run: |
           set -euo pipefail

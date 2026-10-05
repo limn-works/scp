@@ -360,7 +360,7 @@ val uniffiPublishGuard: (TaskExecutionGraph, Project, String) -> Unit = { graph,
     ) {
         throw GradleException(
             "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
-                "and this build must generate the bindings and build every file it publishes; " +
+                "and this build must generate the bindings; " +
                 "scp.uniffi.cargoFeatures is '$resolvedUniffiCargoFeatures', scp.uniffi.prebuiltBindings is " +
                 "'$uniffiPrebuiltBindings' and the task graph lacks $missingTasks",
         )
