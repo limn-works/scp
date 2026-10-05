@@ -1718,10 +1718,9 @@ pub(crate) async fn context_close_on(
     // close does not survive a later readmit of the id, just as it does not
     // survive a process restart.
     //
-    // `Poisoned` and `MigratingOut` refuse because both can return to
-    // `Active` without an import (`clear_poison`, a cancelled migration), and
-    // a release before that return would leave the `Active` context with no
-    // revocation list on this bridge. `Closing` refuses so the release
+    // `Poisoned` and `MigratingOut` refuse because a release while the
+    // context can still return to `Active` would leave the `Active` context
+    // with no revocation list on this bridge. `Closing` refuses so the release
     // follows `contextFinalizeClose`, and the refusal names that call.
     let close_already_happened =
         match crate::runtime::read_live_context_state(bi, &handle.context_id)
@@ -1744,9 +1743,7 @@ pub(crate) async fn context_close_on(
                 | scp_core::context::ContextState::Tombstoned,
             ) => true,
             Some(scp_core::context::ContextState::Active) => false,
-            // `Closing` names its own successor call, because "context must be
-            // active" is unreachable from the closing window: the window ends
-            // at `Closed`, and only an import returns the id to `Active`.
+            // `Closing` names its own successor call.
             Some(scp_core::context::ContextState::Closing) => {
                 return Err(ScpNapiError::Context {
                     message: "cannot close context in 'closing' state -- the context is inside \
@@ -6159,7 +6156,7 @@ mod tests {
         let ctx_id = "a".repeat(64);
         // A close released this id before the join, and a handle from before
         // the close is still alive, so the release mark must survive the
-        // failed join: only a committed spawn readmits the id.
+        // failed join.
         let _closed_handle = active_handle_for(&bi, &ctx_id, "did:dht:z6MkNapiRollbackCreator");
         crate::runtime::release_context(&bi, &ctx_id);
 
@@ -6283,8 +6280,8 @@ mod tests {
 
     /// A readmit that clears the release mark before the close's removal takes
     /// the registry shard lock leaves the readmitted context's state in place
-    /// and the removal returns `false`; while the mark stands, the removal
-    /// takes the state and returns `true`.
+    /// and known-context entry in place, and the removal returns `false`;
+    /// while the mark stands, the removal takes both and returns `true`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_removal_skips_state_a_readmit_already_claimed() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6297,6 +6294,15 @@ mod tests {
             Ok(())
         })
         .expect("the registered context must have UCAN state");
+        bi.core.register_known_context(
+            &ctx_id,
+            scp_ffi_common::bridge_instance::KnownContext {
+                routing_id: [7; 32],
+                relay_url: None,
+                member_did: "did:key:z6MkNapiReleaseRace".to_owned(),
+                last_seen: 0,
+            },
+        );
 
         bi.released_contexts.insert(ctx_id.clone(), ());
         crate::runtime::readmit_context(&bi, &ctx_id);
@@ -6311,6 +6317,10 @@ mod tests {
             .expect("a readmitted context's UCAN state must survive the removal"),
             "the readmitted context's revocation must survive the removal"
         );
+        assert!(
+            bi.core.has_known_context(&ctx_id),
+            "a removal a readmit pre-empted must keep the known-context entry"
+        );
 
         bi.released_contexts.insert(ctx_id.clone(), ());
         assert!(
@@ -6320,6 +6330,10 @@ mod tests {
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
             "the removal must take the state while the mark stands"
+        );
+        assert!(
+            !bi.core.has_known_context(&ctx_id),
+            "the removal must take the known-context entry while the mark stands"
         );
     }
 

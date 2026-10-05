@@ -1765,9 +1765,7 @@ pub fn register_ffi_state(
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
-            // The release mark stays until the spawn commits: the caller
-            // readmits the id only then, so a failed join leaves a closed
-            // context's mark in place.
+            // This insert leaves the release mark in place.
             let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
             vacant.insert(state);
             Ok(())
@@ -1789,7 +1787,8 @@ pub fn register_ffi_state(
 /// # Errors
 ///
 /// Returns `ScpNapiError::Context` (`SCP-CTX-2023`) when a release marked the
-/// context's id on this bridge instance, and the errors of
+/// context's id on this bridge instance and the registry holds no state for
+/// it, and the errors of
 /// [`build_ucan_context_state`].
 pub fn ensure_registered(
     bi: &NapiBridgeInstance,
@@ -1833,10 +1832,7 @@ pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
 /// Removes `context_id`'s [`UcanContextState`] and its known-context entry,
 /// only while the release mark stands, and returns whether the mark stood.
 ///
-/// The mark check and both removals run under the registry entry's shard lock,
-/// which [`readmit_context`] also takes, so a readmit that clears the mark
-/// first leaves the readmitted context's state in place and this returns
-/// `false`, and a readmit that comes second finds the state already gone.
+/// The mark check and both removals run under the registry entry's shard lock.
 pub(crate) fn remove_context_while_released(bi: &NapiBridgeInstance, context_id: &str) -> bool {
     use dashmap::mapref::entry::Entry;
 
@@ -1844,21 +1840,16 @@ pub(crate) fn remove_context_while_released(bi: &NapiBridgeInstance, context_id:
     if !bi.released_contexts.contains_key(context_id) {
         return false;
     }
+    bi.core.remove_known_context(context_id);
     if let Entry::Occupied(occupied) = entry {
         occupied.remove();
     }
-    bi.core.remove_known_context(context_id);
     true
 }
 
-/// Clears the release mark [`release_context`] left for `context_id`, so the
-/// next UCAN, outlet, or event-log call builds fresh state for it.
+/// Clears the release mark [`release_context`] left for `context_id`.
 ///
-/// It clears the mark under the registry entry's shard lock, the lock a
-/// close's removal holds while it checks the mark. The fresh state holds an
-/// empty revocation list and a fresh nonce tracker: this bridge keeps
-/// revocations in process memory, so they survive neither a close followed by
-/// a re-import nor a process restart.
+/// It clears the mark under the registry entry's shard lock.
 pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
     let _shard = ucan_registry(bi).entry(context_id.to_owned());
     bi.released_contexts.remove(context_id);
@@ -2352,10 +2343,6 @@ pub fn query_trust_event_counts(
 // `bi.core.with_rate_limit_tracker(identity_did, f)` directly.
 
 /// Registers a test context in the UCAN state registry.
-///
-/// The state carries no role state, so a test that exercises an authorization
-/// decision creates a supervisor context for the same id and lets the actor
-/// answer.
 #[cfg(test)]
 pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_did: &str) {
     let map = ucan_registry(bi);
