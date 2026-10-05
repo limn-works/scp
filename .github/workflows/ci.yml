@@ -3457,6 +3457,9 @@ jobs:
           expect_failure "$publish publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty" \
             ./gradlew "$publish" --dry-run -x generateUniffiBindings
           ./gradlew -q "$publish" --dry-run
+          expect_failure ":scp-kt:publishMavenJavaPublicationToMavenLocal publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty" \
+            ./gradlew :scp-kt:publishToMavenLocal --dry-run -Pscp.uniffi.cargoFeatures=testing
+          ./gradlew -q :scp-kt:publishToMavenLocal --dry-run
       # Runs the script of release.yml's "Check each JAR's manifest records
       # production UniFFI bindings" step on JARs whose manifests must pass and fail.
       # The JARs Gradle builds here exclude compileKotlin, so their task graph holds

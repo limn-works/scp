@@ -348,9 +348,10 @@ tasks.register("printUniffiCargoFeatures") {
 // uniffiTestGuard: `:scp-kt:test` loads the cdylib under cargo's target directory
 // (see `JnaLibraryPath` above), and its real-FFI suites create identities with the
 // in-memory custody arm, which only a `testing` build compiles. When this build
-// generates the bindings, it builds that cdylib too. This check fails the build
-// before any task runs when `scp.uniffi.cargoFeatures` names neither `testing` nor
-// `scp-ffi-uniffi/testing`.
+// generates the bindings, it builds that cdylib too. When the task graph holds
+// `:scp-kt:test` and `scp.uniffi.prebuiltBindings` is not true, this check fails the
+// build before any task runs if `scp.uniffi.cargoFeatures` names neither `testing`
+// nor `scp-ffi-uniffi/testing`.
 //
 // uniffiBindingsGenerated is true when the task graph holds `generateUniffiBindings`
 // and `scp.uniffi.prebuiltBindings` is not true.
@@ -362,7 +363,7 @@ var uniffiBindingsGenerated = false
 gradle.taskGraph.whenReady {
     uniffiBindingsGenerated =
         uniffiPrebuiltBindings != "true" && hasTask(tasks.named("generateUniffiBindings").get())
-    val publishTask = allTasks.firstOrNull { it is PublishToMavenRepository }
+    val publishTask = allTasks.firstOrNull { it is AbstractPublishToMaven }
     if (publishTask != null && (uniffiCargoFeatures.isNotEmpty() || !uniffiBindingsGenerated)) {
         throw GradleException(
             "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
