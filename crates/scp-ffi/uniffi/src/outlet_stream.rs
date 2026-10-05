@@ -359,31 +359,30 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpError {
 }
 
 /// The error for a stream the Supervisor opened but the bridge refused to
-/// register because bridge shutdown had begun. The open had already reserved
-/// escrow and started its pump, so this is the Context class with
-/// `SCP-CTX-2138`, not the Outlet class of the Supervisor's own refusal, which
-/// comes before anything is reserved.
+/// register because bridge shutdown had begun, built from
+/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
+/// The open had already reserved escrow and started its pump, so this is the
+/// Context class with `SCP-CTX-2139`, not the Outlet class of the Supervisor's
+/// own refusal, which comes before anything is reserved.
 fn late_shutdown_stream_err() -> ScpError {
+    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(None);
     ScpError::Context {
-        msg: "outlet stream opened, then dropped unregistered: bridge shutdown began \
-                  before the bridge registered it"
-            .to_owned(),
-        code: codes::CTX_2138.to_owned(),
+        msg: message,
+        code: code.to_owned(),
     }
 }
 
 /// The error for a streaming saga the Supervisor started but the bridge
-/// refused to register because bridge shutdown had begun. The saga had already
-/// staged its Prepare phase, so this is the Context class with `SCP-CTX-2138`
-/// and the saga id, not the `SagaAborted` class of the Supervisor's own
-/// refusal, which comes before anything is staged.
+/// refused to register because bridge shutdown had begun, built from
+/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
+/// The saga had already staged its Prepare phase, so this is the Context class
+/// with `SCP-CTX-2139` and the saga id, not the `SagaAborted` class of the
+/// Supervisor's own refusal, which comes before anything is staged.
 fn late_shutdown_saga_err(saga_id: &str) -> ScpError {
+    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(Some(saga_id));
     ScpError::Context {
-        msg: format!(
-            "streaming saga {saga_id} started, then its receiver was dropped unregistered: \
-             bridge shutdown began before the bridge registered it"
-        ),
-        code: codes::CTX_2138.to_owned(),
+        msg: message,
+        code: code.to_owned(),
     }
 }
 
@@ -2027,6 +2026,11 @@ impl Scp {
     /// budget injection has no bridge-public wiring — same rationale as the
     /// unary-saga bridge tests). The receiver's sender is dropped immediately
     /// (recover never polls it).
+    ///
+    /// # Panics
+    ///
+    /// Panics when bridge shutdown has begun, because the registry then refuses
+    /// the entry and the test would run against an empty registry.
     pub fn insert_test_streaming_saga_entry(
         &self,
         saga_id: &str,
@@ -2034,7 +2038,7 @@ impl Scp {
         invoker_did: &str,
     ) {
         let (_tx, rx) = mpsc::channel(1);
-        self.inner.outlet_streaming_saga_registry.insert(
+        let registered = self.inner.outlet_streaming_saga_registry.insert(
             saga_id.to_owned(),
             StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
@@ -2043,6 +2047,10 @@ impl Scp {
                 invoker_did: invoker_did.to_owned(),
                 request_id: [0u8; 16],
             },
+        );
+        assert!(
+            registered,
+            "bridge shutdown began before the test entry for {saga_id} was registered"
         );
     }
 

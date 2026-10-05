@@ -908,7 +908,7 @@ impl From<scp_transport::TransportError> for ScpPyError {
 
 impl From<scp_platform::PlatformError> for ScpPyError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        // Spec §17.6 "One Writer per Durable Directory": the closed-store and
+        // Spec §17.6 "One Opener per Durable Directory": the closed-store and
         // lock-still-held conditions carry their registered storage codes.
         match &e {
             scp_platform::PlatformError::StorageClosed => {
@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(context_code_of(err), codes::CTX_2002);
     }
 
-    /// Spec §17.6 "One Writer per Durable Directory": a held lock and a closed
+    /// Spec §17.6 "One Opener per Durable Directory": a held lock and a closed
     /// store carry their registered storage codes; any other platform error
     /// keeps the crypto catch-all.
     #[test]

@@ -679,14 +679,11 @@ impl SupervisorHandle {
     }
 
     /// Persist the per-context state and broadcast snapshot for
-    /// `context_id` if persistence is configured. A persistence failure is
-    /// not propagated. When the Supervisor has dropped, the persist fails:
-    /// ADR-049 Decision 16 item 4 makes that a Class C persist failure,
-    /// logged, counted, and acknowledged with `Ok(())`.
-    pub(crate) async fn persist_context_and_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<(), ContextError> {
+    /// `context_id` if persistence is configured. This method returns no
+    /// error. When the Supervisor has dropped, the persist fails: ADR-049
+    /// Decision 16 item 4 makes that a Class C persist failure, which this
+    /// method logs and counts through `record_persistence_failure`.
+    pub(crate) async fn persist_context_and_broadcast(&self, context_id: &str) {
         match self.upgrade() {
             Ok(supervisor) => {
                 crate::context::manager_methods::persist_context_and_broadcast(
@@ -704,7 +701,6 @@ impl SupervisorHandle {
                 );
             }
         }
-        Ok(())
     }
 
     /// Spawn a per-context [`ContextActor`](crate::context::actor::ContextActor)
@@ -1203,20 +1199,53 @@ mod tests {
         shut_down(handle.spawn_tracked("probe", async {}).map(drop));
     }
 
-    /// ADR-049 Decision 16 item 4: the Class C snapshot persist acknowledges a
-    /// failed upgrade with `Ok(())` instead of `SupervisorShutDown`, the same as
-    /// a persist against a live Supervisor.
-    #[tokio::test]
-    async fn class_c_snapshot_persist_acknowledges_a_dropped_supervisor() {
-        let (sup, handle) = test_handle();
-        assert!(handle.persist_context_and_broadcast("ctx").await.is_ok());
-        drop(sup);
-        assert!(handle.local_dids().is_err(), "the Supervisor has dropped");
-        let r = handle.persist_context_and_broadcast("ctx").await;
-        assert!(
-            r.is_ok(),
-            "expected Ok after the Supervisor dropped, got {r:?}"
-        );
+    /// ADR-049 Decision 16 item 4: the Class C snapshot persist counts a failed
+    /// upgrade as one persistence failure, and counts none against a live
+    /// Supervisor.
+    #[test]
+    fn class_c_snapshot_persist_counts_a_dropped_supervisor_as_a_persist_failure() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let failures = |snapshotter: &metrics_util::debugging::Snapshotter| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| match v {
+                    DebugValue::Counter(c)
+                        if ck.key().name() == "scp_persistence_failures_total" =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (sup, handle) = test_handle();
+                handle.persist_context_and_broadcast("ctx").await;
+                assert_eq!(
+                    failures(&snapshotter),
+                    0,
+                    "a live Supervisor counts no failure"
+                );
+                drop(sup);
+                assert!(handle.local_dids().is_err(), "the Supervisor has dropped");
+                handle.persist_context_and_broadcast("ctx").await;
+                assert_eq!(
+                    failures(&snapshotter),
+                    1,
+                    "a failed upgrade counts one failure"
+                );
+            });
+        });
     }
 
     #[tokio::test]

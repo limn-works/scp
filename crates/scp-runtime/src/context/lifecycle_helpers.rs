@@ -1896,7 +1896,7 @@ pub async fn finalize_create(
     // install is needed.
     deps.supervisor
         .persist_context_and_broadcast(context_id)
-        .await?;
+        .await;
     if ttl_duration.is_some() {
         // Install the TTL timer by mailboxing StartTtlTimer to the
         // freshly-spawned actor: the actor owns `state.ttl.timer` and
@@ -2830,7 +2830,7 @@ pub async fn import_context(
     // 8. Persist if persistence is configured.
     deps.supervisor
         .persist_context_and_broadcast(&context_id)
-        .await?;
+        .await;
 
     // 9. Re-arm the TTL timer through the partitioned single-source deadline
     // (ADR-049 §9). The create BASE + PROMOTION come from the PRUNE-IMMUNE,

@@ -501,7 +501,18 @@ async fn live_poll_next_drains_to_terminal() {
 
     // Once bridge shutdown has begun, the open call site refuses to register a
     // stream the still-live Supervisor opened: the caller receives
-    // `SCP-CTX-2138` and the registry holds no entry for it.
+    // `SCP-CTX-2139` and the registry holds no entry for it. The late open
+    // carries a token of its own, because the nonce check refuses a second use
+    // of the first open's token before the open reaches registration.
+    let late_ucan = scp
+        .ucan_mint(
+            Arc::clone(&handle),
+            invoker.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("ucan_mint should succeed");
     bi.core.stop_borrowers();
     let late = outlet_stream_open_impl(
         &bi,
@@ -509,7 +520,7 @@ async fn live_poll_next_drains_to_terminal() {
         outlet_id.clone(),
         r#"{"a":"1","b":"2"}"#.to_owned(),
         invoker.clone(),
-        ucan.encoded(),
+        late_ucan.encoded(),
         None,
         None,
         None,
@@ -518,8 +529,8 @@ async fn live_poll_next_drains_to_terminal() {
     .await
     .expect_err("an open after bridge shutdown began must be refused");
     assert!(
-        format!("{late}").contains(codes::CTX_2138),
-        "a late open is refused with SCP-CTX-2138: {late}"
+        format!("{late}").contains(codes::CTX_2139),
+        "a late open is refused with SCP-CTX-2139: {late}"
     );
     assert!(
         bi.outlet_stream_registry.is_empty(),
@@ -1277,14 +1288,14 @@ mod xctx_streaming_saga_tests {
 
 /// A stream or streaming saga the bridge refuses to register once bridge
 /// shutdown has begun had already started, so it reaches the caller as the
-/// Context class with `SCP-CTX-2138` (and, for a saga, its id), never as the
+/// Context class with `SCP-CTX-2139` (and, for a saga, its id), never as the
 /// class of the Supervisor's own refusal, which comes before anything started.
 #[test]
 fn late_shutdown_refusals_differ_from_supervisor_refusal_class() {
     let ScpError::Context { code, .. } = late_shutdown_stream_err() else {
         panic!("a late stream refusal must be the Context class");
     };
-    assert_eq!(code, codes::CTX_2138);
+    assert_eq!(code, codes::CTX_2139);
     assert!(
         matches!(
             open_rejection_to_err(&OpenStreamRejection::SupervisorShutDown),
@@ -1296,7 +1307,7 @@ fn late_shutdown_refusals_differ_from_supervisor_refusal_class() {
     let ScpError::Context { msg, code } = late_shutdown_saga_err("saga-late-1") else {
         panic!("a late streaming-saga refusal must be the Context class");
     };
-    assert_eq!(code, codes::CTX_2138);
+    assert_eq!(code, codes::CTX_2139);
     assert!(
         msg.contains("saga-late-1"),
         "the error names the started saga: {msg}"

@@ -5825,7 +5825,8 @@ where
     // caller log, §6.2.4). Compute the input hash before `input` is moved.
     let input_hash = sha256_json(&input);
 
-    // Open the B-side stream. `open_outlet_stream` reserves escrow (zero for
+    // Open the B-side stream through the spawner taken above, so this open has
+    // one shutdown refusal point. `open_outlet_stream_with_spawner` reserves escrow (zero for
     // Query / zero-cost), sources admission caps + timing policy from B's
     // `ContextParams`, wires B's durable `OutletInvoked` sink internally, and
     // spawns the off-mailbox pump. A best-effort open passes `None` for the
@@ -5837,7 +5838,8 @@ where
     // per-stream chunk ceiling; the value-caveat gate runs iff `caveat_binding`
     // is `Some` (supplied by the FFI caller / SCP-OUT-047).
     let mut handle = supervisor
-        .open_outlet_stream(
+        .open_outlet_stream_with_spawner(
+            &spawner,
             operating_context_id,
             registry,
             outlet_id,

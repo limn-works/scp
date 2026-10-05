@@ -5341,7 +5341,7 @@ mod concurrency_cap_tests {
     }
 }
 
-/// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Writer
+/// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Opener
 /// per Durable Directory"): a durable store the shutdown left holding its
 /// advisory lock raises `SCP-STORAGE-8005`.
 fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpNapiError> {

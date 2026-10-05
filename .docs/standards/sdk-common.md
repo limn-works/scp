@@ -300,8 +300,8 @@ enforcement mechanism.)
 | `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
 | `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
-| `SCP-STORAGE-8005` | selection layer, SDK `shutdown`, and `From<PlatformError>` translation (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store (§17.6 "One Writer per Durable Directory") |
-| `SCP-STORAGE-8006` | `From<PlatformError>` translation (all bridges) | `PlatformError::StorageClosed` (§17.6 "One Writer per Durable Directory") |
+| `SCP-STORAGE-8005` | selection layer, SDK `shutdown`, and `From<PlatformError>` translation (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store (§17.6 "One Opener per Durable Directory") |
+| `SCP-STORAGE-8006` | `From<PlatformError>` translation (all bridges) | `PlatformError::StorageClosed` (§17.6 "One Opener per Durable Directory") |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |

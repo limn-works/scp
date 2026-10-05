@@ -183,6 +183,29 @@ impl<K: Eq + std::hash::Hash, V> StreamRegistry<K, V> {
     /// [`BridgeInstanceCore::shutdown`] calls [`CoreFields::stop_borrowers`]
     /// before `release_streams`, so an entry this inserts is either cleared by
     /// that release or removed here.
+    ///
+    /// A caller that gets `false` returns the refusal that
+    /// [`late_registration_refusal`] builds. A call that discards the result
+    /// does not compile under `deny(unused_must_use)`:
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// registry.insert("key".to_owned(), 1);
+    /// ```
+    ///
+    /// The same call compiles when it reads the result:
+    ///
+    /// ```
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// assert!(registry.insert("key".to_owned(), 1));
+    /// ```
+    #[must_use = "a refused insert drops a stream the caller must report refused"]
     pub fn insert(&self, key: K, value: V) -> bool
     where
         K: Clone,
@@ -238,8 +261,9 @@ impl<K: Eq + std::hash::Hash, V> StreamRegistry<K, V> {
 /// The code and message for a refused late registration.
 ///
 /// A bridge returns them when [`StreamRegistry::insert`] refuses a stream or
-/// streaming saga that the Supervisor had already opened. `saga_id` names a
-/// streaming saga; `None` means an outlet stream.
+/// streaming saga that the Supervisor had already opened. The code is
+/// `SCP-CTX-2139`, because the refused operation had started. `saga_id` names
+/// a streaming saga; `None` means an outlet stream.
 #[must_use]
 pub fn late_registration_refusal(saga_id: Option<&str>) -> (&'static str, String) {
     let message = saga_id.map_or_else(
@@ -255,7 +279,7 @@ pub fn late_registration_refusal(saga_id: Option<&str>) -> (&'static str, String
             )
         },
     );
-    (crate::error_codes::CTX_2138, message)
+    (crate::error_codes::CTX_2139, message)
 }
 
 /// Registry backing [`CoreFields::register_borrower`] and
@@ -1339,7 +1363,27 @@ impl CoreFields {
 
     /// Inserts `value` under `key` into `registry` through
     /// [`StreamRegistry::insert`], the registry's only insert, and returns
-    /// whether the entry stayed registered.
+    /// whether the entry stayed registered. A call that discards the result
+    /// does not compile under `deny(unused_must_use)`:
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// core.insert_stream_entry(&registry, "key".to_owned(), 1);
+    /// ```
+    ///
+    /// The same call compiles when it reads the result:
+    ///
+    /// ```
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// assert!(core.insert_stream_entry(&registry, "key".to_owned(), 1));
+    /// ```
+    #[must_use = "a refused insert drops a stream the caller must report refused"]
     pub fn insert_stream_entry<K, V>(
         &self,
         registry: &StreamRegistry<K, V>,
@@ -3728,14 +3772,16 @@ mod tests {
         assert!(drained_registry.is_empty());
     }
 
-    /// The late-registration refusal carries `SCP-CTX-2138`, and a saga's
+    /// The late-registration refusal carries `SCP-CTX-2139`, not the
+    /// `SCP-CTX-2138` of an operation refused before it started, and a saga's
     /// refusal names the saga.
     #[test]
     fn late_registration_refusal_names_code_and_saga() {
         let (code, _) = late_registration_refusal(None);
-        assert_eq!(code, crate::error_codes::CTX_2138);
+        assert_eq!(code, crate::error_codes::CTX_2139);
+        assert_ne!(code, crate::error_codes::CTX_2138);
         let (code, message) = late_registration_refusal(Some("saga-late-1"));
-        assert_eq!(code, crate::error_codes::CTX_2138);
+        assert_eq!(code, crate::error_codes::CTX_2139);
         assert!(message.contains("saga-late-1"), "{message}");
     }
 

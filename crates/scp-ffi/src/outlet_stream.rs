@@ -1979,6 +1979,11 @@ impl crate::scp::PyScp {
     /// actor-state/budget injection has no bridge-public wiring — same rationale
     /// as the unary-saga bridge tests). The receiver's sender is dropped
     /// immediately (recover never polls it).
+    ///
+    /// # Panics
+    ///
+    /// Panics when bridge shutdown has begun, because the registry then refuses
+    /// the entry and the test would run against an empty registry.
     pub fn insert_test_streaming_saga_entry(
         &self,
         saga_id: &str,
@@ -1986,7 +1991,7 @@ impl crate::scp::PyScp {
         invoker_did: &str,
     ) {
         let (_tx, rx) = mpsc::channel(1);
-        self.inner.outlet_streaming_saga_registry.insert(
+        let registered = self.inner.outlet_streaming_saga_registry.insert(
             saga_id.to_owned(),
             scp_ffi_common::streaming_saga::StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
@@ -1995,6 +2000,10 @@ impl crate::scp::PyScp {
                 invoker_did: invoker_did.to_owned(),
                 request_id: [0u8; 16],
             },
+        );
+        assert!(
+            registered,
+            "bridge shutdown began before the test entry for {saga_id} was registered"
         );
     }
 
@@ -2098,19 +2107,19 @@ mod late_shutdown_refusal_tests {
 
     /// A stream or streaming saga the bridge refuses to register once bridge
     /// shutdown has begun had already started, so it reaches the caller as the
-    /// Context class with `SCP-CTX-2138` (and, for a saga, its id), as the
+    /// Context class with `SCP-CTX-2139` (and, for a saga, its id), as the
     /// NAPI and `UniFFI` bridges report it.
     #[test]
     fn late_shutdown_refusals_are_the_context_class() {
         let stream = context_error_parts(late_shutdown_stream_err());
         assert_eq!(
             stream.map(|(_, code)| code).as_deref(),
-            Some(codes::CTX_2138)
+            Some(codes::CTX_2139)
         );
 
         let saga = context_error_parts(late_shutdown_saga_err("saga-late-1"));
         let (message, code) = saga.unwrap_or_default();
-        assert_eq!(code, codes::CTX_2138);
+        assert_eq!(code, codes::CTX_2139);
         assert!(
             message.contains("saga-late-1"),
             "the error names the started saga: {message}"

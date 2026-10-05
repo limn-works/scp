@@ -47,21 +47,23 @@ use crate::context::outlets::dispatch::StreamEscrowRefundSink;
 use crate::context::outlets::invoke::{
     OutletInvokedEventSink, StreamSettlement, StreamSettlementSink,
 };
-use crate::context::supervisor::supervisor::Supervisor;
+use crate::context::supervisor::supervisor::{SinkHandoff, Supervisor};
 
-/// Runs `op` against the Supervisor in a task on its tracker (ADR-049 Decision
-/// 16), on `runtime`. The task holds only the `Weak` and upgrades it when it
-/// starts. When the Supervisor has dropped, or shutdown refuses the spawn, `op`
-/// does not run and the failure logs at error naming `operation`.
+/// Runs `op`, a hand-off of kind `kind`, against the Supervisor in a task on
+/// its tracker (ADR-049 Decision 16), on `runtime`. The task holds only the
+/// `Weak` and upgrades it when it starts. When the Supervisor has dropped, or
+/// shutdown refuses the spawn, `op` does not run and the failure logs at error
+/// naming `kind`.
 fn spawn_supervisor_op<F, Fut>(
     supervisor: &Weak<Supervisor>,
     runtime: &tokio::runtime::Handle,
-    operation: &'static str,
+    kind: SinkHandoff,
     op: F,
 ) where
     F: FnOnce(Arc<Supervisor>) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let operation = kind.label();
     let Some(owner) = supervisor.upgrade() else {
         tracing::error!(
             operation,
@@ -81,7 +83,7 @@ fn spawn_supervisor_op<F, Fut>(
             }
         }
     };
-    if let Err(e) = owner.spawn_tracked_on(operation, task, runtime) {
+    if let Err(e) = owner.spawn_tracked_on(kind, task, runtime) {
         tracing::error!(operation, error = %e, "streaming sink: operation not run");
     }
 }
@@ -124,7 +126,7 @@ impl StreamEscrowRefundSink for ActorEscrowRefundSink {
         spawn_supervisor_op(
             &self.supervisor,
             &self.runtime,
-            "stream escrow refund",
+            SinkHandoff::EscrowRefund,
             move |supervisor| async move {
                 if let Err(e) = supervisor
                     .reverse_stream_escrow_via_actor(&context_id, &member_did, amount)
@@ -189,7 +191,7 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
         spawn_supervisor_op(
             &self.supervisor,
             &self.runtime,
-            "stream settlement",
+            SinkHandoff::StreamSettlement,
             move |supervisor| async move {
                 // Same-context streaming pump: no cross-context witness (its double-
                 // release guard is the `stream_reservations` record), so
@@ -306,7 +308,7 @@ impl OutletInvokedEventSink for ActorOutletInvokedEventSink {
         spawn_supervisor_op(
             &self.supervisor,
             &self.runtime,
-            "streaming OutletInvokedEvent append",
+            SinkHandoff::OutletInvokedEventAppend,
             move |supervisor| async move {
                 if let Err(e) = supervisor
                     .append_streaming_outlet_invoked_event(context_id_bytes, event, actor_did)
@@ -346,7 +348,7 @@ mod tests {
         StreamSettleOutcome, reconcile_stream_reservations, reverse_stream_escrow,
         settle_outlet_stream,
     };
-    use crate::context::supervisor::supervisor::Supervisor;
+    use crate::context::supervisor::supervisor::{SinkHandoff, Supervisor};
     use crate::economy::adapter::{
         AdapterCapabilities, CountingPaymentAdapter, PaymentAdapter, PaymentAdapterDyn,
         PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt, RefundConfirmation,
@@ -1258,10 +1260,15 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let ran = Arc::new(AtomicUsize::new(0));
         let ran_in = Arc::clone(&ran);
-        super::spawn_supervisor_op(&weak, &runtime, "in-flight probe", move |_sup| async move {
-            let _ = release_rx.await;
-            ran_in.fetch_add(1, Ordering::SeqCst);
-        });
+        super::spawn_supervisor_op(
+            &weak,
+            &runtime,
+            SinkHandoff::EscrowRefund,
+            move |_sup| async move {
+                let _ = release_rx.await;
+                ran_in.fetch_add(1, Ordering::SeqCst);
+            },
+        );
         let shutdown = tokio::spawn({
             let supervisor = Arc::clone(&supervisor);
             async move { supervisor.shutdown_all_contexts().await }
@@ -1277,15 +1284,20 @@ mod tests {
 
         let late = Arc::new(AtomicUsize::new(0));
         let late_in = Arc::clone(&late);
-        super::spawn_supervisor_op(&weak, &runtime, "late probe", move |_sup| async move {
-            late_in.fetch_add(1, Ordering::SeqCst);
-        });
+        super::spawn_supervisor_op(
+            &weak,
+            &runtime,
+            SinkHandoff::EscrowRefund,
+            move |_sup| async move {
+                late_in.fetch_add(1, Ordering::SeqCst);
+            },
+        );
         let gone = Arc::new(AtomicUsize::new(0));
         let gone_in = Arc::clone(&gone);
         super::spawn_supervisor_op(
             &std::sync::Weak::new(),
             &runtime,
-            "dropped probe",
+            SinkHandoff::EscrowRefund,
             move |_sup| async move {
                 gone_in.fetch_add(1, Ordering::SeqCst);
             },

@@ -448,25 +448,47 @@ pub enum SagaError {
     },
 }
 
-/// Maps a streaming saga's Phase-1 (B-side escrow reserve) rejection onto the
-/// saga error surface. A reserve refused by Supervisor shutdown keeps
+/// The step of a cross-context streaming saga's B-side open that returned an
+/// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingSagaOpenStep {
+    /// Phase 1: the B-side escrow reserve.
+    EscrowReserve,
+    /// Phase 2: the B-side `open_stream_session` call.
+    StreamOpen,
+}
+
+impl StreamingSagaOpenStep {
+    /// Returns the name this step carries in the saga error message.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::EscrowReserve => "B-side escrow reserve",
+            Self::StreamOpen => "B-side stream open",
+        }
+    }
+}
+
+/// Maps a rejection that `step` of a streaming saga's B-side open returned onto
+/// the saga error surface. A rejection by Supervisor shutdown keeps
 /// `SCP-CTX-2138` as [`SagaError::SupervisorShutDown`] (ADR-049 Decision 16
 /// item 2), the error the saga's own tracker refusal returns; every other
 /// rejection aborts the saga with `SCP-SAGA-13067`.
-fn phase1_rejection_to_saga_error(
+fn stream_open_rejection_to_saga_error(
     rejection: &crate::context::outlets::dispatch::OpenStreamRejection,
+    step: StreamingSagaOpenStep,
 ) -> SagaError {
     match rejection {
         crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown => {
             SagaError::SupervisorShutDown {
-                message: "B-side escrow reserve of a cross-context streaming saga".to_owned(),
+                message: format!("{} of a cross-context streaming saga", step.label()),
             }
         }
         other => SagaError::Aborted {
             reason: SagaAbortReason::Rejected,
             code: 13067,
             message: format!(
-                "streaming saga B-side escrow reserve rejected: {}",
+                "streaming saga {} rejected: {}",
+                step.label(),
                 other.to_invocation_error()
             ),
         },
@@ -1289,6 +1311,30 @@ impl crate::context::outlets::dispatch::StreamEscrowRefundSink for SpawnerEscrow
             async move { inner.refund(&context_id, &member_did, amount) },
             &self.runtime,
         ));
+    }
+}
+
+/// The kind of work a tracked task hands to a task of its own through
+/// [`Supervisor::spawn_tracked_on`]. The variants are the three kinds ADR-049
+/// Decision 16 item 2 admits after the closed flag is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::context) enum SinkHandoff {
+    /// A streaming settlement routed to the context actor.
+    StreamSettlement,
+    /// The append of a stream's close-time `OutletInvokedEvent`.
+    OutletInvokedEventAppend,
+    /// The refund of a stream's open-time escrow hold.
+    EscrowRefund,
+}
+
+impl SinkHandoff {
+    /// Returns the name this hand-off carries in logs and errors.
+    pub(in crate::context) const fn label(self) -> &'static str {
+        match self {
+            Self::StreamSettlement => "stream settlement",
+            Self::OutletInvokedEventAppend => "streaming OutletInvokedEvent append",
+            Self::EscrowRefund => "stream escrow refund",
+        }
     }
 }
 
@@ -7136,7 +7182,10 @@ impl Supervisor {
                     .saga_journal
                     .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
                     .await;
-                return Err(phase1_rejection_to_saga_error(&rejection));
+                return Err(stream_open_rejection_to_saga_error(
+                    &rejection,
+                    StreamingSagaOpenStep::EscrowReserve,
+                ));
             }
         };
 
@@ -7353,14 +7402,10 @@ impl Supervisor {
                 self.release_stream_escrow(&spawner, escrow_ticket, &target_hex, &caller_did)
                     .await;
                 drop(reservation);
-                return Err(SagaError::Aborted {
-                    reason: SagaAbortReason::Rejected,
-                    code: 13067,
-                    message: format!(
-                        "streaming saga B-side stream open rejected: {}",
-                        rejection.to_invocation_error()
-                    ),
-                });
+                return Err(stream_open_rejection_to_saga_error(
+                    &rejection,
+                    StreamingSagaOpenStep::StreamOpen,
+                ));
             }
         };
         let Some(inner_rx) = handle.receiver() else {
@@ -11122,7 +11167,7 @@ impl Supervisor {
     /// local-DID registry, and the per-identity wrapping keys; closes the task
     /// tracker and awaits it. Returns only after every tracked task has
     /// exited, so the caller may then close the storage backend it passed to
-    /// the supervisor (§17.6 of the persistence spec, One Writer per Durable
+    /// the supervisor (§17.6 of the persistence spec, One Opener per Durable
     /// Directory). Imposes no deadline of its own.
     ///
     /// Does NOT send leave messages or notify remote peers. A second call
@@ -11187,16 +11232,14 @@ impl Supervisor {
         Ok(permit.spawn(future))
     }
 
-    /// Spawns `future` onto the Supervisor's task tracker on `runtime`, for a
-    /// caller that can run off any runtime thread (a `Drop`). Unlike
-    /// [`Self::spawn_tracked`], it accepts the spawn after the closed flag is
-    /// set when the caller is itself a tracked task: the tracker is not empty
-    /// while the caller runs, so the drain awaits the spawned task. ADR-049
-    /// Decision 16 item 2 admits only a streaming settlement, its
-    /// `OutletInvokedEvent` append, or a refund after the flag is set, and this
-    /// gate checks the caller, not the future, so the streaming sinks'
-    /// `spawn_supervisor_op` in `outlets/stream_settlement_adapter.rs` is the
-    /// only permitted caller.
+    /// Spawns `future`, a hand-off of kind `kind`, onto the Supervisor's task
+    /// tracker on `runtime`, for a caller that can run off any runtime thread
+    /// (a `Drop`). Unlike [`Self::spawn_tracked`], it accepts the spawn after
+    /// the closed flag is set when the caller is itself a tracked task: the
+    /// tracker is not empty while the caller runs, so the drain awaits the
+    /// spawned task. `kind` is a [`SinkHandoff`], so a caller can name only one
+    /// of the three kinds ADR-049 Decision 16 item 2 admits after the flag is
+    /// set.
     ///
     /// # Errors
     ///
@@ -11204,7 +11247,7 @@ impl Supervisor {
     /// caller is not a tracked task; the future is dropped without running.
     pub(in crate::context) fn spawn_tracked_on<F>(
         &self,
-        operation: &str,
+        kind: SinkHandoff,
         future: F,
         runtime: &tokio::runtime::Handle,
     ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
@@ -11218,8 +11261,9 @@ impl Supervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *gate && !in_tracked_task(&self.task_tracker) {
             return Err(ContextError::SupervisorShutDown(format!(
-                "{operation} refused: the supervisor starts no task for a caller \
-                 outside its tracker once shutdown_all_contexts has begun"
+                "{} refused: the supervisor starts no task for a caller \
+                 outside its tracker once shutdown_all_contexts has begun",
+                kind.label()
             )));
         }
         // The read guard is held across the spawn, so shutdown cannot set the
@@ -13512,7 +13556,7 @@ impl Supervisor {
     /// taxonomy via
     /// [`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection);
     /// any rejection `open_stream_session` returns propagates verbatim.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_outlet_stream<E>(
         self: &Arc<Self>,
         context_id: &str,
@@ -13538,15 +13582,70 @@ impl Supervisor {
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
-        use crate::context::outlets::dispatch;
-
         // Taken before the reserve, so an open refused by shutdown has debited
         // nothing. The pump spawns through it onto the tracker, so the drain
         // waits for the pump and its close-time settlement (ADR-049 Decision
         // 16).
         let spawner = self
             .tracked_spawner("open outlet stream")
-            .map_err(|_refused| dispatch::OpenStreamRejection::SupervisorShutDown)?;
+            .map_err(|_refused| {
+                crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown
+            })?;
+        self.open_outlet_stream_with_spawner(
+            &spawner,
+            context_id,
+            registry,
+            outlet_id,
+            input,
+            invoker_did,
+            timeout_ms,
+            executor,
+            invoked_event_sink,
+            misdeclaration_sink,
+            handler_panic_sink,
+            caveat_binding,
+            params,
+        )
+        .await
+    }
+
+    /// Runs [`Self::open_outlet_stream`] after its spawner check, spawning the
+    /// pump and the escrow reversal through `spawner`. A caller that already
+    /// holds a spawner for the operation passes it here, so the operation has
+    /// one shutdown refusal point.
+    ///
+    /// # Errors
+    ///
+    /// The rejections [`Self::open_outlet_stream`] returns, except the
+    /// shutdown refusal of its spawner check.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(in crate::context) async fn open_outlet_stream_with_spawner<E>(
+        self: &Arc<Self>,
+        spawner: &TrackedSpawner,
+        context_id: &str,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &scp_protocol::context::outlets::OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        timeout_ms: Option<u32>,
+        executor: Arc<E>,
+        invoked_event_sink: Option<
+            Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink>,
+        >,
+        misdeclaration_sink: Option<
+            Arc<dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+        >,
+        handler_panic_sink: Option<Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>>,
+        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        params: crate::context::outlets::dispatch::OpenStreamParams,
+    ) -> Result<
+        crate::context::outlets::dispatch::StreamSessionHandle,
+        crate::context::outlets::dispatch::OpenStreamRejection,
+    >
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
+    {
+        use crate::context::outlets::dispatch;
 
         // Phase 1 — the shared, sink-agnostic pre-pump prologue (reserve →
         // escrow guard → §7.3.8 hook → `ContextParams` caps/timing →
@@ -13566,7 +13665,7 @@ impl Supervisor {
             pump_semaphore,
         } = self
             .open_outlet_stream_phase1(
-                &spawner,
+                spawner,
                 context_id,
                 invoker_did,
                 caveat_binding.as_ref(),
@@ -13636,7 +13735,7 @@ impl Supervisor {
                 // The pump never spawned; reverse the reserve's debited hold
                 // (the sole refund path on failure — the settlement sink never
                 // fires).
-                self.release_stream_escrow(&spawner, escrow_ticket, context_id, invoker_did)
+                self.release_stream_escrow(spawner, escrow_ticket, context_id, invoker_did)
                     .await;
                 Err(rejection)
             }
@@ -20144,7 +20243,7 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
 
         supervisor
-            .spawn_tracked_on("before close", async {}, &runtime)
+            .spawn_tracked_on(SinkHandoff::StreamSettlement, async {}, &runtime)
             .expect("an open gate accepts an outside caller")
             .await
             .expect("the task spawned before close runs");
@@ -20162,7 +20261,7 @@ mod tests {
                 let supervisor = weak.upgrade().expect("the test holds the supervisor");
                 supervisor
                     .spawn_tracked_on(
-                        "tracked child",
+                        SinkHandoff::StreamSettlement,
                         async move {
                             let _ = release_rx.await;
                             finished_in_child.store(true, Ordering::SeqCst);
@@ -20176,7 +20275,7 @@ mod tests {
         supervisor.close_spawn_gate();
         assert!(
             matches!(
-                supervisor.spawn_tracked_on("outside caller after close", async {}, &runtime),
+                supervisor.spawn_tracked_on(SinkHandoff::StreamSettlement, async {}, &runtime),
                 Err(ContextError::SupervisorShutDown(_))
             ),
             "a closed gate refuses spawn_tracked_on from a caller outside the tracker"
@@ -20206,6 +20305,130 @@ mod tests {
         );
     }
 
+    /// The three kinds ADR-049 Decision 16 item 2 admits after the closed flag
+    /// is set. The exhaustive match fails to compile when a variant is added
+    /// without a row here.
+    fn every_sink_handoff() -> [SinkHandoff; 3] {
+        const fn listed(kind: SinkHandoff) -> SinkHandoff {
+            match kind {
+                SinkHandoff::StreamSettlement
+                | SinkHandoff::OutletInvokedEventAppend
+                | SinkHandoff::EscrowRefund => kind,
+            }
+        }
+        [
+            listed(SinkHandoff::StreamSettlement),
+            listed(SinkHandoff::OutletInvokedEventAppend),
+            listed(SinkHandoff::EscrowRefund),
+        ]
+    }
+
+    /// ADR-049 Decision 16, item 2: after the closed flag is set, a tracked
+    /// caller's `spawn_tracked_on` accepts each of the three hand-off kinds,
+    /// and each spawned task runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_tracked_on_after_close_accepts_each_handoff_kind_from_a_tracked_caller() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let supervisor = supervisor_with_providers();
+        let runtime = tokio::runtime::Handle::current();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_parent = Arc::clone(&ran);
+        let weak = Arc::downgrade(&supervisor);
+        let child_runtime = runtime.clone();
+        let parent = supervisor
+            .spawn_tracked("tracked parent", async move {
+                let _ = go_rx.await;
+                let supervisor = weak.upgrade().expect("the test holds the supervisor");
+                let mut results = Vec::new();
+                for kind in every_sink_handoff() {
+                    let ran = Arc::clone(&ran_in_parent);
+                    results.push((
+                        kind,
+                        supervisor
+                            .spawn_tracked_on(
+                                kind,
+                                async move {
+                                    ran.fetch_add(1, Ordering::SeqCst);
+                                },
+                                &child_runtime,
+                            )
+                            .map(drop),
+                    ));
+                }
+                results
+            })
+            .expect("an open gate accepts the parent");
+
+        supervisor.close_spawn_gate();
+        go_tx.send(()).expect("the parent is waiting");
+        for (kind, result) in parent.await.expect("the parent does not panic") {
+            assert!(
+                result.is_ok(),
+                "a closed gate accepts {kind:?} from a tracked caller, got {result:?}"
+            );
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            supervisor.await_tracked_tasks(),
+        )
+        .await
+        .expect("the drain finishes once the three tasks exit");
+        assert_eq!(ran.load(Ordering::SeqCst), 3, "each accepted hand-off ran");
+    }
+
+    /// ADR-049 Decision 16, item 2: after the closed flag is set, a spawn
+    /// outside the exception is refused with `SupervisorShutDown`:
+    /// `spawn_tracked` from any caller, `tracked_spawner` from any caller, and
+    /// `spawn_tracked_on` of each hand-off kind from a caller outside the
+    /// tracker. No refused future runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_after_close_outside_the_handoff_exception_is_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let supervisor = supervisor_with_providers();
+        let runtime = tokio::runtime::Handle::current();
+        let ran = Arc::new(AtomicUsize::new(0));
+        supervisor.close_spawn_gate();
+
+        let ran_in = Arc::clone(&ran);
+        assert!(
+            matches!(
+                supervisor.spawn_tracked("spawn after close", async move {
+                    ran_in.fetch_add(1, Ordering::SeqCst);
+                }),
+                Err(ContextError::SupervisorShutDown(_))
+            ),
+            "a closed gate refuses spawn_tracked"
+        );
+        assert!(
+            matches!(
+                supervisor.tracked_spawner("operation after close"),
+                Err(ContextError::SupervisorShutDown(_))
+            ),
+            "a closed gate refuses tracked_spawner"
+        );
+        for kind in every_sink_handoff() {
+            let ran_in = Arc::clone(&ran);
+            let result = supervisor
+                .spawn_tracked_on(
+                    kind,
+                    async move {
+                        ran_in.fetch_add(1, Ordering::SeqCst);
+                    },
+                    &runtime,
+                )
+                .map(drop);
+            assert!(
+                matches!(result, Err(ContextError::SupervisorShutDown(_))),
+                "a closed gate refuses {kind:?} from a caller outside the tracker, got {result:?}"
+            );
+        }
+        supervisor.await_tracked_tasks().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "no refused future ran");
+    }
+
     /// ADR-049 Decision 16, item 2 — a closed gate issues no spawner to any
     /// caller, a task on another Supervisor's tracker cannot spawn onto this
     /// one, and a spawner issued before close keeps the drain waiting for
@@ -20232,7 +20455,7 @@ mod tests {
             .spawn_tracked("task of A", async move {
                 (
                     b_in_a
-                        .spawn_tracked_on("A's task onto B", async {}, &a_runtime)
+                        .spawn_tracked_on(SinkHandoff::StreamSettlement, async {}, &a_runtime)
                         .map(drop),
                     b_in_a.tracked_spawner("A's task onto B").map(drop),
                 )
@@ -35868,6 +36091,60 @@ mod streaming_saga_tests {
         );
     }
 
+    /// ADR-049 Decision 16 item 2 — `open_outlet_stream_with_spawner` has no
+    /// shutdown refusal point of its own: given a spawner taken before the
+    /// closed flag was set, it opens the stream after the flag is set.
+    /// `open_outlet_stream_refused_by_shutdown_is_typed_and_debits_nothing`
+    /// covers the refusal at `open_outlet_stream`'s own spawner check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_outlet_stream_with_spawner_taken_before_close_opens_after_close() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let supervisor =
+            build_ss_supervisor(&captured, journal, Box::new(SsRecordingEventLog::default()));
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x49; 16]);
+        let executor = Arc::new(FiniteChunkExecutor {
+            data_chunks: 10,
+            invoked: Arc::clone(&invoked),
+        });
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+        let target_hex = hex::encode(SS_TARGET);
+
+        let spawner = supervisor
+            .tracked_spawner("operation begun before close")
+            .expect("an open gate issues a spawner");
+        supervisor.close_spawn_gate();
+
+        let result = supervisor
+            .open_outlet_stream_with_spawner(
+                &spawner,
+                &target_hex,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &ss_invoker(),
+                Some(5_000),
+                executor,
+                None,
+                None,
+                None,
+                Some(binding),
+                params,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "an open through a spawner taken before close is not refused: {:?}",
+            result.as_ref().err()
+        );
+    }
+
     /// ADR-049 Decision 16 — a streaming saga started after shutdown has begun
     /// is refused before it debits any escrow or stages any saga. The
     /// open-gate case is `xctx_streaming_saga_paid_drive_ac1_ac3_ac5_ac6`.
@@ -35962,38 +36239,55 @@ mod streaming_saga_tests {
         );
     }
 
-    /// A Phase-1 reserve refused by shutdown keeps `SCP-CTX-2138` as
-    /// `SagaError::SupervisorShutDown`; any other Phase-1 rejection still
-    /// aborts the saga with `SCP-SAGA-13067`.
+    /// A rejection by shutdown at either step of a streaming saga's B-side open
+    /// (the Phase-1 escrow reserve and the Phase-2 stream open) keeps
+    /// `SCP-CTX-2138` as `SagaError::SupervisorShutDown`; any other rejection
+    /// at either step aborts the saga with `SCP-SAGA-13067`.
     #[test]
-    fn phase1_shutdown_rejection_keeps_supervisor_shut_down() {
+    fn streaming_saga_open_shutdown_rejection_keeps_supervisor_shut_down() {
         use crate::context::outlets::dispatch::OpenStreamRejection;
-        use crate::context::supervisor::supervisor::phase1_rejection_to_saga_error;
-
-        let shut = phase1_rejection_to_saga_error(&OpenStreamRejection::SupervisorShutDown);
-        let SagaError::SupervisorShutDown { message } = &shut else {
-            panic!("a shutdown-refused reserve must map to SupervisorShutDown, got {shut:?}");
+        use crate::context::supervisor::supervisor::{
+            StreamingSagaOpenStep, stream_open_rejection_to_saga_error,
         };
-        assert!(
-            message.contains("escrow reserve"),
-            "the refusal names the reserve: {message}"
-        );
-        assert!(shut.to_string().starts_with("SCP-CTX-2138"));
 
-        let other = phase1_rejection_to_saga_error(&OpenStreamRejection::ContextNotActive {
-            current_state: "Closing".to_owned(),
-        });
-        assert!(
-            matches!(
-                other,
-                SagaError::Aborted {
-                    reason: SagaAbortReason::Rejected,
-                    code: 13067,
-                    ..
-                }
-            ),
-            "a non-shutdown reserve rejection aborts with 13067, got {other:?}"
-        );
+        for (step, named) in [
+            (StreamingSagaOpenStep::EscrowReserve, "escrow reserve"),
+            (StreamingSagaOpenStep::StreamOpen, "stream open"),
+        ] {
+            let shut =
+                stream_open_rejection_to_saga_error(&OpenStreamRejection::SupervisorShutDown, step);
+            let SagaError::SupervisorShutDown { message } = &shut else {
+                panic!(
+                    "a shutdown rejection at {step:?} must map to SupervisorShutDown, got {shut:?}"
+                );
+            };
+            assert!(
+                message.contains(named),
+                "the refusal names the step: {message}"
+            );
+            assert!(
+                shut.to_string().starts_with("SCP-CTX-2138"),
+                "{step:?}: {shut}"
+            );
+
+            let other = stream_open_rejection_to_saga_error(
+                &OpenStreamRejection::ContextNotActive {
+                    current_state: "Closing".to_owned(),
+                },
+                step,
+            );
+            assert!(
+                matches!(
+                    other,
+                    SagaError::Aborted {
+                        reason: SagaAbortReason::Rejected,
+                        code: 13067,
+                        ..
+                    }
+                ),
+                "a non-shutdown rejection at {step:?} aborts with 13067, got {other:?}"
+            );
+        }
     }
 
     /// #2196 — a non-active (Closing) TARGET context rejects the cross-context

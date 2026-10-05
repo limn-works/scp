@@ -580,13 +580,8 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 ///
 /// The Supervisor that owns the context set its closed flag in
 /// `shutdown_all_contexts`, or has dropped, so it refused to start the
-/// operation (ADR-049 Decision 16, supervisor task drain).
-///
-/// A bridge also returns this code, built by
-/// [`late_registration_refusal`](crate::bridge_instance::late_registration_refusal),
-/// when it refuses to register a stream or streaming saga that the Supervisor
-/// had already opened, because bridge shutdown began first. That operation
-/// started before the refusal.
+/// operation (ADR-049 Decision 16, supervisor task drain). Nothing the
+/// refused operation would have done has happened.
 ///
 /// Distinct from the generic `CTX_2001` catch-all so a caller can tell an
 /// operation refused by shutdown apart from a failure of the operation
@@ -594,6 +589,19 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 ///
 /// Maps from `ContextError::SupervisorShutDown`.
 pub const CTX_2138: &str = "SCP-CTX-2138";
+/// Stream or streaming saga dropped unregistered by bridge shutdown.
+///
+/// A bridge returns this code, built by
+/// [`late_registration_refusal`](crate::bridge_instance::late_registration_refusal),
+/// when bridge shutdown began after the Supervisor opened an outlet stream or
+/// started a streaming saga and before the bridge registered it. The operation
+/// started before the refusal: its outlet handler may have run, and its pump
+/// may append the stream's `OutletInvokedEvent` and settle its escrow. The
+/// bridge holds no handle to the stream after the refusal.
+///
+/// Distinct from `CTX_2138`, whose refused operation has done nothing, so a
+/// caller does not treat a started operation as one that never ran.
+pub const CTX_2139: &str = "SCP-CTX-2139";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.

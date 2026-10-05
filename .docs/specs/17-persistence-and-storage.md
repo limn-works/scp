@@ -580,7 +580,7 @@ The readback and the three checks read SQLite's state, and code in the same proc
 
 §9.15 lists the copies that neither wipe reaches, memory SQLCipher's crypto provider obtains from `malloc` among them.
 
-### One Writer per Durable Directory
+### One Opener per Durable Directory
 
 A `SqliteStorage` takes an exclusive advisory file lock on `{dir}/scp.db.lock` before it opens `{dir}/scp.db`, and it holds that lock until it releases its database connection. The lock admits one opener, meaning one `SqliteStorage`, per directory (red-hat finding RED-1002). A writer is any task that holds a reference to the store through which the task can write, whichever owner spawned the task. The tasks in a Supervisor's hierarchy (ADR-049, the actor-per-context concurrency model, Decision 16), such as context actors, key-package actors, and supervisor background tasks, and the tasks of a node that an SDK instance started on its own store are writers today; that list names indicators, and the reference decides membership.
 

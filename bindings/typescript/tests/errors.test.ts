@@ -507,13 +507,15 @@ describe("mapSagaError", () => {
     expect((err as SagaAbortedError).retryAfterMs).toBeNull();
   });
 
-  it("delegates an SCP-CTX-2138 context error without a saga phrase to mapBridgeError", () => {
+  it("delegates an SCP-CTX-2139 context error without a saga phrase to mapBridgeError", () => {
     const err = mapSagaError(
-      new Error("[SCP-CTX-2138] context error: streaming saga s1 started, then dropped"),
+      new Error(
+        "[SCP-CTX-2139] context error: streaming saga s1 started, then its receiver was dropped unregistered: bridge shutdown began before the bridge registered it",
+      ),
     );
     expect(err).toBeInstanceOf(ContextError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
-    expect(err.code).toBe("SCP-CTX-2138");
+    expect(err.code).toBe("SCP-CTX-2139");
   });
 
   it("delegates a non-saga error to mapBridgeError", () => {

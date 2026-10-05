@@ -91,6 +91,23 @@ class TestCodedBridgeError:
         # (which prepends f"[{code}] ") does not double the prefix.
         assert result.message == "context error: state lookup failed"
 
+    def test_late_registration_refusal_maps_to_context_error_by_code(self) -> None:
+        """SCP-CTX-2139, a stream dropped unregistered by bridge shutdown, is a ContextError.
+
+        The bridge class name here is unmapped, so only the code prefix
+        classifies the error.
+        """
+        bridge_cls = type("UnmappedBridgeError", (Exception,), {})
+        bridge_exc = bridge_cls(
+            "[SCP-CTX-2139] context error: streaming saga s1 started, then its receiver "
+            "was dropped unregistered: bridge shutdown began before the bridge registered it"
+        )
+
+        result = _coded_bridge_error(bridge_exc)
+
+        assert isinstance(result, ContextError)
+        assert result.code == "SCP-CTX-2139"
+
     def test_embedded_code_is_not_captured(self) -> None:
         """A [SCP-...] token buried in the message body must not masquerade as the code."""
         bridge_cls = type("ContextError", (Exception,), {})

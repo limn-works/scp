@@ -282,7 +282,7 @@ pub enum StorageInitError {
         message: String,
     },
     /// Another store holds the directory's advisory lock, in this process or
-    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Writer per
+    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Opener per
     /// Durable Directory").
     LockHeld {
         /// The directory path the caller asked for (for the error message).
@@ -3602,7 +3602,7 @@ mod tests {
         assert_eq!(other.code(), scp_ffi_common::error_codes::STORAGE_8004);
     }
 
-    /// Spec §17.6 "One Writer per Durable Directory": a second open of a
+    /// Spec §17.6 "One Opener per Durable Directory": a second open of a
     /// directory whose store is live fails with `LockHeld`, and a shutdown
     /// that finished in time closes the store (through the bridge's
     /// `durable_store_closer`) before it returns, so a reopen succeeds on its

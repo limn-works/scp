@@ -65,7 +65,7 @@ pub struct SqliteStorage {
     //
     // `None` once [`close`](Self::close) has run: the connection is gone and
     // every operation returns [`PlatformError::StorageClosed`] (spec §17.6
-    // "One Writer per Durable Directory": a closed store refuses operations
+    // "One Opener per Durable Directory": a closed store refuses operations
     // and never reopens its database implicitly). Field order matters for
     // `Drop` as well: the connection drops before the lock file, so the lock
     // is never released while the connection is open.
@@ -98,7 +98,7 @@ impl SqliteStorage {
     /// [`PlatformError::StorageLockHeld`] at once, without waiting and
     /// without opening a second `SQLite` handle against the same database —
     /// a configuration that can produce WAL corruption, split-brain writes,
-    /// or silent data loss (red-hat RED-1002; spec §17.6 "One Writer per
+    /// or silent data loss (red-hat RED-1002; spec §17.6 "One Opener per
     /// Durable Directory").
     ///
     /// The `key` parameter is the raw encryption key material. It is
@@ -278,7 +278,7 @@ impl SqliteStorage {
     }
 
     /// Releases the database connection, then the advisory exclusive lock
-    /// on `{dir}/scp.db.lock` (spec §17.6 "One Writer per Durable
+    /// on `{dir}/scp.db.lock` (spec §17.6 "One Opener per Durable
     /// Directory").
     ///
     /// After `close` returns `Ok`, every [`Storage`] operation on this handle
@@ -1104,7 +1104,7 @@ mod tests {
         drop(first);
     }
 
-    /// Spec §17.6 "One Writer per Durable Directory": `close()` releases the
+    /// Spec §17.6 "One Opener per Durable Directory": `close()` releases the
     /// database connection as well as the lock, and every later operation on
     /// the handle fails with the typed closed-store error rather than
     /// writing through a connection the lock no longer guards. Each of the

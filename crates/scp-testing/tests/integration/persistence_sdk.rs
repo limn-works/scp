@@ -460,7 +460,7 @@ fn supervisor_over(storage: Arc<SqliteStorage>) -> Arc<Supervisor> {
 }
 
 /// A store reopens on the first try, with no retry, once its owner has
-/// drained the supervisor (ADR-049 Decision 16; spec §17.6, One Writer per
+/// drained the supervisor (ADR-049 Decision 16; spec §17.6, One Opener per
 /// Durable Directory).
 ///
 /// Two ways out of a "process" are checked:

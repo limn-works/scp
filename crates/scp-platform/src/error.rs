@@ -34,7 +34,7 @@ pub enum PlatformError {
     StorageError(String),
 
     /// The store has released its database connection, so it refuses every
-    /// operation (spec §17.6 "One Writer per Durable Directory": a closed
+    /// operation (spec §17.6 "One Opener per Durable Directory": a closed
     /// store refuses operations and never reopens its database implicitly).
     ///
     /// Open a new store on the directory to continue.
@@ -45,7 +45,7 @@ pub enum PlatformError {
     StorageClosed,
 
     /// Another store holds the directory's exclusive advisory lock, in this
-    /// process or another (spec §17.6 "One Writer per Durable Directory": one
+    /// process or another (spec §17.6 "One Opener per Durable Directory": one
     /// opener per directory). The open fails at once; it neither waits for
     /// the lock nor opens the database.
     ///
