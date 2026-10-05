@@ -546,15 +546,14 @@ impl ScpClient {
         // The blob's wiping buffer moves (no copy) into
         // `PersistedPendingJoin::mls_blob`, which is `Zeroizing` too.
         let mls_blob = serialize_pending_join(&provider, &signer, self.signer.did(), context_id)?;
-        // One exactly-sized buffer, wiped on drop, so no outgrown encoding
-        // buffer holding the signer or the wrapping secret is ever freed, even
-        // in an application that links this crate without the wiping global
-        // allocator (security model spec §9.15 step 2 and freed heap memory).
-        let mut pending_blob = scp_mls::secret_msgpack::encode_named(&PersistedPendingJoin {
+        // The encoding holds the signer and the wrapping secret, so it is
+        // wiped on drop (security model spec §9.15 step 2 and freed heap memory).
+        let mut pending_blob = rmp_serde::to_vec_named(&PersistedPendingJoin {
             mls_blob,
             wrapping_public,
             wrapping_secret: wrapping_secret.clone(),
         })
+        .map(Zeroizing::new)
         .map_err(|e| ClientError::StorageCorrupt(format!("serializing pending join: {e}")))?;
         self.storage
             .put(
@@ -2141,8 +2140,8 @@ mod pending_join_encoding_tests {
             wrapping_public: persisted.wrapping_public,
             wrapping_secret: *persisted.wrapping_secret,
         };
-        let bytes = scp_mls::secret_msgpack::encode_named(&persisted).unwrap();
-        assert_eq!(*bytes, rmp_serde::to_vec_named(&plain).unwrap());
+        let bytes = rmp_serde::to_vec_named(&persisted).unwrap();
+        assert_eq!(bytes, rmp_serde::to_vec_named(&plain).unwrap());
         let back: PersistedPendingJoin = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(*back.mls_blob, *persisted.mls_blob);
         assert_eq!(*back.wrapping_secret, *persisted.wrapping_secret);

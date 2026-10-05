@@ -601,16 +601,16 @@ impl ContextSnapshot {
 
     /// Serializes this snapshot to a `MessagePack` blob for storage.
     ///
-    /// The blob carries the MLS signer and group secrets, so it is written into
-    /// one exactly-sized buffer that is wiped on drop; the bytes equal
-    /// `rmp_serde::to_vec_named`'s (security model spec §9.15 step 2).
+    /// The blob carries the MLS signer and group secrets, so it is returned in
+    /// a buffer wiped on drop (security model spec §9.15 step 2).
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::StorageCorrupt`] if the snapshot cannot be
     /// serialized into a durable blob (unreachable for a well-formed snapshot).
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, ClientError> {
-        scp_mls::secret_msgpack::encode_named(self)
+        rmp_serde::to_vec_named(self)
+            .map(Zeroizing::new)
             .map_err(|e| ClientError::StorageCorrupt(format!("serializing context snapshot: {e}")))
     }
 

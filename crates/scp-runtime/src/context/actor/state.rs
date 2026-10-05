@@ -3166,12 +3166,13 @@ impl PerContextState {
             wrapping_secret_key: Zeroizing::new(wrapping_secret_key.to_vec()),
         };
 
-        // One exactly-sized buffer, wiped on drop: the blob carries the signer,
+        // A buffer wiped on drop: the blob carries the signer,
         // the provider's HPKE and epoch secrets, and the wrapping secret. The
         // snapshot's secret fields wipe themselves when it drops; the blob
         // stays in `Zeroizing` through `ContextSnapshot::mls_crypto_state` to
         // the storage call (Storage encrypts at rest per §17.5).
-        scp_mls::secret_msgpack::encode_named(&snapshot)
+        rmp_serde::to_vec_named(&snapshot)
+            .map(Zeroizing::new)
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")))
     }
 
