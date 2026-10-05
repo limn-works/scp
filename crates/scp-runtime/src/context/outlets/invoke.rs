@@ -244,9 +244,10 @@ pub enum InvocationError {
     },
 }
 
-/// Why an outlet stream open failed: the Supervisor refused it because
-/// `shutdown_all_contexts` has begun, or the open itself failed. A shutdown
-/// refusal is not an outlet error and has no §5.4.4 surface, so it is kept out
+/// Why an outlet stream open failed.
+///
+/// The Supervisor refused it because `shutdown_all_contexts` has begun, or the
+/// open itself failed. A shutdown refusal is not an outlet error and has no §5.4.4 surface, so it is kept out
 /// of [`InvocationError`] and crosses the runtime-to-
 /// [`ContextError`](scp_protocol::context::ContextError) seam as
 /// `ContextError::SupervisorShutDown` (ADR-049 Decision 16 item 2).

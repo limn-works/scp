@@ -2833,7 +2833,7 @@ impl CoreFields {
                      to close; it keeps its connection and advisory lock"
                 ),
                 Err(failure) => {
-                    tracing::error!("late {}", drain_failed_message(failure, has_durable_store))
+                    tracing::error!("late {}", drain_failed_message(failure, has_durable_store));
                 }
             };
             match supervisor
