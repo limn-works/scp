@@ -2231,7 +2231,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         validate::validate_did(identity_did)?;
         // Step 1: Collect contexts from the local runtime registry.
-        let local_contexts = crate::runtime::context_ids_for_member(bi, identity_did)?;
+        let local_contexts = crate::runtime::member_context_role_states(bi, identity_did)?;
 
         // Step 2: Collect contexts from the known-contexts registry.
         let known = crate::runtime::known_contexts_for_member_on(bi, identity_did);
@@ -3920,16 +3920,17 @@ mod tests {
 
         // Since py_mcp_load_contexts requires Python, we test the underlying
         // runtime function directly.
-        let ids = crate::runtime::context_ids_for_member(&bi, creator).unwrap();
+        let states = crate::runtime::member_context_role_states(&bi, creator).unwrap();
         assert!(
-            ids.iter().any(|(id, _)| id == &ctx_id),
+            states.iter().any(|(id, _)| id == &ctx_id),
             "creator should be a member of the context"
         );
 
         // Non-member should not see the context.
-        let other_ids = crate::runtime::context_ids_for_member(&bi, "did:dht:z6MkNobody").unwrap();
+        let other_states =
+            crate::runtime::member_context_role_states(&bi, "did:dht:z6MkNobody").unwrap();
         assert!(
-            !other_ids.iter().any(|(id, _)| id == &ctx_id),
+            !other_states.iter().any(|(id, _)| id == &ctx_id),
             "non-member should not see the context"
         );
 
@@ -5815,11 +5816,8 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// The bridge's copy is resynced only by the bridge's own join,
-    /// leave and governance calls, so a revocation or removal the actor
-    /// applies from an inbound commit leaves the copy still granting. Here the
-    /// actor exists and holds no such context, the state after the actor drops
-    /// a context the agent was removed from, so every gate must deny.
+    /// The actor exists and holds no such context, the state after the actor
+    /// drops a context the agent was removed from, so every gate must deny.
     #[test]
     fn provider_gates_follow_the_actor_not_the_bridge_copy_pyo3() {
         use scp_mcp::server::ResourceKind;

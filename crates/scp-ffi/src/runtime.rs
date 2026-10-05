@@ -1964,7 +1964,7 @@ fn role_state_on(
 /// `ActorCrashed`, or `ContextPoisoned` error when a registered context's
 /// actor does not answer, so an actor that did not answer never drops its
 /// context from the result.
-pub fn context_ids_for_member(
+pub fn member_context_role_states(
     bi: &PyBridgeInstance,
     member_did: &str,
 ) -> Result<Vec<(String, ContextRoleState)>, ScpPyError> {
@@ -4204,17 +4204,17 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
-    /// `context_ids_for_member` reports a member the supervisor actor records,
+    /// `member_context_role_states` reports a member the supervisor actor records,
     /// with no write to the bridge copy.
     #[test]
     #[cfg(feature = "testing")]
-    fn context_ids_for_member_reads_supervisor_membership() {
+    fn member_context_role_states_reads_supervisor_membership() {
         let creator = "did:dht:z6MkIdsForMemberCreator";
         let member = "did:dht:z6MkIdsForMemberJoiner";
         let (bi, ctx_id) = live_state_fixture("ids-for-member", creator, &["messages:read"]);
 
         assert!(
-            !context_ids_for_member(&bi, member)
+            !member_context_role_states(&bi, member)
                 .unwrap()
                 .iter()
                 .any(|(id, _)| id == &ctx_id),
@@ -4224,7 +4224,7 @@ mod tests {
         insert_supervisor_member_for_test(&bi, &ctx_id, member)
             .expect("supervisor must record the member");
 
-        let matched = context_ids_for_member(&bi, member).unwrap();
+        let matched = member_context_role_states(&bi, member).unwrap();
         let (_, role_state) = matched
             .iter()
             .find(|(id, _)| id == &ctx_id)
@@ -4244,10 +4244,10 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
-    /// `context_ids_for_member` refuses when a context is registered but no
+    /// `member_context_role_states` refuses when a context is registered but no
     /// supervisor is attached, instead of answering from the bridge copy.
     #[test]
-    fn context_ids_for_member_fails_closed_without_a_supervisor() {
+    fn member_context_role_states_fails_closed_without_a_supervisor() {
         crate::init_runtime().ok();
         let bi = Arc::new(PyBridgeInstance::new_py());
         let ctx_id = unique_ctx_id("ids-no-supervisor");
@@ -4262,21 +4262,21 @@ mod tests {
             "precondition: the bridge copy lists the creator"
         );
 
-        context_ids_for_member(&bi, creator)
+        member_context_role_states(&bi, creator)
             .expect_err("a registered context with no supervisor must refuse, not answer");
         remove_context(&bi, &ctx_id);
     }
 
-    /// `context_ids_for_member` returns the actor's `ActorBusy` error when a
+    /// `member_context_role_states` returns the actor's `ActorBusy` error when a
     /// registered context's actor does not answer, instead of dropping that
     /// context from the result.
     #[test]
     #[cfg(feature = "testing")]
-    fn context_ids_for_member_propagates_an_unreachable_actor() {
+    fn member_context_role_states_propagates_an_unreachable_actor() {
         let creator = "did:dht:z6MkIdsBusyCreator";
         let (bi, ctx_id) = live_state_fixture("ids-busy", creator, &["messages:read"]);
         assert!(
-            context_ids_for_member(&bi, creator)
+            member_context_role_states(&bi, creator)
                 .unwrap()
                 .iter()
                 .any(|(id, _)| id == &ctx_id),
@@ -4288,7 +4288,7 @@ mod tests {
 
         let err = format!(
             "{:?}",
-            context_ids_for_member(&bi, creator)
+            member_context_role_states(&bi, creator)
                 .expect_err("an unreachable actor must refuse, not drop its context")
         );
         assert!(
