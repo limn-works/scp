@@ -1791,7 +1791,23 @@ pub fn read_live_context_state(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
-    let sup = Arc::clone(supervisor(bi)?);
+    read_live_context_state_on(Arc::clone(supervisor(bi)?), context_id)
+}
+
+/// Runs the [`read_live_context_state`] read on `sup`.
+///
+/// `sup` is a supervisor the caller already resolved, so a caller that makes a
+/// second supervisor call after the read resolves the bridge's supervisor once
+/// for both.
+///
+/// # Errors
+///
+/// Returns every error [`read_live_context_state`] returns except the
+/// supervisor-resolution error, which the caller met when it resolved `sup`.
+pub fn read_live_context_state_on(
+    sup: Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
     let ctx = context_id.to_owned();
     block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
         .map_err(ScpPyError::from)
@@ -2717,6 +2733,39 @@ where
 /// Backward-compatible alias for [`remove_ffi_state`].
 pub fn remove_context(bi: &PyBridgeInstance, context_id: &str) {
     remove_ffi_state(bi, context_id);
+}
+
+/// Re-reads the supervisor and removes `context_id`'s [`FfiBridgeState`] only
+/// when the re-read does not report `Active`.
+///
+/// `context_close` decides from a lifecycle read taken before it releases, so
+/// an import or restore can return the id to `Active` in between. On an
+/// `Active` re-read this removes nothing and returns `false`, so the live
+/// context keeps its revocation list, nonce tracker, outlets, and sessions.
+/// Any other answer, a failed read included, removes the state and returns
+/// `true`.
+///
+/// The re-read and the removal are two steps, and nothing stops a readmit
+/// from landing between them. That window fails closed on this bridge, so it
+/// carries no release mark of the kind the NAPI and `UniFFI` bridges use:
+/// - `context_import` and `restore_context` register no `FfiBridgeState`, so
+///   an id they return to `Active` after the re-read is left with none, the
+///   same state either call leaves on any id. Outlet dispatch and UCAN
+///   issue, revoke, and validate refuse it.
+/// - `context_join_from_welcome` registers its `FfiBridgeState` before it
+///   spawns the joined actor. A removal between the registration and the
+///   spawn leaves the joined context `Active` with no `FfiBridgeState`, so
+///   outlet dispatch and UCAN issue, revoke, and validate refuse that context
+///   on this bridge.
+pub fn release_context_unless_readmitted(bi: &PyBridgeInstance, context_id: &str) -> bool {
+    if matches!(
+        read_live_context_state(bi, context_id),
+        Ok(Some(scp_core::context::ContextState::Active))
+    ) {
+        return false;
+    }
+    remove_context(bi, context_id);
+    true
 }
 
 // ---------------------------------------------------------------------------
