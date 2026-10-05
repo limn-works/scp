@@ -320,7 +320,7 @@ tasks.register<Exec>("generateUniffiBindings") {
     outputs.dir(uniffiBindingsDir)
 }
 
-// uniffiTestGuard: `:scp-kt:test` loads the cdylib under cargo's target directory
+// `:scp-kt:test` loads the cdylib under cargo's target directory
 // (see `JnaLibraryPath` above), and its real-FFI suites create identities with the
 // in-memory custody arm, which only a `testing` build compiles. When this build
 // generates the bindings, it builds that cdylib too. When the task graph holds

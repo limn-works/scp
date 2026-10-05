@@ -1474,7 +1474,7 @@
         "Kotlin: InvocationCaveats data class; ucan.mint + ucan.narrow match",
         "Mint-limit violation in any SDK returns SCP-OUTLET-6114 'caveat-mint-limit-exceeded'",
         "A conformance test per SDK: build a caveats object in the SDK; pass to ucan.mint; decode the returned JWT; assert nb field matches the input caveats",
-        "cargo test --workspace && pytest && bun test && swift test && gradle test all green"
+        "cargo test --workspace && pytest && bun test && swift test && gradle test -Pscp.uniffi.cargoFeatures=testing all green"
       ],
       "actionItems": [
         "Add InvocationCaveats marshalling to each FFI bridge",

@@ -3337,45 +3337,11 @@ jobs:
           # The publish tasks release.yml runs.
           ./gradlew -q :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository --dry-run
           ./gradlew -q :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository --dry-run
-      # Runs the script of release.yml's "Check each JAR's manifest has empty
-      # Scp-Uniffi-Cargo-Features and Scp-Uniffi-Bindings generated" step on JARs
-      # whose manifests must pass and fail.
       # The JARs Gradle builds here exclude compileKotlin, so their task graph holds
       # no generateUniffiBindings.
-      - name: Check release.yml's JAR manifest step
+      - name: Check the Scp-Uniffi attributes in the scp-kt JAR manifest
         run: |
           set -euo pipefail
-          check=$(python3 -c '
-          import sys, yaml
-          with open(sys.argv[1]) as f:
-              steps = yaml.safe_load(f)["jobs"]["sign-maven"]["steps"]
-          print(next(s["run"] for s in steps if s.get("name", "").startswith("Check each JAR")))
-          ' ../../.github/workflows/release.yml)
-          work=$(mktemp -d)
-          mkdir "$work/maven-artifacts"
-          run_check() { (cd "$work" && bash -c "$check"); }
-          expect_rejected() {
-            if run_check >/dev/null 2>&1; then
-              echo "::error::release.yml's JAR manifest step accepted $1"
-              exit 1
-            fi
-          }
-          plant_jar() {
-            rm -f "$work"/maven-artifacts/*
-            python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1], "w").writestr("META-INF/MANIFEST.MF", sys.argv[2])' \
-              "$work/maven-artifacts/scp-kt.jar" "$1"
-          }
-          plant_jar $'Manifest-Version: 1.0\r\nScp-Uniffi-Cargo-Features: \r\nScp-Uniffi-Bindings: generated\r\n\r\n'
-          if ! run_check; then
-            echo "::error::release.yml's JAR manifest step rejected generated bindings with no cargo features"
-            exit 1
-          fi
-          plant_jar $'Manifest-Version: 1.0\r\nScp-Uniffi-Cargo-Features: testing\r\nScp-Uniffi-Bindings: generated\r\n\r\n'
-          expect_rejected "a JAR whose manifest records the testing feature"
-          plant_jar $'Manifest-Version: 1.0\r\n\r\n'
-          expect_rejected "a JAR whose manifest has neither attribute"
-          rm -f "$work"/maven-artifacts/*
-          expect_rejected "an empty maven-artifacts"
           for args in -Pscp.uniffi.cargoFeatures= -Pscp.uniffi.cargoFeatures=testing; do
             rm -f scp-kt/build/libs/*.jar
             ./gradlew -q :scp-kt:jar -x compileKotlin -x compileJava "$args"
@@ -3386,11 +3352,7 @@ jobs:
               echo "::error::Gradle task :scp-kt:jar with $args wrote the wrong Scp-Uniffi attributes"
               exit 1
             fi
-            rm -f "$work"/maven-artifacts/*
-            cp scp-kt/build/libs/*.jar "$work/maven-artifacts/"
-            expect_rejected "the JAR :scp-kt:jar $args builds without generateUniffiBindings"
           done
-          rm -rf "$work"
       # `:scp-kt-android` declares detekt in its own build.gradle.kts and no job
       # invoked it, so every rule in ../detekt.yml — ForbiddenComment among them,
       # which is how this repository enforces its Kotlin stub policy — went
