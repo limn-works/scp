@@ -332,8 +332,7 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpNapiError {
 /// [`CoreFields::register_or_refuse`](scp_ffi_common::bridge_instance::CoreFields::register_or_refuse)
 /// returns. The stream had already reserved escrow and started its pump, and
 /// the saga had already staged its Prepare phase, so this is the Context class
-/// with `SCP-CTX-2139`, not the class of the Supervisor's own refusal, which
-/// comes before anything is reserved or staged.
+/// with `SCP-CTX-2139`.
 fn late_registration_err((code, message): (&'static str, String)) -> ScpNapiError {
     ScpNapiError::Context {
         message,

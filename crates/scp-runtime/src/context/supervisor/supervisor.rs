@@ -489,7 +489,7 @@ fn stream_open_rejection_to_saga_error(
             message: format!(
                 "streaming saga {} rejected: {}",
                 step.label(),
-                other.to_invocation_error()
+                other.to_open_error()
             ),
         },
     }
@@ -14188,8 +14188,9 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`InvocationError`](crate::context::outlets::invoke::InvocationError)
-    /// when A's event-log provider is not configured, when the outlet is a paid
+    /// Returns [`OutletOpenError`](crate::context::outlets::invoke::OutletOpenError):
+    /// `SupervisorShutDown` once shutdown has begun, and `Invocation` when A's
+    /// event-log provider is not configured, when the outlet is a paid
     /// Action outlet (or `cost_per_chunk > 0`), when a §7.3.8 counter cap in
     /// `caveat_binding` is exhausted, or when the B-side open is rejected.
     #[allow(clippy::too_many_arguments)]
@@ -14208,7 +14209,7 @@ impl Supervisor {
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
-        crate::context::outlets::invoke::InvocationError,
+        crate::context::outlets::invoke::OutletOpenError,
     >
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
@@ -14217,11 +14218,13 @@ impl Supervisor {
         // no per-context lock, ADR-049-safe). A missing provider fails the open
         // closed: the bridge cannot record A's `OutletInvoked` without it.
         let a_event_log = self.event_log_ref().cloned().ok_or_else(|| {
-            crate::context::outlets::invoke::InvocationError::ExecutionFailed {
-                message:
-                    "cross-context bridge: receiving-context event-log provider not configured"
-                        .to_owned(),
-            }
+            crate::context::outlets::invoke::OutletOpenError::from(
+                crate::context::outlets::invoke::InvocationError::ExecutionFailed {
+                    message:
+                        "cross-context bridge: receiving-context event-log provider not configured"
+                            .to_owned(),
+                },
+            )
         })?;
 
         crate::context::outlets::invoke::invoke_outlet_cross_context(
@@ -35374,7 +35377,7 @@ mod open_outlet_stream_tests {
     /// and NO receiver is produced.
     #[tokio::test]
     async fn open_outlet_stream_cross_context_rejects_paid_action() {
-        use crate::context::outlets::invoke::InvocationError;
+        use crate::context::outlets::invoke::{InvocationError, OutletOpenError};
 
         let captured = Arc::new(AtomicUsize::new(0));
         let supervisor = build_supervisor(&captured);
@@ -35418,7 +35421,9 @@ mod open_outlet_stream_tests {
         assert!(
             matches!(
                 result,
-                Err(InvocationError::CrossContextPaidActionUnsupported { .. })
+                Err(OutletOpenError::Invocation(
+                    InvocationError::CrossContextPaidActionUnsupported { .. }
+                ))
             ),
             "a paid Action best-effort cross-context open must be rejected zero-escrow; \
              got {result:?}"
@@ -35596,7 +35601,7 @@ mod open_outlet_stream_tests {
     /// `commit_counter_reservation` CAS the finding is about.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_outlet_stream_cross_context_enforces_durable_counter() {
-        use crate::context::outlets::invoke::InvocationError;
+        use crate::context::outlets::invoke::{InvocationError, OutletOpenError};
         use scp_protocol::trust::caveats::RateWindow;
 
         let captured = Arc::new(AtomicUsize::new(0));
@@ -35702,7 +35707,12 @@ mod open_outlet_stream_tests {
             )
             .await;
         assert!(
-            matches!(second, Err(InvocationError::CaveatViolation { .. })),
+            matches!(
+                second,
+                Err(OutletOpenError::Invocation(
+                    InvocationError::CaveatViolation { .. }
+                ))
+            ),
             "the SECOND cross-context open under a rate_window:1 binding must be rejected \
              by the durable counter CAS; got {second:?}"
         );
@@ -36894,7 +36904,7 @@ mod streaming_saga_tests {
                     "the abort surfaces the context-not-active reserve rejection naming the \
                      state (the typed OutletContextNotActive carrier flowed through \
                      reserve_error_to_open_rejection → OpenStreamRejection::ContextNotActive → \
-                     to_invocation_error, preserving current_state for an authorized interface \
+                     to_open_error, preserving current_state for an authorized interface \
                      peer): {message}"
                 );
             }

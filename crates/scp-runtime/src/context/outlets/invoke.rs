@@ -64,18 +64,6 @@ pub enum InvocationError {
         current_state: String,
     },
 
-    /// The Supervisor refused the operation because `shutdown_all_contexts`
-    /// has begun (ADR-049 Decision 16 item 2). Crosses the runtime-to-
-    /// [`ContextError`](scp_protocol::context::ContextError) seam as
-    /// `ContextError::SupervisorShutDown`.
-    ///
-    /// Error code: `SCP-CTX-2138`.
-    #[error("SCP-CTX-2138: {message}")]
-    SupervisorShutDown {
-        /// The refusal detail carried by `ContextError::SupervisorShutDown`.
-        message: String,
-    },
-
     /// The invoker does not have the required capability.
     #[error(
         "invoker \"{did}\" does not have OutletCall(\"{outlet_id}\") or OutletCallAll capability"
@@ -254,6 +242,27 @@ pub enum InvocationError {
         /// The paid Action outlet the best-effort cross-context open rejected.
         outlet_id: String,
     },
+}
+
+/// Why an outlet stream open failed: the Supervisor refused it because
+/// `shutdown_all_contexts` has begun, or the open itself failed. A shutdown
+/// refusal is not an outlet error and has no §5.4.4 surface, so it is kept out
+/// of [`InvocationError`] and crosses the runtime-to-
+/// [`ContextError`](scp_protocol::context::ContextError) seam as
+/// `ContextError::SupervisorShutDown` (ADR-049 Decision 16 item 2).
+#[derive(Debug, thiserror::Error)]
+pub enum OutletOpenError {
+    /// The Supervisor refused the open because shutdown has begun.
+    ///
+    /// Error code: `SCP-CTX-2138`.
+    #[error("SCP-CTX-2138: {message}")]
+    SupervisorShutDown {
+        /// The refusal detail carried by `ContextError::SupervisorShutDown`.
+        message: String,
+    },
+    /// The open failed for an outlet reason.
+    #[error(transparent)]
+    Invocation(#[from] InvocationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -3126,9 +3135,8 @@ fn fresh_request_id() -> RequestId {
 pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPayload {
     use scp_protocol::context::outlets::error_codes::{
         CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION,
-        CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION,
-        SLUG_AUTHORIZATION_DENIED, SLUG_ECONOMIC_BUDGET_EXCEEDED, SLUG_INPUT_SCHEMA_VIOLATION,
-        SLUG_OUTPUT_SCHEMA_VIOLATION, SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+        CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED,
+        SLUG_ECONOMIC_BUDGET_EXCEEDED, SLUG_INPUT_SCHEMA_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION,
         SLUG_QUERY_VIOLATION,
     };
     // The slug is included in the resulting Error chunk's `message`
@@ -3138,11 +3146,6 @@ pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPaylo
         InvocationError::ContextNotActive { .. } => {
             (CODE_PROTOCOL_VIOLATION, "protocol.context-not-active")
         }
-        // §5.4.4 registers no shutdown slug; this pair matches `to_surface`.
-        InvocationError::SupervisorShutDown { .. } => (
-            CODE_PROTOCOL_SESSION,
-            SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
-        ),
         // Spec §5.4.4 query-oracle-collapse: unknown outlets and
         // unauthorized callers both surface as `authorization.denied`
         // so the existence (or registration) of the outlet is not
@@ -3275,16 +3278,11 @@ impl InvocationError {
             // slug/code. The free-text `current_state` is not part of the
             // structured surface (structured errors carry no prose); the wire
             // terminal chunk keeps the descriptive string.
-            // `SupervisorShutDown` has no §5.4.4 slug and shares this pair;
-            // `invocation_error_to_context` maps it to
-            // `ContextError::SupervisorShutDown` without calling `to_surface`.
-            Self::ContextNotActive { .. } | Self::SupervisorShutDown { .. } => {
-                OutletErrorSurface::from_code(
-                    CODE_PROTOCOL_SESSION,
-                    SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
-                    None,
-                )
-            }
+            Self::ContextNotActive { .. } => OutletErrorSurface::from_code(
+                CODE_PROTOCOL_SESSION,
+                SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                None,
+            ),
             // §5.4.4 query-oracle-collapse: unauthorized callers AND unknown
             // outlets both collapse onto `authorization.denied` with NO detail,
             // so outlet existence/registration is never leaked.
@@ -5736,16 +5734,17 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///
 /// # Errors
 ///
-/// Returns [`InvocationError`]:
-/// - [`SupervisorShutDown`](InvocationError::SupervisorShutDown) — the
+/// Returns [`OutletOpenError`]:
+/// - [`SupervisorShutDown`](OutletOpenError::SupervisorShutDown) — the
 ///   Supervisor's tracker refused the spawner because shutdown has begun.
-/// - [`OutletNotFound`](InvocationError::OutletNotFound) — the outlet is not in
+/// - [`Invocation`](OutletOpenError::Invocation) wrapping
+///   [`OutletNotFound`](InvocationError::OutletNotFound) — the outlet is not in
 ///   B's registry.
 /// - [`CrossContextPaidActionUnsupported`](InvocationError::CrossContextPaidActionUnsupported)
 ///   — a paid Action outlet OR a positive billed `cost_per_chunk` (zero-escrow
 ///   rejection on the value actually billed).
 /// - the mapped B-side open rejection
-///   ([`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)),
+///   ([`OpenStreamRejection::to_open_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_open_error)),
 ///   including a §7.3.8 counter-CAS rejection when `caveat_binding`'s cap is
 ///   exhausted.
 #[allow(clippy::too_many_arguments)]
@@ -5768,13 +5767,13 @@ pub(crate) async fn invoke_outlet_cross_context<E>(
     // `[u8; 32]` chunk-signature binding.
     caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
     params: crate::context::outlets::dispatch::OpenStreamParams,
-) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
+) -> Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError>
 where
     E: OutletExecutor + ?Sized + 'static,
 {
     let spawner = supervisor
         .tracked_spawner("open cross-context outlet stream")
-        .map_err(|refused| InvocationError::SupervisorShutDown {
+        .map_err(|refused| OutletOpenError::SupervisorShutDown {
             message: match refused {
                 scp_protocol::context::ContextError::SupervisorShutDown(message) => message,
                 other => other.to_string(),
@@ -5854,7 +5853,7 @@ where
             params,
         )
         .await
-        .map_err(|rejection| rejection.to_invocation_error())?;
+        .map_err(|rejection| rejection.to_open_error())?;
 
     // Take B's plaintext operator-signed chunk receiver.
     let inner_rx = handle
@@ -8616,7 +8615,7 @@ mod tests {
             incoming_open: &OutletStreamOpen,
             params: crate::context::outlets::dispatch::OpenStreamParams,
         ) {
-            let out: Result<mpsc::Receiver<OutletStreamChunk>, InvocationError> =
+            let out: Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError> =
                 invoke_outlet_cross_context::<NoopExecutor>(
                     supervisor,
                     a_event_log,
@@ -9243,7 +9242,7 @@ mod tests {
         /// the Supervisor's spawn gate closed or open.
         async fn cross_context_with_gate(
             gate_closed: bool,
-        ) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError> {
+        ) -> Result<mpsc::Receiver<OutletStreamChunk>, OutletOpenError> {
             let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
                 INVOKER.to_owned(),
                 Arc::new(scp_clock::SystemClock),
@@ -9284,7 +9283,7 @@ mod tests {
         async fn closed_spawn_gate_refuses_cross_context_open_as_supervisor_shut_down() {
             let result = cross_context_with_gate(true).await;
             match result {
-                Err(err @ InvocationError::SupervisorShutDown { .. }) => {
+                Err(err @ OutletOpenError::SupervisorShutDown { .. }) => {
                     let text = err.to_string();
                     assert!(text.starts_with("SCP-CTX-2138: "), "got {text}");
                     assert_eq!(text.matches("SCP-CTX-2138").count(), 1, "got {text}");
@@ -9299,7 +9298,12 @@ mod tests {
         async fn open_spawn_gate_passes_shutdown_check_to_registry_lookup() {
             let result = cross_context_with_gate(false).await;
             assert!(
-                matches!(result, Err(InvocationError::OutletNotFound { .. })),
+                matches!(
+                    result,
+                    Err(OutletOpenError::Invocation(
+                        InvocationError::OutletNotFound { .. }
+                    ))
+                ),
                 "an open gate must not refuse the open; got {result:?}"
             );
         }
@@ -10178,9 +10182,6 @@ mod tests {
             },
             InvocationError::CrossContextPaidActionUnsupported {
                 outlet_id: "o".into(),
-            },
-            InvocationError::SupervisorShutDown {
-                message: "m".into(),
             },
             // Registered SAME-class caveat slugs are identical on both maps.
             InvocationError::CaveatViolation {

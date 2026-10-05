@@ -45,7 +45,7 @@ use scp_core::context::supervisor::{SagaAbortReason, SagaError};
 /// own error enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SagaErrorKind {
-    /// A Prepare-phase abort (spec §6.2.4) — neither side committed.
+    /// Neither side committed.
     ///
     /// `retry_after_ms` is read off the back-off-carrying
     /// `SagaAbortReason::RateLimited` (an `Option<u64>`); the unit

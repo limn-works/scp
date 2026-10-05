@@ -96,7 +96,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::context::ContextHandle;
 
 use super::invoke::{
-    HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink,
+    HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink, OutletOpenError,
     QueryMisdeclarationSink, StreamGateOutcome, StreamSettlement, StreamSettlementSink,
     accrue_data_chunk_if_billable, apply_stream_chunk_gate, ingest_stream_chunk, invoke_outlet,
     release_stream_admission,
@@ -402,12 +402,12 @@ impl OpenStreamRejection {
         }
     }
 
-    /// Routes this rejection into an [`InvocationError`] envelope so
-    /// existing `invocation_error_to_context` translation surfaces it
-    /// identically to other open-time validation failures.
+    /// Routes this rejection into an [`OutletOpenError`] so the existing
+    /// `invocation_error_to_context` translation surfaces it identically to
+    /// other open-time failures.
     #[must_use]
-    pub fn to_invocation_error(&self) -> InvocationError {
-        match self {
+    pub fn to_open_error(&self) -> OutletOpenError {
+        let invocation = match self {
             // #2196 — round-trip as the canonical `InvocationError::ContextNotActive`
             // rather than a misleading `CaveatViolation`, preserving the state
             // string so the wire terminal-chunk message names the actual
@@ -420,14 +420,18 @@ impl OpenStreamRejection {
             },
             // ADR-049 Decision 16 item 2: crosses to the caller as
             // `ContextError::SupervisorShutDown` (`SCP-CTX-2138`).
-            Self::SupervisorShutDown => InvocationError::SupervisorShutDown {
-                message: "outlet stream open refused: Supervisor shutdown has begun".to_owned(),
-            },
+            Self::SupervisorShutDown => {
+                return OutletOpenError::SupervisorShutDown {
+                    message: "outlet stream open refused: Supervisor shutdown has begun"
+                        .to_owned(),
+                };
+            }
             _ => InvocationError::CaveatViolation {
                 slug: self.slug().to_owned(),
                 message: format!("stream open rejected: {}", self.slug()),
             },
-        }
+        };
+        OutletOpenError::Invocation(invocation)
     }
 }
 
@@ -2184,7 +2188,7 @@ fn invocation_error_to_open_rejection(err: &InvocationError) -> OpenStreamReject
 /// the underlying [`invoke_outlet`] (context not active, capability
 /// denial, schema) are translated into the open-time rejection
 /// envelope by the caller via
-/// [`OpenStreamRejection::to_invocation_error`].
+/// [`OpenStreamRejection::to_open_error`].
 ///
 /// # Panics
 ///
@@ -3611,8 +3615,8 @@ mod tests {
             Some(RetryPolicy::Never),
             "a context-not-active open failure must be non-retryable"
         );
-        match rej.to_invocation_error() {
-            InvocationError::ContextNotActive { current_state } => {
+        match rej.to_open_error() {
+            OutletOpenError::Invocation(InvocationError::ContextNotActive { current_state }) => {
                 assert_eq!(current_state, "Closing", "state string round-trips");
             }
             other => panic!("expected ContextNotActive round-trip, got {other:?}"),
@@ -3644,15 +3648,15 @@ mod tests {
         );
         assert!(
             matches!(
-                rej.to_invocation_error(),
-                InvocationError::SupervisorShutDown { .. }
+                rej.to_open_error(),
+                OutletOpenError::SupervisorShutDown { .. }
             ),
-            "the invocation surface keeps the shutdown refusal typed"
+            "the open error keeps the shutdown refusal typed"
         );
         assert!(
             matches!(
-                closed.to_invocation_error(),
-                InvocationError::ContextNotActive { .. }
+                closed.to_open_error(),
+                OutletOpenError::Invocation(InvocationError::ContextNotActive { .. })
             ),
             "a closed context keeps the context-not-active surface"
         );
