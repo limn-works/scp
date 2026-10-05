@@ -16928,12 +16928,12 @@ impl Scp {
     /// Registers the server in this instance's MCP server registry under a
     /// random opaque handle; only this instance's `mcp_server_stop` finds it.
     ///
-    /// A server created while the instance has no supervisor or is
-    /// suspended serves no resource subscriptions for its whole life: it
-    /// advertises `resources.subscribe: false` and rejects
-    /// `resources/subscribe`, and neither attaching a supervisor nor
-    /// `resume()` changes that. Create the server again once the instance
-    /// has a supervisor and is not suspended to get subscriptions.
+    /// A server created while the instance has no supervisor serves no
+    /// resource subscriptions for its whole life: it advertises
+    /// `resources.subscribe: false` and rejects `resources/subscribe`, and
+    /// attaching a supervisor does not change that. Create the server again
+    /// once the instance has a supervisor and is not suspended to get
+    /// subscriptions.
     ///
     /// A `stdio` server writes to this process's stdout, and its event pump
     /// writes there after the reading client may have exited. Before serving,
