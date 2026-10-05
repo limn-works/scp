@@ -16948,7 +16948,12 @@ impl Scp {
     /// Returns `ScpError::Transport` with `SCP-TRANS-5050` when a `stdio`
     /// server's stdout cannot be made to fail without SIGPIPE, for example
     /// because stdout is closed.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    ///
+    /// With a supervisor attached, returns `ScpError::Context` with
+    /// `SCP-CTX-2000` when the instance is suspended, and `ScpError::Transport`
+    /// with `SCP-TRANS-5001` when the supervisor does not report a served
+    /// context `Active` (the refusal withholds the state) or does not count
+    /// `identity_did` among that context's members.
     pub async fn mcp_server_create(&self, config: McpServerConfig) -> Result<String, ScpError> {
         validate_did(&config.identity_did)?;
         validate_transport_mode(&config.transport)?;
@@ -16961,6 +16966,45 @@ impl Scp {
                 msg: "context_ids must not be empty".to_owned(),
                 code: codes::TRANS_5011.to_owned(),
             });
+        }
+
+        // With a supervisor attached, every served context must be `Active`
+        // and count `identity_did` among its members before a server starts.
+        // The lifecycle gate withholds every answer about the context and
+        // returns the role state the membership check reads. With no
+        // supervisor attached the server starts and serves no context.
+        if self.inner.core.try_supervisor().is_some() {
+            let gate_bi = Arc::clone(&self.inner);
+            let gate_ids = config.context_ids.clone();
+            let gate_identity = config.identity_did.clone();
+            runtime()
+                .spawn(async move {
+                    for ctx_id in &gate_ids {
+                        let role_state = gate_bi
+                            .require_active_context_before_authz(ctx_id, "serve context", |msg| {
+                                ScpError::Transport {
+                                    msg,
+                                    code: codes::TRANS_5001.to_owned(),
+                                }
+                            })
+                            .await?;
+                        if !role_state.members.contains(&gate_identity) {
+                            return Err(ScpError::Transport {
+                                msg: format!(
+                                    "cannot serve context '{ctx_id}': '{gate_identity}' is not a \
+                                     member of it"
+                                ),
+                                code: codes::TRANS_5001.to_owned(),
+                            });
+                        }
+                    }
+                    Ok::<(), ScpError>(())
+                })
+                .await
+                .map_err(|e| ScpError::Transport {
+                    msg: format!("tokio task join error during mcp_server_create: {e}"),
+                    code: codes::TRANS_5001.to_owned(),
+                })??;
         }
 
         if config.transport == "stdio" {
@@ -24004,6 +24048,132 @@ mod tests {
 
         let result = scp_test().mcp_server_create(config).await;
         assert!(result.is_err(), "invalid transport mode should be rejected");
+    }
+
+    /// `mcp_server_create` refuses a context the supervisor reports `Closing`
+    /// and a context no actor serves, with the withheld lifecycle text, and
+    /// starts a server for a member of an `Active` context.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn mcp_server_create_refuses_a_context_that_is_not_active() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let create = |params: ContextParams| {
+            rt.block_on(scp.context_create(Arc::clone(&identity), params))
+                .expect("context_create should succeed")
+                .context_id()
+        };
+        let closing = create(ContextParams {
+            ceiling: vec![
+                "messages:read".to_owned(),
+                "messages:write".to_owned(),
+                "context:close".to_owned(),
+            ],
+            ..encrypted_join_test_params()
+        });
+        let despawned = create(encrypted_join_test_params());
+        let active = create(encrypted_join_test_params());
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("supervisor")
+            .clone();
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+                payload: Box::new(CloseContextPayload {
+                    context_id: closing.clone(),
+                    params: scp_core::context::ContextParams::default(),
+                    initiator_did: identity.did.clone().into(),
+                }),
+                reply: tx,
+            })
+            .await
+            .expect("close dispatch");
+            rx.await.expect("close reply").expect("close must succeed");
+            sup.despawn_actor(&despawned).await;
+        });
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&closing))
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        let config = |ctx_id: &str| McpServerConfig {
+            identity_did: identity.did(),
+            context_ids: vec![active.clone(), ctx_id.to_owned()],
+            transport: "sse".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
+        };
+
+        for ctx_id in [&closing, &despawned] {
+            let err = rt
+                .block_on(scp.mcp_server_create(config(ctx_id)))
+                .expect_err("serving a context that is not Active must refuse");
+            assert!(
+                matches!(&err, ScpError::Transport { code, msg }
+                    if code == codes::TRANS_5001
+                        && msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && !msg.to_lowercase().contains("closing")
+                        && !msg.contains(ctx_id.as_str())),
+                "the refusal must come from the lifecycle gate and withhold the state: {err:?}"
+            );
+        }
+        assert!(
+            mcp_server_registry(&scp.inner).is_empty(),
+            "a refused server must not be registered"
+        );
+
+        let handle = rt
+            .block_on(scp.mcp_server_create(McpServerConfig {
+                context_ids: vec![active.clone()],
+                ..config(&active)
+            }))
+            .expect("a member serving an Active context must start a server");
+        rt.block_on(scp.mcp_server_stop(handle))
+            .expect("the server must stop cleanly");
+    }
+
+    /// `mcp_server_create` refuses an identity the supervisor does not count
+    /// as a member of an `Active` served context.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn mcp_server_create_refuses_an_identity_the_supervisor_does_not_count_as_a_member() {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let outsider = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+
+        let config = McpServerConfig {
+            identity_did: outsider.did(),
+            context_ids: vec![handle.context_id()],
+            transport: "sse".to_owned(),
+            ucan_token: None,
+            proof_tokens: None,
+        };
+        let err = rt
+            .block_on(scp.mcp_server_create(config))
+            .expect_err("a non-member must not be able to serve the context");
+        assert!(
+            matches!(&err, ScpError::Transport { code, msg }
+                if code == codes::TRANS_5001 && msg.contains("is not a member of it")),
+            "the refusal must say the identity is not a member: {err:?}"
+        );
+        assert!(
+            mcp_server_registry(&scp.inner).is_empty(),
+            "a refused server must not be registered"
+        );
     }
 
     /// A server created once the instance has shut down is refused and left
