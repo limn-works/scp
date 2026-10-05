@@ -1528,23 +1528,35 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     .map_err(|e| napi::Error::from(crate::outlets::map_saga_error(e)))?;
 
     // ----- (g) register the promptly-returned receiver ------------------------
-    let saga_id = handle.saga_id;
-    let receiver = handle.receiver;
-    let handle_id = saga_id.0.clone();
-    if !bi.core.insert_stream_entry(
-        &bi.outlet_streaming_saga_registry,
-        handle_id.clone(),
+    register_streaming_saga(
+        bi,
         StreamingSagaEntry {
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            saga_id,
+            receiver: Arc::new(tokio::sync::Mutex::new(handle.receiver)),
+            saga_id: handle.saga_id,
             target_context_id,
             invoker_did: caller_did,
             request_id,
         },
-    ) {
-        return Err(napi::Error::from(late_shutdown_saga_err(&handle_id)));
+    )
+    .map_err(napi::Error::from)
+}
+
+/// Registers a started streaming saga's entry under its saga id and returns
+/// the id. Returns [`late_shutdown_saga_err`], with the entry dropped, when
+/// bridge shutdown began before the insert.
+fn register_streaming_saga(
+    bi: &NapiBridgeInstance,
+    entry: StreamingSagaEntry,
+) -> Result<String, ScpNapiError> {
+    let handle_id = entry.saga_id.0.clone();
+    if bi
+        .core
+        .insert_stream_entry(&bi.outlet_streaming_saga_registry, handle_id.clone(), entry)
+    {
+        Ok(handle_id)
+    } else {
+        Err(late_shutdown_saga_err(&handle_id))
     }
-    Ok(handle_id)
 }
 
 /// Drains one chunk from a live cross-context streaming saga, awaiting the seal

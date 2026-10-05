@@ -1304,14 +1304,6 @@ fn late_shutdown_refusals_differ_from_supervisor_refusal_class() {
         "the Supervisor's own stream refusal keeps the Outlet class"
     );
 
-    let ScpError::Context { msg, code } = late_shutdown_saga_err("saga-late-1") else {
-        panic!("a late streaming-saga refusal must be the Context class");
-    };
-    assert_eq!(code, codes::CTX_2139);
-    assert!(
-        msg.contains("saga-late-1"),
-        "the error names the started saga: {msg}"
-    );
     assert!(
         matches!(
             map_saga_error(
@@ -1322,5 +1314,48 @@ fn late_shutdown_refusals_differ_from_supervisor_refusal_class() {
             ScpError::SagaAborted { .. }
         ),
         "the Supervisor's own streaming-saga refusal keeps the SagaAborted class"
+    );
+}
+
+/// A started streaming saga registers while the bridge runs, and once
+/// `stop_borrowers` has run the registration is refused with the Context
+/// class, `SCP-CTX-2139` and the saga id, and leaves no registry entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_saga_registration_refused_after_shutdown_began() {
+    let scp = crate::scp::Scp::new_in_memory_for_test();
+    let bi = Arc::clone(&scp.inner);
+    let entry = |id: &str| {
+        let (_tx, rx) = mpsc::channel(1);
+        StreamingSagaEntry {
+            receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+            saga_id: scp_core::context::supervisor::SagaId(id.to_owned()),
+            target_context_id: "target-ctx-late".to_owned(),
+            invoker_did: "did:scp:test-invoker".to_owned(),
+            request_id: [0u8; 16],
+        }
+    };
+
+    let registered = register_streaming_saga(&bi, entry("saga-before-1"))
+        .expect("a saga started before shutdown registers");
+    assert_eq!(registered, "saga-before-1");
+    assert!(
+        bi.outlet_streaming_saga_registry
+            .contains_key("saga-before-1")
+    );
+
+    bi.core.stop_borrowers();
+    let Err(ScpError::Context { msg, code }) = register_streaming_saga(&bi, entry("saga-late-1"))
+    else {
+        panic!("a late streaming-saga registration must be refused with the Context class");
+    };
+    assert_eq!(code, codes::CTX_2139);
+    assert!(
+        msg.contains("saga-late-1"),
+        "the error names the started saga: {msg}"
+    );
+    assert!(
+        !bi.outlet_streaming_saga_registry
+            .contains_key("saga-late-1"),
+        "a refused registration leaves no entry"
     );
 }
