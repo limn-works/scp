@@ -1564,9 +1564,7 @@ fn generate_handle_id(prefix: &str) -> String {
 /// later does not add subscriptions or `list_changed` notifications to a
 /// running server; stop it and serve again to get them. Every other request reads the instance's state when it arrives:
 /// `tools/call` fails while no supervisor is attached or the instance is
-/// suspended, and stops failing for those reasons once both end; every
-/// access gate reads the actor's role state, and refuses while no
-/// supervisor is attached.
+/// suspended, and stops failing for those reasons once both end.
 ///
 /// # Arguments
 ///
@@ -5747,10 +5745,8 @@ mod tests {
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 
-    /// With no supervisor attached, no MCP gate answers from the bridge's
-    /// copy, though the copy names the agent as a member. The reads that
-    /// return data fail, and the access gates deny with a message naming the
-    /// missing supervisor.
+    /// The reads that return data fail, and the access gates deny with a
+    /// message naming the missing supervisor.
     #[test]
     fn provider_gates_refuse_without_a_supervisor_pyo3() {
         use scp_mcp::server::ResourceKind;
@@ -5821,8 +5817,7 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// Every MCP gate answers from the actor's role state, never from the
-    /// bridge's copy. The copy is resynced only by the bridge's own join,
+    /// The bridge's copy is resynced only by the bridge's own join,
     /// leave and governance calls, so a revocation or removal the actor
     /// applies from an inbound commit leaves the copy still granting. Here the
     /// actor exists and holds no such context, the state after the actor drops
