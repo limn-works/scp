@@ -263,14 +263,8 @@ impl<S: Storage> ProtocolRepository<S> {
     }
 
     /// Serializes a value that carries key material into the same
-    /// `StoredValue` envelope bytes as [`Self::serialize`], held in one
-    /// exactly-sized buffer that is wiped on drop.
-    ///
-    /// `rmp_serde::to_vec_named` grows its output by reallocation and frees
-    /// each outgrown buffer holding a partial copy of the key material. The
-    /// wiping global allocator zeroes those in a shipped artifact; this one
-    /// exactly-sized buffer means they never exist, whichever allocator the
-    /// application installs (security model spec §9.15 step 2 and freed heap
+    /// `StoredValue` envelope bytes as [`Self::serialize`], held in a buffer
+    /// wiped on drop (security model spec §9.15 step 2 and freed heap
     /// memory).
     ///
     /// `T` may be unsized, so a caller holding a `&[u8]` or `&str` secret
@@ -284,7 +278,8 @@ impl<S: Storage> ProtocolRepository<S> {
             version: scp_platform::store_value::CURRENT_STORE_VERSION,
             data: value,
         };
-        scp_mls::secret_msgpack::encode_named(&envelope)
+        rmp_serde::to_vec_named(&envelope)
+            .map(Zeroizing::new)
             .map_err(|e| StoreError::SerializationFailed(e.to_string()))
     }
 

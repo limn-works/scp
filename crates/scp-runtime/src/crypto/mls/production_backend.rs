@@ -337,7 +337,8 @@ fn serialize_signer_state(
     key_package_public_bytes: &[u8],
 ) -> Result<SignerState, MlsError> {
     let wrapper = serialized_signer(signer, provider, key_package_public_bytes)?;
-    let bytes = scp_mls::secret_msgpack::encode_named(&wrapper)
+    let bytes = rmp_serde::to_vec_named(&wrapper)
+        .map(zeroize::Zeroizing::new)
         .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?;
 
     Ok(SignerState { bytes })

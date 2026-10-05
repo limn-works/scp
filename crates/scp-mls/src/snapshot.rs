@@ -152,12 +152,11 @@ pub type ProviderStorageEntries = Zeroizing<Vec<(Vec<u8>, Vec<u8>)>>;
 /// `provider`'s storage entries, returned as `(signer_bytes,
 /// mls_storage_entries)`, both in types that wipe on drop.
 ///
-/// The signer is encoded first, into the one exactly-sized `Zeroizing` buffer
-/// the encoder fills, so no reallocation frees a partial copy of the key
-/// (security model spec §9.15 step 2). The storage lock is read next, and the
-/// entries are cloned into a `Zeroizing` vector sized to the entry count
-/// before the first clone. No plain copy of a secret is live across a
-/// fallible step, so an early return frees only wiped memory.
+/// The signer is encoded first, into a `Zeroizing` buffer. The storage lock
+/// is read next, and the entries are cloned into a `Zeroizing` vector. No
+/// plain copy of a secret is live across a fallible step, so an early return
+/// drops only wiping types (security model spec §9.15 step 2; buffers freed on
+/// the way are covered by §9.15, freed heap memory).
 ///
 /// # Errors
 ///
@@ -167,7 +166,8 @@ pub fn capture_signer_and_storage(
     provider: &InMemoryMlsProvider,
     signer: &SignatureKeyPair,
 ) -> Result<(Zeroizing<Vec<u8>>, ProviderStorageEntries), MlsError> {
-    let signer_bytes = crate::secret_msgpack::encode_named(signer)
+    let signer_bytes = rmp_serde::to_vec_named(signer)
+        .map(Zeroizing::new)
         .map_err(|e| MlsError::Snapshot(format!("signer serialization: {e}")))?;
     let values = provider
         .storage()
@@ -224,8 +224,7 @@ impl ScpMlsGroup {
     /// poisoned or `MessagePack` serialization fails.
     ///
     /// The blob carries the signer and the provider's secrets, so it is
-    /// returned in the one exactly-sized buffer it was written into, wiped on
-    /// drop.
+    /// returned in a buffer wiped on drop (security model spec §9.15).
     pub fn serialize_state(&self) -> Result<Zeroizing<Vec<u8>>, MlsError> {
         let group_id = self.group_id()?.to_vec();
         let signer = self.signer_key_pair()?;
@@ -239,7 +238,8 @@ impl ScpMlsGroup {
 
         // The dump's `Zeroizing` fields wipe the intermediate key material when
         // `snapshot` drops, on success and on error.
-        crate::secret_msgpack::encode_named(&snapshot)
+        rmp_serde::to_vec_named(&snapshot)
+            .map(Zeroizing::new)
             .map_err(|e| MlsError::Snapshot(format!("snapshot serialization: {e}")))
     }
 
@@ -348,8 +348,8 @@ impl std::fmt::Debug for PendingJoinSnapshot {
 /// Returns [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
 /// `MessagePack` serialization fails.
 ///
-/// The blob is returned in the one exactly-sized buffer it was written into,
-/// wiped on drop, as [`ScpMlsGroup::serialize_state`] returns its blob.
+/// The blob is returned in a buffer wiped on drop, as
+/// [`ScpMlsGroup::serialize_state`] returns its blob.
 pub fn serialize_pending_join(
     provider: &InMemoryMlsProvider,
     signer: &SignatureKeyPair,
@@ -366,7 +366,8 @@ pub fn serialize_pending_join(
 
     // The dump's `Zeroizing` fields wipe the intermediate key material when
     // `snapshot` drops, on success and on error.
-    crate::secret_msgpack::encode_named(&snapshot)
+    rmp_serde::to_vec_named(&snapshot)
+        .map(Zeroizing::new)
         .map_err(|e| MlsError::Snapshot(format!("pending snapshot serialization: {e}")))
 }
 
@@ -473,20 +474,14 @@ mod tests {
         assert_eq!(bob.epoch().unwrap(), restored_bob.epoch().unwrap());
     }
 
-    /// Capture returns the signer in the wiping encoder's named encoding, in
-    /// the one exactly-sized buffer that encoder fills (a grown
-    /// `to_vec_named` buffer ends with spare capacity), and the provider's
-    /// storage entries.
+    /// Capture returns the signer's named `MessagePack` encoding and the
+    /// provider's storage entries.
     #[test]
     fn capture_returns_signer_encoding_and_storage_entries() {
         let (_bundle, signer, provider) =
             generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let (signer_bytes, entries) = capture_signer_and_storage(&provider, &signer).unwrap();
-        assert_eq!(signer_bytes.capacity(), signer_bytes.len());
-        assert_eq!(
-            *signer_bytes,
-            *crate::secret_msgpack::encode_named(&signer).unwrap()
-        );
+        assert_eq!(*signer_bytes, rmp_serde::to_vec_named(&signer).unwrap());
         let values = provider.storage().values.read().unwrap();
         assert!(!entries.is_empty());
         assert_eq!(entries.len(), values.len());

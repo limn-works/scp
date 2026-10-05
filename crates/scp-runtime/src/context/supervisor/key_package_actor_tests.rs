@@ -3720,7 +3720,7 @@ fn kp_record_encodes_like_plain_fields() {
         signer_state: vec![0x5A; 300],
     };
     assert_eq!(
-        *scp_mls::secret_msgpack::encode_named(&record).unwrap(),
+        rmp_serde::to_vec_named(&record).unwrap(),
         rmp_serde::to_vec_named(&plain).unwrap()
     );
 }

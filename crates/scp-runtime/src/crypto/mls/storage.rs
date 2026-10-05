@@ -192,15 +192,13 @@ impl<S: Storage> MlsStorageBridge<S> {
     /// Serializes an `OpenMLS` entity value to `MessagePack` bytes for storage.
     ///
     /// Entity values include HPKE private keys and epoch secrets, so the
-    /// encoding lands in one exactly-sized buffer that is wiped on drop;
-    /// `rmp_serde::to_vec_named` would free the buffers it outgrows, which
-    /// only the wiping global allocator wipes (security model spec §9.15
-    /// step 2 and freed heap memory). The bytes equal
-    /// `rmp_serde::to_vec_named`'s.
+    /// encoding is returned in a buffer wiped on drop (security model spec
+    /// §9.15 step 2 and freed heap memory).
     fn serialize_value<V: Serialize + ?Sized>(
         value: &V,
     ) -> Result<Zeroizing<Vec<u8>>, MlsStorageBridgeError> {
-        scp_mls::secret_msgpack::encode_named(value)
+        rmp_serde::to_vec_named(value)
+            .map(Zeroizing::new)
             .map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))
     }
 
