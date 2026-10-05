@@ -2820,21 +2820,22 @@ impl CoreFields {
             // that misses the deadline keeps running and closes the store
             // itself; no caller remains to receive a close failure, so the
             // late callback logs it.
-            let on_late =
-                move |late: Result<Result<(), scp_platform::PlatformError>, JoinFailure>| match late {
-                    Ok(Ok(())) => {
-                        tracing::info!("{}", late_drain_finished_message(has_durable_store));
-                    }
-                    Ok(Err(e)) => tracing::error!(
-                        error = %e,
-                        "late Supervisor drain finished but the durable store refused \
-                         to close; it keeps its connection and advisory lock"
-                    ),
-                    Err(failure) => tracing::error!(
-                        "late {}",
-                        drain_failed_message(failure, has_durable_store)
-                    ),
-                };
+            let on_late = move |late: Result<
+                Result<(), scp_platform::PlatformError>,
+                JoinFailure,
+            >| match late {
+                Ok(Ok(())) => {
+                    tracing::info!("{}", late_drain_finished_message(has_durable_store));
+                }
+                Ok(Err(e)) => tracing::error!(
+                    error = %e,
+                    "late Supervisor drain finished but the durable store refused \
+                     to close; it keeps its connection and advisory lock"
+                ),
+                Err(failure) => {
+                    tracing::error!("late {}", drain_failed_message(failure, has_durable_store))
+                }
+            };
             match supervisor
                 .drain_with_deadline(deadline, move || close_durable_store(store_closer), on_late)
                 .await

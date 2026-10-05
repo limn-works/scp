@@ -422,8 +422,7 @@ impl OpenStreamRejection {
             // `ContextError::SupervisorShutDown` (`SCP-CTX-2138`).
             Self::SupervisorShutDown => {
                 return OutletOpenError::SupervisorShutDown {
-                    message: "outlet stream open refused: Supervisor shutdown has begun"
-                        .to_owned(),
+                    message: "outlet stream open refused: Supervisor shutdown has begun".to_owned(),
                 };
             }
             _ => InvocationError::CaveatViolation {
