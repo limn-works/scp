@@ -235,6 +235,13 @@ pub struct UniffiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
+    /// Context ids whose `ucan_registry` entry [`Self::release_ucan_state`]
+    /// or [`Self::release_ucan_state_unless_readmitted`] released.
+    ///
+    /// [`Self::ensure_ucan_registered`] builds no entry for an id in this set,
+    /// and [`Self::readmit_context`] removes an id from it.
+    pub(crate) released_contexts: Arc<DashMap<String, ()>>,
+
     /// Retained identity custody for the production identity ops, keyed by DID.
     ///
     /// Previously stored type-erased in `CoreFields::identity_registry` AND
@@ -417,6 +424,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -452,6 +460,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -600,6 +609,7 @@ impl UniffiBridgeInstance {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -1057,37 +1067,6 @@ impl UniffiBridgeInstance {
         }
     }
 
-    /// Per-instance equivalent of the module-level
-    /// `sync_role_state_from_manager` free function.
-    ///
-    /// Validates that the attached `ContextManager` has role state for the
-    /// given context after a governance operation. Logs the sync for
-    /// traceability.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScpError::Context` (code `SCP-CTX-2040`) if the context is
-    /// not registered in the attached `ContextManager`, or any error returned
-    /// by [`UniffiBridgeInstance::context_manager_or_error`] if no manager is
-    /// attached.
-    #[allow(dead_code)]
-    pub async fn sync_role_state_from_manager(
-        &self,
-        context_id: &str,
-    ) -> Result<(), crate::ScpError> {
-        let supervisor = self.context_manager_or_error()?;
-        let _role_state = supervisor.get_role_state(context_id).await.ok_or_else(|| {
-            crate::ScpError::Context {
-                msg: format!(
-                    "context '{context_id}' not found in Supervisor during role state sync"
-                ),
-                code: codes::CTX_2040.to_owned(),
-            }
-        })?;
-        tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
-        Ok(())
-    }
-
     /// Reads a context's role state from that context's supervisor actor.
     ///
     /// The method reports each failure as itself, so it suits only a caller
@@ -1205,17 +1184,95 @@ impl UniffiBridgeInstance {
     /// free function.
     ///
     /// Ensures UCAN validation state is registered for `context_id` in this
-    /// instance's UCAN registry. No-op if the context is already registered.
+    /// instance's UCAN registry. No-op if the context is already registered,
+    /// and no-op if `context_id` carries a release mark, so the caller's next
+    /// [`Self::with_ucan_state`] returns `None`.
+    ///
+    /// The release-mark check and the insert run while this call holds the
+    /// registry entry's shard lock.
     #[allow(dead_code)]
     pub fn ensure_ucan_registered(&self, context_id: &str, creator_did: &str, ceiling: &[String]) {
-        if self.ucan_registry.contains_key(context_id) {
+        use dashmap::mapref::entry::Entry;
+
+        if let Entry::Vacant(vacant) = self.ucan_registry.entry(context_id.to_owned())
+            && !self.released_contexts.contains_key(context_id)
+        {
+            vacant.insert(Self::build_ucan_context_state(
+                context_id,
+                creator_did,
+                ceiling,
+            ));
+        }
+    }
+
+    /// Marks `context_id` released, then removes its UCAN state and its
+    /// known-context entry while the mark stands.
+    ///
+    /// The mark goes in before the entry comes out, and
+    /// [`Self::ensure_ucan_registered`] reads the mark while it holds the
+    /// entry's shard lock, so no rebuild lands after this call returns unless
+    /// [`Self::readmit_context`] clears the mark.
+    pub fn release_ucan_state(&self, context_id: &str) {
+        self.released_contexts.insert(context_id.to_owned(), ());
+        self.remove_ucan_state_while_released(context_id);
+    }
+
+    /// Removes `context_id`'s UCAN state and its known-context entry, only
+    /// while the release mark stands.
+    ///
+    /// The mark check and both removals run while this call holds the
+    /// registry entry's shard lock, which [`Self::readmit_context`] also
+    /// takes, so a readmit that cleared the mark first leaves the state in
+    /// place.
+    pub(crate) fn remove_ucan_state_while_released(&self, context_id: &str) {
+        use dashmap::mapref::entry::Entry;
+
+        let entry = self.ucan_registry.entry(context_id.to_owned());
+        if !self.released_contexts.contains_key(context_id) {
             return;
         }
+        if let Entry::Occupied(occupied) = entry {
+            occupied.remove();
+        }
+        self.core.remove_known_context(context_id);
+    }
 
-        self.ucan_registry.insert(
-            context_id.to_owned(),
-            Self::build_ucan_context_state(context_id, creator_did, ceiling),
-        );
+    /// Clears the release mark on `context_id`, so the next
+    /// [`Self::ensure_ucan_registered`] builds fresh state for it.
+    ///
+    /// Clears the mark while holding the registry entry's shard lock. The
+    /// fresh state holds an empty revocation list and a fresh nonce tracker,
+    /// because this bridge keeps revocations in process memory.
+    pub fn readmit_context(&self, context_id: &str) {
+        let _shard = self.ucan_registry.entry(context_id.to_owned());
+        self.released_contexts.remove(context_id);
+    }
+
+    /// Marks `context_id` released, re-reads the supervisor, and removes the
+    /// context's UCAN state only when the re-read does not report `Active`.
+    ///
+    /// A re-read that reports `Active` clears the mark, removes nothing, and
+    /// returns `Ok(false)`. Any other answer removes the state while the mark
+    /// stands and returns `Ok(true)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the re-read's error, with the mark kept and nothing removed,
+    /// when [`Self::read_live_context_state`] fails.
+    pub async fn release_ucan_state_unless_readmitted(
+        &self,
+        context_id: &str,
+    ) -> Result<bool, crate::ScpError> {
+        self.released_contexts.insert(context_id.to_owned(), ());
+        if matches!(
+            self.read_live_context_state(context_id).await?,
+            Some(scp_core::context::ContextState::Active)
+        ) {
+            self.readmit_context(context_id);
+            return Ok(false);
+        }
+        self.remove_ucan_state_while_released(context_id);
+        Ok(true)
     }
 
     /// Atomically registers per-context UCAN validation state for a
@@ -1376,6 +1433,7 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // zeroizes any key material they hold via the custody provider's
         // `Drop` impl.
         self.ucan_registry.clear();
+        self.released_contexts.clear();
         self.identity_custody_registry.clear();
         // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
         // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
@@ -1771,11 +1829,9 @@ where
 pub type UcanContextState = scp_ffi_common::bridge_runtime::UcanContextStateCore;
 
 // Phase D (#1695): module-level `ucan_registry`, `ensure_ucan_registered`,
-// `with_ucan_state`, `remove_ucan_state`, `sync_role_state_from_manager`,
-// and `with_rate_limit_tracker` free functions deleted. Every caller
-// accesses the per-instance equivalents on `UniffiBridgeInstance`
-// (`ensure_ucan_registered`, `with_ucan_state`, `remove_ucan_state`,
-// `sync_role_state_from_manager`, `with_rate_limit_tracker`).
+// `with_ucan_state`, `remove_ucan_state`, and `with_rate_limit_tracker` free
+// functions deleted. Every caller accesses the per-instance equivalents on
+// `UniffiBridgeInstance`.
 
 /// Queries event counts for trust scoring within a context.
 ///

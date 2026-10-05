@@ -236,9 +236,8 @@ public actor Context {
             // fallback. The fallback is `.poisoned` (NOT `.active`): a handle
             // whose state cannot be read, or that reports an unrecognized
             // string, must never present as a live/usable context. Per ADR-049
-            // §10 the authoritative crash/poison signal is the error code on
-            // the next per-context operation; this cached getter is best-effort
-            // and fails safe to a non-active state.
+            // §10 this cached getter is best-effort and fails safe to a
+            // non-active state.
             state = Context.mapStateString((try? handle.state()) ?? "poisoned")
         }
     }
@@ -248,9 +247,7 @@ public actor Context {
     /// An unrecognized or unreadable state fails safe to ``ContextState/poisoned``
     /// rather than ``ContextState/active``: per ADR-049 §10 the cached
     /// ``state`` getter is best-effort, and an unknown context must never be
-    /// reported as live. The authoritative crash/poison signal is the
-    /// `SCP-CTX-2134`/`2135` error code surfaced on the next per-context
-    /// operation, not this getter.
+    /// reported as live.
     static func mapStateString(_ stateString: String) -> ContextState {
         switch stateString {
         case "creating": return .creating
@@ -596,11 +593,16 @@ public actor Context {
     /// Always call `close()` when done with a context. `deinit` provides a
     /// safety net but should not be relied upon for timely cleanup.
     ///
+    /// A second `close()`, and a `close()` after ``leave()``, returns without
+    /// calling the bridge. Otherwise `close()` calls the bridge whatever the
+    /// cached ``state`` reads, ``ContextState/poisoned`` included, and leaves
+    /// ``state`` unchanged when the bridge throws.
+    ///
     /// - Throws: ``ScpError/Context(msg:code:)`` if the bridge close
     ///   operation fails.
     public func close() async throws {
-        guard state == .active else {
-            // Closing an already-closed context is idempotent — no error.
+        guard !didClose else {
+            // This actor already closed or left the context — no error.
             return
         }
         try await scp.contextClose(handle: handle, identity: identity)
