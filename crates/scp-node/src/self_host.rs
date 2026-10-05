@@ -131,15 +131,16 @@ pub const SELF_HOST_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 /// Drains `supervisor` (ADR-049 Decision 16) through
 /// `Supervisor::drain_with_deadline` and reports whether that drain finished
 /// within [`SELF_HOST_DRAIN_DEADLINE`]. A drain that misses the deadline keeps
-/// running to completion. A drain that panics counts as unfinished.
+/// running to completion. A drain that panics or is cancelled counts as
+/// unfinished.
 async fn drained_within_deadline(
     supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
 ) -> bool {
-    use scp_core::context::supervisor::DrainWithDeadline;
+    use scp_core::context::supervisor::{DrainWithDeadline, JoinFailure};
     let deadline = tokio::time::Instant::now() + SELF_HOST_DRAIN_DEADLINE;
-    let on_late = |late: Result<(), String>| {
-        if let Err(panic) = late {
-            tracing::error!(error = %panic, "late self-host Supervisor drain panicked");
+    let on_late = |late: Result<(), JoinFailure>| {
+        if let Err(failure) = late {
+            tracing::error!("late {}", self_host_drain_failed_message(failure));
         }
     };
     match supervisor
@@ -147,11 +148,27 @@ async fn drained_within_deadline(
         .await
     {
         DrainWithDeadline::Finished(()) => true,
-        DrainWithDeadline::Panicked(panic) => {
-            tracing::error!(error = %panic, "self-host Supervisor drain panicked");
+        DrainWithDeadline::Failed(failure) => {
+            tracing::error!("{}", self_host_drain_failed_message(failure));
             false
         }
         DrainWithDeadline::TimedOut => false,
+    }
+}
+
+/// Log line for a self-host Supervisor drain task that ended without
+/// returning: a panic is named as a panic and a cancellation as a
+/// cancellation.
+const fn self_host_drain_failed_message(
+    failure: scp_core::context::supervisor::JoinFailure,
+) -> &'static str {
+    match failure {
+        scp_core::context::supervisor::JoinFailure::Panicked => {
+            "self-host Supervisor drain panicked"
+        }
+        scp_core::context::supervisor::JoinFailure::Cancelled => {
+            "self-host Supervisor drain was cancelled"
+        }
     }
 }
 
@@ -2762,6 +2779,19 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The self-host drain failure line names a panic as a panic and a
+    /// cancellation as a cancellation.
+    #[test]
+    fn self_host_drain_failed_message_never_names_a_cancellation_a_panic() {
+        use scp_core::context::supervisor::JoinFailure;
+        let panicked = self_host_drain_failed_message(JoinFailure::Panicked);
+        assert!(panicked.contains("panicked"), "{panicked}");
+        assert!(!panicked.contains("cancelled"), "{panicked}");
+        let cancelled = self_host_drain_failed_message(JoinFailure::Cancelled);
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        assert!(!cancelled.contains("panicked"), "{cancelled}");
+    }
 
     /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
     /// detects a missing pre-rotation backend by pattern, and the same pattern

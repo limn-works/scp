@@ -1357,7 +1357,7 @@ pub enum DrainWithDeadline<T> {
     Finished(T),
     /// The drain task ended without returning: the drain or the post-drain
     /// step panicked, or the task was cancelled.
-    Panicked(JoinFailure),
+    Failed(JoinFailure),
     /// The deadline passed first. The drain keeps running, and its result
     /// goes to the `on_late` callback.
     TimedOut,
@@ -11294,7 +11294,7 @@ impl Supervisor {
     ///
     /// When the deadline passes first, the task keeps running, `on_late`
     /// receives its result once it ends (`Err` carrying the payload-free
-    /// [`JoinFailure`] text when the drain task did not return), and this returns
+    /// [`JoinFailure`] when the drain task did not return), and this returns
     /// [`DrainWithDeadline::TimedOut`].
     pub async fn drain_with_deadline<T, A, L>(
         self: &Arc<Self>,
@@ -11305,7 +11305,7 @@ impl Supervisor {
     where
         T: Send + 'static,
         A: FnOnce() -> T + Send + 'static,
-        L: FnOnce(Result<T, String>) + Send + 'static,
+        L: FnOnce(Result<T, JoinFailure>) + Send + 'static,
     {
         let supervisor = Arc::clone(self);
         let mut drain = tokio::spawn(async move {
@@ -11316,13 +11316,15 @@ impl Supervisor {
         match tokio::time::timeout_at(deadline, &mut drain).await {
             Ok(Ok(value)) => DrainWithDeadline::Finished(value),
             Ok(Err(join_error)) => {
-                DrainWithDeadline::Panicked(JoinFailure::from_join_error(&join_error))
+                DrainWithDeadline::Failed(JoinFailure::from_join_error(&join_error))
             }
             Err(_elapsed) => {
                 drop(tokio::spawn(async move {
-                    on_late(drain.await.map_err(|join_error| {
-                        JoinFailure::from_join_error(&join_error).to_string()
-                    }));
+                    on_late(
+                        drain
+                            .await
+                            .map_err(|join_error| JoinFailure::from_join_error(&join_error)),
+                    );
                 }));
                 DrainWithDeadline::TimedOut
             }
@@ -20847,8 +20849,8 @@ mod tests {
     }
 
     /// A post-drain step that panics makes `drain_with_deadline` return
-    /// `Panicked(JoinFailure::Panicked)`, never `Finished`, and neither that
-    /// result nor the late callback's error carries the panic payload.
+    /// `Failed(JoinFailure::Panicked)`, never `Finished`, and the late callback
+    /// receives `Err(JoinFailure::Panicked)`, which carries no panic payload.
     #[tokio::test]
     async fn drain_with_deadline_reports_a_panicking_post_drain_step() {
         let supervisor_arc = supervisor_with_providers();
@@ -20860,8 +20862,8 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(outcome, DrainWithDeadline::Panicked(JoinFailure::Panicked)),
-            "a panicking post-drain step must report Panicked, got {outcome:?}"
+            matches!(outcome, DrainWithDeadline::Failed(JoinFailure::Panicked)),
+            "a panicking post-drain step must report Failed(Panicked), got {outcome:?}"
         );
         assert!(!format!("{outcome:?}").contains("secret-drain-payload"));
 
@@ -20893,7 +20895,7 @@ mod tests {
             .await
             .expect("the drain keeps running past the deadline")
             .expect("on_late receives the drain's result");
-        assert_eq!(late, Err(JoinFailure::Panicked.to_string()));
+        assert_eq!(late, Err(JoinFailure::Panicked));
     }
 
     /// `JoinFailure` names a panic as a panic and a cancellation as a

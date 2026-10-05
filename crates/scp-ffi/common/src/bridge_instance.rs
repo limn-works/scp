@@ -71,7 +71,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use scp_core::context::ContextPersistence;
-use scp_core::context::supervisor::{DrainWithDeadline, Supervisor};
+use scp_core::context::supervisor::{DrainWithDeadline, JoinFailure, Supervisor};
 use scp_core::discovery::handles::HandleRegistry;
 use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::scope::ScopeRegistry;
@@ -2821,7 +2821,7 @@ impl CoreFields {
             // itself; no caller remains to receive a close failure, so the
             // late callback logs it.
             let on_late =
-                move |late: Result<Result<(), scp_platform::PlatformError>, String>| match late {
+                move |late: Result<Result<(), scp_platform::PlatformError>, JoinFailure>| match late {
                     Ok(Ok(())) => {
                         tracing::info!("{}", late_drain_finished_message(has_durable_store));
                     }
@@ -2830,10 +2830,9 @@ impl CoreFields {
                         "late Supervisor drain finished but the durable store refused \
                          to close; it keeps its connection and advisory lock"
                     ),
-                    Err(panic) => tracing::error!(
-                        error = %panic,
+                    Err(failure) => tracing::error!(
                         "late {}",
-                        drain_panicked_message(has_durable_store)
+                        drain_failed_message(failure, has_durable_store)
                     ),
                 };
             match supervisor
@@ -2841,13 +2840,9 @@ impl CoreFields {
                 .await
             {
                 DrainWithDeadline::Finished(closed) => SupervisorDrain::Finished(closed),
-                DrainWithDeadline::Panicked(panic) => {
-                    tracing::error!(
-                        error = %panic,
-                        "{}",
-                        drain_panicked_message(has_durable_store)
-                    );
-                    SupervisorDrain::Panicked
+                DrainWithDeadline::Failed(failure) => {
+                    tracing::error!("{}", drain_failed_message(failure, has_durable_store));
+                    SupervisorDrain::Failed(failure)
                 }
                 DrainWithDeadline::TimedOut => {
                     tracing::warn!(
@@ -3008,18 +3003,25 @@ enum SupervisorDrain {
     /// The deadline passed first. The drain keeps running detached and
     /// closes the store when it finishes.
     Pending,
-    /// The drain task panicked. The store was not closed.
-    Panicked,
+    /// The drain task panicked or was cancelled. The store was not closed.
+    Failed(JoinFailure),
 }
 
-/// Log line for a Supervisor drain task that panicked. A durable store is
-/// named only when the instance has one.
-const fn drain_panicked_message(has_durable_store: bool) -> &'static str {
-    if has_durable_store {
-        "Supervisor drain panicked during shutdown — the durable store was not closed and \
-         keeps its advisory lock"
-    } else {
-        "Supervisor drain panicked during shutdown"
+/// Log line for a Supervisor drain task that ended without returning. A
+/// panic is named as a panic and a cancellation as a cancellation, and a
+/// durable store is named only when the instance has one.
+const fn drain_failed_message(failure: JoinFailure, has_durable_store: bool) -> &'static str {
+    match (failure, has_durable_store) {
+        (JoinFailure::Panicked, true) => {
+            "Supervisor drain panicked during shutdown — the durable store was not closed and \
+             keeps its advisory lock"
+        }
+        (JoinFailure::Panicked, false) => "Supervisor drain panicked during shutdown",
+        (JoinFailure::Cancelled, true) => {
+            "Supervisor drain was cancelled during shutdown — the durable store was not closed \
+             and keeps its advisory lock"
+        }
+        (JoinFailure::Cancelled, false) => "Supervisor drain was cancelled during shutdown",
     }
 }
 
@@ -3065,11 +3067,14 @@ fn combine_shutdown_outcome(
     drain: SupervisorDrain,
     has_durable_store: bool,
 ) -> Result<ShutdownOutcome, ShutdownError> {
-    let drain_panics = usize::from(matches!(drain, SupervisorDrain::Panicked));
+    let drain_panics = usize::from(matches!(
+        drain,
+        SupervisorDrain::Failed(JoinFailure::Panicked)
+    ));
     match drain {
         SupervisorDrain::Finished(Err(e)) => Err(ShutdownError::DurableStoreClose(e)),
         SupervisorDrain::Finished(Ok(())) => Ok(outcome),
-        SupervisorDrain::Pending | SupervisorDrain::Panicked => Ok(match outcome {
+        SupervisorDrain::Pending | SupervisorDrain::Failed(_) => Ok(match outcome {
             ShutdownOutcome::GracefulWithin { panicked_tasks, .. } => ShutdownOutcome::TimedOut {
                 aborted_tasks: 0,
                 panicked_tasks: panicked_tasks + drain_panics,
@@ -6138,18 +6143,34 @@ mod tests {
     #[test]
     fn drain_log_lines_name_the_store_only_when_one_exists() {
         for message in [
-            drain_panicked_message(true),
+            drain_failed_message(JoinFailure::Panicked, true),
+            drain_failed_message(JoinFailure::Cancelled, true),
             drain_timed_out_message(true),
             late_drain_finished_message(true),
         ] {
             assert!(message.contains("durable store"), "{message}");
         }
         for message in [
-            drain_panicked_message(false),
+            drain_failed_message(JoinFailure::Panicked, false),
+            drain_failed_message(JoinFailure::Cancelled, false),
             drain_timed_out_message(false),
             late_drain_finished_message(false),
         ] {
             assert!(!message.contains("store"), "{message}");
+        }
+    }
+
+    /// A drain failure's log line names a panic as a panic and a
+    /// cancellation as a cancellation.
+    #[test]
+    fn drain_failed_message_never_names_a_cancellation_a_panic() {
+        for has_store in [true, false] {
+            let panicked = drain_failed_message(JoinFailure::Panicked, has_store);
+            assert!(panicked.contains("panicked"), "{panicked}");
+            assert!(!panicked.contains("cancelled"), "{panicked}");
+            let cancelled = drain_failed_message(JoinFailure::Cancelled, has_store);
+            assert!(cancelled.contains("cancelled"), "{cancelled}");
+            assert!(!cancelled.contains("panicked"), "{cancelled}");
         }
     }
 
@@ -6220,12 +6241,31 @@ mod tests {
             }
         );
         assert_eq!(
-            combine_shutdown_outcome(graceful(), SupervisorDrain::Panicked, true).unwrap(),
+            combine_shutdown_outcome(
+                graceful(),
+                SupervisorDrain::Failed(JoinFailure::Panicked),
+                true
+            )
+            .unwrap(),
             ShutdownOutcome::TimedOut {
                 aborted_tasks: 0,
                 panicked_tasks: 1,
                 durable_store_open: true,
             }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(
+                graceful(),
+                SupervisorDrain::Failed(JoinFailure::Cancelled),
+                true
+            )
+            .unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 0,
+                panicked_tasks: 0,
+                durable_store_open: true,
+            },
+            "a cancelled drain is not counted as a panicked task"
         );
         assert_eq!(
             combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Pending, false).unwrap(),
