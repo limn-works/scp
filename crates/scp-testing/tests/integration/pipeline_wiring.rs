@@ -3855,15 +3855,37 @@ fn mcp_access_gates_pin_the_lifecycle_statement() {
         &production_code(&capability),
         false
     ));
-    // The statement before `bi` is bound, or after the tail, does not count.
-    let before_bind = RESOURCE_BRIDGE.replace(
-        "use scp_mcp::server::AccessRefusal;",
-        "use scp_mcp::server::AccessRefusal;\n    Self::gate_active_lifecycle(&bi, context_id)?;",
-    );
-    assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&before_bind),
-        true
-    ));
+    // The statement before `bi` is bound, or after the predicate call, does
+    // not count, whether it stands alone or beside the statement in the
+    // required slot.
+    for base in [RESOURCE_BRIDGE, resource.as_str()] {
+        let before_bind = base.replace(
+            "use scp_mcp::server::AccessRefusal;",
+            "use scp_mcp::server::AccessRefusal;\n    Self::gate_active_lifecycle(&bi, context_id)?;",
+        );
+        let after_check = base.replace(
+            "context_id);\n    access.map_err",
+            "context_id);\n    Self::gate_active_lifecycle(&bi, context_id)?;\n    access.map_err",
+        );
+        for misplaced in [before_bind, after_check] {
+            assert_ne!(misplaced, base);
+            assert!(
+                !answers_resource_access_from_live_role_state(&production_code(&misplaced), true),
+                "{misplaced}"
+            );
+        }
+    }
+    for base in [CAPABILITY_BRIDGE, capability.as_str()] {
+        let before_bind = base.replace(
+            "use scp_mcp::server::AccessRefusal;",
+            "use scp_mcp::server::AccessRefusal;\n    Self::gate_active_lifecycle(&bi, context_id)?;",
+        );
+        assert_ne!(before_bind, base);
+        assert!(
+            !answers_capability_from_live_role_state(&production_code(&before_bind), true),
+            "{before_bind}"
+        );
+    }
     // Its refusal discarded does not count.
     let discarded = capability.replace(
         "Self::gate_active_lifecycle(&bi, context_id)?;",
