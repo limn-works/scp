@@ -84,7 +84,7 @@ mise installs every tool except Rust. **Never use npm or npx** (bun only). Use `
 | **Rust** | `crates/` | `cargo clippy --workspace --all-targets` | `cargo fmt --all` | `cargo test --workspace` | `cargo build --workspace` |
 | **Python** | `bindings/python/` | `python3.12 -m ruff check .` | `python3.12 -m ruff format .` | `python3.12 -m pytest tests/ -v` | `maturin develop --release` |
 | **TypeScript** | `bindings/typescript/` | `bun run lint` | `bun run format` | `bun test` | `bun run build` |
-| **Kotlin** | `bindings/kotlin/` | `./gradlew detekt` | — | `./gradlew test` | `./gradlew assembleRelease` |
+| **Kotlin** | `bindings/kotlin/` | `./gradlew detekt` | — | `./gradlew test -Pscp.uniffi.cargoFeatures=testing` | `./gradlew assembleRelease` |
 | **Fuzzing** | `fuzz/` (standalone, nightly) | — | — | `cd fuzz && cargo fuzz run <target>` | `cd fuzz && cargo check` |
 
 - **Python linkage.** `cargo test -p scp-ffi` and `--workspace` need `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")`. Under `cargo nextest`, macOS SIP strips `DYLD_*` (exit 104, `Library not loaded: @rpath/libpython3.12.dylib`); use `RUSTFLAGS="-C link-arg=-Wl,-rpath,$LIBDIR"` with a separate `CARGO_TARGET_DIR`. CI's exact commands live in `.github/workflows/ci.yml`.

@@ -250,14 +250,45 @@ listOf("sourcesJar", "kotlinSourcesJar").forEach { sourcesJarTask ->
 // regenerated after any change to the UniFFI bridge (crates/scp-ffi/uniffi/).
 //
 // See ADR-021 (UniFFI Bridge) and .docs/scaffold/kotlin.md.
+//
+// Cargo features
+// --------------
+// `-Pscp.uniffi.cargoFeatures=<comma list>` names the cargo features the generator
+// passes to `cargo build` for the scp-ffi-uniffi cdylib and for uniffi-bindgen. A
+// build that does not pass the property builds the crate with its default features,
+// which are its production features. The `testing` feature gates the in-memory
+// custody arm and the `signed_at_override` parity affordance. So `testing` reaches
+// a build only when the caller names it.
+//
+// The value is read from the `-P` arguments of the outermost Gradle invocation
+// (the root build's, when this build is included in a composite). The build fails
+// when Gradle resolves the property to a different value, which happens when an
+// `ORG_GRADLE_PROJECT_` environment variable, an `org.gradle.project.` system
+// property or a gradle.properties file sets it and the command line does not.
 // ---------------------------------------------------------------------------
+val uniffiCargoFeatures: String =
+    generateSequence(gradle) { it.parent }.last()
+        .startParameter.projectProperties["scp.uniffi.cargoFeatures"] ?: ""
+val resolvedUniffiCargoFeatures: String = providers.gradleProperty("scp.uniffi.cargoFeatures").getOrElse("")
+if (resolvedUniffiCargoFeatures != uniffiCargoFeatures) {
+    throw GradleException(
+        "scp.uniffi.cargoFeatures resolves to '$resolvedUniffiCargoFeatures' but the command line passes " +
+            "'$uniffiCargoFeatures'; pass it only as -Pscp.uniffi.cargoFeatures=<list>",
+    )
+}
+if (!Regex("([A-Za-z0-9_/-]+(,[A-Za-z0-9_/-]+)*)?").matches(uniffiCargoFeatures)) {
+    throw GradleException(
+        "scp.uniffi.cargoFeatures is '$uniffiCargoFeatures'; it takes a comma-separated list of cargo feature names",
+    )
+}
+val uniffiFeatureArgs = if (uniffiCargoFeatures.isEmpty()) emptyList() else listOf("--features=$uniffiCargoFeatures")
+val uniffiPrebuiltBindings: String = providers.gradleProperty("scp.uniffi.prebuiltBindings").getOrElse("false")
+
 tasks.register<Exec>("generateUniffiBindings") {
     group = "codegen"
     description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
     workingDir = rootProject.projectDir.parentFile.parentFile
-    // The `testing` feature gates the in-memory custody arm and the `signed_at_override`
-    // parity affordance.
-    commandLine("./scripts/generate-uniffi-kotlin.sh", "--features=testing")
+    commandLine(listOf("./scripts/generate-uniffi-kotlin.sh") + uniffiFeatureArgs)
     // `-Pscp.uniffi.prebuiltBindings=true` skips this task and compiles the bindings
     // already in `uniffiBindingsDir`. The `kotlin-test` and `bridge-parity-kotlin` jobs
     // in `.github/workflows/ci.yml` set it: `kotlin-test` generates the bindings and the
@@ -268,8 +299,7 @@ tasks.register<Exec>("generateUniffiBindings") {
     // checks for the generated file while this task is configured and fails the build
     // without it, rather than letting `compileKotlin` run over an empty bindings
     // directory. Any value but `true` or `false` fails too.
-    val prebuiltBindings =
-        providers.gradleProperty("scp.uniffi.prebuiltBindings").getOrElse("false")
+    val prebuiltBindings = uniffiPrebuiltBindings
     when (prebuiltBindings) {
         "false" -> Unit
         "true" -> {
@@ -288,6 +318,88 @@ tasks.register<Exec>("generateUniffiBindings") {
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))
     outputs.dir(uniffiBindingsDir)
+}
+
+// `:scp-kt:test` loads the cdylib under cargo's target directory
+// (see `JnaLibraryPath` above), and its real-FFI suites create identities with the
+// in-memory custody arm, which only a `testing` build compiles. When this build
+// generates the bindings, it builds that cdylib too. When the task graph holds
+// `:scp-kt:test` and `scp.uniffi.prebuiltBindings` is not true, this check fails the
+// build before any task runs if `scp.uniffi.cargoFeatures` names neither `testing`
+// nor `scp-ffi-uniffi/testing`.
+//
+// uniffiBindingsGenerated is true when the task graph holds `generateUniffiBindings`
+// and `compileKotlin` of this project and `scp.uniffi.prebuiltBindings` is not true.
+//
+// uniffiPublishGuard(graph, owner, ownerCompileTask): when the task graph holds a
+// task of `owner` of type `AbstractPublishToMaven` (a remote repository or Maven
+// Local), it fails the build before any task runs unless Gradle resolves
+// `scp.uniffi.cargoFeatures` to the empty string, `scp.uniffi.prebuiltBindings` is
+// not true, and the graph holds this project's `generateUniffiBindings` and
+// `compileKotlin`, `owner`'s task named `ownerCompileTask`, and every task each such
+// publish task depends on, directly or transitively, so a `-x` that drops the task
+// building a published file (`jar`, `sourcesJar`, an AAR bundle) fails too.
+val generateUniffiBindingsPath = tasks.named("generateUniffiBindings").get().path
+val compileKotlinPath = "$path:compileKotlin"
+val uniffiPublishGuard: (TaskExecutionGraph, Project, String) -> Unit = { graph, owner, ownerCompileTask ->
+    val publishTasks = graph.allTasks.filter { it is AbstractPublishToMaven && it.project == owner }
+    val publishTask = publishTasks.firstOrNull()
+    val ownerCompilePath = "${owner.path}:$ownerCompileTask"
+    val publishDependencies = mutableSetOf<Task>()
+    val pending = ArrayDeque(publishTasks)
+    while (pending.isNotEmpty()) {
+        val current = pending.removeFirst()
+        current.taskDependencies.getDependencies(current).filter(publishDependencies::add).forEach(pending::addLast)
+    }
+    val missingTasks =
+        (setOf(generateUniffiBindingsPath, compileKotlinPath, ownerCompilePath) + publishDependencies.map { it.path })
+            .filterNot { graph.hasTask(it) }
+            .sorted()
+    if (publishTask != null &&
+        (resolvedUniffiCargoFeatures.isNotEmpty() || uniffiPrebuiltBindings == "true" || missingTasks.isNotEmpty())
+    ) {
+        throw GradleException(
+            "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
+                "and this build must generate the bindings; " +
+                "scp.uniffi.cargoFeatures is '$resolvedUniffiCargoFeatures', scp.uniffi.prebuiltBindings is " +
+                "'$uniffiPrebuiltBindings' and the task graph lacks $missingTasks",
+        )
+    }
+}
+extra["uniffiPublishGuard"] = uniffiPublishGuard
+var uniffiBindingsGenerated = false
+gradle.taskGraph.whenReady {
+    uniffiBindingsGenerated = uniffiPrebuiltBindings != "true" && hasTask(generateUniffiBindingsPath) &&
+        hasTask(compileKotlinPath)
+    uniffiPublishGuard(this, project, "compileKotlin")
+    val testTask = tasks.test.get()
+    val testFeatures = uniffiCargoFeatures.split(",")
+    if (hasTask(testTask) && uniffiPrebuiltBindings != "true" &&
+        "testing" !in testFeatures && "scp-ffi-uniffi/testing" !in testFeatures
+    ) {
+        throw GradleException(
+            "${testTask.path} needs a cdylib built with the testing feature; " +
+                "pass -Pscp.uniffi.cargoFeatures=testing",
+        )
+    }
+}
+
+// The JAR's manifest records `Scp-Uniffi-Cargo-Features` (the value of
+// `scp.uniffi.cargoFeatures`) and `Scp-Uniffi-Bindings` (`generated` when
+// uniffiBindingsGenerated is true, else `prebuilt`).
+tasks.jar {
+    val bindingsSource = provider { if (uniffiBindingsGenerated) "generated" else "prebuilt" }
+    // Declared as inputs so a change to either value reruns the task.
+    inputs.property("scpUniffiCargoFeatures", uniffiCargoFeatures)
+    inputs.property("scpUniffiBindings", bindingsSource)
+    doFirst {
+        manifest.attributes(
+            mapOf(
+                "Scp-Uniffi-Cargo-Features" to uniffiCargoFeatures,
+                "Scp-Uniffi-Bindings" to bindingsSource.get(),
+            ),
+        )
+    }
 }
 
 // Without this dependency, a developer who edits the UniFFI bridge and forgets

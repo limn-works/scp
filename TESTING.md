@@ -52,7 +52,7 @@ bun test
 ```bash
 cd bindings/kotlin
 eval "$(mise env)"    # sets JAVA_HOME
-./gradlew test
+./gradlew test -Pscp.uniffi.cargoFeatures=testing
 ```
 
 ### Swift

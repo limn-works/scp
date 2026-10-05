@@ -411,6 +411,28 @@ jobs:
         shell: bash
         run: bash repo/scripts/assert-nonempty-signing-set.sh --name '*.aar' --name '*.jar' maven-artifacts
 
+      # Fails unless every JAR in maven-artifacts has a manifest whose
+      # `Scp-Uniffi-Cargo-Features` is empty and whose `Scp-Uniffi-Bindings` is
+      # `generated`.
+      - name: Check each JAR's manifest has empty Scp-Uniffi-Cargo-Features and Scp-Uniffi-Bindings generated
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=0
+          while IFS= read -r -d '' jar; do
+            manifest=$(unzip -p "$jar" META-INF/MANIFEST.MF | tr -d '\r')
+            if ! grep -qx 'Scp-Uniffi-Cargo-Features: ' <<<"$manifest" ||
+              ! grep -qx 'Scp-Uniffi-Bindings: generated' <<<"$manifest"; then
+              echo "::error::$jar was not built from bindings generated with no scp.uniffi.cargoFeatures"
+              exit 1
+            fi
+            count=$((count + 1))
+          done < <(find maven-artifacts -type f -name '*.jar' -print0)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::maven-artifacts holds no JAR"
+            exit 1
+          fi
+
       - name: Sign artifacts
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}

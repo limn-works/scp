@@ -418,6 +418,7 @@ jobs:
               - 'crates/scp-alloc/**'
               - 'crates/scp-ffi/common/**'
               - 'scripts/generate-uniffi-kotlin.sh'
+              - '.github/workflows/ci.yml'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
@@ -1251,7 +1252,8 @@ jobs:
       - name: Run clippy over the workspace
         if: matrix.leg == 'workspace'
         run: |
-          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Enable testing for scp-ffi-uniffi so that the
           # in-memory custody code paths are lint-checked. Mobile production
           # builds (iOS XCFramework, Android .aar) MUST NOT enable this
@@ -1260,7 +1262,8 @@ jobs:
       - name: Run the examples gate
         if: matrix.leg == 'examples'
         run: |
-          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Asserts two things: every example target compiles and its example
           # source holds no construct the script's source scan rejects, and every
           # published examples/*.rs is some target's source. The script header
@@ -1269,7 +1272,8 @@ jobs:
       - name: Run clippy over per-package feature sets
         if: matrix.leg == 'packages'
         run: |
-          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # The optional network transports (quic, http3, udp, coap) are not in
           # the default feature set and are not activated by --workspace, so the
           # workspace leg's sweep never lints them. They rotted undetected for months
@@ -1744,7 +1748,8 @@ jobs:
           save-if: false
       - name: Run napi tests in production config (no custody/testing features)
         run: |
-          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Default features = production: `server` on, no in-memory custody and
           # no `scp-runtime`/`scp-core` `testing` gates. The feature-free
           # context-export tests run here for real; the bare/production target
@@ -1843,7 +1848,8 @@ jobs:
       - name: Build pyo3 bridge in production config (no in-memory custody)
         run: |
           # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
-          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi --features server
       - name: Shipped pyo3 fail-closed assertions
@@ -2101,7 +2107,8 @@ jobs:
         # both commands skip those two modules, so rustdoc resolves none of their
         # intra-doc links and `cargo test --doc` compiles none of their doctests.
         run: |
-          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          PY_LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="$PY_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
           cargo doc --workspace --no-deps --document-private-items --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs
 
@@ -3234,14 +3241,14 @@ jobs:
           packages: platform-tools
       - name: Accept Android SDK licenses
         run: |
-          mkdir -p $ANDROID_HOME/licenses
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > $ANDROID_HOME/licenses/android-sdk-license
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > $ANDROID_HOME/licenses/android-sdk-preview-license
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > $ANDROID_HOME/licenses/google-gdk-license
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > $ANDROID_HOME/licenses/intel-android-extra-license
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > $ANDROID_HOME/licenses/android-googletv-license
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
+          mkdir -p "$ANDROID_HOME/licenses"
+          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
+          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
+          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
+          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
+          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
       # `ktlintCheck`, not `runKtlintCheckOverMainSourceSet`: the `runKtlint*`
@@ -3329,6 +3336,87 @@ jobs:
               exit 1
             fi
           done
+      - name: Check scp.uniffi.cargoFeatures
+        run: |
+          set -euo pipefail
+          expect_failure() {
+            local message=$1
+            shift
+            local output
+            if output=$("$@" 2>&1); then
+              echo "::error::$* exited 0; it must fail with: $message"
+              exit 1
+            fi
+            if ! grep -qF -- "$message" <<<"$output"; then
+              echo "$output"
+              echo "::error::$* failed without: $message"
+              exit 1
+            fi
+          }
+          expect_failure "scp.uniffi.cargoFeatures is 'testing;rm'; it takes a comma-separated list of cargo feature names" \
+            ./gradlew :scp-kt:jar --dry-run "-Pscp.uniffi.cargoFeatures=testing;rm"
+          expect_failure ":scp-kt:test needs a cdylib built with the testing feature; pass -Pscp.uniffi.cargoFeatures=testing" \
+            ./gradlew :scp-kt:test --dry-run
+          ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=testing
+          ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=scp-ffi-uniffi/testing
+          # A placeholder scp.kt lets the prebuiltBindings=true cases reach the guard.
+          bindings=scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          for publish in :scp-kt:publishToMavenLocal:publishMavenJavaPublicationToMavenLocal \
+            :scp-kt-android:publishToMavenLocal:publishReleasePublicationToMavenLocal; do
+            project=${publish%%:publish*}
+            guard="$project:${publish##*:} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty"
+            publish=${publish%:*}
+            mkdir -p "$(dirname "$bindings")"
+            echo "// placeholder" > "$bindings"
+            for args in -Pscp.uniffi.cargoFeatures=testing -Pscp.uniffi.cargoFeatures=scp-ffi-uniffi/testing \
+              -Pscp.uniffi.cargoFeatures=outlet-capability-test-grant -Pscp.uniffi.prebuiltBindings=true; do
+              expect_failure "$guard" ./gradlew "$publish" "$args"
+            done
+            expect_failure "$guard" \
+              env ORG_GRADLE_PROJECT_scp.uniffi.prebuiltBindings=true bash ./gradlew "$publish"
+            rm "$bindings"
+            expect_failure "$guard" ./gradlew "$publish" -x generateUniffiBindings
+            expect_failure "$guard" ./gradlew "$publish" -x :scp-kt:compileKotlin
+            expect_failure "$guard" ./gradlew "$publish" -x :scp-kt:jar
+            if [ "$project" = :scp-kt-android ]; then
+              expect_failure "$guard" ./gradlew "$publish" -x :scp-kt-android:compileReleaseKotlin
+              expect_failure "$guard" ./gradlew "$publish" -x :scp-kt-android:bundleReleaseAar
+            else
+              expect_failure "$guard" ./gradlew "$publish" -x :scp-kt:sourcesJar
+            fi
+            expect_failure "$guard" \
+              env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing bash ./gradlew "$publish" -Pscp.uniffi.cargoFeatures=testing
+            expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
+              env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing bash ./gradlew "$publish"
+            expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
+              ./gradlew -Dorg.gradle.project.scp.uniffi.cargoFeatures=testing "$publish"
+            ./gradlew -q "$publish" --dry-run
+          done
+          for publish in :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository \
+            :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository; do
+            guard="$publish publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty"
+            mkdir -p "$(dirname "$bindings")"
+            echo "// placeholder" > "$bindings"
+            expect_failure "$guard" ./gradlew "$publish" -Pscp.uniffi.cargoFeatures=testing
+            expect_failure "$guard" ./gradlew "$publish" -Pscp.uniffi.prebuiltBindings=true
+            rm "$bindings"
+            expect_failure "$guard" ./gradlew "$publish" -x generateUniffiBindings
+            ./gradlew -q "$publish" --dry-run
+          done
+      - name: Check the Scp-Uniffi attributes in the scp-kt JAR manifest
+        run: |
+          set -euo pipefail
+          for args in -Pscp.uniffi.cargoFeatures= -Pscp.uniffi.cargoFeatures=testing; do
+            rm -f scp-kt/build/libs/*.jar
+            ./gradlew -q :scp-kt:jar -x compileKotlin -x compileJava "$args"
+            manifest=$(unzip -p scp-kt/build/libs/*.jar META-INF/MANIFEST.MF | tr -d '\r')
+            if ! grep -qx "Scp-Uniffi-Cargo-Features: ${args#-Pscp.uniffi.cargoFeatures=}" <<<"$manifest" ||
+              ! grep -qx 'Scp-Uniffi-Bindings: prebuilt' <<<"$manifest"; then
+              echo "$manifest"
+              echo "::error::Gradle task :scp-kt:jar with $args wrote the wrong Scp-Uniffi attributes"
+              exit 1
+            fi
+          done
       # `:scp-kt-android` declares detekt in its own build.gradle.kts and no job
       # invoked it, so every rule in ../detekt.yml — ForbiddenComment among them,
       # which is how this repository enforces its Kotlin stub policy — went
@@ -3407,14 +3495,14 @@ jobs:
           packages: platform-tools
       - name: Accept Android SDK licenses
         run: |
-          mkdir -p $ANDROID_HOME/licenses
-          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > $ANDROID_HOME/licenses/android-sdk-license
-          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > $ANDROID_HOME/licenses/android-sdk-preview-license
-          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > $ANDROID_HOME/licenses/google-gdk-license
-          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > $ANDROID_HOME/licenses/intel-android-extra-license
-          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > $ANDROID_HOME/licenses/android-googletv-license
-          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > $ANDROID_HOME/licenses/android-googlexr-license
-          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > $ANDROID_HOME/licenses/mips-android-sysimage-license
+          mkdir -p "$ANDROID_HOME/licenses"
+          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
+          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
+          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
+          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
+          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
       - run: sdkmanager "platforms;android-35"
       - name: Hash the artifact inputs no file glob covers
         id: artifact-inputs
@@ -3539,9 +3627,26 @@ jobs:
           # `-Pscp.uniffi.prebuiltBindings=true` skips `generateUniffiBindings`, which
           # would otherwise rebuild the crate, so these tests compile against the
           # bindings this job uploads and load the cdylib it uploads.
-          # No PR or merge-queue run executes `generateUniffiBindings`; only
-          # build-matrix.yml and release.yml do.
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
+      # This step replaces the generator script with one that exits 0, so
+      # `generateUniffiBindings` and `compileKotlin` run without a Rust toolchain
+      # and the JAR must record `Scp-Uniffi-Bindings: generated`.
+      - name: Check the scp-kt JAR manifest records generated bindings
+        working-directory: bindings/kotlin
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          set -euo pipefail
+          printf '#!/bin/sh\nexit 0\n' > ../../scripts/generate-uniffi-kotlin.sh
+          rm -f scp-kt/build/libs/*.jar
+          ./gradlew -q :scp-kt:jar -Pscp.uniffi.cargoFeatures=testing
+          manifest=$(unzip -p scp-kt/build/libs/*.jar META-INF/MANIFEST.MF | tr -d '\r')
+          if ! grep -qx 'Scp-Uniffi-Cargo-Features: testing' <<<"$manifest" ||
+            ! grep -qx 'Scp-Uniffi-Bindings: generated' <<<"$manifest"; then
+            echo "$manifest"
+            echo "::error::Gradle task :scp-kt:jar that ran generateUniffiBindings and compileKotlin wrote the wrong Scp-Uniffi attributes"
+            exit 1
+          fi
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:

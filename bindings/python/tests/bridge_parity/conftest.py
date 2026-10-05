@@ -333,14 +333,15 @@ def kotlin_runner() -> Iterator[RunnerClient]:
 
     JNA loads the UniFFI cdylib via the JVM library path. CI exports
     `LD_LIBRARY_PATH` pointing at the Rust target directory; locally,
-    run `./gradlew -p . installDist` with the same env set before
-    starting the tests.
+    run `./gradlew -p . installDist -Pscp.uniffi.cargoFeatures=testing`
+    with the same env set before starting the tests.
     """
     binary = _kotlin_runner_binary()
     if binary is None:
         pytest.skip(
             "Kotlin parity runner not built. Set SCP_PARITY_KOTLIN_RUNNER "
-            "or run installDist under helpers/kotlin_bridge_runner/."
+            "or run installDist -Pscp.uniffi.cargoFeatures=testing under "
+            "helpers/kotlin_bridge_runner/."
         )
 
     # JNA needs a path to the UniFFI cdylib. On macOS, DYLD_* env vars
