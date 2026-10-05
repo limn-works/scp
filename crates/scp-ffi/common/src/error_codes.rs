@@ -1199,9 +1199,7 @@ pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
 /// The store has released its database connection.
 ///
 /// Each bridge's `From<scp_platform::PlatformError>` translation maps
-/// `scp_platform::PlatformError::StorageClosed` to this code. A
-/// `SqliteStorage` returns that error for every operation after its
-/// `close()` ran (spec §17.6 "One Writer per Durable Directory").
+/// `scp_platform::PlatformError::StorageClosed` to this code.
 pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
 
 // -------------------------------------------------------------------------
