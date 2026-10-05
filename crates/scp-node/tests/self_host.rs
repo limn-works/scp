@@ -871,13 +871,19 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     //    the SAME root directory MUST be rejected by the advisory lock. This is
     //    precisely what the binary used to do at its second `open_sqlite_or_exit`
     //    call, and is the bug this fix removes. --
-    let second_open = SqliteStorage::new(&storage_dir, storage_key.as_ref());
+    let second_open = scp_node::self_host::open_sqlite(&storage_dir, &storage_key);
     let err = second_open
         .err()
         .expect("opening the root DB twice (while the first handle lives) must fail");
     assert!(
-        matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }),
-        "the second root open must be rejected by the advisory lock, got: {err}"
+        matches!(
+            &err,
+            scp_node::self_host::HostSiteError::StorageOpen {
+                error: scp_platform::PlatformError::StorageLockHeld { .. },
+                ..
+            }
+        ),
+        "the second root open must be rejected by the advisory lock, typed, got: {err}"
     );
 
     // -- A second, live owner of the SAME handle, standing in for the binary's

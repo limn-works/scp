@@ -42,9 +42,9 @@ use scp_dht::{DhtClient, DisabledDhtClient, PkarrDhtClient};
 use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::SequenceStore;
 use scp_identity::{DidCache, DidDht, DidMethod as _, IdentityError};
-use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
+use scp_platform::{KeyCustody, PlatformError};
 
 use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
 use crate::{ApplicationNode, NodeError, PublicSurface, projection};
@@ -1157,9 +1157,20 @@ pub enum HostSiteError {
     /// The `SQLCipher` encryption key could not be resolved or generated.
     #[error("storage key error: {0}")]
     StorageKey(String),
-    /// An encrypted `SQLite` database could not be opened.
-    #[error("storage open error: {0}")]
-    StorageOpen(String),
+    /// An encrypted `SQLite` database at `dir` could not be opened. Carries
+    /// the typed [`PlatformError`], so a caller matches
+    /// `StorageOpen { error: PlatformError::StorageLockHeld { .. }, .. }` to
+    /// detect a directory whose lock is still held without reading the
+    /// message text. The `PlatformError` text is in this variant's Display and
+    /// not returned from `source()`, so a chain-walking reporter prints it
+    /// once.
+    #[error("failed to open SQLite storage at '{}': {error}", dir.display())]
+    StorageOpen {
+        /// The directory whose database failed to open.
+        dir: PathBuf,
+        /// The typed open failure from [`SqliteStorage::new`].
+        error: PlatformError,
+    },
     /// The deployer's encrypted `SQLite` MLS store refused to close after its
     /// Supervisor drained. The store keeps its connection and advisory lock.
     #[error("storage close error: {0}")]
@@ -2076,11 +2087,9 @@ pub fn resolve_storage_key(storage_dir: &Path) -> Result<Zeroizing<[u8; 32]>, Ho
 ///
 /// Returns [`HostSiteError::StorageOpen`] if the database cannot be opened.
 pub fn open_sqlite(dir: &Path, key: &Zeroizing<[u8; 32]>) -> Result<SqliteStorage, HostSiteError> {
-    SqliteStorage::new(dir, key.as_ref()).map_err(|e| {
-        HostSiteError::StorageOpen(format!(
-            "failed to open SQLite storage at '{}': {e}",
-            dir.display()
-        ))
+    SqliteStorage::new(dir, key.as_ref()).map_err(|error| HostSiteError::StorageOpen {
+        dir: dir.to_path_buf(),
+        error,
     })
 }
 
@@ -2513,11 +2522,7 @@ async fn build_host_site_deployer<S>(
 where
     S: scp_platform::EncryptedStorage + 'static,
 {
-    let mls_inner = Arc::new(
-        SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref()).map_err(|e| {
-            HostSiteError::StorageOpen(format!("failed to open MLS SQLite storage: {e}"))
-        })?,
-    );
+    let mls_inner = Arc::new(open_sqlite(&storage_dir.join("mls"), storage_key)?);
     // The durable saga journal and the `mls_storage` view are bound into one
     // `DurableProviders` derived from the SAME `Arc<SqliteStorage>`, so
     // crash-recovery replay and the `OpenMLS` view read and write one
@@ -2806,12 +2811,18 @@ mod tests {
             ),
             "a setup drain timeout must be HostSiteError::Drain, got {err:?}"
         );
+        let held = open_sqlite(&dir, &Zeroizing::new(key));
         assert!(
             matches!(
-                SqliteStorage::new(&dir, &key),
-                Err(scp_platform::PlatformError::StorageLockHeld { .. })
+                &held,
+                Err(HostSiteError::StorageOpen {
+                    dir: d,
+                    error: PlatformError::StorageLockHeld { .. },
+                }) if *d == dir
             ),
-            "the store must keep its lock after a setup drain timeout"
+            "the store must keep its lock after a setup drain timeout, and the \
+             self-host open must report it typed: {:?}",
+            held.err()
         );
 
         let failed = SelfHostError::CommitDeploy("y".to_owned());
@@ -2820,7 +2831,7 @@ mod tests {
             matches!(&err, HostSiteError::DeployerSetup(m) if m == "failed to commit deploy: y"),
             "a drained setup failure must be DeployerSetup, got {err:?}"
         );
-        let reopened = SqliteStorage::new(&dir, &key);
+        let reopened = open_sqlite(&dir, &Zeroizing::new(key));
         assert!(
             reopened.is_ok(),
             "the store must release its lock after a drained setup failure: {:?}",

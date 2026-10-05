@@ -598,6 +598,17 @@ fn open_conn<'g>(
     guard.as_ref().ok_or(PlatformError::StorageClosed)
 }
 
+#[cfg(test)]
+impl SqliteStorage {
+    /// Runs `f` on the open connection through the same [`lock_conn`] and
+    /// [`open_conn`] checks every [`Storage`] operation uses, so tests that
+    /// use the connection do not depend on the `conn` field's representation.
+    fn with_open_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> Result<R, PlatformError> {
+        let guard = lock_conn(&self.conn)?;
+        Ok(f(open_conn(&guard)?))
+    }
+}
+
 /// Collects rows from a statement into a `Vec<String>`.
 fn collect_keys(
     stmt: &mut rusqlite::CachedStatement<'_>,
@@ -788,19 +799,20 @@ mod tests {
     fn connection_serves_nothing_from_lookaside() {
         let dir = TempDir::new().expect("tempdir should succeed");
         let storage = SqliteStorage::new(dir.path(), &[0xAB; 32]).expect("new should succeed");
-        let conn = storage
-            .conn
-            .lock()
-            .expect("connection lock should not be poisoned");
-        conn.execute_batch("CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)")
-            .expect("probe table should be created");
-        conn.execute(
-            "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
-            rusqlite::params!["a-key", vec![0x5A_u8; 64]],
-        )
-        .expect("insert should run");
-        let used = scp_sqlite_pools::lookaside_use(&conn).expect("lookaside status should read");
-        drop(conn);
+        let used = storage
+            .with_open_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)",
+                )
+                .expect("probe table should be created");
+                conn.execute(
+                    "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
+                    rusqlite::params!["a-key", vec![0x5A_u8; 64]],
+                )
+                .expect("insert should run");
+                scp_sqlite_pools::lookaside_use(conn).expect("lookaside status should read")
+            })
+            .expect("the connection should be open");
         assert_eq!(
             used,
             scp_sqlite_pools::LookasideUse {
@@ -1112,11 +1124,10 @@ mod tests {
         store.close().expect("close must succeed");
 
         assert!(
-            store
-                .conn
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
+            matches!(
+                store.with_open_conn(|_| ()),
+                Err(PlatformError::StorageClosed)
+            ),
             "close must drop the connection, not only the lock file"
         );
 
