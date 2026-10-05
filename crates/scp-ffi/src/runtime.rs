@@ -1953,10 +1953,8 @@ fn role_state_on(
 /// `member_did` as a member.
 ///
 /// Reads each registered context's role state from the supervisor actor
-/// (ADR-049 §10). A registered context the supervisor holds no actor for is
-/// omitted. With
-/// no registered context it returns an empty Vec without resolving the
-/// supervisor.
+/// (ADR-049 §10). With no registered context it returns an empty Vec without
+/// resolving the supervisor.
 ///
 /// # Errors
 ///

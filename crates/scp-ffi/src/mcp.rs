@@ -3074,31 +3074,21 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // FfiBridgeProvider::validate_capability — kind-aware defense-in-depth gate
-    // (SCP-OUT-014, §5.4.2). Proves the MCP bridge's role-state check reads the
-    // outlet's registered kind from the runtime registry and dispatches to the
-    // matching split stem: a Query outlet is DENIED to an OutletCall-only member
-    // and ALLOWED to an OutletQuery-only member. This exercises the exact
-    // registry-kind read + `has_outlet_invocation_capability` dispatch the fixed
-    // gate at mcp.rs performs against real bridge state (registered outlet +
-    // role_state). The full through-`validate_capability` path additionally
-    // requires a valid 11-step UCAN token; that primary layer is covered by the
-    // #319 UCAN tests, and the shared gate is covered end-to-end by the runtime
-    // `invoke_query_session_*` test.
-    #[test]
-    #[allow(clippy::too_many_lines)] // End-to-end query-gate test: register + role-state + two-member gate assertions.
-    fn ffi_bridge_provider_validate_capability_query_kind_selects_query_stem() {
-        use scp_core::context::roles::Capability;
+    // (SCP-OUT-014, §5.4.2). A Query outlet is DENIED to an agent whose actor
+    // role state holds only the Action stem and passes the role-state check for
+    // an agent holding the Query stem.
+    // -----------------------------------------------------------------------
 
-        let creator = "did:dht:z6MkCreatorQueryStem";
-        let member = "did:dht:z6MkMemberQueryStem";
-        let bi = __bi();
-        // Register the context WITHOUT the default calculator outlet — we add a
-        // Query-kind one explicitly below.
-        let ctx_id = setup_unsupervised_context(&bi, creator, false);
-
-        // Register a QUERY-kind outlet and add a member holding ONLY the
-        // Action-class OutletCall grant.
-        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+    /// Holds a context on the actor with `ceiling`, which the creator holds as
+    /// admin, and registers a Query-kind `lookup` outlet on the bridge copy,
+    /// where `outlet_grant` reads the outlet's kind.
+    fn setup_query_outlet_context(
+        bi: &crate::runtime::PyBridgeInstance,
+        creator: &str,
+        ceiling: &[&str],
+    ) -> String {
+        let ctx_id = setup_supervised_context(bi, creator, false, ceiling);
+        crate::runtime::with_context(bi, &ctx_id, |rt| {
             let registration = scp_core::context::outlets::OutletRegistration {
                 outlet_id: "lookup".to_owned(),
                 kind: scp_core::context::outlets::OutletKind::Query,
@@ -3135,75 +3125,49 @@ mod tests {
                 creator,
             )
             .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
-
-            rt.role_state.members.insert(member.to_owned());
-            rt.role_state.member_capabilities.insert(
-                member.to_owned(),
-                std::iter::once(Capability::OutletCall("lookup".to_owned())).collect(),
-            );
             Ok(())
         })
         .unwrap();
+        ctx_id
+    }
 
-        // The MCP defense-in-depth gate reads the registered kind and dispatches
-        // via `has_outlet_invocation_capability`. An OutletCall-only member is
-        // DENIED on a Query outlet because the two stems are independent.
-        let denied = crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            let kind = rt
-                .outlet_registry
-                .get("lookup")
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
-            assert_eq!(
-                kind,
-                scp_core::context::outlets::OutletKind::Query,
-                "outlet must round-trip as Query through the bridge registry"
-            );
-            Ok(
-                scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                    &rt.role_state,
-                    member,
-                    "lookup",
-                    kind,
-                ),
-            )
-        })
-        .unwrap();
+    /// The token is unparseable, so an agent that passes the role-state check
+    /// is refused at the UCAN step with "UCAN authorization failed", and an
+    /// agent the role-state check refuses gets "insufficient permissions".
+    #[test]
+    fn ffi_bridge_provider_validate_capability_query_kind_selects_query_stem() {
+        let creator = "did:dht:z6MkCreatorQueryStem";
+        let bi = __bi();
+        let validate = |ctx_id: &str| {
+            FfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: creator.to_owned(),
+                context_ids: vec![ctx_id.to_owned()],
+                outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+                agent_ucan_token: Some("not-a-ucan".to_owned()),
+                agent_proof_tokens: None,
+            }
+            .validate_capability(ctx_id, "lookup", scp_mcp::server::CapabilityCheck::Probe)
+            .unwrap_err()
+        };
+
+        let call_only =
+            setup_query_outlet_context(&bi, creator, &["messages:read", "outlet:call:*"]);
+        let err = validate(&call_only);
         assert!(
-            !denied,
-            "Query outlet must be denied to a member holding only OutletCall"
+            matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg == "insufficient permissions to invoke outlet"),
+            "a Query outlet must be denied to an agent holding only the Action stem: {err}"
         );
 
-        // Grant the Query-class capability → ALLOWED.
-        crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            rt.role_state
-                .member_capabilities
-                .get_mut(member)
-                .unwrap()
-                .insert(Capability::OutletQuery("lookup".to_owned()));
-            Ok(())
-        })
-        .unwrap();
-        let allowed = crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            let kind = rt
-                .outlet_registry
-                .get("lookup")
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
-            Ok(
-                scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                    &rt.role_state,
-                    member,
-                    "lookup",
-                    kind,
-                ),
-            )
-        })
-        .unwrap();
+        let query = setup_query_outlet_context(&bi, creator, &["messages:read", "outlet:query:*"]);
+        let err = validate(&query);
         assert!(
-            allowed,
-            "Query outlet must be allowed once the member holds OutletQuery"
+            matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
+            "an agent holding the Query stem must pass the role-state check: {err}"
         );
 
-        crate::runtime::remove_context(&bi, &ctx_id);
+        crate::runtime::remove_context(&bi, &call_only);
+        crate::runtime::remove_context(&bi, &query);
     }
 
     // -----------------------------------------------------------------------
