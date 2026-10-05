@@ -5772,9 +5772,6 @@ pub(crate) async fn invoke_outlet_cross_context<E>(
 where
     E: OutletExecutor + ?Sized + 'static,
 {
-    // Taken first, so an open refused by shutdown has reserved nothing, and the
-    // bridge task below spawns through it without a second refusal point after
-    // B's stream is open (ADR-049 Decision 16, item 2).
     let spawner = supervisor
         .tracked_spawner("open cross-context outlet stream")
         .map_err(|refused| InvocationError::SupervisorShutDown {
