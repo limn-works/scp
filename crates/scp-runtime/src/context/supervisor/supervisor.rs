@@ -5035,13 +5035,17 @@ impl Supervisor {
         // Read the crash instant (degraded-window `warn!` factored into
         // `crash_now_ms`).
         let now_ms = self.crash_now_ms("context_actor", &ctx_id);
-        // Record the crash and copy the budget state OUT of the DashMap
-        // entry, then DROP the guard before any `.await` (the workspace
-        // denies `await_holding_lock`).
-        let (poisoned, count) = {
-            let mut entry = self.crash_windows.entry(ctx_id.clone()).or_default();
-            let poisoned = entry.record(now_ms);
-            (poisoned, entry.crash_count())
+        // Record the crash, or, once shutdown has begun, record nothing and
+        // start no respawn (ADR-049 Decision 16 item 2): `shutdown_sweep`
+        // reaps the crash window, and a record made after it would outlive it.
+        let Some((poisoned, count)) = self.record_crash_while_open(&ctx_id, now_ms, false) else {
+            tracing::warn!(
+                actor_kind = "context_actor",
+                context_id = %ctx_id,
+                "context actor panicked after shutdown began; not respawned, payload intentionally not logged"
+            );
+            self.despawn_actor(&ctx_id).await;
+            return;
         };
 
         // Payload-free diagnostic (ADR-049 §10). The panic payload is
@@ -5094,6 +5098,13 @@ impl Supervisor {
                     "context actor crashed in a terminal state; not respawned (dormant)"
                 );
             }
+            Err(ContextError::SupervisorShutDown(_)) => {
+                tracing::info!(
+                    actor_kind = "context_actor",
+                    context_id = %ctx_id,
+                    "context actor respawn refused: shutdown began during the respawn"
+                );
+            }
             Err(e) => {
                 tracing::error!(
                     actor_kind = "context_actor",
@@ -5137,10 +5148,22 @@ impl Supervisor {
 
         let poison_key = Self::kp_crash_key(&identity);
         let now_ms = self.crash_now_ms("key_package_store", &identity.0);
-        let (poisoned, count) = {
-            let mut entry = self.crash_windows.entry(poison_key.clone()).or_default();
-            let poisoned = entry.record(now_ms);
-            (poisoned, entry.crash_count())
+        // Once shutdown has begun, a panic records no crash and starts no
+        // respawn, as in `actor_watchdog`. Remove the dead handle.
+        let Some((poisoned, count)) = self.record_crash_while_open(&poison_key, now_ms, false)
+        else {
+            tracing::warn!(
+                actor_kind = "key_package_store",
+                identity = %identity.0,
+                "key-package actor panicked after shutdown began; not respawned, payload intentionally not logged"
+            );
+            {
+                let _guard = self.write_lock.lock().await;
+                self.key_package_stores.remove(&identity);
+            }
+            #[cfg(feature = "testing")]
+            self.kp_watchdog_processed_tx.send_modify(|n| *n += 1);
+            return;
         };
 
         // Payload-free diagnostic (ADR-049 §10) — the panic payload may carry
@@ -5180,19 +5203,23 @@ impl Supervisor {
         // Budget intact: respawn. The fresh actor re-runs the §9 reconciliation
         // from `mls_storage` in its `run()` startup, rebuilding `pool` /
         // `reserved` from the durable journal — NOT a coalesced snapshot.
-        if let Err(e) = self.key_package_store_for(&identity).await {
-            tracing::error!(
+        match self.key_package_store_for(&identity).await {
+            Ok(_) => tracing::info!(
+                actor_kind = "key_package_store",
+                identity = %identity.0,
+                "key-package actor respawned; reconciling from durable storage"
+            ),
+            Err(ContextError::SupervisorShutDown(_)) => tracing::info!(
+                actor_kind = "key_package_store",
+                identity = %identity.0,
+                "key-package actor respawn refused: shutdown began during the respawn"
+            ),
+            Err(e) => tracing::error!(
                 actor_kind = "key_package_store",
                 identity = %identity.0,
                 error = %e,
                 "key-package actor respawn failed"
-            );
-        } else {
-            tracing::info!(
-                actor_kind = "key_package_store",
-                identity = %identity.0,
-                "key-package actor respawned; reconciling from durable storage"
-            );
+            ),
         }
         // Test-only: the crash is recorded and the respawn attempt has
         // completed (fresh handle inserted, or the failure logged + recorded) —
@@ -5282,29 +5309,39 @@ impl Supervisor {
         let Some(persistence) = self.persistence_ref() else {
             // No persistence backend configured — cannot respawn. Count it
             // as a failed respawn so the budget applies.
-            self.record_respawn_failure(ctx_id).await;
-            return Err(ContextError::ActorCrashed(format!(
-                "{ctx_id} (no persistence backend configured for respawn)"
-            )));
+            return self
+                .record_respawn_failure(
+                    ctx_id,
+                    ContextError::ActorCrashed(format!(
+                        "{ctx_id} (no persistence backend configured for respawn)"
+                    )),
+                )
+                .await;
         };
         let snapshot = match persistence.load_context(ctx_id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
-                self.record_respawn_failure(ctx_id).await;
                 tracing::error!(
                     actor_kind = "context_actor",
                     context_id = %ctx_id,
                     "context actor crashed with no persisted snapshot; state is lost"
                 );
-                return Err(ContextError::ActorCrashed(format!(
-                    "{ctx_id} (no persisted snapshot — state lost)"
-                )));
+                return self
+                    .record_respawn_failure(
+                        ctx_id,
+                        ContextError::ActorCrashed(format!(
+                            "{ctx_id} (no persisted snapshot — state lost)"
+                        )),
+                    )
+                    .await;
             }
             Err(e) => {
-                self.record_respawn_failure(ctx_id).await;
-                return Err(ContextError::ActorCrashed(format!(
-                    "{ctx_id} (snapshot load failed: {e})"
-                )));
+                return self
+                    .record_respawn_failure(
+                        ctx_id,
+                        ContextError::ActorCrashed(format!("{ctx_id} (snapshot load failed: {e})")),
+                    )
+                    .await;
             }
         };
 
@@ -5335,13 +5372,7 @@ impl Supervisor {
             // a clean terminal context leaves no lingering crash-window record;
             // otherwise just clear the marker, preserving its real crash
             // history.
-            let reaped = self
-                .crash_windows
-                .remove_if(ctx_id, |_, w| w.is_empty_except_respawning())
-                .is_some();
-            if !reaped && let Some(mut entry) = self.crash_windows.get_mut(ctx_id) {
-                entry.clear_respawning();
-            }
+            self.release_respawn_marker(ctx_id);
             return Err(ContextError::ContextClosed);
         }
 
@@ -5374,17 +5405,18 @@ impl Supervisor {
         // before calling `restore_context`. On a transition failure, count it
         // as a failed respawn.
         if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
-            self.record_respawn_failure(ctx_id).await;
-            return Err(ContextError::ActorCrashed(format!(
-                "{ctx_id} (could not activate respawned context handle: {e})"
-            )));
+            return self
+                .record_respawn_failure(
+                    ctx_id,
+                    ContextError::ActorCrashed(format!(
+                        "{ctx_id} (could not activate respawned context handle: {e})"
+                    )),
+                )
+                .await;
         }
         let deps = match self.build_actor_deps(owning_did).await {
             Ok(deps) => deps,
-            Err(e) => {
-                self.record_respawn_failure(ctx_id).await;
-                return Err(e);
-            }
+            Err(e) => return self.record_respawn_failure(ctx_id, e).await,
         };
         // The recursive async cycle through `restore_context` →
         // `spawn_actor_with_state` is broken by `spawn_actor_watchdog_task`
@@ -5439,16 +5471,16 @@ impl Supervisor {
                 );
                 Ok(())
             }
-            Ok(Err(e)) => {
-                self.record_respawn_failure(ctx_id).await;
-                Err(e)
-            }
+            Ok(Err(e)) => self.record_respawn_failure(ctx_id, e).await,
             Err(_elapsed) => {
-                self.record_respawn_failure(ctx_id).await;
-                Err(ContextError::TransportTimeout(format!(
-                    "respawn restore_context exceeded {:?} budget for context {ctx_id}",
-                    Self::LIFECYCLE_TIMEOUT
-                )))
+                self.record_respawn_failure(
+                    ctx_id,
+                    ContextError::TransportTimeout(format!(
+                        "respawn restore_context exceeded {:?} budget for context {ctx_id}",
+                        Self::LIFECYCLE_TIMEOUT
+                    )),
+                )
+                .await
             }
         }
     }
@@ -5463,7 +5495,21 @@ impl Supervisor {
     /// `despawn_actor` (the workspace denies `await_holding_lock`). Collapsing
     /// the former six inline `record_failure(self)` + `if poisoned { despawn }`
     /// blocks into this single helper is behaviour-preserving.
-    async fn record_respawn_failure(self: &Arc<Self>, ctx_id: &str) {
+    ///
+    /// Every respawn failure exit returns through this helper, which returns
+    /// `Err(cause)`. A [`ContextError::SupervisorShutDown`] cause, or any cause
+    /// once the closed flag is set, records no crash and sets no failed-respawn
+    /// flag (ADR-049 Decision 16 item 2): it only releases the respawn marker,
+    /// so the crash window `shutdown_sweep` reaped stays reaped.
+    async fn record_respawn_failure(
+        self: &Arc<Self>,
+        ctx_id: &str,
+        cause: ContextError,
+    ) -> Result<(), ContextError> {
+        if matches!(cause, ContextError::SupervisorShutDown(_)) {
+            self.release_respawn_marker(ctx_id);
+            return Err(cause);
+        }
         // Mirror `actor_watchdog`'s clock-absent handling: without a clock the
         // crash window degrades to "crashes-ever" (no 60s slide). Emit the
         // same loud, payload-free warning here so a respawn-failure recorded on
@@ -5482,17 +5528,27 @@ impl Supervisor {
             },
             |c| scp_clock::Clock::now_millis(c.as_ref()),
         );
-        let poisoned = {
-            let mut entry = self.crash_windows.entry(ctx_id.to_owned()).or_default();
-            entry.mark_respawn_failed();
-            // The respawn attempt has resolved (in failure): clear the
-            // transient mid-respawn marker so a subsequent lookup-miss reflects
-            // the now-stable failed/poisoned state, not "respawning".
-            entry.clear_respawning();
-            entry.record(now_ms)
+        let Some((poisoned, _count)) = self.record_crash_while_open(ctx_id, now_ms, true) else {
+            self.release_respawn_marker(ctx_id);
+            return Err(cause);
         };
         if poisoned {
             self.despawn_actor(ctx_id).await;
+        }
+        Err(cause)
+    }
+
+    /// Clear the respawn marker `respawn_from_snapshot` set, on an exit that
+    /// records no crash. A window that carries only that marker is removed, so
+    /// a context with no crash history leaves no crash-window record; any
+    /// other window keeps its crash history and loses only the marker.
+    fn release_respawn_marker(&self, ctx_id: &str) {
+        let reaped = self
+            .crash_windows
+            .remove_if(ctx_id, |_, w| w.is_empty_except_respawning())
+            .is_some();
+        if !reaped && let Some(mut entry) = self.crash_windows.get_mut(ctx_id) {
+            entry.clear_respawning();
         }
     }
 
@@ -11308,6 +11364,44 @@ impl Supervisor {
         Ok(spawner)
     }
 
+    /// Records one crash at `now_ms` in the crash window keyed `key` and
+    /// returns `(poisoned, crash_count)`, or records nothing and returns `None`
+    /// once the closed flag is set (ADR-049 Decision 16 item 2). With
+    /// `respawn_failed`, it also sets the failed-respawn flag and clears the
+    /// respawn marker. The two watchdogs and `record_respawn_failure` record a
+    /// crash only through this method.
+    ///
+    /// The record is made under the flag's read guard, and
+    /// [`Self::close_spawn_gate`] takes the write guard, so every record this
+    /// method makes precedes the close.
+    fn record_crash_while_open(
+        &self,
+        key: &str,
+        now_ms: u64,
+        respawn_failed: bool,
+    ) -> Option<(bool, usize)> {
+        let closed = self
+            .spawn_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *closed {
+            return None;
+        }
+        let mut entry = self.crash_windows.entry(key.to_owned()).or_default();
+        if respawn_failed {
+            entry.mark_respawn_failed();
+            // The respawn attempt has resolved (in failure): clear the
+            // transient mid-respawn marker so a subsequent lookup-miss reflects
+            // the now-stable failed/poisoned state, not "respawning".
+            entry.clear_respawning();
+        }
+        let poisoned = entry.record(now_ms);
+        let count = entry.crash_count();
+        drop(entry);
+        drop(closed);
+        Some((poisoned, count))
+    }
+
     /// Sets the closed flag (ADR-049 Decision 16, step 2). Blocks only until
     /// every live [`SpawnPermit`] drops, and a permit is never held across an
     /// `.await`, so the wait is bounded by one synchronous spawn.
@@ -11715,7 +11809,15 @@ impl Supervisor {
             ))
             .await
             .map(|_handle| ())
-            .map_err(|e| ContextError::TransportFailed(e.to_string())),
+            .map_err(|e| match e {
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    inner @ ContextError::SupervisorShutDown(_),
+                ) => inner,
+                other => ContextError::TransportFailed(other.to_string()),
+            }),
+            // A shutdown refusal keeps its typed `SCP-CTX-2138` (ADR-049
+            // Decision 16 item 2), as the create, import and restore arms do.
+            Err(e @ ContextError::SupervisorShutDown(_)) => Err(e),
             Err(e) => Err(ContextError::TransportFailed(e.to_string())),
         };
         if let Some(dormant) = dormant
@@ -25104,6 +25206,98 @@ mod tests {
         );
     }
 
+    /// A context actor that panics after shutdown has begun is despawned and
+    /// not respawned, and its panic records no crash (ADR-049 Decision 16
+    /// item 2).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panic_after_shutdown_began_records_no_crash_and_does_not_respawn() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let (handle, ctx_key) = spawn_active_with_snapshot(&sup, [0xC7u8; 32]).await;
+
+        sup.close_spawn_gate();
+        induce_panic(&handle, "SECRET_SENTINEL_abc123").await;
+        let despawned = wait_until(std::time::Duration::from_secs(5), || {
+            sup.lookup(&ctx_key).is_none()
+        })
+        .await;
+        assert!(despawned, "the watchdog must despawn the dead handle");
+        // The watchdog despawns as its last step on the closed path, so the
+        // crash window is settled here.
+        assert!(
+            sup.crash_windows.get(&ctx_key).is_none(),
+            "a panic after shutdown began must record no crash"
+        );
+        assert!(
+            sup.lookup(&ctx_key).is_none(),
+            "a panic after shutdown began must not respawn the actor"
+        );
+    }
+
+    /// A respawn that fails once shutdown has begun records no crash and sets
+    /// no failed-respawn flag, whether shutdown refused the spawn or the
+    /// respawn failed for another reason; before shutdown the same failure is
+    /// recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn respawn_failure_after_shutdown_began_records_nothing() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let owner = DID("did:example:admin".to_owned());
+
+        // Before shutdown: a respawn with no snapshot is recorded.
+        let before = sup
+            .respawn_from_snapshot("no-snapshot-before", &owner)
+            .await;
+        assert!(matches!(before, Err(ContextError::ActorCrashed(_))));
+        assert!(
+            sup.crash_windows
+                .get("no-snapshot-before")
+                .is_some_and(|w| w.last_respawn_failed() && w.crash_count() == 1),
+            "a respawn failure before shutdown must be recorded"
+        );
+
+        // A persisted Active snapshot whose respawn reaches the refused
+        // key-package actor spawn in `build_actor_deps`.
+        let ctx_bytes = [0xC8u8; 32];
+        let ctx_key = hex::encode(ctx_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_bytes,
+            1_700_000_000,
+            owner.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        sup.persistence_ref()
+            .expect("test supervisor has persistence")
+            .persist_context(&ctx_key, &snap)
+            .await
+            .unwrap();
+
+        sup.close_spawn_gate();
+        let refused = sup.respawn_from_snapshot(&ctx_key, &owner).await;
+        assert!(
+            matches!(refused, Err(ContextError::SupervisorShutDown(_))),
+            "a respawn after shutdown began must be refused; got {refused:?}"
+        );
+        assert!(
+            sup.crash_windows.get(&ctx_key).is_none(),
+            "a shutdown refusal must record no crash and leave no respawn marker"
+        );
+
+        let after = sup.respawn_from_snapshot("no-snapshot-after", &owner).await;
+        assert!(matches!(after, Err(ContextError::ActorCrashed(_))));
+        assert!(
+            sup.crash_windows.get("no-snapshot-after").is_none(),
+            "a respawn failure after shutdown began must record nothing"
+        );
+    }
+
     /// A clean shutdown is NOT a crash: the watchdog sees `Ok(())`, records
     /// no crash, and does not respawn. Same for an inbox-closed exit (all
     /// handles dropped).
@@ -25497,6 +25691,52 @@ mod tests {
         assert!(
             standing_revive_log_lines(&ctx_key).is_empty(),
             "a recreate that registered no actor must not log a revive"
+        );
+    }
+
+    /// Once shutdown has begun, `standing_context` returns the typed
+    /// `SupervisorShutDown` (`SCP-CTX-2138`, ADR-049 Decision 16 item 2), not
+    /// a `TransportFailed`, whether the refusal comes from the actor spawn in
+    /// `create_context` or from the key-package actor spawn in
+    /// `build_actor_deps`. A deps failure of another kind stays
+    /// `TransportFailed`
+    /// (`standing_context_restores_a_dormant_window_when_the_recreate_fails`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standing_context_after_shutdown_keeps_supervisor_shut_down() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let local = DID::from(
+            sup.crypto_ref()
+                .expect("test supervisor has crypto")
+                .local_did()
+                .to_owned(),
+        );
+
+        // A live key-package actor for `local`, so `build_actor_deps`
+        // succeeds and the refusal comes from the actor spawn.
+        sup.key_package_store_for(&local)
+            .await
+            .expect("a key-package actor spawns before shutdown");
+        sup.close_spawn_gate();
+        let peer = DID("did:example:peer-standing-after-shutdown-spawn".to_owned());
+        let spawn_refused = sup.standing_context(&local, &peer).await;
+        assert!(
+            matches!(spawn_refused, Err(ContextError::SupervisorShutDown(_))),
+            "a refused actor spawn must keep SupervisorShutDown; got {spawn_refused:?}"
+        );
+
+        // No key-package actor, so the refusal comes from `build_actor_deps`.
+        sup.stop_key_package_actors().await;
+        let peer = DID("did:example:peer-standing-after-shutdown-deps".to_owned());
+        let deps_refused = sup.standing_context(&local, &peer).await;
+        assert!(
+            matches!(deps_refused, Err(ContextError::SupervisorShutDown(_))),
+            "a refused key-package spawn must keep SupervisorShutDown; got {deps_refused:?}"
+        );
+        assert!(
+            sup.standing_contexts.load().is_empty(),
+            "a refused get-or-create must not track the peer"
         );
     }
 
