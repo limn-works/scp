@@ -487,14 +487,14 @@ impl PyContextParams {
 /// `ContextError::SupervisorShutDown` raises `ContextError` with
 /// `SCP-CTX-2138`; every other variant raises the uncoded `RuntimeError` this
 /// call site raised before.
-fn busy_or(op: &str, e: &scp_core::context::ContextError) -> PyErr {
+fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> PyErr {
     typed_supervisor_error(op, e).map_or_else(
         || PyRuntimeError::new_err(format!("{op} failed: {e}")),
         PyErr::from,
     )
 }
 
-/// The typed error [`busy_or`] raises: `SCP-CTX-2130` for
+/// The typed error [`typed_supervisor_failure`] raises: `SCP-CTX-2130` for
 /// `ContextError::ActorBusy`, `SCP-CTX-2138` for
 /// `ContextError::SupervisorShutDown`, or `None` for every other variant.
 fn typed_supervisor_error(
@@ -2882,7 +2882,7 @@ impl crate::scp::PyScp {
         let owning = scp_did::DID(owning_did.to_owned());
         let (reservation_id, kp_public) = rt
             .block_on(async move { sup.reserve_key_package(owning).await })
-            .map_err(|e| busy_or("reserve_key_package", &e))?;
+            .map_err(|e| typed_supervisor_failure("reserve_key_package", &e))?;
         Ok((reservation_id.to_string(), kp_public))
     }
 
@@ -3073,7 +3073,7 @@ impl crate::scp::PyScp {
                 Ok(handle) => handle,
                 Err(e) => {
                     crate::runtime::remove_context(bi, &sealed.context_id);
-                    return Err(busy_or("context_join_from_welcome", &e));
+                    return Err(typed_supervisor_failure("context_join_from_welcome", &e));
                 }
             };
 
@@ -3224,7 +3224,7 @@ impl crate::scp::PyScp {
         // `.zeroize()` call — is what triggers the wipe here.
         drop(signing_key);
 
-        let outcome = outcome.map_err(|e| busy_or("invite_member", &e))?;
+        let outcome = outcome.map_err(|e| typed_supervisor_failure("invite_member", &e))?;
         Ok(PyInviteMemberOutcome::from_outcome(outcome))
     }
 
@@ -8399,13 +8399,13 @@ mod tests {
         })
     }
 
-    /// `busy_or` raises `SCP-CTX-2130` for `ContextError::ActorBusy`,
+    /// `typed_supervisor_failure` raises `SCP-CTX-2130` for `ContextError::ActorBusy`,
     /// `SCP-CTX-2138` for `ContextError::SupervisorShutDown`, and keeps the
     /// uncoded `RuntimeError` for every other variant, on the
     /// `reserve_key_package`, `context_join_from_welcome` and `invite_member`
     /// failure paths.
     #[test]
-    fn busy_or_types_only_actor_busy_and_supervisor_shut_down() {
+    fn typed_supervisor_failure_types_only_actor_busy_and_supervisor_shut_down() {
         use scp_core::context::ContextError;
         match super::typed_supervisor_error(
             "context_join_from_welcome",
@@ -8439,13 +8439,16 @@ mod tests {
         );
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let busy = super::busy_or("invite_member", &ContextError::ActorBusy("c".to_owned()));
+            let busy = super::typed_supervisor_failure(
+                "invite_member",
+                &ContextError::ActorBusy("c".to_owned()),
+            );
             assert!(
                 busy.is_instance_of::<crate::error::ContextError>(py),
                 "ActorBusy raises ContextError, got {busy}"
             );
             assert!(busy.to_string().contains(codes::CTX_2130), "{busy}");
-            let other = super::busy_or(
+            let other = super::typed_supervisor_failure(
                 "invite_member",
                 &ContextError::MembershipFailed("x".to_owned()),
             );
@@ -8482,6 +8485,45 @@ mod tests {
                 "a non-shutdown failure raises RuntimeError, got {other}"
             );
             assert!(other.to_string().contains(codes::CTX_2064), "{other}");
+        });
+    }
+
+    /// `context_create` and `restore_context`, called through the bridge after
+    /// the Supervisor's shutdown began, raise `ContextError` with
+    /// `SCP-CTX-2138`. A join after shutdown is refused earlier by the
+    /// active-context gate (`SCP-CTX-2013`), so its SCP-CTX-2138 path is
+    /// reachable only when shutdown begins between that gate and the join.
+    #[test]
+    fn create_and_restore_after_supervisor_shutdown_raise_ctx_2138() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        crate::runtime::init_context_manager_for_test(&bi_arc);
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi_arc).unwrap());
+        crate::runtime()
+            .unwrap()
+            .block_on(sup.shutdown_all_contexts());
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "broadcast").unwrap();
+            dict.set_item("memory_scope", "full").unwrap();
+            dict.set_item("ceiling", vec!["messages:read"]).unwrap();
+            let create = scp
+                .context_create("did:dht:z6MkShutDownCreator", &dict)
+                .expect_err("a create after shutdown must be refused");
+            let restore = scp
+                .restore_context(&"0".repeat(64))
+                .expect_err("a restore after shutdown must be refused");
+            for (name, err) in [("restore", restore), ("create", create)] {
+                assert!(
+                    err.is_instance_of::<crate::error::ContextError>(py),
+                    "{name} must raise ContextError, got {err}"
+                );
+                assert!(err.to_string().contains(codes::CTX_2138), "{name}: {err}");
+            }
         });
     }
 

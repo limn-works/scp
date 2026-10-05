@@ -23612,6 +23612,34 @@ mod tests {
         assert_eq!(context_code_of(err), codes::CTX_2002);
     }
 
+    /// `context_create` and `restore_context`, called through the bridge after
+    /// the Supervisor's shutdown began, fail with `SCP-CTX-2138`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn create_and_restore_after_supervisor_shutdown_keep_ctx_2138() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        // The first create stands up the Supervisor this test shuts down.
+        rt.block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create before shutdown should succeed");
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("supervisor initialized");
+        rt.block_on(sup.shutdown_all_contexts());
+        let restore = rt
+            .block_on(scp.restore_context("0".repeat(64)))
+            .expect_err("a restore after shutdown must be refused");
+        assert_eq!(context_code_of(restore), codes::CTX_2138);
+        let create = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect_err("a create after shutdown must be refused");
+        assert_eq!(context_code_of(create), codes::CTX_2138);
+    }
+
     /// Spec §17.6 "One Writer per Durable Directory": a held lock and a closed
     /// store carry their registered storage codes; any other platform error
     /// keeps the crypto catch-all.

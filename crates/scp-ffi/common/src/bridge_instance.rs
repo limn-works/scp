@@ -297,11 +297,11 @@ pub struct CoreFields {
     /// A shut-down instance cannot be resumed.
     shutdown: AtomicBool,
 
-    /// Turns true once a [`DurableStoreCloser`] run by
-    /// [`CoreFields::shutdown_core_async`] has closed the durable store, so a
-    /// later shutdown call can report whether the store still holds its
-    /// advisory lock.
-    durable_store_released: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Whether a shutdown closed the durable store, will never close it, or
+    /// has not settled it yet, so a later shutdown call can report whether
+    /// the store still holds its advisory lock without waiting on a close
+    /// that cannot happen.
+    durable_store_state: Arc<tokio::sync::watch::Sender<DurableStoreState>>,
 
     /// Whether this instance is currently suspended.
     ///
@@ -633,7 +633,9 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
-            durable_store_released: Arc::new(tokio::sync::watch::Sender::new(false)),
+            durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
+                DurableStoreState::Unsettled,
+            )),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
@@ -720,7 +722,9 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
-            durable_store_released: Arc::new(tokio::sync::watch::Sender::new(false)),
+            durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
+                DurableStoreState::Unsettled,
+            )),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
@@ -1397,6 +1401,9 @@ impl CoreFields {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return; // Already shut down
         }
+        // This path never closes the durable store.
+        self.durable_store_state
+            .send_replace(DurableStoreState::NotClosing);
         // Stop borrowers first, so every terminal transition of `CoreFields`
         // ends borrowed writes — not only whichever transition
         // [`BridgeInstanceCore::shutdown`] drives. This path clears registries
@@ -2515,24 +2522,28 @@ impl CoreFields {
         // cleanup.
         if self.shutdown.swap(true, Ordering::SeqCst) {
             let durable_store_open = if store_closer.is_some() {
-                let mut released = self.durable_store_released.subscribe();
+                let mut state = self.durable_store_state.subscribe();
                 !matches!(
-                    tokio::time::timeout(timeout, released.wait_for(|closed| *closed)).await,
-                    Ok(Ok(_))
+                    tokio::time::timeout(
+                        timeout,
+                        state.wait_for(|s| *s != DurableStoreState::Unsettled),
+                    )
+                    .await,
+                    Ok(Ok(s)) if *s == DurableStoreState::Closed
                 )
             } else {
                 false
             };
             return Err(ShutdownError::AlreadyShutDown { durable_store_open });
         }
-        let store_closer = store_closer.map(|close| -> DurableStoreCloser {
-            let released = Arc::clone(&self.durable_store_released);
-            Box::new(move || {
-                close()?;
-                released.send_replace(true);
-                Ok(())
-            })
-        });
+        let store_closer = store_closer.map_or_else(
+            || {
+                self.durable_store_state
+                    .send_replace(DurableStoreState::NotClosing);
+                None
+            },
+            |close| Some(settling_closer(&self.durable_store_state, close)),
+        );
 
         // Signal cooperating tasks to exit. Cheap and idempotent.
         self.cancel.cancel();
@@ -2562,7 +2573,16 @@ impl CoreFields {
         let drain = self
             .run_shutdown_side_effects(remaining, store_closer)
             .await;
-        combine_shutdown_outcome(outcome, drain, has_durable_store)
+        let elapsed = start.elapsed();
+        combine_shutdown_outcome(outcome, drain, has_durable_store).map(|outcome| match outcome {
+            ShutdownOutcome::GracefulWithin { panicked_tasks, .. } => {
+                ShutdownOutcome::GracefulWithin {
+                    elapsed,
+                    panicked_tasks,
+                }
+            }
+            timed_out @ ShutdownOutcome::TimedOut { .. } => timed_out,
+        })
     }
 
     /// Cleanup body of the async [`shutdown_core_async`](Self::shutdown_core_async)
@@ -2761,6 +2781,57 @@ impl CoreFields {
 /// shutdown call has returned.
 pub type DurableStoreCloser =
     Box<dyn FnOnce() -> Result<(), scp_platform::PlatformError> + Send + 'static>;
+
+/// Where an instance's durable store stands once shutdown has begun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableStoreState {
+    /// No shutdown has settled the store yet: a closer may still run.
+    Unsettled,
+    /// A shutdown's closer closed the store and released its advisory lock.
+    Closed,
+    /// No shutdown will close the store: the winning shutdown had no closer
+    /// (the sync path, or an async call given none), its closer failed, or
+    /// its closer was dropped unrun.
+    NotClosing,
+}
+
+/// Records how a [`DurableStoreCloser`] ended when it is dropped:
+/// [`DurableStoreState::Closed`] after a successful close,
+/// [`DurableStoreState::NotClosing`] otherwise.
+struct SettleOnDrop {
+    state: Arc<tokio::sync::watch::Sender<DurableStoreState>>,
+    closed: bool,
+}
+
+impl Drop for SettleOnDrop {
+    fn drop(&mut self) {
+        self.state.send_replace(if self.closed {
+            DurableStoreState::Closed
+        } else {
+            DurableStoreState::NotClosing
+        });
+    }
+}
+
+/// Wraps `close` so that `state` settles however the closer ends: closed,
+/// failed, or dropped unrun, as when the drain task that owns it panics.
+fn settling_closer(
+    state: &Arc<tokio::sync::watch::Sender<DurableStoreState>>,
+    close: DurableStoreCloser,
+) -> DurableStoreCloser {
+    let settle = SettleOnDrop {
+        state: Arc::clone(state),
+        closed: false,
+    };
+    Box::new(move || {
+        // Bind the whole guard: a closure that names only `settle.closed`
+        // would capture a copy of that `bool` and drop the guard at once.
+        let mut settle = settle;
+        close()?;
+        settle.closed = true;
+        Ok(())
+    })
+}
 
 /// How the Supervisor drain ended inside the shutdown deadline.
 enum SupervisorDrain {
@@ -3326,9 +3397,9 @@ impl std::error::Error for HandleAffinityError {}
 pub enum ShutdownOutcome {
     /// All outstanding tasks completed before the deadline.
     GracefulWithin {
-        /// Elapsed wall-clock time from the first cancellation signal to the
-        /// last task joining (or panicking). Reported so callers can log
-        /// shutdown latency.
+        /// Time on the runtime clock from the start of the drain until the
+        /// shutdown's cleanup, including the Supervisor drain and the
+        /// durable store close, finished.
         elapsed: Duration,
         /// Number of tasks that panicked during the graceful drain.
         /// Panics are logged at `tracing::error!` level; shutdown continues
@@ -5720,8 +5791,27 @@ mod tests {
         })
     }
 
+    /// A repeat shutdown given an hour-long timeout, which must return well
+    /// inside five seconds of wall-clock time.
+    async fn repeat_shutdown_with_long_timeout(
+        instance: &CoreFields,
+        unused: &Arc<AtomicBool>,
+    ) -> ShutdownError {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            instance.shutdown_core_async(
+                Duration::from_secs(3600),
+                Some(recording_closer(Ok(()), unused)),
+            ),
+        )
+        .await
+        .expect("a repeat shutdown returns at once once the store is settled")
+        .unwrap_err()
+    }
+
     /// A repeat shutdown reports the store released only after an earlier
-    /// shutdown's closer closed it, and never runs its own closer.
+    /// shutdown's closer closed it, never runs its own closer, and returns at
+    /// once when no shutdown will ever close the store.
     #[tokio::test]
     async fn repeat_shutdown_reports_whether_the_store_still_holds_its_lock() {
         let unused = Arc::new(AtomicBool::new(false));
@@ -5733,10 +5823,7 @@ mod tests {
             .await
             .unwrap();
         assert!(ran.load(Ordering::SeqCst));
-        let err = closed
-            .shutdown_core_async(Duration::ZERO, Some(recording_closer(Ok(()), &unused)))
-            .await
-            .unwrap_err();
+        let err = repeat_shutdown_with_long_timeout(&closed, &unused).await;
         assert!(matches!(
             err,
             ShutdownError::AlreadyShutDown {
@@ -5754,13 +5841,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(first, ShutdownError::DurableStoreClose(_)));
-        let err = refused
-            .shutdown_core_async(
-                Duration::from_millis(20),
-                Some(recording_closer(Ok(()), &unused)),
-            )
-            .await
-            .unwrap_err();
+        let err = repeat_shutdown_with_long_timeout(&refused, &unused).await;
         assert!(matches!(
             err,
             ShutdownError::AlreadyShutDown {
@@ -5771,10 +5852,21 @@ mod tests {
         // The sync path never closes the durable store.
         let sync = CoreFields::new();
         sync.shutdown();
-        let err = sync
-            .shutdown_core_async(Duration::ZERO, Some(recording_closer(Ok(()), &unused)))
+        let err = repeat_shutdown_with_long_timeout(&sync, &unused).await;
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+
+        // A winner given no closer never closes the store.
+        let no_closer = CoreFields::new();
+        no_closer
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
-            .unwrap_err();
+            .unwrap();
+        let err = repeat_shutdown_with_long_timeout(&no_closer, &unused).await;
         assert!(matches!(
             err,
             ShutdownError::AlreadyShutDown {
@@ -5784,6 +5876,55 @@ mod tests {
         assert!(
             !unused.load(Ordering::SeqCst),
             "a losing call runs no closer"
+        );
+    }
+
+    /// A settling closer records `Closed` only after a successful close, and
+    /// `NotClosing` when its close fails or it is dropped unrun, as when the
+    /// drain task that owns it panics.
+    #[test]
+    fn settling_closer_records_how_the_close_ended() {
+        let unused = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(tokio::sync::watch::Sender::new(
+            DurableStoreState::Unsettled,
+        ));
+
+        settling_closer(&state, recording_closer(Ok(()), &unused))().unwrap();
+        assert_eq!(*state.borrow(), DurableStoreState::Closed);
+
+        state.send_replace(DurableStoreState::Unsettled);
+        let refused = scp_platform::PlatformError::StorageError("close refused".to_owned());
+        settling_closer(&state, recording_closer(Err(refused), &unused))().unwrap_err();
+        assert_eq!(*state.borrow(), DurableStoreState::NotClosing);
+
+        state.send_replace(DurableStoreState::Unsettled);
+        let ran = Arc::new(AtomicBool::new(false));
+        let closer = settling_closer(&state, recording_closer(Ok(()), &ran));
+        assert_eq!(*state.borrow(), DurableStoreState::Unsettled);
+        drop(closer);
+        assert_eq!(*state.borrow(), DurableStoreState::NotClosing);
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// `GracefulWithin.elapsed` covers the durable store close, not only the
+    /// bridge's own task drain.
+    #[tokio::test]
+    async fn graceful_elapsed_covers_the_store_close() {
+        let instance = CoreFields::new();
+        let slow_close: DurableStoreCloser = Box::new(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        });
+        let outcome = instance
+            .shutdown_core_async(Duration::from_secs(5), Some(slow_close))
+            .await
+            .unwrap();
+        let ShutdownOutcome::GracefulWithin { elapsed, .. } = outcome else {
+            unreachable!("expected GracefulWithin, got {outcome:?}");
+        };
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "elapsed must include the 50 ms close, got {elapsed:?}"
         );
     }
 

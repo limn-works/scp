@@ -1294,10 +1294,16 @@ pub(crate) async fn reserve_key_package_on(
 
     let sup = crate::runtime::supervisor(bi)?;
     let sup = Arc::clone(sup);
-    let (reservation_id, kp_public) = sup
-        .reserve_key_package(DID(owning_did))
-        .await
-        .map_err(|e| NapiError::from(busy_or("reserve_key_package", codes::CTX_2000, &e)))?;
+    let (reservation_id, kp_public) =
+        sup.reserve_key_package(DID(owning_did))
+            .await
+            .map_err(|e| {
+                NapiError::from(typed_supervisor_failure(
+                    "reserve_key_package",
+                    codes::CTX_2000,
+                    &e,
+                ))
+            })?;
 
     Ok(NapiKeyPackageReservation {
         reservation_id: reservation_id.to_string(),
@@ -1450,7 +1456,7 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(NapiError::from(busy_or(
+            return Err(NapiError::from(typed_supervisor_failure(
                 "context_join_from_welcome",
                 codes::CTX_2013,
                 &e,
@@ -1615,8 +1621,13 @@ pub(crate) async fn invite_member_on(
     // is what triggers the wipe here (matching the PyO3 reference bridge).
     drop(signing_key);
 
-    let outcome =
-        outcome.map_err(|e| NapiError::from(busy_or("invite_member", codes::CTX_2013, &e)))?;
+    let outcome = outcome.map_err(|e| {
+        NapiError::from(typed_supervisor_failure(
+            "invite_member",
+            codes::CTX_2013,
+            &e,
+        ))
+    })?;
     Ok(NapiInviteMemberOutcome::from_outcome(outcome))
 }
 
@@ -5587,7 +5598,11 @@ fn parse_template_id_napi(
 /// reports `SCP-CTX-2138`. Every other failure reports `code`.
 /// The Welcome join, the key-package reservation and the invite map their
 /// errors through it.
-fn busy_or(op: &str, code: &str, e: &scp_core::context::ContextError) -> ScpNapiError {
+fn typed_supervisor_failure(
+    op: &str,
+    code: &str,
+    e: &scp_core::context::ContextError,
+) -> ScpNapiError {
     let code = match e {
         scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
         scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
@@ -6911,7 +6926,7 @@ mod tests {
     /// shutdown began reports `SCP-CTX-2138`, and any other failure reads the
     /// operation's own code.
     #[test]
-    fn busy_or_keeps_actor_busy_code() {
+    fn typed_supervisor_failure_keeps_typed_codes() {
         use scp_core::context::ContextError;
         let code_of = |e: crate::error::ScpNapiError| match e {
             crate::error::ScpNapiError::Context { code, .. } => code,
@@ -6919,7 +6934,7 @@ mod tests {
         };
         for fallback in [codes::CTX_2013, codes::CTX_2000] {
             assert_eq!(
-                code_of(super::busy_or(
+                code_of(super::typed_supervisor_failure(
                     "reserve_key_package",
                     fallback,
                     &ContextError::ActorBusy("key-package actor".to_owned())
@@ -6927,7 +6942,7 @@ mod tests {
                 codes::CTX_2130
             );
             assert_eq!(
-                code_of(super::busy_or(
+                code_of(super::typed_supervisor_failure(
                     "context_join_from_welcome",
                     fallback,
                     &ContextError::SupervisorShutDown("spawn context actor".to_owned())
@@ -6935,7 +6950,7 @@ mod tests {
                 codes::CTX_2138
             );
             assert_eq!(
-                code_of(super::busy_or(
+                code_of(super::typed_supervisor_failure(
                     "context_join_from_welcome",
                     fallback,
                     &ContextError::MembershipFailed("bad welcome".to_owned())
@@ -6968,6 +6983,43 @@ mod tests {
             )),
             codes::CTX_2064
         );
+    }
+
+    /// `context_create` and `context_restore`, called through the bridge
+    /// after the Supervisor's shutdown began, fail with `SCP-CTX-2138`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_and_restore_after_supervisor_shutdown_keep_ctx_2138() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        crate::runtime::init_supervisor(&bi, &owner.inner.did);
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor initialized")
+            .shutdown_all_contexts()
+            .await;
+        let restore = super::context_restore_on(&bi, "0".repeat(64))
+            .await
+            .expect_err("a restore after shutdown must be refused");
+        let create = super::context_create_on(
+            &bi,
+            &owner,
+            r#"{"memoryScope":"ephemeral","ceiling":["messages:read"]}"#.to_owned(),
+        )
+        .await
+        .err()
+        .expect("a create after shutdown must be refused");
+        for (name, err) in [("restore", restore), ("create", create)] {
+            assert!(
+                err.reason.starts_with(&format!("[{}] ", codes::CTX_2138)),
+                "{name}: expected {}, got: {}",
+                codes::CTX_2138,
+                err.reason
+            );
+        }
     }
 
     /// `context_create` rejects a params object whose ceiling is absent or
