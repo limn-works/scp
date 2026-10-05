@@ -1132,6 +1132,19 @@ fn log_watchdog_without_supervisor(
     }
 }
 
+/// Log line for a streaming-open escrow reversal task that ended without
+/// returning. A panic is named without its payload (the ADR-049 §10
+/// payload-free rule; a `JoinError`'s `Display` carries the payload), and a
+/// cancellation, such as its runtime shutting down, is named as one.
+fn escrow_reversal_join_failure_message(err: &tokio::task::JoinError) -> &'static str {
+    if err.is_panic() {
+        "streaming open escrow reversal task panicked — the hold may stay debited; \
+         payload intentionally not logged"
+    } else {
+        "streaming open escrow reversal task was cancelled — the hold may stay debited"
+    }
+}
+
 /// Spawn a `KeyPackageStoreActor`'s watchdog task (ADR-049 §10).
 ///
 /// The per-identity twin of [`spawn_actor_watchdog_task`]. A free function for
@@ -11177,9 +11190,13 @@ impl Supervisor {
     /// Spawns `future` onto the Supervisor's task tracker on `runtime`, for a
     /// caller that can run off any runtime thread (a `Drop`). Unlike
     /// [`Self::spawn_tracked`], it accepts the spawn after the closed flag is
-    /// set when the caller is itself a tracked task (ADR-049 Decision 16, item
-    /// 2): the tracker is not empty while the caller runs, so the drain awaits
-    /// the spawned task.
+    /// set when the caller is itself a tracked task: the tracker is not empty
+    /// while the caller runs, so the drain awaits the spawned task. ADR-049
+    /// Decision 16 item 2 admits only a streaming settlement, its
+    /// `OutletInvokedEvent` append, or a refund after the flag is set, and this
+    /// gate checks the caller, not the future, so the streaming sinks'
+    /// `spawn_supervisor_op` in `outlets/stream_settlement_adapter.rs` is the
+    /// only permitted caller.
     ///
     /// # Errors
     ///
@@ -13347,7 +13364,11 @@ impl Supervisor {
             }
         });
         if let Err(err) = reversal.await {
-            tracing::error!(%err, "streaming open escrow reversal task panicked");
+            tracing::error!(
+                reserved = reserved.value(),
+                "{}",
+                escrow_reversal_join_failure_message(&err)
+            );
         }
     }
 
@@ -17078,6 +17099,30 @@ mod tests {
     use super::*;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
+
+    /// The escrow-reversal join log names a panic as a panic without its
+    /// payload, and names a cancelled task as cancelled, never as panicked.
+    #[tokio::test]
+    async fn escrow_reversal_join_failure_message_splits_panic_from_cancel() {
+        let panicked = tokio::spawn(async { panic!("secret-reversal-payload") })
+            .await
+            .expect_err("a panicking task yields a JoinError");
+        assert!(panicked.is_panic());
+        let msg = escrow_reversal_join_failure_message(&panicked);
+        assert!(msg.contains("panicked"), "{msg}");
+        assert!(!msg.contains("cancelled"), "{msg}");
+        assert!(!msg.contains("secret-reversal-payload"), "{msg}");
+
+        let pending = tokio::spawn(std::future::pending::<()>());
+        pending.abort();
+        let cancelled = pending
+            .await
+            .expect_err("an aborted task yields a JoinError");
+        assert!(cancelled.is_cancelled());
+        let msg = escrow_reversal_join_failure_message(&cancelled);
+        assert!(msg.contains("cancelled"), "{msg}");
+        assert!(!msg.contains("panicked"), "{msg}");
+    }
 
     /// SECURITY regression guard for the hard-rate-limit fail-closed mapping
     /// ([`hard_rate_limit_allow`]): an ALIVE-but-wedged actor (`Elapsed`) MUST

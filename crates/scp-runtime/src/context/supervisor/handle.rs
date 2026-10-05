@@ -680,18 +680,30 @@ impl SupervisorHandle {
 
     /// Persist the per-context state and broadcast snapshot for
     /// `context_id` if persistence is configured. A persistence failure is
-    /// not propagated.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    /// not propagated. When the Supervisor has dropped, the persist fails:
+    /// ADR-049 Decision 16 item 4 makes that a Class C persist failure,
+    /// logged, counted, and acknowledged with `Ok(())`.
     pub(crate) async fn persist_context_and_broadcast(
         &self,
         context_id: &str,
     ) -> Result<(), ContextError> {
-        let supervisor = self.upgrade()?;
-        crate::context::manager_methods::persist_context_and_broadcast(&supervisor, context_id)
-            .await;
+        match self.upgrade() {
+            Ok(supervisor) => {
+                crate::context::manager_methods::persist_context_and_broadcast(
+                    &supervisor,
+                    context_id,
+                )
+                .await;
+            }
+            Err(e) => {
+                crate::metrics::record_persistence_failure();
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "snapshot persist skipped: the supervisor has dropped"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1189,6 +1201,22 @@ mod tests {
         shut_down(handle.find_shared_context("a", "b").await.map(drop));
         shut_down(handle.update_context_gauges().await);
         shut_down(handle.spawn_tracked("probe", async {}).map(drop));
+    }
+
+    /// ADR-049 Decision 16 item 4: the Class C snapshot persist acknowledges a
+    /// failed upgrade with `Ok(())` instead of `SupervisorShutDown`, the same as
+    /// a persist against a live Supervisor.
+    #[tokio::test]
+    async fn class_c_snapshot_persist_acknowledges_a_dropped_supervisor() {
+        let (sup, handle) = test_handle();
+        assert!(handle.persist_context_and_broadcast("ctx").await.is_ok());
+        drop(sup);
+        assert!(handle.local_dids().is_err(), "the Supervisor has dropped");
+        let r = handle.persist_context_and_broadcast("ctx").await;
+        assert!(
+            r.is_ok(),
+            "expected Ok after the Supervisor dropped, got {r:?}"
+        );
     }
 
     #[tokio::test]
