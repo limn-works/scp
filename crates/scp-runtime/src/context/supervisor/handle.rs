@@ -205,8 +205,7 @@ impl SupervisorHandle {
     /// [`Supervisor::export_sender_key_epochs`].
     ///
     /// ADR-049 PR-6: with [`Self::export_recv_sequence_floors`], the
-    /// authoritative durable-blob export source of every production
-    /// `export_crypto_state` caller.
+    /// authoritative durable-blob export source.
     ///
     /// # Errors
     ///

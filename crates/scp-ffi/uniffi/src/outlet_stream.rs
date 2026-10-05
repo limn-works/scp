@@ -342,11 +342,11 @@ impl OutletExecutor for UniffiStreamExecutor {
 }
 
 // ---------------------------------------------------------------------------
-// Error mapping — every code is a canonical SCP-OUTLET-/SCP-PERM- literal
+// Error mapping
 // ---------------------------------------------------------------------------
 
 /// Maps an [`OpenStreamRejection`] onto the bridge error surface, carrying the
-/// rejection's own §5.4.4 `SCP-OUTLET-NNNN` code verbatim.
+/// rejection's own code verbatim.
 fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpError {
     ScpError::Outlet {
         msg: format!(

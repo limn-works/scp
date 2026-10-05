@@ -440,8 +440,7 @@ pub enum SagaError {
     },
     /// The Supervisor refused the saga because `shutdown_all_contexts` has
     /// begun ([`ContextError::SupervisorShutDown`], `SCP-CTX-2138`, ADR-049
-    /// Decision 16 item 2). Nothing was staged or debited, and no later saga
-    /// on this Supervisor starts.
+    /// Decision 16 item 2). Nothing was staged or debited.
     #[error("SCP-CTX-2138: saga refused: {message}")]
     SupervisorShutDown {
         /// Human-readable detail naming the refused operation.
@@ -1169,6 +1168,7 @@ impl SpawnPermit<'_> {
 /// [`Supervisor::tracked_spawner`]. It holds a tracker token, so the tracker
 /// is not empty while the spawner lives: the drain waits for the operation
 /// that holds it and for every task spawned through it.
+#[derive(Clone)]
 pub(in crate::context) struct TrackedSpawner {
     tracker: tokio_util::task::TaskTracker,
     _token: tokio_util::task::task_tracker::TaskTrackerToken,
@@ -1183,6 +1183,74 @@ impl TrackedSpawner {
         F::Output: Send + 'static,
     {
         spawn_marked(&self.tracker, future)
+    }
+
+    /// [`Self::spawn`] on `runtime`, for a caller that may run off a runtime
+    /// thread, such as a `Drop`.
+    fn spawn_on<F>(
+        &self,
+        future: F,
+        runtime: &tokio::runtime::Handle,
+    ) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tracker.spawn_on(
+            tracked_task_marker().scope(self.tracker.clone(), future),
+            runtime,
+        )
+    }
+}
+
+/// The escrow-refund sink of a streaming open's escrow ticket.
+///
+/// It hands the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)'s
+/// `Drop` refund to a task spawned through the open's
+/// [`TrackedSpawner`], so a refund fired after `shutdown_all_contexts` has
+/// begun still runs (ADR-049 Decision 16, item 2, second exception). That
+/// task runs the [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink)
+/// refund as a tracked task, which item 2's first exception admits.
+struct SpawnerEscrowRefundSink {
+    /// The sink the spawned task runs.
+    inner: Arc<crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink>,
+    /// A clone of the open's spawner.
+    spawner: TrackedSpawner,
+    /// Runtime handle captured at construction, so the `Drop`-fired refund
+    /// can spawn even when it runs off a runtime thread.
+    runtime: tokio::runtime::Handle,
+}
+
+impl SpawnerEscrowRefundSink {
+    /// Builds the sink for an open on `supervisor` that holds `spawner`,
+    /// capturing the current runtime handle.
+    fn new(supervisor: &Arc<Supervisor>, spawner: &TrackedSpawner) -> Self {
+        Self {
+            inner: Arc::new(
+                crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
+                    Arc::downgrade(supervisor),
+                ),
+            ),
+            spawner: spawner.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl crate::context::outlets::dispatch::StreamEscrowRefundSink for SpawnerEscrowRefundSink {
+    fn refund(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let context_id = context_id.to_owned();
+        let member_did = member_did.clone();
+        drop(self.spawner.spawn_on(
+            async move { inner.refund(&context_id, &member_did, amount) },
+            &self.runtime,
+        ));
     }
 }
 
@@ -11112,7 +11180,7 @@ impl Supervisor {
 
     /// Issues a [`TrackedSpawner`] for an operation that spawns tasks after
     /// `.await`s of its own. Refused once the closed flag is set, from any
-    /// caller: item 2's exception covers handing a settlement or a refund to
+    /// caller: item 2's first exception covers handing a settlement or a refund to
     /// a task, not starting an operation.
     ///
     /// # Errors
@@ -13173,10 +13241,7 @@ impl Supervisor {
     /// Reverses a streaming open-time escrow hold through the target actor and
     /// consumes the ticket, for an abort path between the reserve's debit and
     /// the pump or seal spawn. The reversal runs as a task spawned through the
-    /// operation's `spawner` rather than through the ticket's `Drop` refund,
-    /// because that refund spawns through [`Self::spawn_tracked_on`], which
-    /// refuses a caller outside the tracker once shutdown has begun (ADR-049
-    /// Decision 16, item 2). The ticket is consumed and the task spawned with
+    /// operation's `spawner`. The ticket is consumed and the task spawned with
     /// no `.await` between them, so a caller that drops this future leaves the
     /// reversal running and gets no second refund from the ticket's `Drop`.
     /// This future waits for the task. A failed reversal logs at error and the
@@ -13594,11 +13659,8 @@ impl Supervisor {
         // exit passes the ticket to `release_stream_escrow`, which reverses the
         // hold. Consumed on success — the pump's close-time settlement then
         // owns the unspent-portion refund.
-        let escrow_refund_sink: Arc<dyn dispatch::StreamEscrowRefundSink> = Arc::new(
-            crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
-                Arc::downgrade(self),
-            ),
-        );
+        let escrow_refund_sink: Arc<dyn dispatch::StreamEscrowRefundSink> =
+            Arc::new(SpawnerEscrowRefundSink::new(self, spawner));
         let escrow_ticket = dispatch::StreamEscrowTicket::new(
             escrow_refund_sink,
             context_id.to_owned(),
@@ -20962,6 +21024,106 @@ mod tests {
             sink.0.load(Ordering::SeqCst),
             0,
             "a dropped release must not refund the hold a second time"
+        );
+    }
+
+    /// After shutdown has begun, an unconsumed escrow ticket that an untracked
+    /// caller drops still reverses its hold when its sink holds the open's
+    /// spawner (ADR-049 Decision 16, item 2). The same drop through a bare
+    /// `ActorEscrowRefundSink` is refused and leaves the hold debited.
+    #[tokio::test]
+    async fn escrow_ticket_dropped_after_shutdown_began_refunds_through_the_spawner() {
+        async fn remaining(supervisor: &Arc<Supervisor>, context_id: &str, member: &DID) -> u64 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            supervisor
+                .dispatch_query(QueriesCommand::RemainingBudgetForTest {
+                    context_id: context_id.to_owned(),
+                    member_did: member.clone(),
+                    reply: tx,
+                })
+                .await
+                .expect("dispatch RemainingBudgetForTest");
+            rx.await.expect("budget reply").expect("budget ok").value()
+        }
+
+        let supervisor = supervisor_with_providers();
+        let member = DID("did:example:live-admin".to_owned());
+        let deps = test_actor_deps(&supervisor).await;
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            [0x5f; 32],
+            1_700_000_000,
+            member.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("drive live context to Active");
+        // Two open-time holds of 25 each: 50 of 100 spent.
+        state
+            .governance
+            .budget_tracker
+            .grant(&member, scp_protocol::economy::types::Amount::new(100));
+        state
+            .governance
+            .budget_tracker
+            .record_spend(&member, scp_protocol::economy::types::Amount::new(50))
+            .expect("the grant covers the holds");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers the live context");
+        let context_id = hex::encode([0x5f; 32]);
+        let actor_sink = Arc::new(
+            crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
+                Arc::downgrade(&supervisor),
+            ),
+        );
+        let spawner = supervisor
+            .tracked_spawner("refund test")
+            .expect("an open gate issues a spawner");
+        let ticket = |sink: Arc<dyn crate::context::outlets::dispatch::StreamEscrowRefundSink>| {
+            crate::context::outlets::dispatch::StreamEscrowTicket::new(
+                sink,
+                context_id.clone(),
+                member.clone(),
+                scp_protocol::economy::types::Amount::new(25),
+            )
+        };
+        let bare = ticket(actor_sink);
+        let through_spawner = ticket(Arc::new(SpawnerEscrowRefundSink::new(
+            &supervisor,
+            &spawner,
+        )));
+
+        supervisor.close_spawn_gate();
+
+        // The bare sink's refund is refused once the gate is closed.
+        drop(bare);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            remaining(&supervisor, &context_id, &member).await,
+            50,
+            "a bare sink's refund is refused after shutdown began"
+        );
+
+        drop(through_spawner);
+        drop(spawner);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while remaining(&supervisor, &context_id, &member).await != 75 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the refund through the spawner returns its hold");
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            remaining(&supervisor, &context_id, &member).await,
+            75,
+            "only the refund through the spawner ran"
         );
     }
 
@@ -35292,7 +35454,7 @@ mod streaming_saga_tests {
     }
 
     /// ADR-049 Decision 16 — a same-context streaming open started after
-    /// shutdown has begun returns the non-retryable
+    /// shutdown has begun returns
     /// `OpenStreamRejection::SupervisorShutDown`, not the retryable transport
     /// rate limit, and debits nothing. The open-gate case is
     /// `open_outlet_stream_reserve_pump_settle_end_to_end`.

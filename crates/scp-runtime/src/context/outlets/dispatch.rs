@@ -341,11 +341,14 @@ pub enum OpenStreamRejection {
     },
     /// The Supervisor refused the open because `shutdown_all_contexts` has
     /// begun ([`ContextError::SupervisorShutDown`](crate::context::ContextError::SupervisorShutDown),
-    /// ADR-049 Decision 16 item 2). Nothing was reserved or debited. Shares
-    /// [`Self::ContextNotActive`]'s slug and code, the NON-retryable Protocol
-    /// class: no later open on this Supervisor succeeds.
+    /// ADR-049 Decision 16 item 2). Nothing was reserved or debited. Carries
+    /// `SCP-CTX-2138`, the code ADR-049 Decision 16 gives a shutdown refusal,
+    /// and [`Self::ContextNotActive`]'s slug.
     SupervisorShutDown,
 }
+
+/// The canonical code of [`ContextError::SupervisorShutDown`](crate::context::ContextError::SupervisorShutDown).
+const SUPERVISOR_SHUT_DOWN_CODE: &str = "SCP-CTX-2138";
 
 impl OpenStreamRejection {
     /// Returns the §5.4.4 slug for this rejection.
@@ -373,7 +376,8 @@ impl OpenStreamRejection {
         }
     }
 
-    /// Returns the §5.4.4 error code for this rejection.
+    /// Returns the error code for this rejection: a §5.4.4 code, or
+    /// `SCP-CTX-2138` for [`Self::SupervisorShutDown`].
     #[must_use]
     pub fn error_code(&self) -> &'static str {
         match self {
@@ -387,9 +391,11 @@ impl OpenStreamRejection {
             // whole point of the error-masking fix: a permanent context-not-active
             // failure must NOT be reported through the retryable transport-fault
             // band the pre-fix catch-all used.
-            Self::ContextNotActive { .. } | Self::SupervisorShutDown => {
-                error_codes::CODE_PROTOCOL_SESSION
-            }
+            Self::ContextNotActive { .. } => error_codes::CODE_PROTOCOL_SESSION,
+            // ADR-049 Decision 16 item 2: the caller of a spawn refused by
+            // shutdown receives `ContextError::SupervisorShutDown`'s code, the
+            // code the streaming-saga refusal also carries.
+            Self::SupervisorShutDown => SUPERVISOR_SHUT_DOWN_CODE,
             // Mirror `caveat_violation_chunk`'s slug→code routing: the
             // input-schema slug is Input-class (`SCP-OUTLET-6120`), every
             // other caveat slug is Authorization-class (`SCP-OUTLET-6110`).
@@ -3620,25 +3626,28 @@ mod tests {
         }
     }
 
-    /// A shutdown refusal maps to the non-retryable Protocol class, never the
-    /// retryable transport rate limit an admission rejection carries.
+    /// A shutdown refusal carries `SCP-CTX-2138` (ADR-049 Decision 16 item 2),
+    /// so a caller tells it apart from a closed context and from the retryable
+    /// transport rate limit an admission rejection carries.
     #[test]
-    fn supervisor_shut_down_rejection_is_non_retryable_protocol() {
-        use scp_protocol::context::outlets::errors::RetryPolicy;
+    fn supervisor_shut_down_rejection_carries_ctx_2138() {
         let rej = OpenStreamRejection::SupervisorShutDown;
-        assert_eq!(rej.error_code(), error_codes::CODE_PROTOCOL_SESSION);
-        assert_eq!(
-            error_codes::error_code_to_retry_policy(rej.error_code()),
-            Some(RetryPolicy::Never),
-            "an open refused by shutdown must be non-retryable"
+        assert_eq!(rej.error_code(), "SCP-CTX-2138");
+        let closed = OpenStreamRejection::ContextNotActive {
+            current_state: "Closing".to_owned(),
+        };
+        assert_ne!(
+            closed.error_code(),
+            rej.error_code(),
+            "a closed context keeps its own code"
         );
         let rate_limited = OpenStreamRejection::AdmissionRateLimited {
             slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
         };
         assert_ne!(
-            error_codes::error_code_to_retry_policy(rate_limited.error_code()),
-            Some(RetryPolicy::Never),
-            "the transport rate limit stays retryable"
+            rate_limited.error_code(),
+            rej.error_code(),
+            "the transport rate limit keeps its own code"
         );
         assert!(
             matches!(
