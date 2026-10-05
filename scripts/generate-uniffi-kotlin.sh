@@ -9,7 +9,7 @@
 #   ./scripts/generate-uniffi-kotlin.sh [--release] [--features=FEAT] [--skip-build] [--print-cargo-args]
 #
 # --print-cargo-args prints `scp-ffi-uniffi|` followed by the arguments this script
-# passes `cargo build` after the manifest path, then exits without building.
+# passes the cdylib's `cargo build` after the manifest path, then exits without building.
 # Any other argument fails the script.
 #
 # Output:

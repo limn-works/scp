@@ -405,7 +405,7 @@ jobs:
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
               - 'scripts/generate-uniffi-kotlin.sh'
-              # kotlin-lint's release Gradle feature check reads these three files.
+              - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
               - '.github/workflows/build-matrix.yml'
               - 'scripts/check-shipped-feature-graph.sh'
@@ -3285,14 +3285,11 @@ jobs:
           done
       # check_release_file loads a workflow file with PyYAML, takes every string
       # value of a `run` key, joins its `\` continuations, and reads each
-      # non-comment line of it that contains `gradle` in any case, or that names a
-      # repository file whose text contains `gradle` in any case (relative to the
-      # repository root, to the root without the path's first directory, or to the
-      # `working-directory` the step or its job's `defaults` names), with each `${{ ... }}` expression read as one
-      # word. It reads the value of every `uses` key that contains `gradle` in any
-      # case, and of every `uses` key naming a local path other than a file the step
-      # checks, as a line it cannot read. It fails unless the line is
-      # `./gradlew` followed only by task paths and `-P<key>=<value>` tokens, runs
+      # non-comment line of it that contains `gradle` in any case, with each
+      # `${{ ... }}` expression read as one word. It reads the value of every `uses`
+      # key that contains `gradle` in any case as a line it cannot read. It fails
+      # unless the line is `./gradlew` followed only by task paths and
+      # `-P<key>=<value>` tokens, runs
       # `:scp-kt:printUniffiCargoFeatures` with that line's `-P` tokens, and fails
       # unless the printed entry is a `scp-ffi-uniffi|` entry of ARTIFACTS in
       # scripts/check-shipped-feature-graph.sh. It also fails on a file with no such
@@ -3311,46 +3308,27 @@ jobs:
             local file=$1 line token got count=0 lines
             local -a tokens props
             if ! lines=$(python3 -c '
-          import os, sys, yaml
-          root = os.path.realpath("../..")
-          checked = {os.path.realpath(p) for p in sys.argv[2:]}
-          def named_files(text, workdir):
-              for token in text.split():
-                  token = token.strip("\"\x27;")
-                  parts = token.split("/")
-                  for base, rel in ((root, token), (root, "/".join(parts[1:])), (os.path.join(root, workdir), token)):
-                      path = os.path.realpath(os.path.join(base, rel))
-                      if rel and path.startswith(root + os.sep) and os.path.isfile(path):
-                          yield path
-          def mentions_gradle(path):
-              with open(path, errors="replace") as f:
-                  return "gradle" in f.read().lower()
-          def walk(node, workdir):
+          import sys, yaml
+          def walk(node):
               if isinstance(node, dict):
-                  defaults = node.get("defaults")
-                  if isinstance(defaults, dict) and isinstance(defaults.get("run"), dict):
-                      workdir = defaults["run"].get("working-directory", workdir)
-                  if isinstance(node.get("working-directory"), str):
-                      workdir = node["working-directory"]
                   for key, value in node.items():
                       if key == "run" and isinstance(value, str):
                           for line in value.replace("\\\n", " ").splitlines():
                               if line.lstrip().startswith("#"):
                                   continue
-                              if "gradle" in line.lower() or any(mentions_gradle(p) for p in named_files(line, workdir) if p not in checked):
+                              if "gradle" in line.lower():
                                   print(line)
                       elif key == "uses" and isinstance(value, str):
-                          local = value.startswith("./") and os.path.realpath(os.path.join(root, value)) not in checked
-                          if "gradle" in value.lower() or local:
+                          if "gradle" in value.lower():
                               print("uses: " + value)
                       else:
-                          walk(value, workdir)
+                          walk(value)
               elif isinstance(node, list):
                   for item in node:
-                      walk(item, workdir)
+                      walk(item)
           with open(sys.argv[1]) as f:
-              walk(yaml.safe_load(f), ".")
-          ' "$file" ../../.github/workflows/release.yml ../../.github/workflows/build-matrix.yml); then
+              walk(yaml.safe_load(f))
+          ' "$file"); then
               echo "$file: cannot read the workflow" >&2
               return 1
             fi
@@ -3402,9 +3380,6 @@ jobs:
           printf '%s\n' 'run: >' '  ./gradlew :scp-kt:jar' '  -Pscp.uniffi.cargoFeatures=testing' > "$planted/folded.yml"
           printf '%s\n' 'run: ./gradlew :scp-kt:jar' '  -Pscp.uniffi.cargoFeatures=testing' > "$planted/plain.yml"
           printf '%s\n' 'steps:' '  - run: ./gradlew :scp-kt:jar' '  - uses: gradle/gradle-build-action@v2' '    with:' '      arguments: :scp-kt:jar' > "$planted/action.yml"
-          printf '%s\n' 'steps:' '  - run: ./gradlew :scp-kt:jar' '  - run: bash repo/scripts/test.sh' > "$planted/script.yml"
-          printf '%s\n' 'steps:' '  - run: ./gradlew :scp-kt:jar' '  - working-directory: scripts' '    run: ./test.sh' > "$planted/workdir.yml"
-          printf '%s\n' 'steps:' '  - run: ./gradlew :scp-kt:jar' '  - uses: ./bindings/kotlin' > "$planted/local-action.yml"
           for file in "$planted"/*.yml; do
             if check_release_file "$file" 2>/dev/null; then
               echo "::error::check_release_file accepted the planted $(basename "$file")"
@@ -3479,7 +3454,62 @@ jobs:
               ./gradlew "$publish" --dry-run "$args"
           done
           rm "$bindings"
+          expect_failure "$publish publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty" \
+            ./gradlew "$publish" --dry-run -x generateUniffiBindings
           ./gradlew -q "$publish" --dry-run
+      # Runs the script of release.yml's "Check each JAR's manifest records
+      # production UniFFI bindings" step on JARs whose manifests must pass and fail.
+      # The JARs Gradle builds here exclude compileKotlin, so their task graph holds
+      # no generateUniffiBindings.
+      - name: Check release.yml's JAR manifest step
+        run: |
+          set -euo pipefail
+          check=$(python3 -c '
+          import sys, yaml
+          with open(sys.argv[1]) as f:
+              steps = yaml.safe_load(f)["jobs"]["sign-maven"]["steps"]
+          print(next(s["run"] for s in steps if s.get("name", "").startswith("Check each JAR")))
+          ' ../../.github/workflows/release.yml)
+          work=$(mktemp -d)
+          mkdir "$work/maven-artifacts"
+          run_check() { (cd "$work" && bash -c "$check"); }
+          expect_rejected() {
+            if run_check >/dev/null 2>&1; then
+              echo "::error::release.yml's JAR manifest step accepted $1"
+              exit 1
+            fi
+          }
+          plant_jar() {
+            rm -f "$work"/maven-artifacts/*
+            python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1], "w").writestr("META-INF/MANIFEST.MF", sys.argv[2])' \
+              "$work/maven-artifacts/scp-kt.jar" "$1"
+          }
+          plant_jar $'Manifest-Version: 1.0\r\nScp-Uniffi-Cargo-Features: \r\nScp-Uniffi-Bindings: generated\r\n\r\n'
+          if ! run_check; then
+            echo "::error::release.yml's JAR manifest step rejected generated bindings with no cargo features"
+            exit 1
+          fi
+          plant_jar $'Manifest-Version: 1.0\r\nScp-Uniffi-Cargo-Features: testing\r\nScp-Uniffi-Bindings: generated\r\n\r\n'
+          expect_rejected "a JAR whose manifest records the testing feature"
+          plant_jar $'Manifest-Version: 1.0\r\n\r\n'
+          expect_rejected "a JAR whose manifest has neither attribute"
+          rm -f "$work"/maven-artifacts/*
+          expect_rejected "an empty maven-artifacts"
+          for args in -Pscp.uniffi.cargoFeatures= -Pscp.uniffi.cargoFeatures=testing; do
+            rm -f scp-kt/build/libs/*.jar
+            ./gradlew -q :scp-kt:jar -x compileKotlin -x compileJava "$args"
+            manifest=$(unzip -p scp-kt/build/libs/*.jar META-INF/MANIFEST.MF | tr -d '\r')
+            if ! grep -qx "Scp-Uniffi-Cargo-Features: ${args#-Pscp.uniffi.cargoFeatures=}" <<<"$manifest" ||
+              ! grep -qx 'Scp-Uniffi-Bindings: prebuilt' <<<"$manifest"; then
+              echo "$manifest"
+              echo "::error::Gradle task :scp-kt:jar with $args wrote the wrong Scp-Uniffi attributes"
+              exit 1
+            fi
+            rm -f "$work"/maven-artifacts/*
+            cp scp-kt/build/libs/*.jar "$work/maven-artifacts/"
+            expect_rejected "the JAR :scp-kt:jar $args builds without generateUniffiBindings"
+          done
+          rm -rf "$work"
       # `:scp-kt-android` declares detekt in its own build.gradle.kts and no job
       # invoked it, so every rule in ../detekt.yml — ForbiddenComment among them,
       # which is how this repository enforces its Kotlin stub policy — went

@@ -340,7 +340,8 @@ def kotlin_runner() -> Iterator[RunnerClient]:
     if binary is None:
         pytest.skip(
             "Kotlin parity runner not built. Set SCP_PARITY_KOTLIN_RUNNER "
-            "or run installDist under helpers/kotlin_bridge_runner/."
+            "or run installDist -Pscp.uniffi.cargoFeatures=testing under "
+            "helpers/kotlin_bridge_runner/."
         )
 
     # JNA needs a path to the UniFFI cdylib. On macOS, DYLD_* env vars

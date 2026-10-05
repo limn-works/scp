@@ -322,12 +322,12 @@ tasks.register<Exec>("generateUniffiBindings") {
 }
 
 // Runs `generateUniffiBindings`' command line with `--print-cargo-args` appended, so
-// the generator prints `scp-ffi-uniffi|` followed by the arguments it passes
-// `cargo build` after the manifest path, and prints that line. With
+// the generator prints `scp-ffi-uniffi|` followed by the arguments it passes the
+// cdylib's `cargo build` after the manifest path, and prints that line. With
 // `scp.uniffi.prebuiltBindings=true` that task does not run, so this task fails.
 tasks.register("printUniffiCargoFeatures") {
     group = "help"
-    description = "Print the scp-ffi-uniffi cargo arguments generateUniffiBindings' generator passes cargo build"
+    description = "Print the cargo arguments generateUniffiBindings' generator passes the scp-ffi-uniffi cdylib build"
     val generator = tasks.named<Exec>("generateUniffiBindings").map { it.workingDir to it.commandLine }
     val prebuiltBindings = uniffiPrebuiltBindings
     val execProvider = providers
@@ -352,17 +352,22 @@ tasks.register("printUniffiCargoFeatures") {
 // before any task runs when `scp.uniffi.cargoFeatures` names neither `testing` nor
 // `scp-ffi-uniffi/testing`.
 //
+// uniffiBindingsGenerated is true when the task graph holds `generateUniffiBindings`
+// and `scp.uniffi.prebuiltBindings` is not true.
+//
 // uniffiPublishGuard: a build whose task graph holds a task that publishes to a
-// Maven repository fails unless this build generates the bindings
-// (`scp.uniffi.prebuiltBindings` is not true) from the crate's default features
-// (`scp.uniffi.cargoFeatures` is empty).
+// Maven repository fails unless uniffiBindingsGenerated is true and
+// `scp.uniffi.cargoFeatures` is empty.
+var uniffiBindingsGenerated = false
 gradle.taskGraph.whenReady {
+    uniffiBindingsGenerated =
+        uniffiPrebuiltBindings != "true" && hasTask(tasks.named("generateUniffiBindings").get())
     val publishTask = allTasks.firstOrNull { it is PublishToMavenRepository }
-    if (publishTask != null && (uniffiCargoFeatures.isNotEmpty() || uniffiPrebuiltBindings == "true")) {
+    if (publishTask != null && (uniffiCargoFeatures.isNotEmpty() || !uniffiBindingsGenerated)) {
         throw GradleException(
             "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
-                "and scp.uniffi.prebuiltBindings must not be true; they are '$uniffiCargoFeatures' and " +
-                "'$uniffiPrebuiltBindings'",
+                "and this build must generate the bindings; scp.uniffi.cargoFeatures is '$uniffiCargoFeatures' " +
+                "and uniffiBindingsGenerated is $uniffiBindingsGenerated",
         )
     }
     val testTask = tasks.test.get()
@@ -373,6 +378,24 @@ gradle.taskGraph.whenReady {
         throw GradleException(
             "${testTask.path} needs a cdylib built with the testing feature; " +
                 "pass -Pscp.uniffi.cargoFeatures=testing",
+        )
+    }
+}
+
+// The JAR's manifest records `Scp-Uniffi-Cargo-Features` (the value of
+// `scp.uniffi.cargoFeatures`) and `Scp-Uniffi-Bindings` (`generated` when
+// uniffiBindingsGenerated is true, else `prebuilt`).
+tasks.jar {
+    val bindingsSource = provider { if (uniffiBindingsGenerated) "generated" else "prebuilt" }
+    // Declared as inputs so a change to either value reruns the task.
+    inputs.property("scpUniffiCargoFeatures", uniffiCargoFeatures)
+    inputs.property("scpUniffiBindings", bindingsSource)
+    doFirst {
+        manifest.attributes(
+            mapOf(
+                "Scp-Uniffi-Cargo-Features" to uniffiCargoFeatures,
+                "Scp-Uniffi-Bindings" to bindingsSource.get(),
+            ),
         )
     }
 }
