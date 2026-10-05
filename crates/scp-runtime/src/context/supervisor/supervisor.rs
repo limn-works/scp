@@ -1549,9 +1549,9 @@ pub struct Supervisor {
     /// The one task tracker every supervisor-held task spawns through
     /// (ADR-049 Decision 16, supervisor task drain); Decision 16 item 1 states
     /// which tasks are members. Spawn only through [`Self::spawn_permit`],
-    /// [`Self::spawn_tracked`], or [`Self::spawn_tracked_on`], which refuse
-    /// once shutdown begins (the last only for a caller outside the tracker). [`Self::shutdown_all_contexts`] closes the tracker and
-    /// awaits it.
+    /// [`Self::spawn_tracked`], [`Self::spawn_tracked_on`], or a
+    /// [`TrackedSpawner`] from [`Self::tracked_spawner`].
+    /// [`Self::shutdown_all_contexts`] closes the tracker and awaits it.
     task_tracker: tokio_util::task::TaskTracker,
     /// The closed flag of ADR-049 Decision 16: `true` once
     /// [`Self::shutdown_all_contexts`] has begun. A spawner holds the read
@@ -2822,14 +2822,14 @@ impl Supervisor {
         // shutdown that has begun refuses this spawn with a typed error and
         // a shutdown that begins later sees the registered handle.
         let permit = self.spawn_permit("spawn key-package actor")?;
-        let (handle, actor) =
-            crate::context::supervisor::key_package_actor::KeyPackageStoreActor::new(
+        let (handle, join) =
+            crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn_through(
+                &permit,
                 identity.clone(),
                 deps,
             );
         self.key_package_stores
             .insert(identity.clone(), handle.clone());
-        let join = permit.spawn(actor.run());
         // Attach the watchdog (ADR-049 §10) — mirrors the per-context actor
         // watchdog. Keeps the JoinHandle and respawns from durable storage on
         // panic; poisons the identity after the 3-crash/60s budget.
@@ -6856,8 +6856,7 @@ impl Supervisor {
     /// [`SagaError::Aborted`] for an authorize-before-reserve rejection, a
     /// Prepare-B policy reject, or a B-side open rejection (neither side
     /// committed; the staged slot + journal are rolled back); [`SagaError::Busy`]
-    /// when the `{caller, target}` set overlaps an in-flight saga;
-    /// [`SagaError::SupervisorShutDown`] once `shutdown_all_contexts` has begun.
+    /// when the `{caller, target}` set overlaps an in-flight saga.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn start_cross_context_streaming_outlet_invocation_saga<E>(
         self: &Arc<Self>,
@@ -6891,7 +6890,12 @@ impl Supervisor {
         let spawner = self
             .tracked_spawner("start cross-context streaming saga")
             .map_err(|refused| SagaError::SupervisorShutDown {
-                message: refused.to_string(),
+                // The variant's `Display` carries the code, so the message
+                // keeps only the detail, not `ContextError`'s coded `Display`.
+                message: match refused {
+                    ContextError::SupervisorShutDown(detail) => detail,
+                    other => other.to_string(),
+                },
             })?;
 
         let caller_hex = hex::encode(caller_context_id);
@@ -11069,9 +11073,8 @@ impl Supervisor {
     /// caller that can run off any runtime thread (a `Drop`). Unlike
     /// [`Self::spawn_tracked`], it accepts the spawn after the closed flag is
     /// set when the caller is itself a tracked task (ADR-049 Decision 16, item
-    /// 2): its callers hand a streaming settlement or refund to a task of its
-    /// own, and the tracker is not empty while the caller runs, so the drain
-    /// awaits the spawned task.
+    /// 2): the tracker is not empty while the caller runs, so the drain awaits
+    /// the spawned task.
     ///
     /// # Errors
     ///
@@ -13358,9 +13361,7 @@ impl Supervisor {
     /// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
     /// taxonomy via
     /// [`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection);
-    /// any rejection `open_stream_session` returns propagates verbatim. An open
-    /// refused because `shutdown_all_contexts` has begun returns
-    /// `OpenStreamRejection::SupervisorShutDown`.
+    /// any rejection `open_stream_session` returns propagates verbatim.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn open_outlet_stream<E>(
         self: &Arc<Self>,
@@ -20103,9 +20104,7 @@ mod tests {
     /// nothing keeps the Supervisor alive (ADR-049 Decision 16): every
     /// supervisor-spawned task holds a `Weak` and the tracker wait has seen
     /// each one exit. A `Weak` probe taken before shutdown must fail to
-    /// upgrade. With strong back-references in the actor deps or watchdogs, a
-    /// context actor, key-package actor, or watchdog still holds an `Arc` and
-    /// the probe upgrades.
+    /// upgrade.
     #[tokio::test]
     async fn supervisor_drops_after_shutdown_and_owner_release() {
         let supervisor_arc = supervisor_with_providers();
@@ -20138,6 +20137,44 @@ mod tests {
             probe.upgrade().is_none(),
             "a supervisor-spawned task still holds the Supervisor after shutdown"
         );
+    }
+
+    /// ADR-049 Decision 16 item 4: with no shutdown, dropping the owner's last
+    /// `Arc` drops the Supervisor while its context actors, their watchdogs,
+    /// and a key-package actor and its watchdog still run, because each holds
+    /// only a `Weak`. A strong back-reference in any of them keeps the probe
+    /// upgradable, and the bounded wait below fails.
+    #[tokio::test]
+    async fn supervisor_drops_on_owner_release_without_shutdown() {
+        let supervisor_arc = supervisor_with_providers();
+        for ctx_id_bytes in [[0x5Eu8; 32], [0x6Fu8; 32]] {
+            let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                1_700_000_000,
+                DID("did:example:admin".to_owned()),
+            );
+            let deps = test_actor_deps(&supervisor_arc).await;
+            supervisor_arc
+                .spawn_actor_with_state(state, deps, None)
+                .await
+                .expect("fresh context id registers");
+        }
+        supervisor_arc
+            .key_package_store_for(&DID("did:dht:z6MkNoShutdownKp".to_owned()))
+            .await
+            .expect("kp store resolves with providers");
+        let probe = Arc::downgrade(&supervisor_arc);
+        drop(supervisor_arc);
+
+        // A task may hold an upgraded `Arc` for one operation (item 4), so
+        // the check waits a bounded time for any such operation to end.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while probe.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a supervisor-spawned task holds a strong reference to the Supervisor");
     }
 
     /// Once shutdown has begun, a spawn through the tracker is refused with
@@ -35374,6 +35411,19 @@ mod streaming_saga_tests {
         assert!(
             message.contains("start cross-context streaming saga refused"),
             "the refusal names the saga: {message}"
+        );
+        let rendered = SagaError::SupervisorShutDown {
+            message: message.clone(),
+        }
+        .to_string();
+        assert_eq!(
+            rendered.matches("SCP-CTX-2138").count(),
+            1,
+            "the code appears once in the rendered error: {rendered}"
+        );
+        assert!(
+            !message.contains("SCP-CTX-2138"),
+            "the message carries the detail, not the code: {message}"
         );
 
         let target_hex = hex::encode(SS_TARGET);

@@ -1162,9 +1162,7 @@ mod tests {
     }
 
     /// ADR-049 Decision 16: the handle holds a `Weak<Supervisor>`, so it never
-    /// keeps the Supervisor alive, and once the last owner drops it every
-    /// operation returns the typed `SupervisorShutDown` error instead of a
-    /// default value.
+    /// keeps the Supervisor alive.
     #[tokio::test]
     async fn handle_returns_supervisor_shut_down_after_owner_drops() {
         let (sup, handle) = test_handle();

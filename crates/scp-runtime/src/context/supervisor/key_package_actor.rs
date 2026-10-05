@@ -788,21 +788,29 @@ impl KeyPackageStoreActor {
         (handle, tokio::spawn(actor.run()))
     }
 
-    /// Builds a new actor and its handle without spawning it.
-    ///
-    /// The Supervisor spawns [`Self::run`] through its task tracker and
-    /// attaches a watchdog to the `JoinHandle` (mirroring the per-context
-    /// actor watchdog, ADR-049 §10 and Decision 16). On spawn the actor runs
-    /// the §9 respawn reconciliation from `mls_storage` and replenishes to
-    /// [`MIN_BUFFER`] before serving commands.
+    /// Builds a new actor and spawns it through `permit` onto the
+    /// Supervisor's task tracker (ADR-049 Decision 16), returning its handle
+    /// and `JoinHandle`. The Supervisor attaches a watchdog to the
+    /// `JoinHandle` (mirroring the per-context actor watchdog, ADR-049 §10).
+    /// On spawn the actor runs the §9 respawn reconciliation from
+    /// `mls_storage` and replenishes to [`MIN_BUFFER`] before serving
+    /// commands.
     ///
     /// The returned handle is the only way to reach the actor — the
     /// `mpsc::Receiver<KeyPackageCommand>` moves into the actor and never
     /// escapes.
-    pub(in crate::context) fn new(
+    pub(in crate::context) fn spawn_through(
+        permit: &super::supervisor::SpawnPermit<'_>,
         identity: DID,
         deps: KeyPackageStoreDeps,
-    ) -> (KeyPackageStoreHandle, Self) {
+    ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
+        let (handle, actor) = Self::new(identity, deps);
+        (handle, permit.spawn(actor.run()))
+    }
+
+    /// Builds a new actor and its handle without spawning it. Private, with
+    /// [`Self::run`], so no caller can spawn the actor off the tracker.
+    fn new(identity: DID, deps: KeyPackageStoreDeps) -> (KeyPackageStoreHandle, Self) {
         let (tx, rx) = mpsc::channel::<KeyPackageCommand>(KP_MAILBOX_CAPACITY);
 
         // Build the credential once. The DID is a genuine local participant
@@ -1065,7 +1073,7 @@ impl KeyPackageStoreActor {
     /// Dispatch loop. On startup runs the §9 reconciliation + an initial
     /// replenish, then serves commands until the inbox closes or a `Shutdown`
     /// command arrives.
-    pub(in crate::context) async fn run(mut self) {
+    async fn run(mut self) {
         if let Err(e) = self.reconcile_from_storage().await {
             tracing::error!(
                 actor_kind = "key_package_store",
