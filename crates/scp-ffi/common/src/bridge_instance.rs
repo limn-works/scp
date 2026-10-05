@@ -1220,6 +1220,35 @@ impl CoreFields {
         }
     }
 
+    /// Inserts `value` under `key` into a stream registry that
+    /// [`BridgeInstanceCore::release_streams`] clears, unless shutdown has
+    /// begun.
+    ///
+    /// Returns `false`, with the entry removed again, when the check that
+    /// follows the insert finds shutdown begun: [`Self::stop_borrowers`] has
+    /// run, or the instance is shut down. [`BridgeInstanceCore::shutdown`]
+    /// calls [`Self::stop_borrowers`] before its first `release_streams`, so
+    /// an entry this inserts is either cleared by that release or removed
+    /// here, and no stream opened during shutdown holds its pump on the
+    /// Supervisor's tracker past the drain.
+    pub fn insert_stream_entry<K, V>(&self, registry: &DashMap<K, V>, key: K, value: V) -> bool
+    where
+        K: Eq + std::hash::Hash + Clone,
+    {
+        let removal = key.clone();
+        registry.insert(key, value);
+        let begun = self
+            .borrowers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed
+            || self.is_shutdown();
+        if begun {
+            registry.remove(&removal);
+        }
+        !begun
+    }
+
     /// Suspends the bridge instance.
     ///
     /// - Disconnects the relay (clears transport)
@@ -2551,8 +2580,7 @@ impl CoreFields {
     /// aborted: aborting would cut a tracked writer mid-write, and closing the
     /// store before that writer exits would release the advisory lock while
     /// the writer still holds the connection's work in flight (ADR-049
-    /// Decision 16). Past the deadline the task keeps running and closes the
-    /// store itself when the last tracked task exits.
+    /// Decision 16).
     async fn run_shutdown_side_effects(
         &self,
         budget: Duration,
@@ -3320,10 +3348,7 @@ pub enum ShutdownOutcome {
         panicked_tasks: usize,
         /// True when the Supervisor drain did not finish and the instance has
         /// a durable store: the store was not closed and keeps its advisory
-        /// lock. After a drain that missed the deadline, the detached drain
-        /// closes it once the last tracked task exits; after a drain that
-        /// panicked, nothing closes it and the lock is released when the
-        /// last handle to the store drops.
+        /// lock.
         durable_store_open: bool,
     },
 }
@@ -3498,6 +3523,30 @@ mod tests {
         assert!(!instance.has_supervisor());
         assert!(instance.try_supervisor().is_none());
         assert!(!instance.is_shutdown());
+    }
+
+    /// A stream entry inserted before shutdown begins stays registered; one
+    /// inserted after `stop_borrowers`, or after the instance shut down, is
+    /// removed and reported refused.
+    #[test]
+    fn insert_stream_entry_refuses_once_shutdown_begins() {
+        let instance = CoreFields::new();
+        let registry: DashMap<String, u8> = DashMap::new();
+        assert!(instance.insert_stream_entry(&registry, "live".to_owned(), 1));
+        assert!(registry.contains_key("live"));
+
+        instance.stop_borrowers();
+        assert!(!instance.insert_stream_entry(&registry, "late".to_owned(), 2));
+        assert!(!registry.contains_key("late"));
+        assert!(
+            registry.contains_key("live"),
+            "only the late entry is removed"
+        );
+
+        let shut = CoreFields::new();
+        shut.shutdown();
+        assert!(!shut.insert_stream_entry(&registry, "after".to_owned(), 3));
+        assert!(!registry.contains_key("after"));
     }
 
     #[test]

@@ -183,8 +183,7 @@ impl Drop for Scp {
 
 /// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Writer
 /// per Durable Directory"): a durable store the shutdown left holding its
-/// advisory lock raises `SCP-STORAGE-8005`, so the caller learns that a
-/// reopen of the directory will fail.
+/// advisory lock raises `SCP-STORAGE-8005`.
 fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpError> {
     sdk_shutdown_result(result).map_err(|msg| ScpError::Validation {
         msg,

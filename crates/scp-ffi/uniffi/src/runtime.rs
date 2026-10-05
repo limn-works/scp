@@ -1257,8 +1257,7 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 
     // `shutdown` inherits the `BridgeInstanceCore` default (ADR-049 §11,
-    // landed in commit 6): `core.shutdown_core_async(timeout).await +
-    // bridge_specific_shutdown()`. Overriding here would diverge from
+    // landed in commit 6). Overriding here would diverge from
     // the shared contract and be caught by the cross-bridge consistency
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 

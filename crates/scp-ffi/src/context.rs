@@ -482,28 +482,33 @@ impl PyContextParams {
 
 /// The Python exception for a failed supervisor call named `op`.
 ///
-/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130`, as the
-/// NAPI and `UniFFI` bridges report it (its doc states producers and retry
-/// behaviour); every other variant raises the uncoded `RuntimeError` this
+/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130` (its
+/// doc states producers and retry behaviour), and
+/// `ContextError::SupervisorShutDown` raises `ContextError` with
+/// `SCP-CTX-2138`; every other variant raises the uncoded `RuntimeError` this
 /// call site raised before.
 fn busy_or(op: &str, e: &scp_core::context::ContextError) -> PyErr {
-    actor_busy_error(op, e).map_or_else(
+    typed_supervisor_error(op, e).map_or_else(
         || PyRuntimeError::new_err(format!("{op} failed: {e}")),
         PyErr::from,
     )
 }
 
-/// The `SCP-CTX-2130` error [`busy_or`] raises for `ContextError::ActorBusy`,
-/// or `None` for every other variant.
-fn actor_busy_error(
+/// The typed error [`busy_or`] raises: `SCP-CTX-2130` for
+/// `ContextError::ActorBusy`, `SCP-CTX-2138` for
+/// `ContextError::SupervisorShutDown`, or `None` for every other variant.
+fn typed_supervisor_error(
     op: &str,
     e: &scp_core::context::ContextError,
 ) -> Option<crate::error::ScpPyError> {
-    matches!(e, scp_core::context::ContextError::ActorBusy(_)).then(|| {
-        crate::error::ScpPyError::ContextError {
-            message: format!("{op} failed: {e}"),
-            code: codes::CTX_2130.to_owned(),
-        }
+    let code = match e {
+        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
+        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
+        _ => return None,
+    };
+    Some(crate::error::ScpPyError::ContextError {
+        message: format!("{op} failed: {e}"),
+        code: code.to_owned(),
     })
 }
 
@@ -4878,7 +4883,9 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` (SCP-CTX-2064) if restoration fails.
+    /// Returns `ContextError` (SCP-CTX-2138) if the Supervisor refused the
+    /// restore because shutdown began, and `RuntimeError` (SCP-CTX-2064) if
+    /// restoration fails otherwise.
     #[pyo3(signature = (context_id,))]
     pub fn restore_context(&self, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -4905,20 +4912,16 @@ impl crate::scp::PyScp {
                 }),
                 reply: tx,
             };
-            sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "SCP-CTX-2064: supervisor dispatch_lifecycle_command failed: {e}"
-                ))
-            })?;
+            sup.dispatch_lifecycle_command(cmd)
+                .await
+                .map_err(|e| restore_context_failure("supervisor dispatch_lifecycle_command", e))?;
             rx.await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!(
                         "SCP-CTX-2064: restore_context shim reply dropped: {e}"
                     ))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("SCP-CTX-2064: restore_context failed: {e}"))
-                })
+                .map_err(|e| restore_context_failure("restore_context", e))
         })
     }
 
@@ -6334,10 +6337,21 @@ const fn keeps_create_failure_code(e: &scp_core::context::ContextError) -> bool 
 }
 
 /// Whether a refused join keeps its typed SDK code: a join refused because
-/// Supervisor shutdown began keeps SCP-CTX-2138, as on the NAPI and `UniFFI`
-/// bridges.
+/// Supervisor shutdown began keeps SCP-CTX-2138.
 const fn keeps_join_failure_code(e: &scp_core::context::ContextError) -> bool {
     matches!(e, scp_core::context::ContextError::SupervisorShutDown(_))
+}
+
+/// The Python exception for a refused `RestoreContext` at `stage`: a restore
+/// refused because Supervisor shutdown began raises `ContextError` with
+/// SCP-CTX-2138; every other failure raises the `RuntimeError` naming
+/// SCP-CTX-2064.
+fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> PyErr {
+    if matches!(e, scp_core::context::ContextError::SupervisorShutDown(_)) {
+        PyErr::from(crate::error::ScpPyError::from(e))
+    } else {
+        PyRuntimeError::new_err(format!("SCP-CTX-2064: {stage} failed: {e}"))
+    }
 }
 
 /// Flattens a refused create to a [`scp_core::context::ContextError`], keeping
@@ -8385,14 +8399,24 @@ mod tests {
         })
     }
 
-    /// `busy_or` raises `SCP-CTX-2130` for `ContextError::ActorBusy` and keeps
-    /// the uncoded `RuntimeError` for every other variant, on the
+    /// `busy_or` raises `SCP-CTX-2130` for `ContextError::ActorBusy`,
+    /// `SCP-CTX-2138` for `ContextError::SupervisorShutDown`, and keeps the
+    /// uncoded `RuntimeError` for every other variant, on the
     /// `reserve_key_package`, `context_join_from_welcome` and `invite_member`
     /// failure paths.
     #[test]
-    fn busy_or_raises_ctx_2130_only_for_actor_busy() {
+    fn busy_or_types_only_actor_busy_and_supervisor_shut_down() {
         use scp_core::context::ContextError;
-        match super::actor_busy_error(
+        match super::typed_supervisor_error(
+            "context_join_from_welcome",
+            &ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+        ) {
+            Some(crate::error::ScpPyError::ContextError { code, .. }) => {
+                assert_eq!(code, codes::CTX_2138);
+            }
+            other => panic!("expected an SCP-CTX-2138 ContextError, got {other:?}"),
+        }
+        match super::typed_supervisor_error(
             "reserve_key_package",
             &ContextError::ActorBusy("key-package actor".to_owned()),
         ) {
@@ -8406,7 +8430,7 @@ mod tests {
             other => panic!("expected an SCP-CTX-2130 ContextError, got {other:?}"),
         }
         assert!(
-            super::actor_busy_error(
+            super::typed_supervisor_error(
                 "context_join_from_welcome",
                 &ContextError::MembershipFailed("bad welcome".to_owned()),
             )
@@ -8429,6 +8453,35 @@ mod tests {
                 other.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
                 "a non-busy failure raises RuntimeError, got {other}"
             );
+        });
+    }
+
+    /// A restore refused because Supervisor shutdown began raises
+    /// `ContextError` with `SCP-CTX-2138`; any other restore failure raises the
+    /// `RuntimeError` naming `SCP-CTX-2064`.
+    #[test]
+    fn restore_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::ContextError;
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let shut = super::restore_context_failure(
+                "restore_context",
+                ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+            );
+            assert!(
+                shut.is_instance_of::<crate::error::ContextError>(py),
+                "SupervisorShutDown raises ContextError, got {shut}"
+            );
+            assert!(shut.to_string().contains(codes::CTX_2138), "{shut}");
+            let other = super::restore_context_failure(
+                "restore_context",
+                ContextError::MembershipFailed("bad snapshot".to_owned()),
+            );
+            assert!(
+                other.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "a non-shutdown failure raises RuntimeError, got {other}"
+            );
+            assert!(other.to_string().contains(codes::CTX_2064), "{other}");
         });
     }
 

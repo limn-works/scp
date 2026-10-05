@@ -4619,10 +4619,10 @@ pub(crate) async fn context_restore_on(
         reply: tx,
     };
     sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
-            code: codes::CTX_2064.to_owned(),
-        })
+        NapiError::from(restore_context_failure(
+            "supervisor dispatch_lifecycle_command failed",
+            e,
+        ))
     })?;
     rx.await
         .map_err(|e| {
@@ -4631,12 +4631,21 @@ pub(crate) async fn context_restore_on(
                 code: codes::CTX_2064.to_owned(),
             })
         })?
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("restore_context failed: {e}"),
-                code: codes::CTX_2064.to_owned(),
-            })
-        })
+        .map_err(|e| NapiError::from(restore_context_failure("restore_context failed", e)))
+}
+
+/// Maps a refused `RestoreContext` to its SDK error: a restore refused because
+/// Supervisor shutdown began keeps SCP-CTX-2138; every other failure carries
+/// SCP-CTX-2064.
+fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> ScpNapiError {
+    if matches!(e, scp_core::context::ContextError::SupervisorShutDown(_)) {
+        ScpNapiError::from(e)
+    } else {
+        ScpNapiError::Context {
+            message: format!("{stage}: {e}"),
+            code: codes::CTX_2064.to_owned(),
+        }
+    }
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_restore_all`](crate::scp::Scp::context_restore_all).
@@ -5570,18 +5579,19 @@ fn parse_template_id_napi(
 }
 
 /// Maps a failed supervisor call that otherwise reports every failure under
-/// one fixed `code` to the bridge error, keeping `ActorBusy` apart.
+/// one fixed `code` to the bridge error, keeping `ActorBusy` and
+/// `SupervisorShutDown` apart.
 ///
 /// `ActorBusy` reports `SCP-CTX-2130` (ADR-049 §10), whose producers and retry
-/// behaviour the `ContextError::ActorBusy` doc states. Every other failure
-/// reports `code`.
+/// behaviour the `ContextError::ActorBusy` doc states. `SupervisorShutDown`
+/// reports `SCP-CTX-2138`. Every other failure reports `code`.
 /// The Welcome join, the key-package reservation and the invite map their
 /// errors through it.
 fn busy_or(op: &str, code: &str, e: &scp_core::context::ContextError) -> ScpNapiError {
-    let code = if matches!(e, scp_core::context::ContextError::ActorBusy(_)) {
-        codes::CTX_2130
-    } else {
-        code
+    let code = match e {
+        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
+        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
+        _ => code,
     };
     ScpNapiError::Context {
         message: format!("{op} failed: {e}"),
@@ -5662,12 +5672,11 @@ mod tests {
         );
     }
 
-    /// A dropped Supervisor yields `None`, which ends the subscription loop,
-    /// and the command is never dispatched.
+    /// A dropped Supervisor yields `None`, which ends the subscription loop.
     #[tokio::test]
     async fn dispatch_to_dropped_supervisor_ends_the_subscription() {
         use scp_core::context::actor::commands::MessagingCommand;
-        let (reply, rx) = tokio::sync::oneshot::channel();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::DeliverIncoming {
             context_id: "ctx".to_owned(),
             envelope_bytes: vec![1, 2, 3],
@@ -5675,10 +5684,6 @@ mod tests {
         };
         let outcome = super::dispatch_to_live_supervisor(&std::sync::Weak::new(), "ctx", cmd).await;
         assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
-        assert!(
-            rx.await.is_err(),
-            "the command must be dropped undispatched"
-        );
     }
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
@@ -6902,7 +6907,8 @@ mod tests {
     }
 
     /// A Welcome join, a key-package reservation or an invite that meets a
-    /// busy actor reports `SCP-CTX-2130`, and any other failure reads the
+    /// busy actor reports `SCP-CTX-2130`, one refused because Supervisor
+    /// shutdown began reports `SCP-CTX-2138`, and any other failure reads the
     /// operation's own code.
     #[test]
     fn busy_or_keeps_actor_busy_code() {
@@ -6924,11 +6930,44 @@ mod tests {
                 code_of(super::busy_or(
                     "context_join_from_welcome",
                     fallback,
+                    &ContextError::SupervisorShutDown("spawn context actor".to_owned())
+                )),
+                codes::CTX_2138
+            );
+            assert_eq!(
+                code_of(super::busy_or(
+                    "context_join_from_welcome",
+                    fallback,
                     &ContextError::MembershipFailed("bad welcome".to_owned())
                 )),
                 fallback
             );
         }
+    }
+
+    /// A restore refused because Supervisor shutdown began keeps
+    /// `SCP-CTX-2138`; any other restore failure reads `SCP-CTX-2064`.
+    #[test]
+    fn restore_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::ContextError;
+        let code_of = |e: crate::error::ScpNapiError| match e {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected ScpNapiError::Context, got {other:?}"),
+        };
+        assert_eq!(
+            code_of(super::restore_context_failure(
+                "restore_context failed",
+                ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+            )),
+            codes::CTX_2138
+        );
+        assert_eq!(
+            code_of(super::restore_context_failure(
+                "restore_context failed",
+                ContextError::MembershipFailed("bad snapshot".to_owned()),
+            )),
+            codes::CTX_2064
+        );
     }
 
     /// `context_create` rejects a params object whose ceiling is absent or

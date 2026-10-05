@@ -613,7 +613,8 @@ fn outlet_stream_open_impl(
     };
 
     let handle_id = hex::encode(request_id);
-    bi.outlet_stream_registry.insert(
+    if !bi.core.insert_stream_entry(
+        &bi.outlet_stream_registry,
         handle_id.clone(),
         StreamEntry {
             handle: Arc::new(tokio::sync::Mutex::new(handle)),
@@ -626,7 +627,14 @@ fn outlet_stream_open_impl(
             stream_epoch,
             cost_per_chunk,
         },
-    );
+    ) {
+        return Err(
+            ScpPyError::from(scp_core::context::ContextError::SupervisorShutDown(
+                "open outlet stream".to_owned(),
+            ))
+            .into(),
+        );
+    }
     Ok(handle_id)
 }
 
@@ -1464,7 +1472,8 @@ fn outlet_streaming_saga_open_impl(
     let saga_id = handle.saga_id;
     let receiver = handle.receiver;
     let handle_id = saga_id.0.clone();
-    bi.outlet_streaming_saga_registry.insert(
+    if !bi.core.insert_stream_entry(
+        &bi.outlet_streaming_saga_registry,
         handle_id.clone(),
         scp_ffi_common::streaming_saga::StreamingSagaEntry {
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
@@ -1473,7 +1482,14 @@ fn outlet_streaming_saga_open_impl(
             invoker_did: caller_did.to_owned(),
             request_id,
         },
-    );
+    ) {
+        return Err(
+            ScpPyError::from(scp_core::context::ContextError::SupervisorShutDown(
+                "open streaming saga".to_owned(),
+            ))
+            .into(),
+        );
+    }
     Ok(handle_id)
 }
 
