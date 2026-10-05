@@ -301,12 +301,6 @@ fn no_pre_rotation_backend() -> ScpError {
 
 /// Tears down a committed Welcome join whose UCAN state a concurrent close
 /// removed, re-marks the id released, and returns the join's `CTX_2040` error.
-///
-/// `discard_joined_context` removes the actor handle, destroys the resident MLS
-/// group, and deletes the durable snapshot the join persisted. The re-mark
-/// restores the release mark the join's readmit cleared, so
-/// [`UniffiBridgeInstance::ensure_ucan_registered`](crate::runtime::UniffiBridgeInstance::ensure_ucan_registered)
-/// builds no state for the id.
 async fn tear_down_vanished_join(
     bi: &crate::runtime::UniffiBridgeInstance,
     sup: &scp_core::context::supervisor::Supervisor,
@@ -11275,9 +11269,7 @@ impl Scp {
                 };
 
                 // The supervisor serves the id again, so clear any release
-                // mark a prior close left on it. A close that lands after this
-                // line re-marks the id and removes the state, and the probe
-                // below catches the removal.
+                // mark a prior close left on it.
                 bi.readmit_context(&context_id);
 
                 // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
@@ -11739,13 +11731,12 @@ impl Scp {
     /// per-context state. It refuses every other state with `SCP-CTX-2017`
     /// and keeps that state, and it propagates a failed state read.
     ///
-    /// The release marks the id so
-    /// [`UniffiBridgeInstance::ensure_ucan_registered`](crate::runtime::UniffiBridgeInstance::ensure_ucan_registered)
-    /// does not rebuild its revocation list and nonce tracker. When a re-read
-    /// after the mark reports `Active`, this function removes nothing,
-    /// leaves the handle's cached state unchanged, and refuses with
-    /// `SCP-CTX-2017`. When that re-read fails, it removes nothing, leaves the
-    /// handle's cached state unchanged, and returns the read's error.
+    /// The release marks the id. When a re-read after the mark reports
+    /// `Active`, or a readmit clears the mark before the release removes the
+    /// state, this function removes nothing, leaves the handle's cached state
+    /// unchanged, and refuses with `SCP-CTX-2017`. When that re-read fails,
+    /// it removes nothing, leaves the handle's cached state unchanged, and
+    /// returns the read's error.
     pub async fn context_close(
         &self,
         handle: Arc<ContextHandle>,
@@ -11767,9 +11758,6 @@ impl Scp {
                 // `scp_core::context::ContextState` is the supervisor's enum;
                 // the UniFFI-exported `ContextState` is a separate type.
                 use scp_core::context::ContextState as CoreContextState;
-                // `read_live_context_state` returns `Ok(None)` only when the
-                // supervisor holds no actor and no crash-window record for the
-                // id; an unreachable or crashed actor is an error.
                 let close_already_happened = match bi
                     .read_live_context_state(&handle.context_id)
                     .await?
@@ -11862,12 +11850,18 @@ impl Scp {
                 // issued from here either (relay_urls / blob_ids were always empty),
                 // so nothing observable is lost by removing this block.
 
-                // Release per-context UCAN state on this instance and mark the
-                // id, unless a re-read after the mark reports `Active`.
-                if !bi
-                    .release_ucan_state_unless_readmitted(&handle.context_id)
-                    .await?
-                {
+                // Mark the id and, unless the re-read reports `Active` or a
+                // readmit clears the mark first, release this instance's UCAN,
+                // connector and economy state and the MCP handle registration
+                // under the registry shard lock.
+                let released = bi
+                    .release_ucan_state_unless_readmitted(&handle.context_id, || {
+                        bi.core.remove_bridge_state(&handle.context_id);
+                        bi.core.remove_economy_state(&handle.context_id);
+                        deregister_context_handle(&bi, &handle.context_id);
+                    })
+                    .await?;
+                if !released {
                     return Err(ScpError::Context {
                         msg: "the context returned to Active while this close ran; it stays \
                               open and keeps its state on this bridge"
@@ -11875,13 +11869,6 @@ impl Scp {
                         code: codes::CTX_2017.to_owned(),
                     });
                 }
-
-                // Clean up per-context bridge connector state and economy state.
-                bi.core.remove_bridge_state(&handle.context_id);
-                bi.core.remove_economy_state(&handle.context_id);
-
-                // Deregister the context handle from the MCP lookup registry.
-                deregister_context_handle(&bi, &handle.context_id);
 
                 *state = ContextState::Closed;
                 drop(state);
@@ -20961,8 +20948,11 @@ mod tests {
             .expect("the Active context must have UCAN state");
 
         assert!(
-            !rt.block_on(scp.inner.release_ucan_state_unless_readmitted(&active))
-                .expect("the re-read of an Active context must succeed"),
+            !rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&active, || {})
+            )
+            .expect("the re-read of an Active context must succeed"),
             "a release on an Active context must report the readmit"
         );
         assert!(!scp.inner.released_contexts.contains_key(&active));
@@ -20976,8 +20966,11 @@ mod tests {
 
         let absent = scp_ffi_common::generate_context_id();
         assert!(
-            rt.block_on(scp.inner.release_ucan_state_unless_readmitted(&absent))
-                .expect("the re-read of an id no actor serves must succeed")
+            rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&absent, || {})
+            )
+            .expect("the re-read of an id no actor serves must succeed")
         );
         assert!(
             scp.inner.released_contexts.contains_key(&absent),
@@ -21012,7 +21005,10 @@ mod tests {
             .test_make_actor_unreachable(&context_id);
 
         let err = rt
-            .block_on(scp.inner.release_ucan_state_unless_readmitted(&context_id))
+            .block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&context_id, || {}),
+            )
             .expect_err("a failed re-read must reach the caller");
         assert!(
             err.to_string().contains("SCP-CTX-2130"),
@@ -21070,8 +21066,9 @@ mod tests {
     }
 
     /// A readmit that clears the release mark before the removal runs leaves
-    /// the state in place; while the mark stands, the removal takes the
-    /// state.
+    /// the state in place, skips the teardown, and reports `false`; while the
+    /// mark stands, the removal takes the state, runs the teardown, and
+    /// reports `true`.
     #[test]
     #[cfg(feature = "testing")]
     fn close_removal_skips_state_a_readmit_already_claimed() {
@@ -21087,9 +21084,18 @@ mod tests {
             })
             .expect("the registered context must have UCAN state");
 
-        scp.inner.released_contexts.insert(ctx_id.clone(), ());
+        scp.inner.mark_released(&ctx_id);
         scp.inner.readmit_context(&ctx_id);
-        scp.inner.remove_ucan_state_while_released(&ctx_id);
+        let mut torn_down = false;
+        assert!(
+            !scp.inner
+                .remove_ucan_state_while_released(&ctx_id, || torn_down = true),
+            "a removal after a readmit must report that the mark was gone"
+        );
+        assert!(
+            !torn_down,
+            "a removal after a readmit must skip the teardown"
+        );
         assert_eq!(
             scp.inner.with_ucan_state(&ctx_id, |state| state
                 .revocation_list
@@ -21098,17 +21104,60 @@ mod tests {
             "the readmitted context's revocation must survive the removal"
         );
 
-        scp.inner.released_contexts.insert(ctx_id.clone(), ());
-        scp.inner.remove_ucan_state_while_released(&ctx_id);
+        scp.inner.mark_released(&ctx_id);
+        assert!(
+            scp.inner
+                .remove_ucan_state_while_released(&ctx_id, || torn_down = true),
+            "a removal while the mark stands must report it"
+        );
+        assert!(
+            torn_down,
+            "a removal while the mark stands must run the teardown"
+        );
         assert!(
             scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none(),
             "the removal must take the state while the mark stands"
         );
     }
 
+    /// Marking a new id at `MAX_RELEASED_CONTEXTS` marks evicts the earliest
+    /// mark; re-marking an id that already holds a mark evicts none.
+    #[test]
+    fn marking_past_the_cap_evicts_the_earliest_mark() {
+        use crate::runtime::MAX_RELEASED_CONTEXTS;
+
+        let scp = scp_test();
+        let marks = &scp.inner.released_contexts;
+        let now = std::time::Instant::now();
+        let earlier = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before now is representable");
+        marks.insert("earliest".to_owned(), earlier);
+        for i in 1..MAX_RELEASED_CONTEXTS {
+            marks.insert(format!("mark-{i}"), now);
+        }
+        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+
+        scp.inner.mark_released("mark-1");
+        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+        assert!(
+            marks.contains_key("earliest"),
+            "re-marking a marked id must evict nothing"
+        );
+
+        scp.inner.mark_released("newest");
+        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+        assert!(marks.contains_key("newest"));
+        assert!(
+            !marks.contains_key("earliest"),
+            "a new mark at the cap must evict the earliest mark"
+        );
+    }
+
     /// A close of a context whose actor the supervisor despawned succeeds,
-    /// releases and marks the per-context UCAN state, and records `Closed`,
-    /// although the handle's cached state still read `Active`.
+    /// releases and marks the per-context UCAN state, deregisters the MCP
+    /// handle, and records `Closed`, although the handle's cached state still
+    /// read `Active`.
     #[test]
     #[cfg(feature = "testing")]
     fn close_of_a_context_no_actor_serves_releases_its_bridge_state() {
@@ -21122,6 +21171,7 @@ mod tests {
             .expect("context_create should succeed");
         let context_id = handle.context_id();
         assert!(scp.inner.with_ucan_state(&context_id, |_| ()).is_some());
+        assert!(context_handle_registry(&scp.inner).contains_key(&context_id));
 
         rt.block_on(async {
             scp.inner
@@ -21140,6 +21190,10 @@ mod tests {
         assert!(
             scp.inner.released_contexts.contains_key(&context_id),
             "close must mark the released id"
+        );
+        assert!(
+            !context_handle_registry(&scp.inner).contains_key(&context_id),
+            "close must deregister the MCP handle"
         );
         assert!(matches!(
             *rt.block_on(handle.state.lock()),
@@ -21871,9 +21925,6 @@ mod tests {
         }
     }
 
-    /// A context already active on this instance collides at the atomic UCAN
-    /// occupy — the join fails BEFORE the single-use `KeyPackage` is consumed,
-    /// leaving the pre-existing handle untouched.
     /// A Welcome join that commits clears the release mark a close left on
     /// the id, so the joined context gets UCAN state.
     ///
@@ -21935,6 +21986,9 @@ mod tests {
         );
     }
 
+    /// A context already active on this instance collides at the atomic UCAN
+    /// occupy — the join fails BEFORE the single-use `KeyPackage` is consumed,
+    /// leaving the pre-existing handle untouched.
     #[test]
     #[cfg(feature = "testing")]
     fn context_join_from_welcome_occupied_context_fails_before_consume() {
