@@ -11,6 +11,17 @@ plugins {
 group = "works.limn"
 version = findProperty("scpVersion")?.toString() ?: "0.1.0-SNAPSHOT"
 
+// Configures :scp-kt first, then registers scp-kt's uniffiPublishGuard (see
+// scp-kt/build.gradle.kts) for this project's tasks: a task graph holding a task of
+// this project of type `AbstractPublishToMaven` fails before any task runs unless
+// the value scp-kt resolves for `scp.uniffi.cargoFeatures` is empty,
+// `scp.uniffi.prebuiltBindings` is not true, and the graph holds
+// `:scp-kt:generateUniffiBindings`.
+evaluationDependsOn(":scp-kt")
+@Suppress("UNCHECKED_CAST")
+val uniffiPublishGuard = project(":scp-kt").extra["uniffiPublishGuard"] as (TaskExecutionGraph, Project) -> Unit
+gradle.taskGraph.whenReady { uniffiPublishGuard(this, project) }
+
 repositories {
     google()
     mavenCentral()

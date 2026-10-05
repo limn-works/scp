@@ -407,8 +407,6 @@ jobs:
               - 'scripts/generate-uniffi-kotlin.sh'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
-              - '.github/workflows/build-matrix.yml'
-              - 'scripts/check-shipped-feature-graph.sh'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
@@ -3283,120 +3281,6 @@ jobs:
               exit 1
             fi
           done
-      # check_release_file loads a workflow file with PyYAML, takes every string
-      # value of a `run` key, joins its `\` continuations, and reads each
-      # non-comment line of it that contains `gradle` in any case. It reads the value
-      # of every `uses` key that contains `gradle` in any case as a line it cannot
-      # read. It fails on a line that holds a GitHub expression. It fails unless the
-      # line is `./gradlew` followed only by task paths, `-P<key>=<value>` tokens,
-      # and `-PscpVersion="$NAME"` tokens, runs `:scp-kt:printUniffiCargoFeatures`
-      # with that line's `-P` tokens, a placeholder standing in for each
-      # `-PscpVersion="$NAME"` value, and fails
-      # unless the printed entry is a `scp-ffi-uniffi|` entry of ARTIFACTS in
-      # scripts/check-shipped-feature-graph.sh. It also fails on a file with no such
-      # line. The step runs it on release.yml and build-matrix.yml, and on planted
-      # files that must fail.
-      - name: Check the UniFFI cargo features of the release workflows' ./gradlew lines
-        run: |
-          set -euo pipefail
-          gated=$(sed -n '/^ARTIFACTS=(/,/^)/p' ../../scripts/check-shipped-feature-graph.sh \
-            | sed -n 's/^[[:space:]]*"\(scp-ffi-uniffi|[^"]*\)"$/\1/p')
-          if [ -z "$gated" ]; then
-            echo "::error::ARTIFACTS in scripts/check-shipped-feature-graph.sh has no scp-ffi-uniffi entry"
-            exit 1
-          fi
-          check_release_file() {
-            local file=$1 line token got count=0 lines
-            local -a tokens props
-            if ! lines=$(python3 -c '
-          import sys, yaml
-          def walk(node):
-              if isinstance(node, dict):
-                  for key, value in node.items():
-                      if key == "run" and isinstance(value, str):
-                          for line in value.replace("\\\n", " ").splitlines():
-                              if line.lstrip().startswith("#"):
-                                  continue
-                              if "gradle" in line.lower():
-                                  print(line)
-                      elif key == "uses" and isinstance(value, str):
-                          if "gradle" in value.lower():
-                              print("uses: " + value)
-                      else:
-                          walk(value)
-              elif isinstance(node, list):
-                  for item in node:
-                      walk(item)
-          with open(sys.argv[1]) as f:
-              walk(yaml.safe_load(f))
-          ' "$file"); then
-              echo "$file: cannot read the workflow" >&2
-              return 1
-            fi
-            while IFS= read -r line; do
-              [ -n "$line" ] || continue
-              if [[ "$line" == *'$''{{'* ]]; then
-                echo "$file: cannot read the Gradle arguments of a line with a GitHub expression: $line" >&2
-                return 1
-              fi
-              read -ra tokens <<<"$line"
-              if [ "${tokens[0]:-}" != "./gradlew" ]; then
-                echo "$file: cannot read the Gradle arguments of: $line" >&2
-                return 1
-              fi
-              props=()
-              for token in "${tokens[@]:1}"; do
-                if [[ "$token" =~ ^-P[A-Za-z0-9._-]+=[A-Za-z0-9._,/-]*$ ]]; then
-                  props+=("$token")
-                elif [[ "$token" =~ ^-PscpVersion=\"\$[A-Za-z_][A-Za-z0-9_]*\"$ ]]; then
-                  props+=("-PscpVersion=0.0.0-check")
-                elif ! [[ "$token" =~ ^:[A-Za-z0-9:_-]+$ ]]; then
-                  echo "$file: cannot read the Gradle argument '$token' of: $line" >&2
-                  return 1
-                fi
-              done
-              if ! got=$(./gradlew -q :scp-kt:printUniffiCargoFeatures ${props[@]+"${props[@]}"} </dev/null | tail -n 1); then
-                echo "$file: printUniffiCargoFeatures failed for: $line" >&2
-                return 1
-              fi
-              if ! grep -qxF -- "$got" <<<"$gated"; then
-                echo "$file: '$line' builds '$got', which ARTIFACTS does not carry" >&2
-                return 1
-              fi
-              count=$((count + 1))
-            done <<<"$lines"
-            if [ "$count" -eq 0 ]; then
-              echo "$file: no line runs ./gradlew" >&2
-              return 1
-            fi
-          }
-          for file in ../../.github/workflows/release.yml ../../.github/workflows/build-matrix.yml; do
-            if ! check_release_file "$file"; then
-              echo "::error::$file runs a Gradle build this step cannot show to be production-only"
-              exit 1
-            fi
-          done
-          planted=$(mktemp -d)
-          printf '%s\n' 'run: ./gradlew :scp-kt:jar -Pscp.uniffi.cargoFeatures=testing' > "$planted/features.yml"
-          printf '%s\n' 'run: |' "  ./gradlew :scp-kt:jar \\" '    -Pscp.uniffi.prebuiltBindings=true' > "$planted/prebuilt.yml"
-          printf '%s\n' 'run: ./gradlew :scp-kt:jar && ./gradlew :scp-kt:jar' > "$planted/chained.yml"
-          printf '%s\n' 'run: cd bindings/kotlin && ./gradlew :scp-kt:jar' > "$planted/prefixed.yml"
-          printf '%s\n' 'run: cargo build -p scp-ffi-uniffi' > "$planted/none.yml"
-          printf '%s\n' 'run: |' '  ./gradlew :scp-kt:jar' '  ./gradlew :scp-kt:jar -Pscp.uniffi.cargoFeatures=testing' > "$planted/second.yml"
-          printf '%s\n' 'run: >' '  ./gradlew :scp-kt:jar' '  -Pscp.uniffi.cargoFeatures=testing' > "$planted/folded.yml"
-          printf '%s\n' 'run: ./gradlew :scp-kt:jar' '  -Pscp.uniffi.cargoFeatures=testing' > "$planted/plain.yml"
-          printf '%s\n' 'steps:' '  - run: ./gradlew :scp-kt:jar' '  - uses: gradle/gradle-build-action@v2' '    with:' '      arguments: :scp-kt:jar' > "$planted/action.yml"
-          expr='$''{{'
-          printf '%s\n' "run: ./gradlew :scp-kt:jar -Pscp.uniffi.cargoFeatures=$expr inputs.f }}" > "$planted/features-expression.yml"
-          printf '%s\n' "run: ./gradlew :scp-kt:jar -PscpVersion=$expr env.VERSION }}" > "$planted/version-expression.yml"
-          printf '%s\n' 'run: ./gradlew :scp-kt:jar -Pscp.uniffi.cargoFeatures="$F"' > "$planted/features-variable.yml"
-          for file in "$planted"/*.yml; do
-            if check_release_file "$file" 2>/dev/null; then
-              echo "::error::check_release_file accepted the planted $(basename "$file")"
-              exit 1
-            fi
-          done
-          rm -rf "$planted"
       # The environment-variable cases run `bash ./gradlew`: gradlew starts with
       # `#!/bin/sh`, which is dash on Ubuntu, and dash drops an environment variable
       # whose name holds a dot before it starts Java.
@@ -3417,59 +3301,42 @@ jobs:
               exit 1
             fi
           }
-          got=$(./gradlew -q :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.cargoFeatures=testing | tail -n 1)
-          if [ "$got" != "scp-ffi-uniffi|--features testing" ]; then
-            echo "::error::printUniffiCargoFeatures -Pscp.uniffi.cargoFeatures=testing printed '$got'"
-            exit 1
-          fi
           expect_failure "scp.uniffi.cargoFeatures is 'testing;rm'; it takes a comma-separated list of cargo feature names" \
-            ./gradlew :scp-kt:printUniffiCargoFeatures "-Pscp.uniffi.cargoFeatures=testing;rm"
-          expect_failure "scp.uniffi.prebuiltBindings is true, so generateUniffiBindings builds nothing" \
-            ./gradlew :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.prebuiltBindings=true
+            ./gradlew :scp-kt:jar --dry-run "-Pscp.uniffi.cargoFeatures=testing;rm"
           expect_failure ":scp-kt:test needs a cdylib built with the testing feature; pass -Pscp.uniffi.cargoFeatures=testing" \
             ./gradlew :scp-kt:test --dry-run
           ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=testing
           ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=scp-ffi-uniffi/testing
-          expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
-            env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing bash ./gradlew :scp-kt:printUniffiCargoFeatures
-          expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
-            ./gradlew -Dorg.gradle.project.scp.uniffi.cargoFeatures=testing :scp-kt:printUniffiCargoFeatures
-          got=$(env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing \
-            bash ./gradlew -q :scp-kt:printUniffiCargoFeatures -Pscp.uniffi.cargoFeatures=testing | tail -n 1)
-          if [ "$got" != "scp-ffi-uniffi|--features testing" ]; then
-            echo "::error::printUniffiCargoFeatures with the same value in the environment and on the command line printed '$got'"
-            exit 1
-          fi
-          # printUniffiCargoFeatures prints what the generator script builds, so a
-          # default the script changes reaches the printed line.
-          generator=../../scripts/generate-uniffi-kotlin.sh
-          cp "$generator" "$RUNNER_TEMP/generate-uniffi-kotlin.sh"
-          sed -i 's/^FEATURES=""$/FEATURES="testing"/' "$generator"
-          got=$(./gradlew -q :scp-kt:printUniffiCargoFeatures | tail -n 1)
-          cp "$RUNNER_TEMP/generate-uniffi-kotlin.sh" "$generator"
-          if [ "$got" != "scp-ffi-uniffi|--features testing" ]; then
-            echo "::error::printUniffiCargoFeatures with the generator's default set to testing printed '$got'"
-            exit 1
-          fi
-          expect_failure "ERROR: unknown argument: --no-default-features" \
-            "$generator" --no-default-features --print-cargo-args
-          publish=:scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository
-          # A placeholder scp.kt lets the prebuiltBindings=true case reach the guard.
+          # The publish cases run the publish task itself, not --dry-run: the guard
+          # fails the build when the task graph is ready, before any task runs. A
+          # placeholder scp.kt lets the prebuiltBindings=true cases reach the guard.
           bindings=scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
-          mkdir -p "$(dirname "$bindings")"
-          echo "// placeholder" > "$bindings"
-          for args in -Pscp.uniffi.cargoFeatures=testing -Pscp.uniffi.cargoFeatures=scp-ffi-uniffi/testing \
-            -Pscp.uniffi.cargoFeatures=outlet-capability-test-grant -Pscp.uniffi.prebuiltBindings=true; do
-            expect_failure "$publish publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty" \
-              ./gradlew "$publish" --dry-run "$args"
+          for publish in :scp-kt:publishToMavenLocal:publishMavenJavaPublicationToMavenLocal \
+            :scp-kt-android:publishToMavenLocal:publishReleasePublicationToMavenLocal; do
+            project=${publish%%:publish*}
+            guard="$project:${publish##*:} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty"
+            publish=${publish%:*}
+            mkdir -p "$(dirname "$bindings")"
+            echo "// placeholder" > "$bindings"
+            for args in -Pscp.uniffi.cargoFeatures=testing -Pscp.uniffi.cargoFeatures=scp-ffi-uniffi/testing \
+              -Pscp.uniffi.cargoFeatures=outlet-capability-test-grant -Pscp.uniffi.prebuiltBindings=true; do
+              expect_failure "$guard" ./gradlew "$publish" "$args"
+            done
+            expect_failure "$guard" \
+              env ORG_GRADLE_PROJECT_scp.uniffi.prebuiltBindings=true bash ./gradlew "$publish"
+            rm "$bindings"
+            expect_failure "$guard" ./gradlew "$publish" -x generateUniffiBindings
+            expect_failure "$guard" \
+              env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing bash ./gradlew "$publish" -Pscp.uniffi.cargoFeatures=testing
+            expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
+              env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing bash ./gradlew "$publish"
+            expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
+              ./gradlew -Dorg.gradle.project.scp.uniffi.cargoFeatures=testing "$publish"
+            ./gradlew -q "$publish" --dry-run
           done
-          rm "$bindings"
-          expect_failure "$publish publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty" \
-            ./gradlew "$publish" --dry-run -x generateUniffiBindings
-          ./gradlew -q "$publish" --dry-run
-          expect_failure ":scp-kt:publishMavenJavaPublicationToMavenLocal publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty" \
-            ./gradlew :scp-kt:publishToMavenLocal --dry-run -Pscp.uniffi.cargoFeatures=testing
-          ./gradlew -q :scp-kt:publishToMavenLocal --dry-run
+          # The publish tasks release.yml runs.
+          ./gradlew -q :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository --dry-run
+          ./gradlew -q :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository --dry-run
       # Runs the script of release.yml's "Check each JAR's manifest has empty
       # Scp-Uniffi-Cargo-Features and Scp-Uniffi-Bindings generated" step on JARs
       # whose manifests must pass and fail.

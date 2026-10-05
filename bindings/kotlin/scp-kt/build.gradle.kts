@@ -320,30 +320,6 @@ tasks.register<Exec>("generateUniffiBindings") {
     outputs.dir(uniffiBindingsDir)
 }
 
-// Runs `generateUniffiBindings`' command line with `--print-cargo-args` appended, so
-// the generator prints `scp-ffi-uniffi|` followed by the arguments it passes the
-// cdylib's `cargo build` after the manifest path, and prints that line. With
-// `scp.uniffi.prebuiltBindings=true` that task does not run, so this task fails.
-tasks.register("printUniffiCargoFeatures") {
-    group = "help"
-    description = "Print the cargo arguments generateUniffiBindings' generator passes the scp-ffi-uniffi cdylib build"
-    val generator = tasks.named<Exec>("generateUniffiBindings").map { it.workingDir to it.commandLine }
-    val prebuiltBindings = uniffiPrebuiltBindings
-    val execProvider = providers
-    doLast {
-        if (prebuiltBindings == "true") {
-            throw GradleException("scp.uniffi.prebuiltBindings is true, so generateUniffiBindings builds nothing")
-        }
-        val (dir, generatorCommand) = generator.get()
-        val printed =
-            execProvider.exec {
-                workingDir = dir
-                commandLine(generatorCommand + "--print-cargo-args")
-            }.standardOutput.asText.get().trim()
-        println(printed)
-    }
-}
-
 // uniffiTestGuard: `:scp-kt:test` loads the cdylib under cargo's target directory
 // (see `JnaLibraryPath` above), and its real-FFI suites create identities with the
 // in-memory custody arm, which only a `testing` build compiles. When this build
@@ -355,21 +331,32 @@ tasks.register("printUniffiCargoFeatures") {
 // uniffiBindingsGenerated is true when the task graph holds `generateUniffiBindings`
 // and `scp.uniffi.prebuiltBindings` is not true.
 //
-// uniffiPublishGuard: a build whose task graph holds a task that publishes to a
-// Maven repository fails unless uniffiBindingsGenerated is true and
-// `scp.uniffi.cargoFeatures` is empty.
-var uniffiBindingsGenerated = false
-gradle.taskGraph.whenReady {
-    uniffiBindingsGenerated =
-        uniffiPrebuiltBindings != "true" && hasTask(tasks.named("generateUniffiBindings").get())
-    val publishTask = allTasks.firstOrNull { it is AbstractPublishToMaven }
-    if (publishTask != null && (uniffiCargoFeatures.isNotEmpty() || !uniffiBindingsGenerated)) {
+// uniffiPublishGuard(graph, owner): when the task graph holds a task of `owner` of
+// type `AbstractPublishToMaven` (a remote repository or Maven Local), it fails the
+// build before any task runs unless Gradle resolves `scp.uniffi.cargoFeatures` to
+// the empty string, `scp.uniffi.prebuiltBindings` is not true, and the graph holds
+// this project's `generateUniffiBindings`. This project calls it for its own tasks;
+// scp-kt-android reads it from this project's `extra` and calls it for its tasks.
+val generateUniffiBindingsPath = tasks.named("generateUniffiBindings").get().path
+val uniffiPublishGuard: (TaskExecutionGraph, Project) -> Unit = { graph, owner ->
+    val publishTask = graph.allTasks.firstOrNull { it is AbstractPublishToMaven && it.project == owner }
+    val generatesBindings = graph.hasTask(generateUniffiBindingsPath)
+    if (publishTask != null &&
+        (resolvedUniffiCargoFeatures.isNotEmpty() || uniffiPrebuiltBindings == "true" || !generatesBindings)
+    ) {
         throw GradleException(
             "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
-                "and this build must generate the bindings; scp.uniffi.cargoFeatures is '$uniffiCargoFeatures' " +
-                "and uniffiBindingsGenerated is $uniffiBindingsGenerated",
+                "and this build must generate the bindings; scp.uniffi.cargoFeatures is " +
+                "'$resolvedUniffiCargoFeatures', scp.uniffi.prebuiltBindings is '$uniffiPrebuiltBindings' and " +
+                "the task graph holds $generateUniffiBindingsPath: $generatesBindings",
         )
     }
+}
+extra["uniffiPublishGuard"] = uniffiPublishGuard
+var uniffiBindingsGenerated = false
+gradle.taskGraph.whenReady {
+    uniffiBindingsGenerated = uniffiPrebuiltBindings != "true" && hasTask(generateUniffiBindingsPath)
+    uniffiPublishGuard(this, project)
     val testTask = tasks.test.get()
     val testFeatures = uniffiCargoFeatures.split(",")
     if (hasTask(testTask) && uniffiPrebuiltBindings != "true" &&

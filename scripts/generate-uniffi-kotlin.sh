@@ -6,11 +6,7 @@
 # builds the library then invokes uniffi-bindgen to produce Kotlin source files.
 #
 # Usage:
-#   ./scripts/generate-uniffi-kotlin.sh [--release] [--features=FEAT] [--skip-build] [--print-cargo-args]
-#
-# --print-cargo-args prints `scp-ffi-uniffi|` followed by the arguments this script
-# passes the cdylib's `cargo build` after the manifest path, then exits without building.
-# Any other argument fails the script.
+#   ./scripts/generate-uniffi-kotlin.sh [--release] [--features=FEAT] [--skip-build]
 #
 # Output:
 #   bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
@@ -29,34 +25,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROFILE="debug"
 FEATURES=""
 SKIP_BUILD=false
-PRINT_CARGO_ARGS=false
 for arg in "$@"; do
     case "$arg" in
         --release) PROFILE="release" ;;
         --features=*) FEATURES="${arg#--features=}" ;;
         --skip-build) SKIP_BUILD=true ;;
-        --print-cargo-args) PRINT_CARGO_ARGS=true ;;
-        *)
-            echo "ERROR: unknown argument: $arg" >&2
-            exit 1
-            ;;
     esac
 done
 
 UNIFFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
-
-# CARGO_ARGS[0..2] are `build --manifest-path <manifest>`; step 2 reuses the rest.
-CARGO_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml")
-if [[ "$PROFILE" == "release" ]]; then
-    CARGO_ARGS+=(--release)
-fi
-if [[ -n "$FEATURES" ]]; then
-    CARGO_ARGS+=(--features "$FEATURES")
-fi
-if [[ "$PRINT_CARGO_ARGS" == "true" ]]; then
-    echo "scp-ffi-uniffi|${CARGO_ARGS[*]:3}"
-    exit 0
-fi
 OUTPUT_DIR="$REPO_ROOT/bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal"
 
 # Cargo writes into the target directory it resolves from `CARGO_TARGET_DIR`, then
@@ -75,6 +52,13 @@ LIB_DIR="$TARGET_DIR/$PROFILE"
 
 # Step 1: Build the Rust cdylib (skip if --skip-build and library exists).
 if [[ "$SKIP_BUILD" == "false" ]]; then
+    CARGO_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml")
+    if [[ "$PROFILE" == "release" ]]; then
+        CARGO_ARGS+=(--release)
+    fi
+    if [[ -n "$FEATURES" ]]; then
+        CARGO_ARGS+=(--features "$FEATURES")
+    fi
     echo "==> Building scp-ffi-uniffi ($PROFILE)..."
     cargo "${CARGO_ARGS[@]}"
 else
@@ -102,7 +86,13 @@ fi
 # `--release` step 1 followed by a dev-profile bindgen build compiles the crate graph
 # a second time; passing the same profile here compiles the bindgen binary alone.
 echo "==> Building uniffi-bindgen tool ($PROFILE)..."
-BINDGEN_ARGS=("${CARGO_ARGS[@]:0:3}" --bin uniffi-bindgen "${CARGO_ARGS[@]:3}")
+BINDGEN_ARGS=(build --manifest-path "$UNIFFI_CRATE_DIR/Cargo.toml" --bin uniffi-bindgen)
+if [[ "$PROFILE" == "release" ]]; then
+    BINDGEN_ARGS+=(--release)
+fi
+if [[ -n "$FEATURES" ]]; then
+    BINDGEN_ARGS+=(--features "$FEATURES")
+fi
 cargo "${BINDGEN_ARGS[@]}"
 
 BINDGEN_BIN="$LIB_DIR/uniffi-bindgen"
