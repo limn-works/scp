@@ -14,7 +14,7 @@
 //!
 //! This module exposes one function — [`decompose_saga_error`] — that every
 //! bridge routes through. It returns a neutral [`SagaErrorParts`] carrying the
-//! already-formatted `SCP-SAGA-…` code, the message, and a [`SagaErrorKind`]
+//! already-formatted code, the message, and a [`SagaErrorKind`]
 //! holding only the per-terminal structured payload. Each bridge's
 //! `map_saga_error` becomes a thin 3-arm match from [`SagaErrorParts`] onto
 //! its own enum, carrying only the per-bridge field-label difference
@@ -73,9 +73,9 @@ pub enum SagaErrorKind {
 
 /// The neutral, bridge-agnostic decomposition of a [`SagaError`] terminal.
 ///
-/// Carries the canonical `SCP-SAGA-…` `code` (already formatted — for
-/// `Aborted` it is `SCP-SAGA-{numeric}`, for `NeedsRepair`/`Busy` it is the
-/// fixed terminal code), the human-readable `message`, and the per-terminal
+/// Carries the `code` (already formatted — for `Aborted` it is
+/// `SCP-SAGA-{numeric}`, for `NeedsRepair`/`Busy` it is the fixed terminal
+/// code, for `SupervisorShutDown` it is `SCP-CTX-2138`), the human-readable `message`, and the per-terminal
 /// structured payload in `kind`. Each bridge's thin `map_saga_error` maps this
 /// onto its own typed error enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +83,7 @@ pub struct SagaErrorParts {
     /// The per-terminal structured payload (`retry_after_ms` / `saga_id` /
     /// `contended_context`).
     pub kind: SagaErrorKind,
-    /// The canonical `SCP-SAGA-…` code string (already formatted).
+    /// The code string (already formatted).
     pub code: String,
     /// Human-readable detail (the underlying terminal's message).
     pub message: String,
@@ -105,6 +105,8 @@ pub struct SagaErrorParts {
 ///   `code = SCP-SAGA-13065` (the durable operator-repair terminal).
 /// - `Busy { contended_context, message }` → `kind = Busy { contended_context }`,
 ///   `code = SCP-SAGA-13066`.
+/// - `SupervisorShutDown { message }` → `kind = Aborted { retry_after_ms: None }`,
+///   `code = SCP-CTX-2138`.
 #[must_use]
 pub fn decompose_saga_error(err: SagaError) -> SagaErrorParts {
     match err {

@@ -423,10 +423,10 @@ impl OpenStreamRejection {
             Self::ContextNotActive { current_state } => InvocationError::ContextNotActive {
                 current_state: current_state.clone(),
             },
-            // Keeps the non-retryable Protocol-session surface
-            // (`InvocationError::ContextNotActive` maps to `SCP-OUTLET-6101`).
-            Self::SupervisorShutDown => InvocationError::ContextNotActive {
-                current_state: "supervisor shut down".to_owned(),
+            // ADR-049 Decision 16 item 2: crosses to the caller as
+            // `ContextError::SupervisorShutDown` (`SCP-CTX-2138`).
+            Self::SupervisorShutDown => InvocationError::SupervisorShutDown {
+                message: "outlet stream open refused: Supervisor shutdown has begun".to_owned(),
             },
             _ => InvocationError::CaveatViolation {
                 slug: self.slug().to_owned(),
@@ -3650,9 +3650,16 @@ mod tests {
         assert!(
             matches!(
                 rej.to_invocation_error(),
+                InvocationError::SupervisorShutDown { .. }
+            ),
+            "the invocation surface keeps the shutdown refusal typed"
+        );
+        assert!(
+            matches!(
+                closed.to_invocation_error(),
                 InvocationError::ContextNotActive { .. }
             ),
-            "the invocation surface keeps the non-retryable class"
+            "a closed context keeps the context-not-active surface"
         );
     }
 

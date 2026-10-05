@@ -390,6 +390,33 @@ async fn live_poll_next_drains_to_terminal() {
         format!("{after}").contains("no active outlet stream"),
         "post-terminal poll is a not-found error: {after}"
     );
+
+    // Once bridge shutdown has begun, the open call site refuses to register a
+    // stream the still-live Supervisor opened: the caller receives
+    // `SCP-CTX-2138` and the registry holds no entry for it.
+    bi.core.stop_borrowers();
+    let late = outlet_stream_open_on(
+        &bi,
+        &handle,
+        outlet_id.clone(),
+        r#"{"a":"1","b":"2"}"#.to_owned(),
+        invoker.clone(),
+        ucan.encoded().clone(),
+        None,
+        None,
+        None,
+        Some(1),
+    )
+    .await
+    .expect_err("an open after bridge shutdown began must be refused");
+    assert!(
+        format!("{late}").contains(codes::CTX_2138),
+        "a late open is refused with SCP-CTX-2138: {late}"
+    );
+    assert!(
+        bi.outlet_stream_registry.is_empty(),
+        "a refused late open leaves no registry entry"
+    );
 }
 
 /// Installs a per-instance DID resolver backed by a caller-retained in-memory

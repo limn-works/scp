@@ -385,15 +385,19 @@ export function mapBridgeError(error: unknown): ScpError {
  *   - `[{code}] saga needs repair: {message} (saga_id={saga_id})`
  *   - `[{code}] saga busy: {message} (contended_context={contended_context})`
  *
- * where `{code}` is a `SCP-SAGA-#####` code. This function reverses the
- * structured terminal datum out of that suffix. The Display suffix is ALWAYS
- * terminal, so the datum regexes are end-anchored (`\s*$`); end-anchored is
- * therefore last-anchored — a decoy `(retry_after_ms=…)` embedded inside
- * `{message}` is non-terminal and cannot match, so only the genuine trailing
- * datum is read.
+ * This function reverses the structured terminal datum out of that suffix.
+ * The Display suffix is ALWAYS terminal, so the datum regexes are
+ * end-anchored (`\s*$`); end-anchored is therefore last-anchored — a decoy
+ * `(retry_after_ms=…)` embedded inside `{message}` is non-terminal and cannot
+ * match, so only the genuine trailing datum is read.
  *
- * Errors that do not carry a `SCP-SAGA-` code are not saga terminals; they
- * delegate to {@link mapBridgeError} unchanged.
+ * The phrase after the `[{code}] ` prefix decides the class, whatever the
+ * code, as the PyO3 and UniFFI bridges classify a saga terminal by its kind:
+ * a saga refused by Supervisor shutdown is `saga aborted:` with
+ * `SCP-CTX-2138`. Every other NAPI error variant has its own phrase there, so
+ * an error without a saga phrase delegates to {@link mapBridgeError}
+ * unchanged, except an `SCP-SAGA-` code with an unrecognized phrase, which
+ * stays an `OutletError`.
  *
  * @param error - The raw error from the bridge layer (Error, string, or unknown).
  * @returns A typed saga `ScpError` subclass, or whatever `mapBridgeError` yields.
@@ -401,22 +405,19 @@ export function mapBridgeError(error: unknown): ScpError {
 export function mapSagaError(error: unknown): ScpError {
   const message = error instanceof Error ? error.message : String(error);
 
-  // Saga codes are `SCP-SAGA-#####`. Anchor at the start so a `SCP-SAGA-`
-  // appearing only inside `{message}` text cannot masquerade as the code.
-  const codeMatch = /^\s*\[(SCP-SAGA-\d+)\]/.exec(message);
-  const code = codeMatch?.[1];
+  // Dispatch on the phrase ANCHORED immediately after the `[{code}] ` prefix,
+  // reading the code from the same start-anchored bracket. The NAPI Display
+  // format (crates/scp-ffi/napi/src/error.rs) fixes the phrase there; a code or
+  // phrase substring appearing only inside {message} is non-terminal and must
+  // not win — same anchoring discipline as the end-anchored datum extraction.
+  const phraseMatch = /^\s*\[(SCP-[A-Z]+-\d+)\] saga (aborted|needs repair|busy):/.exec(message);
+  const sagaCode = /^\s*\[(SCP-SAGA-\d+)\]/.exec(message)?.[1];
+  const code = phraseMatch?.[1] ?? sagaCode;
   if (code === undefined) {
     // Not a saga terminal — defer to the generic bridge error mapping.
     return mapBridgeError(error);
   }
-
-  // Dispatch on the phrase ANCHORED immediately after the `[{code}] ` prefix.
-  // The NAPI Display format (crates/scp-ffi/napi/src/error.rs:127-170) fixes the
-  // phrase there; a phrase substring appearing only inside {message} is
-  // non-terminal and must not win — same anchoring discipline as the
-  // start-anchored code and end-anchored datum extraction.
-  const phraseMatch = /^\s*\[SCP-SAGA-\d+\] saga (aborted|needs repair|busy):/.exec(message);
-  switch (phraseMatch?.[1]) {
+  switch (phraseMatch?.[2]) {
     case "aborted": {
       const m = /\(retry_after_ms=(null|\d+)\)\s*$/.exec(message);
       const datum = m?.[1];

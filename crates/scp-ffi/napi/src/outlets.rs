@@ -820,7 +820,7 @@ pub struct NapiSagaResult {
 /// rendered as a literal `null` when `None` (never `0`):
 ///
 /// - `Aborted` → [`ScpNapiError::SagaAborted`] (`retry_after_ms`, `None` never
-///   `0`, `SCP-SAGA-{code}`).
+///   `0`).
 /// - `NeedsRepair` → [`ScpNapiError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpNapiError::SagaBusy`] (`SCP-SAGA-13066`).

@@ -1169,7 +1169,7 @@ fn outlet_invoke_cross_context_impl(
 /// per-bridge tail that carries the `PyO3` field labels (`message:`):
 ///
 /// - `Aborted` → [`ScpPyError::SagaAborted`] (`retry_after_ms`, `None` never
-///   `0`, `SCP-SAGA-{code}`).
+///   `0`).
 /// - `NeedsRepair` → [`ScpPyError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpPyError::SagaBusy`] (`SCP-SAGA-13066`).

@@ -185,8 +185,8 @@ public final class SCP: @unchecked Sendable {
 
     /// Shuts down this instance with a graceful deadline (seconds).
     ///
-    /// Awaits in-flight tasks up to `timeout` seconds, then runs
-    /// typed-field cleanup. Permanent. Throws `ScpError.Validation` with
+    /// Awaits in-flight tasks up to `timeout` seconds, aborts any
+    /// remaining tasks, then runs typed-field cleanup. Permanent. Throws `ScpError.Validation` with
     /// `SCP-STORAGE-8005` when the durable store still holds its advisory
     /// lock after the call.
     ///
@@ -195,7 +195,7 @@ public final class SCP: @unchecked Sendable {
     /// side takes a `u64` millisecond count.
     ///
     /// `timeout` is clamped defensively:
-    /// - `NaN` or values `<= 0` → `0`.
+    /// - `NaN` or values `<= 0` → `0` (abort in-flight tasks immediately).
     /// - `.infinity` or values that would overflow `UInt64` milliseconds
     ///   → `UInt64.max` (effectively unbounded).
     /// - Finite values in range → rounded to the nearest millisecond.
