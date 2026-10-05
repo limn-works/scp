@@ -1090,8 +1090,9 @@ impl UniffiBridgeInstance {
 
     /// Reads a context's role state from that context's supervisor actor.
     ///
-    /// Tests read through this method. An authorization path reads through
-    /// [`UniffiBridgeInstance::require_active_context_before_authz`] instead.
+    /// The method reports each failure as itself, so it suits only a caller
+    /// that has already passed its own authorization check. It does not gate
+    /// on the lifecycle state.
     ///
     /// Fails closed. A context whose actor holds no role state yields
     /// `ScpError::Context` with `SCP-CTX-2023`; no caller receives a
@@ -1105,7 +1106,6 @@ impl UniffiBridgeInstance {
     /// (`SCP-CTX-2130`), `ActorCrashed` (`SCP-CTX-2135`), or `ContextPoisoned`
     /// (`SCP-CTX-2134`) error when the context's actor is saturated, wedged,
     /// mid-respawn, or poisoned.
-    #[cfg(test)]
     pub(crate) async fn live_role_state(
         &self,
         context_id: &str,

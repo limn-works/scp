@@ -815,10 +815,12 @@ async fn outlet_register_and_verify() {
         .identity_create("in_memory".to_owned(), None)
         .await
         .unwrap();
-    let handle = scp
-        .context_create(alice.clone(), default_encrypted_params())
-        .await
-        .unwrap();
+    // `outlet_register` reads the ceiling off the context's supervisor actor,
+    // so the context has to declare `outlet:register` for Alice to register
+    // one. `default_encrypted_params` omits it.
+    let mut params = default_encrypted_params();
+    params.ceiling.push("outlet:register".to_owned());
+    let handle = scp.context_create(alice.clone(), params).await.unwrap();
 
     let definition = OutletDefinition {
         name: "calculator".to_owned(),
