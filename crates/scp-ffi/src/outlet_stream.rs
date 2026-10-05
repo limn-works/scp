@@ -318,28 +318,30 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpPyError {
 }
 
 /// The error for a stream the Supervisor opened but the bridge refused to
-/// register because bridge shutdown had begun: the class and code
-/// [`open_rejection_to_err`] gives the Supervisor's own shutdown refusal.
+/// register because bridge shutdown had begun. The open had already reserved
+/// escrow and started its pump, so this is the Context class with
+/// `SCP-CTX-2138`.
 fn late_shutdown_stream_err() -> ScpPyError {
     ScpPyError::ContextError {
-        message: "outlet stream dropped: bridge shutdown began after the Supervisor opened it"
+        message: "outlet stream opened, then dropped unregistered: bridge shutdown began \
+                  before the bridge registered it"
             .to_owned(),
-        code: OpenStreamRejection::SupervisorShutDown
-            .error_code()
-            .to_owned(),
+        code: scp_ffi_common::error_codes::CTX_2138.to_owned(),
     }
 }
 
 /// The error for a streaming saga the Supervisor started but the bridge
-/// refused to register because bridge shutdown had begun: the class and code
-/// [`crate::outlets::map_saga_error`] gives the Supervisor's own shutdown
-/// refusal of a streaming saga.
-fn late_shutdown_saga_err() -> ScpPyError {
-    ScpPyError::SagaAborted {
-        message: "streaming saga receiver dropped: bridge shutdown began after the saga started"
-            .to_owned(),
+/// refused to register because bridge shutdown had begun. The saga had already
+/// staged its Prepare phase, so this is the Context class with `SCP-CTX-2138`
+/// and the saga id, not the `SagaAborted` class of the Supervisor's own
+/// refusal, which comes before anything is staged.
+fn late_shutdown_saga_err(saga_id: &str) -> ScpPyError {
+    ScpPyError::ContextError {
+        message: format!(
+            "streaming saga {saga_id} started, then its receiver was dropped unregistered: \
+             bridge shutdown began before the bridge registered it"
+        ),
         code: scp_ffi_common::error_codes::CTX_2138.to_owned(),
-        retry_after_ms: None,
     }
 }
 
@@ -1504,7 +1506,7 @@ fn outlet_streaming_saga_open_impl(
             request_id,
         },
     ) {
-        return Err(late_shutdown_saga_err().into());
+        return Err(late_shutdown_saga_err(&handle_id).into());
     }
     Ok(handle_id)
 }
@@ -2080,66 +2082,52 @@ mod monotonic_seq_crash_safety_tests {
 
 #[cfg(test)]
 mod late_shutdown_refusal_tests {
-    use scp_core::context::outlets::OpenStreamRejection;
     use scp_ffi_common::error_codes as codes;
 
-    use super::{late_shutdown_saga_err, late_shutdown_stream_err, open_rejection_to_err};
+    use super::{late_shutdown_saga_err, late_shutdown_stream_err};
     use crate::error::ScpPyError;
 
-    /// The code of a `ContextError`, or `None` for any other class.
-    fn context_error_code(err: ScpPyError) -> Option<String> {
+    /// The message and code of a `ContextError`, or `None` for any other
+    /// class.
+    fn context_error_parts(err: ScpPyError) -> Option<(String, String)> {
         match err {
-            ScpPyError::ContextError { code, .. } => Some(code),
-            _ => None,
-        }
-    }
-
-    /// The code and back-off hint of a `SagaAborted`, or `None` for any
-    /// other class.
-    fn saga_aborted_parts(err: ScpPyError) -> Option<(String, Option<u64>)> {
-        match err {
-            ScpPyError::SagaAborted {
-                code,
-                retry_after_ms,
-                ..
-            } => Some((code, retry_after_ms)),
+            ScpPyError::ContextError { message, code } => Some((message, code)),
             _ => None,
         }
     }
 
     /// A stream or streaming saga the bridge refuses to register once bridge
-    /// shutdown has begun reaches the caller as the same error class and code
-    /// as the Supervisor's own shutdown refusal of that operation.
+    /// shutdown has begun had already started, so it reaches the caller as the
+    /// Context class with `SCP-CTX-2138` (and, for a saga, its id), as the
+    /// NAPI and `UniFFI` bridges report it.
     #[test]
-    fn late_shutdown_refusals_match_supervisor_refusal_class() {
-        let late_stream = context_error_code(late_shutdown_stream_err());
-        assert_eq!(late_stream.as_deref(), Some(codes::CTX_2138));
+    fn late_shutdown_refusals_are_the_context_class() {
+        let stream = context_error_parts(late_shutdown_stream_err());
         assert_eq!(
-            late_stream,
-            context_error_code(open_rejection_to_err(
-                &OpenStreamRejection::SupervisorShutDown
-            ))
+            stream.map(|(_, code)| code).as_deref(),
+            Some(codes::CTX_2138)
         );
 
-        let late_saga = saga_aborted_parts(late_shutdown_saga_err());
-        assert_eq!(late_saga, Some((codes::CTX_2138.to_owned(), None)));
-        assert_eq!(
-            late_saga,
-            saga_aborted_parts(crate::outlets::map_saga_error(
-                scp_core::context::supervisor::SagaError::SupervisorShutDown {
-                    message: "start cross-context streaming saga".to_owned(),
-                },
-            ))
+        let saga = context_error_parts(late_shutdown_saga_err("saga-late-1"));
+        let (message, code) = saga.unwrap_or_default();
+        assert_eq!(code, codes::CTX_2138);
+        assert!(
+            message.contains("saga-late-1"),
+            "the error names the started saga: {message}"
         );
     }
 
-    /// The `ContextError` translation the saga refusal used before is not
-    /// the `SagaAborted` class, so the class match above can fail.
+    /// The Supervisor's own streaming-saga shutdown refusal, which comes
+    /// before anything is staged, keeps the `SagaAborted` class, so it is not
+    /// the Context class the late refusal returns.
     #[test]
-    fn context_shutdown_error_is_not_the_saga_aborted_class() {
-        let context: ScpPyError =
-            scp_core::context::ContextError::SupervisorShutDown("open streaming saga".to_owned())
-                .into();
-        assert_eq!(saga_aborted_parts(context), None);
+    fn supervisor_saga_refusal_is_not_the_context_class() {
+        let supervisor = crate::outlets::map_saga_error(
+            scp_core::context::supervisor::SagaError::SupervisorShutDown {
+                message: "start cross-context streaming saga".to_owned(),
+            },
+        );
+        assert!(matches!(&supervisor, ScpPyError::SagaAborted { .. }));
+        assert_eq!(context_error_parts(supervisor), None);
     }
 }
