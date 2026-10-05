@@ -1206,44 +1206,40 @@ mod xctx_streaming_saga_tests {
 }
 
 /// A stream or streaming saga the bridge refuses to register once bridge
-/// shutdown has begun reaches the caller as the same error class and code as
-/// the Supervisor's own shutdown refusal of that operation.
+/// shutdown has begun had already started, so it reaches the caller as the
+/// Context class with `SCP-CTX-2138` (and, for a saga, its id), never as the
+/// class of the Supervisor's own refusal, which comes before anything started.
 #[test]
-fn late_shutdown_refusals_match_supervisor_refusal_class() {
-    let supervisor_open = open_rejection_to_err(&OpenStreamRejection::SupervisorShutDown);
-    let (
-        ScpError::Outlet { code: late, .. },
-        ScpError::Outlet {
-            code: supervisor, ..
-        },
-    ) = (late_shutdown_stream_err(), supervisor_open)
-    else {
-        panic!("both stream refusals must be the Outlet class");
+fn late_shutdown_refusals_differ_from_supervisor_refusal_class() {
+    let ScpError::Context { code, .. } = late_shutdown_stream_err() else {
+        panic!("a late stream refusal must be the Context class");
     };
-    assert_eq!(late, supervisor);
-    assert_eq!(late, codes::CTX_2138);
-
-    let supervisor_saga = map_saga_error(
-        scp_core::context::supervisor::SagaError::SupervisorShutDown {
-            message: "start cross-context streaming saga".to_owned(),
-        },
+    assert_eq!(code, codes::CTX_2138);
+    assert!(
+        matches!(
+            open_rejection_to_err(&OpenStreamRejection::SupervisorShutDown),
+            ScpError::Outlet { .. }
+        ),
+        "the Supervisor's own stream refusal keeps the Outlet class"
     );
-    let (
-        ScpError::SagaAborted {
-            code: late,
-            retry_after_ms: late_retry,
-            ..
-        },
-        ScpError::SagaAborted {
-            code: supervisor,
-            retry_after_ms: supervisor_retry,
-            ..
-        },
-    ) = (late_shutdown_saga_err(), supervisor_saga)
-    else {
-        panic!("both streaming-saga refusals must be the SagaAborted class");
+
+    let ScpError::Context { msg, code } = late_shutdown_saga_err("saga-late-1") else {
+        panic!("a late streaming-saga refusal must be the Context class");
     };
-    assert_eq!(late, supervisor);
-    assert_eq!(late, codes::CTX_2138);
-    assert_eq!(late_retry, supervisor_retry);
+    assert_eq!(code, codes::CTX_2138);
+    assert!(
+        msg.contains("saga-late-1"),
+        "the error names the started saga: {msg}"
+    );
+    assert!(
+        matches!(
+            map_saga_error(
+                scp_core::context::supervisor::SagaError::SupervisorShutDown {
+                    message: "start cross-context streaming saga".to_owned(),
+                }
+            ),
+            ScpError::SagaAborted { .. }
+        ),
+        "the Supervisor's own streaming-saga refusal keeps the SagaAborted class"
+    );
 }

@@ -359,30 +359,31 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpError {
 }
 
 /// The error for a stream the Supervisor opened but the bridge refused to
-/// register because bridge shutdown had begun: the class and code
-/// [`open_rejection_to_err`] gives the Supervisor's own shutdown refusal, so
-/// one condition reaches the caller as one error class whichever refusal point
-/// the race lands on.
+/// register because bridge shutdown had begun. The open had already reserved
+/// escrow and started its pump, so this is the Context class with
+/// `SCP-CTX-2138`, not the Outlet class of the Supervisor's own refusal, which
+/// comes before anything is reserved.
 fn late_shutdown_stream_err() -> ScpError {
-    ScpError::Outlet {
-        msg: "outlet stream dropped: bridge shutdown began after the Supervisor opened it"
+    ScpError::Context {
+        msg: "outlet stream opened, then dropped unregistered: bridge shutdown began \
+                  before the bridge registered it"
             .to_owned(),
-        code: OpenStreamRejection::SupervisorShutDown
-            .error_code()
-            .to_owned(),
+        code: codes::CTX_2138.to_owned(),
     }
 }
 
 /// The error for a streaming saga the Supervisor started but the bridge
-/// refused to register because bridge shutdown had begun: the class and code
-/// [`map_saga_error`] gives the Supervisor's own shutdown
-/// refusal of a streaming saga.
-fn late_shutdown_saga_err() -> ScpError {
-    ScpError::SagaAborted {
-        msg: "streaming saga receiver dropped: bridge shutdown began after the saga started"
-            .to_owned(),
+/// refused to register because bridge shutdown had begun. The saga had already
+/// staged its Prepare phase, so this is the Context class with `SCP-CTX-2138`
+/// and the saga id, not the `SagaAborted` class of the Supervisor's own
+/// refusal, which comes before anything is staged.
+fn late_shutdown_saga_err(saga_id: &str) -> ScpError {
+    ScpError::Context {
+        msg: format!(
+            "streaming saga {saga_id} started, then its receiver was dropped unregistered: \
+             bridge shutdown began before the bridge registered it"
+        ),
         code: codes::CTX_2138.to_owned(),
-        retry_after_ms: None,
     }
 }
 
@@ -1509,7 +1510,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
             request_id,
         },
     ) {
-        return Err(late_shutdown_saga_err());
+        return Err(late_shutdown_saga_err(&handle_id));
     }
     Ok(handle_id)
 }

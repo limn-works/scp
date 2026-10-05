@@ -122,9 +122,7 @@ use scp_protocol::context::roles::ContextRoleState;
 /// `MemberBudgetTracker` but never settled.
 ///
 /// `reverse_spend` is async (it takes the per-context lock), and a `Drop`
-/// impl cannot `.await`, so the production sink the native bridges supply
-/// holds a [`tokio::runtime::Handle`] and `Handle::spawn`s the async
-/// `ContextManager::outlet_stream_reverse_spend`. The trait is the seam
+/// impl cannot `.await`. The trait is the seam
 /// that lets `dispatch.rs` (below the `ContextManager` in the dependency
 /// graph) refund a hold without depending on the manager type.
 ///
