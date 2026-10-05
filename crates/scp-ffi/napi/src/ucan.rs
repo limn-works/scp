@@ -1308,6 +1308,141 @@ mod tests {
             );
         }
 
+        /// A token revoked before a close stays refused after the close
+        /// released the context's revocation list.
+        ///
+        /// The creator's close takes the supervisor to `Closing` and releases
+        /// this bridge's `UcanContextState`; `contextFinalizeClose` then takes
+        /// it to `Closed`, and the actor stays resident and still answers the
+        /// role-state read. A rebuilt state would hold an empty revocation
+        /// list, so a validation that reached one would accept the revoked
+        /// token. The validation must refuse, `ensure_registered` must refuse
+        /// to rebuild the state and leave the registry without it, and after
+        /// `readmit_context` it builds the state again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn revoked_token_stays_refused_after_a_close_released_the_revocation_list() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+            let owner = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner_did = owner.did();
+            let params = serde_json::json!({
+                "ceiling": ["messages:read", "messages:write", "context:close"],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            let handle = crate::context::context_create_on(&bi, &owner, params)
+                .await
+                .expect("context_create should succeed");
+            let context_id = handle.context_id();
+
+            let minted = ucan_mint_on(
+                &bi,
+                &handle,
+                AUDIENCE_DID.to_owned(),
+                vec!["messages:write".to_owned()],
+                None,
+            )
+            .await
+            .expect("ucan_mint_on should succeed");
+            let token = minted.encoded.clone();
+            let capability = minted
+                .data
+                .capabilities
+                .first()
+                .expect("the minted token carries its capability")
+                .clone();
+
+            ucan_validate_on(
+                &bi,
+                &handle,
+                token.clone(),
+                capability.clone(),
+                AUDIENCE_DID.to_owned(),
+                None,
+            )
+            .await
+            .expect("an unrevoked token must validate while the context is active");
+
+            ucan_revoke_on(&bi, &handle, token.clone(), owner_did.clone())
+                .await
+                .expect("the creator may revoke a token the creator issued");
+
+            crate::context::context_close_on(&bi, &handle, owner_did)
+                .await
+                .expect("the creator's close should succeed");
+            crate::context::context_finalize_close_on(&bi, &handle)
+                .await
+                .expect("finalize should take the context from closing to closed");
+            assert_eq!(
+                runtime::read_live_context_state(&bi, &context_id)
+                    .await
+                    .expect("state read"),
+                Some(scp_core::context::ContextState::Closed),
+                "the actor must stay resident and report closed"
+            );
+            assert!(
+                runtime::live_role_state(&bi, &context_id).await.is_ok(),
+                "the closed actor still answers the role-state read, so the role-state \
+                 read cannot be what refuses the validation below"
+            );
+
+            let err = ucan_validate_on(
+                &bi,
+                &handle,
+                token,
+                capability,
+                AUDIENCE_DID.to_owned(),
+                None,
+            )
+            .await
+            .expect_err("a token revoked before the close must not validate after it");
+            let message = format!("{err}");
+            assert!(
+                message.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+                "the validation must refuse at the lifecycle gate, got: {message}"
+            );
+            assert!(
+                !message.to_lowercase().contains("closed"),
+                "the refusal must withhold the lifecycle state, got: {message}"
+            );
+
+            // The step a validation takes after its gate passed: a close that
+            // released the state in between must leave it nothing to read.
+            let err = runtime::ensure_registered(&bi, &handle)
+                .expect_err("ensure_registered must not rebuild a released context's state");
+            assert!(
+                format!("{err}").contains("SCP-CTX-2023"),
+                "the refusal must carry SCP-CTX-2023, got: {err}"
+            );
+            assert!(
+                !runtime::ucan_registry(&bi).contains_key(&context_id),
+                "a refused rebuild must leave no state in the registry"
+            );
+
+            // The ungated session close finds no session and builds no state.
+            let err =
+                crate::outlets::outlet_session_close_on(&bi, &handle, "no-such-session".to_owned())
+                    .await
+                    .expect_err("a released context holds no session");
+            assert!(
+                err.to_string().contains(codes::OUTLET_6021),
+                "the session close must report session-not-found, got: {err}"
+            );
+            assert!(
+                !runtime::ucan_registry(&bi).contains_key(&context_id),
+                "a session close must not rebuild a released context's state"
+            );
+
+            runtime::readmit_context(&bi, &context_id);
+            runtime::ensure_registered(&bi, &handle)
+                .expect("a readmitted context builds fresh state again");
+            assert!(runtime::ucan_registry(&bi).contains_key(&context_id));
+        }
+
         /// `ucan_revoke_on` rejects a revoker that is neither the token's issuer
         /// nor the context creator, and leaves the token unrevoked.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

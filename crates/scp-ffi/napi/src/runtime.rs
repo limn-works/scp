@@ -36,7 +36,7 @@ use scp_clock::SystemClock;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::outlets::{OutletRegistry, SessionStore};
 use scp_core::context::persistence::ContextPersistence;
-use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::roles::ContextRoleState;
 use scp_core::context::state::ContextSnapshot;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -228,12 +228,22 @@ pub struct NapiBridgeInstance {
     pub(crate) core: CoreFields,
 
     /// Per-context UCAN validation state (revocation lists, nonce trackers,
-    /// role state, outlet registries, outlet handlers, session stores).
+    /// outlet registries, outlet handlers, session stores).
     ///
     /// Previously stored type-erased in `CoreFields::ucan_registry`. Post
     /// PR 1, the registry lives here as a typed field and is cleared by
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
+
+    /// Context ids whose `ucan_registry` entry a release removed.
+    ///
+    /// [`ensure_registered`] refuses to rebuild an entry for an id in this
+    /// set.
+    pub(crate) released_contexts: Arc<DashMap<String, ()>>,
+
+    /// The number of live [`NapiContextHandle`]s this instance minted, per
+    /// context id.
+    pub(crate) context_handles: Arc<DashMap<String, usize>>,
 
     /// Retained identity state for registered DIDs.
     ///
@@ -434,6 +444,8 @@ impl NapiBridgeInstance {
         Self {
             core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
+            context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             durable_providers: Some(durable_providers),
@@ -470,6 +482,8 @@ impl NapiBridgeInstance {
         Self {
             core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
+            context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             durable_providers: Some(durable_providers),
@@ -603,6 +617,8 @@ impl NapiBridgeInstance {
         Self {
             core,
             ucan_registry: Arc::new(DashMap::new()),
+            released_contexts: Arc::new(DashMap::new()),
+            context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
             durable_providers: Some(durable_providers),
@@ -739,6 +755,8 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // the custody provider's `Drop` impl (matching the behavior of the
         // previous `clear_fn` closures).
         self.ucan_registry.clear();
+        self.released_contexts.clear();
+        self.context_handles.clear();
         self.identity_registry.clear();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
@@ -1657,14 +1675,12 @@ where
 /// Per-context UCAN validation state (NAPI bridge).
 ///
 /// Wraps [`scp_ffi_common::bridge_runtime::UcanContextStateCore`] with
-/// NAPI-specific fields for outlet management and role state. The core
-/// fields (revocation list, nonce tracker, ceiling, creator DID, event log)
-/// are shared with the `UniFFI` bridge (#1447).
+/// NAPI-specific fields for outlet management. The core fields (revocation
+/// list, nonce tracker, ceiling, creator DID, event log) are shared with the
+/// `UniFFI` bridge (#1447).
 pub struct UcanContextState {
     /// Core UCAN validation state shared with `UniFFI` bridge.
     pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,
-    /// Role state for capability checking (outlet registration, invocation).
-    pub role_state: ContextRoleState,
     /// Outlet registry for this context (cross-context + session support).
     pub outlet_registry: OutletRegistry,
     /// Registered outlet handlers keyed by outlet ID.
@@ -1691,15 +1707,13 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
 ///
 /// Shared by [`ensure_registered`] (lazy, idempotent — the UCAN-op path) and
 /// [`register_ffi_state`] (eager, fail-closed — the Welcome-join path) so the
-/// two cannot drift in how they construct per-context FFI state. Mirrors the
-/// `PyO3` reference bridge's `register_ffi_state` state-building: the role state
-/// is seeded from `default_ceiling()` with `creator_did` as admin, and the
-/// caller ceiling drives only the UCAN `ceiling_strings`.
+/// two cannot drift in how they construct per-context FFI state. The state
+/// holds no role state: the context's supervisor actor owns it.
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
-/// grammar, or `ScpNapiError::Context` if role-state construction fails.
+/// grammar.
 fn build_ucan_context_state(
     context_id: &str,
     creator_did: &str,
@@ -1750,20 +1764,6 @@ fn build_ucan_context_state(
             .collect::<HashSet<String>>()
     };
 
-    // Default ceiling + no custom roles cannot fail validation in practice; the
-    // fallible path is preserved for parity with the shared constructor.
-    let role_state = ContextRoleState::new(
-        context_id,
-        creator_did,
-        default_ceiling(),
-        Vec::new(),
-        &SystemClock,
-    )
-    .map_err(|e| ScpNapiError::Context {
-        message: format!("failed to create role state: {e}"),
-        code: codes::CTX_2023.to_owned(),
-    })?;
-
     Ok(UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             revocation_list: RevocationList::new(context_id.to_owned()),
@@ -1772,7 +1772,6 @@ fn build_ucan_context_state(
             creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         },
-        role_state,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
@@ -1791,9 +1790,8 @@ fn build_ucan_context_state(
 /// consumed — and leaves the pre-existing entry untouched (the bridge must
 /// never roll back state it did not create).
 ///
-/// `creator_did` becomes the role-state admin; the joiner is inserted as a
-/// member by the caller via [`with_context`] immediately after, so a
-/// member-insert failure can roll this back.
+/// The registered state holds no role state and no membership: the
+/// supervisor actor the Welcome join spawns owns both.
 ///
 /// # Errors
 ///
@@ -1813,6 +1811,7 @@ pub fn register_ffi_state(
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
+            // This insert leaves the release mark in place.
             let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
             vacant.insert(state);
             Ok(())
@@ -1825,25 +1824,156 @@ pub fn register_ffi_state(
 ///
 /// If the context is already registered, this is a no-op. Otherwise, creates
 /// UCAN state from the `NapiContextHandle` metadata via
-/// [`build_ucan_context_state`].
+/// [`build_ucan_context_state`], unless [`release_context`] released the id.
+///
+/// The released-id check and the insert run under the registry entry's shard
+/// lock, so a mark that lands before this call takes the lock refuses the
+/// rebuild, and a mark that lands after it finds the entry this call built.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the context state cannot be determined.
+/// Returns `ScpNapiError::Context` (`SCP-CTX-2023`) when a release marked the
+/// context's id on this bridge instance and the registry holds no state for
+/// it, and the errors of
+/// [`build_ucan_context_state`].
 pub fn ensure_registered(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> Result<(), ScpNapiError> {
+    use dashmap::mapref::entry::Entry;
+
     let context_id = handle.context_id();
-    let map = ucan_registry(bi);
-
-    if map.contains_key(&context_id) {
-        return Ok(());
+    if let Entry::Vacant(vacant) = ucan_registry(bi).entry(context_id) {
+        if bi.released_contexts.contains_key(vacant.key()) {
+            // The refusal withholds the lifecycle state: this call authorizes
+            // no one, so its answer must not say whether the context closed.
+            return Err(ScpNapiError::Context {
+                message: format!(
+                    "cannot use context: {}",
+                    scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                ),
+                code: codes::CTX_2023.to_owned(),
+            });
+        }
+        let state =
+            build_ucan_context_state(vacant.key(), &handle.creator_did(), &handle.ceiling())?;
+        vacant.insert(state);
     }
-
-    let state = build_ucan_context_state(&context_id, &handle.creator_did(), &handle.ceiling())?;
-    map.entry(context_id).or_insert(state);
     Ok(())
+}
+
+/// Releases a closed context's [`UcanContextState`] and marks the id so
+/// [`ensure_registered`] does not rebuild it.
+///
+/// The mark goes in before the entry comes out; [`ensure_registered`] reads the
+/// mark while it holds the entry's shard lock, so no rebuild lands after this
+/// call returns. When no live [`NapiContextHandle`] for the id remains, this
+/// call drops the mark again.
+pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
+    bi.released_contexts.insert(context_id.to_owned(), ());
+    remove_context_while_released(bi, context_id);
+    prune_release_mark(bi, context_id);
+}
+
+/// Removes `context_id`'s [`UcanContextState`] and its known-context entry,
+/// only while the release mark stands, and returns whether the mark stood.
+///
+/// The mark check and both removals run under the registry entry's shard lock.
+pub(crate) fn remove_context_while_released(bi: &NapiBridgeInstance, context_id: &str) -> bool {
+    use dashmap::mapref::entry::Entry;
+
+    let entry = ucan_registry(bi).entry(context_id.to_owned());
+    if !bi.released_contexts.contains_key(context_id) {
+        return false;
+    }
+    bi.core.remove_known_context(context_id);
+    if let Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
+    true
+}
+
+/// Clears the release mark [`release_context`] left for `context_id`.
+///
+/// It clears the mark under the registry entry's shard lock.
+pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
+    let _shard = ucan_registry(bi).entry(context_id.to_owned());
+    bi.released_contexts.remove(context_id);
+}
+
+/// Marks `context_id` released, re-reads the supervisor, and removes the
+/// context's bridge state only when the re-read does not report `Active`.
+///
+/// A close decides from a lifecycle read taken before it releases, so the id
+/// can return to `Active`, and be readmitted, in between. When the re-read,
+/// taken after the mark went in, reports `Active`, this clears the mark,
+/// removes nothing, and returns `false`, so the readmitted context keeps its
+/// revocation list, nonce tracker, outlets, and sessions. On any other
+/// answer, a failed read included, it removes the state while the mark stands
+/// and returns `true`. When a readmit clears the mark between the re-read and
+/// the removal, it removes nothing and returns `false`.
+pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_id: &str) -> bool {
+    bi.released_contexts.insert(context_id.to_owned(), ());
+    if matches!(
+        read_live_context_state(bi, context_id).await,
+        Ok(Some(scp_core::context::ContextState::Active))
+    ) {
+        readmit_context(bi, context_id);
+        return false;
+    }
+    if !remove_context_while_released(bi, context_id) {
+        return false;
+    }
+    prune_release_mark(bi, context_id);
+    true
+}
+
+/// Counts one more live [`NapiContextHandle`] for `context_id` on this
+/// instance.
+///
+/// [`untrack_context_handle`] undoes one call.
+pub(crate) fn track_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
+    *bi.context_handles.entry(context_id.to_owned()).or_insert(0) += 1;
+}
+
+/// Counts one fewer live [`NapiContextHandle`] for `context_id`, and drops the
+/// id's release mark when the count reaches zero.
+///
+/// Dropping it keeps `released_contexts` from growing by one entry for every
+/// context this instance ever closed. A count
+/// this instance does not hold (after a shutdown cleared the counts) changes
+/// nothing.
+pub(crate) fn untrack_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
+    use dashmap::mapref::entry::Entry;
+
+    let last = match bi.context_handles.entry(context_id.to_owned()) {
+        Entry::Occupied(mut occupied) => {
+            let remaining = occupied.get().saturating_sub(1);
+            if remaining == 0 {
+                occupied.remove();
+                true
+            } else {
+                *occupied.get_mut() = remaining;
+                false
+            }
+        }
+        Entry::Vacant(_) => false,
+    };
+    if last {
+        prune_release_mark(bi, context_id);
+    }
+}
+
+/// Drops `context_id`'s release mark when no live [`NapiContextHandle`] for
+/// the id remains.
+///
+/// The handle-count check and the removal run under the registry entry's
+/// shard lock, the lock [`ensure_registered`] holds while it reads the mark.
+fn prune_release_mark(bi: &NapiBridgeInstance, context_id: &str) {
+    let _shard = ucan_registry(bi).entry(context_id.to_owned());
+    if !bi.context_handles.contains_key(context_id) {
+        bi.released_contexts.remove(context_id);
+    }
 }
 
 /// Executes a closure with mutable access to a context's UCAN state on the
@@ -1877,95 +2007,11 @@ where
 
 /// Removes UCAN state for a context on the given bridge instance.
 ///
-/// Called when a context is closed. Idempotent.
+/// Idempotent.
 pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
     ucan_registry(bi).remove(context_id);
     // Clean up known-context discovery entry on the same instance.
     bi.core.remove_known_context(context_id);
-}
-
-/// Re-syncs the `UcanContextState.role_state` for a context from the shared
-/// `ContextManager`.
-///
-/// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
-/// the NAPI-side copy stays current.
-///
-/// # Errors
-///
-/// Returns `ScpNapiError` if the context is not registered in either the
-/// manager or the UCAN state registry.
-pub async fn sync_role_state_from_manager(
-    bi: &NapiBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpNapiError> {
-    use scp_core::context::actor::commands::QueriesCommand;
-    let sup = Arc::clone(typed_supervisor(bi)?);
-    // Route through the ADR-049 query shim. The handler returns
-    // `Ok(None)` when the context is unknown, matching the legacy
-    // `ContextManager::get_role_state` `Option` contract.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = QueriesCommand::GetRoleState {
-        context_id: context_id.to_owned(),
-        reply: tx,
-    };
-    sup.dispatch_query(cmd)
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("supervisor dispatch_query failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    let new_role_state = rx
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("query shim reply dropped: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?
-        .map_err(|e| ScpNapiError::Context {
-            message: e.to_string(),
-            code: codes::CTX_2000.to_owned(),
-        })?
-        .ok_or_else(|| ScpNapiError::Context {
-            message: format!("context '{context_id}' not registered with Supervisor"),
-            code: codes::CTX_2023.to_owned(),
-        })?;
-
-    with_context(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
-}
-
-/// Re-syncs the `UcanContextState.core.ceiling_strings` for a context from the
-/// AUTHENTICATED context params carried by a joined
-/// [`ContextHandle`](scp_core::context::ContextHandle).
-///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state). Used by
-/// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
-/// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
-/// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
-/// by the joined MLS group's signed context binding. The ceiling entries are
-/// normalized to their enforced UCAN capability-name form (`{resource}:{action}`),
-/// matching the set [`build_ucan_context_state`] builds on the create path.
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Context` if the context's FFI state is not registered
-/// (unreachable on the join success path — the state was just registered and not
-/// removed).
-pub fn sync_ceiling_from_params(
-    bi: &NapiBridgeInstance,
-    context_id: &str,
-    ceiling: &[scp_core::context::roles::Capability],
-) -> Result<(), ScpNapiError> {
-    let ceiling_strings: HashSet<String> = ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect();
-    with_context(bi, context_id, |st| {
-        st.core.ceiling_strings = ceiling_strings;
-        Ok(())
-    })
 }
 
 /// Reads a context's lifecycle state from that context's supervisor actor.
@@ -2342,13 +2388,7 @@ pub fn query_trust_event_counts(
 // `bi.core.with_rate_limit_tracker(identity_did, f)` directly.
 
 /// Registers a test context in the UCAN state registry.
-///
-/// # Panics
-///
-/// Panics if `ContextRoleState::new` fails with default ceiling and no
-/// custom roles, which should be infallible.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_did: &str) {
     let map = ucan_registry(bi);
 
@@ -2356,16 +2396,6 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
         .iter()
         .map(scp_core::context::roles::Capability::ucan_capability_name)
         .collect::<HashSet<String>>();
-
-    // Default ceiling + no custom roles: infallible in practice.
-    let role_state = ContextRoleState::new(
-        context_id,
-        creator_did,
-        default_ceiling(),
-        Vec::new(),
-        &SystemClock,
-    )
-    .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
 
     let state = UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
@@ -2375,7 +2405,6 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
             ceiling_strings,
             creator_did: creator_did.to_owned(),
         },
-        role_state,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
@@ -2458,13 +2487,12 @@ pub(crate) async fn create_supervisor_context_with_ceiling_for_test(
 #[cfg(all(test, feature = "testing"))]
 pub(crate) const NARROWED_COPY_CREATOR: &str = "did:dht:z6MkNapiNarrowedBridgeCopyCreator";
 
-/// Overwrites the bridge copy of `context_id`'s role state
-/// (`UcanContextState::role_state`, `core.ceiling_strings` and
-/// `core.creator_did`) with a `messages:read`-only ceiling and
-/// [`NARROWED_COPY_CREATOR`] as the creator.
+/// Overwrites the bridge copy of `context_id`'s ceiling and creator
+/// (`core.ceiling_strings` and `core.creator_did`) with a `messages:read`-only
+/// ceiling and [`NARROWED_COPY_CREATOR`] as the creator.
 ///
-/// An entry point that still passes after this call took its ceiling, roles
-/// and creator from the supervisor: the copy would refuse it.
+/// An entry point that still passes after this call took its ceiling and
+/// creator from the supervisor: the copy would refuse it.
 ///
 /// # Errors
 ///
@@ -2479,21 +2507,9 @@ pub(crate) fn narrow_bridge_copy_for_test(
     let ceiling = scp_core::context::roles::CapabilityCeiling::new([
         scp_core::context::roles::Capability::MessagesRead,
     ]);
-    let role_state = ContextRoleState::new(
-        context_id,
-        NARROWED_COPY_CREATOR,
-        ceiling.clone(),
-        Vec::new(),
-        &SystemClock,
-    )
-    .map_err(|e| ScpNapiError::Validation {
-        message: format!("narrowed role state does not build: {e}"),
-        code: codes::VALID_7004.to_owned(),
-    })?;
     with_context(bi, context_id, |rt| {
         rt.core.ceiling_strings = ceiling.to_ucan_string_set();
         NARROWED_COPY_CREATOR.clone_into(&mut rt.core.creator_did);
-        rt.role_state = role_state;
         Ok(())
     })
 }
@@ -2666,6 +2682,7 @@ impl ContextPersistence for ArcContextPersistence {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_core::context::roles::default_ceiling;
 
     /// The stream registries this bridge builds share its core's shutdown
     /// gate: a streaming-saga entry registers before shutdown begins and is
