@@ -2133,10 +2133,9 @@ mod late_shutdown_refusal_tests {
     /// the `SagaAborted` class, so the class match above can fail.
     #[test]
     fn context_shutdown_error_is_not_the_saga_aborted_class() {
-        let context: ScpPyError = scp_core::context::ContextError::SupervisorShutDown(
-            "open streaming saga".to_owned(),
-        )
-        .into();
+        let context: ScpPyError =
+            scp_core::context::ContextError::SupervisorShutDown("open streaming saga".to_owned())
+                .into();
         assert!(!matches!(context, ScpPyError::SagaAborted { .. }));
     }
 }
