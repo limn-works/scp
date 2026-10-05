@@ -250,7 +250,7 @@ fn receive_via_verify_and_unwrap(
     resolver: &KeyResolver,
     bob_access_key: &AccessKey,
 ) -> Result<Vec<u8>, ContextError> {
-    let opened = match bob_state.open(&SystemClock, ctx_str, blob)? {
+    let opened = match bob_state.open(ctx_str, blob)? {
         scp_protocol::context::builder::OpenResult::Application(env) => *env,
         other => {
             return Err(ContextError::CryptoFailed(format!(
@@ -450,7 +450,6 @@ mod live_supervisor_send {
     use crate::context::supervisor::key_package_actor::KeyPackageCommand;
     use crate::context::supervisor::{MessageSigner, Supervisor};
     use crate::crypto::mls::provider::NodeMlsFactory;
-    use scp_clock::SystemClock;
 
     /// Shared buffer of `(routing_id, payload)` pairs the recording transport
     /// captures. Mirrors the `scp-testing` `CapturingTransport` (which lives in
@@ -702,7 +701,7 @@ mod live_supervisor_send {
         // `FullStackNode::decrypt_message`).
         for (_routing_id, blob) in bootstrap_blobs {
             match bob_actor
-                .open(&SystemClock, ctx_id, &blob)
+                .open(ctx_id, &blob)
                 .expect("bob opens bootstrap blob")
             {
                 OpenResult::Management {
@@ -808,7 +807,7 @@ mod live_supervisor_send {
         // Open the captured wire blob on Bob's actor and read the persona
         // straight off the recovered inner envelope.
         match bob
-            .open(&SystemClock, ctx_id, ciphertext)
+            .open(ctx_id, ciphertext)
             .expect("bob opens the app blob")
         {
             OpenResult::Application(env) => {

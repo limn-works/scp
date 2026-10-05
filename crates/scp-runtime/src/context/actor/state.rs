@@ -1859,9 +1859,10 @@ impl ContextCryptoState {
             .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
     }
 
-    /// Opens a received outer-envelope blob. `clock` (used to re-validate an
-    /// add-Commit's `KeyPackage` `Lifetime`) and the raw `context_id` digest
-    /// enter as parameters.
+    /// Opens a received outer-envelope blob. The raw `context_id` digest enters
+    /// as a parameter. No clock enters: a received Add's `KeyPackage`
+    /// `Lifetime` is checked for range only (security-model spec §9.7.1, the
+    /// receiver).
     ///
     /// # Errors
     ///
@@ -1869,7 +1870,6 @@ impl ContextCryptoState {
     /// or any MLS / sender-key / decode failure.
     pub(crate) fn open(
         &mut self,
-        clock: &dyn Clock,
         context_id: &[u8; 32],
         context_id_str: &str,
         outer_bytes: &[u8],
@@ -1894,9 +1894,8 @@ impl ContextCryptoState {
         let mls_group = self.mls_group.as_mut().ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
-        let content =
-            scp_mls::encrypt::decrypt_with_sender_did(mls_group, &outer.encrypted_blob, clock)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let content = scp_mls::encrypt::decrypt_with_sender_did(mls_group, &outer.encrypted_blob)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         match content {
             scp_mls::encrypt::DecryptedContent::Application {
@@ -2459,13 +2458,12 @@ impl PerContextState {
     #[cfg(test)]
     pub(crate) fn open(
         &mut self,
-        clock: &dyn Clock,
         context_id_str: &str,
         outer_bytes: &[u8],
     ) -> Result<OpenResult, ContextError> {
         let context_id = self.context_id;
         let crypto = self.encrypted_crypto_mut()?;
-        crypto.open(clock, &context_id, context_id_str, outer_bytes)
+        crypto.open(&context_id, context_id_str, outer_bytes)
     }
 
     /// TEST-ONLY whole-state convenience over
@@ -3168,12 +3166,13 @@ impl PerContextState {
             wrapping_secret_key: Zeroizing::new(wrapping_secret_key.to_vec()),
         };
 
-        // One exactly-sized buffer, wiped on drop: the blob carries the signer,
+        // A buffer wiped on drop: the blob carries the signer,
         // the provider's HPKE and epoch secrets, and the wrapping secret. The
         // snapshot's secret fields wipe themselves when it drops; the blob
         // stays in `Zeroizing` through `ContextSnapshot::mls_crypto_state` to
         // the storage call (Storage encrypts at rest per §17.5).
-        scp_mls::secret_msgpack::encode_named(&snapshot)
+        rmp_serde::to_vec_named(&snapshot)
+            .map(Zeroizing::new)
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")))
     }
 
@@ -4322,7 +4321,7 @@ mod crypto_ops_golden {
         match &mut state.mode {
             ContextModeState::Encrypted(c) => {
                 let group = c.mls_group.as_mut().expect("group present");
-                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace, &SystemClock)
+                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace)
             }
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
         }
@@ -4345,7 +4344,7 @@ mod crypto_ops_golden {
         // is the actor seal→open round-trip decrypting to the ORIGINAL
         // InnerEnvelope byte-for-byte at the base sender-key epoch (1).
         let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
-        let env = match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+        let env = match bob_a.open(CTX_STR, &blob_actor).unwrap() {
             OpenResult::Application(e) => e,
             other => panic!("expected Application result, got {other:?}"),
         };
@@ -4380,7 +4379,7 @@ mod crypto_ops_golden {
 
             // Actor seals -> actor receiver opens (in-order consecutive gens).
             let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
-            match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+            match bob_a.open(CTX_STR, &blob_actor).unwrap() {
                 OpenResult::Application(e) => actor_seqs.push(e.receive_floor.sequence),
                 other => panic!("expected Application, got {other:?}"),
             }
@@ -4421,7 +4420,7 @@ mod crypto_ops_golden {
         assert_eq!(recv_epoch_a, epoch_a);
         bob_recv_a.set_sender_key_unchecked(ALICE, key_a);
         let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
-        let opened_a = match bob_recv_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+        let opened_a = match bob_recv_a.open(CTX_STR, &blob_actor).unwrap() {
             OpenResult::Application(e) => e,
             other => panic!("expected Application, got {other:?}"),
         };
@@ -4481,7 +4480,7 @@ mod crypto_ops_golden {
         // ACTOR seals at the non-zero epoch -> ACTOR receiver opens under the
         // delivered rotated key.
         let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
-        let env = match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+        let env = match bob_a.open(CTX_STR, &blob_actor).unwrap() {
             OpenResult::Application(e) => e,
             other => panic!("expected Application result, got {other:?}"),
         };
@@ -4575,7 +4574,7 @@ mod crypto_ops_golden {
         // Actor management-encrypts; the actor receiver opens and recovers the
         // exact payload (the provider twin is deleted).
         let blob_actor = alice_a.mls_encrypt_management(payload, &rid, 300).unwrap();
-        match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+        match bob_a.open(CTX_STR, &blob_actor).unwrap() {
             OpenResult::Management { payload: p, .. } => assert_eq!(p, payload),
             other => panic!("expected Management result, got {other:?}"),
         }
@@ -4647,7 +4646,7 @@ mod crypto_ops_golden {
         bob_a.set_sender_key_unchecked(ALICE, recovered_key);
         let inner = build_inner(ALICE, 0);
         let sealed = alice_a.seal(ALICE, &inner, &routing(&ctx), 300).unwrap();
-        match bob_a.open(&SystemClock, CTX_STR, &sealed).unwrap() {
+        match bob_a.open(CTX_STR, &sealed).unwrap() {
             OpenResult::Application(env) => assert_eq!(env.sender_did, ALICE),
             other => panic!("expected Application, got {other:?}"),
         }

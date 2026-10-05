@@ -263,16 +263,13 @@ impl<S: Storage> ProtocolRepository<S> {
     }
 
     /// Serializes a value that carries key material into the same
-    /// `StoredValue` envelope bytes as [`Self::serialize`], held in one
-    /// exactly-sized buffer that is wiped on drop.
-    ///
-    /// `rmp_serde::to_vec_named` grows its output by reallocation and frees
-    /// each outgrown buffer unwiped, leaving partial copies of the key material
-    /// behind (security model spec §9.15 step 2).
+    /// `StoredValue` envelope bytes as [`Self::serialize`], held in a buffer
+    /// wiped on drop (security model spec §9.15 step 2 and freed heap
+    /// memory).
     ///
     /// `T` may be unsized, so a caller holding a `&[u8]` or `&str` secret
-    /// passes it as is instead of copying it into an owned `Vec` or `String`
-    /// that would be freed unwiped; a slice encodes to the same bytes as the
+    /// passes it as is instead of copying it into an owned `Vec` or `String`,
+    /// a second copy to wipe; a slice encodes to the same bytes as the
     /// `Vec` holding it.
     pub(crate) fn serialize_secret<T: Serialize + ?Sized>(
         value: &T,
@@ -281,7 +278,8 @@ impl<S: Storage> ProtocolRepository<S> {
             version: scp_platform::store_value::CURRENT_STORE_VERSION,
             data: value,
         };
-        scp_mls::secret_msgpack::encode_named(&envelope)
+        rmp_serde::to_vec_named(&envelope)
+            .map(Zeroizing::new)
             .map_err(|e| StoreError::SerializationFailed(e.to_string()))
     }
 
@@ -560,7 +558,7 @@ mod tests {
 
     /// A secret passed as a slice (`&[u8]`, `&str`) encodes to exactly the
     /// bytes its owned copy (`Vec<u8>`, `String`) did, so callers that stopped
-    /// copying the secret into an unwiped owned value still write and read
+    /// copying the secret into a plain owned value still write and read
     /// the same stored records.
     #[test]
     fn slice_secret_encodes_like_its_owned_copy() {

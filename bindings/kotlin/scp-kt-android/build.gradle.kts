@@ -11,6 +11,15 @@ plugins {
 group = "works.limn"
 version = findProperty("scpVersion")?.toString() ?: "0.1.0-SNAPSHOT"
 
+// Configures :scp-kt first, then registers scp-kt's uniffiPublishGuard (see
+// scp-kt/build.gradle.kts) for this project's tasks, naming `compileReleaseKotlin`
+// as this project's compile task.
+evaluationDependsOn(":scp-kt")
+@Suppress("UNCHECKED_CAST")
+val uniffiPublishGuard =
+    project(":scp-kt").extra["uniffiPublishGuard"] as (TaskExecutionGraph, Project, String) -> Unit
+gradle.taskGraph.whenReady { uniffiPublishGuard(this, project, "compileReleaseKotlin") }
+
 repositories {
     google()
     mavenCentral()

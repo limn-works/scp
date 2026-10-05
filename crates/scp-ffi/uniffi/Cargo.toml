@@ -46,6 +46,9 @@ testing = [
 outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
+# Links the wiping global allocator every shipped artifact installs
+# (09-security-model.md §9.15, freed heap memory).
+scp-alloc = { path = "../../scp-alloc" }
 uniffi = { version = "0.29", features = ["tokio", "cli"] }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -93,7 +96,22 @@ rand = { workspace = true }
 zeroize = { workspace = true }
 z-base-32 = { workspace = true }
 
+# A stdio MCP server's stdin is a Unix socket whose writes cannot raise
+# SIGPIPE (`SO_NOSIGPIPE` on Apple, `MSG_NOSIGNAL` elsewhere): a Swift app
+# loading this library keeps SIGPIPE's default action, so a write to a dead
+# server would otherwise terminate the app. When this library serves MCP over
+# stdio, the process's stdout gets the same protection through `libc` (`F_SETNOSIGPIPE` on Apple, SIGPIPE
+# ignored elsewhere when it still has its default action), and the SIGPIPE
+# tests use `libc` to restore SIGPIPE's default action in a child test
+# process, as a Swift app has it; the test harness ignores SIGPIPE.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "net"] }
+libc = "0.2"
+
 [dev-dependencies]
+# The MCP subscription tests build a wired server with
+# `McpServer::with_event_source`, public only under `scp-mcp/testing`.
+scp-mcp = { path = "../../scp-mcp", features = ["testing"] }
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
 # Test seams (`install_seedable_resolver`) construct

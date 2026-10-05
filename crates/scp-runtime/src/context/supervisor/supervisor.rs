@@ -1352,6 +1352,15 @@ pub struct CrossContextOutletInvocationRequest {
 /// 7-day default).
 const INVITATION_TTL_SECS: u32 = 7 * 24 * 60 * 60;
 
+// Security-model spec §9.18.7: the adder's minimum remaining KeyPackage
+// lifetime covers the InvitationBundle relay TTL plus the lifetime margin, so a
+// joiner fetching its Welcome while the relay still holds the bundle finds its
+// own KeyPackage current. `u64::from` is not const, so the widening is `as`.
+const _: () = assert!(
+    scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
+        >= INVITATION_TTL_SECS as u64 + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
+
 /// Outcome of [`Supervisor::invite_member`].
 ///
 /// An extensible enum with a SINGLE variant today. `invite_member` currently
@@ -5791,8 +5800,9 @@ impl Supervisor {
         // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
         //    discarded welcome-join is permanently gone (its actor-owned crypto
         //    freed on the handle drop above — `SenderKey`s, the MLS group's
-        //    signer, and its provider-storage values zeroize on drop; its durable snapshot
-        //    deleted), so
+        //    signer, and its provider-storage values zeroize on drop, and
+        //    security model spec §9.15 lists the copies no wipe reaches; its
+        //    durable snapshot deleted), so
         //    the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
         //    transient safety argument.
@@ -12448,6 +12458,33 @@ impl Supervisor {
         event_log.event_log_entries(context_id_bytes)
     }
 
+    /// Returns the entry count and Merkle root of `context_id`'s event log,
+    /// read from the same shared provider as [`Self::event_log_entries`].
+    ///
+    /// The provider reads both values from one state of the log
+    /// ([`ContextEventLogProvider::event_log_summary`]), so an append that
+    /// lands concurrently never pairs one tree's count with another tree's
+    /// root. A context whose log exists and has no entries reports a count of
+    /// 0 and the empty-tree root, `SHA-256("")` (spec §25.8 Vector 15).
+    /// Synchronous for the reason [`Self::event_log_entries`] gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if no event-log provider is
+    /// wired, and the provider's [`ContextError`] if the context has no event
+    /// log or the provider cannot summarize it.
+    pub fn event_log_summary(
+        &self,
+        context_id_bytes: &[u8; 32],
+    ) -> Result<(usize, [u8; 32]), ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::event_log_summary — event_log provider not configured".to_owned(),
+            )
+        })?;
+        event_log.event_log_summary(context_id_bytes)
+    }
+
     /// Computes the participation record (§7.3.2) for `subject_did` in
     /// `context_id` from the context's FULL event log.
     ///
@@ -17292,6 +17329,18 @@ mod tests {
         assert!(s.lookup("any-ctx").is_none());
         assert!(s.local_dids.load().is_empty());
         assert!(s.standing_contexts.load().is_empty());
+    }
+
+    /// A supervisor with no event-log provider wired reports the summary as
+    /// `NotInitialized` rather than as an empty log.
+    #[tokio::test]
+    async fn event_log_summary_without_a_provider_is_not_initialized() {
+        let s = test_supervisor();
+        let summary = s.event_log_summary(&[7u8; 32]);
+        assert!(
+            matches!(summary, Err(ContextError::NotInitialized(_))),
+            "a supervisor with no event-log provider must not summarize a log, got {summary:?}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -24087,6 +24136,148 @@ mod tests {
         assert!(
             replay.is_err(),
             "a replay of an already-accepted message must be rejected, got {replay:?}"
+        );
+    }
+
+    /// Security-model spec §9.7.1, the receiver, on the native receive path.
+    /// Alice adds Carol on her actor state, and Bob's actor opens the add
+    /// Commit through `decrypt_and_dispatch` while his injected `ActorDeps`
+    /// clock reads `bob_clock_secs(not_before, not_after)` of Carol's
+    /// `Lifetime`. Asserts that Bob merges: his epoch advances by one and
+    /// Carol's leaf joins his member set. The wall clock stays inside Carol's
+    /// `Lifetime`, so openmls's own wall-clock reads pass, and only a
+    /// receive-side check against the injected clock could refuse the Add.
+    #[cfg(feature = "testing")]
+    fn actor_merges_add_under_receiver_clock(
+        ctx_str: &str,
+        alice: &str,
+        bob: &str,
+        carol: &str,
+        bob_clock_secs: fn(u64, u64) -> u64,
+    ) {
+        use openmls::prelude::tls_codec::Serialize as _;
+        use scp_clock::{Clock as _, SystemClock, TestClock};
+        use scp_did::SigningKeyId;
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, alice, bob);
+
+        let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Bob's ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut bob_deps = rt
+            .block_on(bob_sup.build_actor_deps(&DID::from(bob)))
+            .expect("build Bob's actor deps");
+
+        // Carol's KeyPackage is minted under the wall clock, so the wall clock
+        // lies inside its `Lifetime`.
+        let carol_credential =
+            scp_mls::ScpCredential::new(carol.to_owned(), None, SigningKeyId::Active)
+                .expect("Carol's credential");
+        let (carol_bundle, carol_signer, _carol_provider) =
+            scp_mls::group::generate_key_package_with_context_params(
+                &carol_credential,
+                Some(&[0xCC; 32]),
+                &SystemClock,
+            )
+            .expect("Carol's KeyPackage");
+        let lifetime = carol_bundle.key_package().life_time();
+        let (not_before, not_after) = (lifetime.not_before(), lifetime.not_after());
+        let carol_kp = carol_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .expect("serialize Carol's KeyPackage");
+
+        let commit = alice_actor
+            .add_member(carol, Some(&carol_kp), &SystemClock)
+            .expect("Alice adds Carol")
+            .commit_bytes;
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let outer =
+            scp_protocol::envelope::outer::create_outer_envelope(&routing_id, None, 3600, commit)
+                .expect("wrap the add Commit in an outer envelope");
+        let blob = rmp_serde::to_vec_named(&outer).expect("serialize the outer envelope");
+
+        let bob_now = bob_clock_secs(not_before, not_after);
+        bob_deps.clock = Arc::new(TestClock::new(bob_now));
+        let wall = SystemClock.now_secs();
+        assert!(
+            not_before <= wall && wall <= not_after,
+            "the wall clock lies inside Carol's Lifetime"
+        );
+        assert!(
+            bob_now < not_before || not_after < bob_now,
+            "Bob's injected clock lies outside Carol's Lifetime"
+        );
+
+        let bob_cs = match &mut bob_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c,
+            crate::context::actor::ContextModeState::Broadcast(_) => {
+                panic!("expected encrypted mode")
+            }
+        };
+        let epoch_before = bob_cs
+            .mls_group
+            .as_ref()
+            .expect("Bob's group")
+            .epoch()
+            .expect("Bob's epoch");
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &blob,
+        )
+        .expect("Bob merges the add-Carol Commit");
+        assert!(opened.is_none(), "a Commit surfaces no envelope");
+        let group = bob_cs.mls_group.as_ref().expect("Bob's group");
+        assert_eq!(
+            group.epoch().expect("Bob's epoch"),
+            epoch_before + 1,
+            "Bob's epoch advances by the add Commit"
+        );
+        let carol_key = carol_signer.to_public_vec();
+        assert!(
+            group
+                .members()
+                .expect("Bob's members")
+                .iter()
+                .any(|m| m.signature_key == carol_key),
+            "Carol is in Bob's member set"
+        );
+    }
+
+    /// Bob's injected clock stands past Carol's `not_after`: Bob merges.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn decrypt_and_dispatch_merges_add_expired_under_receiver_clock() {
+        actor_merges_add_under_receiver_clock(
+            "e2e-decrypt-and-dispatch-add-expired-under-receiver-clock",
+            "did:dht:z6MkAliceRecvExpiredAliceRecvExpiredAlice1",
+            "did:dht:z6MkBobRecvExpiredBobRecvExpiredBobRecvExp1",
+            "did:dht:z6MkCarolRecvExpiredCarolRecvExpiredCarol1",
+            |_not_before, not_after| not_after + 1,
+        );
+    }
+
+    /// Bob's injected clock stands before Carol's `not_before`: Bob merges.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn decrypt_and_dispatch_merges_add_not_yet_valid_under_receiver_clock() {
+        actor_merges_add_under_receiver_clock(
+            "e2e-decrypt-and-dispatch-add-not-yet-valid-under-receiver-clock",
+            "did:dht:z6MkAliceRecvEarlyAliceRecvEarlyAliceRecv1",
+            "did:dht:z6MkBobRecvEarlyBobRecvEarlyBobRecvEarlyB1",
+            "did:dht:z6MkCarolRecvEarlyCarolRecvEarlyCarolRec1",
+            |not_before, _not_after| not_before - 3600,
         );
     }
 

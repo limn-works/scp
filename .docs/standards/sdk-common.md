@@ -343,6 +343,10 @@ reusing `8001` would make one code string mean both "storage key not found" and
 | `SCP-ATTEST-9018` | Cryptographic-class attestation not verifiable via browser fetch |
 | `SCP-ATTEST-9019` | Apple App Attest is unsupported on this device: `DCAppAttestService.isSupported` is `false`, or an App Attest call answered with `DCError.featureUnsupported` |
 | `SCP-ATTEST-9020` | No App Attest key ID is stored, so no assertion is possible |
+| `SCP-ATTEST-9021` | Apple already attested this App Attest key |
+| `SCP-ATTEST-9022` | Apple refused an `assertRequest` assertion with a stored App Attest key that carries no attestation record |
+| `SCP-ATTEST-9023` | Apple's App Attest service rejected this device's key |
+| `SCP-ATTEST-9024` | Apple App Attest `attestKey` or `generateAssertion` answered with `DCError.serverUnavailable`; the Apple adapter keeps the key for a retry |
 | `SCP-ATTEST-9025` | The App Attest adapter reached a state no caller input produces: Apple's service answered a completion handler with neither a value nor an error |
 | `SCP-ATTEST-9026` | The attestation challenge or the assertion request hash is not 32 bytes |
 | `SCP-ATTEST-9027` | Apple App Attest did not answer one serialized call (one `attest` or one `assertRequest`) within 25 seconds of the call's start; the adapter runs the next queued call and discards any later answer |

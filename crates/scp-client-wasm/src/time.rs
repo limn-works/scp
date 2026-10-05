@@ -34,14 +34,20 @@
 //!   `Lifetime` SCP *mints* is built via `scp_mls::lifetime::key_package_lifetime`
 //!   from the injected hardened clock (`Lifetime::init` with explicit bounds),
 //!   never openmls's `Lifetime::default()`. See `scp-mls/src/group.rs`.
-//! - **The receive/accept side is bracketed.** Every `Lifetime` SCP *accepts*,
-//!   except another member's leaf in a Welcome's ratchet tree (below), is
-//!   additionally re-validated against the injected hardened clock
-//!   (`scp_mls::lifetime::validate_key_package_lifetime`) wherever openmls
-//!   exposes the accepted `Lifetime` — post-`KeyPackageIn::validate`
-//!   (add-member / key-package-DID) and pre-merge on staged-commit Add proposals
-//!   — and the RFC 9420 maximum-range bound openmls never enforces is added
-//!   there too.
+//! - **The add side is bracketed, with a minimum.** Every `KeyPackage` SCP
+//!   *adds* is re-validated after `KeyPackageIn::validate` against the injected
+//!   hardened clock (`scp_mls::lifetime::validate_key_package_lifetime_for_add`):
+//!   the current time lies within its `Lifetime`, its range is within the RFC
+//!   9420 maximum openmls never enforces, its `not_before` lies at least
+//!   `KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS` (3,300 s) before the current time,
+//!   and at least `KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS` (7 days + 1 hour)
+//!   remains
+//!   (security-model spec §9.7.1, the adder).
+//! - **The receive side reads no clock.** An Add received in a Commit or a
+//!   Proposal is checked for range only
+//!   (`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`), so neither this
+//!   module's clock nor `Date.now()` takes part in SCP's own verdict on it
+//!   (security-model spec §9.7.1, the receiver).
 //! - **Welcome tree leaves: no clock (V3).**
 //!   `scp_mls::group::join_group_from_bytes` switches openmls's tree-leaf
 //!   `Lifetime` check off (`skip_lifetime_validation`) and checks only each
@@ -56,16 +62,22 @@
 //!   0.9.0's internal checks call `Lifetime::validate`, never
 //!   `validate_with_time` with a caller's time, so its own check inside
 //!   `KeyPackageIn::validate` and `process_message` still reads `web_time`'s
-//!   `Date.now()`, in addition to SCP's checks. Prerequisite 1's one-clock
-//!   criterion is therefore not yet met. Every accept decision on those paths
-//!   also needs SCP's check against this module's clock, so openmls's clock can
-//!   only add rejections: a page script that overrides `Date.now()` after this
-//!   module initializes can make an honest `KeyPackage` or commit fail, but
-//!   cannot get a forged `Lifetime` accepted. Page same-origin integrity
-//!   (CSP/SRI/COOP/COEP) stays load-bearing for every `Lifetime` decision,
-//!   because a script that runs before this module initializes shifts the
-//!   captured clock too. The residual closes when openmls lets the caller
-//!   supply the clock that `KeyPackageIn::validate` and `process_message` read.
+//!   `Date.now()`. On the add path SCP's check against this module's clock
+//!   also runs, so there openmls's clock can only add rejections, and a page
+//!   script that overrides `Date.now()` cannot get a forged `Lifetime`
+//!   accepted on an add. On the receive path SCP's verdict is the range
+//!   check, which reads no clock; openmls's own check is the only clock check
+//!   there, so a `Date.now()` override can only add rejections and can make an
+//!   honest add-Commit fail. The adder's minimum remaining lifetime and
+//!   minimum `not_before` age bound openmls's check, and security-model spec
+//!   §9.7.1 states every condition under which it still refuses an
+//!   add-Commit, including delays that add up to 7 days + 1 hour.
+//!   Page same-origin integrity (CSP/SRI/COOP/COEP) stays load-bearing for
+//!   every add-side `Lifetime` decision, because a script that runs before this module
+//!   initializes shifts the captured clock too. The residual closes when
+//!   openmls exposes a receive-side lifetime policy SCP can set to skip the
+//!   current-time check, and lets the caller supply the clock
+//!   `KeyPackageIn::validate` reads.
 
 use scp_clock::Clock;
 

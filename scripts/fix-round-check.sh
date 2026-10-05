@@ -10,8 +10,8 @@
 # agent discovers the cost only after paying it.
 #
 #   1. Compiling the whole workspace. `cargo clippy --workspace --all-targets` with the
-#      feature set the `rust-clippy` job of `.github/workflows/ci.yml` names compiles 26
-#      workspace members and every test target each one declares. That command is the
+#      feature set the `rust-clippy` job of `.github/workflows/ci.yml` names compiles every
+#      workspace member and every test target each one declares. That command is the
 #      merge gate, and CI runs it on the pushed head. A fix agent that runs it locally
 #      pays for it twice and blocks its own round on the local copy.
 #   2. Compiling into a private target directory. `~/.cargo/config.toml` points every
@@ -100,8 +100,8 @@
 #      so its pass covers the committed half alone. It is the one gate in the list below
 #      that reads a diff range, and every other gate in that list reads the working tree.
 #   6. Every compile of a crate source that the native `cargo check` above does not
-#      reach. `cargo check -p … --target wasm32-unknown-unknown` over scp-clock,
-#      scp-crypto, scp-did, scp-protocol, scp-relay-client, scp-mls, scp-client,
+#      reach. `cargo check -p … --target wasm32-unknown-unknown` over scp-alloc,
+#      scp-clock, scp-crypto, scp-did, scp-protocol, scp-relay-client, scp-mls, scp-client,
 #      scp-event-log and scp-client-wasm, which the `wasm-protocol` job runs and which
 #      rejects a host-only API a native check accepts; `wasm-pack test` over
 #      scp-client-wasm, which the `wasm-test` job runs; `cargo doc --workspace --no-deps
@@ -196,7 +196,7 @@
 # exist, and when this branch changed a file that every workspace member compiles against
 # while changing no file inside a workspace crate. No `-p`-narrowed `cargo check` covers
 # that last shape, so a run that reported it as a skip would exit 0 having compiled zero
-# lines of a change that recompiles all 26 members.
+# lines of a change that recompiles every member.
 #
 # The toolchain step is a precondition rather than one failure among several: a compile on
 # a compiler the pin does not name reports lints that CI will not report and misses lints
@@ -580,7 +580,7 @@ CI_FEATURES=(
 # ── The features a sibling manifest activates on a selected package ──────────────────
 #
 # `cargo clippy --workspace --all-targets`, the command the `rust-clippy` job of
-# `.github/workflows/ci.yml` runs, resolves one feature set across all 26 members, so a
+# `.github/workflows/ci.yml` runs, resolves one feature set across every member, so a
 # non-default feature that ANY member's dependency declaration requests is on for that
 # dependency. `cargo check -p <crate> --all-targets` resolves that crate and its own
 # dependencies alone, so none of those sibling requests reaches it, and every module the
@@ -688,6 +688,7 @@ EXTRA_FEATURE_CHECKS=(
 # rejects. This script starts no wasm compile, for the reason item 6 of the DOES-NOT-RUN
 # list gives, so a run that selects one of these names it in a NOT CHECKED line instead.
 WASM_TARGET_CRATES=(
+    scp-alloc
     scp-clock
     scp-crypto
     scp-did
@@ -705,12 +706,12 @@ crate_list="none"
 if [[ ${#CRATES[@]} -eq 0 ]]; then
     # A branch that changed one of WORKSPACE_WIDE_INPUTS and no file under a crate
     # directory fails here rather than recording a skip. `cargo check -p` takes a package
-    # name, this run has none to pass, and every one of the 26 members compiles against
+    # name, this run has none to pass, and every member compiles against
     # each of those four files, so the only command that covers the change is the
     # workspace one this script refuses to start. Exit 1 says that the script reached no
     # verdict; exit 0 with a skip line would say that the change needed no compile.
     if [[ -n $wide_list ]]; then
-        printf '\nfix-round-check: this branch changed %s, which every workspace member compiles against, and changed no file inside a workspace crate. `cargo check -p` needs a package name and this run derived none, so this script compiled zero lines of a change that recompiles all 26 members and it reports no compile verdict. Run `cargo check --workspace --all-targets` yourself, and read the rust-clippy job of .github/workflows/ci.yml on the pushed head.\n' "$wide_list" >&2
+        printf '\nfix-round-check: this branch changed %s, which every workspace member compiles against, and changed no file inside a workspace crate. `cargo check -p` needs a package name and this run derived none, so this script compiled zero lines of a change that recompiles every member and it reports no compile verdict. Run `cargo check --workspace --all-targets` yourself, and read the rust-clippy job of .github/workflows/ci.yml on the pushed head.\n' "$wide_list" >&2
         RAN+=("compile FAILED 0s")
         FAILED=1
     else
@@ -751,9 +752,9 @@ else
             [[ $seen -eq 0 ]] && SELECTED_FEATURES+=("$f")
         done <<< "$sibling_out"
     elif [[ $metadata_rc -ne 0 ]]; then
-        NOTES+=("the features a sibling manifest activates on $crate_list: the cargo metadata call this script makes did not answer, for the reason the target-directory clause of the summary above gives, so this run read no dependency declaration and compiled the packages above under their own default features and the CI command line alone. The rust-clippy job of .github/workflows/ci.yml resolves one feature set across all 26 members, so every module gated on a feature another member requests compiled nowhere in this run")
+        NOTES+=("the features a sibling manifest activates on $crate_list: the cargo metadata call this script makes did not answer, for the reason the target-directory clause of the summary above gives, so this run read no dependency declaration and compiled the packages above under their own default features and the CI command line alone. The rust-clippy job of .github/workflows/ci.yml resolves one feature set across every member, so every module gated on a feature another member requests compiled nowhere in this run")
     else
-        NOTES+=("the features a sibling manifest activates on $crate_list: $PYTHON could not read the dependency declarations out of cargo metadata's output, so this run compiled the packages above under their own default features and the CI command line alone. The rust-clippy job of .github/workflows/ci.yml resolves one feature set across all 26 members, so every module gated on a feature another member requests compiled nowhere in this run")
+        NOTES+=("the features a sibling manifest activates on $crate_list: $PYTHON could not read the dependency declarations out of cargo metadata's output, so this run compiled the packages above under their own default features and the CI command line alone. The rust-clippy job of .github/workflows/ci.yml resolves one feature set across every member, so every module gated on a feature another member requests compiled nowhere in this run")
     fi
 
     if [[ ${#SELECTED_FEATURES[@]} -gt 0 ]]; then
@@ -873,17 +874,19 @@ run_step format cargo fmt --all -- --check
 # cost is reading repository files and, for one gate, resolving a dependency graph. Every
 # gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 32 files named
-# `check-*`. This list names 30 of them, and GATES_NOT_RUN below names the other two with
+# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 33 files named
+# `check-*`. This list names 31 of them, and GATES_NOT_RUN below names the other two with
 # the reason each is absent. Neither count is load-bearing: the loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
 # unnoticed.
 #
-# TWO GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
+# THREE GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
 # graph.sh` runs eleven `cargo tree` resolutions and `scripts/check-protocol-deps.sh` runs
 # one, and `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run
 # measured them at 12.9 seconds and 391 ms while another worktree held that lock.
+# `scripts/check-wiping-allocator.sh` runs one `cargo metadata --no-deps`, which resolves
+# no dependency and compiles nothing.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
 # list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the
@@ -923,6 +926,7 @@ GATES=(
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
     scripts/check-toolchain-wiring.sh
+    scripts/check-wiping-allocator.sh
     scripts/check-workflow-compile-steps.py
 )
 

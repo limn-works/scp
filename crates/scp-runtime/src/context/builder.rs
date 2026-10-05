@@ -478,6 +478,28 @@ pub trait ContextEventLogProvider: Send + Sync {
         ))
     }
 
+    /// Returns the entry count and the Merkle root of a context's event log,
+    /// both read from one state of the log.
+    ///
+    /// An implementation reads the two values under one acquisition of its
+    /// log state, so an append that lands concurrently is either counted and
+    /// hashed or neither. Calling [`Self::event_log_entries`] and then
+    /// [`Self::event_log_merkle_root`] gives no such guarantee.
+    ///
+    /// An existing log with no entries reports a count of 0 and the
+    /// empty-tree root, `SHA-256("")`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if no log exists for the
+    /// context, or if this provider does not support the summary.
+    fn event_log_summary(&self, context_id: &[u8; 32]) -> Result<(usize, [u8; 32]), ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "event log summary not supported by this provider".into(),
+        ))
+    }
+
     // -- Persistence for process restart recovery (#636) --------------------
 
     /// Restores the event log for a context from persistent storage.

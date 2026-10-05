@@ -799,6 +799,23 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         })
     }
 
+    fn event_log_summary(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<(usize, [u8; 32]), scp_protocol::context::ContextError> {
+        // One lock acquisition for both values, so a concurrent append is
+        // either in the count and the root or in neither.
+        self.with_log(context_id, |log| {
+            (log.events().len(), scp_event_log::tree::root(log))
+        })
+        .ok_or_else(|| {
+            scp_protocol::context::ContextError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            ))
+        })
+    }
+
     async fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         // Delegate to the INHERENT method, which loads persisted entries
         // (`persistence.load_entries`) and replays them via
@@ -1312,6 +1329,49 @@ mod tests {
             .unwrap();
         let one_root = provider.merkle_root(&ctx_id).unwrap();
         assert_ne!(empty_root, one_root);
+    }
+
+    /// `event_log_summary` refuses a context that has no log instead of
+    /// reporting the empty-tree root for it, reports `(0, SHA-256(""))` only
+    /// for a log that exists and is empty, and returns the count and root of
+    /// one tree once entries exist.
+    #[tokio::test]
+    async fn event_log_summary_distinguishes_missing_from_empty() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [23u8; 32];
+
+        let missing = provider.event_log_summary(&ctx_id);
+        assert!(
+            matches!(
+                missing,
+                Err(scp_protocol::context::ContextError::EventLogFailed(_))
+            ),
+            "a context with no event log must be an error, not an empty log: {missing:?}"
+        );
+
+        provider.init_event_log(&ctx_id).await.unwrap();
+        let empty_root = scp_event_log::tree::root(&EventLog::new(String::new()));
+        assert_eq!(
+            provider.event_log_summary(&ctx_id).unwrap(),
+            (0, empty_root)
+        );
+
+        for event_type in [EventType::ContextCreated, EventType::MessageSent] {
+            provider
+                .append_event(
+                    &ctx_id,
+                    event_type,
+                    "",
+                    EventPayload::default(),
+                    1_700_000_000,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            provider.event_log_summary(&ctx_id).unwrap(),
+            (2, provider.merkle_root(&ctx_id).unwrap())
+        );
     }
 
     #[tokio::test]

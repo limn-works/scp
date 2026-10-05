@@ -197,10 +197,10 @@ fuzz_target!(|data: &[u8]| {
             let _ = decrypt(&mut g, data);
         }
         if let Some(mut g) = fresh_receiver(snap) {
-            let _ = decrypt_with_sender_did(&mut g, data, &SystemClock);
+            let _ = decrypt_with_sender_did(&mut g, data);
         }
         if let Some(mut g) = fresh_receiver(snap) {
-            let _ = decrypt_with_membership_changes(&mut g, data, &SystemClock);
+            let _ = decrypt_with_membership_changes(&mut g, data);
         }
 
         // --- Path 2: tamper the TAIL of a valid ciphertext ---
@@ -243,7 +243,6 @@ fuzz_target!(|data: &[u8]| {
             decrypt_with_sender_did(
                 &mut fresh_receiver(snap).expect(expect_msg),
                 &tampered,
-                &SystemClock
             )
             .is_err(),
             "tampered ciphertext decrypted Ok via decrypt_with_sender_did (AEAD forgery?)"
@@ -252,7 +251,6 @@ fuzz_target!(|data: &[u8]| {
             decrypt_with_membership_changes(
                 &mut fresh_receiver(snap).expect(expect_msg),
                 &tampered,
-                &SystemClock
             )
             .is_err(),
             "tampered ciphertext decrypted Ok via decrypt_with_membership_changes (AEAD forgery?)"

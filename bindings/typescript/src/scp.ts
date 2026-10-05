@@ -2911,6 +2911,8 @@ export class SCP {
    * the token to any external subject, passing a token addressed to someone else
    * (trust inflation). Pass the agent the token must be addressed to.
    *
+   * Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   *
    * @param handle The context handle to validate against.
    * @param token The UCAN token string to validate.
    * @param capability The required capability URI (mandatory on this gate).
@@ -2943,8 +2945,8 @@ export class SCP {
    * {@link CapabilityValidation} of six per-stage booleans (spec §7.2.4,
    * ADR-059). The probe never records the token's nonce, so calling it does
    * not consume the token. Capability/signature/expiry outcomes are reported
-   * via the booleans; only malformed FFI inputs (bad handle / token /
-   * capability) reject.
+   * via the booleans; malformed FFI inputs (bad handle / token / capability)
+   * reject. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
    *
    * The six booleans cross the FFI already camelCased, so consumers read the
    * per-check breakdown directly and never reverse-engineer *which* check
@@ -3007,6 +3009,10 @@ export class SCP {
     return toCapabilityValidation(raw);
   }
 
+  /**
+   * Mints a UCAN from the context creator to `memberDid`, within the ceiling
+   * the context holds. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   */
   async ucanMint(
     handle: unknown,
     memberDid: string,
@@ -3027,6 +3033,10 @@ export class SCP {
     }
   }
 
+  /**
+   * Delegates a subset of `parentToken`'s capabilities from `delegatorDid` to
+   * `delegateeDid`, within the ceiling the context holds. Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   */
   async ucanDelegate(
     handle: unknown,
     delegatorDid: string,
@@ -3049,6 +3059,10 @@ export class SCP {
     }
   }
 
+  /**
+   * Revokes `token` in the context, as its issuer or the context creator.
+   * Throws {@link "./errors".ContextError} carrying `SCP-CTX-2023` when the context is not active.
+   */
   async ucanRevoke(handle: unknown, token: string, revokerDid: string): Promise<void> {
     try {
       await (this.#native.ucanRevoke as (h: unknown, t: string, r: string) => Promise<void>)(
@@ -3550,8 +3564,8 @@ export class SCP {
    *   first. Use {@link participationRecord} directly when the empty-log case
    *   should surface as an error instead.
    *
-   * The capability outcome is non-throwing (it reads booleans); only malformed
-   * FFI inputs (bad context handle / token / capability) propagate as a typed
+   * The capability outcome is non-throwing (it reads booleans); malformed FFI
+   * inputs (bad context handle / token / capability) propagate as a typed
    * {@link "./errors".ScpError}.
    *
    * SECURITY: the behavioral record's `attestationCount` (and any challenge
@@ -3595,8 +3609,9 @@ export class SCP {
       let notRevoked = true;
       let timeBoundsValid = true;
       for (const token of capabilityTokens) {
-        // Read-only diagnostic — does NOT throw on capability outcomes; only
-        // malformed FFI input rejects (and propagates). Pass the subject as the
+        // Read-only diagnostic — does NOT throw on capability outcomes;
+        // malformed FFI input and an inactive context reject (and propagate).
+        // Pass the subject as the
         // presenting agent so the audience check evaluates against the DID under
         // assessment.
         //
@@ -3931,9 +3946,18 @@ export class SCP {
     }
   }
 
-  async mcpClientConnectSse(url: string): Promise<unknown> {
+  /**
+   * Connects an MCP client to an SSE server. `authToken` is sent as
+   * `Authorization: Bearer <token>` on every request; pass `null` only for a
+   * server that runs no bearer check. An SCP SSE server always runs one
+   * (ADR-015). The transport has no TLS, so a token is sent only to a
+   * loopback host.
+   */
+  async mcpClientConnectSse(url: string, authToken: string | null): Promise<unknown> {
     try {
-      return await (this.#native.mcpClientConnectSse as (u: string) => Promise<unknown>)(url);
+      return await (
+        this.#native.mcpClientConnectSse as (u: string, t: string | null) => Promise<unknown>
+      )(url, authToken);
     } catch (err) {
       throw mapBridgeError(err);
     }

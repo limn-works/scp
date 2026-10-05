@@ -1024,9 +1024,9 @@ impl KeyPackageStoreActor {
     }
 
     /// Persist one KP record (public + private signer-state). The `MessagePack`
-    /// buffer carries the private signer-state, so it is encoded into one
-    /// exactly-sized buffer wiped on drop (security model spec §9.15 step 2;
-    /// mirrors `serialize_signer_state`).
+    /// buffer carries the private signer-state, so it is held in a buffer
+    /// wiped on drop (security model spec §9.15 step 2; mirrors
+    /// `serialize_signer_state`).
     async fn persist_kp_record(
         &self,
         kp_ref: &KpRef,
@@ -1037,7 +1037,8 @@ impl KeyPackageStoreActor {
             public_bytes: public_bytes.to_vec(),
             signer_state: Zeroizing::new(signer_state.to_vec()),
         };
-        let bytes = scp_mls::secret_msgpack::encode_named(&record)
+        let bytes = rmp_serde::to_vec_named(&record)
+            .map(Zeroizing::new)
             .map_err(|e| ContextError::PersistenceFailed(format!("kp record encode: {e}")))?;
         self.mls_storage
             .store(&self.kp_record_key(kp_ref), &bytes)

@@ -230,7 +230,7 @@ pub(crate) async fn dispatch(
             context_id,
             envelope_bytes,
             reply,
-        } => handle_inspect_incoming_inner(cell, deps, &context_id, &envelope_bytes, reply),
+        } => handle_inspect_incoming_inner(cell, &context_id, &envelope_bytes, reply),
     }
 }
 
@@ -271,7 +271,6 @@ pub(crate) async fn dispatch(
 #[cfg(feature = "testing")]
 fn handle_inspect_incoming_inner(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
     context_id: &str,
     envelope_bytes: &[u8],
     reply: oneshot::Sender<Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError>>,
@@ -298,29 +297,28 @@ fn handle_inspect_incoming_inner(
     // enforcement (that is at the messaging seam, which this path skips). No floor
     // advance, no `nonce_dedup` mutation, no Class-M registry write, no epoch
     // change — only the intrinsic MLS decryption-ratchet advance.
-    let (outcome, reply_result) =
-        match cs.open(&*deps.clock, &context_id_bytes, context_id, envelope_bytes) {
-            Ok(OpenResult::Application(env)) => (Outcome::ok_mutated(()), Ok(env.inner)),
-            Ok(OpenResult::Control) => {
-                let err = ContextError::CryptoFailed(
-                    "open_inner_envelope: blob decoded to Control, not an application envelope"
-                        .to_string(),
-                );
-                (Outcome::ok_mutated(()), Err(err))
-            }
-            Ok(OpenResult::Management { .. }) => {
-                let err = ContextError::CryptoFailed(
-                    "open_inner_envelope: blob decoded to Management, not an application envelope"
-                        .to_string(),
-                );
-                (Outcome::ok_mutated(()), Err(err))
-            }
-            Err(e) => {
-                let sketch = outcome_error_sketch(&e);
-                let _ = reply.send(Err(e));
-                return Outcome::err(sketch);
-            }
-        };
+    let (outcome, reply_result) = match cs.open(&context_id_bytes, context_id, envelope_bytes) {
+        Ok(OpenResult::Application(env)) => (Outcome::ok_mutated(()), Ok(env.inner)),
+        Ok(OpenResult::Control) => {
+            let err = ContextError::CryptoFailed(
+                "open_inner_envelope: blob decoded to Control, not an application envelope"
+                    .to_string(),
+            );
+            (Outcome::ok_mutated(()), Err(err))
+        }
+        Ok(OpenResult::Management { .. }) => {
+            let err = ContextError::CryptoFailed(
+                "open_inner_envelope: blob decoded to Management, not an application envelope"
+                    .to_string(),
+            );
+            (Outcome::ok_mutated(()), Err(err))
+        }
+        Err(e) => {
+            let sketch = outcome_error_sketch(&e);
+            let _ = reply.send(Err(e));
+            return Outcome::err(sketch);
+        }
+    };
 
     let _ = reply.send(reply_result);
     outcome

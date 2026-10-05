@@ -9867,17 +9867,13 @@ mod tests {
                 DID::from("did:dht:z6MkOutsiderOutsiderOutsiderOutsiderOut".to_owned()),
             );
             assert!(
-                outsider_a
-                    .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_outsider)
-                    .is_err(),
+                outsider_a.open(a_ctx_str, &sealed_for_outsider).is_err(),
                 "a non-A-member holding no A group key must not decrypt the sealed chunk"
             );
 
             // (b) An A member decrypts and recovers the chunk with B's operator
             // signature intact and verifying against B's PINNED context_id.
-            let opened = bob_a
-                .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_member)
-                .unwrap();
+            let opened = bob_a.open(a_ctx_str, &sealed_for_member).unwrap();
             let recovered_bytes = match opened {
                 OpenResult::Application(env) => env.inner.payload,
                 other => panic!("expected Application, got {other:?}"),

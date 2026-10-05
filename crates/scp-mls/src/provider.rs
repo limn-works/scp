@@ -16,17 +16,29 @@
 //! [`OsRand`] replaces it as the `RandProvider`: each request reads the
 //! operating system's generator and keeps nothing, so no seed exists to recover.
 //!
-//! What the wipe does not cover:
+//! What this provider's wipe does not reach, and what reaches it instead.
+//! Every shipped SCP artifact installs the wiping global allocator, which
+//! zeroes each heap block before freeing it, the old block of a reallocation
+//! included (security model spec §9.15, freed heap memory). In those artifacts
+//! the allocator wipes each of these copies when it is freed:
 //! - values openmls replaces or deletes during normal group operation, which
-//!   `MemoryStorage` frees unzeroized before the provider is released;
+//!   `MemoryStorage` frees before the provider is released;
 //! - the copies `openmls_memory_storage` 0.6.0's `MemoryStorage` makes while
-//!   it encodes and decodes. It encodes each secret through
-//!   `serde_json::to_vec`, whose growing buffer frees its smaller copies
-//!   unwiped; it stores `value.to_vec()` and drops the original unwiped; on
-//!   each list append and removal it decodes the stored list and re-encodes
-//!   it into the stored `Vec`, which grows and frees what it outgrew
-//!   unwiped; and it decodes every read through `serde_json`. SCP's own
-//!   encoders do not reach inside this store;
+//!   it encodes and decodes: the smaller buffers `serde_json::to_vec` outgrows,
+//!   the original it drops after storing `value.to_vec()`, the buffers each
+//!   list append and removal outgrows when it re-encodes the stored list, and
+//!   the buffers every `serde_json` read decodes through;
+//! - hpke-rs 0.7.0's encapsulation intermediates (the input key material
+//!   `hpke.random()` returns, from which the ephemeral private key derives,
+//!   the Diffie-Hellman output, the `eae_prk`, and the KEM shared secret `zz`),
+//!   the `labeled_ikm` and `dkp_prk` that `derive_key_pair` builds for every
+//!   leaf and path-node encryption key openmls derives through
+//!   `derive_hpke_keypair`, and the Diffie-Hellman output, `eae_prk`, and `zz`
+//!   of decapsulation (`hpke_open`, `hpke_setup_receiver_and_export`), all
+//!   plain `Vec<u8>` values.
+//!
+//! The allocator does not reach these, which §9.15 states as limits:
+//! - each copy while it is live, before it is freed;
 //! - the `ChaCha20Rng` inside the wrapped `RustCrypto`. It stays in memory for
 //!   the provider's life, and two kinds of draw reach its seed.
 //!   `OpenMlsCrypto::signature_key_gen` is one: the `disallowed-methods` ban
@@ -39,20 +51,12 @@
 //! - HPKE encapsulation randomness. openmls draws it through `crypto()`, not
 //!   `rand()`: each `hpke_seal` builds an hpke-rs context whose
 //!   `HpkeRustCryptoPrng` seeds a `ChaCha20Rng` from the operating system for
-//!   that call, and that type's `Zeroize` is a no-op, so the generator state
-//!   is freed unwiped. [`OsRand`] therefore covers `rand()` draws only;
-//! - hpke-rs 0.7.0's encapsulation intermediates. The input key material
-//!   `hpke.random()` returns is a plain `Vec<u8>`, and the ephemeral private
-//!   key is derived from it, so that key's own zeroize on drop does not cover
-//!   the ephemeral secret. The Diffie-Hellman output, the `eae_prk`, and the
-//!   KEM shared secret `zz` are plain `Vec<u8>` too;
-//! - hpke-rs's `derive_key_pair`, which openmls reaches through
-//!   `derive_hpke_keypair` for every leaf and path-node encryption key. It
-//!   leaves the `labeled_ikm` it builds from the node secret and the
-//!   `dkp_prk` it extracts in plain `Vec<u8>`;
-//! - decapsulation (`hpke_open`, `hpke_setup_receiver_and_export`), which
-//!   leaves the Diffie-Hellman output, the `eae_prk`, and `zz` in plain
-//!   `Vec<u8>`.
+//!   that call. That type's `Zeroize` is a no-op, and the generator state it
+//!   holds on the stack is outside any allocator. [`OsRand`] therefore covers
+//!   `rand()` draws only;
+//! - every copy above in a Rust application that links this crate without
+//!   linking `scp-alloc`, because that application chooses its own global
+//!   allocator.
 
 use openmls_memory_storage::MemoryStorage;
 use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};

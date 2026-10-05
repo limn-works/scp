@@ -49,7 +49,7 @@ use super::production_backend::ProductionMlsBackend;
 use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
 use scp_mls::credential::ScpCredential;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use scp_mls::validate_key_package_lifetime;
+use scp_mls::validate_key_package_lifetime_for_add;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::builder::ReceiveFloor;
@@ -102,7 +102,9 @@ use scp_protocol::crypto::sender_keys::{
 /// type that wipes on drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so
 /// the intermediate `MlsCryptoSnapshot` wipes those fields when it drops on an
 /// export or restore path, early returns included. Buffers that serde
-/// allocates and frees while decoding the blob are not wiped. `Zeroizing`'s
+/// allocates and frees while decoding the blob are wiped as they are freed by
+/// the wiping global allocator every shipped artifact installs (security model
+/// spec §9.15, freed heap memory). `Zeroizing`'s
 /// serde impls delegate to the inner value, so the encoding is that of the
 /// plain fields.
 // ADR-049 PR-7 (crypto-state move, prep A): visibility elevated from private to
@@ -812,9 +814,9 @@ impl NodeMlsFactory {
         // `Lifetime` against the injected hardened clock and enforce the RFC 9420
         // max-range bound openmls's `validate` never applies. Additive hardening;
         // never replaces openmls.
-        validate_key_package_lifetime(verified.life_time(), self.clock.as_ref()).map_err(|e| {
-            ContextError::InvalidKeyPackage(format!("key package lifetime invalid: {e}"))
-        })?;
+        validate_key_package_lifetime_for_add(verified.life_time(), self.clock.as_ref()).map_err(
+            |e| ContextError::InvalidKeyPackage(format!("key package lifetime invalid: {e}")),
+        )?;
 
         if verified.ciphersuite() != SCP_CIPHERSUITE {
             return Err(ContextError::InvalidKeyPackage(format!(
@@ -1121,7 +1123,8 @@ impl NodeMlsFactory {
         // Take the local_sender_key and leave a zeroed placeholder. SenderKey
         // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot
         // drops, and the original is moved into crypto_state. Stack copies the
-        // move makes are not wiped.
+        // move makes are not wiped; security model spec §9.15 (freed heap
+        // memory) lists stack copies as a limit.
         let local_sender_key = std::mem::replace(
             &mut snapshot.local_sender_key,
             SenderKey::from_bytes([0u8; 32]),
@@ -1233,7 +1236,7 @@ impl NodeMlsFactory {
 )]
 mod tests {
     use super::*;
-    use scp_clock::SystemClock;
+    use scp_clock::{SystemClock, TestClock};
     use scp_mls::group::generate_key_package;
     use tls_codec::Serialize as TlsSerializeTrait;
 
@@ -1540,6 +1543,52 @@ mod tests {
                 .validate_key_package(&bob_cred.did, Some(&kp_bytes))
                 .is_ok(),
             "a freshly-minted KeyPackage must pass under a real-present clock"
+        );
+    }
+
+    /// Security-model spec §9.7.1, the adder: the joiner-`KeyPackage` gate
+    /// accepts exactly the minimum remaining lifetime under the provider's
+    /// clock and refuses one a second short of it.
+    #[test]
+    fn validate_key_package_enforces_min_remaining_lifetime_boundary() {
+        use scp_mls::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+        let minted_at = SystemClock.now_secs();
+        let bob_cred = ScpCredential::new(
+            "did:dht:z6MkBobBoundary".to_string(),
+            None,
+            SigningKeyId::Active,
+        )
+        .unwrap();
+        let (bundle, _signer, _provider) =
+            generate_key_package(&bob_cred, &TestClock::new(minted_at)).unwrap();
+        let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
+        let not_after = minted_at + KEY_PACKAGE_LIFETIME_SECS;
+
+        let at_min = NodeMlsFactory::new(
+            TEST_DID.to_string(),
+            Arc::new(TestClock::new(
+                not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS,
+            )),
+        );
+        assert!(
+            at_min
+                .validate_key_package(&bob_cred.did, Some(&kp_bytes))
+                .is_ok(),
+            "exactly the minimum remaining must pass the gate"
+        );
+
+        let past_min = NodeMlsFactory::new(
+            TEST_DID.to_string(),
+            Arc::new(TestClock::new(
+                not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1,
+            )),
+        );
+        let err = past_min
+            .validate_key_package(&bob_cred.did, Some(&kp_bytes))
+            .expect_err("one second short of the minimum must be refused");
+        assert!(
+            matches!(err, ContextError::InvalidKeyPackage(ref m) if m.contains("lifetime")),
+            "rejection must be at the lifetime gate, got: {err:?}"
         );
     }
 
@@ -2708,17 +2757,15 @@ mod tests {
         // dedicated guard-rejection path is covered by
         // `open_rejects_context_id_str_that_does_not_resolve_to_context_id`.
         let hex_ctx = hex::encode(ctx_id);
-        bob_actor
-            .open(&SystemClock, &hex_ctx, &sealed_neg)
-            .expect_err(
-                "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
+        bob_actor.open(&hex_ctx, &sealed_neg).expect_err(
+            "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
              under the RAW context_id string, so the rebuilt AAD does not authenticate",
-            );
+        );
 
         // Positive: opening the second blob with the RAW context_id string
         // (the spec value) succeeds, proving the AAD binds the raw string.
         let opened = bob_actor
-            .open(&SystemClock, TEST_CTX_STR, &sealed_pos)
+            .open(TEST_CTX_STR, &sealed_pos)
             .expect("opening with the raw context_id string (spec AAD) must succeed");
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
@@ -2757,7 +2804,7 @@ mod tests {
         // by its absence that the fail-fast assert ran ahead of the AEAD layer.
         let bogus_outer = [0xABu8; 64];
         let err = bob_actor
-            .open(&SystemClock, mismatched_ctx_str, &bogus_outer)
+            .open(mismatched_ctx_str, &bogus_outer)
             .expect_err("open must reject a context_id_str that does not resolve to context_id");
 
         match err {
@@ -2965,7 +3012,7 @@ mod tests {
 
         // Bob opens the same blob and recovers the application plaintext,
         // proving the zeroed routing_id does not break delivery.
-        let opened = bob_actor.open(&SystemClock, ctx_str, &wire).unwrap();
+        let opened = bob_actor.open(ctx_str, &wire).unwrap();
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
                 assert_eq!(

@@ -8,8 +8,10 @@
 //! tls/private_key
 //! ```
 //!
-//! The private key is stored via `store_value_zeroize` to clear serialized
-//! bytes from memory after the write completes (defense-in-depth).
+//! The private key is stored via `store_value_zeroize`, which zeroizes the
+//! serialized bytes once the write completes, while SCP still owns them.
+//! Security model spec §9.15 (freed heap memory) lists the copies no wipe
+//! reaches.
 //!
 //! See spec sections 17.3 and 17.4.
 

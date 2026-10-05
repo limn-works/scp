@@ -274,9 +274,10 @@ pub trait MlsBackend: Send + Sync {
     ///   merging fails.
     /// - [`MlsError::CannotDecryptOwnMessage`] for the local member's own
     ///   echoed Commit.
-    /// - [`MlsError::KeyPackageLifetimeInvalid`] if an Add proposal's
-    ///   `KeyPackage` lifetime fails the injected-clock or maximum-range check;
-    ///   the Commit is not merged.
+    /// - [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] if an Add
+    ///   proposal's `KeyPackage` `Lifetime` range is empty, inverted, or over
+    ///   the maximum; the check reads no clock (security-model spec §9.7.1, the
+    ///   receiver), and the Commit is not merged.
     async fn process_commit(
         &self,
         group: &mut ScpMlsGroup,
@@ -312,7 +313,11 @@ pub trait MlsBackend: Send + Sync {
     /// Returns [`MlsError::AddMemberFailed`] on validation failure (malformed
     /// KP, signature invalid, ciphersuite mismatch), or
     /// [`MlsError::KeyPackageLifetimeInvalid`] when the accepted `Lifetime`
-    /// is expired / out of range under `clock`.
+    /// is expired / out of range under `clock`, keeps less than
+    /// [`scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS`] under `clock`, or
+    /// has a `not_before` later than `now -`
+    /// [`scp_mls::KEY_PACKAGE_MIN_NOT_BEFORE_AGE_SECS`] under `clock`
+    /// (security-model spec §9.7.1, the adder; every caller is an add path).
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],

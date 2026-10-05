@@ -537,7 +537,7 @@
         "Kotlin: ctx.outlets.invokeCrossContext(options: InvokeCrossContextOptions) suspend function exists (options-builder form with target, outletId, input, ucan fields to prevent positional-argument swap with string-typed target and outletId); no top-level Context.invokeOutletCrossContext(...)",
         "Kotlin: ctx.outlets.invoke(id, input) returns an InvocationHandle exposing `suspend fun aggregate(): Aggregate` and `fun asFlow(): Flow<OutletStreamChunk>`; single registration in the namespace",
         "Kotlin: Caveats.spendingCap, Caveats.timeBounded, Caveats.rateLimited, Caveats.forTarget builder functions \u2192 InvocationCaveats",
-        "Kotlin: ./gradlew detekt and ./gradlew test pass",
+        "Kotlin: ./gradlew detekt and ./gradlew test -Pscp.uniffi.cargoFeatures=testing pass",
         "SDK capability matrix updated: outlets namespace and its sub-namespaces listed uniformly across all four SDKs with identical verb set",
         "Deleted test files test_tools.py, tools.test.ts, ToolsTests.swift, and any Kotlin tools-test source do not exist",
         "README snippets / quickstart examples updated from tool to outlet vocabulary; no broken links (cross-check with docs lint)",
@@ -1474,7 +1474,7 @@
         "Kotlin: InvocationCaveats data class; ucan.mint + ucan.narrow match",
         "Mint-limit violation in any SDK returns SCP-OUTLET-6114 'caveat-mint-limit-exceeded'",
         "A conformance test per SDK: build a caveats object in the SDK; pass to ucan.mint; decode the returned JWT; assert nb field matches the input caveats",
-        "cargo test --workspace && pytest && bun test && swift test && gradle test all green"
+        "cargo test --workspace && pytest && bun test && swift test && gradle test -Pscp.uniffi.cargoFeatures=testing all green"
       ],
       "actionItems": [
         "Add InvocationCaveats marshalling to each FFI bridge",
@@ -1851,7 +1851,7 @@
         "Swift: enum OutletError: Error with associated types per concrete variant",
         "Kotlin: sealed class OutletError with data-class children",
         "Test outlet_error_conformance.rs round-trips each fixture through each bridge and asserts the resulting OutletError has the right class and code",
-        "Per-SDK test: pytest, bun test, swift test, gradle test all assert that round-tripping each fixture preserves every field",
+        "Per-SDK test: pytest, bun test, swift test, gradle test -Pscp.uniffi.cargoFeatures=testing all assert that round-tripping each fixture preserves every field",
         "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds",
         "File tests/conformance/vectors/outlet_error_fixtures.json contains \u2265 1 fixture per allocated code (\u2265 12) AND \u2265 1 fixture per unique (code, slug) pair covering every slug in the \u00a75.4.4 taxonomy (\u2265 30 total fixtures)",
         "TypeScript: error subclasses survive `instanceof` across the napi-rs FFI boundary \u2014 explicit test in bindings/typescript/tests/errors.test.ts asserts `err instanceof OutletAuthorizationError` holds after the error crosses the bridge and again after JSON round-trip",
@@ -2682,14 +2682,14 @@
         "SDK surface: Python OutletError.new(*, outlet_id=..., catalog_key=..., class_=..., ...) calls FFI outlet_error_new (PyO3) which HMACs at the bridge boundary; the SDK never receives the raw outlet_message_key. grep -c 'outlet_error_new' bindings/python/scp_sdk/ returns >= 1",
         "SDK surface: TypeScript OutletError.new({ outletId, catalogKey, class, ... }) calls outletErrorNew NAPI export; bun test asserts wire_message is a 32-byte opaque value, not the catalog_key string",
         "SDK surface: Swift OutletError.new(outletId:catalogKey:class:...) calls the UniFFI binding; swift test asserts construction; Swift retains labeled-argument form per API MAJOR 22",
-        "SDK surface: Kotlin OutletError.new(opts: OutletErrorNewOptions) where OutletErrorNewOptions is a builder carrying outletId/catalogKey/class; gradle test asserts construction",
+        "SDK surface: Kotlin OutletError.new(opts: OutletErrorNewOptions) where OutletErrorNewOptions is a builder carrying outletId/catalogKey/class; gradle test -Pscp.uniffi.cargoFeatures=testing asserts construction",
         "FFI bridges: PyO3 outlet_error_new, NAPI outletErrorNew, UniFFI outlet_error_new (UDL), WASM outletErrorNew \u2014 all four bridges expose the catalog_key -> wire_message HMAC at the FFI boundary with the options-object signature",
         "FFI bridges: all four bridges expose outlet_catalog_rotation_validator (check-only path) that returns CatalogRotationTooFrequent typed error when the dwell-time rule (OUT-041c) fails; SDK wrappers surface this as a typed OutletProtocolError subclass",
         "Per-SDK test: Python/TypeScript/Swift/Kotlin each verify that registering an outlet with catalog C0 at T0, then updating to catalog C1 at T0 + 23.99h (simulated via the test event log) produces CatalogRotationTooFrequent; T0 + 24.01h succeeds",
         "Conformance fixture: tests/conformance/vectors/outlet_message_hmac_fixtures.json \u2014 one fixture per (outlet_id, catalog_key) pair (minimum 10 fixtures covering varied outlet_ids and catalog sizes); every bridge produces byte-identical wire_message for the same (outlet_message_key, catalog_key) input",
         "bridge_ratchet_baseline.json is regenerated additively (new exports only \u2014 outlet_error_new, outlet_catalog_rotation_validator); CI ratchet passes",
         "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds",
-        "python3.12 -m pytest bindings/python/tests/test_outlet_error_new.py succeeds; bun test bindings/typescript/tests/outlet-error-new.test.ts succeeds; swift test bindings/swift/Tests/SCPTests/OutletErrorTests.swift succeeds; ./gradlew test for OutletErrorTests passes"
+        "python3.12 -m pytest bindings/python/tests/test_outlet_error_new.py succeeds; bun test bindings/typescript/tests/outlet-error-new.test.ts succeeds; swift test bindings/swift/Tests/SCPTests/OutletErrorTests.swift succeeds; ./gradlew test -Pscp.uniffi.cargoFeatures=testing for OutletErrorTests passes"
       ],
       "actionItems": [
         "Add all four bridge exports (PyO3, NAPI, UniFFI, WASM) for outlet_error_new and outlet_catalog_rotation_validator",

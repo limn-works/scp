@@ -376,19 +376,16 @@ impl ContextExport {
 /// Returns [`ContextError::EventLogFailed`] if serialization fails.
 ///
 /// A `Full` export carries the context's access keys, and a snapshot handed
-/// in with `mls_crypto_state` set carries the MLS signer, so the encoding is
-/// written once into an exactly-sized buffer
-/// ([`scp_mls::secret_msgpack::encode_named`]) and no outgrown buffer is
-/// freed unwiped. The bytes equal `rmp_serde::to_vec_named`'s. The returned
-/// `Vec` is that buffer, moved out without a copy, for the bridge to hand to
-/// the host.
+/// in with `mls_crypto_state` set carries the MLS signer; buffers the encoder
+/// outgrows are wiped as they are freed (security model spec §9.15, freed heap
+/// memory), and by nothing in an application that links this crate without
+/// `scp-alloc`. The returned `Vec` goes to the bridge to hand to the host.
 pub fn serialize_export(export: &ContextExport) -> Result<Vec<u8>, ContextError> {
     let envelope = StoredValue {
         version: 1u16,
         data: export,
     };
-    scp_mls::secret_msgpack::encode_named(&envelope)
-        .map(|mut bytes| std::mem::take(&mut *bytes))
+    rmp_serde::to_vec_named(&envelope)
         .map_err(|e| ContextError::EventLogFailed(format!("export serialization failed: {e}")))
 }
 

@@ -46,7 +46,7 @@ use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use scp_mls::error::MlsError;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use scp_mls::validate_key_package_lifetime;
+use scp_mls::{validate_key_package_lifetime, validate_key_package_lifetime_for_add};
 
 /// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
 /// single-use backstop). Value at `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`
@@ -105,10 +105,12 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 /// spawn-from-Welcome entrypoint) and deliberately NOT implemented now.
 pub struct ProductionMlsBackend {
     /// Injected hardened [`Clock`] used to stamp `KeyPackage` / group-leaf
-    /// `Lifetime`s on generation and to re-validate accepted `Lifetime`s on the
-    /// receive/add paths and the joiner's own `KeyPackage` on a Welcome join
-    /// (ADR-057 §Prereq-1); another member's Welcome tree leaf is checked for
-    /// range only and reads no clock. In production this is the SAME
+    /// `Lifetime`s on generation, to check a `KeyPackage` an adder adds
+    /// (current, with the add-side minimum remaining lifetime and minimum
+    /// `not_before` age), and to check
+    /// the joiner's own `KeyPackage` on a Welcome join (ADR-057 §Prereq-1). A
+    /// received Add and another member's Welcome tree leaf are checked for
+    /// range only and read no clock. In production this is the SAME
     /// `Arc` the owning `NodeMlsFactory` and the actor-deps clock share, so
     /// there is one hardened clock per node — never openmls's internal one.
     clock: Arc<dyn Clock>,
@@ -335,7 +337,8 @@ fn serialize_signer_state(
     key_package_public_bytes: &[u8],
 ) -> Result<SignerState, MlsError> {
     let wrapper = serialized_signer(signer, provider, key_package_public_bytes)?;
-    let bytes = scp_mls::secret_msgpack::encode_named(&wrapper)
+    let bytes = rmp_serde::to_vec_named(&wrapper)
+        .map(zeroize::Zeroizing::new)
         .map_err(|e| MlsError::StorageError(format!("signer-state serialization: {e}")))?;
 
     Ok(SignerState { bytes })
@@ -492,7 +495,7 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         ciphertext: &[u8],
     ) -> Result<DecryptedContent, MlsError> {
-        decrypt_with_sender_did(group, ciphertext, self.clock.as_ref())
+        decrypt_with_sender_did(group, ciphertext)
     }
 
     async fn process_commit(
@@ -503,7 +506,7 @@ impl MlsBackend for ProductionMlsBackend {
         // `decrypt_commit` refuses a non-Commit before decrypting it, so a
         // refused application message or Proposal consumes no ratchet
         // generation, then merges a Commit through `decrypt_with_sender_did`.
-        scp_mls::encrypt::decrypt_commit(group, commit_bytes, self.clock.as_ref())
+        scp_mls::encrypt::decrypt_commit(group, commit_bytes)
     }
 
     async fn advance_epoch(
@@ -543,8 +546,10 @@ impl MlsBackend for ProductionMlsBackend {
         // hardened clock (threaded in as `clock`, not read from backend state —
         // SCP-CRYPTOMOVE-000c) and enforce the RFC 9420 max-range bound
         // openmls's `validate` never applies. Additive hardening; never
-        // replaces openmls.
-        validate_key_package_lifetime(validated.life_time(), clock)?;
+        // replaces openmls. Every caller is an add path, so the add-side
+        // minimum remaining lifetime and minimum `not_before` age apply too
+        // (security-model spec §9.7.1, the adder).
+        validate_key_package_lifetime_for_add(validated.life_time(), clock)?;
 
         // Guard the SCP ciphersuite invariant: any KP using a non-SCP
         // ciphersuite MUST be rejected even if OpenMLS validates it against
@@ -1108,6 +1113,75 @@ mod tests {
             store.retrieve(&consumed_key).await.unwrap().is_some(),
             "an accepted join records the init key as consumed"
         );
+    }
+
+    /// Security-model spec §9.7.1, the receiver, on
+    /// `MlsBackend::process_commit`: a receiving backend whose injected clock
+    /// stands past an added `KeyPackage`'s `not_after` still merges the add
+    /// Commit, because a receiver checks the received `Lifetime`'s range only
+    /// and reads no clock. The wall clock stays inside Carol's `Lifetime`, so
+    /// openmls's own wall-clock check passes and only an injected-clock check
+    /// on receive could refuse. No production receive path calls
+    /// `process_commit`; the native receive path, `decrypt_and_dispatch`, has
+    /// its own tests among the supervisor tests.
+    #[tokio::test]
+    async fn process_commit_merges_add_expired_under_receiver_injected_clock() {
+        use scp_clock::TestClock;
+        use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
+
+        let real_now = SystemClock.now_secs();
+        let adder = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let mut alice = adder
+            .create_group(&test_credential("alice-recv-expired"), None)
+            .await
+            .unwrap();
+
+        // Bob joins with his backend clock at the real present.
+        let bob_clock = Arc::new(TestClock::new(real_now));
+        let bob_backend = ProductionMlsBackend::new(Arc::clone(&bob_clock) as Arc<dyn Clock>);
+        bob_backend.set_consumed_init_key_store(Arc::new(SpawnBlockingStorageAdapter::new(
+            Arc::new(InMemoryStorage::new()),
+        )));
+        let bob_gen = bob_backend
+            .generate_key_package(&test_credential("bob-recv-expired"), None)
+            .await
+            .unwrap();
+        let bob_add = adder
+            .add_member_raw(&mut alice, &bob_gen.key_package_bytes)
+            .await
+            .unwrap();
+        let mut bob = bob_backend
+            .join_from_welcome(
+                &bob_add.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .unwrap();
+        let bob_epoch_before = bob.epoch().unwrap();
+
+        // Carol's KeyPackage is minted at `real_now`, so its `not_after` is
+        // `real_now + KEY_PACKAGE_LIFETIME_SECS`, and Alice adds her.
+        let carol_gen = ProductionMlsBackend::new(Arc::new(TestClock::new(real_now)))
+            .generate_key_package(&test_credential("carol-recv-expired"), None)
+            .await
+            .unwrap();
+        let carol_add = adder
+            .add_member_raw(&mut alice, &carol_gen.key_package_bytes)
+            .await
+            .unwrap();
+
+        // Bob's injected clock passes Carol's `not_after`; the wall clock
+        // does not.
+        let carol_not_after = real_now + KEY_PACKAGE_LIFETIME_SECS;
+        bob_clock.set(carol_not_after + 1);
+        assert!(SystemClock.now_secs() < carol_not_after);
+        bob_backend
+            .process_commit(&mut bob, &carol_add.commit)
+            .await
+            .expect("a receiver merges an Add expired under its own clock");
+        assert_eq!(bob.epoch().unwrap(), bob_epoch_before + 1);
+        assert_eq!(bob.members().unwrap().len(), 3, "Alice, Bob and Carol");
     }
 
     /// The consumed-set key of the signer state's own `KeyPackage`, read from
@@ -1738,6 +1812,41 @@ mod tests {
             matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
             "expired lifetime under the injected clock must return \
              KeyPackageLifetimeInvalid, got: {err:?}"
+        );
+    }
+
+    /// Security-model spec §9.7.1, the adder: `validate_key_package` (every
+    /// caller is an add path) accepts a `KeyPackage` with exactly the minimum
+    /// remaining lifetime under the injected clock and refuses one a second
+    /// short of it.
+    #[tokio::test]
+    async fn validate_key_package_enforces_min_remaining_lifetime_boundary() {
+        use scp_clock::TestClock;
+        use scp_mls::{KEY_PACKAGE_LIFETIME_SECS, KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS};
+
+        // Mint at a pinned present so `not_after` is known exactly.
+        let minted_at = SystemClock.now_secs();
+        let backend = ProductionMlsBackend::new(Arc::new(TestClock::new(minted_at)));
+        let generated = backend
+            .generate_key_package(&test_credential("dave-boundary"), None)
+            .await
+            .unwrap();
+        let not_after = minted_at + KEY_PACKAGE_LIFETIME_SECS;
+
+        let at_min = TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS);
+        backend
+            .validate_key_package(&generated.key_package_bytes, &at_min)
+            .await
+            .unwrap();
+
+        let past_min = TestClock::new(not_after - KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS + 1);
+        let err = backend
+            .validate_key_package(&generated.key_package_bytes, &past_min)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { not_after: na, .. } if na == not_after),
+            "one second short of the minimum must be KeyPackageLifetimeInvalid, got: {err:?}"
         );
     }
 

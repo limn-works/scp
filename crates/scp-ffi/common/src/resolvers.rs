@@ -771,6 +771,56 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
     }
 }
 
+/// Nonce adapter for an MCP outlet grant.
+///
+/// A [`scp_mcp::server::CapabilityCheck::Invoke`] check records the nonce, as
+/// [`BridgeNonceTracker`] does. A [`scp_mcp::server::CapabilityCheck::Probe`]
+/// check runs the same format, freshness and replay checks and leaves the
+/// tracker unchanged.
+///
+/// An MCP server holds one agent token for its lifetime, and ADR-016 Step 9
+/// makes that token single-use: the Invoke check a bridge's `invoke_outlet`
+/// makes just before it dispatches the first outlet records the nonce, and
+/// every check after that fails it as a replay. The validator records at
+/// Step 9 and can still refuse at a later step, so a refused Invoke check
+/// may also have spent the token. A
+/// `tools/list` or a view refresh that recorded the nonce would spend the
+/// token before any `tools/call`, so a probe never records it. Both bridges
+/// build this adapter through [`Self::new`], so the mapping from check to
+/// recording lives here, where its test covers every bridge.
+pub struct OutletGrantNonceTracker<'a, C: Clock> {
+    inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+    record: bool,
+}
+
+impl<'a, C: Clock> OutletGrantNonceTracker<'a, C> {
+    /// An adapter over `inner` that records the nonce only for an
+    /// [`scp_mcp::server::CapabilityCheck::Invoke`] check.
+    pub fn new(
+        inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+        check: scp_mcp::server::CapabilityCheck,
+    ) -> Self {
+        Self {
+            inner,
+            record: check == scp_mcp::server::CapabilityCheck::Invoke,
+        }
+    }
+}
+
+impl<C: Clock> NonceTrackerTrait for OutletGrantNonceTracker<'_, C> {
+    fn check_replay(&self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
+        self.inner.check_replay(nonce, token_expiry)
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
+        if self.record {
+            self.inner.record(nonce, token_expiry)
+        } else {
+            self.inner.check_replay(nonce, token_expiry)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BridgeRevocationAuthorizer (issue #499)
 // ---------------------------------------------------------------------------
@@ -933,6 +983,29 @@ mod tests {
     use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
     use scp_identity::{DidMethod, DualLayerResolver, NoOpRelayQuerier};
     use std::sync::Arc;
+
+    /// A probe runs the replay check and records nothing, so the same token
+    /// passes any number of probes and then one invoke check; after that
+    /// check, a probe and an invoke check both fail it as a replay.
+    #[test]
+    fn outlet_grant_nonce_probe_records_nothing() {
+        use scp_mcp::server::CapabilityCheck;
+        let clock = scp_clock::SystemClock;
+        let nonce = scp_core::crypto::ucan::nonce::generate_nonce(&clock);
+        let expiry = clock.now_secs() + 3600;
+        let mut tracker =
+            scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-probe".to_owned(), clock);
+        let check = |tracker: &mut scp_core::crypto::ucan::nonce::NonceTracker<_>,
+                     kind: CapabilityCheck| {
+            OutletGrantNonceTracker::new(tracker, kind).check_and_record(&nonce, expiry)
+        };
+        for _ in 0..3 {
+            check(&mut tracker, CapabilityCheck::Probe).expect("a probe must not record the nonce");
+        }
+        check(&mut tracker, CapabilityCheck::Invoke).expect("the first invoke check passes");
+        assert!(check(&mut tracker, CapabilityCheck::Probe).is_err());
+        assert!(check(&mut tracker, CapabilityCheck::Invoke).is_err());
+    }
 
     /// Helper: create a `DualLayerResolver` with in-memory backends for testing.
     fn make_test_resolver() -> Arc<DualLayerResolver<NoOpRelayQuerier, InMemoryDhtClient>> {

@@ -4770,6 +4770,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scp-alloc"
+version = "0.1.0-beta.2"
+
+[[package]]
 name = "scp-client"
 version = "0.1.0-beta.2"
 dependencies = [
@@ -4802,6 +4806,7 @@ dependencies = [
  "js-sys",
  "openmls",
  "rmp-serde",
+ "scp-alloc",
  "scp-client",
  "scp-clock",
  "scp-crypto",
@@ -4912,6 +4917,7 @@ dependencies = [
  "pyo3",
  "rand 0.8.8",
  "rmp-serde",
+ "scp-alloc",
  "scp-clock",
  "scp-core",
  "scp-dht",
@@ -4984,6 +4990,7 @@ dependencies = [
  "napi-derive",
  "rand 0.8.8",
  "rmp-serde",
+ "scp-alloc",
  "scp-clock",
  "scp-core",
  "scp-dht",
@@ -5027,8 +5034,11 @@ dependencies = [
  "dashmap",
  "ed25519-dalek 2.2.0",
  "hex",
+ "libc",
  "rand 0.8.8",
  "rmp-serde",
+ "rustix",
+ "scp-alloc",
  "scp-clock",
  "scp-core",
  "scp-dht",
@@ -5087,6 +5097,9 @@ name = "scp-mcp"
 version = "0.1.0-beta.2"
 dependencies = [
  "axum",
+ "hex",
+ "rand 0.8.8",
+ "rustix",
  "scp-clock",
  "scp-core",
  "serde",
@@ -5173,6 +5186,7 @@ dependencies = [
  "rmp-serde",
  "rustls",
  "rustls-pemfile",
+ "scp-alloc",
  "scp-clock",
  "scp-core",
  "scp-crypto",
@@ -5216,6 +5230,7 @@ dependencies = [
  "rmp-serde",
  "rusqlite",
  "scp-crypto",
+ "scp-sqlite-pools",
  "scp-testing",
  "serde",
  "sha2 0.10.9",
@@ -5276,6 +5291,7 @@ dependencies = [
  "axum",
  "metrics",
  "metrics-exporter-prometheus",
+ "scp-alloc",
  "scp-transport",
  "tempfile",
  "tokio",
@@ -5359,6 +5375,14 @@ dependencies = [
  "x25519-dalek 2.0.1",
  "z-base-32",
  "zeroize",
+]
+
+[[package]]
+name = "scp-sqlite-pools"
+version = "0.1.0-beta.2"
+dependencies = [
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]
@@ -5454,6 +5478,7 @@ dependencies = [
  "scp-platform",
  "scp-protocol",
  "scp-relay-client",
+ "scp-sqlite-pools",
  "scp-testing",
  "serde",
  "serde_bytes",

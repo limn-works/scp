@@ -3689,7 +3689,8 @@ pub(crate) async fn context_reconnect_on(
     let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     // Hold the 32-byte seed in `Zeroizing` so it is wiped after the driver
-    // call rather than lingering in freed memory.
+    // call, on the stack as well as the heap; the wiping global allocator
+    // reaches freed heap blocks only (security model spec §9.15).
     let signing_key_bytes = zeroize::Zeroizing::new(sk.to_bytes());
 
     let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
@@ -6716,6 +6717,575 @@ mod tests {
         super::NapiContextHandle::test_active_on(bi, context_id.to_owned(), creator_did.to_owned())
     }
 
+    /// Builds a handle for `context_id` whose `ceiling` is the wide default,
+    /// while the supervisor actor for that context holds a narrower ceiling.
+    ///
+    /// NAPI's UCAN mint and delegate sites used to read
+    /// `NapiContextHandle::ceiling`. Every capability `default_ceiling()`
+    /// carries is in this handle, so a site that reads the handle admits what
+    /// the actor withholds.
+    #[cfg(feature = "testing")]
+    fn wide_ceiling_handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+        creator_did: &str,
+    ) -> super::NapiContextHandle {
+        let mut handle = active_handle_for(bi, context_id, creator_did);
+        handle.ceiling = scp_core::context::roles::default_ceiling()
+            .to_ucan_string_set()
+            .into_iter()
+            .collect();
+        handle
+    }
+
+    /// The DID `register_test_context` records as the bridge copy's creator in
+    /// the tests below. No identity and no supervisor context carries it, so a
+    /// call that authorizes against the bridge copy instead of the supervisor
+    /// anchors on the wrong creator.
+    #[cfg(feature = "testing")]
+    const BRIDGE_COPY_CREATOR: &str = "did:dht:z6MkNapiBridgeCopyCreatorOnly";
+
+    /// Calls all five UCAN entry points against `handle` and asserts each one
+    /// refuses with the withheld pre-authorization refusal: `SCP-CTX-2023`, the
+    /// shared withheld text, and neither the context id, the lifecycle state,
+    /// nor an actor fault code.
+    #[cfg(feature = "testing")]
+    async fn assert_every_ucan_entry_point_withholds(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        handle: &super::NapiContextHandle,
+        token: &str,
+        capability: &str,
+        holder_did: &str,
+        revoker_did: &str,
+        label: &str,
+    ) {
+        let ctx_id = handle.context_id();
+        let results: [(&str, Result<(), napi::Error>); 5] = [
+            (
+                "validate",
+                crate::ucan::ucan_validate_on(
+                    bi,
+                    handle,
+                    token.to_owned(),
+                    capability.to_owned(),
+                    holder_did.to_owned(),
+                    None,
+                )
+                .await,
+            ),
+            (
+                "evaluate",
+                crate::ucan::ucan_evaluate_on(
+                    bi,
+                    handle,
+                    token.to_owned(),
+                    Some(capability.to_owned()),
+                    holder_did.to_owned(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "mint",
+                crate::ucan::ucan_mint_on(
+                    bi,
+                    handle,
+                    holder_did.to_owned(),
+                    vec!["messages:read".to_owned()],
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "delegate",
+                crate::ucan::ucan_delegate_on(
+                    bi,
+                    handle,
+                    holder_did.to_owned(),
+                    "did:dht:z6MkNapiWithheldDelegatee".to_owned(),
+                    token.to_owned(),
+                    vec![capability.to_owned()],
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "revoke",
+                crate::ucan::ucan_revoke_on(bi, handle, token.to_owned(), revoker_did.to_owned())
+                    .await,
+            ),
+        ];
+        for (call, result) in results {
+            let Err(err) = result else {
+                panic!("{call} must refuse ({label})");
+            };
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && text.contains(codes::CTX_2023),
+                "{call} must refuse with the withheld text and SCP-CTX-2023 ({label}): {text}"
+            );
+            for leaked in [
+                ctx_id.as_str(),
+                codes::CTX_2130,
+                codes::CTX_2134,
+                codes::CTX_2135,
+                "closing",
+                "poisoned",
+            ] {
+                assert!(
+                    !text.contains(leaked),
+                    "{call} must not disclose {leaked:?} before authorization ({label}): {text}"
+                );
+            }
+        }
+    }
+
+    /// Creates an in-memory `Scp`, an owner and a holder identity on it, and an
+    /// Active supervisor context the owner created with `ceiling`, then mints a
+    /// `messages:write` token from the owner to the holder in that context.
+    ///
+    /// Returns the bridge instance, the handle, the token, its capability URI,
+    /// the owner DID, and the holder DID. The bridge copy is registered under
+    /// [`BRIDGE_COPY_CREATOR`] with `default_ceiling()`, so it disagrees with
+    /// the supervisor on the creator and, for a narrow `ceiling`, on the
+    /// ceiling.
+    #[cfg(feature = "testing")]
+    async fn active_context_with_token(
+        scp: &crate::scp::Scp,
+        ceiling: &[&str],
+    ) -> (
+        Arc<crate::runtime::NapiBridgeInstance>,
+        super::NapiContextHandle,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let bi = Arc::clone(&scp.inner);
+        let owner_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let holder_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let ctx_id = format!("napi-ucan-live-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi, &ctx_id, &owner_did, ceiling,
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id, BRIDGE_COPY_CREATOR);
+        let handle = active_handle_for(&bi, &ctx_id, &owner_did);
+        let token = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            holder_did.clone(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint inside the supervisor ceiling must succeed")
+        .encoded();
+        let capability = format!("scp:ctx:{ctx_id}/messages:write");
+        (bi, handle, token, capability, owner_did, holder_did)
+    }
+
+    /// Every UCAN entry point refuses a context whose actor is resident but
+    /// reports `Closing`, and withholds that state from the refusal.
+    ///
+    /// The actor still answers the role-state read, so an entry point that
+    /// dropped its pre-authorization gate would pass here: validate and
+    /// evaluate would accept the token, and mint, delegate and revoke would
+    /// issue or record against a context the supervisor stopped serving.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_ucan_entry_point_refuses_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, handle, token, capability, owner_did, holder_did) =
+            active_context_with_token(&scp, &["messages:read", "messages:write", "context:close"])
+                .await;
+        let ctx_id = handle.context_id();
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: ctx_id.clone(),
+                params: ContextParams::default(),
+                initiator_did: DID(owner_did.clone()),
+            }),
+            reply: tx,
+        })
+        .await
+        .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &ctx_id)
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert!(
+            crate::runtime::live_role_state(&bi, &ctx_id).await.is_ok(),
+            "the closing actor still answers the role-state read, so only the gate can refuse"
+        );
+
+        assert_every_ucan_entry_point_withholds(
+            &bi,
+            &handle,
+            &token,
+            &capability,
+            &holder_did,
+            &owner_did,
+            "closing",
+        )
+        .await;
+    }
+
+    /// Every UCAN entry point refuses a context no actor serves, a poisoned
+    /// context, a context mid-respawn or past a failed respawn, and an actor
+    /// that does not answer, with the one withheld refusal.
+    ///
+    /// The supervisor reports the faults as `Some(Poisoned)`, `ActorCrashed`
+    /// (`SCP-CTX-2135`) and `ActorBusy` (`SCP-CTX-2130`). Passing either code
+    /// through told a caller this call had not yet authorized that the context
+    /// exists and is faulted, which the outlet PRD's SCP-OUT-031 PR-2a note
+    /// forbids, and the absent-role-state refusal names the context.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_ucan_entry_point_withholds_an_absent_or_faulted_actor() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        // A real token from a healthy context, so each refusal below comes
+        // from the gate and not from a malformed input.
+        let (bi, _donor, token, capability, owner_did, holder_did) =
+            active_context_with_token(&scp, &["messages:read", "messages:write"]).await;
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+
+        for fault in [
+            "absent",
+            "poisoned",
+            "mid_respawn",
+            "respawn_failed",
+            "unreachable",
+        ] {
+            let ctx_id = format!("napi-ucan-{fault}-{}", uuid::Uuid::new_v4());
+            if fault != "absent" {
+                crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, &owner_did)
+                    .await
+                    .expect("test supervisor context creation must succeed");
+            }
+            crate::runtime::register_test_context(&bi, &ctx_id, &owner_did);
+            match fault {
+                "poisoned" => sup.test_poison_context(&ctx_id).await,
+                "mid_respawn" => sup.test_hold_context_mid_respawn(&ctx_id).await,
+                "respawn_failed" => sup.test_fail_context_respawn(&ctx_id).await,
+                "unreachable" => sup.test_make_actor_unreachable(&ctx_id),
+                _ => {}
+            }
+            assert_ne!(
+                crate::runtime::read_live_context_state(&bi, &ctx_id)
+                    .await
+                    .ok(),
+                Some(Some(scp_core::context::ContextState::Active)),
+                "the fixture must take the context out of Active ({fault})"
+            );
+            let handle = active_handle_for(&bi, &ctx_id, &owner_did);
+            assert_every_ucan_entry_point_withholds(
+                &bi,
+                &handle,
+                &token,
+                &capability,
+                &holder_did,
+                &owner_did,
+                fault,
+            )
+            .await;
+        }
+    }
+
+    /// `ucan_mint_on` grants no more than the ceiling the supervisor actor
+    /// holds, even when the handle's ceiling and the bridge copy are wider.
+    ///
+    /// The handle carries `default_ceiling()`, and an empty handle ceiling used
+    /// to widen to `default_ceiling()` too, so a mint that read the handle
+    /// would grant `messages:write` here.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_enforces_the_supervisor_ceiling_not_the_handle_ceiling() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let owner_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let ctx_id = format!("napi-mint-live-ceiling-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &ctx_id,
+            &owner_did,
+            &["messages:read"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id, &owner_did);
+        let handle = wide_ceiling_handle_for(&bi, &ctx_id, &owner_did);
+        assert!(
+            handle.ceiling.iter().any(|c| c == "messages:write"),
+            "the fixture's handle must carry the capability the actor withholds"
+        );
+
+        let Err(err) = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkNapiLiveCeilingMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        else {
+            panic!("a mint outside the supervisor's ceiling must fail");
+        };
+        assert!(
+            err.to_string().contains("ceiling"),
+            "expected a ceiling refusal, got: {err}"
+        );
+
+        // The capability the actor holds still mints, so the refusal above is
+        // the ceiling check and not a broken fixture.
+        crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkNapiLiveCeilingMember".to_owned(),
+            vec!["messages:read".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint inside the supervisor's ceiling must succeed");
+    }
+
+    /// `ucan_validate_on`, `ucan_evaluate_on`, and `ucan_delegate_on` compare a
+    /// token's grants against the ceiling the supervisor holds for the handle's
+    /// context, and anchor the chain on the creator the supervisor holds.
+    ///
+    /// One owner creates two contexts: `wide` holds `messages:write` and
+    /// `narrow` omits it. A `messages:write` token minted in `wide` passes each
+    /// call there and fails the ceiling check in `narrow`. Both bridge copies
+    /// carry `default_ceiling()`, which holds `messages:write`, and name
+    /// [`BRIDGE_COPY_CREATOR`]. An edit that hands the core the bridge ceiling,
+    /// the handle's empty ceiling widened to the default, or the other
+    /// context's ceiling fails the `narrow` half; an edit that hands it the
+    /// bridge creator fails the `wide` half at the root-issuer check.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, wide, token, cap, owner_did, holder_did) =
+            active_context_with_token(&scp, &["messages:read", "messages:write"]).await;
+        let delegatee = "did:dht:z6MkNapiLiveCeilingDelegatee".to_owned();
+        let narrow_id = format!("napi-narrow-live-ceiling-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &narrow_id,
+            &owner_did,
+            &["messages:read"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &narrow_id, BRIDGE_COPY_CREATOR);
+        let narrow = active_handle_for(&bi, &narrow_id, &owner_did);
+
+        for (handle, inside) in [(&wide, true), (&narrow, false)] {
+            let evaluation = crate::ucan::ucan_evaluate_on(
+                &bi,
+                handle,
+                token.clone(),
+                Some(cap.clone()),
+                holder_did.clone(),
+                None,
+            )
+            .await
+            .expect("evaluate");
+            assert_eq!(
+                evaluation.within_ceiling, inside,
+                "evaluate must report the supervisor ceiling of the handle's context"
+            );
+            assert!(
+                evaluation.signatures_valid,
+                "evaluate must anchor the chain on the supervisor's creator (inside={inside})"
+            );
+
+            let delegation = crate::ucan::ucan_delegate_on(
+                &bi,
+                handle,
+                holder_did.clone(),
+                delegatee.clone(),
+                token.clone(),
+                vec![cap.clone()],
+            )
+            .await;
+            let validation = crate::ucan::ucan_validate_on(
+                &bi,
+                handle,
+                token.clone(),
+                cap.clone(),
+                holder_did.clone(),
+                None,
+            )
+            .await;
+            if inside {
+                delegation.expect("a delegation inside the wide ceiling must succeed");
+                validation.expect("a validation inside the wide ceiling must succeed");
+            } else {
+                for (call, err) in [
+                    ("delegation", delegation.err()),
+                    ("validation", validation.err()),
+                ] {
+                    let err = err.unwrap_or_else(|| {
+                        panic!("the narrow supervisor ceiling must refuse the {call}")
+                    });
+                    assert!(
+                        err.to_string().to_lowercase().contains("ceiling"),
+                        "the {call} refusal must be the ceiling check: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `ucan_mint_on` signs with the custody this bridge holds for the
+    /// supervisor's creator, not with the custody the handle carries.
+    ///
+    /// The handle carries an unrelated identity's custody and signing key. A
+    /// mint that signed with them would issue a token whose `iss` names the
+    /// creator and whose signature belongs to someone else, and the
+    /// validation below would reject it at the signature check.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_mint_signs_with_the_live_creators_custody_not_the_handle_custody() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let owner_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let holder_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let stranger = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let ctx_id = format!("napi-mint-live-custody-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &ctx_id,
+            &owner_did,
+            &["messages:read", "messages:write"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id, &owner_did);
+        let mut handle = active_handle_for(&bi, &ctx_id, &owner_did);
+        handle
+            .in_memory_custody
+            .clone_from(&stranger.inner.in_memory_custody);
+        handle.signing_key = stranger
+            .inner
+            .scp_identity
+            .as_ref()
+            .map(|identity| identity.active_signing_key);
+        assert!(
+            handle.in_memory_custody.is_some() && handle.signing_key.is_some(),
+            "the fixture's handle must carry the stranger's custody"
+        );
+
+        let token = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            holder_did.clone(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("the creator's custody is on this bridge, so the mint must succeed");
+        assert_eq!(
+            token.data.issuer, owner_did,
+            "the issuer is the supervisor's creator"
+        );
+        crate::ucan::ucan_validate_on(
+            &bi,
+            &handle,
+            token.encoded(),
+            format!("scp:ctx:{ctx_id}/messages:write"),
+            holder_did,
+            None,
+        )
+        .await
+        .expect("the token must carry the creator's own signature");
+    }
+
+    /// `ucan_revoke_on` admits the creator the supervisor holds, and refuses
+    /// the creator the bridge copy recorded.
+    ///
+    /// The token's issuer is a third identity, so only the creator clause of
+    /// the revocation authorizer can admit either revoker.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_revoke_authorizes_the_supervisor_creator_not_the_bridge_copy() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        // The donor context's owner issues the token; the revocation runs in a
+        // second context with a different supervisor creator.
+        let (bi, _donor, token, _cap, issuer_did, _holder) =
+            active_context_with_token(&scp, &["messages:read", "messages:write"]).await;
+        let creator_did = "did:dht:z6MkNapiRevokeLiveCreator";
+        let ctx_id = format!("napi-revoke-live-creator-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator_did)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id, BRIDGE_COPY_CREATOR);
+        let handle = active_handle_for(&bi, &ctx_id, creator_did);
+        assert_ne!(issuer_did, creator_did);
+
+        let err = crate::ucan::ucan_revoke_on(
+            &bi,
+            &handle,
+            token.clone(),
+            BRIDGE_COPY_CREATOR.to_owned(),
+        )
+        .await
+        .expect_err("the bridge copy's creator is neither the issuer nor the live creator");
+        assert!(
+            err.to_string().contains("neither the token issuer"),
+            "the refusal must come from BridgeRevocationAuthorizer, got: {err}"
+        );
+
+        crate::ucan::ucan_revoke_on(&bi, &handle, token, creator_did.to_owned())
+            .await
+            .expect("the supervisor's creator may revoke a token in its context");
+    }
+
     /// A context no supervisor actor serves fails every lifecycle gate closed.
     ///
     /// `register_test_context` registers the bridge's per-context UCAN state
@@ -8275,6 +8845,682 @@ mod tests {
         assert!(
             reason.contains("SCP-IDENT-1017"),
             "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
+
+    /// Outlet registration, exposure, and acceptance each refuse a context no
+    /// supervisor actor serves.
+    ///
+    /// Each entry point runs the lifecycle gate before the role-state read, so
+    /// after the despawn the three refusals come from that gate.
+    /// `outlet_register_follows_the_supervisor_ceiling_not_the_bridge_copy`
+    /// covers the value the read returns for registration.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_authorization_fails_closed_without_a_supervisor_actor() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-outlet-no-actor-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiOutletNoActor";
+        // Spawn an actor so the lifecycle gate passes and the role-state read
+        // answers, then drop the actor: the lifecycle gate then refuses all
+        // three entry points before their role-state read runs.
+        crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let role_state = crate::runtime::live_role_state(&bi, &ctx_id)
+            .await
+            .expect("a spawned actor answers the role-state read");
+        assert_eq!(role_state.creator_did, creator);
+
+        let expose = crate::outlets::outlet_interface_expose_on(
+            &bi,
+            &handle,
+            "outlet-that-does-not-exist".to_owned(),
+            format!("napi-outlet-target-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await
+        .expect_err("exposing an unregistered outlet must fail");
+        assert!(
+            expose.to_string().contains("expose_outlet failed"),
+            "expose reported: {expose}"
+        );
+
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor")
+            .despawn_actor(&ctx_id)
+            .await;
+
+        let register = crate::outlets::outlet_register_on(
+            &bi,
+            &handle,
+            outlet_fixture_definition("napi-no-actor-register-probe", creator),
+        )
+        .await
+        .expect_err("registration must refuse a context no actor serves");
+        assert!(
+            register
+                .to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "register reported: {register}"
+        );
+
+        // A malformed definition is refused by its input check before the
+        // lifecycle gate runs.
+        let mut malformed_definition =
+            outlet_fixture_definition("napi-no-actor-malformed-probe", creator);
+        malformed_definition.input_schema_json = "not valid json{{{".to_owned();
+        let malformed = crate::outlets::outlet_register_on(&bi, &handle, malformed_definition)
+            .await
+            .expect_err("a malformed definition must be refused");
+        assert!(
+            malformed.to_string().contains("input_schema_json")
+                && !malformed
+                    .to_string()
+                    .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the input check must answer before the lifecycle gate, got: {malformed}"
+        );
+
+        let expose = crate::outlets::outlet_interface_expose_on(
+            &bi,
+            &handle,
+            "outlet-that-does-not-exist".to_owned(),
+            format!("napi-outlet-target-{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await
+        .expect_err("exposure must refuse a context no actor serves");
+        assert!(
+            expose
+                .to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "expose reported: {expose}"
+        );
+
+        let accept = crate::outlets::outlet_interface_accept_on(&bi, &handle, "{}".to_owned())
+            .await
+            .expect_err("acceptance must refuse a context no actor serves");
+        assert!(
+            accept
+                .to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "accept reported: {accept}"
+        );
+    }
+
+    /// An outlet definition with a valid schema pair, for the outlet tests
+    /// below.
+    #[cfg(feature = "testing")]
+    fn outlet_fixture_definition(
+        name: &str,
+        operator_did: &str,
+    ) -> crate::outlets::NapiOutletDefinition {
+        crate::outlets::NapiOutletDefinition {
+            name: name.to_owned(),
+            description: "an outlet test fixture".to_owned(),
+            kind: crate::outlets::NapiOutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: operator_did.to_owned(),
+            cost: None,
+        }
+    }
+
+    /// `outlet_stream_open_on` gates on the live lifecycle before the UCAN
+    /// pipeline reads the role state, so a context no actor serves refuses with
+    /// the withheld text and `SCP-OUTLET-6005`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_open_withholds_an_absent_actor_before_authorization() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let ctx_id = format!("napi-stream-open-no-actor-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiStreamOpenNoActor";
+        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+
+        let err = crate::outlet_stream::outlet_stream_open_on(
+            &bi,
+            &handle,
+            "probe-outlet".to_owned(),
+            "{}".to_owned(),
+            creator.to_owned(),
+            "bogus.jwt.token".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("no supervisor actor must refuse the stream open");
+        let text = err.to_string();
+        assert!(
+            text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && text.contains(codes::OUTLET_6005),
+            "the refusal must come from the lifecycle gate: {text}"
+        );
+        assert!(
+            !text.contains(&ctx_id) && !text.contains("no live supervisor role state"),
+            "the refusal must not report the absent actor or echo the id: {text}"
+        );
+    }
+
+    /// `outlet_stream_open_on` builds bridge UCAN state only after the
+    /// lifecycle gate admits the context: a context no actor serves refuses
+    /// and leaves no registry entry, while a live context gets its entry built
+    /// before the UCAN pipeline rejects the token.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_open_builds_bridge_state_only_after_the_gate() {
+        let creator = "did:key:z6MkNapiStreamOpenStateOrder";
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        let open = |ctx_id: String| {
+            let bi = Arc::clone(&bi);
+            async move {
+                let handle = active_handle_for(&bi, &ctx_id, creator);
+                crate::outlet_stream::outlet_stream_open_on(
+                    &bi,
+                    &handle,
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    creator.to_owned(),
+                    "bogus.jwt.token".to_owned(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("a bogus token never opens a stream")
+            }
+        };
+
+        let absent = format!("napi-stream-open-absent-state-{}", uuid::Uuid::new_v4());
+        let err = open(absent.clone()).await;
+        assert!(
+            err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the lifecycle gate must refuse: {err}"
+        );
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&absent),
+            "a refused stream open must not build bridge state"
+        );
+
+        let live = format!("napi-stream-open-live-state-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &live,
+            creator,
+            &["messages:write"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        let err = open(live.clone()).await;
+        assert!(
+            !err.to_string()
+                .contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "a live context must pass the lifecycle gate: {err}"
+        );
+        assert!(
+            crate::runtime::ucan_registry(&bi).contains_key(&live),
+            "an admitted stream open must build bridge state"
+        );
+    }
+
+    /// `outlet_register_on` refuses the creator when the supervisor ceiling
+    /// omits `outlet:register`, although the bridge copy's ceiling
+    /// (`default_ceiling()`, written by `register_test_context`) and the
+    /// handle's ceiling both carry it, and admits the creator once the
+    /// supervisor ceiling carries it.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_register_follows_the_supervisor_ceiling_not_the_bridge_copy() {
+        let creator = "did:dht:z6MkNapiRegisterLiveCeiling";
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+
+        let narrow = format!("napi-register-narrow-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &narrow,
+            creator,
+            &["messages:write"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &narrow, creator);
+        let err = crate::outlets::outlet_register_on(
+            &bi,
+            &wide_ceiling_handle_for(&bi, &narrow, creator),
+            outlet_fixture_definition("napi-narrow-ceiling-probe", creator),
+        )
+        .await
+        .expect_err("a supervisor ceiling without outlet:register must refuse registration");
+        assert!(
+            err.to_string().contains("OutletRegister")
+                && err.to_string().contains(codes::OUTLET_6001),
+            "the refusal must name the missing capability: {err}"
+        );
+
+        let wide = format!("napi-register-wide-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_with_ceiling_for_test(
+            &bi,
+            &wide,
+            creator,
+            &["messages:write", "outlet:register"],
+        )
+        .await
+        .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &wide, creator);
+        crate::outlets::outlet_register_on(
+            &bi,
+            &wide_ceiling_handle_for(&bi, &wide, creator),
+            outlet_fixture_definition("napi-wide-ceiling-probe", creator),
+        )
+        .await
+        .expect("a supervisor ceiling carrying outlet:register must admit registration");
+    }
+
+    /// Outlet invocation, cross-context invocation, session invocation,
+    /// exposure and acceptance pass with the ceiling, roles and creator the
+    /// supervisor holds, while both contexts' bridge copies are narrowed to
+    /// `messages:read` under another creator
+    /// (`crate::runtime::narrow_bridge_copy_for_test`).
+    ///
+    /// An edit that hands any of these calls the bridge copy's ceiling, role
+    /// state or creator fails it: the copy grants neither `outlet:call` nor
+    /// `role:assign`, and the tokens' root issuer is not the copy's creator.
+    #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outlet_authorization_follows_the_supervisor_not_the_bridge_copy() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, target, _token, _cap, owner_did, holder_did) = active_context_with_token(
+            &scp,
+            &[
+                "messages:read",
+                "messages:write",
+                "outlet:register",
+                "outlet:call:*",
+                "role:assign",
+            ],
+        )
+        .await;
+        let target_id = target.context_id();
+        let source_id = format!("napi-outlet-live-source-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &source_id, &owner_did)
+            .await
+            .expect("test supervisor context creation must succeed");
+        crate::runtime::register_test_context(&bi, &source_id, BRIDGE_COPY_CREATOR);
+        let source = active_handle_for(&bi, &source_id, &owner_did);
+
+        let outlet_id = crate::outlets::outlet_register_on(
+            &bi,
+            &target,
+            outlet_fixture_definition("napi-live-authz-probe", &owner_did),
+        )
+        .await
+        .expect("the supervisor ceiling carries outlet:register");
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        sup.test_insert_member(&target_id, DID(holder_did.clone()), "member")
+            .await
+            .expect("test_insert_member seeds the holder as a member");
+        sup.test_grant_member_capability(&target_id, DID(holder_did.clone()), "outlet_call:*")
+            .await
+            .expect("grant OutletCallAll to the member holder");
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            tokens.push(
+                crate::ucan::ucan_mint_on(
+                    &bi,
+                    &target,
+                    holder_did.clone(),
+                    vec!["outlet_call:*".to_owned()],
+                    None,
+                )
+                .await
+                .expect("the supervisor ceiling carries outlet_call:*")
+                .encoded(),
+            );
+        }
+        let session_id = crate::outlets::outlet_session_create_on(
+            &bi,
+            &target,
+            outlet_id.clone(),
+            source_id.clone(),
+            None,
+        )
+        .await
+        .expect("session creation must succeed");
+
+        crate::runtime::narrow_bridge_copy_for_test(&bi, &target_id)
+            .expect("the context has a bridge copy to narrow");
+        crate::runtime::narrow_bridge_copy_for_test(&bi, &source_id)
+            .expect("the context has a bridge copy to narrow");
+        let input = r#"{"a":"x","b":1}"#;
+
+        crate::outlets::outlet_invoke_on(
+            &bi,
+            &target,
+            outlet_id.clone(),
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[0].clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("invocation authorizes against the supervisor ceiling and creator");
+        crate::outlets::outlet_invoke_cross_context_on(
+            &bi,
+            &source,
+            &target,
+            outlet_id.clone(),
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[1].clone(),
+            1,
+            None,
+        )
+        .await
+        .expect("cross-context invocation authorizes against the target's supervisor state");
+        crate::outlets::outlet_session_invoke_on(
+            &bi,
+            &target,
+            session_id,
+            input.to_owned(),
+            holder_did.clone(),
+            tokens[2].clone(),
+            None,
+        )
+        .await
+        .expect("session invocation authorizes against the supervisor ceiling and creator");
+        let interface =
+            crate::outlets::outlet_interface_expose_on(&bi, &target, outlet_id, source_id, None)
+                .await
+                .expect("the supervisor's creator holds role:assign in the target");
+        crate::outlets::outlet_interface_accept_on(&bi, &source, interface)
+            .await
+            .expect("the supervisor's creator holds role:assign in the source");
+    }
+
+    /// Each outlet entry point this test calls refuses a context whose actor is
+    /// resident but reports `Closing`, with its own outlet code and the withheld text,
+    /// and names neither the lifecycle state nor the context id.
+    ///
+    /// The actor still answers the role-state read, so an entry point that
+    /// dropped its gate would reach its authorization or its registry instead.
+    /// Each cross-context entry point is called twice, once with the closing
+    /// context as the source and once as the target, so each axis's gate is
+    /// exercised alone.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn called_outlet_entry_points_refuse_a_resident_actor_in_closing() {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let (bi, closing, token, _capability, owner_did, _holder_did) = active_context_with_token(
+            &scp,
+            &[
+                "messages:read",
+                "messages:write",
+                "context:close",
+                "outlet:register",
+            ],
+        )
+        .await;
+        let closing_id = closing.context_id();
+        let active_id = format!("napi-outlet-active-peer-{}", uuid::Uuid::new_v4());
+        crate::runtime::create_supervisor_context_for_test(&bi, &active_id, &owner_did)
+            .await
+            .expect("test supervisor context creation must succeed");
+        let active = active_handle_for(&bi, &active_id, &owner_did);
+
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: closing_id.clone(),
+                params: ContextParams::default(),
+                initiator_did: DID(owner_did.clone()),
+            }),
+            reply: tx,
+        })
+        .await
+        .expect("close dispatch");
+        rx.await.expect("close reply").expect("close must succeed");
+        assert_eq!(
+            crate::runtime::read_live_context_state(&bi, &closing_id)
+                .await
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        assert!(
+            crate::runtime::live_role_state(&bi, &closing_id)
+                .await
+                .is_ok(),
+            "the closing actor still answers the role-state read, so only the gate can refuse"
+        );
+
+        let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id("napi-closing-probe");
+        let input = r#"{"a":"x","b":1}"#;
+        let results: Vec<(&str, &str, Result<(), napi::Error>)> = vec![
+            (
+                "register",
+                codes::OUTLET_6003,
+                crate::outlets::outlet_register_on(
+                    &bi,
+                    &closing,
+                    outlet_fixture_definition("napi-closing-register-probe", &owner_did),
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "invoke",
+                codes::OUTLET_6005,
+                crate::outlets::outlet_invoke_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    None,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "verify",
+                codes::OUTLET_6007,
+                crate::outlets::outlet_verify_on(&bi, &closing, outlet_id.clone())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "session_create",
+                codes::OUTLET_6014,
+                crate::outlets::outlet_session_create_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    active_id.clone(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "session_invoke",
+                codes::OUTLET_6017,
+                crate::outlets::outlet_session_invoke_on(
+                    &bi,
+                    &closing,
+                    "napi-closing-session".to_owned(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "expose",
+                codes::OUTLET_6030,
+                crate::outlets::outlet_interface_expose_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    active_id.clone(),
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "accept",
+                codes::OUTLET_6032,
+                crate::outlets::outlet_interface_accept_on(&bi, &closing, "{}".to_owned())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "stream_open",
+                codes::OUTLET_6005,
+                crate::outlet_stream::outlet_stream_open_on(
+                    &bi,
+                    &closing,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context source",
+                codes::OUTLET_6010,
+                crate::outlets::outlet_invoke_cross_context_on(
+                    &bi,
+                    &closing,
+                    &active,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context target",
+                codes::OUTLET_6011,
+                crate::outlets::outlet_invoke_cross_context_on(
+                    &bi,
+                    &active,
+                    &closing,
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    owner_did.clone(),
+                    token.clone(),
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context_saga caller",
+                codes::OUTLET_6010,
+                crate::outlets::outlet_invoke_cross_context_saga_on(
+                    &bi,
+                    &closing,
+                    &active,
+                    owner_did.clone(),
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                    1,
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+            (
+                "cross_context_saga target",
+                codes::OUTLET_6011,
+                crate::outlets::outlet_invoke_cross_context_saga_on(
+                    &bi,
+                    &active,
+                    &closing,
+                    owner_did.clone(),
+                    outlet_id.clone(),
+                    input.to_owned(),
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                    1,
+                    1,
+                    None,
+                )
+                .await
+                .map(drop),
+            ),
+        ];
+        for (call, code, result) in results {
+            let Err(err) = result else {
+                panic!("{call} must refuse a closing context");
+            };
+            let text = err.to_string();
+            assert!(
+                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD) && text.contains(code),
+                "{call} must refuse with the withheld text and {code}: {text}"
+            );
+            assert!(
+                !text.to_lowercase().contains("closing") && !text.contains(&closing_id),
+                "{call} must name neither the lifecycle state nor the context id: {text}"
+            );
+        }
+    }
+
+    /// `outlet_session_close_on` on a context with no `UcanContextState` on this
+    /// bridge instance reports `SCP-OUTLET-6021` and builds no registry entry.
+    ///
+    /// The call carries no lifecycle gate and authorizes nothing; building the
+    /// entry would resurrect per-context state `context_close_on` released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_close_without_bridge_state_builds_none() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-session-close-no-state-{}", uuid::Uuid::new_v4());
+        let creator = "did:key:z6MkNapiSessionCloseNoState";
+        let handle = active_handle_for(&bi, &ctx_id, creator);
+        assert!(!crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
+
+        let err =
+            crate::outlets::outlet_session_close_on(&bi, &handle, "napi-no-session".to_owned())
+                .await
+                .expect_err("a context with no bridge state holds no session");
+        assert!(
+            err.to_string().contains(codes::OUTLET_6021),
+            "session close reported: {err}"
+        );
+        assert!(
+            !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
+            "session close must not build bridge state"
         );
     }
 }

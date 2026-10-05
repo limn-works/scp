@@ -760,17 +760,29 @@ pub const TRANS_5016: &str = "SCP-TRANS-5016";
 pub const TRANS_5018: &str = "SCP-TRANS-5018";
 /// Transport proof error.
 pub const TRANS_5019: &str = "SCP-TRANS-5019";
-/// Transport webhook error.
+/// MCP client `tools/list`: no client is registered under the handle.
 pub const TRANS_5020: &str = "SCP-TRANS-5020";
-/// Transport webhook register error.
+/// MCP client `tools/list`: the handle was disconnected while the call
+/// waited for the client's lock, so the call sent no request.
 pub const TRANS_5021: &str = "SCP-TRANS-5021";
-/// Transport webhook unregister error.
+/// MCP client `tools/list`: the request failed on the transport, the server
+/// answered with an error, or the call itself failed.
+///
+/// On NAPI and `UniFFI` the task running the call failed; on `PyO3` an
+/// earlier call panicked while holding the client's lock, which fails every
+/// later call on the handle this way until the host disconnects it.
 pub const TRANS_5022: &str = "SCP-TRANS-5022";
-/// Transport webhook list error.
+/// MCP client `tools/call`: no client is registered under the handle.
 pub const TRANS_5023: &str = "SCP-TRANS-5023";
-/// Transport webhook fire error.
+/// MCP client `tools/call`: the handle was disconnected while the call
+/// waited for the client's lock, so the call sent no request.
 pub const TRANS_5024: &str = "SCP-TRANS-5024";
-/// Transport webhook test error.
+/// MCP client `tools/call`: the request failed on the transport, the server
+/// answered with an error, or the call itself failed.
+///
+/// On NAPI and `UniFFI` the task running the call failed; on `PyO3` an
+/// earlier call panicked while holding the client's lock, which fails every
+/// later call on the handle this way until the host disconnects it.
 pub const TRANS_5025: &str = "SCP-TRANS-5025";
 /// Transport relay configured error.
 pub const TRANS_5030: &str = "SCP-TRANS-5030";
@@ -1247,8 +1259,8 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 // Codes the Swift `AppleDeviceAttestation` adapter throws as `ScpError`
 // from its UniFFI `DeviceAttestationProvider` callback methods
-// (`AttestationError.scpError`). Each of these five codes belongs to one of
-// the six `AttestationError` cases; the sixth case, `serviceError`, reuses
+// (`AttestationError.scpError`). Each of these nine codes belongs to one of
+// the ten `AttestationError` cases; the tenth case, `serviceError`, reuses
 // `ATTEST_9001`.
 
 /// Apple App Attest is unsupported on this device.
@@ -1258,6 +1270,35 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 pub const ATTEST_9019: &str = "SCP-ATTEST-9019";
 /// No App Attest key ID is stored, so no assertion is possible.
 pub const ATTEST_9020: &str = "SCP-ATTEST-9020";
+/// Apple already attested this App Attest key.
+///
+/// `attestKey` answered `DCError.invalidKey` and the key probe's assertion
+/// with that key succeeded. For the stored key, the Apple adapter keeps the
+/// key and records it as attested; for a replacement key, it discards the
+/// replacement key ID and keeps the stored key.
+pub const ATTEST_9021: &str = "SCP-ATTEST-9021";
+/// Apple refused an `assertRequest` assertion with a stored App Attest key that
+/// carries no attestation record.
+///
+/// `assertRequest`'s `generateAssertion` answered `DCError.invalidKey` for a
+/// key that carries no attestation record, which names either an unattested
+/// key or a rejected key whose record was never written; the Apple adapter
+/// keeps the key.
+pub const ATTEST_9022: &str = "SCP-ATTEST-9022";
+/// Apple's App Attest service rejected this device's key.
+///
+/// `generateAssertion` answered `DCError.invalidKey` for a key that carries
+/// an attestation record, or `attestKey` and the key probe's assertion both
+/// answered `DCError.invalidKey`. For the stored key, the Apple adapter
+/// discards the key ID and record; for a replacement key, it discards the
+/// replacement key ID and keeps the stored key and its record.
+pub const ATTEST_9023: &str = "SCP-ATTEST-9023";
+/// App Attest `attestKey` or `generateAssertion` answered
+/// `DCError.serverUnavailable`.
+///
+/// The Apple adapter keeps the key for a retry. A `generateKey` answer of
+/// `DCError.serverUnavailable` gives `SCP-ATTEST-9001`.
+pub const ATTEST_9024: &str = "SCP-ATTEST-9024";
 /// The App Attest adapter reached a state no caller input produces.
 ///
 /// Apple's service answered a completion handler with neither a value nor an
@@ -1283,7 +1324,8 @@ pub const ATTEST_9026: &str = "SCP-ATTEST-9026";
 /// When the bound expires, the waiting
 /// `attest` or `assert_request` throws this code, the serializer starts the
 /// next queued call, and an answer Apple gives later is discarded: it stores
-/// no key ID and reaches no caller. `SCP-ATTEST-9025` names a completion
+/// no key ID, writes no attestation record, discards no key ID, and reaches
+/// no caller. `SCP-ATTEST-9025` names a completion
 /// handler that answered with neither a value nor an error, a different
 /// condition.
 pub const ATTEST_9027: &str = "SCP-ATTEST-9027";

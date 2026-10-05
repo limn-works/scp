@@ -62,6 +62,10 @@
 // The uniffi::include_scaffolding! macro expands unsafe extern "C" declarations.
 #![allow(unsafe_code)]
 
+// Links the one `#[global_allocator]`, which wipes every heap block before
+// freeing it (09-security-model.md §9.15, freed heap memory).
+use scp_alloc as _;
+
 use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -429,15 +433,19 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
     ///
-    /// Required for governance vote signing, which uses `ed25519_dalek::SigningKey`
-    /// directly. Platform implementations using software-backed Ed25519 storage
-    /// (e.g., Keychain, Android Keystore with `PURPOSE_SIGN`) MUST support this.
+    /// The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
+    /// governance vote signing among them, build that key from the returned
+    /// bytes. A key held in hardware or in Android Keystore does not export its
+    /// bytes, and ADR-063 requires every key-export accessor, this callback
+    /// included, to leave the custody adapters and all three bridges, because
+    /// hardware custody on the governance path is impossible until then.
     ///
     /// # Default
     ///
     /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. Platform SDKs (Swift `AppleKeyCustody`, Kotlin
-    /// `AndroidKeyCustody`) override this with real implementations. Third-party
+    /// implemented. No Kotlin class implements this callback: the Kotlin
+    /// `AndroidKeyCustody` implements the Kotlin SDK's own `KeyCustodyProvider`
+    /// interface, and no code passes it to the Rust engine. Third-party
     /// `KeyCustodyProvider` implementations that do not need governance vote
     /// signing may rely on the default until they add support.
     ///

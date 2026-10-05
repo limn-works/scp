@@ -17,8 +17,6 @@
 use openmls::prelude::*;
 use tls_codec::Serialize as TlsSerializeTrait;
 
-use scp_clock::Clock;
-
 use crate::epoch_grace::EpochGraceStore;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
@@ -36,16 +34,15 @@ use crate::group::ScpMlsGroup;
 /// * `commit_bytes` - The serialized Commit message bytes (TLS-serialized
 ///   `MlsMessageOut` from the committer).
 /// * `grace_store` - The epoch grace store where the old epoch will be tracked.
-/// * `clock` - The injected clock the Add proposals' `KeyPackage` lifetimes are
-///   checked against.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed,
 /// [`MlsError::CannotDecryptOwnMessage`] for the local member's own echoed
-/// Commit, [`MlsError::KeyPackageLifetimeInvalid`] if an Add proposal's
-/// `KeyPackage` lifetime fails the injected-clock or maximum-range check (the
-/// Commit is then not merged), [`MlsError::CommitProcessingFailed`] if the
+/// Commit, [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] if an Add
+/// proposal's `KeyPackage` `Lifetime` range is empty, inverted, or over the
+/// maximum (a clock-free check, security-model spec §9.7.1; the Commit is then
+/// not merged), [`MlsError::CommitProcessingFailed`] if the
 /// message is an application message or a Proposal rather than a Commit, and
 /// the other errors of [`crate::encrypt::decrypt_commit`] if the bytes cannot
 /// be deserialized, processed, or merged. On every error raised before the
@@ -58,7 +55,6 @@ pub fn process_commit(
     group: &mut ScpMlsGroup,
     commit_bytes: &[u8],
     grace_store: &mut EpochGraceStore,
-    clock: &dyn Clock,
 ) -> Result<(), MlsError> {
     // Record the current epoch before processing the Commit. This epoch will
     // enter the grace window after the Commit is merged.
@@ -71,7 +67,7 @@ pub fn process_commit(
 
     // Refuses a non-Commit before decrypting it, so a refused message
     // consumes no ratchet generation.
-    crate::encrypt::decrypt_commit(group, commit_bytes, clock)?;
+    crate::encrypt::decrypt_commit(group, commit_bytes)?;
 
     // Place the old epoch into the grace window. In-flight messages encrypted
     // under this epoch can still be decrypted until the grace window closes
@@ -205,7 +201,7 @@ mod tests {
     use crate::credential::ScpCredential;
     use crate::encrypt::DecryptedContent;
     use crate::group::{add_member, create_group, generate_key_package, join_group};
-    use scp_clock::SystemClock;
+    use scp_clock::{Clock, SystemClock};
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -277,13 +273,7 @@ mod tests {
         let commit_bytes = serialize_mls_message(&commit).unwrap();
 
         // Bob processes the Commit.
-        process_commit(
-            &mut bob_group,
-            &commit_bytes,
-            &mut grace_store,
-            &SystemClock,
-        )
-        .unwrap();
+        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
 
         let bob_epoch_after = bob_group.epoch().unwrap();
         assert_eq!(
@@ -304,13 +294,7 @@ mod tests {
         let commit = propose_update(&mut alice_group).unwrap();
         let commit_bytes = serialize_mls_message(&commit).unwrap();
 
-        process_commit(
-            &mut bob_group,
-            &commit_bytes,
-            &mut grace_store,
-            &SystemClock,
-        )
-        .unwrap();
+        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
 
         assert!(
             grace_store.is_in_grace(bob_old_epoch),
@@ -329,12 +313,7 @@ mod tests {
 
         crate::group::destroy_group(&mut bob_group).unwrap();
 
-        let result = process_commit(
-            &mut bob_group,
-            &commit_bytes,
-            &mut grace_store,
-            &SystemClock,
-        );
+        let result = process_commit(&mut bob_group, &commit_bytes, &mut grace_store);
         assert!(
             result.is_err(),
             "process_commit must fail on destroyed group"
@@ -360,13 +339,7 @@ mod tests {
             .unwrap();
         let commit_bytes = serialize_mls_message(&bundle.into_commit()).unwrap();
 
-        let err = process_commit(
-            &mut alice_group,
-            &commit_bytes,
-            &mut grace_store,
-            &SystemClock,
-        )
-        .unwrap_err();
+        let err = process_commit(&mut alice_group, &commit_bytes, &mut grace_store).unwrap_err();
         assert!(
             matches!(err, MlsError::CannotDecryptOwnMessage),
             "expected CannotDecryptOwnMessage, got {err:?}"
@@ -375,35 +348,45 @@ mod tests {
         assert_eq!(grace_store.len(), 0);
     }
 
-    /// An add-Commit whose `KeyPackage` has expired against the injected clock is
-    /// refused before the merge with `KeyPackageLifetimeInvalid`; the receiver
-    /// stays on its epoch and records nothing in the grace window.
+    /// An add-Commit whose `KeyPackage` keeps less than the add-side minimum
+    /// under the receiver's (wall) clock merges: `process_commit` checks a
+    /// received Add's `Lifetime` range only and applies no minimum, so the
+    /// receiver advances its epoch and records the old epoch in the grace
+    /// window (security-model spec §9.7.1, the receiver).
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn process_commit_rejects_expired_add_key_package_without_merging() {
+    fn process_commit_merges_add_short_of_add_side_minimum() {
+        use crate::lifetime::{KEY_PACKAGE_LIFETIME_SECS, validate_key_package_lifetime_for_add};
+        const DAY: u64 = 24 * 60 * 60;
         let real_now = SystemClock.now_secs();
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
         let bob_epoch_before = bob_group.epoch().unwrap();
 
-        // Carol's KeyPackage is minted at real now, so it expires about 84 days
-        // later; Alice adds her under the real clock.
-        let carol_cred = test_credential("carol");
-        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        // Carol's KeyPackage expires one day after the wall clock, so
+        // openmls's own wall-clock check passes, and under the wall clock it
+        // is short of the add-side minimum.
+        let carol_not_after = real_now + DAY;
+        let carol_clock = scp_clock::TestClock::new(carol_not_after - KEY_PACKAGE_LIFETIME_SECS);
+        let (carol_kp_bundle, _s, _p) =
+            generate_key_package(&test_credential("carol"), &carol_clock).unwrap();
+        let carol_lifetime = carol_kp_bundle.key_package().life_time();
+        assert_eq!(carol_lifetime.not_after(), carol_not_after);
+        assert!(
+            validate_key_package_lifetime_for_add(carol_lifetime, &SystemClock).is_err(),
+            "under the wall clock Carol must be short of the add-side minimum"
+        );
+
+        // Alice's clock stands seven days back, so Carol keeps eight days
+        // under it and Alice's add-side minimum holds.
+        let adder_clock = scp_clock::TestClock::new(real_now - 7 * DAY);
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        let add_carol = add_member(&mut alice_group, carol_kp, &adder_clock).unwrap();
         let commit_bytes = serialize_mls_message(&add_carol.commit).unwrap();
 
-        // Bob's injected clock is 100 days ahead, past Carol's not_after.
-        let future = scp_clock::TestClock::new(real_now + 100 * 24 * 60 * 60);
-        let err =
-            process_commit(&mut bob_group, &commit_bytes, &mut grace_store, &future).unwrap_err();
-        assert!(
-            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
-            "expected KeyPackageLifetimeInvalid, got {err:?}"
-        );
-        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before);
-        assert_eq!(grace_store.len(), 0);
+        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        assert_eq!(bob_group.epoch().unwrap(), bob_epoch_before + 1);
+        assert_eq!(grace_store.len(), 1);
     }
 
     #[test]
@@ -435,8 +418,7 @@ mod tests {
         let message = encrypt(&mut alice_group, b"in flight").unwrap();
         let bytes = serialize_ciphertext(&message).unwrap();
 
-        let err =
-            process_commit(&mut bob_group, &bytes, &mut grace_store, &SystemClock).unwrap_err();
+        let err = process_commit(&mut bob_group, &bytes, &mut grace_store).unwrap_err();
         assert!(
             matches!(err, MlsError::CommitProcessingFailed(_)),
             "expected CommitProcessingFailed, got {err:?}"
@@ -488,8 +470,7 @@ mod tests {
         let mut relabelled = bytes.clone();
         relabelled[content_type_at] = 3; // commit
 
-        let err = process_commit(&mut bob_group, &relabelled, &mut grace_store, &SystemClock)
-            .unwrap_err();
+        let err = process_commit(&mut bob_group, &relabelled, &mut grace_store).unwrap_err();
         assert!(
             matches!(err, MlsError::DecryptionFailed(_)),
             "expected DecryptionFailed, got {err:?}"
@@ -511,9 +492,7 @@ mod tests {
             2,
             "the Proposal must be a PrivateMessage to use the handshake ratchet"
         );
-        let content =
-            crate::encrypt::decrypt_with_sender_did(&mut bob_group, &handshake, &SystemClock)
-                .unwrap();
+        let content = crate::encrypt::decrypt_with_sender_did(&mut bob_group, &handshake).unwrap();
         assert!(
             matches!(content, DecryptedContent::Proposal { .. }),
             "expected handshake generation 0 to decrypt as a Proposal, got {content:?}"
@@ -537,8 +516,7 @@ mod tests {
             .unwrap();
         let bytes = serialize_mls_message(&proposal).unwrap();
 
-        let err =
-            process_commit(&mut bob_group, &bytes, &mut grace_store, &SystemClock).unwrap_err();
+        let err = process_commit(&mut bob_group, &bytes, &mut grace_store).unwrap_err();
         assert!(
             matches!(err, MlsError::CommitProcessingFailed(_)),
             "expected CommitProcessingFailed, got {err:?}"
@@ -546,8 +524,7 @@ mod tests {
         assert_eq!(bob_group.epoch().unwrap(), epoch_before);
         assert_eq!(grace_store.len(), 0);
 
-        let content =
-            crate::encrypt::decrypt_with_sender_did(&mut bob_group, &bytes, &SystemClock).unwrap();
+        let content = crate::encrypt::decrypt_with_sender_did(&mut bob_group, &bytes).unwrap();
         assert!(
             matches!(content, DecryptedContent::Proposal { .. }),
             "expected the same bytes to decrypt as a Proposal, got {content:?}"
@@ -560,7 +537,7 @@ mod tests {
         let mut grace_store = EpochGraceStore::new();
 
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let result = process_commit(&mut bob_group, &garbage, &mut grace_store, &SystemClock);
+        let result = process_commit(&mut bob_group, &garbage, &mut grace_store);
         assert!(
             result.is_err(),
             "process_commit must reject malformed bytes"
@@ -578,13 +555,7 @@ mod tests {
         for i in 0u64..3 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(
-                &mut bob_group,
-                &commit_bytes,
-                &mut grace_store,
-                &SystemClock,
-            )
-            .unwrap();
+            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
 
             assert_eq!(
                 bob_group.epoch().unwrap(),
@@ -649,13 +620,7 @@ mod tests {
         );
 
         // Also verify Bob can process the commit and advance.
-        process_commit(
-            &mut bob_group,
-            &commit_bytes,
-            &mut grace_store,
-            &SystemClock,
-        )
-        .unwrap();
+        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         assert_eq!(bob_group.epoch().unwrap(), old_epoch + 1);
     }
 
@@ -719,13 +684,7 @@ mod tests {
         for _ in 0..3 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(
-                &mut bob_group,
-                &commit_bytes,
-                &mut grace_store,
-                &SystemClock,
-            )
-            .unwrap();
+            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         }
 
         assert_eq!(bob_group.epoch().unwrap(), 4);
@@ -761,13 +720,7 @@ mod tests {
         for _ in 0..2 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(
-                &mut bob_group,
-                &commit_bytes,
-                &mut grace_store,
-                &SystemClock,
-            )
-            .unwrap();
+            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         }
 
         assert_eq!(alice_group.epoch().unwrap(), 3);
@@ -807,13 +760,7 @@ mod tests {
         for _ in 0..3 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_mls_message(&commit).unwrap();
-            process_commit(
-                &mut bob_group,
-                &commit_bytes,
-                &mut grace_store,
-                &SystemClock,
-            )
-            .unwrap();
+            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         }
 
         // The grace store has capacity 2, so the first epoch should have been

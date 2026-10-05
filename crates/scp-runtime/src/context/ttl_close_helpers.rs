@@ -927,7 +927,8 @@ pub async fn finalize_close(
     // linger live. `dispose_secrets` runs OpenMLS `destroy_group`, which eagerly
     // frees the group NOW; the Ed25519 signer zeroizes on drop
     // (`SignatureKeyPair` holds its private key in `SecretVLBytes`) — same as a
-    // bare drop, just eager; the sender key zeroizes on its own drop. Full scope retains keys
+    // bare drop, just eager; the sender key zeroizes on its own drop (security
+    // model spec §9.15 lists the copies no wipe reaches). Full scope retains keys
     // (readable after close), so it is
     // skipped. A broadcast context carries no `ContextCryptoState`
     // (`crypto_mut() == None`), a clean no-op there.

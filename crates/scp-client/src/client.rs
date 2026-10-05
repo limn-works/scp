@@ -119,6 +119,20 @@ const _: fn() = || {
     guard::<PersistedPendingJoin>();
 };
 
+// Security-model spec §9.18.7: the adder's minimum remaining KeyPackage
+// lifetime covers the relay maximum blob TTL plus the lifetime margin, so an
+// add-Commit that the adder publishes when it checks the KeyPackage, and that
+// a receiver processes when an SCP relay delivers it within its retention,
+// carries no KeyPackage expired under that receiver's clock while the
+// receiver's clock runs at most one hour ahead of the adder's. §9.7.1 states
+// every condition under which openmls's receive-side wall-clock `Lifetime`
+// check still refuses the Commit, including delays that add up. This crate
+// sees both scp-mls and scp-relay-client. `u64::from` is not const, so the widening is `as`.
+const _: () = assert!(
+    scp_mls::KEY_PACKAGE_MIN_REMAINING_LIFETIME_SECS
+        >= scp_relay_client::MAX_BLOB_TTL as u64 + scp_mls::KEY_PACKAGE_LIFETIME_MARGIN_SECS
+);
+
 /// The result of adding a member: the wire bytes the driver must distribute.
 ///
 /// `commit` goes to all *existing* members. They apply it via
@@ -532,14 +546,14 @@ impl ScpClient {
         // The blob's wiping buffer moves (no copy) into
         // `PersistedPendingJoin::mls_blob`, which is `Zeroizing` too.
         let mls_blob = serialize_pending_join(&provider, &signer, self.signer.did(), context_id)?;
-        // One exactly-sized buffer, wiped on drop, so no outgrown encoding
-        // buffer holding the signer or the wrapping secret is freed unwiped
-        // (security model spec §9.15 step 2).
-        let mut pending_blob = scp_mls::secret_msgpack::encode_named(&PersistedPendingJoin {
+        // The encoding holds the signer and the wrapping secret, so it is
+        // wiped on drop (security model spec §9.15 step 2 and freed heap memory).
+        let mut pending_blob = rmp_serde::to_vec_named(&PersistedPendingJoin {
             mls_blob,
             wrapping_public,
             wrapping_secret: wrapping_secret.clone(),
         })
+        .map(Zeroizing::new)
         .map_err(|e| ClientError::StorageCorrupt(format!("serializing pending join: {e}")))?;
         self.storage
             .put(
@@ -1280,7 +1294,7 @@ impl ScpClient {
     ///   context (§9.9.3). Returns `false` (no application payload was produced).
     /// - **No-add Commit** (e.g. a self-update) → advances the MLS epoch, stamps
     ///   no leaf, records no member. Returns `false`.
-    /// - **Bare proposal** → cached by `scp-mls`; no leaf, returns `false`.
+    /// - **Bare proposal** → not stored; no leaf, returns `false`.
     ///
     /// # Convergent-timestamp authentication (ADR-057)
     ///
@@ -1353,10 +1367,6 @@ impl ScpClient {
         ciphertext: &[u8],
         channel: RecvChannel,
     ) -> Result<ReceiveOutput, ClientError> {
-        // ADR-057 §Prereq-1: captured before the `state` mutable borrow so the
-        // hardened clock (used to re-validate any add-Commit's KeyPackage
-        // `Lifetime`) and the mutable context borrow do not alias `self`.
-        let clock = Arc::clone(&self.clock);
         // This member's own DID — needed for the self-collision check in the
         // §9.10.4 ingest, and as the `local_did` when it seals its own sender key to
         // a member a bystander add introduces (INVARIANT 2).
@@ -1364,8 +1374,8 @@ impl ScpClient {
         let state = self.context_mut(context_id)?;
         // Any successful `decrypt_message` mutates persistent MLS state — it
         // ratchets forward (application), merges a staged commit (add Commit),
-        // installs an incoming sender key (management distribution), or caches a
-        // proposal in the provider store. So every non-error outcome is persisted
+        // installs an incoming sender key (management distribution), or ratchets
+        // past a proposal. So every non-error outcome is persisted
         // after the `state` borrow ends. Only the rejected Remove-bearing Commit
         // (which `scp-mls` dropped BEFORE merging, leaving MLS + SCP state
         // unchanged) returns without a write.
@@ -1380,9 +1390,7 @@ impl ScpClient {
         // out-of-order/too-early announcement, content/channel mismatch) propagate;
         // `handle_relay_frame` categorizes them into benign drops + counters, and a
         // direct caller of `receive_message` sees them.
-        let decrypted = state
-            .crypto
-            .decrypt_message(ciphertext, clock.as_ref(), channel)?;
+        let decrypted = state.crypto.decrypt_message(ciphertext, channel)?;
         let outcome = match decrypted {
             Inbound::Application {
                 sender_did,
@@ -2132,8 +2140,8 @@ mod pending_join_encoding_tests {
             wrapping_public: persisted.wrapping_public,
             wrapping_secret: *persisted.wrapping_secret,
         };
-        let bytes = scp_mls::secret_msgpack::encode_named(&persisted).unwrap();
-        assert_eq!(*bytes, rmp_serde::to_vec_named(&plain).unwrap());
+        let bytes = rmp_serde::to_vec_named(&persisted).unwrap();
+        assert_eq!(bytes, rmp_serde::to_vec_named(&plain).unwrap());
         let back: PersistedPendingJoin = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(*back.mls_blob, *persisted.mls_blob);
         assert_eq!(*back.wrapping_secret, *persisted.wrapping_secret);
@@ -2253,6 +2261,121 @@ mod ingest_emit_tests {
             state.peer_pseudonyms.get(&DID(BOB.to_owned())),
             Some(&rotated),
             "the peer registry now holds BOB's rotated pseudonym"
+        );
+    }
+}
+
+/// The driver's receive path for a bare Add proposal (security-model spec
+/// §9.7.1, the receiver: range only, no clock). It lives inside the crate
+/// because no public driver API sends a bare proposal: the test reaches
+/// Alice's group to propose, and Bob receives through
+/// [`ScpClient::receive_message`].
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod received_proposal_tests {
+    use std::sync::Arc;
+
+    use scp_clock::{Clock, SystemClock, TestClock};
+    use scp_did::SigningKeyId;
+    use scp_mls::ScpCredential;
+    use scp_mls::group::{generate_key_package_with_context_params, propose_add_member_bare};
+
+    use super::ScpClient;
+    use crate::{LocalSigner, MemoryStorage, RelaySink};
+
+    const CTX: &str = "ctx-client-received-proposal-unit";
+    const ALICE: &str = "did:key:z6MkAliceClientProposalFixtureAAAAAAAAAAA";
+    const BOB: &str = "did:key:z6MkBobClientProposalFixtureBBBBBBBBBBBBBB";
+    const CAROL: &str = "did:key:z6MkCarolClientProposalFixtureCCCCCCCCCCC";
+
+    /// Accepts and drops every frame; this test delivers directly.
+    struct DroppingSink;
+
+    impl RelaySink for DroppingSink {
+        fn send(&self, _frame: Vec<u8>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn client(did: &str, clock: Arc<dyn Clock>) -> ScpClient {
+        ScpClient::new(
+            Arc::new(LocalSigner::active(did)),
+            Arc::new(MemoryStorage::new()),
+            clock,
+            Arc::new(DroppingSink),
+        )
+        .expect("construct client")
+    }
+
+    /// Bob's injected clock stands past Carol's `not_after` while the wall
+    /// clock stays inside her `Lifetime`. Bob receives Alice's bare Add
+    /// proposal of Carol without error, and nothing about his membership
+    /// changes, because a proposal changes no membership until a Commit.
+    #[test]
+    fn add_proposal_expired_under_receiver_clock_is_received() {
+        let real_now = SystemClock.now_secs();
+        let mut alice = client(ALICE, Arc::new(TestClock::new(real_now)));
+        alice.create_context(CTX).expect("Alice creates");
+        let bob_clock = Arc::new(TestClock::new(real_now));
+        let mut bob = client(BOB, Arc::clone(&bob_clock) as Arc<dyn Clock>);
+        let bob_kp = bob
+            .generate_key_package_for_join(CTX)
+            .expect("Bob key package");
+        let add_bob = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
+        bob.join_context_encrypted(
+            CTX,
+            &add_bob.welcome,
+            &add_bob.event_log,
+            &add_bob.wrapping_keys,
+        )
+        .expect("Bob joins");
+
+        // Carol's KeyPackage is minted under the wall clock.
+        let carol_credential = ScpCredential::new(CAROL.to_owned(), None, SigningKeyId::Active)
+            .expect("Carol's credential");
+        let (carol_bundle, _carol_signer, _carol_provider) =
+            generate_key_package_with_context_params(
+                &carol_credential,
+                Some(&[0xCC; 32]),
+                &SystemClock,
+            )
+            .expect("Carol's KeyPackage");
+        let carol_not_after = carol_bundle.key_package().life_time().not_after();
+        let proposal = propose_add_member_bare(
+            &mut alice
+                .contexts
+                .get_mut(CTX)
+                .expect("Alice's context")
+                .crypto
+                .mls_group,
+            carol_bundle.key_package(),
+        )
+        .expect("Alice proposes adding Carol");
+
+        // Bob's injected clock passes Carol's `not_after`; the wall clock
+        // does not.
+        bob_clock.set(carol_not_after + 1);
+        assert!(SystemClock.now_secs() < carol_not_after);
+        let epoch_before = bob.mls_epoch(CTX).expect("Bob's epoch");
+        let members_before = bob.member_dids(CTX).expect("Bob's members");
+
+        let output = bob
+            .receive_message(CTX, &proposal)
+            .expect("Bob receives the Add proposal");
+        assert!(!output.application, "a proposal is not application data");
+        assert!(
+            output.sender_key_distributions.is_empty(),
+            "a proposal produces no sender-key distribution"
+        );
+        assert_eq!(
+            bob.mls_epoch(CTX).expect("Bob's epoch"),
+            epoch_before,
+            "a proposal leaves Bob's epoch unchanged"
+        );
+        assert_eq!(
+            bob.member_dids(CTX).expect("Bob's members"),
+            members_before,
+            "a proposal leaves Bob's member set unchanged"
         );
     }
 }

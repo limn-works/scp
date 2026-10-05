@@ -650,8 +650,9 @@ fn handle_shutdown_self_actor(
     // DELETED), so tear the ACTOR-OWNED material down explicitly through the
     // field-granular Class-C view (teardown is best-effort, not a fail-closed
     // persist obligation). Each `ScpMlsGroup` owns its own in-memory
-    // `InMemoryMlsProvider`, so the epoch/group secrets are freed the moment the
-    // `PerContextState` itself drops — a bare drop is NOT a leak of group storage.
+    // `InMemoryMlsProvider`, so the epoch/group secrets are zeroized and freed the
+    // moment the `PerContextState` itself drops — a bare drop is NOT a leak of
+    // group storage (security model spec §9.15 lists the copies no wipe reaches).
     // The reason to dispose explicitly here is EAGER release: this close leaves
     // the `PerContextState` alive (a later respawn rehydrates it), so nothing else
     // frees the crypto until the state eventually drops — `dispose_secrets`

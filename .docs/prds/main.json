@@ -2968,7 +2968,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-mcp/server.rs"
       ],
@@ -2985,7 +2985,7 @@
         "Provenance is attached to the result.",
         "The JSON-RPC response contains the outlet output as content.",
         "Errors are returned as JSON-RPC error responses with descriptive messages.",
-        "`resources/list` returns SCP context event streams as MCP resources: `scp://context_a/events`, `scp://context_a/members`, `scp://context_a/tools`.",
+        "`resources/list` returns the context event streams the agent may read as MCP resources, out of `scp://context_a/events`, `scp://context_a/members`, `scp://context_a/tools`.",
         "`resources/read` returns the current state of a resource (e.g., member list, recent events).",
         "Resource subscriptions (`resources/subscribe`) map to SCP context event streams.",
         "Handles MCP lifecycle: `initialize`, `initialized`, `ping`.",
@@ -3014,9 +3014,17 @@
         }
       ],
       "details": {
-        "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}"
+        "tool_call_example": "{\n    \"jsonrpc\": \"2.0\",\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"context_a/guide_assistant\",\n        \"arguments\": { \"query\": \"butter substitute\" }\n    },\n    \"id\": 1\n}",
+        "audit_note": "Downgraded from done (audit): the NAPI MCP provider in crates/scp-ffi/napi/src/mcp.rs does not implement ContextProvider::invoke_outlet, so its validate_capability refuses every tool, tools/list is empty and tools/call is refused. The tool-invocation criterion is unmet on NAPI. The PyO3 provider runs an outlet from tools/call at most once per server: the server holds the one agent UCAN it was created with, the first tools/call whose Invoke check reaches ADR-016 Step 9 records that token's nonce, whether or not the check then passes and the outlet runs, and every later check of the token fails as a replay, so tools/list then omits every outlet and tools/call refuses it; the token's nonce also fails the freshness check five minutes after it was minted. The UniFFI provider runs no outlet from tools/call: no production code in the UniFFI crate registers an outlet handler. On both the PyO3 and UniFFI providers, tools/list lists an outlet only when the server holds an agent UCAN, the agent's role state grants the outlet's invocation capability, and the UCAN check passes; that check runs the nonce freshness check on every tools/list probe, so five minutes after the server's one agent token was minted tools/list omits every outlet on UniFFI as it does on PyO3. The one-token replay above applies to UniFFI as well once a caller can register a handler. The tool-invocation criterion is unmet on PyO3 until a server can present a fresh token per call, and on UniFFI until a caller can register an outlet handler and a server can present a fresh token per call. The dynamic-update criterion is unmet on every bridge: registering, updating or removing an outlet sends no `notifications/tools/list_changed`, because the event pump runs only on a ContextEvent, no ContextEvent variant reports an outlet change, and every bridge discards the registry event that register_outlet returns. The built-in-tools criterion is unmet on every bridge: `{context}/send_message`, `{context}/read_messages` and `{context}/list_members` are listed only when the provider grants the built-in's name, the PyO3 and UniFFI providers grant a name only for an outlet registered under it in the context's outlet registry, and no code registers an outlet under any of the three names, so tools/list omits them and tools/call refuses them from the first request; the NAPI provider refuses them as it refuses every tool. `resources/list` returns only the resources the agent may read: `events` and `members` require `messages:read` (contexts spec §5.5.1, Default Role Set) and `tools` requires membership, so a member without `messages:read` sees only `scp://{context}/tools` (ADR-015 criterion 3). A server created while the instance is suspended or has no supervisor has no event source for its whole life: it advertises `resources.subscribe`, `resources.listChanged` and `tools.listChanged` as false and answers `resources/subscribe` and `resources/unsubscribe` with METHOD_NOT_FOUND, so the subscription criterion holds only on a server created with a supervisor while the instance is not suspended."
       },
-      "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests."
+      "result": "MCP server with ContextProvider trait, capability filtering, tool namespacing. 42 tests.",
+      "blockedByIssues": [
+        2506,
+        2512,
+        2513,
+        2561,
+        2582
+      ]
     },
     {
       "id": "SCP-049",
@@ -3024,7 +3032,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-mcp/stdio.rs",
         "crates/scp-mcp/sse.rs"
@@ -3038,7 +3046,11 @@
         "SSE transport: HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages.",
         "SSE transport: POST endpoint accepts client-to-server JSON-RPC requests.",
         "SSE transport: handles connection lifecycle, reconnection, keep-alive.",
-        "SSE transport: suitable for web-based MCP clients and remote integrations."
+        "SSE transport: suitable for web-based MCP clients and remote integrations.",
+        "SSE transport: every SDK's SSE client sends a bearer token over plain HTTP only to a loopback address: given a token, it refuses, before it opens a connection, a URL whose host resolves to any other address.",
+        "SSE transport: every request to the SSE and POST endpoints presents an `Authorization: Bearer <token>` header, and the server answers any other request with HTTP 401. `SseConfig::new` fills the token with 256 bits from the operating system's random number generator, and every SDK's SSE client takes the token and sends it on the `GET` and on every POST.",
+        "SSE transport: one server serves one MCP session at a time. A new `GET /sse` that passes the bearer check ends the live session's stream and takes its place; the server answers that `GET /sse` with HTTP 409 when the ended session still holds the slot 5 seconds later, when a newer `GET /sse` arrives while it waits, or when the server shuts down while it waits, and it answers a POST that names any other session with HTTP 409.",
+        "SSE transport: reconnection starts a new session. The server clears the ended session's handshake, client capabilities and subscriptions before it admits the next client, and it ignores the `Last-Event-ID` header."
       ],
       "actionItems": [
         "Create `crates/scp-mcp/stdio.rs` with stdio transport: tokio stdin/stdout reader/writer, line-delimited JSON parsing, JSON-RPC request dispatch to server handler, response writing.",
@@ -3060,8 +3072,15 @@
           "tokio (async I/O)",
           "axum (HTTP/SSE)",
           "serde_json (JSON-RPC serialization)"
-        ]
-      }
+        ],
+        "audit_note": "Downgraded from done (audit): two SSE criteria are unmet, 'suitable for web-based MCP clients and remote integrations' and 'HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages'. The criterion 'suitable for web-based MCP clients and remote integrations' is unmet in both halves. Web-based clients: a browser's EventSource cannot set the Authorization header, so the server answers its GET /sse with HTTP 401, and the server answers a CORS preflight with HTTP 401 and no Access-Control-Allow-* header, so the browser blocks a fetch() that sets the header. Remote integrations: neither the SSE server nor the SDK SSE client has TLS, the client refuses to send a bearer token to a host that is not loopback, and the server answers every tokenless request with HTTP 401, so no SDK client can reach an SSE server on another host. The criterion 'HTTP server (configurable host:port) serves SSE endpoint for server-to-client messages' is unmet on every bridge: the PyO3, UniFFI and NAPI bridges each bind the SSE server to 127.0.0.1 port 0, so a caller cannot choose the host or the port, and no bridge returns the port it bound or the bearer token SseConfig::new drew, so a caller cannot connect any client to an SSE server a bridge starts."
+      },
+      "blockedByIssues": [
+        2311,
+        2551,
+        2557,
+        2583
+      ]
     },
     {
       "id": "SCP-050",
@@ -3108,7 +3127,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/python/scp_sdk/mcp.py"
       ],
@@ -3144,9 +3163,16 @@
       ],
       "details": {
         "python_usage": "from scp_sdk.mcp import serve_mcp\n\nserver = await serve_mcp(\n    identity=my_identity,\n    contexts=[context_a, context_b],\n    transport=\"stdio\",\n)",
-        "cli_usage": "scp-mcp serve --identity <did> --relay <relay_url> --transport stdio"
+        "cli_usage": "scp-mcp serve --identity <did> --relay <relay_url> --transport stdio",
+        "audit_note": "Downgraded from done (audit): five criteria are unmet. The criterion '`serve_mcp(identity, contexts, transport)` starts an MCP server that dynamically exposes outlets from the agent's active SCP contexts' is unmet. The Python SDK starts a server through `SCP.mcp_serve(did, context_ids, transport)`, and the PyO3 server it starts holds the one agent UCAN it was created with, so tools/list omits every outlet after the first tools/call whose Invoke check reaches ADR-016 Step 9, and five minutes after that token was minted (SCP-048 audit note). That server also sends no `notifications/tools/list_changed` when an outlet is registered, updated or removed, so a connected client sees a new outlet only when it calls tools/list again (SCP-048 audit note). The criterion 'Transport parameter accepts `\"stdio\"` or `\"sse\"`' is unmet for `\"sse\"`: the PyO3 bridge binds the SSE server to 127.0.0.1 port 0 and returns neither the port nor the bearer token, so no client can connect to a server started with `\"sse\"` (SCP-049 audit note). The criteria 'CLI entry point: `scp-mcp serve --identity <did> --relay <relay_url> --transport stdio` starts an MCP server for a given SCP identity' and 'CLI connects to specified relays, loads active contexts, and serves tools' are unmet. `_cli_serve` in `bindings/python/scp_sdk/mcp.py` opens `SCP(storage={\"type\": \"in_memory\"})` and then calls `identity_load` on that store, which the same process created empty, so every run fails with 'identity not found in storage' before any server starts. Past that step, `mcp_load_contexts` ignores its relay URL and reads contexts only from the same empty instance, so it would return none. The criterion 'Suitable for integration with MCP hosts that launch servers as subprocesses' is unmet for the same reason, because `scp-mcp serve` is the entry point such a host launches. `blockedByIssues` lists the issue that tracks the CLI."
       },
-      "result": "Created bindings/python/scp_sdk/mcp.py with serve_mcp(), McpClient, and CLI entry point. All Python SDK patterns followed."
+      "result": "Created bindings/python/scp_sdk/mcp.py with serve_mcp(), McpClient, and CLI entry point. All Python SDK patterns followed.",
+      "blockedByIssues": [
+        2311,
+        2512,
+        2513,
+        2584
+      ]
     },
     {
       "id": "SCP-052",
@@ -3435,7 +3461,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "tests/integration/phase3_integration_test.py"
       ],
@@ -3501,8 +3527,15 @@
           "section": "## Phase 3 Integration Test"
         }
       ],
-      "details": {},
-      "result": "Phase 3 end-to-end Python SDK integration test created at tests/integration/phase3_integration_test.py. Exercises Identity, Context, Outlets, UCAN, MCP, and EventLog across PyO3 bridge."
+      "details": {
+        "audit_note": "Downgraded from done (audit): the two MCP criteria are unmet, and the story's test proves no criterion. The MCP server criterion is unmet because the Python SDK defines no `scp.mcp.serve_mcp`, the entry point the criterion names. The Python SDK starts a server through `SCP.mcp_serve` instead, and the PyO3 server it starts omits every outlet from tools/list after the first tools/call whose Invoke check reaches ADR-016 Step 9, and five minutes after its agent UCAN was minted (SCP-048 audit note). In the MCP tool-invocation criterion, a PyO3 server runs an outlet from tools/call at most once, and none five minutes after its agent UCAN was minted, because it presents that one token for every call (SCP-048 audit note). `tests/integration/phase3_integration_test.py` imports `serve_mcp` from `scp_sdk.mcp`, which the Python SDK no longer defines, so the module fails at import. The test also replaces the PyO3 bridge with a `MagicMock` fixture, so even a passing run would show no call crossing the bridge, and no CI workflow or script runs the test. `blockedByIssues` lists the issue that tracks the test."
+      },
+      "result": "Phase 3 end-to-end Python SDK integration test created at tests/integration/phase3_integration_test.py. Exercises Identity, Context, Outlets, UCAN, MCP, and EventLog across PyO3 bridge.",
+      "blockedByIssues": [
+        2512,
+        2545,
+        2561
+      ]
     },
     {
       "id": "SCP-059",
@@ -5401,14 +5434,14 @@
       "severity": "major",
       "status": "in-progress",
       "files": [
-        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift"
+        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift",
+        "bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift"
       ],
-      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter hands App Attest the 32-byte `challenge` it receives unchanged and throws on an unsupported device instead of returning the synthetic token. On the minting side no Rust code meets the requirements of ADR-025 acceptance criterion 3 that fall outside the adapter, because no Rust code yet holds or calls the `DeviceAttestationProvider` callback: nothing computes `D`, passes `D` to `attest`, publishes the attestation object, strips `attStmt.receipt` from it, re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`, computes the assertion digest `A`, or passes `A` to `assertRequest`. No code verifies an attestation against Apple's root, so the criterion \"A reader verifies the attestation offline against Apple's App Attestation Root CA\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.",
+      "description": "Implement the Apple App Attest device attestation adapter as the Swift class `AppleDeviceAttestation` in `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift`. ADR-025, the Apple platform adapter, decides that the Apple adapter is a set of Swift classes conforming to the UniFFI callback interfaces, so no Rust file holds the App Attest calls. A Rust `DeviceAttestation` implementation that calls the adapter through the UniFFI `DeviceAttestationProvider` callback is still missing, and criterion 1 waits on it; GitHub issue #2515, \"Implement DeviceAttestation in Rust over the UniFFI DeviceAttestationProvider callback (SCP-095 criterion 1)\", tracks it. An earlier revision of this description named `scp-platform/apple/app_attest.rs`; that file never existed, and ADR-025 places the adapter in Swift.\n\nApp Attest integration: attestation flow, key binding, and App Attest error handling. App Attest provides hardware-backed device attestation. Under `09-security-model.md` §9.3.1 a peer runs every App Attest check offline; SCP-316, the device-attestation reader story, specifies that reader, and no code implements it yet.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nStatus reopened 2026-09-27: ADR-025's amendment of that date replaces the `clientDataJSON` binding with the binding digest `D` of `09-security-model.md` §9.3.1 and withdraws the synthetic software-only token. The shipped adapter hands App Attest the 32-byte `challenge` it receives unchanged and throws on an unsupported device instead of returning the synthetic token. On the minting side no Rust code meets the requirements of ADR-025 acceptance criterion 3 that fall outside the adapter, because no Rust code yet holds or calls the `DeviceAttestationProvider` callback: nothing computes `D`, passes `D` to `attest`, publishes the attestation object, strips `attStmt.receipt` from it, re-attests before the credential certificate's `notBefore` plus the context's `device_attestation_max_age_secs`, computes the assertion digest `A`, or passes `A` to `assertRequest`. No code verifies an attestation against Apple's root, so the criterion \"A reader verifies the attestation offline against Apple's App Attestation Root CA\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.\n\nRevision on 2026-10-04: this revision deleted acceptance criterion 4 and its action item, which required the adapter to read Apple's risk metric, because `09-security-model.md` §9.3.1 states that no peer can use the App Attest receipt. The same revision deleted this description's claim that a server verifies the attestation, because §9.3.1 has each reader verify it offline, and deleted the sentence that called ADR-025 a stub, because ADR-025 is decided. `details.criteriaStatus` names the evidence for each of the five remaining criteria.",
       "acceptanceCriteria": [
         "Implements DeviceAttestation trait for Apple platforms",
         "Attestation request generates App Attest attestation object",
         "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
-        "Fraud metric handling integrated (risk metric from Apple)",
         "Attestation bound to specific key material",
         "Tests pass with App Attest sandbox environment"
       ],
@@ -5416,7 +5449,6 @@
         "Implement DeviceAttestation::attest() using App Attest API (DCAppAttestService)",
         "Leave verification to the reader of `09-security-model.md` §9.3.1, a pure function in `scp-protocol` (SCP-316); the adapter implements no verify method",
         "Handle attestation key generation and binding to SCP identity",
-        "Implement fraud metric extraction and reporting",
         "Handle App Attest error cases (unsupported device, service unavailable)",
         "Write integration tests using App Attest sandbox"
       ],
@@ -5435,13 +5467,41 @@
         }
       ],
       "details": {
-        "stubADR": true,
+        "stubADR": false,
         "adr": "ADR-025",
         "protocolSections": [
           "§9.15"
         ],
         "expectedDecisions": {
-          "appAttest": "Attestation flow, server-side verification, fraud metric handling"
+          "appAttest": "Attestation flow, offline verification by every reader under `09-security-model.md` §9.3.1, no receipt exchange with Apple"
+        },
+        "criteriaStatus": {
+          "assessedOn": "2026-10-04",
+          "assessedAgainst": "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift and bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift, after the change that generates and attests a replacement key when the stored key carries an attestation record",
+          "met": [
+            {
+              "criterion": "Attestation request generates App Attest attestation object",
+              "evidence": "`AppleDeviceAttestation.attest(challenge:deviceId:)` checks that `challenge` is 32 bytes, calls `DCAppAttestService.attestKey(_:clientDataHash:)` with `challenge` as `clientDataHash` unchanged, and returns the raw CBOR attestation object Apple signed. `attestForwardsChallenge` pins the unchanged `clientDataHash` under two different `deviceId` values and the raw return value; `attestRejectsWrongLengthChallenge` pins `SCP-ATTEST-9026` for a 0-, 31- and 33-byte `challenge`, with no key generated and no App Attest call. `AppleDeviceAttestation` is the only adapter that implements this criterion: `AndroidDeviceAttestation`, the other class conforming to a `DeviceAttestationProvider` interface, requests a Play Integrity token under SCP-111, the Play Integrity adapter story."
+            }
+          ],
+          "unmet": [
+            {
+              "criterion": "Attestation bound to specific key material",
+              "evidence": "`AppleDeviceAttestation.attest(challenge:deviceId:)` attests the App Attest key Apple generated. No code binds the attestation to an SCP identity key."
+            },
+            {
+              "criterion": "Implements DeviceAttestation trait for Apple platforms",
+              "evidence": "No Rust code implements the `DeviceAttestation` trait over the Apple adapter. `DeviceAttestation` in `crates/scp-platform/src/traits.rs` declares `attest(&self)`, which takes no argument and returns a `DeviceAttestationToken`, and `verify(&self, token)`. `DeviceAttestationProvider` in `crates/scp-ffi/uniffi/src/lib.rs`, the UniFFI callback interface `AppleDeviceAttestation` conforms to, declares `attest(challenge, device_id)` returning bytes and `assert_request(request_hash)`, so its method set differs from the trait's. The only implementation of `DeviceAttestation` under `crates/` is the `testing`-gated `InMemoryDeviceAttestation` in `crates/scp-platform/src/testing/attestation.rs`. No Rust code holds or calls a `DeviceAttestationProvider`, and no Swift code under `bindings/swift/Sources` constructs or calls `AppleDeviceAttestation`: outside `AppleDeviceAttestation.swift`, the name appears under `bindings/swift/Sources` only in a doc comment in `AppleKeyCustody.swift` and a doc comment in the generated `Internal/ScpBindings.swift`, so no production path reaches `attest(challenge:deviceId:)` or `assertRequest(requestHash:)`. GitHub issue #2515, \"Implement DeviceAttestation in Rust over the UniFFI DeviceAttestationProvider callback (SCP-095 criterion 1)\", tracks that implementation."
+            },
+            {
+              "criterion": "A reader verifies the attestation offline against Apple's App Attestation Root CA under `09-security-model.md` §9.3.1 (SCP-316)",
+              "evidence": "`AppleDeviceAttestation` carries no verifier, because the maintainer ruled on 2026-09-26 that reading-side verification belongs to the keri workstream. `09-security-model.md` §9.3.1 states how a reader verifies an App Attest attestation. SCP-316, still pending, specifies that reader, and no file under `crates/` or `bindings/` implements it."
+            },
+            {
+              "criterion": "Tests pass with App Attest sandbox environment",
+              "evidence": "`AppleDeviceAttestationTests.swift` drives the adapter with `ScriptedAppAttestService`, `CountingAppAttestService`, `OverlapDetectingAppAttestService` and `RecordingAppAttestService`, `DCAppAttestService` subclasses that override `isSupported` and the App Attest methods each one scripts. No test contacts Apple's App Attest sandbox, and no test runs on a physical device."
+            }
+          ]
         }
       }
     },
@@ -6258,15 +6318,21 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt"
       ],
-      "description": "Implement the KeyCustody platform trait for Android Keystore. Android Keystore provides TEE-backed key custody; Ed25519 support requires API 33+ (Android 13+). StrongBox is available but dramatically slower than TEE-backed operations. Must decide minimum API level (API 33+ for Ed25519 Keystore, or software fallback for older devices) and TEE vs StrongBox policy (performance vs security tradeoff). Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.",
+      "description": "Implement the KeyCustody platform trait for Android Keystore. ADR-027, the Android platform adapter, as amended on 2026-09-10, sets the API levels and curve: the SDK minimum is API 26, every signing key the adapter generates is an EC P-256 key in Android Keystore at every supported API level, and P-256 key agreement uses Keystore from API 31 and a Bouncy Castle software key below API 31. ADR-027 also excludes StrongBox with no opt-in, because StrongBox operations run 10-100x slower than TEE-backed operations and SCP signs frequently, and this story follows ADR-027. Spec 17, persistence and storage, makes StrongBox opt-in in two tables: the platform-encryption table in §17.5, Serialization (\"StrongBox opt-in only\"), and the key custody table in §17.8, Platform-Specific Key Custody (\"StrongBox is available, dramatically slower, and opt-in\"). ADR-027 and spec 17 cannot both hold, so the open question \"StrongBox opt-in on Android\" in `.docs/specs/00-open-questions.md` puts that conflict to a human. Mirrors the Apple adapter structure from ADR-025. Emulator Keystore behavior differs from hardware — test on physical devices.\n\nStatus reopened 2026-09-28: ADR-027, as amended on 2026-09-10, requires an EC P-256 signing key in Keystore at every supported API level, P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256 agreement key below it, and (acceptance criterion 6) a hardware `pseudonym_secret` that is a 32-byte symmetric key generated inside the TEE, never `SHA-256` over a signature. The shipped adapter generates Ed25519 and X25519 keys, derives Ed25519 pseudonym keypairs, and derives the hardware pseudonym secret from a signature. It reports every Keystore key as `CustodyType.HARDWARE` without reading the key's `KeyInfo` security level. `AndroidKeyCustody` implements the Kotlin `KeyCustodyProvider` interface of `Types.kt`, not the UniFFI `KeyCustodyProvider` callback interface that ADR-027 requires, and no code injects it into the Rust engine, so \"KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025\" is unmet. Key destruction deletes the Keystore entry and checks that the alias is gone; it requests no Keystore attestation, so \"Key destruction verification via Android Keystore attestation per §9.15\" is unmet.",
       "acceptanceCriteria": [
         "KeyCustody trait implemented for Android Keystore matching the same platform trait signatures as ADR-025",
-        "Ed25519 key generation uses Android Keystore on API 33+ devices",
-        "Software fallback path exists for devices below API 33",
+        "`generateKeypair` generates every P-256 signing key in `AndroidKeyStore` with `ECGenParameterSpec(\"secp256r1\")` at every supported API level (API 26+) and returns `CustodyType.HARDWARE` (ADR-027 acceptance criterion 1)",
+        "`generateKeypair` generates a P-256 agreement key in `AndroidKeyStore` with `KeyProperties.PURPOSE_AGREE_KEY` on API 31+ and returns `CustodyType.HARDWARE`; on API 26-30 it generates a Bouncy Castle software key, stores it in `EncryptedSharedPreferences`, and returns `CustodyType.SOFTWARE` (ADR-027 acceptance criterion 1)",
+        "`generateKeypair` generates no key for the root member: `09-security-model.md` §9.7.4.1 item 4 places the root in the platform credential provider as a passkey (ADR-027 acceptance criterion 1)",
+        "`sign` signs with `SHA256withECDSA` under the handle's P-256 key, returns the 64-byte raw `r || s` form of §9.5 with `s` normalized into the low half of the group order, rejects an agreement-only handle with `PlatformError.wrongKeyType`, and throws `ScpException` with code `SCP-CRYPTO-4001` for a handle it does not hold (ADR-027 acceptance criterion 2)",
+        "`publicKey` returns the 33-byte SEC1 compressed encoding of the P-256 public point (§9.5, ADR-027 acceptance criterion 3)",
+        "`dhAgree` performs P-256 ECDH in `AndroidKeyStore` on API 31+ and through Bouncy Castle below API 31, returns the 32-byte x-coordinate of the agreed point, and rejects a signing-only handle with `PlatformError.wrongKeyType` (ADR-027 acceptance criterion 5)",
+        "`derivePseudonym` computes `HMAC-SHA256(pseudonym_secret, contextId || \"scp-pseudonym\")`, derives a P-256 keypair from the first 32 bytes through the seed-to-scalar step of §9.10.4, and returns a `PseudonymKeyHandle` with `custodyType = CustodyType.SOFTWARE`, for a hardware identity key too (ADR-027 acceptance criterion 6)",
+        "A hardware key's `pseudonym_secret` is a 32-byte symmetric key generated inside the TEE at `generateKeypair`, never `SHA-256` over a signature; a software key's `pseudonym_secret` is `HKDF-SHA256(p256_private_scalar, salt=\"scp-pseudonym-secret-v1\", info=\"\", len=32)` and matches the §25.19 vectors (ADR-027 acceptance criterion 6)",
         "TEE-backed key operations used exclusively; StrongBox is not offered due to prohibitive latency for SCP's frequent signing operations (ADR-027)",
         "Key destruction verification via Android Keystore attestation per §9.15",
         "Compromise recovery follows same 6 steps from §9.12 with Android-specific key rotation",
@@ -6274,10 +6340,12 @@
       ],
       "actionItems": [
         "Define Android-specific KeyCustody implementation struct",
-        "Implement Ed25519 key generation via Android Keystore (API 33+)",
-        "Implement software fallback key generation for API < 33",
+        "Implement P-256 signing key generation in Android Keystore at every supported API level",
+        "Implement P-256 agreement key generation: Android Keystore on API 31+, Bouncy Castle software keys on API 26-30",
+        "Generate the hardware `pseudonym_secret` as a 32-byte symmetric key inside the TEE at key generation",
+        "Derive each pseudonym keypair on P-256 through the §9.10.4 seed-to-scalar step",
         "Implement TEE-backed signing and verification operations",
-        "Add StrongBox policy configuration (opt-in, document performance tradeoff)",
+        "Request no StrongBox key and offer no StrongBox opt-in (ADR-027)",
         "Implement key destruction with attestation per §9.15",
         "Implement compromise recovery key rotation per §9.12",
         "Test on physical Android device — emulator Keystore behavior differs from hardware"
@@ -6295,20 +6363,21 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
-          "minimumApiLevel": "API 33+ for Ed25519 Keystore, or software fallback for older devices",
-          "teeVsStrongBox": "StrongBox excluded — 10-100x latency penalty is incompatible with SCP's per-message signing. TEE is the only option (ADR-027)"
+          "minimumApiLevel": "Decided by ADR-027 as amended on 2026-09-10: API 26 SDK minimum, P-256 signing in Keystore at every supported API level, Keystore P-256 key agreement from API 31",
+          "teeVsStrongBox": "StrongBox excluded: its 10-100x latency penalty is incompatible with SCP's per-message signing, so TEE is the only option (ADR-027). Spec 17 §17.5 and §17.8 make StrongBox opt-in, and the open question \"StrongBox opt-in on Android\" in `.docs/specs/00-open-questions.md` records that conflict"
         },
         "references": [
-          "§17.8 — Android Keystore: TEE-backed, API 33+ for Ed25519",
+          "§17.5 — Serialization: the platform-encryption table's Android row makes StrongBox opt-in for the SQLCipher key",
+          "§17.8 — Platform-specific key custody: the Android row",
+          "§9.7.4.1 — Pre-rotation key custody: item 4",
           "§9.12 — Compromise recovery",
           "§9.15 — Key destruction verification",
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidKeyCustody.kt + Types.kt implemented. TEE-backed Ed25519 on API 33+, Bouncy Castle fallback for API 26-32, software X25519. 32 JVM unit tests. Commits: 77f48a0, 87fc586."
+      "result": "AndroidKeyCustody.kt and Types.kt implemented. Ed25519 keys are held by Android Keystore on API 33+ and reported as `CustodyType.HARDWARE` without a `KeyInfo.securityLevel` check, so the adapter does not know whether a key sits in the TEE or in software; API 26-32 falls back to Bouncy Castle software keys, and X25519 keys are software keys. ADR-027 requires P-256."
     },
     {
       "id": "SCP-111",
@@ -6320,18 +6389,21 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidDeviceAttestation.kt"
       ],
-      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. Must decide integration level: standard requests vs classic attestation. Mirrors the Apple adapter structure from ADR-025. Play Integrity API integration pattern must be determined (standard vs classic).\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.",
+      "description": "Implement the DeviceAttestation platform trait for Android using Play Integrity API. ADR-027 sets the integration level: Standard integrity requests, and no Classic attestation. Mirrors the Apple adapter structure from ADR-025.\n\nStatus reopened 2026-09-27: ADR-027's amendment of that date sets the Standard request's `requestHash` to the hexadecimal binding digest `D` of `09-security-model.md` §9.3.1 and names a verifier whose signed verdict a reader checks. The shipped adapter calls the Classic API's `setNonce` with a `clientDataJSON` digest, and no component validates a token, so the criterion \"Attestation tokens validated server-side\" is unmet. The adapter prepares no token with a `cloudProjectNumber`, accepts a `challenge` of any length, and reads `deviceId`. It routes `assertRequest` through `attest`. ADR-027 acceptance criteria 7 and 8 forbid each of these, and this story's acceptance criteria state each rule. `AndroidDeviceAttestation` implements the Kotlin `DeviceAttestationProvider` interface of `Types.kt`, not the UniFFI `DeviceAttestationProvider` callback interface that ADR-027 requires, and no code injects it into the Rust engine, so \"DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures\" is unmet. SCP-316, still pending, specifies the reader, and no code verifies a device attestation yet; this story keeps the minting side.",
       "acceptanceCriteria": [
         "DeviceAttestation trait implemented for Android using Play Integrity API matching ADR-025 trait signatures",
-        "Standard Play Integrity request flow implemented",
-        "Classic attestation flow available as alternative (if decided)",
+        "`attest` calls `IntegrityManagerFactory.createStandard(context)`, `prepareIntegrityToken` with the `cloudProjectNumber` of the package verifier's `PlayIntegrityVerifier` entry, and `StandardIntegrityTokenProvider.request` with `requestHash` set to the lowercase hexadecimal form of the binding digest `D` of §9.3.1 (ADR-027 acceptance criterion 7)",
+        "The adapter makes no Classic Play Integrity request: it never calls `IntegrityManagerFactory.create` or builds an `IntegrityTokenRequest` (ADR-027)",
+        "`attest` rejects a `challenge` that is not 32 bytes and does not read `deviceId` (ADR-027 acceptance criterion 7)",
+        "Every `attest` failure, a missing Google Play services installation and a `challenge` of the wrong size included, throws `ScpException` with code `SCP-ATTEST-9001` (ADR-027 acceptance criterion 7)",
+        "`assertRequest` issues a fresh Standard integrity token whose `requestHash` is the lowercase hexadecimal form of the assertion digest `A` of §9.3.1, and does not route through `attest` (ADR-027 acceptance criterion 8)",
         "Attestation tokens validated server-side",
         "Integration tests verify attestation flow end-to-end on physical device"
       ],
       "actionItems": [
         "Define Android-specific DeviceAttestation implementation struct",
         "Implement Play Integrity standard request flow",
-        "Evaluate and optionally implement classic attestation flow",
+        "Implement no Classic attestation flow: ADR-027 decides against it",
         "Wire attestation into SCP identity verification pipeline",
         "Test on physical Android device"
       ],
@@ -6352,16 +6424,15 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
-          "playIntegrityLevel": "Standard requests vs classic attestation"
+          "playIntegrityLevel": "Decided by ADR-027: Standard integrity requests; Classic attestation is not used"
         },
         "references": [
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidDeviceAttestation.kt implemented. Play Integrity Standard API, SHA-256 nonce, JWT token return. 14 JVM unit tests. Commits: bd4e2f7, 87fc586."
+      "result": "AndroidDeviceAttestation.kt implemented. The adapter requests a Classic Play Integrity token through `IntegrityTokenRequest.builder().setNonce(nonce)` with a SHA-256 nonce and returns the token bytes; ADR-027 requires a Standard request, which this story still has to deliver."
     },
     {
       "id": "SCP-112",
@@ -6369,11 +6440,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidPushProvider.kt"
       ],
-      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.",
+      "description": "Implement the PushProvider platform trait for Android using Firebase Cloud Messaging (FCM). FCM payload format must parallel the APNs opacity decision in ADR-025 — payloads must be opaque to the push infrastructure. FCM payload constraints and opacity requirements must be respected.\n\nStatus reopened 2026-09-28: No sender in the repository emits the §10.7.1 step 5 payload `{ \"scp\": 1 }`, so the criterion \"FCM payload format is opaque\" is unmet: opacity is an obligation on the sender, and FCM carries every field of a payload before `handleNotification` runs. `handleNotification` checks only the `scp` field and accepts extra fields. No SDK code wakes the app, connects to a relay, or pulls envelopes on a push, so \"Push notification delivery triggers SCP message fetch\" is unmet, and no integration test exists, so \"Integration tests verify push delivery flow\" is unmet. The Kotlin `PushProvider` interface matches neither the Rust `Push` trait nor the UniFFI `PushProvider` callback interface, so \"PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures\" is unmet. `register` only returns the FCM token: no SDK code builds or sends the §10.7.1 `PushRegistration` to a relay or sends a new one when the token changes, so \"FCM token registration and refresh handled\" is unmet.",
       "acceptanceCriteria": [
         "PushProvider trait implemented for Android using FCM matching ADR-025 trait signatures",
         "FCM payload format is opaque — no plaintext protocol data exposed to push infrastructure",
@@ -6401,8 +6472,7 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "fcmPayloadFormat": "Parallel to APNs opacity decision in ADR-025"
         },
@@ -6410,7 +6480,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidPushProvider.kt implemented. FCM data-only opaque payload, SCP-PUSH-5001/5002 error codes. 10 JVM unit tests. Commits: b37d2f0, 87fc586."
+      "result": "AndroidPushProvider.kt implemented. `register` returns the FCM token, and `handleNotification` checks only the `scp` field of a data-only payload, throwing `SCP-TRANS-5001` when the field is missing and `SCP-TRANS-5002` when it is not `\"1\"`. It accepts extra fields. No sender in the repository emits the §10.7.1 step 5 payload, so no code meets §10.7 opacity, which binds the sender."
     },
     {
       "id": "SCP-113",
@@ -6418,11 +6488,11 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
       ],
-      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.",
+      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.\n\nStatus reopened 2026-09-28: the shipped adapter derives the SQLCipher passphrase from a Keystore AES-256 key but never reads that key's `KeyInfo` security level, so it does not show that the key is TEE-backed, and no unit test opens a SQLCipher database. Each test in `AndroidStorageTest.kt` runs against the test-only `InMemoryStorageProvider` or checks `AndroidStorage` constants, type or error codes. `StorageConformanceTest.kt` runs its conformance tests against `InMemoryStorageProvider` and against an unencrypted JVM SQLite provider that runs hand-copied versions of `AndroidStorage`'s schema and SQL statements, which no test compares with `AndroidStorage`, plus SQL-specific tests against that SQLite provider; none of them opens SQLCipher. The criteria \"SQLCipher database encryption key derived via TEE-backed key derivation\" and \"Unit tests verify encrypted storage round-trip\" are unmet. `AndroidStorage` implements the Kotlin `StorageProvider` interface of `Types.kt`, which declares the method names of the UniFFI `StorageProvider` callback interface but is not that interface, and no code injects it into the Rust engine as ADR-027 requires, so the criterion \"Storage trait implemented for Android matching ADR-025 trait signatures\" is unmet as well.",
       "acceptanceCriteria": [
         "Storage trait implemented for Android matching ADR-025 trait signatures",
         "SQLCipher database encryption key derived via TEE-backed key derivation",
@@ -6451,8 +6521,7 @@
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
+        "note": "Derived before ADR-027 was written; ADR-027, the Android platform adapter, and its amendments now decide this story",
         "expectedDecisions": {
           "sqlCipherKeyDerivation": "TEE-backed key derivation for database encryption key"
         },
@@ -6461,7 +6530,7 @@
           "ADR-025 — Apple adapter as parallel reference"
         ]
       },
-      "result": "AndroidStorage.kt implemented with TEE-backed AES-256 key derivation via Android Keystore. InMemoryStorageProvider for testing. 548-line test suite. Commit 775403b."
+      "result": "AndroidStorage.kt implemented. The SQLCipher passphrase is derived from an AES-256 key held by Android Keystore, and SQLCipher derives the database key from that passphrase; the adapter does not read `KeyInfo.securityLevel`, so it does not know whether the AES key sits in the TEE or in software. Each JVM unit test in `AndroidStorageTest.kt` runs against the test-only `InMemoryStorageProvider`, asserts an `AndroidStorage` constant, or checks `AndroidStorage`'s type and constructor by reflection or builds an `ScpException` from its error-code constants. None opens a SQLCipher database."
     },
     {
       "id": "SCP-114",
@@ -6473,7 +6542,7 @@
       "files": [
         "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/PlatformAdapter.kt"
       ],
-      "description": "Create the scp-platform/android/ module root in mod.rs. Declares and re-exports all Android platform adapter modules: key_custody, device_attestation, push_provider, storage. Platform adapters implement traits defined in scp-platform/ (KeyCustody, PushProvider, DeviceAttestation, Storage). Android module is conditionally compiled for Android targets only. Mirrors Apple platform module root SCP-097 (gate-5).",
+      "description": "Create the scp-platform/android/ module root in mod.rs. Declares and re-exports all Android platform adapter modules: key_custody, device_attestation, push_provider, storage. Android module is conditionally compiled for Android targets only. Mirrors Apple platform module root SCP-097 (gate-5).",
       "acceptanceCriteria": [
         "mod.rs declares pub mod for key_custody, device_attestation, push_provider, storage",
         "All Android adapter types re-exported from mod.rs",
@@ -9589,7 +9658,7 @@
       ],
       "description": "Scaffold the Kotlin SDK Gradle build infrastructure. Multi-module project with scp-kt (core JVM) and scp-kt-android (Android platform adapter). Must match ADR-028 layout conventions.",
       "acceptanceCriteria": [
-        "gradle build succeeds from bindings/kotlin/",
+        "gradle build -Pscp.uniffi.cargoFeatures=testing succeeds from bindings/kotlin/",
         "Multi-module structure matches ADR-028 layout (scp-kt + scp-kt-android)",
         "UniFFI-generated NativeLib.kt integration configured",
         "Android dependencies declared: Bouncy Castle, Play Integrity, FCM, SQLCipher, AndroidX Security",
@@ -9716,7 +9785,7 @@
         "crates/scp-ffi/src/runtime.rs",
         ".docs/specs/09-security-model.md"
       ],
-      "description": "Wire platform-injected KeyCustodyProvider callbacks through all three FFI bridges (PyO3, UniFFI, NAPI) into scp-core crypto operations. Currently, all bridges use InMemoryKeyCustody unconditionally — platform custody (Secure Enclave, Android Keystore) is implemented (SCP-093, SCP-110) but unreachable from Rust. KeyHandle references are not retained across FFI boundaries, making all cryptographic operations impossible with real key material.\n\nWithout this wiring, 14 scp-core public functions that take &impl KeyCustody are unreachable from production FFI code:\n- Identity: the identity-creation path that signs and publishes an inception event, and the rotation path that appends a `KeyState` event under the standing root (`09-security-model.md` §9.7.4.2 R2, R3)\n- Envelope: create_inner_envelope (message signing), derive_pseudonym (routing IDs)\n- Event log: CheckpointManager::maybe_create_checkpoint, CheckpointManager::force_create_checkpoint, generate_checkpoint (checkpoint signing)\n- UCAN: mint_ucan (token signing — py_ucan_mint is a stub that doesn't call scp-core yet), delegate_ucan (delegation chain signing — no FFI bridge function exists)\n- Sender keys: publish_sender_key_epoch_advance, request_sender_key, open_sender_key_response, send_block_notification, rotate_sender_key_for_block\n\nAdditionally, 4 internal functions (the signing-closure builder, rotate_active_key, create_new_identity_keys, and generate_checkpoint_at) take KeyCustody but are called by the above — they don't need separate FFI wiring. There is no migration function to wire: the identifier is the inception event's digest and never changes (`09-security-model.md` §9.7.4.2 R13), so SCP-008 implements rotation and the two reveal-authorized recovery kinds and no migration.\n\nseal_envelope takes a pre-computed routing_id: &[u8] parameter, so it does not take KeyCustody directly — but its two inputs (routing_id from derive_pseudonym and InnerEnvelope from create_inner_envelope) both require KeyCustody upstream. The entire message send path is blocked.\n\nAdditionally, the InMemoryKeyCustody implementation must use the HKDF-derived pseudonym_secret (crate::pseudonym::derive_pseudonym_secret, HKDF-SHA256 over the P-256 private scalar) as the HMAC key for derive_pseudonym, per §9.10.4.A. The HMAC key is the private-derived pseudonym_secret, never the public key — public-key-keyed derivation is rejected as a membership-enumeration oracle. The golden vector test must assert this private-seed-HKDF derivation.\n\nThis is a P0 blocker because:\n1. Routing IDs use a stub HMAC derivation (context.rs) instead of KeyCustody::derive_pseudonym — relay probes never match real envelopes\n2. InMemoryKeyCustody stores private keys in unprotected heap memory on mobile devices — the entire TEE/Secure Enclave security model is dead code\n3. Key rotation always errors (\"requires wired KeyCustodyProvider\")\n4. UniFFI KeyCustodyProvider callback interface is incomplete — missing derive_pseudonym and dh_agree methods vs the full KeyCustody trait (7 methods)\n5. Inner envelope signing, UCAN minting/delegation, checkpoint signing, and all sender key protocol operations are unreachable with platform key material\n6. py_ucan_mint (ucan.rs:320) is a stub that builds a local PyUcanToken without calling scp-core::mint_ucan — no real signing occurs\n7. No py_ucan_delegate bridge function exists despite the scp-core implementation being complete (SCP-056)\n8. InMemoryKeyCustody::derive_pseudonym must key the HMAC with the private-derived pseudonym_secret (HKDF-SHA256 over the P-256 private scalar) per §9.10.4.A, never the public key — public-key-keyed derivation is a rejected membership-enumeration oracle\n\nThe architecture is fully specified in ADR-006, ADR-021, ADR-022, ADR-025, ADR-027. Platform adapters are implemented. Only the wiring is missing.",
+      "description": "Wire platform-injected KeyCustodyProvider callbacks through all three FFI bridges (PyO3, UniFFI, NAPI) into scp-core crypto operations. Currently, all bridges use InMemoryKeyCustody unconditionally — platform custody adapters exist (`AppleKeyCustody` under SCP-093, which holds Ed25519 and X25519 keys in the Keychain where ADR-025 as amended on 2026-09-10 requires P-256 keys in the Secure Enclave; Android Keystore under SCP-110, which is in progress because the Android adapter holds Ed25519 keys where ADR-027 requires P-256) but Rust cannot reach them. KeyHandle references are not retained across FFI boundaries, making all cryptographic operations impossible with real key material.\n\nWithout this wiring, 14 scp-core public functions that take &impl KeyCustody are unreachable from production FFI code:\n- Identity: the identity-creation path that signs and publishes an inception event, and the rotation path that appends a `KeyState` event under the standing root (`09-security-model.md` §9.7.4.2 R2, R3)\n- Envelope: create_inner_envelope (message signing), derive_pseudonym (routing IDs)\n- Event log: CheckpointManager::maybe_create_checkpoint, CheckpointManager::force_create_checkpoint, generate_checkpoint (checkpoint signing)\n- UCAN: mint_ucan (token signing — py_ucan_mint is a stub that doesn't call scp-core yet), delegate_ucan (delegation chain signing — no FFI bridge function exists)\n- Sender keys: publish_sender_key_epoch_advance, request_sender_key, open_sender_key_response, send_block_notification, rotate_sender_key_for_block\n\nAdditionally, 4 internal functions (the signing-closure builder, rotate_active_key, create_new_identity_keys, and generate_checkpoint_at) take KeyCustody but are called by the above — they don't need separate FFI wiring. There is no migration function to wire: the identifier is the inception event's digest and never changes (`09-security-model.md` §9.7.4.2 R13), so SCP-008 implements rotation and the two reveal-authorized recovery kinds and no migration.\n\nseal_envelope takes a pre-computed routing_id: &[u8] parameter, so it does not take KeyCustody directly — but its two inputs (routing_id from derive_pseudonym and InnerEnvelope from create_inner_envelope) both require KeyCustody upstream. The entire message send path is blocked.\n\nAdditionally, the InMemoryKeyCustody implementation must use the HKDF-derived pseudonym_secret (crate::pseudonym::derive_pseudonym_secret, HKDF-SHA256 over the P-256 private scalar) as the HMAC key for derive_pseudonym, per §9.10.4.A. The HMAC key is the private-derived pseudonym_secret, never the public key — public-key-keyed derivation is rejected as a membership-enumeration oracle. The golden vector test must assert this private-seed-HKDF derivation.\n\nThis is a P0 blocker because:\n1. Routing IDs use a stub HMAC derivation (context.rs) instead of KeyCustody::derive_pseudonym — relay probes never match real envelopes\n2. InMemoryKeyCustody stores private keys in unprotected heap memory on mobile devices — the entire TEE/Secure Enclave security model is dead code\n3. Key rotation always errors (\"requires wired KeyCustodyProvider\")\n4. UniFFI KeyCustodyProvider callback interface is incomplete — missing derive_pseudonym and dh_agree methods vs the full KeyCustody trait (7 methods)\n5. Inner envelope signing, UCAN minting/delegation, checkpoint signing, and all sender key protocol operations are unreachable with platform key material\n6. py_ucan_mint (ucan.rs:320) is a stub that builds a local PyUcanToken without calling scp-core::mint_ucan — no real signing occurs\n7. No py_ucan_delegate bridge function exists despite the scp-core implementation being complete (SCP-056)\n8. InMemoryKeyCustody::derive_pseudonym must key the HMAC with the private-derived pseudonym_secret (HKDF-SHA256 over the P-256 private scalar) per §9.10.4.A, never the public key — public-key-keyed derivation is a rejected membership-enumeration oracle\n\nThe architecture is fully specified in ADR-006, ADR-021, ADR-022, ADR-025, ADR-027. Neither platform custody adapter holds the P-256 keys its ADR requires, and SCP-110 tracks the Android adapter's remaining gaps. This story adds the wiring from each bridge to the platform adapter.",
       "acceptanceCriteria": [
         "UniFFI KeyCustodyProvider callback interface includes all 7 KeyCustody trait methods: generate_keypair, sign, get_public_key, destroy_key, dh_agree, derive_pseudonym, custody_type",
         "UniFFI identity_create with CustodyMethod::Platform accepts an injected KeyCustodyProvider and creates the identity using it, signing and publishing the inception event through that provider",
@@ -9949,7 +10018,7 @@
         "crates/scp-ffi/src/runtime.rs",
         "crates/scp-ffi/src/lib.rs"
       ],
-      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the identifier with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolRepository (scp-core/store) exist, and platform implementations are done (SCP-113 Android, SCP-093 Apple). What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolRepository to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
+      "description": "py_identity_load (identity.rs:278) is a stub that reconstructs a PyIdentity from the identifier with in_memory custody instead of loading from persistent storage. The inline comment says \"full storage integration is a future story\" but no story was ever created.\n\nSCP-038 acceptance criterion 2 requires: \"py_identity_load(did) -> loads an existing identity from storage.\" This criterion is unmet. The Storage trait (scp-platform) and ProtocolRepository (scp-core/store) exist, and platform storage adapters exist: `AppleStorage` under SCP-094, and `AndroidStorage` under SCP-113, which is in progress because the adapter does not check that its SQLCipher key is TEE-backed and no unit test opens a SQLCipher database. What is missing is:\n\n1. A StorageProvider injection point in the Python FFI bridge (analogous to SCP-214 for KeyCustody)\n2. py_identity_load calling ProtocolRepository to retrieve persisted identity state\n3. py_identity_create persisting identity state after creation\n\nThis is the Storage counterpart to SCP-214 (KeyCustody wiring). Both are required for a functional production FFI bridge.",
       "acceptanceCriteria": [
         "Python FFI bridge accepts a StorageProvider at initialization (analogous to KeyCustody injection in SCP-214)",
         "py_identity_create persists identity state (DID, custody type, key handles) via StorageProvider after successful creation",

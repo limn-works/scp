@@ -43,7 +43,7 @@ in-memory-push = ["dep:uuid"]
 testing = ["software_platform", "in-memory-storage", "in-memory-push"]
 # Apple storage adapter with SQLCipher encryption (spec section 17.6).
 # Same engine as `sqlite` but encryption key provided by caller (Apple Keychain).
-apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
+apple = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:fs2"]
 # SQLite storage adapter with SQLCipher encryption (spec section 17.6).
 # `argon2` + `rand` back the passphrase key-derivation mode (§17.6) and its
 # per-database salt generation; the shared `kdf` module is the single source
@@ -52,7 +52,7 @@ apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 # `dep:libsqlite3-sys` names, on a non-Apple target only, the package rusqlite
 # already compiles, so that `vendored-openssl` below has an edge to set a
 # feature on; it adds no package to the build.
-sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2", "dep:libsqlite3-sys"]
+sqlite = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2", "dep:libsqlite3-sys"]
 # On a non-Apple target, compile OpenSSL from source into SQLCipher instead of
 # linking the build host's libcrypto (see the `rusqlite` comment in the workspace
 # Cargo.toml for what each host supplies). On an Apple target this feature
@@ -133,6 +133,9 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = tru
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }
+# Opens this crate's SQLCipher connections with SQLite's lookaside pool and page-cache
+# bulk block off (spec section 17.6).
+scp-sqlite-pools = { path = "../scp-sqlite-pools", version = "=0.1.0-beta.2", optional = true }
 hex = { workspace = true, optional = true }
 # fs2 provides advisory POSIX / Windows file locking — used by SqliteStorage
 # to refuse a second process/instance trying to open the same database

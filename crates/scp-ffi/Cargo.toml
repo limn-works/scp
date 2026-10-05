@@ -62,6 +62,9 @@ testing = [
 outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
+# Links the wiping global allocator every shipped artifact installs
+# (09-security-model.md §9.15, freed heap memory).
+scp-alloc = { path = "../scp-alloc" }
 async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async", "multiple-pymethods"] }
 tokio = { workspace = true }
@@ -107,6 +110,9 @@ tls_codec = "0.5"
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# The MCP subscription tests build a wired server with
+# `McpServer::with_event_source`, public only under `scp-mcp/testing`.
+scp-mcp = { path = "../scp-mcp", features = ["testing"] }
 pyo3 = { version = "0.24.1", features = ["auto-initialize", "multiple-pymethods"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing", "custody"] }

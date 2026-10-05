@@ -253,6 +253,21 @@ nothing:
                job writing it), a writer's
                matrix that drops on push the leg its `save-if` names, and any
                job whose `if:` answers a scenario differently from SCENARIOS.
+  macos-bridges
+               A pull request runs the four macOS bridge jobs (xcframework,
+               pyo3-module-macos, swift-build-test and bridge-parity-swift)
+               when the `swift` output is true, and all but swift-build-test
+               when the `python` output is true, and a merge_group run also
+               runs them on `rust`. A
+               condition that reads `rust` on pull requests too puts all four
+               back on every Rust pull request; one that drops `rust` from the
+               merge queue lands a Rust change no macOS bridge job ran; and a
+               filter that drops the uniffi or common directory skips them on a
+               pull request that changes a bridge they test. The `ci` aggregate
+               evaluates each job's own `if:`, so it passes all three. The check
+               computes each path group's filter outputs from the `changes` job
+               and reports every event whose answer differs from
+               MACOS_BRIDGE_PATH_CASES.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -743,6 +758,17 @@ RUST_ONLY_RUNS = {
     "xcframework": True,
 }
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
+# A Rust-only pull request skips the four macOS bridge jobs, while a Rust-only
+# merge_group run runs all four and a Rust-only push runs the two producers among
+# them, xcframework and pyo3-module-macos. MACOS_BRIDGE_PATH_CASES below states the
+# same rule per changed path.
+MACOS_BRIDGE_JOBS = (
+    "bridge-parity-swift",
+    "pyo3-module-macos",
+    "swift-build-test",
+    "xcframework",
+)
+RUST_ONLY_PR_RUNS = RUST_ONLY_RUNS | dict.fromkeys(MACOS_BRIDGE_JOBS, False)
 PYTHON_ONLY = DOCS_ONLY | {"python": "true"}
 PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
     (
@@ -794,7 +820,7 @@ SCENARIOS = {
         name="rust-only, pull_request",
         filters=RUST_ONLY,
         event="pull_request",
-        runs=on_event(RUST_ONLY_RUNS, "pull_request"),
+        runs=on_event(RUST_ONLY_PR_RUNS, "pull_request"),
     ),
     "docs-only, pull_request": Scenario(
         name="docs-only, pull_request",
@@ -6173,6 +6199,223 @@ def check_push_writer_mutants(doc: dict) -> None:
         )
 
 
+# CRITERION for macos_bridge_gaps: on a pull_request event, each of the four macOS
+# bridge jobs runs only when the `changes` job's `swift` output or `python` output is
+# true; those outputs read the `swift` and `python` filters, which between them hold
+# bindings/swift/**, bindings/python/**, crates/scp-ffi/uniffi/**,
+# crates/scp-ffi/common/** and crates/scp-ffi/src/**, and each ORs in the
+# `toolchain` filter; on a
+# merge_group event each also runs on the `rust` output; on a push the two producers
+# also run on `rust`, because each writes a cache.
+#
+# INDICATORS, not the criterion: each case below names one file a pull request in
+# that path group would touch. A case maps an event to the jobs that run; every job
+# MACOS_BRIDGE_JOBS lists and a case leaves out skips. swift-build-test is absent
+# from the python case on every event, because it runs a Swift suite whose
+# XCFramework no file under bindings/python/ or crates/scp-ffi/src/ reaches.
+MACOS_PRODUCERS = frozenset(("pyo3-module-macos", "xcframework"))
+MACOS_ALL = frozenset(MACOS_BRIDGE_JOBS)
+MACOS_PYTHON = frozenset(("bridge-parity-swift", "pyo3-module-macos", "xcframework"))
+MACOS_BRIDGE_PATH_CASES = (
+    (
+        "crates-only",
+        "crates/scp-runtime/src/lib.rs",
+        {"pull_request": frozenset(), "merge_group": MACOS_ALL, "push": MACOS_PRODUCERS},
+    ),
+    (
+        "swift",
+        "bindings/swift/Package.swift",
+        {"pull_request": MACOS_ALL, "merge_group": MACOS_ALL, "push": MACOS_PRODUCERS},
+    ),
+    (
+        "uniffi",
+        "crates/scp-ffi/uniffi/src/lib.rs",
+        {"pull_request": MACOS_ALL, "merge_group": MACOS_ALL, "push": MACOS_PRODUCERS},
+    ),
+    (
+        "common",
+        "crates/scp-ffi/common/src/lib.rs",
+        {"pull_request": MACOS_ALL, "merge_group": MACOS_ALL, "push": MACOS_PRODUCERS},
+    ),
+    (
+        "python",
+        "bindings/python/pyproject.toml",
+        {
+            "pull_request": MACOS_PYTHON,
+            "merge_group": MACOS_PYTHON,
+            "push": MACOS_PRODUCERS,
+        },
+    ),
+    (
+        "pyo3",
+        "crates/scp-ffi/src/lib.rs",
+        {"pull_request": MACOS_PYTHON, "merge_group": MACOS_ALL, "push": MACOS_PRODUCERS},
+    ),
+)
+
+STEP_FILTER_OUTPUT = re.compile(r"steps\.filter\.outputs\.([A-Za-z0-9_-]+)")
+
+
+def changed_path_outputs(doc: dict, path: str) -> dict[str, str]:
+    """Return the outputs `changes` publishes when a run changes one file.
+
+    Every output in ci.yml ORs together `steps.filter.outputs.<key> == 'true'`
+    comparisons, or reads one key bare, so an output is true when any filter it
+    names lists a pattern selecting the path. An output naming no filter key, or a
+    key the filter step does not define, raises, which stops the check rather than
+    publishing a "false" no run would publish.
+    """
+    filters = path_filters(doc["jobs"])
+    outputs: dict[str, str] = {}
+    for name, expression in (doc["jobs"]["changes"].get("outputs") or {}).items():
+        keys = STEP_FILTER_OUTPUT.findall(str(expression))
+        if not keys or any(key not in filters for key in keys):
+            raise ValueError(f"`changes` output {name!r} reads {keys}, not a filter key")
+        selected = any(pattern_covers(set(filters[key]), path) for key in keys)
+        outputs[name] = "true" if selected else "false"
+    return outputs
+
+
+def macos_bridge_gaps(doc: dict) -> list[str]:
+    """Return each (path group, event) whose macOS bridge jobs differ from the cases."""
+    gaps: list[str] = []
+    for label, path, expected in MACOS_BRIDGE_PATH_CASES:
+        try:
+            outputs = changed_path_outputs(doc, path)
+            for event, runs in expected.items():
+                actual = {
+                    job_id
+                    for job_id in MACOS_BRIDGE_JOBS
+                    if selects(doc["jobs"][job_id].get("if") or "true == 'true'", outputs, event)
+                }
+                if actual != runs:
+                    gaps.append(
+                        f"{label} ({path}), {event}: runs {sorted(actual)}, "
+                        f"expected {sorted(runs)}"
+                    )
+        except ValueError as unreadable:
+            gaps.append(f"{label} ({path}): this check cannot decide ({unreadable})")
+    return gaps
+
+
+def check_macos_bridges_follow_their_paths(doc: dict) -> None:
+    for job_id in MACOS_BRIDGE_JOBS:
+        check(f"ci.yml defines macOS bridge job {job_id}", job_id in doc["jobs"])
+    gaps = macos_bridge_gaps(doc)
+    check(
+        "ci.yml: a pull request runs the macOS bridge jobs only on their paths, the "
+        "merge queue on Rust too, and a push runs both producers on Rust",
+        not gaps,
+        "; ".join(gaps),
+    )
+
+
+def check_macos_bridge_mutants(doc: dict) -> None:
+    """Each way of breaking the macOS bridge rule is reported."""
+    guard = "(github.event_name != 'pull_request' && needs.changes.outputs.rust == 'true')"
+    crates_only = "crates-only (crates/scp-runtime/src/lib.rs)"
+
+    def with_condition(job_id: str, old: str, new: str) -> dict:
+        mutant = copy.deepcopy(doc)
+        current = " ".join(str(mutant["jobs"][job_id]["if"]).split())
+        check(f"{job_id}'s `if:` holds {old!r} for the mutant", old in current, current)
+        mutant["jobs"][job_id]["if"] = current.replace(old, new)
+        return mutant
+
+    def reported(mutant: dict, fragment: str) -> tuple[bool, str]:
+        gaps = macos_bridge_gaps(mutant)
+        return any(fragment in gap for gap in gaps), "; ".join(gaps) or "no gap reported"
+
+    for job_id in MACOS_BRIDGE_JOBS:
+        # The `rust` clause read on pull requests too, as it was before this rule.
+        mutant = with_condition(job_id, guard, "needs.changes.outputs.rust == 'true'")
+        found, detail = reported(mutant, f"{crates_only}, pull_request")
+        check(f"{job_id} running on a crates-only pull request is reported", found, detail)
+        check(
+            f"{job_id} running on a crates-only pull request disagrees with SCENARIOS",
+            any(
+                f"rust-only, pull_request: {job_id} runs" in line
+                for line in scenario_disagreements(mutant)
+            ),
+            f"{scenario_disagreements(mutant)}",
+        )
+        # The `rust` clause dropped from the merge queue as well.
+        mutant = with_condition(
+            job_id, guard, "(github.event_name == 'push' && needs.changes.outputs.rust == 'true')"
+        )
+        found, detail = reported(mutant, f"{crates_only}, merge_group")
+        check(f"{job_id} skipping a crates-only merge_group run is reported", found, detail)
+
+    for job_id in sorted(MACOS_PRODUCERS):
+        # The `rust` clause dropped from push, which leaves the producer's cache stale.
+        mutant = with_condition(
+            job_id,
+            guard,
+            "(github.event_name == 'merge_group' && needs.changes.outputs.rust == 'true')",
+        )
+        found, detail = reported(mutant, f"{crates_only}, push")
+        check(f"{job_id} skipping a crates-only push is reported", found, detail)
+        check(
+            f"{job_id} skipping a crates-only push is a push-writer gap",
+            any(gap.startswith(f"{job_id} writes") for gap in push_writer_gaps(mutant)),
+            f"{push_writer_gaps(mutant)}",
+        )
+
+    # Each path group, dropped from the clause that routes it.
+    python_pr = "python (bindings/python/pyproject.toml), pull_request"
+    swift_pr = "swift (bindings/swift/Package.swift), pull_request"
+    for job_id, clause, fragment in (
+        ("xcframework", "python", python_pr),
+        ("pyo3-module-macos", "python", python_pr),
+        ("bridge-parity-swift", "python", python_pr),
+        ("xcframework", "swift", swift_pr),
+        ("pyo3-module-macos", "swift", swift_pr),
+        ("swift-build-test", "swift", swift_pr),
+        ("bridge-parity-swift", "swift", swift_pr),
+    ):
+        mutant = with_condition(job_id, f"needs.changes.outputs.{clause} == 'true' || ", "")
+        found, detail = reported(mutant, fragment)
+        check(f"{job_id} without its {clause} clause is reported", found, detail)
+
+    # Each path group, dropped from the filter that routes it.
+    for label, patterns, fragment in (
+        (
+            "the uniffi path dropped from the swift filter",
+            {"swift": "crates/scp-ffi/uniffi/**"},
+            "uniffi (crates/scp-ffi/uniffi/src/lib.rs), pull_request",
+        ),
+        (
+            "the common path dropped from the swift and python filters",
+            {"swift": "crates/scp-ffi/common/**", "python": "crates/scp-ffi/common/**"},
+            "common (crates/scp-ffi/common/src/lib.rs), pull_request",
+        ),
+        ("bindings/swift dropped from the swift filter", {"swift": "bindings/swift/**"}, swift_pr),
+        (
+            "bindings/python dropped from the python filter",
+            {"python": "bindings/python/**"},
+            python_pr,
+        ),
+        (
+            "the PyO3 bridge path dropped from the python filter",
+            {"python": "crates/scp-ffi/src/**"},
+            "pyo3 (crates/scp-ffi/src/lib.rs), pull_request",
+        ),
+    ):
+        mutant = copy.deepcopy(doc)
+        step = next(
+            step
+            for step in mutant["jobs"]["changes"]["steps"]
+            if str(step.get("uses") or "").startswith("dorny/paths-filter")
+        )
+        filters = yaml.safe_load(step["with"]["filters"])
+        for key, pattern in patterns.items():
+            check(f"filter {key} lists {pattern} for the mutant", pattern in filters[key])
+            filters[key] = [entry for entry in filters[key] if entry != pattern]
+        step["with"]["filters"] = yaml.safe_dump(filters)
+        found, detail = reported(mutant, fragment)
+        check(f"{label} is reported", found, detail)
+
+
 def check_condition_grammar() -> None:
     """parse_condition reads the grammar ci.yml uses and refuses everything else."""
     outputs = {"rust": "true", "python": "false"}
@@ -6663,6 +6906,10 @@ def main() -> int:
     check_push_runs_every_cache_writer(workflow)
     check_push_writer_mutants(workflow)
 
+    print("macos-bridges — a pull request runs the macOS bridge jobs only on their paths")
+    check_macos_bridges_follow_their_paths(workflow)
+    check_macos_bridge_mutants(workflow)
+
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
     declared = set(jobs["ci"]["needs"])
@@ -6763,28 +7010,58 @@ def main() -> int:
     docs_pr = SCENARIOS["docs-only, pull_request"]
     docs_push = SCENARIOS["docs-only, push"]
     rust_merge = SCENARIOS["rust-only, merge_group"]
+    python_pr = SCENARIOS["python-only, pull_request"]
 
     print("rust-fanout — a Rust-only change runs binding test jobs")
     # SCENARIOS says each job below runs on a Rust-only change, so reporting it
     # `skipped` must reach an aggregate as one named failure. Narrowing that
     # job's `if:` in ci.yml back to its own binding directory makes an aggregate
-    # accept that skip, which drops this assertion's exit code to 0.
-    for job_id in (
-        "python-test",
-        "typescript-check",
-        "kotlin-test",
-        "swift-build-test",
+    # accept that skip, which drops this assertion's exit code to 0. A Rust-only
+    # pull request skips swift-build-test, so its case reads the merge_group run,
+    # where the `rust` clause still selects it.
+    for job_id, scenario in (
+        ("python-test", rust_pr),
+        ("typescript-check", rust_pr),
+        ("kotlin-test", rust_pr),
+        ("swift-build-test", rust_merge),
     ):
-        needs = build_needs(jobs, rust_pr)
+        needs = build_needs(jobs, scenario)
         needs[job_id]["result"] = "skipped"
-        code, out = run_aggregate(needs, rust_pr.event)
+        code, out = run_aggregate(needs, scenario.event)
         check(
-            f"{job_id} skipped on a Rust-only change -> exit 1 naming it",
+            f"{job_id} skipped on a Rust-only change ({scenario.event}) -> exit 1 naming it",
             code == 1 and job_id in out,
             out,
         )
 
-    python_pr = SCENARIOS["python-only, pull_request"]
+    print("macos-bridges — the aggregate judges a macOS bridge skip by event and path")
+    # A Rust-only pull request skips the four macOS bridge jobs and passes. The
+    # same skip fails a Rust-only merge_group run and a swift pull request, and
+    # the python pull request fails on a skip of each of its three; each failure
+    # names the job, so a verdict reached for another reason does not satisfy it.
+    needs = build_needs(jobs, rust_pr)
+    check(
+        "Rust-only pull request reports every macOS bridge job skipped",
+        all(needs[job_id]["result"] == "skipped" for job_id in MACOS_BRIDGE_JOBS),
+        f"{ {job_id: needs[job_id] for job_id in MACOS_BRIDGE_JOBS} }",
+    )
+    code, out = run_aggregate(needs, rust_pr.event)
+    check("Rust-only pull request, macOS bridge jobs skipped -> exit 0", code == 0, out)
+    swift_pr = SCENARIOS["swift-and-typescript, pull_request"]
+    for scenario, selected in (
+        (rust_merge, MACOS_BRIDGE_JOBS),
+        (swift_pr, MACOS_BRIDGE_JOBS),
+        (python_pr, ("bridge-parity-swift", "pyo3-module-macos", "xcframework")),
+    ):
+        for job_id in selected:
+            needs = build_needs(jobs, scenario)
+            needs[job_id]["result"] = "skipped"
+            code, out = run_aggregate(needs, scenario.event)
+            check(
+                f"{scenario.name}, macOS bridge job {job_id} skipped -> exit 1 naming it",
+                code == 1 and f"{job_id}: skipped" in out,
+                f"exit {code}: {out}",
+            )
 
     print("python-fanout — a change under bindings/python/ runs the wheel-features build")
     # rust-build-pyo3-production builds scp-ffi with bindings/python/pyproject.toml's

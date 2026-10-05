@@ -102,7 +102,7 @@
 #     Case 15 names one crate on the command line on a branch that changed another, and
 #     asserts that the summary names the package the run left uncompiled.
 #
-#     Case 16 changes a file under `crates/scp-clock/`, one of the nine packages the
+#     Case 16 changes a file under `crates/scp-clock/`, one of the ten packages the
 #     `wasm-protocol` job compiles for `wasm32-unknown-unknown`, and asserts that the
 #     summary names that target and starts no wasm compile of its own. A host `cargo
 #     check` accepts an API that target rejects.
@@ -259,17 +259,26 @@ trap 'rm -rf "$WORK"' EXIT
 #   $4 the exit code the stub `cargo` returns for `cargo fmt`
 #   $5 the exit code a stub `python3.12` returns, or the empty string for no such stub
 #
-# The stub `cargo` answers `check`, `fmt`, and `metadata` itself and hands every other
-# subcommand to the real cargo this harness found before it led PATH with the stub.
+# The stub `cargo` answers `check`, `fmt`, and a `metadata` that resolves dependencies
+# itself, answers `metadata` from a `metadata.json` beside the stubs when the case wrote
+# one, and hands every other call to the real cargo this harness found before it led PATH
+# with the stub.
 #
 # WHICH SUBCOMMANDS THE STUB ANSWERS, and the criterion that decides: a subcommand belongs
 # to the stub when the real one waits on the shared target directory's build lock, because
 # this harness must finish in a bounded time on a machine where some other worktree is
 # always compiling. `cargo check` waits by definition. `cargo fmt` waits because it resolves
-# the workspace through a full `cargo metadata` first, and `cargo metadata` waits for the
-# same reason. Measured on 2026-09-13: an earlier revision of this file delegated `fmt`, and
-# one case sat in it for 87 minutes behind another worktree's `cargo clippy --workspace`
-# until a 2400-second bound killed the run after case 1.
+# the workspace through a full `cargo metadata` first, and a `cargo metadata` without
+# `--no-deps` waits for the same reason, so the stub refuses one rather than delegate it.
+# Measured on 2026-09-13: an earlier revision of this file delegated `fmt`, and one case
+# sat in it for 87 minutes behind another worktree's `cargo clippy --workspace` until a
+# 2400-second bound killed the run after case 1.
+#
+# `cargo metadata --no-deps` resolves no dependency and reads only the workspace's
+# manifests, so it stays delegated when the case wrote no `metadata.json`. Case 3 runs
+# `scripts/check-wiping-allocator.sh` over this repository, and that gate fails closed on a
+# metadata answer that lists no package; an earlier revision of this stub answered every
+# `metadata` call with an object holding no package list, which turned case 3 red.
 #
 # `cargo tree` stays delegated, so the twelve resolutions inside
 # `scripts/check-shipped-feature-graph.sh` and `scripts/check-protocol-deps.sh` read this
@@ -327,15 +336,20 @@ case "\$1" in
     metadata)
         # The runner reads two things out of this answer: the target directory its summary
         # names, and the dependency declarations its compile step derives a feature set
-        # from. A case that wants the second writes its own JSON to metadata.json beside
-        # these stubs; every other case gets the object below, which carries no package
-        # list and drives the runner's "this run could not read them" branch.
+        # from. A fixture case writes its answer to metadata.json beside these stubs,
+        # either through write_no_package_metadata below or as JSON of its own.
         if [[ -f "$dir/metadata.json" ]]; then
             cat "$dir/metadata.json"
-        else
-            printf '{"version":1,"target_directory":"$dir/stub-target-dir"}\n'
+            exit 0
         fi
-        exit 0
+        no_deps=0
+        for arg in "\$@"; do
+            [[ \$arg == --no-deps ]] && no_deps=1
+        done
+        if [[ \$no_deps -eq 0 ]]; then
+            printf 'stub cargo refuses a cargo metadata that resolves dependencies: %s\n' "\$*" >&2
+            exit 101
+        fi
         ;;
 esac
 # Delegating means removing this directory from PATH first. The cargo on PATH here is a
@@ -349,6 +363,14 @@ exec cargo "\$@"
 EOF
 
     chmod +x "$dir/bin/rustc" "$dir/bin/rustup" "$dir/bin/cargo"
+}
+
+# Make the stub `cargo` under $1 answer `cargo metadata` with an object that names a target
+# directory and carries no package list, which drives the runner's "this run could not read
+# them" branch. A fixture repository is no workspace the real cargo can read, so every
+# fixture harness that writes no JSON of its own calls this.
+write_no_package_metadata() {
+    printf '{"version":1,"target_directory":"%s/stub-target-dir"}\n' "$1" > "$1/metadata.json"
 }
 
 # Run this repository's own `scripts/fix-round-check.sh` against one named crate, under the
@@ -450,6 +472,7 @@ fixture_commit() {
 run_fixture() {
     local root=$1 harness="$1.harness"
     write_stubs "$harness" "$PIN_CHANNEL" 0 0 ""
+    write_no_package_metadata "$harness"
     PATH="$harness/bin:$PATH" bash "$root/scripts/fix-round-check.sh" > "$harness/out.txt" 2>&1
     printf '%s' $? > "$harness/rc.txt"
 }
@@ -941,6 +964,7 @@ build_fixture "$FIXTURE15"
 fixture_commit "$FIXTURE15" crates/scp-ffi/napi/src/lib.rs
 HARNESS15="$FIXTURE15.harness"
 write_stubs "$HARNESS15" "$PIN_CHANNEL" 0 0 ""
+write_no_package_metadata "$HARNESS15"
 PATH="$HARNESS15/bin:$PATH" bash "$FIXTURE15/scripts/fix-round-check.sh" scp-clock \
     > "$HARNESS15/out.txt" 2>&1
 printf '%s' $? > "$HARNESS15/rc.txt"
@@ -963,7 +987,7 @@ fi
 
 # ── Case 16: the wasm target the host compile does not reach ─────────────────────────
 #
-# The `wasm-protocol` job of `.github/workflows/ci.yml` runs one `cargo check` over nine
+# The `wasm-protocol` job of `.github/workflows/ci.yml` runs one `cargo check` over ten
 # packages for `wasm32-unknown-unknown`. `scp-clock` is one of them, and a host `cargo
 # check` accepts an API that target rejects, so a run that compiled `scp-clock` for the
 # host alone and printed `compile ok` would tell a fix agent that the wasm build is safe.
@@ -1474,6 +1498,7 @@ fixture_commit "$FIXTURE24" crates/scp-ffi/napi/src/lib.rs
 git -C "$FIXTURE24" update-ref -d refs/remotes/origin/main
 HARNESS24="$FIXTURE24.harness"
 write_stubs "$HARNESS24" "$PIN_CHANNEL" 0 0 ""
+write_no_package_metadata "$HARNESS24"
 PATH="$HARNESS24/bin:$PATH" bash "$FIXTURE24/scripts/fix-round-check.sh" scp-clock \
     > "$HARNESS24/out.txt" 2>&1
 printf '%s' $? > "$HARNESS24/rc.txt"
@@ -1565,6 +1590,54 @@ if [[ $GITHUB_LANE_QUALIFIED -gt 0 ]]; then
     report "case 25 found at least one suite that reads this repository's workflow files" 0 ""
 else
     report "case 25 found at least one suite that reads this repository's workflow files" 1 "no suite .github/workflows/ci.yml starts under scripts/ matched the repository-rooted workflow read this case looks for, so the assertion above compared an empty set and could not fail"
+fi
+
+# ── Case 26: the wiping-allocator gate exits non-zero when it dies mid-run ──────────────
+#
+# THE CRITERION: a run of `scripts/check-wiping-allocator.sh` that dies before a deliberate
+# exit, from a failed command under `set -e` or an unbound variable under `set -u`, exits
+# non-zero. The run-tests harness runs that gate in case 3, so a gate that exits 0 after a
+# death turns case 3 green on a check it never finished.
+#
+# The gate cannot read the status of a death from `$?`: on bash 3.2 `$?` inside an EXIT
+# trap reads 0 after a `set -u` death. Its EXIT trap exits with `${exit_code:-1}`, and
+# every deliberate exit sets `exit_code` first, so a death leaves it empty and exits 1.
+#
+# This case puts a cargo on PATH that fails every call, and runs the real gate with no
+# argument under `/bin/bash`, which is bash 3.2 on macOS and bash 5 on the Linux runners.
+# The fixtures need no cargo and pass; the gate's `cargo metadata --no-deps` then fails,
+# and `set -e` ends the run inside `main` with `exit_code` still empty. The case asserts
+# the exit status 1, that the run got past the fixtures, that the stub cargo saw the
+# `metadata` call, and that no PASSED line was printed.
+#
+# The mutation it kills: writing `exit "${exit_code:-0}"` in the gate's `finish` makes
+# this run exit 0, and every other assertion in this file still passes.
+HARNESS26="$WORK/wiping-death"
+mkdir -p "$HARNESS26/bin"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/cargo.log"\nexit 101\n' "$HARNESS26" > "$HARNESS26/bin/cargo"
+chmod +x "$HARNESS26/bin/cargo"
+: > "$HARNESS26/cargo.log"
+WIPING26_RC=0
+PATH="$HARNESS26/bin:$PATH" /bin/bash "$REPO_ROOT/scripts/check-wiping-allocator.sh" > "$HARNESS26/out.txt" 2>&1 || WIPING26_RC=$?
+if [[ $WIPING26_RC -eq 1 ]]; then
+    report "case 26 a wiping-allocator gate run that dies at cargo metadata exits 1" 0 ""
+else
+    report "case 26 a wiping-allocator gate run that dies at cargo metadata exits 1" 1 "the gate exited $WIPING26_RC: $(tail -n 4 "$HARNESS26/out.txt")"
+fi
+if grep -qF 'FIXTURE HARNESS: all behavioral proofs passed.' "$HARNESS26/out.txt"; then
+    report "case 26 reached the gate's main past its fixtures" 0 ""
+else
+    report "case 26 reached the gate's main past its fixtures" 1 "the output holds no fixture pass line, so the run stopped somewhere else: $(tail -n 4 "$HARNESS26/out.txt")"
+fi
+if grep -q '^metadata ' "$HARNESS26/cargo.log"; then
+    report "case 26 died at the gate's cargo metadata call" 0 ""
+else
+    report "case 26 died at the gate's cargo metadata call" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS26/cargo.log")"
+fi
+if grep -qF 'PASSED:' "$HARNESS26/out.txt"; then
+    report "case 26 printed no PASSED line" 1 "the gate printed PASSED after its cargo metadata call failed"
+else
+    report "case 26 printed no PASSED line" 0 ""
 fi
 
 printf '\n'

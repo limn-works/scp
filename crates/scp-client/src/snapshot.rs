@@ -72,7 +72,10 @@
 //! field holding key material or decrypted plaintext has a type that wipes on
 //! drop (`Zeroizing`, or `SenderKey`'s `ZeroizeOnDrop`), so a snapshot wipes
 //! those fields when it drops. Buffers that serde and `rmp_serde` allocate and
-//! free while decoding a snapshot are not wiped.
+//! free while decoding a snapshot are wiped as they are freed by the wiping
+//! global allocator every shipped artifact installs (security model spec §9.15,
+//! freed heap memory), and by nothing in an application that links this crate
+//! without `scp-alloc`.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -598,16 +601,16 @@ impl ContextSnapshot {
 
     /// Serializes this snapshot to a `MessagePack` blob for storage.
     ///
-    /// The blob carries the MLS signer and group secrets, so it is written into
-    /// one exactly-sized buffer that is wiped on drop; the bytes equal
-    /// `rmp_serde::to_vec_named`'s (security model spec §9.15 step 2).
+    /// The blob carries the MLS signer and group secrets, so it is returned in
+    /// a buffer wiped on drop (security model spec §9.15 step 2).
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::StorageCorrupt`] if the snapshot cannot be
     /// serialized into a durable blob (unreachable for a well-formed snapshot).
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, ClientError> {
-        scp_mls::secret_msgpack::encode_named(self)
+        rmp_serde::to_vec_named(self)
+            .map(Zeroizing::new)
             .map_err(|e| ClientError::StorageCorrupt(format!("serializing context snapshot: {e}")))
     }
 
