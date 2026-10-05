@@ -2963,12 +2963,16 @@ fn check_invocation_error_to_context(
 /// The per-variant `(class, code, slug, detail, retry)` mapping is
 /// single-sourced on [`InvocationError::to_surface`] — never re-derived in the
 /// bridges.
-// Ownership-consuming conversion (a `From`-like seam): every caller hands over
-// an owned `InvocationError` it no longer needs. `to_surface` borrows, so the
-// value is dropped at the end — the by-value signature is the natural shape.
-#[allow(clippy::needless_pass_by_value)]
+///
+/// A shutdown refusal is not an outlet error: it keeps `SCP-CTX-2138` as
+/// `ContextError::SupervisorShutDown` (ADR-049 Decision 16 item 2).
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
-    ContextError::Outlet(Box::new(err.to_surface()))
+    match err {
+        InvocationError::SupervisorShutDown { message } => {
+            ContextError::SupervisorShutDown(message)
+        }
+        other => ContextError::Outlet(Box::new(other.to_surface())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3661,6 +3665,26 @@ mod tests {
                     "outlet errors must not flatten to PermissionDenied(String)"
                 );
             }
+        }
+
+        /// A shutdown refusal crosses the seam as `SupervisorShutDown` with its
+        /// detail intact; `ContextNotActive` stays a typed outlet error.
+        #[test]
+        fn invocation_error_to_context_keeps_supervisor_shut_down() {
+            match super::super::invocation_error_to_context(InvocationError::SupervisorShutDown {
+                message: "open refused".into(),
+            }) {
+                ContextError::SupervisorShutDown(m) => assert_eq!(m, "open refused"),
+                other => panic!("expected ContextError::SupervisorShutDown, got {other:?}"),
+            }
+            let not_active =
+                super::super::invocation_error_to_context(InvocationError::ContextNotActive {
+                    current_state: "Closing".into(),
+                });
+            assert!(
+                matches!(not_active, ContextError::Outlet(_)),
+                "got {not_active:?}"
+            );
         }
 
         /// SCP-OUT-031 PR-2a — direct coverage of the supervisor-side

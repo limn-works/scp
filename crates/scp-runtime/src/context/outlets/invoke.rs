@@ -64,6 +64,18 @@ pub enum InvocationError {
         current_state: String,
     },
 
+    /// The Supervisor refused the operation because `shutdown_all_contexts`
+    /// has begun (ADR-049 Decision 16 item 2). Crosses the runtime-to-
+    /// [`ContextError`](scp_protocol::context::ContextError) seam as
+    /// `ContextError::SupervisorShutDown`.
+    ///
+    /// Error code: `SCP-CTX-2138`.
+    #[error("SCP-CTX-2138: {message}")]
+    SupervisorShutDown {
+        /// The refusal detail carried by `ContextError::SupervisorShutDown`.
+        message: String,
+    },
+
     /// The invoker does not have the required capability.
     #[error(
         "invoker \"{did}\" does not have OutletCall(\"{outlet_id}\") or OutletCallAll capability"
@@ -3114,8 +3126,9 @@ fn fresh_request_id() -> RequestId {
 pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPayload {
     use scp_protocol::context::outlets::error_codes::{
         CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION,
-        CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED,
-        SLUG_ECONOMIC_BUDGET_EXCEEDED, SLUG_INPUT_SCHEMA_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION,
+        CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION,
+        SLUG_AUTHORIZATION_DENIED, SLUG_ECONOMIC_BUDGET_EXCEEDED, SLUG_INPUT_SCHEMA_VIOLATION,
+        SLUG_OUTPUT_SCHEMA_VIOLATION, SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
         SLUG_QUERY_VIOLATION,
     };
     // The slug is included in the resulting Error chunk's `message`
@@ -3125,6 +3138,11 @@ pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPaylo
         InvocationError::ContextNotActive { .. } => {
             (CODE_PROTOCOL_VIOLATION, "protocol.context-not-active")
         }
+        // §5.4.4 registers no shutdown slug; this pair matches `to_surface`.
+        InvocationError::SupervisorShutDown { .. } => (
+            CODE_PROTOCOL_SESSION,
+            SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+        ),
         // Spec §5.4.4 query-oracle-collapse: unknown outlets and
         // unauthorized callers both surface as `authorization.denied`
         // so the existence (or registration) of the outlet is not
@@ -3257,11 +3275,16 @@ impl InvocationError {
             // slug/code. The free-text `current_state` is not part of the
             // structured surface (structured errors carry no prose); the wire
             // terminal chunk keeps the descriptive string.
-            Self::ContextNotActive { .. } => OutletErrorSurface::from_code(
-                CODE_PROTOCOL_SESSION,
-                SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
-                None,
-            ),
+            // `SupervisorShutDown` has no §5.4.4 slug and shares this pair;
+            // `invocation_error_to_context` maps it to
+            // `ContextError::SupervisorShutDown` without calling `to_surface`.
+            Self::ContextNotActive { .. } | Self::SupervisorShutDown { .. } => {
+                OutletErrorSurface::from_code(
+                    CODE_PROTOCOL_SESSION,
+                    SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                    None,
+                )
+            }
             // §5.4.4 query-oracle-collapse: unauthorized callers AND unknown
             // outlets both collapse onto `authorization.denied` with NO detail,
             // so outlet existence/registration is never leaked.
@@ -5714,6 +5737,8 @@ pub(crate) async fn record_streaming_saga_a_event(
 /// # Errors
 ///
 /// Returns [`InvocationError`]:
+/// - [`SupervisorShutDown`](InvocationError::SupervisorShutDown) — the
+///   Supervisor's tracker refused the spawner because shutdown has begun.
 /// - [`OutletNotFound`](InvocationError::OutletNotFound) — the outlet is not in
 ///   B's registry.
 /// - [`CrossContextPaidActionUnsupported`](InvocationError::CrossContextPaidActionUnsupported)
@@ -5752,9 +5777,11 @@ where
     // B's stream is open (ADR-049 Decision 16, item 2).
     let spawner = supervisor
         .tracked_spawner("open cross-context outlet stream")
-        .map_err(|_refused| {
-            crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown
-                .to_invocation_error()
+        .map_err(|refused| InvocationError::SupervisorShutDown {
+            message: match refused {
+                scp_protocol::context::ContextError::SupervisorShutDown(message) => message,
+                other => other.to_string(),
+            },
         })?;
 
     // Look up the registration in B's registry: the economy gate reads its
@@ -9252,16 +9279,18 @@ mod tests {
         }
 
         /// Once shutdown has begun, a cross-context open is refused before the
-        /// registry lookup with `ContextNotActive`, never `ExecutionFailed`
-        /// (the handler-panic surface).
+        /// registry lookup with `SupervisorShutDown` (`SCP-CTX-2138`), never
+        /// `ContextNotActive` or `ExecutionFailed` (the handler-panic surface).
         #[tokio::test]
-        async fn closed_spawn_gate_refuses_cross_context_open_as_context_not_active() {
+        async fn closed_spawn_gate_refuses_cross_context_open_as_supervisor_shut_down() {
             let result = cross_context_with_gate(true).await;
             match result {
-                Err(InvocationError::ContextNotActive { current_state }) => {
-                    assert_eq!(current_state, "supervisor shut down");
+                Err(err @ InvocationError::SupervisorShutDown { .. }) => {
+                    let text = err.to_string();
+                    assert!(text.starts_with("SCP-CTX-2138: "), "got {text}");
+                    assert_eq!(text.matches("SCP-CTX-2138").count(), 1, "got {text}");
                 }
-                other => panic!("expected ContextNotActive, got {other:?}"),
+                other => panic!("expected SupervisorShutDown, got {other:?}"),
             }
         }
 
@@ -10154,6 +10183,9 @@ mod tests {
             },
             InvocationError::CrossContextPaidActionUnsupported {
                 outlet_id: "o".into(),
+            },
+            InvocationError::SupervisorShutDown {
+                message: "m".into(),
             },
             // Registered SAME-class caveat slugs are identical on both maps.
             InvocationError::CaveatViolation {
