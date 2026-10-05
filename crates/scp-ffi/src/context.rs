@@ -64,10 +64,22 @@ enum CloseDecision {
 }
 
 /// The refusal `context_close` returns for a lifecycle state it neither
-/// dispatches for nor releases.
-fn close_state_refusal(state: &scp_core::context::ContextState) -> PyErr {
+/// dispatches for nor releases: `SCP-CTX-2134` (`ContextPoisoned`) for
+/// `Poisoned`, and `SCP-CTX-2017` naming the state for every other state.
+fn close_state_refusal(
+    context_id: &str,
+    state: &scp_core::context::ContextState,
+) -> crate::error::ScpPyError {
+    if matches!(state, scp_core::context::ContextState::Poisoned) {
+        return crate::error::ScpPyError::from(scp_core::context::ContextError::ContextPoisoned(
+            context_id.to_owned(),
+        ));
+    }
     let state_name = context_state_str(state);
-    PyRuntimeError::new_err(format!("cannot close context in '{state_name}' state"))
+    crate::error::ScpPyError::ContextError {
+        message: format!("cannot close context in '{state_name}' state"),
+        code: codes::CTX_2017.to_owned(),
+    }
 }
 
 /// Decides from the supervisor's first lifecycle answer what `context_close`
@@ -75,9 +87,12 @@ fn close_state_refusal(state: &scp_core::context::ContextState) -> PyErr {
 ///
 /// # Errors
 ///
-/// Returns `RuntimeError` naming the state for `Creating`, `Closing`,
+/// Returns [`close_state_refusal`]'s error for `Creating`, `Closing`,
 /// `MigratingOut` and `Poisoned`.
-fn close_decision(state: Option<&scp_core::context::ContextState>) -> PyResult<CloseDecision> {
+fn close_decision(
+    context_id: &str,
+    state: Option<&scp_core::context::ContextState>,
+) -> Result<CloseDecision, crate::error::ScpPyError> {
     use scp_core::context::ContextState;
     match state {
         None | Some(ContextState::Closed | ContextState::Expired | ContextState::Tombstoned) => {
@@ -89,7 +104,7 @@ fn close_decision(state: Option<&scp_core::context::ContextState>) -> PyResult<C
             | ContextState::Closing
             | ContextState::MigratingOut
             | ContextState::Poisoned),
-        ) => Err(close_state_refusal(other)),
+        ) => Err(close_state_refusal(context_id, other)),
     }
 }
 
@@ -99,8 +114,9 @@ fn close_decision(state: Option<&scp_core::context::ContextState>) -> PyResult<C
 /// # Errors
 ///
 /// Returns the errors `context_close` documents for its close decision and its
-/// `CloseContext` dispatch, and a `RuntimeError` when the supervisor reports
-/// the context `Active` again after the dispatch or the skipped dispatch.
+/// `CloseContext` dispatch, and a `ContextError` with code `SCP-CTX-2017` when
+/// the supervisor reports the context `Active` again after the dispatch or the
+/// skipped dispatch.
 fn close_context_on(
     bi: &crate::runtime::PyBridgeInstance,
     handle: &PyContextHandle,
@@ -108,7 +124,7 @@ fn close_context_on(
     sup: &std::sync::Arc<scp_core::context::supervisor::Supervisor>,
     live: Option<&scp_core::context::ContextState>,
 ) -> PyResult<()> {
-    let decision = close_decision(live)?;
+    let decision = close_decision(&handle.context_id, live)?;
     // ----------------------------------------------------------------
     // Teardown ordering (close-auth-honoring, fail-closed on success).
     //
@@ -164,17 +180,16 @@ fn close_context_on(
             }),
             reply: tx,
         };
-        // Returns `Result<Result<CloseResult, ContextError>, String>` so
-        // `check_close_dispatch_outcome` can single out
-        // `ContextError::ContextNotRegistered`.
+        // A dispatch error and the actor's reply both arrive as the inner
+        // `ContextError`; the outer error is a dropped reply.
         let dispatch_outcome: Result<
             Result<scp_core::context::ttl::CloseResult, scp_core::context::ContextError>,
-            String,
+            tokio::sync::oneshot::error::RecvError,
         > = rt.block_on(async move {
-            sup.dispatch_lifecycle_command(cmd)
-                .await
-                .map_err(|e| format!("supervisor dispatch_lifecycle_command failed: {e}"))?;
-            rx.await.map_err(|e| format!("shim reply dropped: {e}"))
+            if let Err(e) = sup.dispatch_lifecycle_command(cmd).await {
+                return Ok(Err(e));
+            }
+            rx.await
         });
         // A failed dispatch returns its error here and releases nothing.
         check_close_dispatch_outcome(dispatch_outcome)?;
@@ -183,10 +198,13 @@ fn close_context_on(
     // Remove the FFI bridge state, so bridge outlet dispatch fails closed for
     // this id, unless the supervisor reports the context `Active` again.
     if !crate::runtime::release_context_unless_readmitted(bi, sup, &handle.context_id) {
-        return Err(PyRuntimeError::new_err(
-            "the context returned to Active while this close ran; it stays open and keeps its \
-             state on this bridge",
-        ));
+        return Err(crate::error::ScpPyError::ContextError {
+            message: "the context returned to Active while this close ran; it stays open and \
+                      keeps its state on this bridge"
+                .to_owned(),
+            code: codes::CTX_2017.to_owned(),
+        }
+        .into());
     }
 
     // Transition directly to "closed" (skipping "closing" for the bridge
@@ -214,38 +232,25 @@ fn close_context_on(
 /// Turns the outcome of `context_close`'s `CloseContext` dispatch into the
 /// close's result.
 ///
-/// `ContextNotRegistered` is an error here, although `context_close` dispatches
-/// only after the supervisor answered `Active`: the dispatch takes that error
-/// from `Supervisor::lookup_miss_error`, which can report it for a context
-/// whose actor the crash watchdog respawned while the dispatch missed. That
-/// error is therefore no proof that the close already happened.
-///
 /// # Errors
 ///
-/// Returns `ContextError` with code `SCP-CTX-2001` for `ContextNotRegistered`,
-/// and `RuntimeError` carrying the failure for every other failure.
+/// Returns the dispatch's `ContextError` converted through
+/// `ScpPyError::from`, which gives `ContextNotRegistered` code `SCP-CTX-2001`,
+/// and a `ContextError` with code `SCP-CTX-2000` when the actor's reply was
+/// dropped.
 fn check_close_dispatch_outcome(
     outcome: Result<
         Result<scp_core::context::ttl::CloseResult, scp_core::context::ContextError>,
-        String,
+        tokio::sync::oneshot::error::RecvError,
     >,
-) -> PyResult<()> {
+) -> Result<(), crate::error::ScpPyError> {
     match outcome {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e @ scp_core::context::ContextError::ContextNotRegistered(_))) => {
-            Err(crate::error::ScpPyError::ContextError {
-                message: format!(
-                    "Supervisor close_context found no actor for a context it had reported \
-                     active ({e}); this close released nothing, so retry it"
-                ),
-                code: codes::CTX_2001.to_owned(),
-            }
-            .into())
-        }
-        Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
-            "Supervisor close_context failed: {e}"
-        ))),
-        Err(message) => Err(PyRuntimeError::new_err(message)),
+        Ok(Err(e)) => Err(crate::error::ScpPyError::from(e)),
+        Err(e) => Err(crate::error::ScpPyError::ContextError {
+            message: format!("close_context shim reply dropped: {e}"),
+            code: codes::CTX_2000.to_owned(),
+        }),
     }
 }
 
@@ -3563,24 +3568,21 @@ impl crate::scp::PyScp {
     ///
     /// For the supervisor read this call takes before deciding whether to
     /// dispatch, it releases nothing and returns:
-    /// - `RuntimeError` naming the state if the read reports the context
-    ///   `creating`, `closing`, `migrating_out` or `poisoned`;
+    /// - `ContextError` with code `SCP-CTX-2017` naming the state if the read
+    ///   reports the context `creating`, `closing` or `migrating_out`, and
+    ///   with code `SCP-CTX-2134` (`ContextPoisoned`) if it reports `poisoned`;
     /// - `ContextError` for the read's error, among them code `SCP-CTX-2135`
     ///   (`ActorCrashed`) for the causes `Supervisor::read_context_state_checked`
     ///   documents.
     ///
-    /// Returns `RuntimeError` carrying the dispatch's failure and releases
-    /// nothing if the `CloseContext` dispatch fails with any error but
-    /// `ContextNotRegistered`.
+    /// Returns `ContextError` carrying the dispatch's code and releases nothing
+    /// if the `CloseContext` dispatch fails: `SCP-CTX-2001` when the dispatch
+    /// finds no actor, and `SCP-CTX-2000` when the actor's reply is dropped.
     ///
-    /// After the dispatch succeeds or is skipped, it returns a `RuntimeError`
-    /// and releases nothing if the supervisor read this call takes next
-    /// reports the context `active`.
+    /// After the dispatch succeeds or is skipped, it returns `ContextError`
+    /// with code `SCP-CTX-2017` and releases nothing if the supervisor read
+    /// this call takes next reports the context `active`.
     ///
-    /// Returns `ContextError` with code `SCP-CTX-2001` and releases nothing if
-    /// the supervisor reported the context `active` and the close dispatch
-    /// then found no actor for it: a respawn can produce that answer for a
-    /// context that is still open, so the caller retries the close.
     /// Returns the bridge's supervisor-resolution error unchanged when the
     /// bridge is suspended or has no `ContextManager` attached.
     /// Returns `ContextError` if the caller lacks the `ContextClose` capability.
@@ -8197,41 +8199,44 @@ mod tests {
         );
     }
 
-    /// A `CloseContext` dispatch that answers `ContextNotRegistered` fails the
-    /// close, so `context_close` releases no bridge state on that answer.
-    ///
-    /// `Supervisor::lookup_miss_error` can return `ContextNotRegistered` for a
-    /// context whose actor the crash watchdog respawned while the dispatch
-    /// missed, so a close that read that answer as an idempotent success
-    /// skipped the actor's `ContextClose` check and released the bridge state
-    /// of a context that was still open.
+    /// A failed `CloseContext` dispatch fails the close with a coded
+    /// `ContextError`: `ContextNotRegistered` carries `SCP-CTX-2001`,
+    /// `ContextPoisoned` `SCP-CTX-2134`, `ActorCrashed` `SCP-CTX-2135`, a
+    /// denial its embedded code, and a dropped reply `SCP-CTX-2000`.
     #[test]
-    fn close_dispatch_that_finds_no_actor_fails_the_close() {
-        let err = super::check_close_dispatch_outcome(Ok(Err(
-            scp_core::context::ContextError::ContextNotRegistered("ctx".to_owned()),
-        )))
-        .expect_err("a dispatch that found no actor must fail the close");
-        let text = err.to_string();
-        assert!(
-            text.contains(codes::CTX_2001) && text.contains("retry"),
-            "the refusal must carry SCP-CTX-2001 and tell the caller to retry: {text}"
-        );
+    fn close_dispatch_that_fails_returns_its_code() {
+        use scp_core::context::ContextError as CE;
+        for (error, code) in [
+            (CE::ContextNotRegistered("ctx".to_owned()), codes::CTX_2001),
+            (CE::ContextPoisoned("ctx".to_owned()), codes::CTX_2134),
+            (CE::ActorCrashed("ctx".to_owned()), codes::CTX_2135),
+            (
+                CE::PermissionDenied("no context:close".to_owned()),
+                codes::PERM_3001,
+            ),
+        ] {
+            let err = super::check_close_dispatch_outcome(Ok(Err(error)))
+                .expect_err("a failed dispatch must fail the close");
+            assert!(
+                err.to_string().starts_with(&format!("[{code}]")),
+                "expected {code}, got: {err}"
+            );
+        }
 
-        let denied = super::check_close_dispatch_outcome(Ok(Err(
-            scp_core::context::ContextError::PermissionDenied("no context:close".to_owned()),
-        )))
-        .expect_err("a denied dispatch must fail the close");
-        assert!(
-            denied
-                .to_string()
-                .contains("Supervisor close_context failed"),
-            "denied dispatch reported: {denied}"
-        );
-
-        let undelivered = super::check_close_dispatch_outcome(Err("shim reply dropped".to_owned()))
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<Result<scp_core::context::ttl::CloseResult, CE>>();
+        drop(tx);
+        let dropped = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(rx);
+        let undelivered = super::check_close_dispatch_outcome(dropped)
             .expect_err("a dispatch that lost its reply must fail the close");
         assert!(
-            undelivered.to_string().contains("shim reply dropped"),
+            matches!(
+                &undelivered,
+                crate::error::ScpPyError::ContextError { code, .. } if code == codes::CTX_2000
+            ),
             "undelivered dispatch reported: {undelivered}"
         );
 
@@ -8244,7 +8249,8 @@ mod tests {
 
     /// `close_decision` dispatches for `Active`, releases without a dispatch
     /// when no actor serves the context or the supervisor reports `Closed`,
-    /// `Expired` or `Tombstoned`, and refuses every other state by name.
+    /// `Expired` or `Tombstoned`, refuses `Poisoned` with `SCP-CTX-2134`, and
+    /// refuses every other state by name with `SCP-CTX-2017`.
     ///
     /// The `match` below has no wildcard, so a new `ContextState` variant fails
     /// to compile here until this table states its outcome.
@@ -8252,7 +8258,7 @@ mod tests {
     fn close_decision_answers_every_lifecycle_state() {
         use scp_core::context::ContextState;
         assert_eq!(
-            super::close_decision(None).expect("no actor must not refuse"),
+            super::close_decision("ctx", None).expect("no actor must not refuse"),
             super::CloseDecision::SkipDispatch,
             "an id no actor serves must skip the dispatch"
         );
@@ -8266,7 +8272,7 @@ mod tests {
             ContextState::Tombstoned,
             ContextState::Poisoned,
         ] {
-            let outcome = super::close_decision(Some(&state));
+            let outcome = super::close_decision("ctx", Some(&state));
             match state {
                 ContextState::Active => assert_eq!(
                     outcome.expect("Active must not refuse"),
@@ -8280,18 +8286,24 @@ mod tests {
                         "{state:?} must skip the dispatch"
                     );
                 }
-                ContextState::Creating
-                | ContextState::Closing
-                | ContextState::MigratingOut
-                | ContextState::Poisoned => {
+                ContextState::Creating | ContextState::Closing | ContextState::MigratingOut => {
                     let err = outcome.expect_err("a non-terminal state but Active must refuse");
                     let expected = format!(
-                        "cannot close context in '{}' state",
+                        "[{}] context error: cannot close context in '{}' state",
+                        codes::CTX_2017,
                         super::context_state_str(&state)
                     );
                     assert!(
-                        err.to_string().contains(&expected),
+                        err.to_string().starts_with(&expected),
                         "{state:?} reported: {err}"
+                    );
+                }
+                ContextState::Poisoned => {
+                    let err = outcome.expect_err("Poisoned must refuse");
+                    assert!(
+                        err.to_string()
+                            .starts_with(&format!("[{}]", codes::CTX_2134)),
+                        "Poisoned must refuse with ContextPoisoned: {err}"
                     );
                 }
             }
@@ -8433,7 +8445,8 @@ mod tests {
         assert!(
             close
                 .to_string()
-                .contains("cannot close context in 'closing'"),
+                .contains("cannot close context in 'closing'")
+                && close.to_string().contains(codes::CTX_2017),
             "close reported: {close}"
         );
     }
@@ -8472,7 +8485,7 @@ mod tests {
         )
         .expect_err("a close whose dispatch fails must fail");
         assert!(
-            err.to_string().contains("Supervisor close_context failed"),
+            err.to_string().contains(codes::CTX_2001),
             "close reported: {err}"
         );
         assert!(
@@ -8494,7 +8507,8 @@ mod tests {
         let err = super::close_context_on(&scp.inner, &handle, creator, &sup, None)
             .expect_err("an Active re-read must fail the close");
         assert!(
-            err.to_string().contains("returned to Active"),
+            err.to_string().contains("returned to Active")
+                && err.to_string().contains(codes::CTX_2017),
             "close reported: {err}"
         );
         assert!(
@@ -8581,7 +8595,8 @@ mod tests {
             .expect_err("close must refuse a context inside its closing window");
         assert!(
             err.to_string()
-                .contains("cannot close context in 'closing'"),
+                .contains("cannot close context in 'closing'")
+                && err.to_string().contains(codes::CTX_2017),
             "close reported: {err}"
         );
         assert!(
@@ -8797,9 +8812,8 @@ mod tests {
             .context_close(&handle, creator)
             .expect_err("close of a poisoned context must refuse");
         assert!(
-            err.to_string()
-                .contains("cannot close context in 'poisoned' state"),
-            "unexpected refusal: {err}"
+            err.to_string().contains(codes::CTX_2134),
+            "a poisoned context must refuse with ContextPoisoned: {err}"
         );
         assert!(
             crate::runtime::ffi_state_registry(&bi).contains_key(&context_id),
