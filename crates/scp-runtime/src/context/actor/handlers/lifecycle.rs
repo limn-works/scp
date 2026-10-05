@@ -509,8 +509,9 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 /// Best-effort: persist failures log via `tracing::warn!` and
 /// increment `crate::metrics::record_persistence_failure()`; the
 /// reply carries `Ok(())` after a persist attempt. When the Supervisor
-/// has dropped, nothing is persisted and the reply carries
-/// [`ContextError::SupervisorShutDown`].
+/// has dropped, nothing is persisted; the failure is logged and counted
+/// the same way and the reply carries `Ok(())` (ADR-049 Decision 16
+/// item 4).
 // `Send` discipline (ADR-049 Decision 7): SYNC fn returning a future. The
 // snapshot is built from `&PerContextState` in the synchronous prelude; the
 // returned future captures only the owned `context_id` / `snapshot` / `reply`
@@ -541,7 +542,8 @@ fn handle_flush_snapshot_actor<'d>(
     // The floors come from the Supervisor. When it has dropped (ADR-049
     // Decision 16), no floor export exists, and persisting a snapshot with
     // empty floors would durably regress them (re-admitting replays after
-    // restore), so the flush persists nothing and replies with the typed error.
+    // restore), so the flush persists nothing. Decision 16 item 4 makes that
+    // a Class C persist failure: logged, counted, and acknowledged with `Ok(())`.
     let floors = deps
         .supervisor
         .export_sender_key_epochs(&ctx_id_bytes)
@@ -560,9 +562,8 @@ fn handle_flush_snapshot_actor<'d>(
                 error = %e,
                 "flush snapshot skipped: the supervisor holds no floor export"
             );
-            let sketch = outcome_error_sketch(&e);
-            let _ = reply.send(Err(e));
-            return futures::future::Either::Left(std::future::ready(Outcome::err(sketch)));
+            let _ = reply.send(Ok(()));
+            return futures::future::Either::Left(std::future::ready(Outcome::ok(())));
         }
     };
     let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
@@ -805,9 +806,7 @@ async fn handle_issue_mls_update_actor(
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use crate::context::messaging_helpers::dropped_supervisor_tests::{
-        Fixture, assert_shut_down, state,
-    };
+    use crate::context::messaging_helpers::dropped_supervisor_tests::{Fixture, state};
 
     #[tokio::test]
     async fn flush_snapshot_persists_with_live_supervisor() {
@@ -819,16 +818,21 @@ mod tests {
         assert_eq!(f.persists.load(Ordering::SeqCst), 1);
     }
 
+    /// ADR-049 Decision 16 item 4: a failed upgrade in this Class C
+    /// best-effort persist is a persist failure, acknowledged with `Ok(())`.
     #[tokio::test]
-    async fn flush_snapshot_persists_nothing_after_supervisor_drops() {
+    async fn flush_snapshot_acknowledges_and_persists_nothing_after_supervisor_drops() {
         let f = Fixture::new().await.drop_supervisor();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let out = super::handle_flush_snapshot_actor(&state(), &f.deps, tx).await;
         assert!(
-            out.result.is_err(),
-            "the Outcome must record the failed flush"
+            out.result.is_ok(),
+            "a Class C persist failure records no error: {:?}",
+            out.result
         );
-        assert_shut_down(&rx.await.unwrap());
+        rx.await
+            .unwrap()
+            .expect("a Class C persist failure is acknowledged");
         assert_eq!(
             f.persists.load(Ordering::SeqCst),
             0,
