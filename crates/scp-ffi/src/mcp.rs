@@ -2231,7 +2231,7 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         validate::validate_did(identity_did)?;
         // Step 1: Collect contexts from the local runtime registry.
-        let local_context_ids = crate::runtime::context_ids_for_member(bi, identity_did)?;
+        let local_contexts = crate::runtime::context_ids_for_member(bi, identity_did)?;
 
         // Step 2: Collect contexts from the known-contexts registry.
         let known = crate::runtime::known_contexts_for_member_on(bi, identity_did);
@@ -2244,12 +2244,12 @@ impl crate::scp::PyScp {
         let mut results = Vec::new();
 
         // Add local contexts first.
-        for ctx_id in &local_context_ids {
+        for (ctx_id, role_state) in local_contexts {
             seen.insert(ctx_id.clone());
             let dict = PyDict::new(py);
-            dict.set_item("context_id", ctx_id)?;
+            dict.set_item("context_id", &ctx_id)?;
 
-            let relay_active = relay_active_set.contains(ctx_id);
+            let relay_active = relay_active_set.contains(&ctx_id);
             if relay_active {
                 dict.set_item("source", "local+relay")?;
             } else {
@@ -2259,10 +2259,8 @@ impl crate::scp::PyScp {
 
             // Enrich with the creator DID and the member count the supervisor
             // actor holds, plus the outlet count of the bridge's registry.
-            let outlet_count =
-                crate::runtime::with_context(bi, ctx_id, |rt| Ok(rt.outlet_registry.len()));
-            if let (Ok(role_state), Ok(outlet_count)) =
-                (crate::runtime::live_role_state(bi, ctx_id), outlet_count)
+            if let Ok(outlet_count) =
+                crate::runtime::with_context(bi, &ctx_id, |rt| Ok(rt.outlet_registry.len()))
             {
                 dict.set_item("creator_did", role_state.creator_did)?;
                 dict.set_item("member_count", role_state.members.len())?;
@@ -3924,14 +3922,14 @@ mod tests {
         // runtime function directly.
         let ids = crate::runtime::context_ids_for_member(&bi, creator).unwrap();
         assert!(
-            ids.contains(&ctx_id),
+            ids.iter().any(|(id, _)| id == &ctx_id),
             "creator should be a member of the context"
         );
 
         // Non-member should not see the context.
         let other_ids = crate::runtime::context_ids_for_member(&bi, "did:dht:z6MkNobody").unwrap();
         assert!(
-            !other_ids.contains(&ctx_id),
+            !other_ids.iter().any(|(id, _)| id == &ctx_id),
             "non-member should not see the context"
         );
 

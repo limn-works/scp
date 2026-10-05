@@ -1949,12 +1949,13 @@ fn role_state_on(
     }))
 }
 
-/// Returns the IDs of the registered contexts whose supervisor actor lists
-/// `member_did` as a member.
+/// Returns the ID and the role state of each registered context whose
+/// supervisor actor lists `member_did` as a member.
 ///
-/// Reads each registered context's role state from the supervisor actor
-/// (ADR-049 §10). With no registered context it returns an empty Vec without
-/// resolving the supervisor.
+/// Reads each registered context's role state from the supervisor actor once
+/// (ADR-049 §10) and returns the role state it matched against. With no
+/// registered context it returns an empty Vec without resolving the
+/// supervisor.
 ///
 /// # Errors
 ///
@@ -1966,7 +1967,7 @@ fn role_state_on(
 pub fn context_ids_for_member(
     bi: &PyBridgeInstance,
     member_did: &str,
-) -> Result<Vec<String>, ScpPyError> {
+) -> Result<Vec<(String, ContextRoleState)>, ScpPyError> {
     let ids: Vec<String> = ffi_state_registry(bi)
         .iter()
         .map(|entry| entry.key().clone())
@@ -1982,8 +1983,8 @@ pub fn context_ids_for_member(
         let answer =
             block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })?
                 .map_err(ScpPyError::from)?;
-        if answer.is_some_and(|role_state| role_state.members.contains(member_did)) {
-            matched.push(id);
+        if let Some(role_state) = answer.filter(|rs| rs.members.contains(member_did)) {
+            matched.push((id, role_state));
         }
     }
     Ok(matched)
@@ -4215,18 +4216,22 @@ mod tests {
         assert!(
             !context_ids_for_member(&bi, member)
                 .unwrap()
-                .contains(&ctx_id),
+                .iter()
+                .any(|(id, _)| id == &ctx_id),
             "precondition: the member is not in the context yet"
         );
 
         insert_supervisor_member_for_test(&bi, &ctx_id, member)
             .expect("supervisor must record the member");
 
+        let matched = context_ids_for_member(&bi, member).unwrap();
+        let (_, role_state) = matched
+            .iter()
+            .find(|(id, _)| id == &ctx_id)
+            .expect("a member the supervisor recorded must be reported, with no bridge-side write");
         assert!(
-            context_ids_for_member(&bi, member)
-                .unwrap()
-                .contains(&ctx_id),
-            "a member the supervisor recorded must be reported, with no bridge-side write"
+            role_state.members.contains(member) && role_state.creator_did == creator,
+            "the returned role state must be the supervisor's, which lists the member"
         );
         assert!(
             !with_ffi_state(&bi, &ctx_id, |st| Ok(st
@@ -4273,7 +4278,8 @@ mod tests {
         assert!(
             context_ids_for_member(&bi, creator)
                 .unwrap()
-                .contains(&ctx_id),
+                .iter()
+                .any(|(id, _)| id == &ctx_id),
             "precondition: the creator's context is reported while its actor answers"
         );
         supervisor(&bi)
