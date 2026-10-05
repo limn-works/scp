@@ -1140,7 +1140,7 @@ fn log_watchdog_without_supervisor(
     outcome: &Result<(), tokio::task::JoinError>,
 ) {
     match outcome {
-        Err(e) if e.is_panic() => tracing::error!(
+        Err(e) if JoinFailure::from_join_error(e) == JoinFailure::Panicked => tracing::error!(
             actor_kind,
             subject,
             panic_location = "unknown",
@@ -1159,11 +1159,46 @@ fn log_watchdog_without_supervisor(
 /// payload-free rule; a `JoinError`'s `Display` carries the payload), and a
 /// cancellation, such as its runtime shutting down, is named as one.
 fn escrow_reversal_join_failure_message(err: &tokio::task::JoinError) -> &'static str {
-    if err.is_panic() {
-        "streaming open escrow reversal task panicked — the hold may stay debited; \
-         payload intentionally not logged"
-    } else {
-        "streaming open escrow reversal task was cancelled — the hold may stay debited"
+    match JoinFailure::from_join_error(err) {
+        JoinFailure::Panicked => {
+            "streaming open escrow reversal task panicked — the hold may stay debited; \
+             payload intentionally not logged"
+        }
+        JoinFailure::Cancelled => {
+            "streaming open escrow reversal task was cancelled — the hold may stay debited"
+        }
+    }
+}
+
+/// How a spawned task ended without returning. It holds no panic payload (the
+/// ADR-049 §10 payload-free rule; a `JoinError`'s `Display` carries the
+/// payload), so its `Display` is safe to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinFailure {
+    /// The task panicked.
+    Panicked,
+    /// The task was cancelled, for example because its runtime shut down.
+    Cancelled,
+}
+
+impl JoinFailure {
+    /// Classifies `err` without reading its payload.
+    #[must_use]
+    pub fn from_join_error(err: &tokio::task::JoinError) -> Self {
+        if err.is_panic() {
+            Self::Panicked
+        } else {
+            Self::Cancelled
+        }
+    }
+}
+
+impl std::fmt::Display for JoinFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Panicked => "task panicked; payload intentionally not logged",
+            Self::Cancelled => "task was cancelled",
+        })
     }
 }
 
@@ -1320,8 +1355,9 @@ pub enum DrainWithDeadline<T> {
     /// The drain and the post-drain step finished within the deadline; holds
     /// the post-drain step's value.
     Finished(T),
-    /// The drain or the post-drain step panicked; holds the panic message.
-    Panicked(String),
+    /// The drain task ended without returning: the drain or the post-drain
+    /// step panicked, or the task was cancelled.
+    Panicked(JoinFailure),
     /// The deadline passed first. The drain keeps running, and its result
     /// goes to the `on_late` callback.
     TimedOut,
@@ -11257,8 +11293,8 @@ impl Supervisor {
     /// drain returns and drops it before `after_drain` runs.
     ///
     /// When the deadline passes first, the task keeps running, `on_late`
-    /// receives its result once it ends (`Err` carrying the panic message when
-    /// the drain or `after_drain` panicked), and this returns
+    /// receives its result once it ends (`Err` carrying the payload-free
+    /// [`JoinFailure`] text when the drain task did not return), and this returns
     /// [`DrainWithDeadline::TimedOut`].
     pub async fn drain_with_deadline<T, A, L>(
         self: &Arc<Self>,
@@ -11279,10 +11315,14 @@ impl Supervisor {
         });
         match tokio::time::timeout_at(deadline, &mut drain).await {
             Ok(Ok(value)) => DrainWithDeadline::Finished(value),
-            Ok(Err(join_error)) => DrainWithDeadline::Panicked(join_error.to_string()),
+            Ok(Err(join_error)) => {
+                DrainWithDeadline::Panicked(JoinFailure::from_join_error(&join_error))
+            }
             Err(_elapsed) => {
                 drop(tokio::spawn(async move {
-                    on_late(drain.await.map_err(|join_error| join_error.to_string()));
+                    on_late(drain.await.map_err(|join_error| {
+                        JoinFailure::from_join_error(&join_error).to_string()
+                    }));
                 }));
                 DrainWithDeadline::TimedOut
             }
@@ -11497,9 +11537,17 @@ impl Supervisor {
     /// Closes the task tracker and waits until every tracked task has exited
     /// (ADR-049 Decision 16, step 3). Call only after the closed flag is set
     /// and every actor was told to stop.
+    ///
+    /// Once the wait returns, removes every non-poison crash-window entry so
+    /// none leaks past teardown (ADR-049 §10); a poisoned entry stays. The
+    /// removal runs here rather than per swept id because a watchdog or
+    /// respawn task can despawn its actor before the sweep's snapshot, or
+    /// write a window after the sweep, and no such task remains once the wait
+    /// returns.
     pub(in crate::context) async fn await_tracked_tasks(&self) {
         self.task_tracker.close();
         self.task_tracker.wait().await;
+        self.crash_windows.retain(|_, window| window.is_poisoned());
     }
 
     /// Sync wrapper for [`Self::shutdown_all_contexts`].
@@ -20799,21 +20847,79 @@ mod tests {
     }
 
     /// A post-drain step that panics makes `drain_with_deadline` return
-    /// `Panicked`, never `Finished`.
+    /// `Panicked(JoinFailure::Panicked)`, never `Finished`, and neither that
+    /// result nor the late callback's error carries the panic payload.
     #[tokio::test]
     async fn drain_with_deadline_reports_a_panicking_post_drain_step() {
         let supervisor_arc = supervisor_with_providers();
         let outcome = supervisor_arc
             .drain_with_deadline(
                 tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-                || -> u8 { panic!("post-drain step panicked") },
+                || -> u8 { panic!("secret-drain-payload") },
                 |_| {},
             )
             .await;
         assert!(
-            matches!(outcome, DrainWithDeadline::Panicked(_)),
+            matches!(outcome, DrainWithDeadline::Panicked(JoinFailure::Panicked)),
             "a panicking post-drain step must report Panicked, got {outcome:?}"
         );
+        assert!(!format!("{outcome:?}").contains("secret-drain-payload"));
+
+        let late_sup = supervisor_with_providers();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(
+            late_sup
+                .spawn_tracked("slow tracked task", async move {
+                    let _ = release_rx.await;
+                })
+                .expect("an open supervisor accepts a tracked spawn"),
+        );
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel();
+        let outcome = late_sup
+            .drain_with_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+                || -> u8 { panic!("secret-late-payload") },
+                move |late| {
+                    let _ = late_tx.send(late);
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, DrainWithDeadline::TimedOut),
+            "{outcome:?}"
+        );
+        release_tx.send(()).expect("the tracked task still waits");
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), late_rx)
+            .await
+            .expect("the drain keeps running past the deadline")
+            .expect("on_late receives the drain's result");
+        assert_eq!(late, Err(JoinFailure::Panicked.to_string()));
+    }
+
+    /// `JoinFailure` names a panic as a panic and a cancellation as a
+    /// cancellation, and its text never carries the panic payload.
+    #[tokio::test]
+    async fn join_failure_splits_panic_from_cancel_without_payload() {
+        let panicked = tokio::spawn(async { panic!("secret-join-payload") })
+            .await
+            .expect_err("a panicking task yields a JoinError");
+        assert_eq!(
+            JoinFailure::from_join_error(&panicked),
+            JoinFailure::Panicked
+        );
+        let text = JoinFailure::from_join_error(&panicked).to_string();
+        assert!(!text.contains("secret-join-payload"), "{text}");
+
+        let pending = tokio::spawn(std::future::pending::<()>());
+        pending.abort();
+        let cancelled = pending
+            .await
+            .expect_err("an aborted task yields a JoinError");
+        assert_eq!(
+            JoinFailure::from_join_error(&cancelled),
+            JoinFailure::Cancelled
+        );
+        assert!(!JoinFailure::Cancelled.to_string().contains("panicked"));
     }
 
     /// Once shutdown has begun, a spawn through the tracker is refused with
@@ -25426,6 +25532,44 @@ mod tests {
         assert!(
             sup.crash_windows.get("no-snapshot-after").is_none(),
             "a respawn failure after shutdown began must record nothing"
+        );
+    }
+
+    /// A crash window recorded before shutdown for a context with no
+    /// registered actor (its respawn despawned the actor before the sweep's
+    /// snapshot) is removed once the drain returns; a poisoned window stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_reaps_a_crash_window_whose_actor_left_before_the_sweep() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup =
+            supervisor_with_clock_and_persistence(clock_dyn, Box::new(MapPersistence::default()));
+        let owner = DID("did:example:admin".to_owned());
+
+        let failed = sup.respawn_from_snapshot("unswept-crash", &owner).await;
+        assert!(matches!(failed, Err(ContextError::ActorCrashed(_))));
+        assert!(sup.lookup("unswept-crash").is_none());
+        assert!(
+            sup.crash_windows
+                .get("unswept-crash")
+                .is_some_and(|w| w.crash_count() == 1 && !w.is_poisoned()),
+            "the crash is recorded before shutdown"
+        );
+        sup.crash_windows
+            .entry("unswept-poison".to_owned())
+            .or_default()
+            .poisoned = true;
+
+        sup.shutdown_all_contexts().await;
+
+        assert!(
+            !sup.crash_windows.contains_key("unswept-crash"),
+            "a non-poison window outside the sweep's snapshot must not outlive the drain"
+        );
+        assert!(
+            sup.crash_windows
+                .get("unswept-poison")
+                .is_some_and(|w| w.is_poisoned()),
+            "a poisoned window survives shutdown"
         );
     }
 
