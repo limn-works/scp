@@ -556,8 +556,7 @@ impl FfiBridgeProvider {
     /// [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
     /// naming the check that refused the invocation, and
     /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
-    /// when the agent's proof tokens cannot be read, so a failed read never
-    /// reaches the client as a denial.
+    /// when the agent's proof tokens cannot be read.
     fn outlet_grant(
         &self,
         bi: &crate::runtime::PyBridgeInstance,
@@ -795,11 +794,10 @@ impl ContextProvider for FfiBridgeProvider {
         check: scp_mcp::server::CapabilityCheck,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
-        // A dropped bridge instance, an unreadable role state, or a failed
-        // read inside `outlet_grant` is a failed read, which `tools/list`
-        // reports as an error instead of omitting the context's tools. A
-        // context the actor does not hold is a denial. The role state comes
-        // from the actor, not the bridge copy.
+        // A dropped bridge instance or an unreadable role state is a failed
+        // read, which `tools/list` reports as an error instead of omitting
+        // the context's tools. A context the actor does not hold is a
+        // denial. The role state comes from the actor, not the bridge copy.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
         let role_state = Self::gate_role_state(&bi, context_id)?;
         self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
@@ -2190,7 +2188,7 @@ impl crate::scp::PyScp {
 /// Context discovery is **client-side** because the SCP relay is a dumb blob
 /// store with no identity-to-context mapping. This function:
 ///
-/// 1. Collects contexts from the local runtime registry (always available).
+/// 1. Collects contexts from the local runtime registry.
 /// 2. Collects contexts from the known-contexts registry (SCP-213).
 /// 3. If a relay connection is active, probes known routing IDs via QUERY
 ///    to determine which contexts have recent activity on the relay.
@@ -2203,10 +2201,10 @@ impl crate::scp::PyScp {
 /// - `member_count` -- Number of members, from the supervisor actor.
 /// - `outlet_count` -- Number of outlets registered on this bridge's copy of
 ///   the context.
-///
-/// The last three are present only when the supervisor actor answers for the
-/// context and this bridge holds a copy of it.
 /// - `relay_active` -- `True` if the relay returned blobs for this context.
+///
+/// `creator_did`, `member_count` and `outlet_count` are present only when the
+/// supervisor actor answers for the context and this bridge holds a copy of it.
 ///
 /// # Arguments
 ///
@@ -6327,10 +6325,8 @@ mod tests {
         );
     }
 
-    /// A missing `Supervisor` removes only the pump-backed capabilities
-    /// (`resources.subscribe`, `resources.listChanged`, `tools.listChanged`)
-    /// — it must not fail MCP serving outright. Drives the production entry point:
-    /// were `py_mcp_serve` to propagate the missing-supervisor error
+    /// A missing `Supervisor` must not fail MCP serving outright. Drives the
+    /// production entry point: were `py_mcp_serve` to propagate the missing-supervisor error
     /// (`supervisor(bi)?`), the serve call would return `Err`. Then checks that
     /// `mcp_server_bundle`, the function `py_mcp_serve` builds its server with,
     /// returns the unwired bundle, whose server advertises
@@ -6339,7 +6335,7 @@ mod tests {
     /// supervisor the role-state read fails, so the list fails instead of
     /// answering from the bridge copy.
     #[test]
-    fn missing_supervisor_degrades_subscriptions_not_the_whole_server_pyo3() {
+    fn missing_supervisor_serves_but_fails_role_state_reads_pyo3() {
         crate::init_runtime().ok();
         let agent = "did:dht:z6MkNoSupervisorAgent";
         let bi = __bi();
