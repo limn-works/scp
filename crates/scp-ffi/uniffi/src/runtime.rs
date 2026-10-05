@@ -238,6 +238,9 @@ pub struct UniffiBridgeInstance {
     /// Release marks, keyed by context id.
     pub(crate) released_contexts: std::sync::Mutex<std::collections::HashMap<String, ReleaseMark>>,
 
+    /// Generation the next newly created release mark receives.
+    pub(crate) next_release_generation: std::sync::atomic::AtomicU64,
+
     /// Retained identity custody for the production identity ops, keyed by DID.
     ///
     /// Previously stored type-erased in `CoreFields::identity_registry` AND
@@ -421,6 +424,7 @@ impl UniffiBridgeInstance {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
             released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -457,6 +461,7 @@ impl UniffiBridgeInstance {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
             released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -606,6 +611,7 @@ impl UniffiBridgeInstance {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
             released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
             identity_link_attestation_registry: Arc::new(DashMap::new()),
@@ -1230,15 +1236,19 @@ impl UniffiBridgeInstance {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Sets the release mark on `context_id` to the current instant and adds
-    /// `in_flight` to its count of unsettled closes. When `marks` holds
-    /// [`MAX_RELEASED_CONTEXTS`] marks and `context_id` has none, first
-    /// removes the earliest mark whose count of unsettled closes is zero.
+    /// Sets the release mark on `context_id` to the current instant, adds
+    /// `in_flight` to its count of unsettled closes, and returns the mark's
+    /// generation. A mark created by this call takes a generation no earlier
+    /// mark of this instance took; a mark that already stands keeps its
+    /// generation. When `marks` holds [`MAX_RELEASED_CONTEXTS`] marks and
+    /// `context_id` has none, first removes the earliest mark whose count of
+    /// unsettled closes is zero.
     fn set_release_mark(
         marks: &mut std::collections::HashMap<String, ReleaseMark>,
+        next_generation: &std::sync::atomic::AtomicU64,
         context_id: &str,
         in_flight: usize,
-    ) {
+    ) -> u64 {
         if !marks.contains_key(context_id) && marks.len() >= MAX_RELEASED_CONTEXTS {
             let oldest = marks
                 .iter()
@@ -1250,12 +1260,16 @@ impl UniffiBridgeInstance {
             }
         }
         let now = std::time::Instant::now();
-        let mark = marks.entry(context_id.to_owned()).or_insert(ReleaseMark {
-            at: now,
-            in_flight: 0,
-        });
+        let mark = marks
+            .entry(context_id.to_owned())
+            .or_insert_with(|| ReleaseMark {
+                at: now,
+                in_flight: 0,
+                generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            });
         mark.at = now;
         mark.in_flight = mark.in_flight.saturating_add(in_flight);
+        mark.generation
     }
 
     /// Marks `context_id` released, and removes its UCAN state and its
@@ -1263,7 +1277,7 @@ impl UniffiBridgeInstance {
     pub fn release_ucan_state(&self, context_id: &str) {
         let entry = self.ucan_registry.entry(context_id.to_owned());
         let mut marks = self.lock_release_marks();
-        Self::set_release_mark(&mut marks, context_id, 0);
+        Self::set_release_mark(&mut marks, &self.next_release_generation, context_id, 0);
         Self::remove_registry_entry(entry);
         self.core.remove_known_context(context_id);
         drop(marks);
@@ -1277,39 +1291,74 @@ impl UniffiBridgeInstance {
         }
     }
 
-    /// Marks `context_id` released with one unsettled close.
-    pub(crate) fn mark_released(&self, context_id: &str) {
-        Self::set_release_mark(&mut self.lock_release_marks(), context_id, 1);
+    /// Marks `context_id` released with one unsettled close, and returns the
+    /// ticket that names the mark generation this close set or joined.
+    pub(crate) fn mark_released(&self, context_id: &str) -> ReleaseTicket {
+        let generation = Self::set_release_mark(
+            &mut self.lock_release_marks(),
+            &self.next_release_generation,
+            context_id,
+            1,
+        );
+        ReleaseTicket {
+            context_id: context_id.to_owned(),
+            generation,
+        }
     }
 
-    /// Settles one unsettled close on `context_id`'s release mark, if the
-    /// mark stands.
-    fn settle_release_mark(&self, context_id: &str) {
-        if let Some(mark) = self.lock_release_marks().get_mut(context_id) {
+    /// Returns the mark on `ticket`'s context id when it stands under
+    /// `ticket`'s generation.
+    fn ticketed_mark<'m>(
+        marks: &'m mut std::collections::HashMap<String, ReleaseMark>,
+        ticket: &ReleaseTicket,
+    ) -> Option<&'m mut ReleaseMark> {
+        marks
+            .get_mut(&ticket.context_id)
+            .filter(|mark| mark.generation == ticket.generation)
+    }
+
+    /// Settles `ticket`'s close on its context id's release mark, if the mark
+    /// stands under `ticket`'s generation.
+    fn settle_release_mark(&self, ticket: ReleaseTicket) {
+        if let Some(mark) = Self::ticketed_mark(&mut self.lock_release_marks(), &ticket) {
             mark.in_flight = mark.in_flight.saturating_sub(1);
         }
     }
 
-    /// Removes `context_id`'s UCAN state and its known-context entry and runs
-    /// `teardown`, only while the release mark stands, and returns whether
-    /// the mark stood. When it stood, settles one unsettled close on it.
+    /// Settles `ticket`'s close and clears its context id's release mark when
+    /// no unsettled close remains on it, if the mark stands under `ticket`'s
+    /// generation.
+    fn readmit_ticketed(&self, ticket: ReleaseTicket) {
+        let mut marks = self.lock_release_marks();
+        if let Some(mark) = Self::ticketed_mark(&mut marks, &ticket) {
+            mark.in_flight = mark.in_flight.saturating_sub(1);
+            if mark.in_flight == 0 {
+                marks.remove(&ticket.context_id);
+            }
+        }
+    }
+
+    /// Removes `ticket`'s context id's UCAN state and known-context entry and
+    /// runs `teardown`, only while the release mark stands under `ticket`'s
+    /// generation, and returns whether it stood. When it stood, settles
+    /// `ticket`'s close on it.
     ///
     /// The mark check, both removals and `teardown` run while this call holds
     /// the release-mark lock, and no registry guard is held while `teardown`
     /// runs.
     pub(crate) fn remove_ucan_state_while_released(
         &self,
-        context_id: &str,
+        ticket: ReleaseTicket,
         teardown: impl FnOnce(),
     ) -> bool {
-        let entry = self.ucan_registry.entry(context_id.to_owned());
+        let entry = self.ucan_registry.entry(ticket.context_id.clone());
         let mut marks = self.lock_release_marks();
-        let Some(mark) = marks.get_mut(context_id) else {
+        let Some(mark) = Self::ticketed_mark(&mut marks, &ticket) else {
             return false;
         };
         mark.in_flight = mark.in_flight.saturating_sub(1);
         Self::remove_registry_entry(entry);
-        self.core.remove_known_context(context_id);
+        self.core.remove_known_context(&ticket.context_id);
         teardown();
         drop(marks);
         true
@@ -1327,12 +1376,15 @@ impl UniffiBridgeInstance {
 
     /// Marks `context_id` released and re-reads the supervisor.
     ///
-    /// A re-read that reports `Active` clears the mark, removes nothing, runs
-    /// nothing, and returns `Ok(false)`. On any other answer this call runs
-    /// [`Self::remove_ucan_state_while_released`] with `teardown` and returns
-    /// its result: `Ok(true)` when the mark stood, so the state was removed
-    /// and `teardown` ran, and `Ok(false)` when the mark was gone, so nothing
-    /// was removed and `teardown` did not run.
+    /// A re-read that reports `Active` removes nothing, runs nothing, and
+    /// returns `Ok(false)`; when the mark still stands under the generation
+    /// this call set or joined, it settles this call's close and clears the
+    /// mark once no unsettled close remains on it. On any other answer this
+    /// call runs [`Self::remove_ucan_state_while_released`] with `teardown`
+    /// and returns its result: `Ok(true)` when the mark stood under that
+    /// generation, so the state was removed and `teardown` ran, and
+    /// `Ok(false)` otherwise, so nothing was removed and `teardown` did not
+    /// run.
     ///
     /// # Errors
     ///
@@ -1343,17 +1395,17 @@ impl UniffiBridgeInstance {
         context_id: &str,
         teardown: impl FnOnce(),
     ) -> Result<bool, crate::ScpError> {
-        self.mark_released(context_id);
+        let ticket = self.mark_released(context_id);
         match self.read_live_context_state(context_id).await {
             Err(e) => {
-                self.settle_release_mark(context_id);
+                self.settle_release_mark(ticket);
                 Err(e)
             }
             Ok(Some(scp_core::context::ContextState::Active)) => {
-                self.readmit_context(context_id);
+                self.readmit_ticketed(ticket);
                 Ok(false)
             }
-            Ok(_) => Ok(self.remove_ucan_state_while_released(context_id, teardown)),
+            Ok(_) => Ok(self.remove_ucan_state_while_released(ticket, teardown)),
         }
     }
 
@@ -1734,12 +1786,23 @@ pub(crate) fn context_poisoned_error(context_id: &str) -> crate::ScpError {
 /// has no unsettled close.
 pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
 
-/// One release mark: the instant it was last set and the number of closes
-/// that set it and have not yet settled.
+/// One release mark: the instant it was last set, the number of closes
+/// that set it and have not yet settled, and the generation it took when it
+/// was created.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReleaseMark {
     pub(crate) at: std::time::Instant,
     pub(crate) in_flight: usize,
+    pub(crate) generation: u64,
+}
+
+/// One close's claim on a release mark: the context id and the mark
+/// generation the close set or joined.
+#[must_use]
+#[derive(Debug)]
+pub(crate) struct ReleaseTicket {
+    context_id: String,
+    generation: u64,
 }
 
 /// Constructs a fresh per-instance `Supervisor` with the given

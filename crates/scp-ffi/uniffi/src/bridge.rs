@@ -21096,12 +21096,12 @@ mod tests {
             })
             .expect("the registered context must have UCAN state");
 
-        scp.inner.mark_released(&ctx_id);
+        let ticket = scp.inner.mark_released(&ctx_id);
         scp.inner.readmit_context(&ctx_id);
         let mut torn_down = false;
         assert!(
             !scp.inner
-                .remove_ucan_state_while_released(&ctx_id, || torn_down = true),
+                .remove_ucan_state_while_released(ticket, || torn_down = true),
             "a removal after a readmit must report that the mark was gone"
         );
         assert!(
@@ -21116,10 +21116,10 @@ mod tests {
             "the readmitted context's revocation must survive the removal"
         );
 
-        scp.inner.mark_released(&ctx_id);
+        let ticket = scp.inner.mark_released(&ctx_id);
         assert!(
             scp.inner
-                .remove_ucan_state_while_released(&ctx_id, || torn_down = true),
+                .remove_ucan_state_while_released(ticket, || torn_down = true),
             "a removal while the mark stands must report it"
         );
         assert!(
@@ -21129,6 +21129,131 @@ mod tests {
         assert!(
             scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none(),
             "the removal must take the state while the mark stands"
+        );
+    }
+
+    /// A close whose mark a readmit cleared does not tear down under a mark
+    /// a later close set after the readmit, and does not settle that later
+    /// close; the later close still tears down under its own mark.
+    #[test]
+    fn stale_close_skips_a_mark_set_after_a_readmit() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        let stale = scp.inner.mark_released(&ctx_id);
+        scp.inner.readmit_context(&ctx_id);
+        scp.inner
+            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        let later = scp.inner.mark_released(&ctx_id);
+        let in_flight = || {
+            scp.inner
+                .released_contexts
+                .lock()
+                .expect("marks lock")
+                .get(&ctx_id)
+                .map(|mark| mark.in_flight)
+        };
+
+        let mut torn_down = false;
+        assert!(
+            !scp.inner
+                .remove_ucan_state_while_released(stale, || torn_down = true),
+            "a close whose mark a readmit cleared must not remove under a later mark"
+        );
+        assert!(!torn_down, "the stale close must skip the teardown");
+        assert!(
+            scp.inner.with_ucan_state(&ctx_id, |_| ()).is_some(),
+            "the readmitted context's state must survive the stale close"
+        );
+        assert_eq!(
+            in_flight(),
+            Some(1),
+            "the stale close must not settle the later close"
+        );
+
+        assert!(
+            scp.inner
+                .remove_ucan_state_while_released(later, || torn_down = true),
+            "the later close must remove under its own mark"
+        );
+        assert!(torn_down, "the later close must run the teardown");
+        assert!(scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none());
+        assert_eq!(in_flight(), Some(0));
+    }
+
+    /// Two closes that join one standing mark share its generation: each
+    /// removal finds the mark and settles only its own close.
+    #[test]
+    fn closes_joining_one_mark_share_its_generation() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        let first = scp.inner.mark_released(&ctx_id);
+        let second = scp.inner.mark_released(&ctx_id);
+        let in_flight = || {
+            scp.inner
+                .released_contexts
+                .lock()
+                .expect("marks lock")
+                .get(&ctx_id)
+                .map(|mark| mark.in_flight)
+        };
+        assert_eq!(in_flight(), Some(2));
+        assert!(scp.inner.remove_ucan_state_while_released(first, || {}));
+        assert_eq!(
+            in_flight(),
+            Some(1),
+            "the first removal must settle only its own close"
+        );
+        assert!(
+            scp.inner.remove_ucan_state_while_released(second, || {}),
+            "a second close that joined the same mark must still find it"
+        );
+        assert_eq!(in_flight(), Some(0));
+    }
+
+    /// A close whose re-read reports `Active` settles only its own close: the
+    /// mark stays while another close that joined it is unsettled, and that
+    /// close still finds the mark; a lone close's `Active` re-read clears it.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn active_re_read_keeps_a_mark_another_close_holds() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let active = handle.context_id();
+
+        let pending = scp.inner.mark_released(&active);
+        assert!(
+            !rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&active, || {})
+            )
+            .expect("the re-read of an Active context must succeed")
+        );
+        assert!(
+            has_release_mark(&scp.inner, &active),
+            "an Active re-read must keep a mark another close has not settled"
+        );
+        assert!(
+            scp.inner.remove_ucan_state_while_released(pending, || {}),
+            "the pending close must still find the mark it joined"
+        );
+
+        scp.inner.readmit_context(&active);
+        assert!(
+            !rt.block_on(
+                scp.inner
+                    .release_ucan_state_unless_readmitted(&active, || {})
+            )
+            .expect("the re-read of an Active context must succeed")
+        );
+        assert!(
+            !has_release_mark(&scp.inner, &active),
+            "a lone close's Active re-read must clear its mark"
         );
     }
 
@@ -21161,6 +21286,7 @@ mod tests {
                 ReleaseMark {
                     at: earlier,
                     in_flight: 1,
+                    generation: 0,
                 },
             );
             marks.insert(
@@ -21168,6 +21294,7 @@ mod tests {
                 ReleaseMark {
                     at: middle,
                     in_flight: 0,
+                    generation: 0,
                 },
             );
             for i in 2..MAX_RELEASED_CONTEXTS {
@@ -21176,13 +21303,14 @@ mod tests {
                     ReleaseMark {
                         at: now,
                         in_flight: 0,
+                        generation: 0,
                     },
                 );
             }
         }
         assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
 
-        scp.inner.mark_released("mark-2");
+        let _ticket = scp.inner.mark_released("mark-2");
         assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
         assert!(
             has_release_mark(&scp.inner, "earliest-settled"),
@@ -21224,11 +21352,11 @@ mod tests {
         let ctx_id = scp_ffi_common::generate_context_id();
         scp.inner
             .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
-        scp.inner.mark_released(&ctx_id);
+        let ticket = scp.inner.mark_released(&ctx_id);
 
         let readmitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut readmit_thread = None;
-        let removed = scp.inner.remove_ucan_state_while_released(&ctx_id, || {
+        let removed = scp.inner.remove_ucan_state_while_released(ticket, || {
             assert!(
                 !matches!(
                     scp.inner.ucan_registry.try_get(&ctx_id),
@@ -21284,7 +21412,8 @@ mod tests {
                     0 => bi.release_ucan_state(&id),
                     1 => bi.ensure_ucan_registered(&id, "did:dht:test", &[]),
                     _ => {
-                        bi.remove_ucan_state_while_released(&id, || {});
+                        let ticket = bi.mark_released(&id);
+                        bi.remove_ucan_state_while_released(ticket, || {});
                     }
                 })
             })
@@ -21308,7 +21437,7 @@ mod tests {
             .expect("repeat_with never ends");
         let other_id = other.clone();
         let other_thread = std::thread::spawn(move || {
-            bi.mark_released(&other_id);
+            let _ticket = bi.mark_released(&other_id);
             bi.readmit_context(&other_id);
             bi.ensure_ucan_registered(&other_id, "did:dht:test", &[]);
             tx.send(()).expect("the test thread is waiting");
