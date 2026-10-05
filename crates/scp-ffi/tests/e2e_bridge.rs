@@ -3268,12 +3268,10 @@ fn outlet_stream_pure_wrappers_roundtrip() {
 ///
 /// One creator owns two contexts: `wide` holds `messages:write` and `narrow`
 /// omits it. Both register their bridge state with an empty ceiling argument,
-/// so both bridge copies `FfiBridgeState.ceiling_strings` carry
-/// `default_ceiling()`, which holds `messages:write`. A `messages:write` token
-/// minted in `wide` passes each call there and fails the ceiling check in
-/// `narrow`. An edit that hands the core the bridge copy, an empty ceiling, or
-/// the other context's ceiling passes one of the two halves and fails the
-/// other.
+/// and the bridge state holds no ceiling. A `messages:write` token minted in
+/// `wide` passes each call there and fails the ceiling check in `narrow`. An
+/// edit that hands the core `default_ceiling()`, an empty ceiling, or the other
+/// context's ceiling passes one of the two halves and fails the other.
 #[cfg(feature = "testing")]
 #[test]
 fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
@@ -3363,15 +3361,16 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
 }
 
 /// `ucan_validate` and `ucan_evaluate` anchor a token's root issuer on the
-/// context creator the SUPERVISOR holds, not the bridge copy
-/// `FfiBridgeState.creator_did`.
+/// context creator the SUPERVISOR holds, not the DID the bridge state was
+/// registered under.
 ///
 /// Each of the two contexts registers its bridge state under one DID and
 /// creates its supervisor context under the other. In `anchored` the supervisor
-/// names `owner`, the token's issuer, and the bridge copy names `other`; in
-/// `crossed` the supervisor names `other` and the bridge copy names `owner`.
+/// names `owner`, the token's issuer, and the registration names `other`; in
+/// `crossed` the supervisor names `other` and the registration names `owner`.
 /// The token passes the root-issuer check in `anchored` and fails it in
-/// `crossed`. An edit that hands the core the bridge copy reverses both results.
+/// `crossed`. An edit that anchors on the registration DID reverses both
+/// results.
 #[cfg(feature = "testing")]
 #[test]
 fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_bridge_copy() {
@@ -3431,12 +3430,12 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_bridge_co
         );
         assert!(
             !in_crossed.signatures_valid,
-            "evaluate must refuse a root issuer only the bridge copy names as creator"
+            "evaluate must refuse a root issuer only the registration DID names"
         );
 
         let crossed_err = scp
             .ucan_validate(&crossed, &token, &cap, &holder, None)
-            .expect_err("a root issuer only the bridge copy names must refuse")
+            .expect_err("a root issuer only the registration DID names must refuse")
             .to_string();
         assert!(
             crossed_err.contains(&format!("invalid issuer: expected {other}, got {owner}")),
@@ -3453,9 +3452,10 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_bridge_co
 /// The fixture hands `register_context` a WIDE ceiling carrying `outlet:call:*`
 /// and creates the supervisor context with a NARROW one that omits it, then
 /// mints `outlet_call:*`. The supervisor's ceiling forbids that capability, so
-/// the mint must refuse. `register_context` builds the bridge copy
-/// `FfiBridgeState.ceiling_strings` from the wide argument, so a mint that read
-/// that copy would succeed here.
+/// the mint must refuse. `register_context` validates the wide argument and
+/// then discards it, and the bridge state holds no ceiling; before that, a
+/// bridge-local ceiling built from the registration argument permitted the
+/// mint, and a mint that read such a copy again would succeed here.
 #[cfg(feature = "testing")]
 #[test]
 fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
@@ -3917,24 +3917,12 @@ fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
     });
 }
 
-/// Overwrites the bridge copy `FfiBridgeState.creator_did` of `context_id` with
-/// `bridge_creator`, so the bridge copy and the supervisor name different
-/// creators.
-fn split_bridge_copy_creator(bi: &PyBridgeInstance, context_id: &str, bridge_creator: &str) {
-    runtime::with_context(bi, context_id, |state| {
-        bridge_creator.clone_into(&mut state.creator_did);
-        Ok(())
-    })
-    .expect("the context has a bridge copy");
-}
-
 /// The outlet UCAN validation anchors the delegation chain on the creator the
-/// SUPERVISOR holds, not the bridge copy `FfiBridgeState.creator_did`.
+/// SUPERVISOR holds.
 ///
-/// The fixture mints the invocation UCAN as `owner`, the supervisor's creator,
-/// then overwrites the bridge copy's creator with a DID that issued nothing. A
-/// validation anchored on the bridge copy refuses the token at the root-issuer
-/// check, which this test forbids.
+/// The fixture mints the invocation UCAN as `owner`, the supervisor's creator.
+/// `FfiBridgeState` holds no creator, so the supervisor is the only source the
+/// validation can anchor on, and this test requires the token to validate.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
 fn session_invoke_anchors_the_ucan_on_the_supervisor_creator_not_the_bridge_copy() {
@@ -3946,11 +3934,6 @@ fn session_invoke_anchors_the_ucan_on_the_supervisor_creator_not_the_bridge_copy
         runtime::init_context_manager_for_test(scp.bridge_instance());
         let (ctx_id, outlet_id, ucan) =
             supervisor_only_member_context(py, &scp, &owner, &invoker, true);
-        split_bridge_copy_creator(
-            scp.bridge_instance(),
-            &ctx_id,
-            "did:dht:z6MkOutletAnchorBridgeCopyCreator",
-        );
 
         let session_id = scp
             .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
@@ -3972,18 +3955,14 @@ fn session_invoke_anchors_the_ucan_on_the_supervisor_creator_not_the_bridge_copy
 }
 
 /// The unary cross-context saga signs with the keys of the creators the
-/// SUPERVISOR holds for the caller and target contexts, not the bridge copies.
+/// SUPERVISOR holds for the caller and target contexts.
 ///
-/// The fixture overwrites both bridge copies' creators with DIDs this instance
-/// holds no key for. A saga that took either signer from a bridge copy refuses
-/// at key export, so this test requires the saga to reach `Committed`.
+/// `FfiBridgeState` holds no creator, so the supervisor is the only source of
+/// either signer, and this test requires the saga to reach `Committed`.
 #[test]
 fn xctx_saga_signs_as_the_supervisor_creators_not_the_bridge_copies() {
     Python::with_gil(|py| {
         let (scp, ctx_a, ctx_b, owner, outlet_id) = establish_xctx_saga_commit_preconditions(py);
-        let bi = scp.bridge_instance();
-        split_bridge_copy_creator(bi, &ctx_a, "did:dht:z6MkSagaCallerBridgeCopyCreator");
-        split_bridge_copy_creator(bi, &ctx_b, "did:dht:z6MkSagaTargetBridgeCopyCreator");
 
         let input = PyDict::new(py);
         input.set_item("a", "x").unwrap();
@@ -4018,21 +3997,16 @@ fn xctx_saga_signs_as_the_supervisor_creators_not_the_bridge_copies() {
 }
 
 /// The cross-context streaming saga open signs with the keys of the creators
-/// the SUPERVISOR holds for the caller and target contexts, not the bridge
-/// copies.
+/// the SUPERVISOR holds for the caller and target contexts.
 ///
-/// The fixture overwrites both bridge copies' creators with DIDs this instance
-/// holds no key for. An open that took either signer from a bridge copy
-/// refuses at key export, so this test requires the open to return a saga id.
+/// `FfiBridgeState` holds no creator, so the supervisor is the only source of
+/// either signer, and this test requires the open to return a saga id.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
 fn xctx_streaming_saga_open_signs_as_the_supervisor_creators_not_the_bridge_copies() {
     Python::with_gil(|py| {
         let (scp, ctx_a, ctx_b, invoker, outlet_id, ucan, release_tx) =
             establish_xctx_streaming_saga_preconditions(py);
-        let bi = scp.bridge_instance();
-        split_bridge_copy_creator(bi, &ctx_a, "did:dht:z6MkStreamCallerBridgeCopyCreator");
-        split_bridge_copy_creator(bi, &ctx_b, "did:dht:z6MkStreamTargetBridgeCopyCreator");
 
         let input = PyDict::new(py);
         input.set_item("a", "x").unwrap();

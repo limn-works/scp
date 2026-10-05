@@ -367,8 +367,7 @@ fn outlet_register_impl(
 /// `role_state` is the role state [`active_outlet_role_state`] returned for
 /// `context_id`. ADR-016 step 8 compares the token's grants against that role
 /// state's capability ceiling, and the delegation-chain check anchors on its
-/// creator, so this function reads neither from the bridge copies in
-/// `FfiBridgeState`.
+/// creator. `FfiBridgeState` holds neither.
 pub(crate) fn validate_outlet_ucan(
     bi: &PyBridgeInstance,
     role_state: &scp_core::context::roles::ContextRoleState,
@@ -2901,7 +2900,7 @@ mod tests {
         // reads the registrant's authority.
         crate::init_runtime().ok();
         crate::runtime::init_context_manager_for_test(bi);
-        crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
+        crate::runtime::register_ffi_state(bi, &ctx_id, &[]).unwrap();
         crate::runtime::create_supervisor_context_for_test(
             bi,
             &ctx_id,

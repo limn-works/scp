@@ -372,19 +372,11 @@ impl FfiBridgeProvider {
 
     /// Reads `context_id`'s current role state for an MCP authorization.
     ///
-    /// With a supervisor attached, the answer is the actor's role state, never
-    /// this bridge's copy (`FfiBridgeState.role_state`). Only the bridge's own
-    /// join, leave and governance calls resync that copy. A change the actor
-    /// applies from an inbound commit, such as another admin revoking this
-    /// agent's `messages:read` or removing it, never reaches the copy by itself,
-    /// so a gate reading the copy keeps authorizing the agent after the
-    /// revocation. The `UniFFI` provider asks the actor on every read for the
-    /// same reason.
-    ///
-    /// The function writes nothing back to the copy. The MCP transport task
-    /// and the notification pump call it concurrently with the bridge's own
-    /// calls, so a write-back could replace a newer copy with the older
-    /// snapshot this call read.
+    /// With a supervisor attached, the answer is the actor's role state.
+    /// `FfiBridgeState` holds no role state, so a change the actor applies from
+    /// an inbound commit, such as another admin revoking this agent's
+    /// `messages:read` or removing it, reaches the next gate that reads. The
+    /// `UniFFI` provider asks the actor on every read for the same reason.
     ///
     /// # Errors
     ///
@@ -457,8 +449,7 @@ impl FfiBridgeProvider {
     /// Reads `context_id`'s current role state from the supervisor actor, and
     /// separates the two outcomes [`Self::live_role_state`] merges: `Ok(None)`
     /// when the actor holds no such context, and `Err` when the read itself
-    /// failed. With no supervisor attached it returns `Ok(None)` and reads no
-    /// bridge copy.
+    /// failed. With no supervisor attached it returns `Ok(None)`.
     ///
     /// # Errors
     ///
@@ -613,9 +604,9 @@ impl FfiBridgeProvider {
                 "insufficient permissions to invoke outlet".to_owned(),
             ));
         }
-        // With no bridge copy, the context has no outlet registered through
+        // With no FFI state, the context has no outlet registered through
         // this bridge (see `context_tools`), so the outlet is unregistered:
-        // the denial the copy's own registry gives below, not a failed read.
+        // the denial the state's own registry gives below, not a failed read.
         if !crate::runtime::ffi_state_registry(bi).contains_key(context_id) {
             return Err(AccessRefusal::Denied(format!(
                 "outlet '{outlet_name}' not registered in context '{context_id}'"
@@ -749,10 +740,10 @@ impl ContextProvider for FfiBridgeProvider {
         // A dropped bridge or an unreadable context is an error, never an
         // empty outlet registry.
         let bi = self.upgrade_bi()?;
-        // Outlets register only on the bridge copy, and only this bridge's
-        // create and join paths register a copy, so a context the actor holds
-        // by any other path has no copy here and no outlet registered through
-        // this bridge: its registry is empty.
+        // Outlets register only in this bridge's FFI state, and only this
+        // bridge's create and join paths register that state, so a context the
+        // actor holds by any other path has no FFI state here and no outlet
+        // registered through this bridge: its registry is empty.
         if !crate::runtime::ffi_state_registry(&bi).contains_key(context_id) {
             return match Self::supervised_role_state(&bi, context_id)? {
                 Some(_) => Ok(Vec::new()),
@@ -2839,8 +2830,24 @@ mod tests {
         ctx_id
     }
 
-    /// [`setup_test_context`] without the supervisor: the bridge holds a copy
-    /// of the context.
+    /// A role state for `ctx_id` with `creator_did` as creator and admin over
+    /// `default_ceiling()`, for fixtures whose context no supervisor serves.
+    fn fixture_role_state(
+        ctx_id: &str,
+        creator_did: &str,
+    ) -> scp_core::context::roles::ContextRoleState {
+        scp_core::context::roles::ContextRoleState::new(
+            ctx_id,
+            creator_did,
+            scp_core::context::roles::default_ceiling(),
+            vec![],
+            &scp_clock::SystemClock,
+        )
+        .expect("a role state over the default ceiling builds")
+    }
+
+    /// [`setup_test_context`] without the supervisor: the bridge holds FFI state
+    /// for the context and no supervisor serves it.
     fn setup_unsupervised_context(
         bi: &crate::runtime::PyBridgeInstance,
         creator_did: &str,
@@ -2848,9 +2855,13 @@ mod tests {
     ) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
-        crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
+        crate::runtime::register_ffi_state(bi, &ctx_id, &[]).unwrap();
 
         if with_outlet {
+            // No supervisor serves this context, so the registration authorizes
+            // `creator_did` against a role state the fixture builds over
+            // `default_ceiling()`.
+            let role_state = fixture_role_state(&ctx_id, creator_did);
             crate::runtime::with_context(bi, &ctx_id, |rt| {
                 let registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: "calculator".to_owned(),
@@ -2884,7 +2895,7 @@ mod tests {
                 };
                 scp_core::context::outlets::register_outlet(
                     &mut rt.outlet_registry,
-                    &rt.role_state,
+                    &role_state,
                     registration,
                     creator_did,
                 )
@@ -3071,15 +3082,21 @@ mod tests {
     // an agent holding the Query stem.
     // -----------------------------------------------------------------------
 
-    /// Holds a context on the actor with `ceiling`, which the creator holds as
-    /// admin, and registers a Query-kind `lookup` outlet on the bridge copy,
-    /// where `outlet_grant` reads the outlet's kind.
+    /// Holds a context on the actor with `ceiling` plus `outlet:register`,
+    /// which the creator holds as admin, and registers a Query-kind `lookup`
+    /// outlet in this bridge's outlet registry, where `outlet_grant` reads the
+    /// outlet's kind. The registration checks the creator's capability against
+    /// the actor's role state, so the ceiling carries `outlet:register`; it
+    /// grants no outlet call or query stem.
     fn setup_query_outlet_context(
         bi: &crate::runtime::PyBridgeInstance,
         creator: &str,
         ceiling: &[&str],
     ) -> String {
-        let ctx_id = setup_supervised_context(bi, creator, false, ceiling);
+        let mut held = ceiling.to_vec();
+        held.push("outlet:register");
+        let ctx_id = setup_supervised_context(bi, creator, false, &held);
+        let role_state = crate::runtime::live_role_state(bi, &ctx_id).unwrap();
         crate::runtime::with_context(bi, &ctx_id, |rt| {
             let registration = scp_core::context::outlets::OutletRegistration {
                 outlet_id: "lookup".to_owned(),
@@ -3112,7 +3129,7 @@ mod tests {
             };
             scp_core::context::outlets::register_outlet(
                 &mut rt.outlet_registry,
-                &rt.role_state,
+                &role_state,
                 registration,
                 creator,
             )
@@ -3593,17 +3610,16 @@ mod tests {
     }
 
     /// The UCAN step of `validate_capability` takes the ceiling and the
-    /// creator from the supervisor actor. The bridge copy names a different
-    /// creator and carries an empty ceiling, so a UCAN step that read the
-    /// copy would refuse the token the actor's creator issued.
+    /// creator from the supervisor actor: the token the actor's creator
+    /// issued within the actor's ceiling passes. FFI state holds no ceiling
+    /// and no creator, so the actor is the only source the step can read.
     #[test]
     #[cfg(feature = "testing")]
     fn validate_capability_ucan_step_reads_the_supervisor_ceiling_and_creator() {
         let issuer = TestIssuer::new();
         let agent = "did:dht:z6MkAgentLiveUcanAnchor";
-        let copy_creator = "did:dht:z6MkCopyCreatorLiveUcanAnchor";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, copy_creator, true);
+        let ctx_id = setup_test_context(&bi, &issuer.did, true);
         hold_on_actor(
             &bi,
             &ctx_id,
@@ -3612,21 +3628,6 @@ mod tests {
         );
         crate::runtime::insert_supervisor_member_for_test(&bi, &ctx_id, agent)
             .expect("supervisor must record the member");
-        crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            rt.ceiling_strings.clear();
-            Ok(())
-        })
-        .unwrap();
-        let (copy_ceiling_empty, copy_creator_now) =
-            crate::runtime::with_context(&bi, &ctx_id, |rt| {
-                Ok((rt.ceiling_strings.is_empty(), rt.creator_did.clone()))
-            })
-            .unwrap();
-        assert!(
-            copy_ceiling_empty && copy_creator_now == copy_creator,
-            "precondition: the copy's ceiling is empty and its creator is not the issuer"
-        );
-
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: agent.to_owned(),
@@ -3703,8 +3704,10 @@ mod tests {
         let ctx_id = setup_unsupervised_context(&bi, creator, true);
         let mut provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
         provider.agent_ucan_token = Some("not-a-ucan".to_owned());
-        let role_state =
-            crate::runtime::with_context(&bi, &ctx_id, |rt| Ok(rt.role_state.clone())).unwrap();
+        // No supervisor serves the context, so the test builds the role state
+        // the caller would pass; `outlet_grant` must fail its lifecycle read
+        // before it consults this value.
+        let role_state = fixture_role_state(&ctx_id, creator);
         let refusal = provider
             .outlet_grant(
                 &bi,
@@ -4008,7 +4011,7 @@ mod tests {
         Python::with_gil(|py| {
             assert!(
                 scp.py_mcp_load_contexts(py, creator, "").is_err(),
-                "no supervisor must fail the listing, not answer from the bridge copy"
+                "no supervisor must fail the listing, not answer from bridge state"
             );
         });
 
@@ -5753,14 +5756,6 @@ mod tests {
         let bi = __bi();
         let ctx_id = setup_unsupervised_context(&bi, agent, false);
         let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
-        assert!(
-            crate::runtime::with_context(&bi, &ctx_id, |rt| Ok(rt
-                .role_state
-                .members
-                .contains(agent)))
-            .unwrap(),
-            "precondition: the bridge copy names the agent as a member"
-        );
 
         assert!(
             provider
@@ -5817,7 +5812,7 @@ mod tests {
     /// The actor exists and holds no such context, the state after the actor
     /// drops a context the agent was removed from, so every gate must deny.
     #[test]
-    fn provider_gates_follow_the_actor_not_the_bridge_copy_pyo3() {
+    fn provider_gates_follow_the_actor_not_the_bridge_state_pyo3() {
         use scp_mcp::server::ResourceKind;
 
         crate::init_runtime().ok();
@@ -5827,14 +5822,6 @@ mod tests {
         let provider = pyo3_mcp_provider(&bi, &ctx_id, agent);
         crate::runtime::init_context_manager_for_test(&bi);
         assert!(crate::runtime::supervisor(&bi).is_ok());
-        assert!(
-            crate::runtime::with_context(&bi, &ctx_id, |rt| Ok(rt
-                .role_state
-                .members
-                .contains(agent)))
-            .unwrap(),
-            "precondition: the bridge copy names the agent as a member"
-        );
 
         assert!(
             provider.active_context_ids().unwrap().is_empty(),
@@ -5847,7 +5834,7 @@ mod tests {
         ] {
             let denial = provider
                 .validate_resource_access(&ctx_id, kind)
-                .expect_err("the bridge copy must not grant what the actor does not");
+                .expect_err("a context the actor does not hold must be denied");
             assert!(
                 matches!(
                     &denial,
@@ -5863,7 +5850,7 @@ mod tests {
         ] {
             let denial = provider
                 .validate_capability(&ctx_id, "any-outlet", check)
-                .expect_err("the bridge copy must not grant a tool the actor does not");
+                .expect_err("a context the actor does not hold must deny its tools");
             assert!(
                 matches!(
                     &denial,
@@ -5909,34 +5896,25 @@ mod tests {
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
-    /// Registers `ctx_id` on the bridge with `copy_creator` as the copy's sole
-    /// member, and creates it on the actor with `actor_creator` as its creator,
-    /// so the bridge copy and the actor disagree about who is a member.
-    fn setup_diverged_context(
+    /// Registers FFI state for `ctx_id` on the bridge, and creates it on the
+    /// actor with `actor_creator` as its creator and sole member.
+    fn setup_registered_context(
         bi: &crate::runtime::PyBridgeInstance,
         ctx_id: &str,
-        copy_creator: &str,
         actor_creator: &str,
     ) {
-        setup_diverged_context_with_ceiling(
-            bi,
-            ctx_id,
-            copy_creator,
-            actor_creator,
-            &["messages:read"],
-        );
+        setup_registered_context_with_ceiling(bi, ctx_id, actor_creator, &["messages:read"]);
     }
 
-    /// [`setup_diverged_context`] with `ceiling` as the actor context's
+    /// [`setup_registered_context`] with `ceiling` as the actor context's
     /// ceiling, which its creator holds as admin.
-    fn setup_diverged_context_with_ceiling(
+    fn setup_registered_context_with_ceiling(
         bi: &crate::runtime::PyBridgeInstance,
         ctx_id: &str,
-        copy_creator: &str,
         actor_creator: &str,
         ceiling: &[&str],
     ) {
-        crate::runtime::register_context(bi, ctx_id, copy_creator, &[]).unwrap();
+        crate::runtime::register_context(bi, ctx_id, actor_creator, &[]).unwrap();
         hold_on_actor(bi, ctx_id, actor_creator, ceiling);
     }
 
@@ -5969,16 +5947,15 @@ mod tests {
     }
 
     /// Every MCP gate answers from the actor's role state while the actor holds
-    /// the context, and the gates write nothing back to the bridge copy.
+    /// the context.
     ///
     /// `revoked` is the state after an inbound commit removed the agent: the
-    /// actor holds the context without the agent while the bridge copy still
-    /// names the agent as its member. `granted` is the reverse. A gate that read
-    /// the copy, or that let the copy decide, fails one of the two halves; a
-    /// gate that wrote the actor's snapshot back into the copy fails the final
-    /// assertions.
+    /// actor holds the context without the agent. `granted` is the reverse: the
+    /// actor's creator, and so its sole member, is the agent. A gate that
+    /// answered from anything other than the actor's membership fails one of
+    /// the two halves.
     #[test]
-    fn provider_gates_read_the_actor_role_state_without_writing_the_copy_pyo3() {
+    fn provider_gates_read_the_actor_role_state_pyo3() {
         use scp_mcp::server::ResourceKind;
 
         crate::init_runtime().ok();
@@ -5987,13 +5964,8 @@ mod tests {
         let bi = __bi();
         let revoked = crate::types::generate_random_id("test-mcp-revoked");
         let granted = crate::types::generate_random_id("test-mcp-granted");
-        setup_diverged_context(&bi, &revoked, agent, other);
-        setup_diverged_context(&bi, &granted, other, agent);
-        let copy_has_agent = |ctx: &str| {
-            crate::runtime::with_context(&bi, ctx, |rt| Ok(rt.role_state.members.contains(agent)))
-                .unwrap()
-        };
-        assert!(copy_has_agent(&revoked) && !copy_has_agent(&granted));
+        setup_registered_context(&bi, &revoked, other);
+        setup_registered_context(&bi, &granted, agent);
 
         let provider = pyo3_mcp_provider(&bi, &revoked, agent);
         assert!(provider.active_context_ids().unwrap().is_empty());
@@ -6004,7 +5976,7 @@ mod tests {
         ] {
             let denial = provider
                 .validate_resource_access(&revoked, kind)
-                .expect_err("the copy's grant must not outlive the actor's revocation");
+                .expect_err("the actor's revocation must deny the resource");
             assert!(
                 matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains(requirement)),
                 "{kind:?}: {denial}"
@@ -6081,9 +6053,6 @@ mod tests {
             "{denial}"
         );
 
-        // No write-back: each copy still holds what the bridge wrote into it.
-        assert!(copy_has_agent(&revoked) && !copy_has_agent(&granted));
-
         crate::runtime::remove_context(&bi, &revoked);
         crate::runtime::remove_context(&bi, &granted);
     }
@@ -6116,10 +6085,9 @@ mod tests {
         let agent = "did:dht:z6MkNoCopyAgent";
         let bi = __bi();
         let ctx_id = crate::types::generate_random_id("test-mcp-no-copy");
-        setup_diverged_context_with_ceiling(
+        setup_registered_context_with_ceiling(
             &bi,
             &ctx_id,
-            agent,
             agent,
             &["messages:read", "outlet:call:*"],
         );
@@ -6140,7 +6108,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&refusal, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("not registered")),
-            "a missing bridge copy is no registration, not a failed read: {refusal}"
+            "missing FFI state is no registration, not a failed read: {refusal}"
         );
 
         // A context held by neither is still an error.
@@ -6157,7 +6125,7 @@ mod tests {
         let agent = "did:dht:z6MkEventsResourceAgent";
         let bi = __bi();
         let ctx_id = crate::types::generate_random_id("test-mcp-events");
-        setup_diverged_context(&bi, &ctx_id, agent, agent);
+        setup_registered_context(&bi, &ctx_id, agent);
         // Make the bridge's local tree diverge from the actor's log.
         crate::runtime::with_context(&bi, &ctx_id, |rt| {
             rt.event_log.push_leaf_raw([0x5A; 32]);
@@ -6286,7 +6254,7 @@ mod tests {
     /// `resources.subscribe: false`, and reads `resources/list` through the
     /// provider type that entry point builds over the same instance: with no
     /// supervisor the role-state read fails, so the list fails instead of
-    /// answering from the bridge copy.
+    /// answering from bridge state.
     #[test]
     fn missing_supervisor_serves_but_fails_role_state_reads_pyo3() {
         crate::init_runtime().ok();
