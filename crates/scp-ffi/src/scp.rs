@@ -290,9 +290,8 @@ impl PyScp {
     /// Shuts the instance down with a graceful deadline for in-flight tasks.
     ///
     /// Delegates to [`PyBridgeInstance::shutdown`] via the
-    /// [`BridgeInstanceCore`] trait: fires the cancellation token, drains
-    /// the `JoinSet` inside the `timeout_millis` budget, then runs
-    /// typed-field cleanup.
+    /// [`BridgeInstanceCore`] trait, which awaits in-flight tasks up to
+    /// `timeout_millis`.
     ///
     /// The timeout unit is **milliseconds** — unified across all Rust
     /// bridges so the Python, TypeScript, Swift, and Kotlin SDKs can

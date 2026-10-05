@@ -318,9 +318,8 @@ impl Scp {
 
     /// Shuts down this bridge instance with a graceful deadline.
     ///
-    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-    /// then clears registries and runs shutdown hooks. Permanent — a
-    /// shut-down instance cannot be reused.
+    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+    /// Permanent — a shut-down instance cannot be reused.
     ///
     /// The unit is **milliseconds** — unified across all Rust bridges.
     /// The width is `u64` so the NAPI / `UniFFI` / `PyO3` bridges share
@@ -3337,11 +3336,8 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// Rejects with a typed saga error — `SagaAborted` (a Prepare-phase abort
-    /// that may be a permanent rejection — authorization, freshness, rate limit,
-    /// or co-residency — OR a retryable transient: a rate limit, or a
-    /// participant actor unavailable to complete the Prepare exchange; carries
-    /// `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
+    /// Rejects with a typed saga error — `SagaAborted` (its causes told
+    /// apart by its code; carries `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
     /// carries the durable `saga_id`), or `SagaBusy` (the participant context
     /// set overlapped an in-flight saga — §5.15.4). Rejects with a validation
     /// error if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not

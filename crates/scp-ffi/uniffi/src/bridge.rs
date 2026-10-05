@@ -1146,31 +1146,21 @@ pub enum ScpError {
     #[error("validation error [{code}]: {msg}")]
     Validation { msg: String, code: String },
 
-    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
+    /// A §6.2.4 cross-context outlet-invocation saga aborted.
     ///
-    /// Surfaces the `Aborted` terminal of
-    /// `Supervisor::start_cross_context_outlet_invocation_saga`. This terminal may
-    /// be a PERMANENT rejection (authorization / freshness / rate-limit /
-    /// co-residency policy denial, or the §6.2.4 *Caller authentication*
-    /// mismatch this bridge enforces before the saga runs) OR a RETRYABLE
-    /// transient (a rate-limit back-off, or a participant actor unavailable to
-    /// complete the Prepare exchange) — distinguished by the code.
+    /// The code tells its causes apart.
     /// Carries the rate-limit back-off hint STRUCTURALLY
     /// (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
-    /// `None` (NEVER `0`) means no precise back-off instant exists (a
-    /// token-bucket hard limit, an unavailable participant actor, or a permanent
-    /// rejection) — `0` would read as "retry immediately" and re-trip the same
-    /// hard limit. Maps to Swift `ScpError.SagaAborted`
-    /// / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
-    /// Swift `msg:` label — the `UniFFI` field-name convention every variant
-    /// here follows).
+    /// `None` (NEVER `0`) means no precise back-off instant exists — `0` would
+    /// read as "retry immediately" and re-trip the same hard limit. Maps to
+    /// Swift `ScpError.SagaAborted` / Kotlin `ScpException.SagaAborted` (the
+    /// `msg` field surfaces as the Swift `msg:` label — the `UniFFI`
+    /// field-name convention every variant here follows).
     #[error("saga aborted [{code}]: {msg}")]
     SagaAborted {
         /// Human-readable detail.
         msg: String,
-        /// The code
-        /// [`decompose_saga_error`](scp_ffi_common::saga_errors::decompose_saga_error)
-        /// assigns.
+        /// Stable error code.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -6787,6 +6777,8 @@ async fn resolve_uniffi_message_signer(
 /// - `NeedsRepair` → [`ScpError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpError::SagaBusy`] (`SCP-SAGA-13066`).
+/// - `SupervisorShutDown` → [`ScpError::SagaAborted`] (`retry_after_ms` `None`,
+///   `SCP-CTX-2138`).
 pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
     use scp_ffi_common::saga_errors::{SagaErrorKind, decompose_saga_error};
     let parts = decompose_saga_error(err);
@@ -14702,11 +14694,8 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-    /// Prepare-phase abort that may be a permanent rejection — authorization,
-    /// freshness, rate limit, or co-residency — OR a retryable transient: a rate
-    /// limit, or a participant actor unavailable to complete the Prepare
-    /// exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+    /// Returns one of the typed saga errors — [`ScpError::SagaAborted`] (its causes told
+    /// apart by its code; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
     /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
     /// handle), or [`ScpError::SagaBusy`] (the participant context set
     /// overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]

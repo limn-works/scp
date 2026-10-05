@@ -112,14 +112,9 @@ pub enum ScpNapiError {
         code: String,
     },
 
-    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase
-    /// (ADR-049 §3a).
+    /// A §6.2.4 cross-context outlet-invocation saga aborted (ADR-049 §3a).
     ///
-    /// This terminal surfaces a §6.2.4 saga `Aborted` and, like its `PyO3` and
-    /// `UniFFI` siblings, may be a PERMANENT rejection (authorization / freshness
-    /// / rate-limit / co-residency policy denial) OR a RETRYABLE transient (a
-    /// rate limit, or a participant actor unavailable to complete the Prepare
-    /// exchange) — distinguished by the code.
+    /// The code tells its causes apart.
     ///
     /// napi-rs collapses every `ScpNapiError` to a single `napi::Error` whose
     /// only payload is a message string (the TypeScript SDK reverses the
@@ -137,9 +132,7 @@ pub enum ScpNapiError {
     SagaAborted {
         /// Human-readable detail.
         message: String,
-        /// The code
-        /// [`decompose_saga_error`](scp_ffi_common::saga_errors::decompose_saga_error)
-        /// assigns.
+        /// Stable error code.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,

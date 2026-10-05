@@ -87,9 +87,8 @@ pyo3::create_exception!(
 // makes load-bearing as a positional Python exception argument (read from
 // `e.args`, never re-parsed from the message text):
 //
-// - `SagaAbortedError(message, code, retry_after_ms)` — a Prepare-phase abort
-//   (§6.2.4) that may be a permanent rejection OR a retryable transient (rate
-//   limit / participant actor unavailable), distinguished by the code.
+// - `SagaAbortedError(message, code, retry_after_ms)` — a §6.2.4 saga abort,
+//   its causes told apart by the code.
 //   `retry_after_ms` is the rate-limit back-off hint: an `int` of milliseconds when the tripped limiter can compute one, or
 //   `None` (NEVER `0`) when no precise back-off instant exists — `0` would
 //   read as "retry immediately" and re-trip the same hard limit. An unavailable
@@ -107,7 +106,7 @@ pyo3::create_exception!(
     scp_sdk,
     SagaAbortedError,
     ScpError,
-    "A cross-context outlet-invocation saga aborted at a Prepare phase (§6.2.4). \
+    "A cross-context outlet-invocation saga aborted (§6.2.4). \
      args = (message, code, retry_after_ms): retry_after_ms is an int of \
      milliseconds or None (never 0)."
 );
@@ -186,21 +185,17 @@ pub enum ScpPyError {
         /// Stable error code (e.g. `SCP-VALID-7001`).
         code: String,
     },
-    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
+    /// A §6.2.4 cross-context outlet-invocation saga aborted.
     ///
-    /// Maps to the Python `SagaAbortedError`. This terminal may be a permanent
-    /// rejection OR a retryable transient (rate limit / participant actor
-    /// unavailable), distinguished by the code. Carries the
+    /// Maps to the Python `SagaAbortedError`. The code tells its causes
+    /// apart. Carries the
     /// rate-limit back-off hint STRUCTURALLY (`retry_after_ms`): `Some(ms)` is
     /// the limiter's computed cooldown; `None` (NEVER `0`) means no precise
-    /// back-off instant (a token-bucket hard limit, an unavailable participant
-    /// actor, or a permanent rejection).
+    /// back-off instant.
     SagaAborted {
         /// Human-readable detail.
         message: String,
-        /// The code
-        /// [`decompose_saga_error`](scp_ffi_common::saga_errors::decompose_saga_error)
-        /// assigns.
+        /// Stable error code.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,

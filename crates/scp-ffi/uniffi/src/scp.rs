@@ -134,9 +134,8 @@ impl Scp {
 
     /// Shuts down this bridge instance with a graceful deadline.
     ///
-    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-    /// then clears registries and runs shutdown hooks. Permanent — a
-    /// shut-down instance cannot be reused.
+    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+    /// Permanent — a shut-down instance cannot be reused.
     ///
     /// The unit is **milliseconds** — unified across all Rust bridges
     /// so the Swift and Kotlin SDKs can share a single conversion
