@@ -4377,9 +4377,6 @@ pub fn identity_verify_link_attestation(
 /// A context handle and the role state that
 /// [`UniffiBridgeInstance::require_active_context_before_authz`](crate::runtime::UniffiBridgeInstance::require_active_context_before_authz)
 /// returned for that handle's own `context_id`.
-///
-/// [`Self::gate`] is the only constructor, so a role state read for another
-/// context cannot be paired with the handle.
 pub(crate) struct GatedHandle<'a> {
     handle: &'a ContextHandle,
     role_state: scp_core::context::roles::ContextRoleState,
@@ -5225,7 +5222,10 @@ impl McpUniFfiBridgeProvider {
             Ok(Some(role_state)) => Ok(role_state),
             Ok(None) => Err(AccessRefusal::Denied(
                 if bi.core.try_supervisor().is_some() {
-                    format!("context '{context_id}' is not held by the supervisor")
+                    format!(
+                        "context '{context_id}': {}",
+                        scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                    )
                 } else {
                     format!("context '{context_id}' is not held: no supervisor is attached")
                 },
@@ -25855,7 +25855,8 @@ mod tests {
     /// Once a close leaves the actor resident in `Closing`, still holding its
     /// role state, a probe, a `tools/call` and a resource read are each denied
     /// with the withheld refusal, and no outlet runs. A gate that read only the
-    /// role state would admit all three.
+    /// role state would admit all three. A probe and a resource read of a
+    /// context no actor holds are refused with the same text.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "testing")]
     async fn uniffi_mcp_access_gates_deny_a_context_whose_actor_is_closing() {
@@ -26051,6 +26052,32 @@ mod tests {
             is_withheld_denial(&resource),
             "the resource denial must withhold the state: {resource}"
         );
+
+        // A context no actor holds is refused with the same text, so the
+        // refusal does not tell a resident non-Active context from an absent
+        // one.
+        let absent_resource = provider
+            .validate_resource_access("ctx-absent", scp_mcp::server::ResourceKind::Tools)
+            .expect_err("a resource read of an absent context must be denied");
+        let absent_probe = provider
+            .validate_capability(
+                "ctx-absent",
+                "calculator",
+                scp_mcp::server::CapabilityCheck::Probe,
+            )
+            .expect_err("a probe of an absent context must be denied");
+        for (closing, absent) in [(&resource, &absent_resource), (&probe, &absent_probe)] {
+            assert_eq!(
+                closing.to_string().replace("ctx-test", "ctx-absent"),
+                absent.to_string(),
+                "an absent context and a closing context must be refused with the same text"
+            );
+            assert_eq!(
+                std::mem::discriminant(closing),
+                std::mem::discriminant(absent),
+                "an absent context and a closing context must be refused with the same variant"
+            );
+        }
     }
 
     /// `run_outlet` asks for the Invoke check, which spends the agent token,
@@ -26436,7 +26463,7 @@ mod tests {
 
         gates("no supervisor is attached");
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
-        gates("is not held by the supervisor");
+        gates(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD);
 
         bi.core.suspend().expect("suspend");
         let resource = provider.validate_resource_access("ctx-absent", ResourceKind::Events);

@@ -1161,7 +1161,7 @@ async fn resolve_context_active_signing_key_by_id(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("failed to export Active Signing Key for context '{context_id}': {e}"),
-            // INTENTIONALLY DISTINCT from the CTX_2001 "not hosted here" siblings
+            // INTENTIONALLY DISTINCT from the CTX_2001 "not hosted here" error
             // above: the identity IS hosted, but the custody export operation
             // itself failed (a crypto/custody operational fault, not a hosting /
             // channel-auth class) — kept as CTX_2040.

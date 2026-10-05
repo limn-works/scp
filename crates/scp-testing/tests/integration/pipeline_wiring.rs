@@ -3786,9 +3786,10 @@ const CAPABILITY_BRIDGE: &str = "fn validate_capability(&self, context_id: &str,
 /// or when a statement returns before the check.
 #[test]
 fn mcp_capability_gate_rejects_a_discarded_verdict() {
-    assert!(answers_capability_from_live_role_state(&production_code(
-        CAPABILITY_BRIDGE
-    )));
+    assert!(answers_capability_from_live_role_state(
+        &production_code(CAPABILITY_BRIDGE),
+        false
+    ));
     let discarded = CAPABILITY_BRIDGE.replace(
         "outlet_name, check)\n}",
         "outlet_name, check).ok();\n    Ok(())\n}",
@@ -3807,10 +3808,71 @@ fn mcp_capability_gate_rejects_a_discarded_verdict() {
     );
     for regression in [discarded, inner_block, stand_in, early_return] {
         assert!(
-            !answers_capability_from_live_role_state(&production_code(&regression)),
+            !answers_capability_from_live_role_state(&production_code(&regression), false),
             "{regression}"
         );
     }
+}
+
+/// With `lifecycle` true, both MCP access gates accept a body only when
+/// `LIFECYCLE_GATE` sits between the role-state read and the tail; with it
+/// false, they reject that statement.
+#[test]
+fn mcp_access_gates_pin_the_lifecycle_statement() {
+    let resource = RESOURCE_BRIDGE.replace(
+        "?;\n    let access",
+        "?;\n    Self::gate_active_lifecycle(&bi, context_id)?;\n    let access",
+    );
+    let capability = CAPABILITY_BRIDGE.replace(
+        "?;\n    self.outlet_grant",
+        "?;\n    Self::gate_active_lifecycle(&bi, context_id)?;\n    self.outlet_grant",
+    );
+    assert_ne!(resource, RESOURCE_BRIDGE);
+    assert_ne!(capability, CAPABILITY_BRIDGE);
+    assert!(answers_resource_access_from_live_role_state(
+        &production_code(&resource),
+        true
+    ));
+    assert!(answers_capability_from_live_role_state(
+        &production_code(&capability),
+        true
+    ));
+    // The statement is required when `lifecycle` is true.
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(RESOURCE_BRIDGE),
+        true
+    ));
+    assert!(!answers_capability_from_live_role_state(
+        &production_code(CAPABILITY_BRIDGE),
+        true
+    ));
+    // The statement is refused when `lifecycle` is false.
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&resource),
+        false
+    ));
+    assert!(!answers_capability_from_live_role_state(
+        &production_code(&capability),
+        false
+    ));
+    // The statement before `bi` is bound, or after the tail, does not count.
+    let before_bind = RESOURCE_BRIDGE.replace(
+        "use scp_mcp::server::AccessRefusal;",
+        "use scp_mcp::server::AccessRefusal;\n    Self::gate_active_lifecycle(&bi, context_id)?;",
+    );
+    assert!(!answers_resource_access_from_live_role_state(
+        &production_code(&before_bind),
+        true
+    ));
+    // Its refusal discarded does not count.
+    let discarded = capability.replace(
+        "Self::gate_active_lifecycle(&bi, context_id)?;",
+        "let _ = Self::gate_active_lifecycle(&bi, context_id);",
+    );
+    assert!(!answers_capability_from_live_role_state(
+        &production_code(&discarded),
+        true
+    ));
 }
 
 /// The resource-access gate must go red when the live read targets an instance
@@ -3820,7 +3882,8 @@ fn mcp_capability_gate_rejects_a_discarded_verdict() {
 fn mcp_resource_gate_rejects_a_read_not_from_the_bridge_instance() {
     let bridge = RESOURCE_BRIDGE;
     assert!(answers_resource_access_from_live_role_state(
-        &production_code(bridge)
+        &production_code(bridge),
+        false
     ));
     // The live read survives, but `bi` is a stand-in instance, not the
     // provider's own bridge instance.
@@ -3829,7 +3892,8 @@ fn mcp_resource_gate_rejects_a_read_not_from_the_bridge_instance() {
         "let bi = detached.clone();",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&stand_in_instance)
+        &production_code(&stand_in_instance),
+        false
     ));
     // `bi` is bound from the bridge instance, then rebound to another
     // instance before the live read.
@@ -3838,7 +3902,8 @@ fn mcp_resource_gate_rejects_a_read_not_from_the_bridge_instance() {
         "let bi = detached.clone();\n    let role_state =\n",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&bi_rebound)
+        &production_code(&bi_rebound),
+        false
     ));
     // A statement before the `bi` binding answers `Ok(())` early.
     let early_return = bridge.replace(
@@ -3846,7 +3911,8 @@ fn mcp_resource_gate_rejects_a_read_not_from_the_bridge_instance() {
         "use scp_mcp::server::AccessRefusal;\n    return Ok(());",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&early_return)
+        &production_code(&early_return),
+        false
     ));
 }
 
@@ -3871,7 +3937,8 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     // predicate, and return the predicate's verdict.
     let bridge = RESOURCE_BRIDGE;
     assert!(answers_resource_access_from_live_role_state(
-        &production_code(bridge)
+        &production_code(bridge),
+        false
     ));
     // A stand-in role state reaches the predicate: the live read is gone.
     let stand_in = bridge.replace(
@@ -3879,7 +3946,8 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
         "ContextRoleState::default()",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&stand_in)
+        &production_code(&stand_in),
+        false
     ));
     // The live read survives, but a stand-in shadows it before the predicate.
     let shadowed = bridge.replace(
@@ -3887,7 +3955,8 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
         "let role_state = ContextRoleState::default();\n    let access = resource",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&shadowed)
+        &production_code(&shadowed),
+        false
     ));
     // The live read survives, but a call chained onto it turns a failed read
     // into a stand-in before the predicate.
@@ -3896,14 +3965,16 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
         ".or_else(|_| Ok(fallback.clone()))?;\n    let access",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&chained)
+        &production_code(&chained),
+        false
     ));
     let unwrapped = bridge.replace(
         "?;\n    let access",
         ".unwrap_or_else(|_| fallback.clone());\n    let access",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&unwrapped)
+        &production_code(&unwrapped),
+        false
     ));
     // The predicate call is deleted and the function answers `Ok(())`.
     let unchecked = bridge.replace(
@@ -3911,7 +3982,8 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
         "Ok(())",
     );
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&unchecked)
+        &production_code(&unchecked),
+        false
     ));
     // The predicate call survives, but the function discards its verdict and
     // answers `Ok(())`.
@@ -3919,7 +3991,8 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
         .replace("let access = resource", "let _access = resource")
         .replace("access.map_err(AccessRefusal::Denied)", "Ok(())");
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&discarded)
+        &production_code(&discarded),
+        false
     ));
     // The verdict is returned only from an inner block, and the function
     // answers `Ok(())` after it.
@@ -3931,14 +4004,16 @@ fn mcp_resource_gate_code_search_ignores_comments_and_stand_ins() {
     );
     assert_ne!(inner_block, bridge);
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(&inner_block)
+        &production_code(&inner_block),
+        false
     ));
     // The live read and the predicate call survive only in ANOTHER function.
     let moved = "fn validate_resource_access(&self) -> Result<(), String> { Ok(()) }\n\
                  fn other(&self) { let role_state = Self::gate_role_state(&bi, context_id)?; \
                  resource.check_access(&role_state, &self.agent_did, context_id) }\n";
     assert!(!answers_resource_access_from_live_role_state(
-        &production_code(moved)
+        &production_code(moved),
+        false
     ));
     // The predicate's `messages:read` arm is replaced by a membership check,
     // or the two arms swap their requirements.
@@ -4125,6 +4200,10 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+/// The statement `UniFFI`'s MCP access gates run between the `gate_role_state`
+/// read and the tail.
+const LIFECYCLE_GATE: &str = "Self::gate_active_lifecycle(&bi, context_id)?;";
+
 /// Whether the production `validate_resource_access` in `code` reads the
 /// context's role state through the bridge's `gate_role_state` (an associated
 /// function on PyO3 and UniFFI, a free function on NAPI) from the provider's
@@ -4140,7 +4219,11 @@ fn fn_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
 /// into a stand-in: the pinned read ends in `?`, which returns
 /// `gate_role_state`'s refusal. [`splits_absent_context_from_failed_read`]
 /// checks which refusal `gate_role_state` returns.
-fn answers_resource_access_from_live_role_state(code: &str) -> bool {
+///
+/// When `lifecycle` is true, the body must also hold [`LIFECYCLE_GATE`] as its
+/// own statement between the `gate_role_state` read and the predicate call;
+/// when it is false, nothing may sit there.
+fn answers_resource_access_from_live_role_state(code: &str, lifecycle: bool) -> bool {
     const BIND: &str = "use scp_mcp::server::AccessRefusal; \
                         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;";
     const TAIL: &str = "let access = resource.check_access(&role_state, &self.agent_did, \
@@ -4155,6 +4238,17 @@ fn answers_resource_access_from_live_role_state(code: &str) -> bool {
             return false;
         };
         let before_tail = body[..tail_at].trim_end();
+        let before_tail = if lifecycle {
+            match before_tail
+                .strip_suffix(LIFECYCLE_GATE)
+                .and_then(|rest| rest.strip_suffix(' '))
+            {
+                Some(rest) => rest,
+                None => return false,
+            }
+        } else {
+            before_tail
+        };
         READS.iter().any(|read| {
             before_tail
                 .strip_suffix(read)
@@ -4325,8 +4419,9 @@ fn reads_role_state_from_its_own_source(code: &str) -> bool {
 /// from the provider's own bridge instance, passes it to `outlet_grant`, and
 /// returns that call's verdict as the function's tail expression, pinned
 /// statement by statement as [`answers_resource_access_from_live_role_state`]
-/// pins `validate_resource_access`.
-fn answers_capability_from_live_role_state(code: &str) -> bool {
+/// pins `validate_resource_access`, including the [`LIFECYCLE_GATE`]
+/// statement between the read and the tail when `lifecycle` is true.
+fn answers_capability_from_live_role_state(code: &str, lifecycle: bool) -> bool {
     const BIND: &str = "use scp_mcp::server::AccessRefusal; \
                         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;";
     const TAIL: &str = "self.outlet_grant(&bi, &role_state, context_id, outlet_name, check) }";
@@ -4336,8 +4431,13 @@ fn answers_capability_from_live_role_state(code: &str) -> bool {
     ];
     fn_body(code, "validate_capability").is_some_and(|body| {
         READS.iter().any(|read| {
+            let shape = if lifecycle {
+                format!("{BIND} {read} {LIFECYCLE_GATE} {TAIL}")
+            } else {
+                format!("{BIND} {read} {TAIL}")
+            };
             body.trim_end()
-                .strip_suffix(&format!("{BIND} {read} {TAIL}"))
+                .strip_suffix(&shape)
                 .is_some_and(|signature| {
                     signature.trim_end().ends_with('{') && signature.matches('{').count() == 1
                 })
@@ -4362,11 +4462,11 @@ fn invokes_no_outlet(code: &str) -> bool {
 /// grant lists a tool in `tools/list` that every `tools/call` then fails;
 /// otherwise it must return `outlet_grant`'s verdict on live role state
 /// ([`answers_capability_from_live_role_state`]).
-fn answers_capability_as_invoke_outlet_allows(code: &str) -> bool {
+fn answers_capability_as_invoke_outlet_allows(code: &str, lifecycle: bool) -> bool {
     if invokes_no_outlet(code) {
         refuses_every_capability_as_unsupported(code)
     } else {
-        answers_capability_from_live_role_state(code)
+        answers_capability_from_live_role_state(code, lifecycle)
     }
 }
 
@@ -4417,7 +4517,10 @@ fn mcp_capability_gate_follows_invoke_outlet() {
     );
     assert_ne!(free_read, live_validate);
     let accepts = |validate: &str, invoke: &str| {
-        answers_capability_as_invoke_outlet_allows(&production_code(&format!("{validate}{invoke}")))
+        answers_capability_as_invoke_outlet_allows(
+            &production_code(&format!("{validate}{invoke}")),
+            false,
+        )
     };
     assert!(invokes_no_outlet(&production_code(stub_invoke)));
     assert!(!invokes_no_outlet(&production_code(REAL_INVOKE)));
@@ -4615,27 +4718,34 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
     // event-source gate above does: each bridge's test module and doc comments
     // name the same symbols, so a whole-file `contains` stayed green after the
     // real call was deleted.
-    for (bridge, src) in [
+    //
+    // `lifecycle` is true for a bridge whose two MCP access gates must run
+    // `LIFECYCLE_GATE` between the role-state read and the tail.
+    for (bridge, src, lifecycle) in [
         (
             "PyO3",
             include_str!("../../../../crates/scp-ffi/src/mcp.rs"),
+            false,
         ),
         (
             "NAPI",
             include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs"),
+            false,
         ),
         (
             "UniFFI",
             include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
+            true,
         ),
     ] {
         let code = production_code(src);
         assert!(
-            answers_resource_access_from_live_role_state(&code),
+            answers_resource_access_from_live_role_state(&code, lifecycle),
             "{bridge}'s production `validate_resource_access` must read the context's \
              role state through `gate_role_state` from its own bridge instance and pass that \
              value to `ResourceKind::check_access`; a stand-in role state, a deleted predicate \
-             call, or a call in some other function does not count"
+             call, or a call in some other function does not count (lifecycle gate required: \
+             {lifecycle})"
         );
         assert!(
             splits_absent_context_from_failed_read(&code),
@@ -4653,7 +4763,7 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
              outside that branch"
         );
         assert!(
-            answers_capability_as_invoke_outlet_allows(&code),
+            answers_capability_as_invoke_outlet_allows(&code, lifecycle),
             "{bridge}'s production `validate_capability` must, while its `invoke_outlet` is the \
              SCP-048 stub (stub: {}), be the stub whose whole body is \
              `Err(AccessRefusal::Unsupported(OUTLET_INVOCATION_UNAVAILABLE))`, since any grant \
