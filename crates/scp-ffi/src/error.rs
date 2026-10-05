@@ -89,9 +89,8 @@ pyo3::create_exception!(
 //
 // - `SagaAbortedError(message, code, retry_after_ms)` — a Prepare-phase abort
 //   (§6.2.4) that may be a permanent rejection OR a retryable transient (rate
-//   limit / participant actor unavailable), distinguished by the `SCP-SAGA-*`
-//   code. `retry_after_ms` is the rate-limit back-off hint:
-//   an `int` of milliseconds when the tripped limiter can compute one, or
+//   limit / participant actor unavailable), distinguished by the code.
+//   `retry_after_ms` is the rate-limit back-off hint: an `int` of milliseconds when the tripped limiter can compute one, or
 //   `None` (NEVER `0`) when no precise back-off instant exists — `0` would
 //   read as "retry immediately" and re-trip the same hard limit. An unavailable
 //   participant actor or a plain (non-rate-limit) rejection also carries `None`.
@@ -102,9 +101,8 @@ pyo3::create_exception!(
 //   context set overlapped an in-flight saga (§5.15.4). `contended_context`
 //   names the shared context id.
 //
-// `code` is the canonical `SCP-SAGA-13xxx` string and is ALSO embedded in
-// `message` (`"[SCP-SAGA-13xxx] …"`) so a flattened log line still
-// disambiguates by `grep`.
+// `code` is ALSO embedded in the exception message (`"[<code>] …"`) so a
+// flattened log line still disambiguates by `grep`.
 pyo3::create_exception!(
     scp_sdk,
     SagaAbortedError,
@@ -192,15 +190,17 @@ pub enum ScpPyError {
     ///
     /// Maps to the Python `SagaAbortedError`. This terminal may be a permanent
     /// rejection OR a retryable transient (rate limit / participant actor
-    /// unavailable), distinguished by the `SCP-SAGA-*` code. Carries the
+    /// unavailable), distinguished by the code. Carries the
     /// rate-limit back-off hint STRUCTURALLY (`retry_after_ms`): `Some(ms)` is
     /// the limiter's computed cooldown; `None` (NEVER `0`) means no precise
     /// back-off instant (a token-bucket hard limit, an unavailable participant
     /// actor, or a permanent rejection).
     SagaAborted {
-        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        /// Human-readable detail.
         message: String,
-        /// The canonical `SCP-SAGA-13xxx` code.
+        /// The code
+        /// [`decompose_saga_error`](scp_ffi_common::saga_errors::decompose_saga_error)
+        /// assigns.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -251,7 +251,7 @@ impl std::fmt::Display for ScpPyError {
             Self::ValidationError { message, code } => {
                 write!(f, "[{code}] validation error: {message}")
             }
-            // Saga terminals embed the canonical SCP-SAGA-13xxx code so a
+            // Saga terminals embed their code so a
             // flattened log line still `grep`-disambiguates; the structured
             // datum (retry_after_ms / saga_id / contended_context) rides the
             // exception args, not the message text.
@@ -360,8 +360,7 @@ impl From<ScpPyError> for PyErr {
             // exception args so a Python caller reads `retry_after_ms` /
             // `saga_id` / `contended_context` directly from `e.args[2]` —
             // never by re-parsing the message text. `formatted` (carrying the
-            // `[SCP-SAGA-…]` prefix) is `args[0]`; the canonical code is
-            // `args[1]`. `retry_after_ms` maps `None` → Python `None`
+            // `[<code>]` prefix) is `args[0]`; the code is `args[1]`. `retry_after_ms` maps `None` → Python `None`
             // (NEVER `0`), preserving the §6.2.4 back-off semantics across
             // the FFI boundary.
             ScpPyError::SagaAborted {

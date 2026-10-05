@@ -71,7 +71,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use scp_core::context::ContextPersistence;
-use scp_core::context::supervisor::Supervisor;
+use scp_core::context::supervisor::{DrainWithDeadline, Supervisor};
 use scp_core::discovery::handles::HandleRegistry;
 use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::scope::ScopeRegistry;
@@ -184,9 +184,10 @@ impl<K: Eq + std::hash::Hash, V> StreamRegistry<K, V> {
     /// before `release_streams`, so an entry this inserts is either cleared by
     /// that release or removed here.
     ///
-    /// A caller that gets `false` returns the refusal that
-    /// [`late_registration_refusal`] builds. A call that discards the result
-    /// does not compile under `deny(unused_must_use)`:
+    /// A bridge registers through [`CoreFields::register_or_refuse`], which
+    /// returns the refusal that [`late_registration_refusal`] builds. A call
+    /// that discards the result does not compile under
+    /// `deny(unused_must_use)`:
     ///
     /// ```compile_fail
     /// #![deny(unused_must_use)]
@@ -1394,6 +1395,33 @@ impl CoreFields {
         K: Eq + std::hash::Hash + Clone,
     {
         registry.insert(key, value)
+    }
+
+    /// Inserts `value` under `key` into `registry` through
+    /// [`Self::insert_stream_entry`], and on refusal returns the code and
+    /// message [`late_registration_refusal`] builds for `saga_id` (`None` for
+    /// an outlet stream). Every bridge registers a started stream or streaming
+    /// saga through this method.
+    ///
+    /// # Errors
+    ///
+    /// `(SCP-CTX-2139, message)` when shutdown began before the insert; the
+    /// entry is dropped.
+    pub fn register_or_refuse<K, V>(
+        &self,
+        registry: &StreamRegistry<K, V>,
+        key: K,
+        value: V,
+        saga_id: Option<&str>,
+    ) -> Result<(), (&'static str, String)>
+    where
+        K: Eq + std::hash::Hash + Clone,
+    {
+        if self.insert_stream_entry(registry, key, value) {
+            Ok(())
+        } else {
+            Err(late_registration_refusal(saga_id))
+        }
     }
 
     /// Suspends the bridge instance.
@@ -2739,13 +2767,12 @@ impl CoreFields {
     /// runs any registered shutdown hooks. `budget` bounds the flush and the
     /// drain together.
     ///
-    /// The drain (`Supervisor::shutdown_all_contexts`, which closes the
-    /// Supervisor's task tracker and awaits it) runs in its own task, followed
-    /// by `store_closer`. The task is awaited until the deadline and never
-    /// aborted: aborting would cut a tracked writer mid-write, and closing the
-    /// store before that writer exits would release the advisory lock while
-    /// the writer still holds the connection's work in flight (ADR-049
-    /// Decision 16).
+    /// The drain runs through `Supervisor::drain_with_deadline`, followed by
+    /// `store_closer` in the same task. The task is awaited until the deadline
+    /// and never aborted: aborting would cut a tracked writer mid-write, and
+    /// closing the store before that writer exits would release the advisory
+    /// lock while the writer still holds the connection's work in flight
+    /// (ADR-049 Decision 16).
     async fn run_shutdown_side_effects(
         &self,
         budget: Duration,
@@ -2788,51 +2815,46 @@ impl CoreFields {
                 }
             }
             let has_durable_store = store_closer.is_some();
-            let supervisor = Arc::clone(supervisor);
-            let mut drain_then_close = tokio::spawn(async move {
-                supervisor.shutdown_all_contexts().await;
-                drop(supervisor);
-                close_durable_store(store_closer)
-            });
-            match tokio::time::timeout_at(deadline, &mut drain_then_close).await {
-                Ok(Ok(closed)) => SupervisorDrain::Finished(closed),
-                Ok(Err(join_error)) => {
+            // The store closes inside the drain task, after the drain: never
+            // before a tracked writer exits (ADR-049 Decision 16). A drain
+            // that misses the deadline keeps running and closes the store
+            // itself; no caller remains to receive a close failure, so the
+            // late callback logs it.
+            let on_late =
+                move |late: Result<Result<(), scp_platform::PlatformError>, String>| match late {
+                    Ok(Ok(())) => {
+                        tracing::info!("{}", late_drain_finished_message(has_durable_store));
+                    }
+                    Ok(Err(e)) => tracing::error!(
+                        error = %e,
+                        "late Supervisor drain finished but the durable store refused \
+                         to close; it keeps its connection and advisory lock"
+                    ),
+                    Err(panic) => tracing::error!(
+                        error = %panic,
+                        "late {}",
+                        drain_panicked_message(has_durable_store)
+                    ),
+                };
+            match supervisor
+                .drain_with_deadline(deadline, move || close_durable_store(store_closer), on_late)
+                .await
+            {
+                DrainWithDeadline::Finished(closed) => SupervisorDrain::Finished(closed),
+                DrainWithDeadline::Panicked(panic) => {
                     tracing::error!(
-                        error = %join_error,
+                        error = %panic,
                         "{}",
                         drain_panicked_message(has_durable_store)
                     );
                     SupervisorDrain::Panicked
                 }
-                Err(_elapsed) => {
+                DrainWithDeadline::TimedOut => {
                     tracing::warn!(
                         budget_ms = budget.as_millis(),
                         "{}",
                         drain_timed_out_message(has_durable_store)
                     );
-                    // Detach, never abort: the task closes the store itself
-                    // once the drain finishes, and logs a close failure, since
-                    // no caller remains to receive it.
-                    tokio::spawn(async move {
-                        match drain_then_close.await {
-                            Ok(Ok(())) => {
-                                tracing::info!(
-                                    "{}",
-                                    late_drain_finished_message(has_durable_store)
-                                );
-                            }
-                            Ok(Err(e)) => tracing::error!(
-                                error = %e,
-                                "late Supervisor drain finished but the durable store refused \
-                                 to close; it keeps its connection and advisory lock"
-                            ),
-                            Err(join_error) => tracing::error!(
-                                error = %join_error,
-                                "late {}",
-                                drain_panicked_message(has_durable_store)
-                            ),
-                        }
-                    });
                     SupervisorDrain::Pending
                 }
             }
@@ -3770,6 +3792,32 @@ mod tests {
             .await;
         assert!(!drained_registry.insert("after-drain".to_owned(), 4));
         assert!(drained_registry.is_empty());
+    }
+
+    /// `register_or_refuse` accepts an entry before shutdown begins and, once
+    /// `stop_borrowers` has run, refuses it with `SCP-CTX-2139`, names the
+    /// saga when given one, and leaves no entry.
+    #[test]
+    fn register_or_refuse_accepts_then_refuses_with_the_late_code() {
+        let instance = CoreFields::new();
+        let registry: StreamRegistry<String, u8> = StreamRegistry::new(&instance);
+        assert_eq!(
+            instance.register_or_refuse(&registry, "live".to_owned(), 1, None),
+            Ok(())
+        );
+        assert!(registry.contains_key("live"));
+
+        instance.stop_borrowers();
+        assert_eq!(
+            instance.register_or_refuse(&registry, "late".to_owned(), 2, None),
+            Err(late_registration_refusal(None))
+        );
+        let (code, message) = instance
+            .register_or_refuse(&registry, "late-saga".to_owned(), 3, Some("saga-late-1"))
+            .expect_err("a registration after stop_borrowers must be refused");
+        assert_eq!(code, crate::error_codes::CTX_2139);
+        assert!(message.contains("saga-late-1"), "{message}");
+        assert!(!registry.contains_key("late") && !registry.contains_key("late-saga"));
     }
 
     /// The late-registration refusal carries `SCP-CTX-2139`, not the

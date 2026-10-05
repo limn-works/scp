@@ -1292,7 +1292,9 @@ mod xctx_streaming_saga_tests {
 /// class of the Supervisor's own refusal, which comes before anything started.
 #[test]
 fn late_shutdown_refusals_differ_from_supervisor_refusal_class() {
-    let ScpError::Context { code, .. } = late_shutdown_stream_err() else {
+    let ScpError::Context { code, .. } = late_registration_err(
+        scp_ffi_common::bridge_instance::late_registration_refusal(None),
+    ) else {
         panic!("a late stream refusal must be the Context class");
     };
     assert_eq!(code, codes::CTX_2139);

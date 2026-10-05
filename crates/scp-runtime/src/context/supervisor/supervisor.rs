@@ -1314,6 +1314,19 @@ impl crate::context::outlets::dispatch::StreamEscrowRefundSink for SpawnerEscrow
     }
 }
 
+/// The result of [`Supervisor::drain_with_deadline`].
+#[derive(Debug)]
+pub enum DrainWithDeadline<T> {
+    /// The drain and the post-drain step finished within the deadline; holds
+    /// the post-drain step's value.
+    Finished(T),
+    /// The drain or the post-drain step panicked; holds the panic message.
+    Panicked(String),
+    /// The deadline passed first. The drain keeps running, and its result
+    /// goes to the `on_late` callback.
+    TimedOut,
+}
+
 /// The kind of work a tracked task hands to a task of its own through
 /// [`Supervisor::spawn_tracked_on`]. The variants are the three kinds ADR-049
 /// Decision 16 item 2 admits after the closed flag is set.
@@ -11236,6 +11249,46 @@ impl Supervisor {
         crate::context::lifecycle_helpers::shutdown_all_contexts(self).await;
     }
 
+    /// Runs [`Self::shutdown_all_contexts`] and then `after_drain` on a task
+    /// of their own, and waits for that task until `deadline`. The deadline
+    /// bounds only the wait, never the drain: the task is never aborted, so
+    /// `after_drain` (for example, closing the durable store) runs only once
+    /// every tracked task has exited. The task holds this Supervisor until the
+    /// drain returns and drops it before `after_drain` runs.
+    ///
+    /// When the deadline passes first, the task keeps running, `on_late`
+    /// receives its result once it ends (`Err` carrying the panic message when
+    /// the drain or `after_drain` panicked), and this returns
+    /// [`DrainWithDeadline::TimedOut`].
+    pub async fn drain_with_deadline<T, A, L>(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        after_drain: A,
+        on_late: L,
+    ) -> DrainWithDeadline<T>
+    where
+        T: Send + 'static,
+        A: FnOnce() -> T + Send + 'static,
+        L: FnOnce(Result<T, String>) + Send + 'static,
+    {
+        let supervisor = Arc::clone(self);
+        let mut drain = tokio::spawn(async move {
+            supervisor.shutdown_all_contexts().await;
+            drop(supervisor);
+            after_drain()
+        });
+        match tokio::time::timeout_at(deadline, &mut drain).await {
+            Ok(Ok(value)) => DrainWithDeadline::Finished(value),
+            Ok(Err(join_error)) => DrainWithDeadline::Panicked(join_error.to_string()),
+            Err(_elapsed) => {
+                drop(tokio::spawn(async move {
+                    on_late(drain.await.map_err(|join_error| join_error.to_string()));
+                }));
+                DrainWithDeadline::TimedOut
+            }
+        }
+    }
+
     /// Issues a [`SpawnPermit`] for the Supervisor's task tracker, or refuses
     /// once [`Self::shutdown_all_contexts`] has begun (ADR-049 Decision 16).
     ///
@@ -20683,6 +20736,84 @@ mod tests {
         })
         .await
         .expect("a supervisor-spawned task holds a strong reference to the Supervisor");
+    }
+
+    /// `drain_with_deadline` runs the post-drain step only after the last
+    /// tracked task exits. A drain slower than the deadline returns `TimedOut`
+    /// with the step not yet run, keeps running, and hands the step's value to
+    /// `on_late`; a drain within the deadline returns `Finished` with that
+    /// value.
+    #[tokio::test]
+    async fn drain_with_deadline_waits_for_tracked_tasks_before_the_post_drain_step() {
+        let supervisor_arc = supervisor_with_providers();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(
+            supervisor_arc
+                .spawn_tracked("slow tracked task", async move {
+                    let _ = release_rx.await;
+                })
+                .expect("an open supervisor accepts a tracked spawn"),
+        );
+        let step_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let step_flag = Arc::clone(&step_ran);
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel();
+        let outcome = supervisor_arc
+            .drain_with_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+                move || {
+                    step_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    7_u8
+                },
+                move |late| {
+                    let _ = late_tx.send(late);
+                },
+            )
+            .await;
+        assert!(
+            matches!(outcome, DrainWithDeadline::TimedOut),
+            "a drain blocked on a tracked task must time out, got {outcome:?}"
+        );
+        assert!(
+            !step_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the post-drain step must not run while a tracked task is live"
+        );
+        release_tx.send(()).expect("the tracked task still waits");
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), late_rx)
+            .await
+            .expect("the drain keeps running past the deadline")
+            .expect("on_late receives the drain's result");
+        assert_eq!(late, Ok(7), "on_late receives the post-drain step's value");
+
+        let fast = supervisor_with_providers();
+        let outcome = fast
+            .drain_with_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                || 9_u8,
+                |_| panic!("on_late must not run for a drain that met its deadline"),
+            )
+            .await;
+        assert!(
+            matches!(outcome, DrainWithDeadline::Finished(9)),
+            "a drain within the deadline must finish with the step's value, got {outcome:?}"
+        );
+    }
+
+    /// A post-drain step that panics makes `drain_with_deadline` return
+    /// `Panicked`, never `Finished`.
+    #[tokio::test]
+    async fn drain_with_deadline_reports_a_panicking_post_drain_step() {
+        let supervisor_arc = supervisor_with_providers();
+        let outcome = supervisor_arc
+            .drain_with_deadline(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                || -> u8 { panic!("post-drain step panicked") },
+                |_| {},
+            )
+            .await;
+        assert!(
+            matches!(outcome, DrainWithDeadline::Panicked(_)),
+            "a panicking post-drain step must report Panicked, got {outcome:?}"
+        );
     }
 
     /// Once shutdown has begun, a spawn through the tracker is refused with

@@ -317,22 +317,15 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpPyError {
     }
 }
 
-/// The error for a stream the Supervisor opened but the bridge refused to
-/// register because bridge shutdown had begun, built from
-/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
-fn late_shutdown_stream_err() -> ScpPyError {
-    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(None);
-    ScpPyError::ContextError {
-        message,
-        code: code.to_owned(),
-    }
-}
-
-/// The error for a streaming saga the Supervisor started but the bridge
-/// refused to register because bridge shutdown had begun, built from
-/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
-fn late_shutdown_saga_err(saga_id: &str) -> ScpPyError {
-    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(Some(saga_id));
+/// The error for a stream or streaming saga the Supervisor started but the
+/// bridge refused to register because bridge shutdown had begun, built from
+/// the refusal
+/// [`CoreFields::register_or_refuse`](scp_ffi_common::bridge_instance::CoreFields::register_or_refuse)
+/// returns. The stream had already reserved escrow and started its pump, and
+/// the saga had already staged its Prepare phase, so this is the Context class
+/// with `SCP-CTX-2139`, not the class of the Supervisor's own refusal, which
+/// comes before anything is reserved or staged.
+fn late_registration_err((code, message): (&'static str, String)) -> ScpPyError {
     ScpPyError::ContextError {
         message,
         code: code.to_owned(),
@@ -647,23 +640,24 @@ fn outlet_stream_open_impl(
     };
 
     let handle_id = hex::encode(request_id);
-    if !bi.core.insert_stream_entry(
-        &bi.outlet_stream_registry,
-        handle_id.clone(),
-        StreamEntry {
-            handle: Arc::new(tokio::sync::Mutex::new(handle)),
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            invoker_did: caller_did.to_owned(),
-            context_id: context_id.to_owned(),
-            outlet_id: outlet_id.to_owned(),
-            caveats_binding,
-            request_id,
-            stream_epoch,
-            cost_per_chunk,
-        },
-    ) {
-        return Err(late_shutdown_stream_err().into());
-    }
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_stream_registry,
+            handle_id.clone(),
+            StreamEntry {
+                handle: Arc::new(tokio::sync::Mutex::new(handle)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                invoker_did: caller_did.to_owned(),
+                context_id: context_id.to_owned(),
+                outlet_id: outlet_id.to_owned(),
+                caveats_binding,
+                request_id,
+                stream_epoch,
+                cost_per_chunk,
+            },
+            None,
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1492,19 +1486,20 @@ fn outlet_streaming_saga_open_impl(
     let saga_id = handle.saga_id;
     let receiver = handle.receiver;
     let handle_id = saga_id.0.clone();
-    if !bi.core.insert_stream_entry(
-        &bi.outlet_streaming_saga_registry,
-        handle_id.clone(),
-        scp_ffi_common::streaming_saga::StreamingSagaEntry {
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            saga_id,
-            target_context_id: target_context_id.to_owned(),
-            invoker_did: caller_did.to_owned(),
-            request_id,
-        },
-    ) {
-        return Err(late_shutdown_saga_err(&handle_id).into());
-    }
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_streaming_saga_registry,
+            handle_id.clone(),
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                saga_id,
+                target_context_id: target_context_id.to_owned(),
+                invoker_did: caller_did.to_owned(),
+                request_id,
+            },
+            Some(&handle_id),
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -2093,7 +2088,9 @@ mod monotonic_seq_crash_safety_tests {
 mod late_shutdown_refusal_tests {
     use scp_ffi_common::error_codes as codes;
 
-    use super::{late_shutdown_saga_err, late_shutdown_stream_err};
+    use scp_ffi_common::bridge_instance::late_registration_refusal;
+
+    use super::late_registration_err;
     use crate::error::ScpPyError;
 
     /// The message and code of a `ContextError`, or `None` for any other
@@ -2111,13 +2108,15 @@ mod late_shutdown_refusal_tests {
     /// NAPI and `UniFFI` bridges report it.
     #[test]
     fn late_shutdown_refusals_are_the_context_class() {
-        let stream = context_error_parts(late_shutdown_stream_err());
+        let stream = context_error_parts(late_registration_err(late_registration_refusal(None)));
         assert_eq!(
             stream.map(|(_, code)| code).as_deref(),
             Some(codes::CTX_2139)
         );
 
-        let saga = context_error_parts(late_shutdown_saga_err("saga-late-1"));
+        let saga = context_error_parts(late_registration_err(late_registration_refusal(Some(
+            "saga-late-1",
+        ))));
         let (message, code) = saga.unwrap_or_default();
         assert_eq!(code, codes::CTX_2139);
         assert!(

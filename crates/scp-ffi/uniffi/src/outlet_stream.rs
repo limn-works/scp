@@ -358,28 +358,15 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpError {
     }
 }
 
-/// The error for a stream the Supervisor opened but the bridge refused to
-/// register because bridge shutdown had begun, built from
-/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
-/// The open had already reserved escrow and started its pump, so this is the
-/// Context class with `SCP-CTX-2139`, not the Outlet class of the Supervisor's
-/// own refusal, which comes before anything is reserved.
-fn late_shutdown_stream_err() -> ScpError {
-    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(None);
-    ScpError::Context {
-        msg: message,
-        code: code.to_owned(),
-    }
-}
-
-/// The error for a streaming saga the Supervisor started but the bridge
-/// refused to register because bridge shutdown had begun, built from
-/// [`late_registration_refusal`](scp_ffi_common::bridge_instance::late_registration_refusal).
-/// The saga had already staged its Prepare phase, so this is the Context class
-/// with `SCP-CTX-2139` and the saga id, not the `SagaAborted` class of the
-/// Supervisor's own refusal, which comes before anything is staged.
-fn late_shutdown_saga_err(saga_id: &str) -> ScpError {
-    let (code, message) = scp_ffi_common::bridge_instance::late_registration_refusal(Some(saga_id));
+/// The error for a stream or streaming saga the Supervisor started but the
+/// bridge refused to register because bridge shutdown had begun, built from
+/// the refusal
+/// [`CoreFields::register_or_refuse`](scp_ffi_common::bridge_instance::CoreFields::register_or_refuse)
+/// returns. The stream had already reserved escrow and started its pump, and
+/// the saga had already staged its Prepare phase, so this is the Context class
+/// with `SCP-CTX-2139`, not the class of the Supervisor's own refusal, which
+/// comes before anything is reserved or staged.
+fn late_registration_err((code, message): (&'static str, String)) -> ScpError {
     ScpError::Context {
         msg: message,
         code: code.to_owned(),
@@ -705,23 +692,24 @@ pub(crate) async fn outlet_stream_open_impl(
     };
 
     let handle_id = hex::encode(request_id);
-    if !bi.core.insert_stream_entry(
-        &bi.outlet_stream_registry,
-        handle_id.clone(),
-        StreamEntry {
-            handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            invoker_did: caller_did,
-            context_id,
-            outlet_id,
-            caveats_binding,
-            request_id,
-            stream_epoch,
-            cost_per_chunk,
-        },
-    ) {
-        return Err(late_shutdown_stream_err());
-    }
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_stream_registry,
+            handle_id.clone(),
+            StreamEntry {
+                handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                invoker_did: caller_did,
+                context_id,
+                outlet_id,
+                caveats_binding,
+                request_id,
+                stream_epoch,
+                cost_per_chunk,
+            },
+            None,
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1539,21 +1527,22 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
 }
 
 /// Registers a started streaming saga's entry under its saga id and returns
-/// the id. Returns [`late_shutdown_saga_err`], with the entry dropped, when
+/// the id. Returns [`late_registration_err`], with the entry dropped, when
 /// bridge shutdown began before the insert.
 fn register_streaming_saga(
     bi: &UniffiBridgeInstance,
     entry: StreamingSagaEntry,
 ) -> Result<String, ScpError> {
     let handle_id = entry.saga_id.0.clone();
-    if bi
-        .core
-        .insert_stream_entry(&bi.outlet_streaming_saga_registry, handle_id.clone(), entry)
-    {
-        Ok(handle_id)
-    } else {
-        Err(late_shutdown_saga_err(&handle_id))
-    }
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_streaming_saga_registry,
+            handle_id.clone(),
+            entry,
+            Some(&handle_id),
+        )
+        .map_err(late_registration_err)?;
+    Ok(handle_id)
 }
 
 /// Drains one chunk from a live cross-context streaming saga, awaiting the seal

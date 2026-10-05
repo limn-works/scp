@@ -1154,22 +1154,23 @@ pub enum ScpError {
     /// co-residency policy denial, or the §6.2.4 *Caller authentication*
     /// mismatch this bridge enforces before the saga runs) OR a RETRYABLE
     /// transient (a rate-limit back-off, or a participant actor unavailable to
-    /// complete the Prepare exchange) — distinguished by the `SCP-SAGA-*` code.
+    /// complete the Prepare exchange) — distinguished by the code.
     /// Carries the rate-limit back-off hint STRUCTURALLY
     /// (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
     /// `None` (NEVER `0`) means no precise back-off instant exists (a
     /// token-bucket hard limit, an unavailable participant actor, or a permanent
     /// rejection) — `0` would read as "retry immediately" and re-trip the same
-    /// hard limit. `code` is the
-    /// canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
+    /// hard limit. Maps to Swift `ScpError.SagaAborted`
     /// / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
     /// Swift `msg:` label — the `UniFFI` field-name convention every variant
     /// here follows).
     #[error("saga aborted [{code}]: {msg}")]
     SagaAborted {
-        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        /// Human-readable detail.
         msg: String,
-        /// The canonical `SCP-SAGA-13xxx` code.
+        /// The code
+        /// [`decompose_saga_error`](scp_ffi_common::saga_errors::decompose_saga_error)
+        /// assigns.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -6782,8 +6783,7 @@ async fn resolve_uniffi_message_signer(
 /// tested there, so the three bridges cannot drift. This function is the thin
 /// per-bridge tail that carries the `UniFFI` field labels (`msg:`):
 ///
-/// - `Aborted` → [`ScpError::SagaAborted`] (`retry_after_ms`, `None` never `0`,
-///   `SCP-SAGA-{code}`).
+/// - `Aborted` → [`ScpError::SagaAborted`] (`retry_after_ms`, `None` never `0`).
 /// - `NeedsRepair` → [`ScpError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpError::SagaBusy`] (`SCP-SAGA-13066`).
