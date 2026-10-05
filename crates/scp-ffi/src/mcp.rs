@@ -28,8 +28,8 @@
 //!   [`scp_mcp::server::ContextProvider`]. It reads outlet registrations
 //!   from the bridge's copy of each context in the scp-ffi runtime registry,
 //!   role state from the supervisor actor, and the event-log summary from
-//!   the supervisor actor while a supervisor is attached, from that bridge
-//!   copy otherwise. The MCP server is run
+//!   the supervisor actor while a supervisor is attached. The MCP server is
+//!   run
 //!   on the tokio runtime via [`scp_mcp::stdio::run_stdio`] or
 //!   [`scp_mcp::sse::run_sse`].
 //!
@@ -307,7 +307,7 @@ const FFI_OUTLET_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_M
 /// supervisor is attached, the reads that return role state fail and the
 /// access gates refuse. The top level of
 /// `context_events` comes from the supervisor actor while a supervisor is
-/// attached, and from that bridge copy otherwise.
+/// attached.
 struct FfiBridgeProvider {
     /// Weak reference to the bridge instance whose runtime registry and
     /// supervisor this provider reads.
@@ -348,7 +348,7 @@ struct FfiBridgeProvider {
     /// or `outlet_call:*` for the context. When absent, `validate_capability`
     /// rejects immediately (UCAN is required for outlet invocation).
     ///
-    /// See spec §6.2, §8, ADR-016, and issue #319.
+    /// See spec §6.2, §8, and ADR-016.
     agent_ucan_token: Option<String>,
     /// Optional proof tokens for UCAN delegation chain verification.
     ///
@@ -426,9 +426,7 @@ impl FfiBridgeProvider {
     ///
     /// Returns [`AccessRefusal::Denied`](scp_mcp::server::AccessRefusal::Denied)
     /// when the actor holds no such context, and when no supervisor is
-    /// attached, with a message naming the missing supervisor:
-    /// the agent holds no grant in a context this instance does not hold, so
-    /// `tools/list` and `resources/list` omit it. Returns
+    /// attached, with a message naming the missing supervisor. Returns
     /// [`AccessRefusal::Unreadable`](scp_mcp::server::AccessRefusal::Unreadable)
     /// when the read itself failed, so a failed read never reaches the client
     /// as a shorter list.
@@ -629,7 +627,7 @@ impl FfiBridgeProvider {
         // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
         // outlet_call:{outlet_name}/outlet_call:* for Action outlets
         // (SCP-OUT-014, §5.4.2) — for this context.
-        // See spec §6.2, §8, ADR-016, and issue #319.
+        // See spec §6.2, §8, and ADR-016.
         // Build proof resolver from optional proof tokens (supports delegated UCANs).
         let proof_resolver =
             crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
@@ -1549,8 +1547,8 @@ fn generate_handle_id(prefix: &str) -> String {
 /// Creates an MCP server backed by a `FfiBridgeProvider`, which reads outlet
 /// registrations from the bridge's copy of each context in the scp-ffi
 /// runtime registry, role state from the supervisor actor, and the event-log
-/// summary from the supervisor actor while a supervisor is attached, from
-/// that bridge copy otherwise. For `"stdio"`
+/// summary from the supervisor actor while a supervisor is attached. For
+/// `"stdio"`
 /// transport, the server processes JSON-RPC messages via a tokio task. For
 /// `"sse"` transport, the server binds a loopback HTTP server on an ephemeral
 /// port behind a per-server bearer token. This function returns neither the
@@ -2906,7 +2904,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::validate_capability — rejects missing UCAN (#319)
+    // FfiBridgeProvider::validate_capability — rejects missing UCAN
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2989,7 +2987,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // FfiBridgeProvider::validate_capability — rejects a member who presents no
-    // UCAN token (#319)
+    // UCAN token
     // -----------------------------------------------------------------------
 
     #[test]
