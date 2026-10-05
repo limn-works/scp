@@ -1867,12 +1867,11 @@ pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
 /// Marks `context_id` released, re-reads the supervisor, and removes the
 /// context's bridge state only when the re-read does not report `Active`.
 ///
-/// A close decides from a lifecycle read taken before it releases, so an
-/// import or restore can return the id to `Active`, and readmit it, in
-/// between. When the re-read, taken after the mark went in, reports
-/// `Active`, this clears the mark, removes nothing, and returns `false`, so
-/// the readmitted context keeps its revocation list, nonce tracker, outlets,
-/// and sessions. Any other answer, a failed read included, removes the state
+/// A close decides from a lifecycle read taken before it releases, so the id
+/// can return to `Active`, and be readmitted, in between. When the re-read,
+/// taken after the mark went in, reports `Active`, this clears the mark,
+/// removes nothing, and returns `false`, so the readmitted context keeps its
+/// revocation list, nonce tracker, outlets, and sessions. Any other answer, a failed read included, removes the state
 /// while the mark stands and returns `true`; the mark then lasts while a live
 /// [`NapiContextHandle`] for the id does.
 pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_id: &str) -> bool {
@@ -1969,7 +1968,7 @@ where
 
 /// Removes UCAN state for a context on the given bridge instance.
 ///
-/// Called when a context is closed. Idempotent.
+/// Idempotent.
 pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
     ucan_registry(bi).remove(context_id);
     // Clean up known-context discovery entry on the same instance.

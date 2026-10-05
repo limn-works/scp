@@ -1315,7 +1315,7 @@ pub(crate) async fn reserve_key_package_on(
 }
 
 /// Tears down a committed Welcome join whose bridge state a concurrent close
-/// or leave removed, and returns the join's `CTX_2040` error.
+/// removed, and returns the join's `CTX_2040` error.
 ///
 /// The close that removed the state marked the id, and the join's readmit may
 /// have cleared that mark. No actor serves the id after the teardown, so this
@@ -1487,11 +1487,11 @@ pub(crate) async fn context_join_from_welcome_on(
     crate::runtime::readmit_context(bi, &sealed.context_id);
 
     // BLACK-2JF-01, post-irreversible-commit compensation: the presence probe
-    // below misses only when a concurrent close or leave removed the bridge
+    // below misses only when a concurrent close removed the bridge
     // state this join registered while the spawn ran or after it returned. A
     // close on an older handle for the same context id reads no actor while
     // the spawn runs, so `context_close_on` skips the dispatch and releases
-    // that state. A close or leave does not despawn the actor, so returning
+    // that state. A close does not despawn the actor, so returning
     // without a teardown would strand a live actor behind a handle with no
     // bridge state. `discard_joined_context` removes the actor handle, destroys
     // the resident MLS group, and deletes the durable snapshot the join
@@ -1710,8 +1710,7 @@ pub(crate) async fn context_close_on(
     // Read the supervisor, not the handle's cached string. An absent actor
     // (a completed TTL expiry) and a terminal state (`Closed`, `Expired`,
     // `Tombstoned`) mean the close already happened: they skip the dispatch
-    // and fall through to the release below. Every other state refuses the
-    // close, whoever calls.
+    // and fall through to the release below.
     //
     // The terminal skip runs no `ContextClose` check, because
     // `ttl::close_context` runs inside the dispatch the skip removes, so any
@@ -1826,14 +1825,14 @@ pub(crate) async fn context_close_on(
     }
 
     // Release UCAN state for this context, and mark the id so no later call
-    // rebuilds it empty, unless an import or restore returned the id to
-    // `Active` after the lifecycle read above. That check runs before the
-    // handle is written `Closed` and before its subscription is cancelled, so
-    // a close that reports the context stays open leaves the handle reading
-    // "active" with its subscription running.
+    // rebuilds it empty, unless the id returned to `Active` after the
+    // lifecycle read above. That check runs before the handle is written
+    // `Closed` and before its subscription is cancelled, so a close that
+    // reports the context stays open leaves the handle reading "active" with
+    // its subscription running.
     if !crate::runtime::release_context_unless_readmitted(bi, &handle.context_id).await {
         return Err(NapiError::from(ScpNapiError::Context {
-            message: "the context returned to Active through an import or restore while this close ran; the imported context stays open and keeps its state on this bridge".to_owned(),
+            message: "the context returned to Active while this close ran; it stays open and keeps its state on this bridge".to_owned(),
             code: codes::CTX_2017.to_owned(),
         }));
     }

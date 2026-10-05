@@ -885,8 +885,7 @@ async fn run_mcp_stdio_server(
 /// `notifications/*/list_changed`, so those capabilities are honestly absent
 /// rather than accepted-and-never-delivered. Serving is not failed: the server
 /// still answers `resources/list|read`, which read role state from the actor
-/// and fail while no supervisor is attached. Failing outright would
-/// deny working functionality over an optional feature. This server lists no
+/// and fail while no supervisor is attached. This server lists no
 /// tools with or without a supervisor (`OUTLET_INVOCATION_UNAVAILABLE`).
 ///
 /// One call decides both the advertisement and the delivery machinery, folded
