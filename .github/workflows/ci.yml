@@ -405,6 +405,10 @@ jobs:
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
               - 'scripts/generate-uniffi-kotlin.sh'
+              # kotlin-lint's release Gradle feature check reads these three files.
+              - '.github/workflows/release.yml'
+              - '.github/workflows/build-matrix.yml'
+              - 'scripts/check-shipped-feature-graph.sh'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
@@ -3279,8 +3283,9 @@ jobs:
               exit 1
             fi
           done
-      # check_release_file reads each non-comment line of a workflow file that
-      # contains `gradle` in any case, with `\` continuations joined and each
+      # check_release_file loads a workflow file with PyYAML, takes every string
+      # value of a `run` key, joins its `\` continuations, and reads each
+      # non-comment line of it that contains `gradle` in any case, with each
       # `${{ ... }}` expression read as one word. It fails unless the line is
       # `./gradlew` followed only by task paths and `-P<key>=<value>` tokens, runs
       # `:scp-kt:printUniffiCargoFeatures` with that line's `-P` tokens, and fails
@@ -3301,7 +3306,7 @@ jobs:
             local file=$1 line token got count=0
             local -a tokens props
             while IFS= read -r line; do
-              line=$(sed -E 's/\$\{\{[^}]*\}\}/X/g; s/^[[:space:]]*(run:[[:space:]]*)?//' <<<"$line")
+              line=$(sed -E 's/\$\{\{[^}]*\}\}/X/g' <<<"$line")
               read -ra tokens <<<"$line"
               if [ "${tokens[0]:-}" != "./gradlew" ]; then
                 echo "$file: cannot read the Gradle arguments of: $line" >&2
@@ -3316,7 +3321,7 @@ jobs:
                   return 1
                 fi
               done
-              if ! got=$(./gradlew -q :scp-kt:printUniffiCargoFeatures ${props[@]+"${props[@]}"} | tail -n 1); then
+              if ! got=$(./gradlew -q :scp-kt:printUniffiCargoFeatures ${props[@]+"${props[@]}"} </dev/null | tail -n 1); then
                 echo "$file: printUniffiCargoFeatures failed for: $line" >&2
                 return 1
               fi
@@ -3325,9 +3330,25 @@ jobs:
                 return 1
               fi
               count=$((count + 1))
-            done < <(awk '{ sub(/\r$/, "") } /^[[:space:]]*#/ { next }
-                          { if (sub(/\\$/, "")) { buf = buf $0 " "; next } print buf $0; buf = "" }' "$file" \
-                       | grep -i gradle || true)
+            done < <(python3 -c '
+          import sys, yaml
+          def runs(node):
+              if isinstance(node, dict):
+                  for key, value in node.items():
+                      if key == "run" and isinstance(value, str):
+                          yield value
+                      else:
+                          yield from runs(value)
+              elif isinstance(node, list):
+                  for item in node:
+                      yield from runs(item)
+          with open(sys.argv[1]) as f:
+              doc = yaml.safe_load(f)
+          for run in runs(doc):
+              for line in run.replace("\\\n", " ").splitlines():
+                  if not line.lstrip().startswith("#"):
+                      print(line)
+          ' "$file" | grep -i gradle || true)
             if [ "$count" -eq 0 ]; then
               echo "$file: no line runs ./gradlew" >&2
               return 1
@@ -3345,6 +3366,9 @@ jobs:
           printf '%s\n' 'run: ./gradlew :scp-kt:jar && ./gradlew :scp-kt:jar' > "$planted/chained.yml"
           printf '%s\n' 'run: cd bindings/kotlin && ./gradlew :scp-kt:jar' > "$planted/prefixed.yml"
           printf '%s\n' 'run: cargo build -p scp-ffi-uniffi' > "$planted/none.yml"
+          printf '%s\n' 'run: |' '  ./gradlew :scp-kt:jar' '  ./gradlew :scp-kt:jar -Pscp.uniffi.cargoFeatures=testing' > "$planted/second.yml"
+          printf '%s\n' 'run: >' '  ./gradlew :scp-kt:jar' '  -Pscp.uniffi.cargoFeatures=testing' > "$planted/folded.yml"
+          printf '%s\n' 'run: ./gradlew :scp-kt:jar' '  -Pscp.uniffi.cargoFeatures=testing' > "$planted/plain.yml"
           for file in "$planted"/*.yml; do
             if check_release_file "$file" 2>/dev/null; then
               echo "::error::check_release_file accepted the planted $(basename "$file")"

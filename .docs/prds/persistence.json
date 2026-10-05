@@ -1178,7 +1178,7 @@
         "Schema matches SqliteStorage: `CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID`",
         "Database stored in `getNoBackupFilesDir()`; all 6 Storage methods implemented",
         "Passes storage conformance tests (Kotlin JUnit port)",
-        "`./gradlew test` passes"
+        "`./gradlew test -Pscp.uniffi.cargoFeatures=testing` passes"
       ],
       "actionItems": [
         "Create Rust-side UniFFI callback interface for Storage trait",

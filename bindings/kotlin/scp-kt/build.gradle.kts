@@ -332,8 +332,7 @@ tasks.register("printUniffiCargoFeatures") {
 // generates the bindings, it builds that cdylib too, so a test run without
 // `testing` in `scp.uniffi.cargoFeatures` would load a production library and fail
 // suite by suite with SCP-IDENT-1008. This check fails the build before any task
-// runs instead. With `scp.uniffi.prebuiltBindings=true` another step built the
-// library, and that step names its own features.
+// runs instead.
 gradle.taskGraph.whenReady {
     val testTask = tasks.test.get()
     if (hasTask(testTask) && uniffiPrebuiltBindings != "true" && "testing" !in uniffiCargoFeatures.split(",")) {

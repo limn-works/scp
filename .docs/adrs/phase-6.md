@@ -1224,8 +1224,8 @@ dependencies {
 1. **Module builds for all JVM targets:**
 
    ```bash
-   ./gradlew build
-   ./gradlew test
+   ./gradlew build -Pscp.uniffi.cargoFeatures=testing
+   ./gradlew test -Pscp.uniffi.cargoFeatures=testing
    ```
 
    Both commands exit 0. Zero ktlint violations. Zero detekt findings.
@@ -1335,8 +1335,8 @@ dependencies {
 14. **Test suite passes:**
 
     ```bash
-    ./gradlew test
-    ./gradlew test -Ptarget=android  # Android instrumented tests (requires connected device or emulator)
+    ./gradlew test -Pscp.uniffi.cargoFeatures=testing
+    ./gradlew test -Pscp.uniffi.cargoFeatures=testing -Ptarget=android  # Android instrumented tests (requires connected device or emulator)
     ```
 
     All tests use JUnit 5 (`@Test`, `runTest`). No JUnit 4.
