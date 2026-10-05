@@ -2214,9 +2214,7 @@ impl crate::scp::PyScp {
 ///
 /// Raises `ContextError` if a context is registered while the bridge is
 /// suspended or has no supervisor attached, or a registered context's actor
-/// does not answer the membership
-/// read. Raises `TransportError` if the relay query fails fatally (transient
-/// failures are handled by falling back to local-only).
+/// does not answer the membership read.
 ///
 /// See SCP-213, ADR-015 in `.docs/adrs/phase-3.md`.
 #[pymethods]
@@ -2842,7 +2840,7 @@ mod tests {
     }
 
     /// [`setup_test_context`] without the supervisor: the bridge holds a copy
-    /// of the context and no supervisor is attached.
+    /// of the context.
     fn setup_unsupervised_context(
         bi: &crate::runtime::PyBridgeInstance,
         creator_did: &str,
