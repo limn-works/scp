@@ -1031,14 +1031,15 @@ mod xctx_streaming_saga_tests {
     }
 
     /// Asserts that `msg` is the lifecycle gate's withheld refusal: it carries
-    /// the withheld text and names neither the `Closing` state nor `context_id`.
+    /// the withheld text, does not contain "closing" in any letter case, and
+    /// does not contain `context_id`.
     fn assert_withheld(msg: &str, context_id: &str) {
         assert!(
             msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
             "the refusal must come from the lifecycle gate: {msg}"
         );
         assert!(
-            !msg.contains("Closing") && !msg.contains(context_id),
+            !msg.to_lowercase().contains("closing") && !msg.contains(context_id),
             "the refusal must withhold the lifecycle state and the context id: {msg}"
         );
     }

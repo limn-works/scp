@@ -15327,8 +15327,8 @@ impl Scp {
     /// `instance_id` does not match this `SCP`'s.
     ///
     /// Carries no lifecycle gate. It reads no context state and grants
-    /// nothing: it builds an `InterfaceRevoked` event from the interface id and
-    /// the clock and hands it back for the caller to distribute, so a gate
+    /// nothing: it builds an `InterfaceRevoked` event from the interface id,
+    /// the handle's context id and the clock and hands it back for the caller to distribute, so a gate
     /// would deny a member the record of a revocation without withholding any
     /// capability.
     pub async fn outlet_interface_revoke(
@@ -21153,8 +21153,11 @@ mod tests {
                         msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
                         "{entry_point} must refuse at the lifecycle gate: {msg}"
                     );
+                    let outside_withheld = msg
+                        .replace(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD, "")
+                        .to_lowercase();
                     assert!(
-                        !msg.contains("Active") && !msg.contains(&dead.context_id()),
+                        !outside_withheld.contains("active") && !msg.contains(&dead.context_id()),
                         "{entry_point} refusal must withhold the lifecycle state and the id: {msg}"
                     );
                 }
