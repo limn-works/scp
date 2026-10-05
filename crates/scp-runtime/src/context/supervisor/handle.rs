@@ -638,7 +638,10 @@ impl SupervisorHandle {
     ///
     /// Returns [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
     /// if the broadcast context construction or initial author
-    /// registration fails.
+    /// registration fails, and
+    /// [`ContextCreationError::StateTransition`](scp_protocol::context::builder::ContextCreationError::StateTransition)
+    /// carrying [`ContextError::SupervisorShutDown`] when the Supervisor has
+    /// dropped.
     pub(crate) fn init_broadcast_context(
         &self,
         context_id: &str,
@@ -964,11 +967,14 @@ impl SupervisorHandle {
     /// and hold only `&ActorDeps` (no `&mut state`). They delegate timer
     /// installation to the actor through this mailbox dispatch.
     ///
-    /// Best-effort: a `lookup → None` (actor not yet registered) or a
-    /// mailbox-send failure is logged and skipped — arming the TTL deadline
-    /// is a background facility, not part of the create/restore success
-    /// contract. (The actor's own `reconcile_timers` arms the one-shot TTL
-    /// sleep from the recorded `deadline_unix_secs`; ADR-049 finding A3.)
+    /// A `lookup → None` (actor not yet registered) or a mailbox-send
+    /// failure is logged and skipped. (The actor's own `reconcile_timers`
+    /// arms the one-shot TTL sleep from the recorded `deadline_unix_secs`;
+    /// ADR-049 finding A3.)
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
     pub(in crate::context) async fn dispatch_start_ttl_timer(
         &self,
         context_id: &str,

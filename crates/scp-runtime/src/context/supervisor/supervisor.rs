@@ -448,6 +448,31 @@ pub enum SagaError {
     },
 }
 
+/// Maps a streaming saga's Phase-1 (B-side escrow reserve) rejection onto the
+/// saga error surface. A reserve refused by Supervisor shutdown keeps
+/// `SCP-CTX-2138` as [`SagaError::SupervisorShutDown`] (ADR-049 Decision 16
+/// item 2), the error the saga's own tracker refusal returns; every other
+/// rejection aborts the saga with `SCP-SAGA-13067`.
+fn phase1_rejection_to_saga_error(
+    rejection: &crate::context::outlets::dispatch::OpenStreamRejection,
+) -> SagaError {
+    match rejection {
+        crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown => {
+            SagaError::SupervisorShutDown {
+                message: "B-side escrow reserve of a cross-context streaming saga".to_owned(),
+            }
+        }
+        other => SagaError::Aborted {
+            reason: SagaAbortReason::Rejected,
+            code: 13067,
+            message: format!(
+                "streaming saga B-side escrow reserve rejected: {}",
+                other.to_invocation_error()
+            ),
+        },
+    }
+}
+
 /// The structured reason a §6.2.4 saga reached the `Aborted` terminal — carried
 /// by [`SagaError::Aborted`] so the FFI surface reads the reason structurally
 /// (ADR-049 §3a), never by re-parsing the message. The reason is one of
@@ -1147,7 +1172,7 @@ fn spawn_kp_actor_watchdog_task(
 /// compile in any spawned future.
 pub(in crate::context) struct SpawnPermit<'a> {
     tracker: &'a tokio_util::task::TaskTracker,
-    _open: std::sync::RwLockReadGuard<'a, bool>,
+    _closed: std::sync::RwLockReadGuard<'a, bool>,
 }
 
 impl SpawnPermit<'_> {
@@ -3383,10 +3408,19 @@ impl Supervisor {
                     Ok(deps) => deps,
                     Err(e) => {
                         let sketch = standing_outcome_error_sketch(&e);
-                        let err =
-                            scp_protocol::context::builder::ContextCreationError::CreationFailed(
-                                format!("create_context: deps unavailable: {e}"),
-                            );
+                        // A shutdown refusal keeps its typed `SCP-CTX-2138`
+                        // (ADR-049 Decision 16 item 2), as the import and
+                        // restore arms pass `e` through unchanged.
+                        let err = match e {
+                            ContextError::SupervisorShutDown(_) => {
+                                scp_protocol::context::builder::ContextCreationError::StateTransition(e)
+                            }
+                            other => {
+                                scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                                    format!("create_context: deps unavailable: {other}"),
+                                )
+                            }
+                        };
                         drop(crash_window);
                         let _ = reply.send(Err(err));
                         return Outcome::err_mutated(sketch);
@@ -7079,14 +7113,7 @@ impl Supervisor {
                     .saga_journal
                     .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
                     .await;
-                return Err(SagaError::Aborted {
-                    reason: SagaAbortReason::Rejected,
-                    code: 13067,
-                    message: format!(
-                        "streaming saga B-side escrow reserve rejected: {}",
-                        rejection.to_invocation_error()
-                    ),
-                });
+                return Err(phase1_rejection_to_saga_error(&rejection));
             }
         };
 
@@ -11099,11 +11126,11 @@ impl Supervisor {
         &self,
         operation: &str,
     ) -> Result<SpawnPermit<'_>, ContextError> {
-        let open = self
+        let closed = self
             .spawn_gate
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *open {
+        if *closed {
             return Err(ContextError::SupervisorShutDown(format!(
                 "{operation} refused: the supervisor starts no task once \
                  shutdown_all_contexts has begun"
@@ -11111,7 +11138,7 @@ impl Supervisor {
         }
         Ok(SpawnPermit {
             tracker: &self.task_tracker,
-            _open: open,
+            _closed: closed,
         })
     }
 
@@ -20810,6 +20837,50 @@ mod tests {
             .expect("an export carrying registrable outlets imports successfully");
     }
 
+    /// An import that `import_accepts_a_registrable_outlet_registry` shows
+    /// succeeding is refused with the typed `ContextError::SupervisorShutDown`
+    /// (`SCP-CTX-2138`, ADR-049 Decision 16 item 2) once
+    /// `shutdown_all_contexts` has begun.
+    #[tokio::test]
+    async fn import_after_shutdown_keeps_supervisor_shut_down() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let creator = "did:key:import-after-shutdown-creator";
+        let context_id = "import-after-shutdown-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.registered_outlets = vec![
+            importable_outlet_fixture("alpha"),
+            importable_outlet_fixture("beta"),
+        ];
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+        );
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_clock::SystemClock,
+            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+        )
+        .expect("build a valid signed full export");
+
+        sup.shutdown_all_contexts().await;
+        let result = sup.import_context(export, &verifying_key, None).await;
+        assert!(
+            matches!(result, Err(ContextError::SupervisorShutDown(_))),
+            "an import after shutdown must fail with SupervisorShutDown; got {result:?}"
+        );
+    }
+
     /// A validly-signed export whose ceiling carries a MALFORMED entry (spec
     /// §5.3.1.1) must be rejected with `ImportRejected`. A valid signature
     /// authenticates the ORIGIN, not the WELL-FORMEDNESS of the payload — so a
@@ -22528,6 +22599,52 @@ mod tests {
             .await
             .expect("create over an ABSENT snapshot must succeed (precheck allows it)");
         assert_eq!(handle.context_id(), ctx_id);
+    }
+
+    /// A create succeeds before `shutdown_all_contexts` and, once shutdown has
+    /// begun, fails with the typed `SupervisorShutDown` (`SCP-CTX-2138`,
+    /// ADR-049 Decision 16 item 2), never a flattened `CreationFailed`.
+    #[tokio::test]
+    async fn create_after_shutdown_keeps_supervisor_shut_down() {
+        let creator = "did:dht:z6MkCreateAfterShutdownCreator";
+        let clock: Arc<dyn Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_and_persistence(clock, Box::new(MapPersistence::default()));
+        let params = || scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..scp_protocol::context::ContextParams::default()
+        };
+
+        sup.create_context(
+            "create-before-shutdown-ctx".to_owned(),
+            params(),
+            DID(creator.to_owned()),
+            None,
+        )
+        .await
+        .expect("a create before shutdown succeeds");
+
+        sup.shutdown_all_contexts().await;
+        // A creator with no key-package actor yet, so the create reaches the
+        // refused key-package actor spawn in `build_actor_deps`.
+        let result = sup
+            .create_context(
+                "create-after-shutdown-ctx".to_owned(),
+                params(),
+                DID("did:dht:z6MkCreateAfterShutdownSecondCreator".to_owned()),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(
+                    scp_protocol::context::builder::ContextCreationError::StateTransition(
+                        ContextError::SupervisorShutDown(_)
+                    )
+                )
+            ),
+            "a create after shutdown must keep SupervisorShutDown; got {result:?}"
+        );
     }
 
     /// Drive a panic into the actor via the testing-only seam and wait for
@@ -35606,6 +35723,40 @@ mod streaming_saga_tests {
                 .expect("load_unresolved")
                 .is_empty(),
             "a refused saga stages nothing"
+        );
+    }
+
+    /// A Phase-1 reserve refused by shutdown keeps `SCP-CTX-2138` as
+    /// `SagaError::SupervisorShutDown`; any other Phase-1 rejection still
+    /// aborts the saga with `SCP-SAGA-13067`.
+    #[test]
+    fn phase1_shutdown_rejection_keeps_supervisor_shut_down() {
+        use crate::context::outlets::dispatch::OpenStreamRejection;
+        use crate::context::supervisor::supervisor::phase1_rejection_to_saga_error;
+
+        let shut = phase1_rejection_to_saga_error(&OpenStreamRejection::SupervisorShutDown);
+        let SagaError::SupervisorShutDown { message } = &shut else {
+            panic!("a shutdown-refused reserve must map to SupervisorShutDown, got {shut:?}");
+        };
+        assert!(
+            message.contains("escrow reserve"),
+            "the refusal names the reserve: {message}"
+        );
+        assert!(shut.to_string().starts_with("SCP-CTX-2138"));
+
+        let other = phase1_rejection_to_saga_error(&OpenStreamRejection::ContextNotActive {
+            current_state: "Closing".to_owned(),
+        });
+        assert!(
+            matches!(
+                other,
+                SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13067,
+                    ..
+                }
+            ),
+            "a non-shutdown reserve rejection aborts with 13067, got {other:?}"
         );
     }
 

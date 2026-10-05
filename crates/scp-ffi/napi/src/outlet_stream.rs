@@ -326,6 +326,34 @@ fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpNapiError {
     }
 }
 
+/// The error for a stream the Supervisor opened but the bridge refused to
+/// register because bridge shutdown had begun: the class and code
+/// [`open_rejection_to_err`] gives the Supervisor's own shutdown refusal, so
+/// one condition reaches the caller as one error class whichever refusal point
+/// the race lands on.
+fn late_shutdown_stream_err() -> ScpNapiError {
+    ScpNapiError::Outlet {
+        message: "outlet stream dropped: bridge shutdown began after the Supervisor opened it"
+            .to_owned(),
+        code: OpenStreamRejection::SupervisorShutDown
+            .error_code()
+            .to_owned(),
+    }
+}
+
+/// The error for a streaming saga the Supervisor started but the bridge
+/// refused to register because bridge shutdown had begun: the class and code
+/// [`crate::outlets::map_saga_error`] gives the Supervisor's own shutdown
+/// refusal of a streaming saga.
+fn late_shutdown_saga_err() -> ScpNapiError {
+    ScpNapiError::SagaAborted {
+        message: "streaming saga receiver dropped: bridge shutdown began after the saga started"
+            .to_owned(),
+        code: codes::CTX_2138.to_owned(),
+        retry_after_ms: None,
+    }
+}
+
 /// The `SCP-PERM-3001` rejection for a control-plane call whose `caller_did` is
 /// not the invoker pinned at open (CRITICAL #1).
 fn caller_not_invoker_err(caller_did: &str, invoker_did: &str) -> ScpNapiError {
@@ -661,9 +689,7 @@ pub(crate) async fn outlet_stream_open_on(
             cost_per_chunk,
         },
     ) {
-        return Err(napi::Error::from(ScpNapiError::from(
-            scp_core::context::ContextError::SupervisorShutDown("open outlet stream".to_owned()),
-        )));
+        return Err(napi::Error::from(late_shutdown_stream_err()));
     }
     Ok(handle_id)
 }
@@ -1488,9 +1514,7 @@ pub(crate) async fn outlet_streaming_saga_open_on(
             request_id,
         },
     ) {
-        return Err(napi::Error::from(ScpNapiError::from(
-            scp_core::context::ContextError::SupervisorShutDown("open streaming saga".to_owned()),
-        )));
+        return Err(napi::Error::from(late_shutdown_saga_err()));
     }
     Ok(handle_id)
 }

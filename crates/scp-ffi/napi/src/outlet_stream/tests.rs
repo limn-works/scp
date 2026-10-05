@@ -1489,3 +1489,46 @@ mod xctx_streaming_saga_tests {
         );
     }
 }
+
+/// A stream or streaming saga the bridge refuses to register once bridge
+/// shutdown has begun reaches the caller as the same error class and code as
+/// the Supervisor's own shutdown refusal of that operation.
+#[test]
+fn late_shutdown_refusals_match_supervisor_refusal_class() {
+    let supervisor_open = open_rejection_to_err(&OpenStreamRejection::SupervisorShutDown);
+    let (
+        ScpNapiError::Outlet { code: late, .. },
+        ScpNapiError::Outlet {
+            code: supervisor, ..
+        },
+    ) = (late_shutdown_stream_err(), supervisor_open)
+    else {
+        panic!("both stream refusals must be the Outlet class");
+    };
+    assert_eq!(late, supervisor);
+    assert_eq!(late, codes::CTX_2138);
+
+    let supervisor_saga = crate::outlets::map_saga_error(
+        scp_core::context::supervisor::SagaError::SupervisorShutDown {
+            message: "start cross-context streaming saga".to_owned(),
+        },
+    );
+    let (
+        ScpNapiError::SagaAborted {
+            code: late,
+            retry_after_ms: late_retry,
+            ..
+        },
+        ScpNapiError::SagaAborted {
+            code: supervisor,
+            retry_after_ms: supervisor_retry,
+            ..
+        },
+    ) = (late_shutdown_saga_err(), supervisor_saga)
+    else {
+        panic!("both streaming-saga refusals must be the SagaAborted class");
+    };
+    assert_eq!(late, supervisor);
+    assert_eq!(late, codes::CTX_2138);
+    assert_eq!(late_retry, supervisor_retry);
+}
