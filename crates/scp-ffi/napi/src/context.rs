@@ -1714,8 +1714,8 @@ pub(crate) async fn context_close_on(
     //
     // `Poisoned` and `MigratingOut` refuse because a release while the
     // context can still return to `Active` would leave the `Active` context
-    // with no revocation list on this bridge. `Closing` refuses so the release
-    // follows `contextFinalizeClose`, and the refusal names that call.
+    // with no revocation list on this bridge. `Closing` refuses, and the
+    // refusal names `contextFinalizeClose`.
     let close_already_happened =
         match crate::runtime::read_live_context_state(bi, &handle.context_id)
             .await
@@ -6196,10 +6196,8 @@ mod tests {
         );
     }
 
-    /// A close's release that lands after an import returned the id to
-    /// `Active` clears its own mark and removes nothing, so the imported
-    /// context keeps the revocations it recorded; a release against an id no
-    /// actor serves keeps the mark while a handle for the id lives.
+    /// A close's release against an `Active` context clears its own mark and
+    /// removes nothing, so the context keeps the revocations it recorded.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_release_clears_its_mark_when_the_supervisor_reports_active() {
@@ -6214,7 +6212,7 @@ mod tests {
         crate::runtime::with_context(&bi, &active, |rt| {
             rt.core
                 .revocation_list
-                .revoke("revoked-after-import".to_owned());
+                .revoke("revoked-before-release".to_owned());
             Ok(())
         })
         .expect("the Active context must have UCAN state");
@@ -6226,7 +6224,7 @@ mod tests {
         assert!(!bi.released_contexts.contains_key(&active));
         assert!(
             crate::runtime::with_context(&bi, &active, |rt| {
-                Ok(rt.core.revocation_list.is_revoked("revoked-after-import"))
+                Ok(rt.core.revocation_list.is_revoked("revoked-before-release"))
             })
             .expect("the release must leave the Active context's UCAN state in place"),
             "a revocation the Active context recorded must survive the release"
@@ -6331,9 +6329,6 @@ mod tests {
         );
     }
 
-    /// A release mark refuses a rebuild while any handle for the id lives,
-    /// and goes away when the last handle drops; a release with no live
-    /// handle leaves no mark.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_mark_lasts_until_the_last_handle_for_the_id_drops() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());

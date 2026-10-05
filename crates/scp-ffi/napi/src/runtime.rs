@@ -196,17 +196,11 @@ pub struct NapiBridgeInstance {
     /// Context ids whose `ucan_registry` entry a release removed.
     ///
     /// [`ensure_registered`] refuses to rebuild an entry for an id in this
-    /// set. [`readmit_context`] removes an id, and so does
-    /// [`untrack_context_handle`] when the last live [`NapiContextHandle`]
-    /// for the id drops.
+    /// set.
     pub(crate) released_contexts: Arc<DashMap<String, ()>>,
 
     /// The number of live [`NapiContextHandle`]s this instance minted, per
     /// context id.
-    ///
-    /// [`untrack_context_handle`] drops the release mark for an id when its
-    /// last handle drops, so `released_contexts` holds only ids a live handle
-    /// can still reach.
     pub(crate) context_handles: Arc<DashMap<String, usize>>,
 
     /// Retained identity state for registered DIDs.
@@ -1864,8 +1858,7 @@ pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
 /// removes nothing, and returns `false`, so the readmitted context keeps its
 /// revocation list, nonce tracker, outlets, and sessions. On any other
 /// answer, a failed read included, it removes the state while the mark stands
-/// and returns `true`; the mark then lasts while a live [`NapiContextHandle`]
-/// for the id does. When a readmit clears the mark between the re-read and
+/// and returns `true`. When a readmit clears the mark between the re-read and
 /// the removal, it removes nothing and returns `false`.
 pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_id: &str) -> bool {
     bi.released_contexts.insert(context_id.to_owned(), ());
