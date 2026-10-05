@@ -20903,9 +20903,9 @@ mod tests {
     /// snapshot that still reads `Active` after the supervisor despawns the
     /// actor, so it admitted an invocation into a context the supervisor had
     /// stopped serving. `outlet_invoke_cross_context_saga` carried no lifecycle
-    /// gate at all. The test drives each axis of each entry point with the
-    /// other context live, so the code the refusal carries identifies which
-    /// read refused.
+    /// gate at all. The test drives each axis of each entry point, against a
+    /// despawned context and against a `Closing` one, with the other context
+    /// live, so the code the refusal carries identifies which read refused.
     #[test]
     #[cfg(feature = "testing")]
     fn cross_context_outlet_gates_read_the_supervisor_not_the_cached_handle_state() {
@@ -20936,98 +20936,82 @@ mod tests {
             ContextState::Active
         ));
 
-        // Target axis, unary entry point: the source is live, so the code names
-        // which of the two reads refused.
-        let unary = rt
-            .block_on(scp.outlet_invoke_cross_context(
-                Arc::clone(&live),
-                Arc::clone(&dead),
-                "probe-outlet".to_owned(),
-                "{}".to_owned(),
-                Arc::clone(&identity),
-                "not-a-real-token".to_owned(),
-                1,
-                None,
-            ))
-            .expect_err("a target context no actor serves must refuse the unary invocation");
-        match unary {
-            ScpError::Outlet { ref code, ref msg } => {
-                assert_eq!(code, codes::OUTLET_6011, "unary refusal reported: {msg}");
-                assert!(
-                    msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
-                    "unary refusal must come from the lifecycle gate: {msg}"
-                );
-                assert!(
-                    !msg.contains(&dead.context_id()),
-                    "unary refusal must withhold the context id: {msg}"
-                );
-            }
-            other => panic!("unary refusal must be an Outlet error, got: {other:?}"),
+        let closing = closing_context(&scp, &identity);
+
+        for stopped in [&dead, &closing] {
+            // Each axis runs with the other context live, so the code names
+            // which of the two reads refused.
+            let unary_target = rt
+                .block_on(scp.outlet_invoke_cross_context(
+                    Arc::clone(&live),
+                    Arc::clone(stopped),
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    Arc::clone(&identity),
+                    "not-a-real-token".to_owned(),
+                    1,
+                    None,
+                ))
+                .expect_err("a target context that is not Active must refuse the unary invocation");
+            assert_withheld_outlet_refusal(
+                &unary_target,
+                codes::OUTLET_6011,
+                &stopped.context_id(),
+            );
+
+            let unary_source = rt
+                .block_on(scp.outlet_invoke_cross_context(
+                    Arc::clone(stopped),
+                    Arc::clone(&live),
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    Arc::clone(&identity),
+                    "not-a-real-token".to_owned(),
+                    1,
+                    None,
+                ))
+                .expect_err("a source context that is not Active must refuse the unary invocation");
+            assert_withheld_outlet_refusal(
+                &unary_source,
+                codes::OUTLET_6010,
+                &stopped.context_id(),
+            );
+
+            let saga_caller = rt
+                .block_on(scp.outlet_invoke_cross_context_saga(
+                    Arc::clone(stopped),
+                    Arc::clone(&live),
+                    identity.did(),
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    "000102030405060708090a0b0c0d0e0f".to_owned(),
+                    1,
+                    1,
+                    None,
+                ))
+                .expect_err("a caller context that is not Active must refuse the saga");
+            assert_withheld_outlet_refusal(&saga_caller, codes::OUTLET_6010, &stopped.context_id());
+
+            let saga_target = rt
+                .block_on(scp.outlet_invoke_cross_context_saga(
+                    Arc::clone(&live),
+                    Arc::clone(stopped),
+                    identity.did(),
+                    "probe-outlet".to_owned(),
+                    "{}".to_owned(),
+                    "000102030405060708090a0b0c0d0e0f".to_owned(),
+                    1,
+                    1,
+                    None,
+                ))
+                .expect_err("a target context that is not Active must refuse the saga");
+            assert_withheld_outlet_refusal(&saga_target, codes::OUTLET_6011, &stopped.context_id());
         }
-
-        // Caller axis, saga entry point.
-        let saga = rt
-            .block_on(scp.outlet_invoke_cross_context_saga(
-                Arc::clone(&dead),
-                Arc::clone(&live),
-                identity.did(),
-                "probe-outlet".to_owned(),
-                "{}".to_owned(),
-                "000102030405060708090a0b0c0d0e0f".to_owned(),
-                1,
-                1,
-                None,
-            ))
-            .expect_err("a caller context no actor serves must refuse the saga");
-        match saga {
-            ScpError::Outlet { ref code, ref msg } => {
-                assert_eq!(code, codes::OUTLET_6010, "saga refusal reported: {msg}");
-                assert!(
-                    msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
-                    "saga refusal must come from the lifecycle gate: {msg}"
-                );
-                assert!(
-                    !msg.contains(&dead.context_id()),
-                    "saga refusal must withhold the context id: {msg}"
-                );
-            }
-            other => panic!("saga refusal must be an Outlet error, got: {other:?}"),
-        }
-
-        // Source axis, unary entry point.
-        let unary_source = rt
-            .block_on(scp.outlet_invoke_cross_context(
-                Arc::clone(&dead),
-                Arc::clone(&live),
-                "probe-outlet".to_owned(),
-                "{}".to_owned(),
-                Arc::clone(&identity),
-                "not-a-real-token".to_owned(),
-                1,
-                None,
-            ))
-            .expect_err("a source context no actor serves must refuse the unary invocation");
-        assert_withheld_outlet_refusal(&unary_source, codes::OUTLET_6010, &dead.context_id());
-
-        // Target axis, saga entry point.
-        let saga_target = rt
-            .block_on(scp.outlet_invoke_cross_context_saga(
-                Arc::clone(&live),
-                Arc::clone(&dead),
-                identity.did(),
-                "probe-outlet".to_owned(),
-                "{}".to_owned(),
-                "000102030405060708090a0b0c0d0e0f".to_owned(),
-                1,
-                1,
-                None,
-            ))
-            .expect_err("a target context no actor serves must refuse the saga");
-        assert_withheld_outlet_refusal(&saga_target, codes::OUTLET_6011, &dead.context_id());
     }
 
     /// Asserts that `err` is an outlet lifecycle-gate refusal with `code`
-    /// that withholds `context_id`.
+    /// that withholds `context_id` and, outside the withheld text, names no
+    /// `active` or `closing` state in any letter case.
     #[cfg(feature = "testing")]
     fn assert_withheld_outlet_refusal(err: &ScpError, code: &str, context_id: &str) {
         match err {
@@ -21036,6 +21020,13 @@ mod tests {
                 assert!(
                     msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
                     "refusal must come from the lifecycle gate: {msg}"
+                );
+                let outside_withheld = msg
+                    .replace(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD, "")
+                    .to_lowercase();
+                assert!(
+                    !outside_withheld.contains("active") && !outside_withheld.contains("closing"),
+                    "refusal must withhold the lifecycle state: {msg}"
                 );
                 assert!(
                     !msg.contains(context_id),
@@ -21046,13 +21037,56 @@ mod tests {
         }
     }
 
+    /// Creates a context, closes it, and returns its handle after asserting
+    /// that the supervisor reports the resident actor `Closing`.
+    #[cfg(feature = "testing")]
+    fn closing_context(scp: &crate::scp::Scp, identity: &Arc<Identity>) -> Arc<ContextHandle> {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let rt = runtime();
+        let handle = rt
+            .block_on(scp.context_create(
+                Arc::clone(identity),
+                ContextParams {
+                    ceiling: vec!["messages:read".to_owned(), "context:close".to_owned()],
+                    ..encrypted_join_test_params()
+                },
+            ))
+            .expect("context_create should succeed for the closing context");
+        let sup = scp
+            .inner
+            .context_manager_or_error()
+            .expect("supervisor")
+            .clone();
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sup.dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+                payload: Box::new(CloseContextPayload {
+                    context_id: handle.context_id(),
+                    params: scp_core::context::ContextParams::default(),
+                    initiator_did: identity.did.clone().into(),
+                }),
+                reply: tx,
+            })
+            .await
+            .expect("close dispatch");
+            rx.await.expect("close reply").expect("close must succeed");
+        });
+        assert_eq!(
+            rt.block_on(scp.inner.read_live_context_state(&handle.context_id()))
+                .expect("the resident actor answers"),
+            Some(scp_core::context::ContextState::Closing),
+        );
+        handle
+    }
+
     /// Each single-context outlet entry point below gates on the supervisor
     /// actor, and its refusal withholds the lifecycle state.
     ///
     /// The gate runs before the caller is authorized, so its refusal names no
     /// lifecycle state (the outlet PRD's SCP-OUT-031 PR-2a note). The junk UCAN
     /// token below reaches no authorization step, and each assertion pins the
-    /// entry point's own code.
+    /// entry point's own code. Each entry point runs against a despawned
+    /// context and against a `Closing` one.
     #[test]
     #[cfg(feature = "testing")]
     fn single_context_outlet_gates_read_the_supervisor_not_the_cached_handle_state() {
@@ -21078,8 +21112,8 @@ mod tests {
 
         let junk_token = "not-a-real-token".to_owned();
         let definition = OutletDefinition {
-            name: "uniffi-despawned-register-probe".to_owned(),
-            description: "a despawned-actor fixture outlet".to_owned(),
+            name: "uniffi-lifecycle-gate-register-probe".to_owned(),
+            description: "a lifecycle-gate fixture outlet".to_owned(),
             kind: OutletKind::Action,
             input_schema_json: r#"{"type":"object"}"#.to_owned(),
             output_schema_json: r#"{"type":"object"}"#.to_owned(),
@@ -21104,108 +21138,100 @@ mod tests {
             matches!(&malformed, ScpError::Validation { code, .. } if code == codes::VALID_7035),
             "the input check must answer before the lifecycle gate, got {malformed:?}"
         );
-        let refusals: Vec<(&str, &str, Result<(), ScpError>)> = vec![
-            (
-                "register",
-                codes::OUTLET_6003,
-                rt.block_on(scp.outlet_register(Arc::clone(&dead), definition))
+        let closing = closing_context(&scp, &identity);
+        for stopped in [&dead, &closing] {
+            let refusals: Vec<(&str, &str, Result<(), ScpError>)> = vec![
+                (
+                    "register",
+                    codes::OUTLET_6003,
+                    rt.block_on(scp.outlet_register(Arc::clone(stopped), definition.clone()))
+                        .map(drop),
+                ),
+                (
+                    "invoke",
+                    codes::OUTLET_6005,
+                    rt.block_on(scp.outlet_invoke(
+                        Arc::clone(stopped),
+                        "probe-outlet".to_owned(),
+                        "{}".to_owned(),
+                        Arc::clone(&identity),
+                        Some(junk_token.clone()),
+                        None,
+                        None,
+                    ))
                     .map(drop),
-            ),
-            (
-                "invoke",
-                codes::OUTLET_6005,
-                rt.block_on(scp.outlet_invoke(
-                    Arc::clone(&dead),
-                    "probe-outlet".to_owned(),
-                    "{}".to_owned(),
-                    Arc::clone(&identity),
-                    Some(junk_token.clone()),
-                    None,
-                    None,
-                ))
-                .map(drop),
-            ),
-            (
-                "stream_open",
-                codes::OUTLET_6005,
-                rt.block_on(scp.outlet_stream_open(
-                    Arc::clone(&dead),
-                    "probe-outlet".to_owned(),
-                    "{}".to_owned(),
-                    identity.did(),
-                    junk_token.clone(),
-                    None,
-                    None,
-                    None,
-                    None,
-                ))
-                .map(drop),
-            ),
-            (
-                "verify",
-                codes::OUTLET_6007,
-                rt.block_on(scp.outlet_verify(Arc::clone(&dead), "probe-outlet".to_owned()))
+                ),
+                (
+                    "stream_open",
+                    codes::OUTLET_6005,
+                    rt.block_on(scp.outlet_stream_open(
+                        Arc::clone(stopped),
+                        "probe-outlet".to_owned(),
+                        "{}".to_owned(),
+                        identity.did(),
+                        junk_token.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ))
                     .map(drop),
-            ),
-            (
-                "session_create",
-                codes::OUTLET_6014,
-                rt.block_on(scp.outlet_session_create(
-                    Arc::clone(&dead),
-                    "probe-outlet".to_owned(),
-                    dead.context_id(),
-                    None,
-                ))
-                .map(drop),
-            ),
-            (
-                "session_invoke",
-                codes::OUTLET_6017,
-                rt.block_on(scp.outlet_session_invoke(
-                    Arc::clone(&dead),
-                    "probe-session".to_owned(),
-                    "{}".to_owned(),
-                    Arc::clone(&identity),
-                    junk_token,
-                    None,
-                ))
-                .map(drop),
-            ),
-            (
-                "interface_expose",
-                codes::OUTLET_6030,
-                rt.block_on(scp.outlet_interface_expose(
-                    Arc::clone(&dead),
-                    "probe-outlet".to_owned(),
-                    "probe-target-context".to_owned(),
-                    None,
-                ))
-                .map(drop),
-            ),
-            (
-                "interface_accept",
-                codes::OUTLET_6032,
-                rt.block_on(scp.outlet_interface_accept(Arc::clone(&dead), "{}".to_owned()))
+                ),
+                (
+                    "verify",
+                    codes::OUTLET_6007,
+                    rt.block_on(scp.outlet_verify(Arc::clone(stopped), "probe-outlet".to_owned()))
+                        .map(drop),
+                ),
+                (
+                    "session_create",
+                    codes::OUTLET_6014,
+                    rt.block_on(scp.outlet_session_create(
+                        Arc::clone(stopped),
+                        "probe-outlet".to_owned(),
+                        stopped.context_id(),
+                        None,
+                    ))
                     .map(drop),
-            ),
-        ];
-        for (entry_point, expected_code, result) in refusals {
-            match result {
-                Err(ScpError::Outlet { ref code, ref msg }) => {
-                    assert_eq!(code, expected_code, "{entry_point} refusal reported: {msg}");
-                    assert!(
-                        msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
-                        "{entry_point} must refuse at the lifecycle gate: {msg}"
-                    );
-                    let outside_withheld = msg
-                        .replace(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD, "")
-                        .to_lowercase();
-                    assert!(
-                        !outside_withheld.contains("active") && !msg.contains(&dead.context_id()),
-                        "{entry_point} refusal must withhold the lifecycle state and the id: {msg}"
-                    );
+                ),
+                (
+                    "session_invoke",
+                    codes::OUTLET_6017,
+                    rt.block_on(scp.outlet_session_invoke(
+                        Arc::clone(stopped),
+                        "probe-session".to_owned(),
+                        "{}".to_owned(),
+                        Arc::clone(&identity),
+                        junk_token.clone(),
+                        None,
+                    ))
+                    .map(drop),
+                ),
+                (
+                    "interface_expose",
+                    codes::OUTLET_6030,
+                    rt.block_on(scp.outlet_interface_expose(
+                        Arc::clone(stopped),
+                        "probe-outlet".to_owned(),
+                        "probe-target-context".to_owned(),
+                        None,
+                    ))
+                    .map(drop),
+                ),
+                (
+                    "interface_accept",
+                    codes::OUTLET_6032,
+                    rt.block_on(scp.outlet_interface_accept(Arc::clone(stopped), "{}".to_owned()))
+                        .map(drop),
+                ),
+            ];
+            for (entry_point, expected_code, result) in refusals {
+                match result {
+                    Err(err) => {
+                        assert_withheld_outlet_refusal(&err, expected_code, &stopped.context_id());
+                    }
+                    Ok(()) => panic!("{entry_point} must refuse a context that is not Active"),
                 }
-                other => panic!("{entry_point} must refuse with an Outlet error, got: {other:?}"),
             }
         }
     }
