@@ -321,45 +321,55 @@ tasks.register<Exec>("generateUniffiBindings") {
     outputs.dir(uniffiBindingsDir)
 }
 
-// Prints `scp-ffi-uniffi|` followed by the arguments `generateUniffiBindings` passes
-// the generator, each `--features=<list>` written `--features <list>`. With
+// Runs `generateUniffiBindings`' command line with `--print-cargo-args` appended, so
+// the generator prints `scp-ffi-uniffi|` followed by the arguments it passes
+// `cargo build` after the manifest path, and prints that line. With
 // `scp.uniffi.prebuiltBindings=true` that task does not run, so this task fails.
 tasks.register("printUniffiCargoFeatures") {
     group = "help"
-    description = "Print the scp-ffi-uniffi cargo arguments generateUniffiBindings passes the generator"
-    val generatorArgs = tasks.named<Exec>("generateUniffiBindings").map { it.commandLine.drop(1) }
+    description = "Print the scp-ffi-uniffi cargo arguments generateUniffiBindings' generator passes cargo build"
+    val generator = tasks.named<Exec>("generateUniffiBindings").map { it.workingDir to it.commandLine }
     val prebuiltBindings = uniffiPrebuiltBindings
+    val execProvider = providers
     doLast {
         if (prebuiltBindings == "true") {
             throw GradleException("scp.uniffi.prebuiltBindings is true, so generateUniffiBindings builds nothing")
         }
-        val cargoArgs =
-            generatorArgs.get().joinToString(" ") { arg ->
-                if (arg.startsWith("--features=")) "--features ${arg.removePrefix("--features=")}" else arg
-            }
-        println("scp-ffi-uniffi|$cargoArgs")
+        val (dir, generatorCommand) = generator.get()
+        val printed =
+            execProvider.exec {
+                workingDir = dir
+                commandLine(generatorCommand + "--print-cargo-args")
+            }.standardOutput.asText.get().trim()
+        println(printed)
     }
 }
 
 // uniffiTestGuard: `:scp-kt:test` loads the cdylib under cargo's target directory
 // (see `JnaLibraryPath` above), and its real-FFI suites create identities with the
 // in-memory custody arm, which only a `testing` build compiles. When this build
-// generates the bindings, it builds that cdylib too, so a test run without
-// `testing` in `scp.uniffi.cargoFeatures` would load a production library and fail
-// suite by suite with SCP-IDENT-1008. This check fails the build before any task
-// runs instead.
+// generates the bindings, it builds that cdylib too. This check fails the build
+// before any task runs when `scp.uniffi.cargoFeatures` names neither `testing` nor
+// `scp-ffi-uniffi/testing`.
 //
 // uniffiPublishGuard: a build whose task graph holds a task that publishes to a
-// Maven repository fails when `scp.uniffi.cargoFeatures` names `testing`.
+// Maven repository fails unless this build generates the bindings
+// (`scp.uniffi.prebuiltBindings` is not true) from the crate's default features
+// (`scp.uniffi.cargoFeatures` is empty).
 gradle.taskGraph.whenReady {
     val publishTask = allTasks.firstOrNull { it is PublishToMavenRepository }
-    if (publishTask != null && "testing" in uniffiCargoFeatures.split(",")) {
+    if (publishTask != null && (uniffiCargoFeatures.isNotEmpty() || uniffiPrebuiltBindings == "true")) {
         throw GradleException(
-            "${publishTask.path} publishes to a Maven repository, and scp.uniffi.cargoFeatures names testing",
+            "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
+                "and scp.uniffi.prebuiltBindings must not be true; they are '$uniffiCargoFeatures' and " +
+                "'$uniffiPrebuiltBindings'",
         )
     }
     val testTask = tasks.test.get()
-    if (hasTask(testTask) && uniffiPrebuiltBindings != "true" && "testing" !in uniffiCargoFeatures.split(",")) {
+    val testFeatures = uniffiCargoFeatures.split(",")
+    if (hasTask(testTask) && uniffiPrebuiltBindings != "true" &&
+        "testing" !in testFeatures && "scp-ffi-uniffi/testing" !in testFeatures
+    ) {
         throw GradleException(
             "${testTask.path} needs a cdylib built with the testing feature; " +
                 "pass -Pscp.uniffi.cargoFeatures=testing",
