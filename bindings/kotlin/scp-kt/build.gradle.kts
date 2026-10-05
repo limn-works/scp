@@ -329,34 +329,42 @@ tasks.register<Exec>("generateUniffiBindings") {
 // nor `scp-ffi-uniffi/testing`.
 //
 // uniffiBindingsGenerated is true when the task graph holds `generateUniffiBindings`
-// and `scp.uniffi.prebuiltBindings` is not true.
+// and `compileKotlin` of this project and `scp.uniffi.prebuiltBindings` is not true.
 //
-// uniffiPublishGuard(graph, owner): when the task graph holds a task of `owner` of
-// type `AbstractPublishToMaven` (a remote repository or Maven Local), it fails the
-// build before any task runs unless Gradle resolves `scp.uniffi.cargoFeatures` to
-// the empty string, `scp.uniffi.prebuiltBindings` is not true, and the graph holds
-// this project's `generateUniffiBindings`. This project calls it for its own tasks;
-// scp-kt-android reads it from this project's `extra` and calls it for its tasks.
+// uniffiPublishGuard(graph, owner, ownerCompileTask): when the task graph holds a
+// task of `owner` of type `AbstractPublishToMaven` (a remote repository or Maven
+// Local), it fails the build before any task runs unless Gradle resolves
+// `scp.uniffi.cargoFeatures` to the empty string, `scp.uniffi.prebuiltBindings` is
+// not true, and the graph holds this project's `generateUniffiBindings` and
+// `compileKotlin` and `owner`'s task named `ownerCompileTask`. This project calls it
+// for its own tasks; scp-kt-android reads it from this project's `extra` and calls
+// it for its tasks.
 val generateUniffiBindingsPath = tasks.named("generateUniffiBindings").get().path
-val uniffiPublishGuard: (TaskExecutionGraph, Project) -> Unit = { graph, owner ->
+val compileKotlinPath = "$path:compileKotlin"
+val uniffiPublishGuard: (TaskExecutionGraph, Project, String) -> Unit = { graph, owner, ownerCompileTask ->
     val publishTask = graph.allTasks.firstOrNull { it is AbstractPublishToMaven && it.project == owner }
-    val generatesBindings = graph.hasTask(generateUniffiBindingsPath)
+    val ownerCompilePath = "${owner.path}:$ownerCompileTask"
+    val missingTasks =
+        setOf(generateUniffiBindingsPath, compileKotlinPath, ownerCompilePath).filterNot {
+            graph.hasTask(it)
+        }
     if (publishTask != null &&
-        (resolvedUniffiCargoFeatures.isNotEmpty() || uniffiPrebuiltBindings == "true" || !generatesBindings)
+        (resolvedUniffiCargoFeatures.isNotEmpty() || uniffiPrebuiltBindings == "true" || missingTasks.isNotEmpty())
     ) {
         throw GradleException(
             "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
-                "and this build must generate the bindings; scp.uniffi.cargoFeatures is " +
-                "'$resolvedUniffiCargoFeatures', scp.uniffi.prebuiltBindings is '$uniffiPrebuiltBindings' and " +
-                "the task graph holds $generateUniffiBindingsPath: $generatesBindings",
+                "and this build must generate the bindings and compile the Kotlin it publishes; " +
+                "scp.uniffi.cargoFeatures is '$resolvedUniffiCargoFeatures', scp.uniffi.prebuiltBindings is " +
+                "'$uniffiPrebuiltBindings' and the task graph lacks $missingTasks",
         )
     }
 }
 extra["uniffiPublishGuard"] = uniffiPublishGuard
 var uniffiBindingsGenerated = false
 gradle.taskGraph.whenReady {
-    uniffiBindingsGenerated = uniffiPrebuiltBindings != "true" && hasTask(generateUniffiBindingsPath)
-    uniffiPublishGuard(this, project)
+    uniffiBindingsGenerated = uniffiPrebuiltBindings != "true" && hasTask(generateUniffiBindingsPath) &&
+        hasTask(compileKotlinPath)
+    uniffiPublishGuard(this, project, "compileKotlin")
     val testTask = tasks.test.get()
     val testFeatures = uniffiCargoFeatures.split(",")
     if (hasTask(testTask) && uniffiPrebuiltBindings != "true" &&

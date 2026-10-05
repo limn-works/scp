@@ -411,7 +411,7 @@ jobs:
 
       # Fails unless every JAR in maven-artifacts has a manifest whose
       # `Scp-Uniffi-Cargo-Features` is empty and whose `Scp-Uniffi-Bindings` is
-      # `generated`, the attributes bindings/kotlin/scp-kt/build.gradle.kts writes.
+      # `generated`.
       - name: Check each JAR's manifest has empty Scp-Uniffi-Cargo-Features and Scp-Uniffi-Bindings generated
         shell: bash
         run: |

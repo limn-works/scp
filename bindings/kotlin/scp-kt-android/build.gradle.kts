@@ -16,11 +16,13 @@ version = findProperty("scpVersion")?.toString() ?: "0.1.0-SNAPSHOT"
 // this project of type `AbstractPublishToMaven` fails before any task runs unless
 // the value scp-kt resolves for `scp.uniffi.cargoFeatures` is empty,
 // `scp.uniffi.prebuiltBindings` is not true, and the graph holds
-// `:scp-kt:generateUniffiBindings`.
+// `:scp-kt:generateUniffiBindings`, `:scp-kt:compileKotlin` and this project's
+// `compileReleaseKotlin`.
 evaluationDependsOn(":scp-kt")
 @Suppress("UNCHECKED_CAST")
-val uniffiPublishGuard = project(":scp-kt").extra["uniffiPublishGuard"] as (TaskExecutionGraph, Project) -> Unit
-gradle.taskGraph.whenReady { uniffiPublishGuard(this, project) }
+val uniffiPublishGuard =
+    project(":scp-kt").extra["uniffiPublishGuard"] as (TaskExecutionGraph, Project, String) -> Unit
+gradle.taskGraph.whenReady { uniffiPublishGuard(this, project, "compileReleaseKotlin") }
 
 repositories {
     google()

@@ -406,7 +406,6 @@ jobs:
               - 'crates/scp-ffi/common/**'
               - 'scripts/generate-uniffi-kotlin.sh'
               - '.github/workflows/ci.yml'
-              - '.github/workflows/release.yml'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
@@ -3326,6 +3325,10 @@ jobs:
               env ORG_GRADLE_PROJECT_scp.uniffi.prebuiltBindings=true bash ./gradlew "$publish"
             rm "$bindings"
             expect_failure "$guard" ./gradlew "$publish" -x generateUniffiBindings
+            expect_failure "$guard" ./gradlew "$publish" -x :scp-kt:compileKotlin
+            if [ "$project" = :scp-kt-android ]; then
+              expect_failure "$guard" ./gradlew "$publish" -x :scp-kt-android:compileReleaseKotlin
+            fi
             expect_failure "$guard" \
               env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing bash ./gradlew "$publish" -Pscp.uniffi.cargoFeatures=testing
             expect_failure "scp.uniffi.cargoFeatures resolves to 'testing' but the command line passes ''" \
@@ -3334,11 +3337,8 @@ jobs:
               ./gradlew -Dorg.gradle.project.scp.uniffi.cargoFeatures=testing "$publish"
             ./gradlew -q "$publish" --dry-run
           done
-          # The publish tasks release.yml runs.
           ./gradlew -q :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository --dry-run
           ./gradlew -q :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository --dry-run
-      # The JARs Gradle builds here exclude compileKotlin, so their task graph holds
-      # no generateUniffiBindings.
       - name: Check the Scp-Uniffi attributes in the scp-kt JAR manifest
         run: |
           set -euo pipefail
