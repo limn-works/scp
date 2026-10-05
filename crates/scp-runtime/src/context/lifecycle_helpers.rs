@@ -752,8 +752,8 @@ pub async fn close_context_with_key(
         // eventually-consistent metrics, so fire-and-forget is the correct coupling.
         // The task captures the handle, so it spawns on the Supervisor's tracker
         // (ADR-049 Decision 16) and shutdown waits for it. A refusal means
-        // shutdown has begun or the Supervisor dropped: no registry remains to
-        // measure, so the refresh is skipped and logged.
+        // shutdown has begun or the Supervisor dropped, so the refresh is
+        // skipped and logged.
         let supervisor = deps.supervisor.clone();
         let refresh = async move {
             if let Err(e) = supervisor.update_context_gauges().await {
@@ -1582,6 +1582,9 @@ fn rollback_join_economy_ticket(
 ///   when the running SDK does not satisfy `params.min_protocol_version`.
 /// - [`ContextCreationError::InvalidCeilingCategory`] when a ceiling entry
 ///   breaks the ceiling-entry grammar (spec §5.3.1.1).
+/// - [`ContextCreationError::StateTransition`] wrapping
+///   [`ContextError::SupervisorShutDown`] when the actor spawn is refused
+///   because shutdown has begun or the Supervisor dropped (ADR-049 Decision 16).
 /// - [`ContextCreationError::CreationFailed`] for governance /
 ///   consequence-rule / economic-policy validation failures, or supervisor
 ///   registration failures.
@@ -1846,7 +1849,10 @@ pub async fn create_context(
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            ContextError::SupervisorShutDown(_) => ContextCreationError::StateTransition(e),
+            other => ContextCreationError::CreationFailed(other.to_string()),
+        })?;
 
     finalize_create(deps, &context_id, params.ttl, &handle).await?;
     Ok(handle)
@@ -2810,7 +2816,10 @@ pub async fn import_context(
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            ContextError::SupervisorShutDown(_) => e,
+            other => ContextError::MembershipFailed(other.to_string()),
+        })?;
 
     deps.supervisor.update_context_gauges().await?;
 
@@ -3476,7 +3485,10 @@ pub async fn restore_context(
     deps.supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            ContextError::SupervisorShutDown(_) => e,
+            other => ContextError::MembershipFailed(other.to_string()),
+        })?;
 
     // Fix-D — restore-time streaming crash-recovery sweep. The actor is now
     // resident with its Class-S state rehydrated (including any
@@ -4430,6 +4442,113 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
         let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
         lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle, None).await
+    }
+
+    /// ADR-049 Decision 16: a create or a restore that reaches the actor spawn
+    /// after shutdown has begun returns the typed `SupervisorShutDown`
+    /// (SCP-CTX-2138), not a flattened `CreationFailed` / `MembershipFailed`.
+    /// The same calls on a live Supervisor succeed.
+    #[tokio::test]
+    async fn create_and_restore_after_shutdown_keep_supervisor_shut_down() {
+        let params = || ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..ContextParams::default()
+        };
+        let creator = || DID("did:dht:z6MkShutdownCreate".to_owned());
+
+        // The deps are built before shutdown, as a create already past
+        // `build_actor_deps` holds them when shutdown begins.
+        let create_on = |closed: bool, ctx_id: &'static str| async move {
+            let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+                CapturingPersistence::default(),
+            ))));
+            let deps = supervisor
+                .build_actor_deps(&creator())
+                .await
+                .expect("build_actor_deps");
+            if closed {
+                supervisor.shutdown_all_contexts().await;
+            }
+            lifecycle_helpers::create_context(
+                &deps,
+                ctx_id.to_owned(),
+                params(),
+                creator(),
+                Some([7u8; 32]),
+            )
+            .await
+        };
+        create_on(false, "create-live")
+            .await
+            .expect("create on a live supervisor succeeds");
+        let created = create_on(true, "create-closed").await;
+        assert!(
+            matches!(
+                created,
+                Err(ContextCreationError::StateTransition(
+                    ContextError::SupervisorShutDown(_)
+                ))
+            ),
+            "create after shutdown must keep SupervisorShutDown; got {created:?}"
+        );
+
+        let ctx_id = "restore-after-shutdown";
+        let (snapshot, _) = harvest_snapshot(ctx_id, false).await;
+        let serving = build_supervisor(Box::new(ServingPersistence {
+            snapshot: snapshot.clone(),
+        }));
+        let deps = serving
+            .build_actor_deps(&DID("did:dht:z6MkRestoreShutdown".to_owned()))
+            .await
+            .expect("build_actor_deps");
+        let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
+        serving.shutdown_all_contexts().await;
+        let restored = lifecycle_helpers::restore_context(&deps, ctx_id, &handle, None).await;
+        assert!(
+            matches!(restored, Err(ContextError::SupervisorShutDown(_))),
+            "restore after shutdown must keep SupervisorShutDown; got {restored:?}"
+        );
+    }
+
+    /// A duplicate id is an actor-spawn failure other than shutdown: create
+    /// still flattens it to `CreationFailed`.
+    #[tokio::test]
+    async fn create_duplicate_id_still_flattens_to_creation_failed() {
+        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+            CapturingPersistence::default(),
+        ))));
+        let params = || ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..ContextParams::default()
+        };
+        let creator = || DID("did:dht:z6MkDuplicateCreate".to_owned());
+        let deps = supervisor
+            .build_actor_deps(&creator())
+            .await
+            .expect("build_actor_deps");
+        lifecycle_helpers::create_context(
+            &deps,
+            "create-dup".to_owned(),
+            params(),
+            creator(),
+            Some([7u8; 32]),
+        )
+        .await
+        .expect("first create succeeds");
+        let second = lifecycle_helpers::create_context(
+            &deps,
+            "create-dup".to_owned(),
+            params(),
+            creator(),
+            Some([8u8; 32]),
+        )
+        .await;
+        assert!(
+            matches!(second, Err(ContextCreationError::CreationFailed(_))),
+            "a duplicate id must still flatten to CreationFailed; got {second:?}"
+        );
     }
 
     /// Case 1: reconstructed mode ENCRYPTED (no broadcast state) but the
