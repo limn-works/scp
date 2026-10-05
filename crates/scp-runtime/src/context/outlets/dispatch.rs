@@ -235,11 +235,6 @@ impl Drop for StreamEscrowTicket {
 /// Distinct from [`InvocationError`] because the OUT-034 admission /
 /// escrow gates run BEFORE the stream is opened — a synchronous failure
 /// at this point produces a terminal envelope, not a chunk receiver.
-/// Each variant maps to a §5.4.4 slug + class + retry policy via
-/// [`OpenStreamRejection::slug`] and
-/// [`OpenStreamRejection::error_code`] so the FFI / SDK layer can shape
-/// the error envelope identically to the in-stream terminal `Error`
-/// chunks the pump emits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenStreamRejection {
     /// `StreamAdmissionTracker` rejected the open at one of the three

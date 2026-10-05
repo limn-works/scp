@@ -254,12 +254,12 @@ export class EconomyError extends ScpError {
 // the matching class below, preserving the datum.
 
 /**
- * A §6.2.4 saga aborted at a Prepare phase (authorization, freshness, rate
- * limit, co-residency, or a transiently-unavailable participant actor).
+ * A §6.2.4 saga that ended in an `Aborted` terminal, with the code
+ * `decompose_saga_error` (crates/scp-ffi/common/src/saga_errors.rs) gives it.
  *
  * An `Aborted` terminal may be a PERMANENT rejection the caller must not
  * blindly retry, OR a RETRYABLE transient (rate limit / participant-actor
- * unavailable); the two are distinguished by the `SCP-SAGA-*` code.
+ * unavailable).
  */
 export class SagaAbortedError extends OutletError {
   /**

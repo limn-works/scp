@@ -2450,8 +2450,10 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `TypeError` if params contains invalid types, `ValueError` if
-    /// parameter values are out of range, or `RuntimeError` if context creation
-    /// fails.
+    /// parameter values are out of range, the typed SDK error for a failure
+    /// `keeps_create_failure_code` keeps (`ContextError` with `SCP-CTX-2138`
+    /// when the Supervisor refused the create because shutdown began), or
+    /// `RuntimeError` if context creation fails otherwise.
     #[pyo3(signature = (identity_did, params))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
@@ -2642,8 +2644,9 @@ impl crate::scp::PyScp {
     ///
     /// Returns `ContextError` carrying `SCP-CTX-2013` when the supervisor reports
     /// the context in any state but active or no actor serves it,
-    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
-    /// when its actor crashed or is mid-respawn.
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn, and `SCP-CTX-2138` when the
+    /// Supervisor refused the join because shutdown began.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager, syncs FFI state
     pub fn context_join(
