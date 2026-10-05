@@ -3280,9 +3280,6 @@ jobs:
               exit 1
             fi
           done
-      # The environment-variable cases run `bash ./gradlew`: gradlew starts with
-      # `#!/bin/sh`, which is dash on Ubuntu, and dash drops an environment variable
-      # whose name holds a dot before it starts Java.
       - name: Check scp.uniffi.cargoFeatures
         run: |
           set -euo pipefail
@@ -3306,9 +3303,7 @@ jobs:
             ./gradlew :scp-kt:test --dry-run
           ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=testing
           ./gradlew -q :scp-kt:test --dry-run -Pscp.uniffi.cargoFeatures=scp-ffi-uniffi/testing
-          # The publish cases run the publish task itself, not --dry-run: the guard
-          # fails the build when the task graph is ready, before any task runs. A
-          # placeholder scp.kt lets the prebuiltBindings=true cases reach the guard.
+          # A placeholder scp.kt lets the prebuiltBindings=true cases reach the guard.
           bindings=scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
           for publish in :scp-kt:publishToMavenLocal:publishMavenJavaPublicationToMavenLocal \
             :scp-kt-android:publishToMavenLocal:publishReleasePublicationToMavenLocal; do
@@ -3567,13 +3562,10 @@ jobs:
           # `-Pscp.uniffi.prebuiltBindings=true` skips `generateUniffiBindings`, which
           # would otherwise rebuild the crate, so these tests compile against the
           # bindings this job uploads and load the cdylib it uploads.
-          # No PR or merge-queue run executes `generateUniffiBindings`; only
-          # build-matrix.yml and release.yml do.
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
-      # The bindings the steps above placed stay on disk, and this step replaces the
-      # generator script with one that exits 0, so `generateUniffiBindings` and
-      # `compileKotlin` run without a Rust toolchain and the JAR must record
-      # `Scp-Uniffi-Bindings: generated`.
+      # This step replaces the generator script with one that exits 0, so
+      # `generateUniffiBindings` and `compileKotlin` run without a Rust toolchain
+      # and the JAR must record `Scp-Uniffi-Bindings: generated`.
       - name: Check the scp-kt JAR manifest records generated bindings
         working-directory: bindings/kotlin
         env:
