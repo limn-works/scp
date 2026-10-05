@@ -336,24 +336,31 @@ tasks.register<Exec>("generateUniffiBindings") {
 // Local), it fails the build before any task runs unless Gradle resolves
 // `scp.uniffi.cargoFeatures` to the empty string, `scp.uniffi.prebuiltBindings` is
 // not true, and the graph holds this project's `generateUniffiBindings` and
-// `compileKotlin` and `owner`'s task named `ownerCompileTask`. This project calls it
-// for its own tasks; scp-kt-android reads it from this project's `extra` and calls
-// it for its tasks.
+// `compileKotlin`, `owner`'s task named `ownerCompileTask`, and every task each such
+// publish task depends on, directly or transitively, so a `-x` that drops the task
+// building a published file (`jar`, `sourcesJar`, an AAR bundle) fails too.
 val generateUniffiBindingsPath = tasks.named("generateUniffiBindings").get().path
 val compileKotlinPath = "$path:compileKotlin"
 val uniffiPublishGuard: (TaskExecutionGraph, Project, String) -> Unit = { graph, owner, ownerCompileTask ->
-    val publishTask = graph.allTasks.firstOrNull { it is AbstractPublishToMaven && it.project == owner }
+    val publishTasks = graph.allTasks.filter { it is AbstractPublishToMaven && it.project == owner }
+    val publishTask = publishTasks.firstOrNull()
     val ownerCompilePath = "${owner.path}:$ownerCompileTask"
+    val publishDependencies = mutableSetOf<Task>()
+    val pending = ArrayDeque(publishTasks)
+    while (pending.isNotEmpty()) {
+        val current = pending.removeFirst()
+        current.taskDependencies.getDependencies(current).filter(publishDependencies::add).forEach(pending::addLast)
+    }
     val missingTasks =
-        setOf(generateUniffiBindingsPath, compileKotlinPath, ownerCompilePath).filterNot {
-            graph.hasTask(it)
-        }
+        (setOf(generateUniffiBindingsPath, compileKotlinPath, ownerCompilePath) + publishDependencies.map { it.path })
+            .filterNot { graph.hasTask(it) }
+            .sorted()
     if (publishTask != null &&
         (resolvedUniffiCargoFeatures.isNotEmpty() || uniffiPrebuiltBindings == "true" || missingTasks.isNotEmpty())
     ) {
         throw GradleException(
             "${publishTask.path} publishes to a Maven repository, so scp.uniffi.cargoFeatures must be empty " +
-                "and this build must generate the bindings and compile the Kotlin it publishes; " +
+                "and this build must generate the bindings and build every file it publishes; " +
                 "scp.uniffi.cargoFeatures is '$resolvedUniffiCargoFeatures', scp.uniffi.prebuiltBindings is " +
                 "'$uniffiPrebuiltBindings' and the task graph lacks $missingTasks",
         )

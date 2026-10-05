@@ -9631,7 +9631,7 @@
       ],
       "description": "Scaffold the Kotlin SDK Gradle build infrastructure. Multi-module project with scp-kt (core JVM) and scp-kt-android (Android platform adapter). Must match ADR-028 layout conventions.",
       "acceptanceCriteria": [
-        "gradle build succeeds from bindings/kotlin/",
+        "gradle build -Pscp.uniffi.cargoFeatures=testing succeeds from bindings/kotlin/",
         "Multi-module structure matches ADR-028 layout (scp-kt + scp-kt-android)",
         "UniFFI-generated NativeLib.kt integration configured",
         "Android dependencies declared: Bouncy Castle, Play Integrity, FCM, SQLCipher, AndroidX Security",

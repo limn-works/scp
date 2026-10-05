@@ -3326,8 +3326,12 @@ jobs:
             rm "$bindings"
             expect_failure "$guard" ./gradlew "$publish" -x generateUniffiBindings
             expect_failure "$guard" ./gradlew "$publish" -x :scp-kt:compileKotlin
+            expect_failure "$guard" ./gradlew "$publish" -x :scp-kt:jar
             if [ "$project" = :scp-kt-android ]; then
               expect_failure "$guard" ./gradlew "$publish" -x :scp-kt-android:compileReleaseKotlin
+              expect_failure "$guard" ./gradlew "$publish" -x :scp-kt-android:bundleReleaseAar
+            else
+              expect_failure "$guard" ./gradlew "$publish" -x :scp-kt:sourcesJar
             fi
             expect_failure "$guard" \
               env ORG_GRADLE_PROJECT_scp.uniffi.cargoFeatures=testing bash ./gradlew "$publish" -Pscp.uniffi.cargoFeatures=testing
@@ -3566,6 +3570,26 @@ jobs:
           # No PR or merge-queue run executes `generateUniffiBindings`; only
           # build-matrix.yml and release.yml do.
           ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest -Pscp.uniffi.prebuiltBindings=true
+      # The bindings the steps above placed stay on disk, and this step replaces the
+      # generator script with one that exits 0, so `generateUniffiBindings` and
+      # `compileKotlin` run without a Rust toolchain and the JAR must record
+      # `Scp-Uniffi-Bindings: generated`.
+      - name: Check the scp-kt JAR manifest records generated bindings
+        working-directory: bindings/kotlin
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          set -euo pipefail
+          printf '#!/bin/sh\nexit 0\n' > ../../scripts/generate-uniffi-kotlin.sh
+          rm -f scp-kt/build/libs/*.jar
+          ./gradlew -q :scp-kt:jar -Pscp.uniffi.cargoFeatures=testing
+          manifest=$(unzip -p scp-kt/build/libs/*.jar META-INF/MANIFEST.MF | tr -d '\r')
+          if ! grep -qx 'Scp-Uniffi-Cargo-Features: testing' <<<"$manifest" ||
+            ! grep -qx 'Scp-Uniffi-Bindings: generated' <<<"$manifest"; then
+            echo "$manifest"
+            echo "::error::Gradle task :scp-kt:jar that ran generateUniffiBindings and compileKotlin wrote the wrong Scp-Uniffi attributes"
+            exit 1
+          fi
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
