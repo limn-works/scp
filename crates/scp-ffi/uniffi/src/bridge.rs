@@ -5392,29 +5392,34 @@ impl McpUniFfiBridgeProvider {
         }
         let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
-        // Ensure UCAN state is registered for this context, and read the
-        // outlet's registered kind so the UCAN check selects the correct
-        // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
-        // is released before entering with_ucan_state (a different DashMap).
-        // A handle removed since the lookup above is a denial for the same
-        // reason.
-        let outlet_kind_for_ucan = {
+        // Read the outlet's registered kind so the UCAN check selects the
+        // correct split stem (SCP-OUT-014), then ensure UCAN state is
+        // registered for this context. Scope the DashMap Ref so the shard
+        // lock is released before `ensure_ucan_registered` and
+        // `with_ucan_state` run. A handle removed since the lookup above is a
+        // denial for the same reason.
+        let (outlet_kind_for_ucan, creator_did, handle_ceiling) = {
             let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
                 AccessRefusal::Denied(format!(
                     "outlet '{outlet_name}' not registered in context '{context_id}'"
                 ))
             })?;
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
             let registry = handle
                 .outlet_registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
+            let kind = registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
                 AccessRefusal::Denied(format!(
                     "outlet '{outlet_name}' not registered in context '{context_id}'"
                 ))
-            })?
+            })?;
+            (
+                kind,
+                handle.creator_did.clone(),
+                handle.ceiling_strings.clone(),
+            )
         };
+        bi.ensure_ucan_registered(context_id, &creator_did, &handle_ceiling);
 
         // ADR-016 step 8 compares the token's grants against the ceiling in
         // `role_state`, and the chain check anchors on its `creator_did`. The
@@ -5807,9 +5812,13 @@ impl McpUniFfiBridgeProvider {
 
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
-        // Ensure UCAN state is registered before appending the event.
-        if let Some(handle) = context_handle_registry(&bi).get(context_id) {
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
+        // Ensure UCAN state is registered before appending the event. The
+        // handle Ref is dropped before `ensure_ucan_registered` runs.
+        let registered_handle = context_handle_registry(&bi)
+            .get(context_id)
+            .map(|handle| (handle.creator_did.clone(), handle.ceiling_strings.clone()));
+        if let Some((creator_did, handle_ceiling)) = registered_handle {
+            bi.ensure_ucan_registered(context_id, &creator_did, &handle_ceiling);
         }
 
         let append_result = bi.with_ucan_state(context_id, |ucan_state| {
@@ -6356,12 +6365,14 @@ async fn event_log_checkpoint_impl(
                 })?;
 
             // Ensure UCAN state (which contains the event log) is registered
-            // on this bridge instance.
-            bi.ensure_ucan_registered(
+            // on this bridge instance while the supervisor reports the context
+            // `Active`.
+            bi.ensure_ucan_registered_while_active(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
-            );
+            )
+            .await?;
 
             let sender_did = scp_did::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
@@ -6481,12 +6492,14 @@ async fn event_log_checkpoint_by_did_impl(
                 })?;
 
             // Ensure UCAN state (which contains the event log) is registered
-            // on this bridge instance.
-            bi.ensure_ucan_registered(
+            // on this bridge instance while the supervisor reports the context
+            // `Active`.
+            bi.ensure_ucan_registered_while_active(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
-            );
+            )
+            .await?;
 
             let sender_did = scp_did::DID(did);
             let context_id = handle.context_id.clone();
@@ -11853,7 +11866,7 @@ impl Scp {
                 // Mark the id and, unless the re-read reports `Active` or a
                 // readmit clears the mark first, release this instance's UCAN,
                 // connector and economy state and the MCP handle registration
-                // under the registry shard lock.
+                // under the release-mark lock.
                 let released = bi
                     .release_ucan_state_unless_readmitted(&handle.context_id, || {
                         bi.core.remove_bridge_state(&handle.context_id);
@@ -15622,12 +15635,14 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                // Ensure UCAN state (which contains the event log) is registered.
-                bi.ensure_ucan_registered(
+                // Ensure UCAN state (which contains the event log) is registered
+                // while the supervisor reports the context `Active`.
+                bi.ensure_ucan_registered_while_active(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )
+                .await?;
 
                 // Parse optional filter JSON.
                 let filter: Option<serde_json::Value> =
@@ -15905,12 +15920,14 @@ impl Scp {
                 })?;
 
                 // Ensure UCAN state (which contains the event log) is registered
-                // on this instance.
-                bi.ensure_ucan_registered(
+                // on this instance while the supervisor reports the context
+                // `Active`.
+                bi.ensure_ucan_registered_while_active(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )
+                .await?;
 
                 match claim_type {
                     "inclusion" => {
@@ -20911,7 +20928,7 @@ mod tests {
             "UCAN state must be rolled back after a failed spawn"
         );
         assert!(
-            scp.inner.released_contexts.contains_key(&context_id),
+            has_release_mark(&scp.inner, &context_id),
             "a failed join must not clear the release mark a close left"
         );
         scp.inner
@@ -20955,7 +20972,7 @@ mod tests {
             .expect("the re-read of an Active context must succeed"),
             "a release on an Active context must report the readmit"
         );
-        assert!(!scp.inner.released_contexts.contains_key(&active));
+        assert!(!has_release_mark(&scp.inner, &active));
         assert_eq!(
             scp.inner.with_ucan_state(&active, |state| state
                 .revocation_list
@@ -20973,7 +20990,7 @@ mod tests {
             .expect("the re-read of an id no actor serves must succeed")
         );
         assert!(
-            scp.inner.released_contexts.contains_key(&absent),
+            has_release_mark(&scp.inner, &absent),
             "a release on an id no actor serves must keep the mark"
         );
     }
@@ -21015,7 +21032,7 @@ mod tests {
             "the release must report the actor-busy code, got: {err}"
         );
         assert!(
-            scp.inner.released_contexts.contains_key(&context_id),
+            has_release_mark(&scp.inner, &context_id),
             "a failed re-read must keep the mark"
         );
         assert_eq!(
@@ -21054,7 +21071,7 @@ mod tests {
             "the teardown must surface CTX_2040, got {err:?}"
         );
         assert!(
-            scp.inner.released_contexts.contains_key(&ctx_id),
+            has_release_mark(&scp.inner, &ctx_id),
             "the teardown must re-mark the id the join's readmit cleared"
         );
         scp.inner
@@ -21121,37 +21138,196 @@ mod tests {
     }
 
     /// Marking a new id at `MAX_RELEASED_CONTEXTS` marks evicts the earliest
-    /// mark; re-marking an id that already holds a mark evicts none.
+    /// mark with no unsettled close; re-marking an id that already holds a
+    /// mark evicts none, and a mark whose close is unsettled is never evicted.
     #[test]
-    fn marking_past_the_cap_evicts_the_earliest_mark() {
-        use crate::runtime::MAX_RELEASED_CONTEXTS;
+    fn marking_past_the_cap_evicts_the_earliest_settled_mark() {
+        use crate::runtime::{MAX_RELEASED_CONTEXTS, ReleaseMark};
 
         let scp = scp_test();
-        let marks = &scp.inner.released_contexts;
         let now = std::time::Instant::now();
         let earlier = now
+            .checked_sub(std::time::Duration::from_secs(2))
+            .expect("two seconds before now is representable");
+        let middle = now
             .checked_sub(std::time::Duration::from_secs(1))
             .expect("one second before now is representable");
-        marks.insert("earliest".to_owned(), earlier);
-        for i in 1..MAX_RELEASED_CONTEXTS {
-            marks.insert(format!("mark-{i}"), now);
+        let mark_count = || {
+            scp.inner
+                .released_contexts
+                .lock()
+                .expect("marks lock")
+                .len()
+        };
+        {
+            let mut marks = scp.inner.released_contexts.lock().expect("marks lock");
+            marks.insert(
+                "earliest-in-flight".to_owned(),
+                ReleaseMark {
+                    at: earlier,
+                    in_flight: 1,
+                },
+            );
+            marks.insert(
+                "earliest-settled".to_owned(),
+                ReleaseMark {
+                    at: middle,
+                    in_flight: 0,
+                },
+            );
+            for i in 2..MAX_RELEASED_CONTEXTS {
+                marks.insert(
+                    format!("mark-{i}"),
+                    ReleaseMark {
+                        at: now,
+                        in_flight: 0,
+                    },
+                );
+            }
         }
-        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
 
-        scp.inner.mark_released("mark-1");
-        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+        scp.inner.mark_released("mark-2");
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
         assert!(
-            marks.contains_key("earliest"),
+            has_release_mark(&scp.inner, "earliest-settled"),
             "re-marking a marked id must evict nothing"
         );
 
-        scp.inner.mark_released("newest");
-        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
-        assert!(marks.contains_key("newest"));
+        scp.inner.release_ucan_state("newest");
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
+        assert!(has_release_mark(&scp.inner, "newest"));
         assert!(
-            !marks.contains_key("earliest"),
-            "a new mark at the cap must evict the earliest mark"
+            has_release_mark(&scp.inner, "earliest-in-flight"),
+            "a mark whose close is unsettled must not be evicted"
         );
+        assert!(
+            !has_release_mark(&scp.inner, "earliest-settled"),
+            "a new mark at the cap must evict the earliest settled mark"
+        );
+
+        {
+            let mut marks = scp.inner.released_contexts.lock().expect("marks lock");
+            for mark in marks.values_mut() {
+                mark.in_flight = 1;
+            }
+        }
+        scp.inner.release_ucan_state("over-the-cap");
+        assert_eq!(
+            mark_count(),
+            MAX_RELEASED_CONTEXTS + 1,
+            "with every close unsettled, a new mark must evict none"
+        );
+    }
+
+    /// A close's teardown runs while it holds the release-mark lock and no
+    /// UCAN registry guard: a readmit started during the teardown waits for
+    /// it to finish, and the registry entry for the id is not locked.
+    #[test]
+    fn close_teardown_holds_the_release_lock_and_no_registry_guard() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner
+            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        scp.inner.mark_released(&ctx_id);
+
+        let readmitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readmit_thread = None;
+        let removed = scp.inner.remove_ucan_state_while_released(&ctx_id, || {
+            assert!(
+                !matches!(
+                    scp.inner.ucan_registry.try_get(&ctx_id),
+                    dashmap::try_result::TryResult::Locked
+                ),
+                "the teardown must run with no UCAN registry guard on the id"
+            );
+            let bi = Arc::clone(&scp.inner);
+            let id = ctx_id.clone();
+            let flag = Arc::clone(&readmitted);
+            readmit_thread = Some(std::thread::spawn(move || {
+                bi.readmit_context(&id);
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !readmitted.load(std::sync::atomic::Ordering::SeqCst),
+                "a readmit must wait for the teardown that holds the release-mark lock"
+            );
+        });
+        assert!(removed, "the removal must report the standing mark");
+        readmit_thread
+            .expect("the teardown started the readmit")
+            .join()
+            .expect("the readmit thread must not panic");
+        assert!(readmitted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !has_release_mark(&scp.inner, &ctx_id),
+            "the readmit must clear the mark once the teardown finished"
+        );
+    }
+
+    /// `ensure_ucan_registered_while_active` builds UCAN state for a context
+    /// the supervisor reports `Active`, and builds none for an id no actor
+    /// serves, which is what an evicted release mark leaves behind.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ensure_while_active_builds_only_for_an_active_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let active = handle.context_id();
+        scp.inner.remove_ucan_state(&active);
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active(&active, &identity.did(), &[]),
+        )
+        .expect("the read of an Active context must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&active, |_| ()).is_some(),
+            "an Active context must get UCAN state"
+        );
+
+        let absent = scp_ffi_common::generate_context_id();
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active(&absent, &identity.did(), &[]),
+        )
+        .expect("the read of an id no actor serves must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&absent, |_| ()).is_none(),
+            "an id no actor serves must not get UCAN state"
+        );
+        assert!(
+            !has_release_mark(&scp.inner, &absent),
+            "the id carries no mark, so only the supervisor read refused it"
+        );
+    }
+
+    /// A close whose supervisor re-read fails settles its mark's unsettled
+    /// close, so the bound may evict that mark later.
+    #[test]
+    fn a_failed_close_re_read_settles_its_mark() {
+        let scp = scp_test();
+        let ctx_id = scp_ffi_common::generate_context_id();
+        scp.inner.core.suspend().expect("suspend");
+        let result = runtime().block_on(
+            scp.inner
+                .release_ucan_state_unless_readmitted(&ctx_id, || {}),
+        );
+        assert!(result.is_err(), "a suspended bridge's re-read must fail");
+        let mark = *scp
+            .inner
+            .released_contexts
+            .lock()
+            .expect("marks lock")
+            .get(&ctx_id)
+            .expect("a failed re-read keeps the mark");
+        assert_eq!(mark.in_flight, 0, "a failed re-read must settle its close");
     }
 
     /// A close of a context whose actor the supervisor despawned succeeds,
@@ -21188,7 +21364,7 @@ mod tests {
             "close must release the per-context UCAN state"
         );
         assert!(
-            scp.inner.released_contexts.contains_key(&context_id),
+            has_release_mark(&scp.inner, &context_id),
             "close must mark the released id"
         );
         assert!(
@@ -21283,7 +21459,7 @@ mod tests {
             "a refused close must leave the per-context UCAN state registered"
         );
         assert!(
-            !scp.inner.released_contexts.contains_key(&context_id),
+            !has_release_mark(&scp.inner, &context_id),
             "a refused close must not mark the id"
         );
         assert!(
@@ -21334,7 +21510,7 @@ mod tests {
                  (mid_respawn={mid_respawn})"
             );
             assert!(
-                !scp.inner.released_contexts.contains_key(&context_id),
+                !has_release_mark(&scp.inner, &context_id),
                 "a refused close must not mark the id (mid_respawn={mid_respawn})"
             );
             assert!(
@@ -21504,14 +21680,14 @@ mod tests {
             .expect("the creator's close should succeed");
         rt.block_on(scp.finalize_close(Arc::clone(&handle)))
             .expect("finalize should take the context from closing to closed");
-        assert!(scp.inner.released_contexts.contains_key(&context_id));
+        assert!(has_release_mark(&scp.inner, &context_id));
 
         let imported_id = rt
             .block_on(scp.context_import(export_data, Arc::clone(&identity)))
             .expect("context_import should replace the closed actor");
         assert_eq!(imported_id, context_id);
         assert!(
-            !scp.inner.released_contexts.contains_key(&context_id),
+            !has_release_mark(&scp.inner, &context_id),
             "the import must clear the release mark"
         );
         scp.inner
@@ -21560,7 +21736,7 @@ mod tests {
         rt.block_on(scp.restore_context(one.clone()))
             .expect("restore_context should restore the despawned context");
         assert!(
-            !scp.inner.released_contexts.contains_key(&one),
+            !has_release_mark(&scp.inner, &one),
             "restore_context must clear the release mark"
         );
 
@@ -21580,7 +21756,7 @@ mod tests {
             "restore_all_contexts restored: {restored}"
         );
         assert!(
-            !scp.inner.released_contexts.contains_key(&all),
+            !has_release_mark(&scp.inner, &all),
             "restore_all_contexts must clear the release mark"
         );
     }
@@ -21977,7 +22153,7 @@ mod tests {
         ))
         .expect("the Welcome join should commit");
         assert!(
-            !scp.inner.released_contexts.contains_key(&context_id),
+            !has_release_mark(&scp.inner, &context_id),
             "a committed Welcome join must clear the release mark"
         );
         assert!(
@@ -23025,6 +23201,14 @@ mod tests {
     /// `instance_id` so the per-instance handle-affinity check accepts
     /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
     /// which only worked against the deleted process-wide default.
+    /// Returns whether `context_id` carries a release mark on `bi`.
+    fn has_release_mark(bi: &crate::runtime::UniffiBridgeInstance, context_id: &str) -> bool {
+        bi.released_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(context_id)
+    }
+
     fn test_handle_for(scp: &Arc<crate::scp::Scp>) -> Arc<ContextHandle> {
         test_handle_with(scp, "did:dht:z6MkTestUser", Vec::new())
     }
@@ -29670,11 +29854,12 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A synthetic handle stamped with this instance's id; the checkpoint
-        // impl registers fresh UCAN state (event log) for the context, so no
-        // full `context_create` is required. Custody comes from `identity`, not
-        // the handle.
+        // A synthetic handle stamped with this instance's id, with UCAN state
+        // (event log) registered for it here, so no full `context_create` is
+        // required. Custody comes from `identity`, not the handle.
         let handle = test_handle_for(&scp);
+        scp.inner
+            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
 
         let checkpoint = event_log_checkpoint_impl(Arc::clone(&scp.inner), handle, identity, 0u64)
             .await
@@ -29707,11 +29892,12 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A synthetic handle stamped with this instance's id; the checkpoint
-        // impl registers fresh UCAN state (event log) for the context, so no
-        // full `context_create` is required. Custody comes from `identity`, not
-        // the handle.
+        // A synthetic handle stamped with this instance's id, with UCAN state
+        // (event log) registered for it here, so no full `context_create` is
+        // required. Custody comes from `identity`, not the handle.
         let handle = test_handle_for(&scp);
+        scp.inner
+            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
 
         // Pass the identity's own DID so the `did == identity.did` binding
         // (VALID_7000) is satisfied — the production happy path.
@@ -29760,6 +29946,8 @@ mod tests {
             .await
             .expect("identity_create");
         let handle = test_handle_for(&scp);
+        scp.inner
+            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
 
         // Mismatch: a different, syntactically valid DID is rejected because it
         // does not match the signing identity's DID.
