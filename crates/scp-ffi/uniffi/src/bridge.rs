@@ -299,8 +299,8 @@ fn no_pre_rotation_backend() -> ScpError {
     }
 }
 
-/// Tears down a committed Welcome join whose UCAN state a concurrent close
-/// removed, re-marks the id released, and returns the join's `CTX_2040` error.
+/// Tears down a committed Welcome join, re-marks the id released, and returns
+/// the join's `CTX_2040` error.
 async fn tear_down_vanished_join(
     bi: &crate::runtime::UniffiBridgeInstance,
     sup: &scp_core::context::supervisor::Supervisor,
@@ -11292,12 +11292,10 @@ impl Scp {
                 // irreversible commit; the UCAN state was just occupied (and not
                 // removed on this success path), so the sync targets a live entry.
                 //
-                // BLACK-2JF-01 — post-irreversible-commit compensation: the sync
-                // fails ONLY if a concurrent close removed the just-occupied
-                // UCAN state in the window since the spawn returned. A close
-                // does NOT despawn the runtime actor, so returning `Err` here
-                // without tearing the actor down would strand a live, orphaned
-                // actor for a join that never fully materialized at the bridge.
+                // BLACK-2JF-01 — post-irreversible-commit compensation: when
+                // the sync finds no UCAN state, returning `Err` here without
+                // tearing the actor down would strand a live, orphaned actor
+                // for a join that never fully materialized at the bridge.
                 // Compensate with the COMPLETE teardown (`discard_joined_context`):
                 // it removes the actor handle AND destroys the resident MLS group
                 // AND deletes the durable Class-S snapshot the join persisted — a
@@ -11858,8 +11856,8 @@ impl Scp {
                 // issued from here either (relay_urls / blob_ids were always empty),
                 // so nothing observable is lost by removing this block.
 
-                // Mark the id and, unless the re-read reports `Active` or a
-                // readmit clears the mark first, release this instance's UCAN,
+                // Mark the id and, unless the re-read reports `Active` or this
+                // close's mark no longer stands, release this instance's UCAN,
                 // connector and economy state and the MCP handle registration
                 // under the release-mark lock.
                 let released = bi
@@ -11871,8 +11869,7 @@ impl Scp {
                     .await?;
                 if !released {
                     return Err(ScpError::Context {
-                        msg: "the context returned to Active while this close ran; it stays \
-                              open and keeps its state on this bridge"
+                        msg: "this close released none of the context's state on this bridge"
                             .to_owned(),
                         code: codes::CTX_2017.to_owned(),
                     });
