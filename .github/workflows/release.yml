@@ -413,7 +413,7 @@ jobs:
       # `Scp-Uniffi-Cargo-Features` is empty and whose `Scp-Uniffi-Bindings` is
       # `generated`, the attributes bindings/kotlin/scp-kt/build.gradle.kts writes.
       # kotlin-lint in ci.yml runs this step's script on JARs that must pass and fail.
-      - name: Check each JAR's manifest records production UniFFI bindings
+      - name: Check each JAR's manifest has empty Scp-Uniffi-Cargo-Features and Scp-Uniffi-Bindings generated
         shell: bash
         run: |
           set -euo pipefail
@@ -792,7 +792,7 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           ./gradlew :scp-kt:publishMavenJavaPublicationToSonatypeStagingRepository \
-            -PscpVersion=${{ env.VERSION }}
+            -PscpVersion="$VERSION"
 
       # Kotlin Android AAR: works.limn:scp-kt-android
       - name: Publish Kotlin Android AAR to Maven Central
@@ -805,7 +805,7 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           ./gradlew :scp-kt-android:publishReleasePublicationToSonatypeStagingRepository \
-            -PscpVersion=${{ env.VERSION }}
+            -PscpVersion="$VERSION"
 
   publish-spm:
     name: "Step 6f: Publish Swift Package (SPM)"
