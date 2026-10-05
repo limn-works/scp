@@ -3070,6 +3070,10 @@ pub trait BridgeInstanceCore: Send + Sync {
             .core()
             .shutdown_core_async(timeout, self.durable_store_closer())
             .await;
+        // Release again after the drain: a stream whose open was in flight
+        // across the first release inserted its receiver after that clear,
+        // and a timed-out drain finishes only once that receiver drops.
+        self.release_streams();
         self.bridge_specific_shutdown();
         result
     }
@@ -3088,7 +3092,8 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// Override hook for per-bridge concrete structs to drop their outlet-
     /// stream and streaming-saga registries. [`Self::shutdown`] calls it
     /// before the Supervisor drain, because each registry entry holds the
-    /// receiver whose drop lets a tracked pump settle. The default
+    /// receiver whose drop lets a tracked pump settle, and again after
+    /// [`CoreFields::shutdown_core_async`] returns. The default
     /// implementation is a no-op.
     fn release_streams(&self) {}
 
@@ -5305,8 +5310,8 @@ mod tests {
         }
         // `shutdown` inherits the trait default (landed in commit 6 of
         // ADR-049): `self.release_streams()`, then
-        // `self.core().shutdown_core_async(timeout, closer).await +
-        // self.bridge_specific_shutdown()`. Overriding it here would
+        // `self.core().shutdown_core_async(timeout, closer).await`, then
+        // `self.release_streams()` and `self.bridge_specific_shutdown()`. Overriding it here would
         // diverge from production behavior and be caught by the
         // cross-bridge consistency gate.
     }
@@ -5492,6 +5497,83 @@ mod tests {
         assert!(sdk_shutdown_result(Ok(outcome)).is_ok());
         drop(scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY).expect("reopen"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bridge whose first `release_streams` finds nothing to release and
+    /// whose second frees the gate, standing in for a stream whose open
+    /// inserted its receiver after the first clear.
+    struct LateStreamBridge {
+        inner: SqliteBackedBridge,
+        gate: Arc<tokio::sync::Semaphore>,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeInstanceCore for LateStreamBridge {
+        fn core(&self) -> &CoreFields {
+            &self.inner.core
+        }
+        fn durable_store_closer(&self) -> Option<DurableStoreCloser> {
+            self.inner.durable_store_closer()
+        }
+        fn release_streams(&self) {
+            if self
+                .releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 1
+            {
+                self.gate.add_permits(1);
+            }
+        }
+    }
+
+    /// A stream inserted after the first release keeps the drain past the
+    /// deadline, and the release after the drain lets the late drain close
+    /// the store with no other action from the caller.
+    #[tokio::test]
+    async fn shutdown_releases_streams_inserted_during_the_drain() {
+        let dir = unique_store_dir("late-stream");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let bridge = LateStreamBridge {
+            inner: sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await,
+            gate,
+            releases: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let outcome = bridge
+            .shutdown(Duration::from_millis(200))
+            .await
+            .expect("shutdown reports an outcome");
+        assert!(
+            matches!(
+                outcome,
+                ShutdownOutcome::TimedOut {
+                    durable_store_open: true,
+                    ..
+                }
+            ),
+            "the first release frees nothing, so the drain must miss the deadline, got {outcome:?}"
+        );
+        assert_eq!(
+            bridge.releases.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "shutdown must release streams before and after the drain"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let reopen = loop {
+            match scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY) {
+                Err(scp_platform::PlatformError::StorageLockHeld { .. })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => break other,
+            }
+        };
+        reopen
+            .expect("the late drain never released the store")
+            .close()
+            .expect("close the reopened store");
+        drop(std::fs::remove_dir_all(&dir));
     }
 
     /// A shutdown whose Supervisor drain misses the deadline reports

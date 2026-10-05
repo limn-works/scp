@@ -1,10 +1,10 @@
-//! `SCP-STORAGE-` band allocation: the selection layer's codes take no number
-//! another backend owns.
+//! `SCP-STORAGE-` band allocation: the codes `scp-ffi-common` defines take no
+//! number another backend owns.
 //!
 //! `.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes allocates the
 //! band per owner and states the rule in prose: "never reuse a number assigned
 //! to a different backend, even across languages". This file asserts that rule
-//! for the codes `scp-ffi-common` defines, because a violation is invisible
+//! for the `SCP-STORAGE-` codes `scp-ffi-common` defines, because a violation is invisible
 //! at the Rust layer — the colliding owner, `scp-kt-android` `AndroidStorage`,
 //! is Kotlin, and an Android app links it and the `UniFFI` bridge into one
 //! process.
@@ -35,22 +35,22 @@ const BROWSER_OWNED: [&str; 4] = [
     "SCP-STORAGE-8013",
 ];
 
-/// The codes the storage-selection layer raises across all three bridges
-/// carry the numbers `.docs/standards/sdk-common.md` allocates to that layer.
+/// The `SCP-STORAGE-` codes `scp-ffi-common` defines carry the numbers
+/// `.docs/standards/sdk-common.md` allocates to their owners.
 #[test]
-fn selection_layer_codes_carry_their_registered_numbers() {
+fn ffi_common_storage_codes_carry_their_registered_numbers() {
     assert_eq!(STORAGE_8000, "SCP-STORAGE-8000");
     assert_eq!(STORAGE_8004, "SCP-STORAGE-8004");
     assert_eq!(STORAGE_8005, "SCP-STORAGE-8005");
     assert_eq!(STORAGE_8006, "SCP-STORAGE-8006");
 }
 
-/// No selection-layer code takes a number another backend owns. An
-/// Android app links `AndroidStorage` and the `UniFFI` bridge into one process,
-/// so a selection-layer code inside `8001`--`8003` would make one code string
+/// No `SCP-STORAGE-` code `scp-ffi-common` defines takes a number another
+/// backend owns. An Android app links `AndroidStorage` and the `UniFFI` bridge
+/// into one process, so such a code inside `8001`--`8003` would make one code string
 /// name two conditions in that app.
 #[test]
-fn selection_layer_codes_avoid_every_other_owner_sub_block() {
+fn ffi_common_storage_codes_avoid_every_other_owner_sub_block() {
     for code in [STORAGE_8000, STORAGE_8004, STORAGE_8005, STORAGE_8006] {
         assert!(
             !ANDROID_OWNED.contains(&code),

@@ -300,6 +300,7 @@ impl PyScp {
     ///
     /// # Errors
     ///
+    /// Raises `RuntimeError` if the tokio runtime is not initialized.
     /// Raises `ValidationError` with `SCP-STORAGE-8005` when the durable store
     /// still holds its advisory lock after the call.
     pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {

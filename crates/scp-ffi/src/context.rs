@@ -2737,7 +2737,11 @@ impl crate::scp::PyScp {
                 .await
             })
             .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
+                if keeps_join_failure_code(&e) {
+                    PyErr::from(crate::error::ScpPyError::from(e))
+                } else {
+                    PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
+                }
             })?;
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
@@ -6329,6 +6333,13 @@ const fn keeps_create_failure_code(e: &scp_core::context::ContextError) -> bool 
     )
 }
 
+/// Whether a refused join keeps its typed SDK code: a join refused because
+/// Supervisor shutdown began keeps SCP-CTX-2138, as on the NAPI and `UniFFI`
+/// bridges.
+const fn keeps_join_failure_code(e: &scp_core::context::ContextError) -> bool {
+    matches!(e, scp_core::context::ContextError::SupervisorShutDown(_))
+}
+
 /// Flattens a refused create to a [`scp_core::context::ContextError`], keeping
 /// the variants [`keeps_create_failure_code`] names typed.
 fn create_context_failure(
@@ -6354,6 +6365,18 @@ mod tests {
     use super::*;
     use crate::runtime::RECEIVE_BUFFER_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A join refused because Supervisor shutdown began keeps its typed code;
+    /// any other join failure does not.
+    #[test]
+    fn join_failure_keeps_only_supervisor_shut_down_typed() {
+        assert!(keeps_join_failure_code(
+            &scp_core::context::ContextError::SupervisorShutDown("join".to_owned())
+        ));
+        assert!(!keeps_join_failure_code(
+            &scp_core::context::ContextError::TransportFailed("join".to_owned())
+        ));
+    }
 
     /// A create refused because Supervisor shutdown began stays typed and maps
     /// to SCP-CTX-2138; an unrelated create failure is flattened.
