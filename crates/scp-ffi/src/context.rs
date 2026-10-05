@@ -63,18 +63,6 @@ enum CloseDecision {
     SkipDispatch,
 }
 
-/// What `context_close`'s `CloseContext` step produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CloseDispatch {
-    /// The close decision skipped the dispatch.
-    Skipped,
-    /// The dispatch returned `Ok`.
-    Applied,
-    /// The dispatch failed with this message, for any failure but
-    /// `ContextNotRegistered`.
-    Failed(String),
-}
-
 /// The refusal `context_close` returns for a lifecycle state it neither
 /// dispatches for nor releases.
 fn close_state_refusal(state: &scp_core::context::ContextState) -> PyErr {
@@ -105,126 +93,14 @@ fn close_decision(state: Option<&scp_core::context::ContextState>) -> PyResult<C
     }
 }
 
-/// Removes this bridge's state for `context_id` only when `reread`, the
-/// supervisor's lifecycle answer read after `dispatch`, permits the release.
-///
-/// When the dispatch was skipped, the re-read permits the release when no
-/// actor serves the context or the supervisor reports `Closed`, `Expired` or
-/// `Tombstoned`. After a dispatch, whether it succeeded or failed, the re-read
-/// permits the release whenever it answers anything but `Active`: a close
-/// handler can move the context out of `Active` and still fail. After a
-/// successful dispatch a failed re-read also permits the release, and after a
-/// failed dispatch it does not.
-///
-/// The re-read and the removal are two steps, and nothing stops a readmit
-/// from landing between them.
-///
-/// Returns `Ok(Some(err))` after a failed dispatch whose re-read permitted
-/// the release: the state is removed, and `context_close` returns `err` once
-/// it has finished its teardown.
-///
-/// # Errors
-///
-/// Returns the re-read's error when the dispatch was skipped, the dispatch's
-/// error when the dispatch failed and the re-read failed or reports `Active`,
-/// `RuntimeError` when the re-read reports `Active` after a skipped or a
-/// successful dispatch, and `RuntimeError` naming the state for every other
-/// state a skipped dispatch does not release, and removes nothing in each
-/// case.
-fn release_after_close_reread(
-    bi: &crate::runtime::PyBridgeInstance,
-    context_id: &str,
-    dispatch: CloseDispatch,
-    reread: Result<Option<scp_core::context::ContextState>, crate::error::ScpPyError>,
-) -> PyResult<Option<PyErr>> {
-    use scp_core::context::ContextState;
-    let deferred = match (dispatch, reread) {
-        (CloseDispatch::Skipped, Err(e)) => return Err(e.into()),
-        (
-            CloseDispatch::Skipped,
-            Ok(
-                None
-                | Some(ContextState::Closed | ContextState::Expired | ContextState::Tombstoned),
-            ),
-        )
-        | (
-            CloseDispatch::Applied,
-            Ok(
-                None
-                | Some(
-                    ContextState::Creating
-                    | ContextState::Closing
-                    | ContextState::Closed
-                    | ContextState::Expired
-                    | ContextState::MigratingOut
-                    | ContextState::Tombstoned
-                    | ContextState::Poisoned,
-                ),
-            ),
-        ) => None,
-        (CloseDispatch::Skipped | CloseDispatch::Applied, Ok(Some(ContextState::Active))) => {
-            return Err(PyRuntimeError::new_err(
-                "the supervisor reports the context active again after this close's lifecycle \
-                 read; this close released none of the context's state on this bridge",
-            ));
-        }
-        (
-            CloseDispatch::Skipped,
-            Ok(Some(
-                other @ (ContextState::Creating
-                | ContextState::Closing
-                | ContextState::MigratingOut
-                | ContextState::Poisoned),
-            )),
-        ) => return Err(close_state_refusal(&other)),
-        (CloseDispatch::Applied, Err(e)) => {
-            tracing::warn!(
-                context_id,
-                error = %e,
-                "context_close: lifecycle re-read after a successful CloseContext dispatch \
-                 failed; releasing this bridge's state"
-            );
-            None
-        }
-        (CloseDispatch::Failed(message), Ok(Some(ContextState::Active))) => {
-            return Err(PyRuntimeError::new_err(message));
-        }
-        (CloseDispatch::Failed(message), Err(e)) => {
-            return Err(PyRuntimeError::new_err(format!(
-                "{message}; the lifecycle re-read after it failed too ({e}), so this close \
-                 released nothing"
-            )));
-        }
-        (
-            CloseDispatch::Failed(message),
-            Ok(
-                None
-                | Some(
-                    ContextState::Creating
-                    | ContextState::Closing
-                    | ContextState::Closed
-                    | ContextState::Expired
-                    | ContextState::MigratingOut
-                    | ContextState::Tombstoned
-                    | ContextState::Poisoned,
-                ),
-            ),
-        ) => Some(PyRuntimeError::new_err(format!(
-            "{message}; the supervisor no longer reports the context active, so this close \
-             released this bridge's state"
-        ))),
-    };
-    crate::runtime::remove_context(bi, context_id);
-    Ok(deferred)
-}
-
 /// Runs `context_close` on `sup`, the supervisor the call resolved, given
 /// `live`, that supervisor's first lifecycle answer for the handle's context.
 ///
 /// # Errors
 ///
-/// Returns the errors `context_close` documents for its close decision, its
-/// `CloseContext` dispatch and its re-read.
+/// Returns the errors `context_close` documents for its close decision and its
+/// `CloseContext` dispatch, and a `RuntimeError` when the supervisor reports
+/// the context `Active` again after the dispatch or the skipped dispatch.
 fn close_context_on(
     bi: &crate::runtime::PyBridgeInstance,
     handle: &PyContextHandle,
@@ -271,7 +147,7 @@ fn close_context_on(
     // FFI bridge state is touched. The bridge runs no capability check of
     // its own: the `CloseContext` dispatch runs `ttl::close_context`, which
     // checks the `ContextClose` capability.
-    let dispatch = if decision == CloseDecision::Dispatch {
+    if decision == CloseDecision::Dispatch {
         let initiator_did = scp_did::DID(identity_did.to_owned());
         let rt = crate::runtime()?;
         let sup = std::sync::Arc::clone(sup);
@@ -300,19 +176,18 @@ fn close_context_on(
                 .map_err(|e| format!("supervisor dispatch_lifecycle_command failed: {e}"))?;
             rx.await.map_err(|e| format!("shim reply dropped: {e}"))
         });
-        check_close_dispatch_outcome(dispatch_outcome)?
-    } else {
-        CloseDispatch::Skipped
-    };
+        // A failed dispatch returns its error here and releases nothing.
+        check_close_dispatch_outcome(dispatch_outcome)?;
+    }
 
     // Remove the FFI bridge state, so bridge outlet dispatch fails closed for
-    // this id, only when the supervisor's re-read permits the release.
-    let deferred = release_after_close_reread(
-        bi,
-        &handle.context_id,
-        dispatch,
-        crate::runtime::read_live_context_state_on(std::sync::Arc::clone(sup), &handle.context_id),
-    )?;
+    // this id, unless the supervisor reports the context `Active` again.
+    if !crate::runtime::release_context_unless_readmitted(bi, sup, &handle.context_id) {
+        return Err(PyRuntimeError::new_err(
+            "the context returned to Active while this close ran; it stays open and keeps its \
+             state on this bridge",
+        ));
+    }
 
     // Transition directly to "closed" (skipping "closing" for the bridge
     // layer -- the full runtime will implement the cooperative closing window).
@@ -333,11 +208,11 @@ fn close_context_on(
     // `with_context`; it uses the captured sender directly.
     drain_and_deliver_via_sender(bi, &handle.context_id, close_channel);
 
-    deferred.map_or(Ok(()), Err)
+    Ok(())
 }
 
 /// Turns the outcome of `context_close`'s `CloseContext` dispatch into the
-/// [`CloseDispatch`] that `context_close`'s re-read is judged against.
+/// close's result.
 ///
 /// `ContextNotRegistered` is an error here, although `context_close` dispatches
 /// only after the supervisor answered `Active`: the dispatch takes that error
@@ -347,16 +222,16 @@ fn close_context_on(
 ///
 /// # Errors
 ///
-/// Returns `ContextError` with code `SCP-CTX-2001` for `ContextNotRegistered`.
-/// Every other failure becomes [`CloseDispatch::Failed`] carrying its message.
+/// Returns `ContextError` with code `SCP-CTX-2001` for `ContextNotRegistered`,
+/// and `RuntimeError` carrying the failure for every other failure.
 fn check_close_dispatch_outcome(
     outcome: Result<
         Result<scp_core::context::ttl::CloseResult, scp_core::context::ContextError>,
         String,
     >,
-) -> PyResult<CloseDispatch> {
+) -> PyResult<()> {
     match outcome {
-        Ok(Ok(_)) => Ok(CloseDispatch::Applied),
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(e @ scp_core::context::ContextError::ContextNotRegistered(_))) => {
             Err(crate::error::ScpPyError::ContextError {
                 message: format!(
@@ -367,10 +242,10 @@ fn check_close_dispatch_outcome(
             }
             .into())
         }
-        Ok(Err(e)) => Ok(CloseDispatch::Failed(format!(
+        Ok(Err(e)) => Err(PyRuntimeError::new_err(format!(
             "Supervisor close_context failed: {e}"
         ))),
-        Err(message) => Ok(CloseDispatch::Failed(message)),
+        Err(message) => Err(PyRuntimeError::new_err(message)),
     }
 }
 
@@ -3690,29 +3565,17 @@ impl crate::scp::PyScp {
     /// dispatch, it releases nothing and returns:
     /// - `RuntimeError` naming the state if the read reports the context
     ///   `creating`, `closing`, `migrating_out` or `poisoned`;
-    /// - `ContextError` with code `SCP-CTX-2135` (`ActorCrashed`) if the
-    ///   supervisor holds no actor for the context because the actor is
-    ///   mid-respawn or its last respawn failed;
-    /// - `ContextError` whose message carries `SCP-CTX-2130` if the supervisor
-    ///   still holds an actor for the context and that actor did not answer
-    ///   the read.
+    /// - `ContextError` for the read's error, among them code `SCP-CTX-2135`
+    ///   (`ActorCrashed`) for the causes `Supervisor::read_context_state_checked`
+    ///   documents.
     ///
-    /// For the supervisor read this call takes in place of the dispatch, it
-    /// releases nothing and returns the read's error, a `RuntimeError` if the
-    /// read reports the context `active`, and a `RuntimeError` naming the
-    /// state if the read reports `creating`, `closing`, `migrating_out` or
-    /// `poisoned`.
+    /// Returns `RuntimeError` carrying the dispatch's failure and releases
+    /// nothing if the `CloseContext` dispatch fails with any error but
+    /// `ContextNotRegistered`.
     ///
-    /// After a dispatch that succeeded, it returns a `RuntimeError` and
-    /// releases nothing if the supervisor read this call takes next reports
-    /// the context `active`.
-    ///
-    /// After a dispatch that failed with any error but
-    /// `ContextNotRegistered`, it returns a `RuntimeError` carrying the
-    /// dispatch's failure. It releases this bridge's state for the context
-    /// first when the supervisor read this call takes next answers anything
-    /// but `active`, and releases nothing when that read reports `active` or
-    /// fails.
+    /// After the dispatch succeeds or is skipped, it returns a `RuntimeError`
+    /// and releases nothing if the supervisor read this call takes next
+    /// reports the context `active`.
     ///
     /// Returns `ContextError` with code `SCP-CTX-2001` and releases nothing if
     /// the supervisor reported the context `active` and the close dispatch
@@ -8357,30 +8220,26 @@ mod tests {
         let denied = super::check_close_dispatch_outcome(Ok(Err(
             scp_core::context::ContextError::PermissionDenied("no context:close".to_owned()),
         )))
-        .expect("a denied dispatch must go on to the re-read");
+        .expect_err("a denied dispatch must fail the close");
         assert!(
-            matches!(
-                &denied,
-                super::CloseDispatch::Failed(message)
-                    if message.contains("Supervisor close_context failed")
-            ),
-            "denied dispatch reported: {denied:?}"
+            denied
+                .to_string()
+                .contains("Supervisor close_context failed"),
+            "denied dispatch reported: {denied}"
         );
 
         let undelivered = super::check_close_dispatch_outcome(Err("shim reply dropped".to_owned()))
-            .expect("a dispatch that lost its reply must go on to the re-read");
-        assert_eq!(
-            undelivered,
-            super::CloseDispatch::Failed("shim reply dropped".to_owned())
+            .expect_err("a dispatch that lost its reply must fail the close");
+        assert!(
+            undelivered.to_string().contains("shim reply dropped"),
+            "undelivered dispatch reported: {undelivered}"
         );
 
-        let applied =
-            super::check_close_dispatch_outcome(Ok(Ok(scp_core::context::ttl::CloseResult {
-                should_generate_summary: false,
-                should_schedule_key_destruction: false,
-            })))
-            .expect("a successful dispatch must go on to the re-read");
-        assert_eq!(applied, super::CloseDispatch::Applied);
+        super::check_close_dispatch_outcome(Ok(Ok(scp_core::context::ttl::CloseResult {
+            should_generate_summary: false,
+            should_schedule_key_destruction: false,
+        })))
+        .expect("a successful dispatch must go on to the release");
     }
 
     /// `close_decision` dispatches for `Active`, releases without a dispatch
@@ -8579,156 +8438,114 @@ mod tests {
         );
     }
 
-    /// Registers a fresh context on `bi`, runs `release_after_close_reread` for
-    /// it, and returns whether the state was released and the error the close
-    /// returns, released or not.
-    fn run_release_case(
-        bi: &crate::runtime::PyBridgeInstance,
-        case: &mut u32,
-        dispatch: super::CloseDispatch,
-        reread: Result<Option<scp_core::context::ContextState>, crate::error::ScpPyError>,
-    ) -> (bool, Option<String>) {
-        *case += 1;
-        let context_id = format!("pyrel{case:03}{}", "0".repeat(53));
-        crate::runtime::register_context(
-            bi,
-            &context_id,
-            "did:dht:z6MkPyReleaseRereadCreator",
-            &[],
-        )
-        .expect("fixture registration");
-        let outcome = super::release_after_close_reread(bi, &context_id, dispatch, reread);
-        let released = !crate::runtime::ffi_state_registry(bi).contains_key(&context_id);
+    /// A `CloseContext` dispatch that fails releases none of the context's
+    /// bridge state, even when the supervisor no longer reports the context
+    /// `Active`.
+    ///
+    /// The context sits in its closing window, and the close is handed an
+    /// `Active` first read, so it dispatches. `ttl::close_context` refuses a
+    /// context that is not `Active`, so the dispatch fails while the
+    /// supervisor reports `Closing`. A close that released on a failed
+    /// dispatch removes the bridge state here and fails this case.
+    #[test]
+    fn close_whose_dispatch_fails_keeps_bridge_state() {
+        let creator = "did:dht:z6MkFailedDispatchCreator";
+        let (scp, handle) = lifecycle_fixture("c1", creator);
+        close_context_behind_the_handle(&scp, &handle, creator);
+        crate::runtime::register_context(&scp.inner, handle.context_id(), creator, &[])
+            .expect("re-register the bridge state the fixture close released");
         assert_eq!(
-            released,
-            outcome.is_ok(),
-            "the release must succeed exactly when it removes the state"
+            crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
+                .expect("state read"),
+            Some(scp_core::context::ContextState::Closing),
+            "the fixture must leave the supervisor reporting Closing"
         );
-        let err = match outcome {
-            Ok(deferred) => deferred.map(|e| e.to_string()),
-            Err(e) => Some(e.to_string()),
-        };
-        (released, err)
+        let sup =
+            std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
+
+        let err = super::close_context_on(
+            &scp.inner,
+            &handle,
+            creator,
+            &sup,
+            Some(&scp_core::context::ContextState::Active),
+        )
+        .expect_err("a close whose dispatch fails must fail");
+        assert!(
+            err.to_string().contains("Supervisor close_context failed"),
+            "close reported: {err}"
+        );
+        assert!(
+            crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+            "a failed dispatch must keep the bridge state"
+        );
+        assert_eq!(handle.state().expect("state"), "active");
     }
 
-    /// A close's release removes this bridge's state only on a re-read that
-    /// permits it, and keeps the state on every other re-read.
-    ///
-    /// After a skipped dispatch, only no actor, `Closed`, `Expired` and
-    /// `Tombstoned` release. After a dispatch, successful or failed, every
-    /// answer but `Active` releases, because a close handler can leave
-    /// `Active` and still fail. A failed re-read releases after a successful
-    /// dispatch only. A failed dispatch's error reaches the caller whether or
-    /// not the state was released.
-    ///
-    /// The `match` below has no wildcard, so a new `ContextState` variant fails
-    /// to compile here until this table states its outcome.
+    /// A close that skips its dispatch refuses, and releases nothing, when the
+    /// supervisor reports the context `Active` on the read after the skip.
     #[test]
-    fn close_release_removes_state_only_on_a_reread_that_permits_it() {
-        use super::CloseDispatch;
-        use scp_core::context::{ContextError, ContextState};
-        crate::init_runtime().ok();
-        let bi = __bi();
-        crate::runtime::init_context_manager_for_test(&bi);
-        let mut case = 0_u32;
+    fn close_keeps_bridge_state_of_a_context_reported_active_after_the_skip() {
+        let creator = "did:dht:z6MkReadmittedCloseCreator";
+        let (scp, handle) = lifecycle_fixture("c2", creator);
+        let sup =
+            std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
 
-        let failed_marker = "dispatch-failed-marker";
-        for dispatch in [
-            CloseDispatch::Skipped,
-            CloseDispatch::Applied,
-            CloseDispatch::Failed(failed_marker.to_owned()),
-        ] {
-            let after_dispatch = dispatch != CloseDispatch::Skipped;
-            let failed = matches!(dispatch, CloseDispatch::Failed(_));
-            // A failed dispatch's message reaches the caller on every path.
-            let check_failed = |err: &Option<String>| {
-                assert!(
-                    !failed || err.as_deref().is_some_and(|e| e.contains(failed_marker)),
-                    "{dispatch:?}: the dispatch's failure must reach the caller, got {err:?}"
-                );
-            };
+        let err = super::close_context_on(&scp.inner, &handle, creator, &sup, None)
+            .expect_err("an Active re-read must fail the close");
+        assert!(
+            err.to_string().contains("returned to Active"),
+            "close reported: {err}"
+        );
+        assert!(
+            crate::runtime::ffi_state_registry(&scp.inner).contains_key(handle.context_id()),
+            "an Active re-read must keep the bridge state"
+        );
+        assert_eq!(handle.state().expect("state"), "active");
+    }
 
-            let (released, err) = run_release_case(&bi, &mut case, dispatch.clone(), Ok(None));
-            assert!(released, "{dispatch:?}: no actor must release");
-            assert_eq!(err.is_some(), failed, "{dispatch:?}/no actor: {err:?}");
-            check_failed(&err);
+    /// `release_context_unless_readmitted` keeps the state of a context the
+    /// supervisor reports `Active`, and removes it for a context no actor
+    /// serves and for one in its closing window.
+    #[test]
+    fn release_unless_readmitted_keeps_only_an_active_context() {
+        let creator = "did:dht:z6MkReleaseUnlessReadmitted";
+        let (scp, active) = lifecycle_fixture("c3", creator);
+        let sup =
+            std::sync::Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
+        let registry = || crate::runtime::ffi_state_registry(&scp.inner);
 
-            for marker in ["reread-busy-ctx", "reread-crashed-ctx"] {
-                let error = if marker == "reread-busy-ctx" {
-                    ContextError::ActorBusy(marker.to_owned())
-                } else {
-                    ContextError::ActorCrashed(marker.to_owned())
-                };
-                let (released, err) = run_release_case(
-                    &bi,
-                    &mut case,
-                    dispatch.clone(),
-                    Err(crate::error::ScpPyError::from(error)),
-                );
-                assert_eq!(
-                    released,
-                    dispatch == CloseDispatch::Applied,
-                    "{dispatch:?}: a failed re-read releases only after a successful dispatch \
-                     ({marker})"
-                );
-                assert!(
-                    released || err.as_deref().is_some_and(|e| e.contains(marker)),
-                    "{dispatch:?}: the re-read's own error must reach the caller, got {err:?}"
-                );
-                check_failed(&err);
-            }
-            for state in [
-                ContextState::Creating,
-                ContextState::Active,
-                ContextState::Closing,
-                ContextState::Closed,
-                ContextState::Expired,
-                ContextState::MigratingOut,
-                ContextState::Tombstoned,
-                ContextState::Poisoned,
-            ] {
-                let (released, err) =
-                    run_release_case(&bi, &mut case, dispatch.clone(), Ok(Some(state.clone())));
-                check_failed(&err);
-                match state {
-                    ContextState::Closed | ContextState::Expired | ContextState::Tombstoned => {
-                        assert!(released, "{dispatch:?}/{state:?} must release");
-                        assert_eq!(err.is_some(), failed, "{dispatch:?}/{state:?}: {err:?}");
-                    }
-                    ContextState::Active => {
-                        assert!(
-                            !released,
-                            "{dispatch:?}: an Active re-read must keep the state"
-                        );
-                        assert!(
-                            failed || err.unwrap_or_default().contains("active again"),
-                            "{dispatch:?}: an Active re-read must report the readmit"
-                        );
-                    }
-                    ContextState::Creating
-                    | ContextState::Closing
-                    | ContextState::MigratingOut
-                    | ContextState::Poisoned => {
-                        assert_eq!(
-                            released, after_dispatch,
-                            "{dispatch:?}/{state:?} releases only after a dispatch: {err:?}"
-                        );
-                        let expected = format!(
-                            "cannot close context in '{}' state",
-                            super::context_state_str(&state)
-                        );
-                        assert!(
-                            if after_dispatch {
-                                err.is_some() == failed
-                            } else {
-                                err.unwrap_or_default().contains(&expected)
-                            },
-                            "{dispatch:?}/{state:?}: a skipped dispatch must name the state"
-                        );
-                    }
-                }
-            }
-        }
+        assert!(
+            !crate::runtime::release_context_unless_readmitted(
+                &scp.inner,
+                &sup,
+                active.context_id()
+            ),
+            "an Active context must not be released"
+        );
+        assert!(registry().contains_key(active.context_id()));
+
+        let absent = format!("c4{}", "0".repeat(56));
+        crate::runtime::register_context(&scp.inner, &absent, creator, &[])
+            .expect("fixture registration");
+        assert!(
+            crate::runtime::release_context_unless_readmitted(&scp.inner, &sup, &absent),
+            "a context no actor serves must be released"
+        );
+        assert!(!registry().contains_key(&absent));
+
+        close_context_behind_the_handle(&scp, &active, creator);
+        crate::runtime::register_context(&scp.inner, active.context_id(), creator, &[])
+            .expect("re-register the bridge state the fixture close released");
+        assert!(
+            crate::runtime::release_context_unless_readmitted(
+                &scp.inner,
+                &sup,
+                active.context_id()
+            ),
+            "a Closing context must be released"
+        );
+        assert!(!registry().contains_key(active.context_id()));
     }
 
     /// A close refuses a context the supervisor holds in the cooperative

@@ -1813,6 +1813,31 @@ pub fn read_live_context_state_on(
         .map_err(ScpPyError::from)
 }
 
+/// Re-reads `context_id`'s lifecycle state on `sup` and removes this bridge's
+/// state for it unless the read reports `Active`.
+///
+/// Returns `false` and removes nothing when the read reports `Active`. On any
+/// other answer, a failed read included, it removes the state and returns
+/// `true`. The read and the removal are two steps, so a readmit that lands
+/// between them loses this bridge's state for the id.
+pub fn release_context_unless_readmitted(
+    bi: &PyBridgeInstance,
+    sup: &Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+) -> bool {
+    match read_live_context_state_on(Arc::clone(sup), context_id) {
+        Ok(Some(scp_core::context::ContextState::Active)) => return false,
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            context_id,
+            error = %e,
+            "lifecycle re-read before a release failed; releasing this bridge's state"
+        ),
+    }
+    remove_context(bi, context_id);
+    true
+}
+
 /// Reads `context_id`'s role state for an authorization decision after its
 /// supervisor actor reports `Active`, and withholds the lifecycle state from
 /// the refusal.
