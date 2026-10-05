@@ -405,8 +405,7 @@ pub struct UniffiBridgeInstance {
     /// `NapiBridgeInstance::outlet_stream_registry` — a per-instance field, NOT a
     /// `static` (`check-no-bridge-globals.sh` / `check-handle-affinity.sh` forbid
     /// the alternative). A stream opened on one instance is invisible to another;
-    /// instance shutdown drops every live stream (and its billing pump `Arc`) via
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`].
+    /// instance shutdown drops every live stream (and its billing pump `Arc`).
     pub(crate) outlet_stream_registry:
         Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
@@ -421,7 +420,7 @@ pub struct UniffiBridgeInstance {
     /// field, NOT a `static` (`check-no-bridge-globals.sh` /
     /// `check-handle-affinity.sh` forbid the alternative). A saga opened on one
     /// instance is invisible to another; instance shutdown drops every live saga
-    /// stream via [`BridgeInstanceCore::bridge_specific_shutdown`].
+    /// stream.
     pub(crate) outlet_streaming_saga_registry:
         Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }

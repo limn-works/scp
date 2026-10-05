@@ -1210,7 +1210,7 @@ pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 /// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
 /// finds `{dir}/scp.db.lock` held by another store, in this process or
 /// another (`scp_platform::PlatformError::StorageLockHeld`). Spec §17.6 "One
-/// Writer per Durable Directory" makes the open fail at once: it does not
+/// Opener per Durable Directory" makes the open fail at once: it does not
 /// wait for the lock and does not fall back to another backend.
 ///
 /// Also returned by an SDK `shutdown` that left the instance's own store

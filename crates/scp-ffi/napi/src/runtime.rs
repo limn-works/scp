@@ -372,8 +372,7 @@ pub struct NapiBridgeInstance {
     /// control-plane handle + detached chunk receiver. Per-instance (never a
     /// `static` — `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a
     /// stream opened on one instance is invisible to another, and instance
-    /// shutdown drops every live stream with the `Arc`. Cleared by
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// shutdown drops every live stream with the `Arc`. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_stream_registry`.
     pub(crate) outlet_stream_registry:
         Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
@@ -388,8 +387,7 @@ pub struct NapiBridgeInstance {
     /// invoker DID, and `request_id`. Per-instance (never a `static` —
     /// `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a saga opened
     /// on one instance is invisible to another, and instance shutdown drops every
-    /// live saga stream with the `Arc`. Cleared by
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// live saga stream with the `Arc`. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_streaming_saga_registry`.
     pub(crate) outlet_streaming_saga_registry:
         Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
