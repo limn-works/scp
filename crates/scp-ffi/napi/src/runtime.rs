@@ -1822,9 +1822,8 @@ pub fn ensure_registered(
 ///
 /// The mark goes in before the entry comes out; [`ensure_registered`] reads the
 /// mark while it holds the entry's shard lock, so no rebuild lands after this
-/// call returns. When no live [`NapiContextHandle`] for the id remains, no
-/// call can reach [`ensure_registered`] for it, so this call drops the mark
-/// again.
+/// call returns. When no live [`NapiContextHandle`] for the id remains, this
+/// call drops the mark again.
 pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
     bi.released_contexts.insert(context_id.to_owned(), ());
     remove_context_while_released(bi, context_id);
@@ -1832,23 +1831,24 @@ pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
 }
 
 /// Removes `context_id`'s [`UcanContextState`] and its known-context entry,
-/// only while the release mark stands.
+/// only while the release mark stands, and returns whether the mark stood.
 ///
 /// The mark check and both removals run under the registry entry's shard lock,
 /// which [`readmit_context`] also takes, so a readmit that clears the mark
-/// first leaves the readmitted context's state in place, and a readmit that
-/// comes second finds the state already gone.
-pub(crate) fn remove_context_while_released(bi: &NapiBridgeInstance, context_id: &str) {
+/// first leaves the readmitted context's state in place and this returns
+/// `false`, and a readmit that comes second finds the state already gone.
+pub(crate) fn remove_context_while_released(bi: &NapiBridgeInstance, context_id: &str) -> bool {
     use dashmap::mapref::entry::Entry;
 
     let entry = ucan_registry(bi).entry(context_id.to_owned());
     if !bi.released_contexts.contains_key(context_id) {
-        return;
+        return false;
     }
     if let Entry::Occupied(occupied) = entry {
         occupied.remove();
     }
     bi.core.remove_known_context(context_id);
+    true
 }
 
 /// Clears the release mark [`release_context`] left for `context_id`, so the
@@ -1871,9 +1871,11 @@ pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
 /// can return to `Active`, and be readmitted, in between. When the re-read,
 /// taken after the mark went in, reports `Active`, this clears the mark,
 /// removes nothing, and returns `false`, so the readmitted context keeps its
-/// revocation list, nonce tracker, outlets, and sessions. Any other answer, a failed read included, removes the state
-/// while the mark stands and returns `true`; the mark then lasts while a live
-/// [`NapiContextHandle`] for the id does.
+/// revocation list, nonce tracker, outlets, and sessions. On any other
+/// answer, a failed read included, it removes the state while the mark stands
+/// and returns `true`; the mark then lasts while a live [`NapiContextHandle`]
+/// for the id does. When a readmit clears the mark between the re-read and
+/// the removal, it removes nothing and returns `false`.
 pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_id: &str) -> bool {
     bi.released_contexts.insert(context_id.to_owned(), ());
     if matches!(
@@ -1883,7 +1885,9 @@ pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_
         readmit_context(bi, context_id);
         return false;
     }
-    remove_context_while_released(bi, context_id);
+    if !remove_context_while_released(bi, context_id) {
+        return false;
+    }
     prune_release_mark(bi, context_id);
     true
 }
@@ -1899,9 +1903,8 @@ pub(crate) fn track_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
 /// Counts one fewer live [`NapiContextHandle`] for `context_id`, and drops the
 /// id's release mark when the count reaches zero.
 ///
-/// [`ensure_registered`] runs only on a handle, so a mark for an id no live
-/// handle names refuses nothing; dropping it keeps `released_contexts` from
-/// growing by one entry for every context this instance ever closed. A count
+/// Dropping it keeps `released_contexts` from growing by one entry for every
+/// context this instance ever closed. A count
 /// this instance does not hold (after a shutdown cleared the counts) changes
 /// nothing.
 pub(crate) fn untrack_context_handle(bi: &NapiBridgeInstance, context_id: &str) {

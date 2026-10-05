@@ -1487,13 +1487,9 @@ pub(crate) async fn context_join_from_welcome_on(
     crate::runtime::readmit_context(bi, &sealed.context_id);
 
     // BLACK-2JF-01, post-irreversible-commit compensation: the presence probe
-    // below misses only when a concurrent close removed the bridge
-    // state this join registered while the spawn ran or after it returned. A
-    // close on an older handle for the same context id reads no actor while
-    // the spawn runs, so `context_close_on` skips the dispatch and releases
-    // that state. A close does not despawn the actor, so returning
-    // without a teardown would strand a live actor behind a handle with no
-    // bridge state. `discard_joined_context` removes the actor handle, destroys
+    // below misses when the bridge state this join registered is gone.
+    // Returning without a teardown would strand a live actor behind a handle
+    // with no bridge state. `discard_joined_context` removes the actor handle, destroys
     // the resident MLS group, and deletes the durable snapshot the join
     // persisted; a bare `despawn_actor` would leave the group and the snapshot
     // behind, so a restart would restore the context and a fresh re-join would
@@ -6286,8 +6282,9 @@ mod tests {
     }
 
     /// A readmit that clears the release mark before the close's removal takes
-    /// the registry shard lock leaves the readmitted context's state in place;
-    /// while the mark stands, the removal takes the state.
+    /// the registry shard lock leaves the readmitted context's state in place
+    /// and the removal returns `false`; while the mark stands, the removal
+    /// takes the state and returns `true`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_removal_skips_state_a_readmit_already_claimed() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6303,7 +6300,10 @@ mod tests {
 
         bi.released_contexts.insert(ctx_id.clone(), ());
         crate::runtime::readmit_context(&bi, &ctx_id);
-        crate::runtime::remove_context_while_released(&bi, &ctx_id);
+        assert!(
+            !crate::runtime::remove_context_while_released(&bi, &ctx_id),
+            "a removal a readmit pre-empted must report that it removed nothing"
+        );
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |rt| {
                 Ok(rt.core.revocation_list.is_revoked("revoked-after-readmit"))
@@ -6313,7 +6313,10 @@ mod tests {
         );
 
         bi.released_contexts.insert(ctx_id.clone(), ());
-        crate::runtime::remove_context_while_released(&bi, &ctx_id);
+        assert!(
+            crate::runtime::remove_context_while_released(&bi, &ctx_id),
+            "a removal while the mark stands must report that it removed"
+        );
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
             "the removal must take the state while the mark stands"
