@@ -21465,7 +21465,7 @@ mod tests {
 
     /// `ensure_ucan_registered_while_active` builds UCAN state for a context
     /// the supervisor reports `Active`, and builds none for an id no actor
-    /// serves, which is what an evicted release mark leaves behind.
+    /// serves or for a closed context whose release mark is gone.
     #[test]
     #[cfg(feature = "testing")]
     fn ensure_while_active_builds_only_for_an_active_context() {
@@ -21502,6 +21502,32 @@ mod tests {
         assert!(
             !has_release_mark(&scp.inner, &absent),
             "the id carries no mark, so only the supervisor read refused it"
+        );
+
+        let closed_handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), closable_test_params()))
+            .expect("context_create should succeed");
+        let closed = closed_handle.context_id();
+        rt.block_on(scp.context_close(Arc::clone(&closed_handle), Arc::clone(&identity)))
+            .expect("close of an Active context must succeed");
+        let closed_state = rt
+            .block_on(scp.inner.read_live_context_state(&closed))
+            .expect("the read of a closed context must succeed");
+        assert!(
+            closed_state.is_some() && closed_state != Some(scp_core::context::ContextState::Active),
+            "the closed context's actor must stay resident in a non-Active state, got {closed_state:?}"
+        );
+        scp.inner.readmit_context(&closed);
+        scp.inner.remove_ucan_state(&closed);
+        assert!(!has_release_mark(&scp.inner, &closed));
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active(&closed, &identity.did(), &[]),
+        )
+        .expect("the read of a closed context must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&closed, |_| ()).is_none(),
+            "a closed context whose mark is gone must not get UCAN state"
         );
     }
 
