@@ -16972,7 +16972,7 @@ impl Scp {
         // and count `identity_did` among its members before a server starts.
         // The lifecycle gate withholds every answer about the context and
         // returns the role state the membership check reads. With no
-        // supervisor attached the server starts and serves no context.
+        // supervisor attached the server starts.
         if self.inner.core.try_supervisor().is_some() {
             let gate_bi = Arc::clone(&self.inner);
             let gate_ids = config.context_ids.clone();
