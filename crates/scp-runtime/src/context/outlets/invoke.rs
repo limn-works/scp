@@ -5750,6 +5750,17 @@ pub(crate) async fn invoke_outlet_cross_context<E>(
 where
     E: OutletExecutor + ?Sized + 'static,
 {
+    // Taken first, so an open refused by shutdown has reserved nothing, and the
+    // bridge task below spawns through it without a second refusal point after
+    // B's stream is open (ADR-049 Decision 16, item 2). The refusal reaches the
+    // caller as the same-context open's `SupervisorShutDown` rejection does.
+    let spawner = supervisor
+        .tracked_spawner("open cross-context outlet stream")
+        .map_err(|_refused| {
+            crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown
+                .to_invocation_error()
+        })?;
+
     // Look up the registration in B's registry: the economy gate reads its
     // `cost`, and the pinned verification descriptor + schemas are sourced from
     // it BEFORE the stream opens (never from delivery-time chunk input).
@@ -5848,9 +5859,7 @@ where
     // sender, the PINNED descriptor, the schemas, and A's event-log provider.
     // The task holds no Supervisor reference, but it writes A's event log, so it
     // spawns on the Supervisor's tracker and shutdown waits for that write
-    // before the owner closes storage (ADR-049 Decision 16, step 5). A refusal
-    // means shutdown has begun: the future drops unrun, which closes B's
-    // receiver, and the caller gets a typed error.
+    // before the owner closes storage (ADR-049 Decision 16, step 5).
     let bridge = run_cross_context_bridge(
         inner_rx,
         outer_tx,
@@ -5868,11 +5877,7 @@ where
         MAX_CROSS_CONTEXT_STREAM_CHUNKS,
         None,
     );
-    supervisor
-        .spawn_tracked("spawn cross-context bridge task", bridge)
-        .map_err(|refused| InvocationError::ExecutionFailed {
-            message: refused.to_string(),
-        })?;
+    spawner.spawn(bridge);
 
     Ok(outer_rx)
 }
@@ -9153,6 +9158,127 @@ mod tests {
             )
             .await;
             assert_terminal_error(received.last().unwrap(), CODE_AUTHORIZATION_DENIED);
+        }
+
+        // ---- ADR-049 Decision 16, item 2: a shutdown refusal is typed.
+
+        /// Builds the `OpenStreamParams` + incoming open for a cross-context
+        /// call that the gate tests below refuse before any stream opens.
+        fn shutdown_gate_inputs() -> (
+            crate::context::outlets::dispatch::OpenStreamParams,
+            OutletStreamOpen,
+        ) {
+            let operator = operator_key();
+            let params = crate::context::outlets::dispatch::OpenStreamParams {
+                identity: crate::context::outlets::stream::StreamIdentity {
+                    context_id: B_CTX.to_owned(),
+                    outlet_id: OUTLET.to_owned(),
+                    stream_epoch: 1,
+                    caveats_binding: CB,
+                },
+                caps: crate::context::outlets::stream::AdmissionCaps {
+                    per_invoker: 10,
+                    per_origin_invoker: 10,
+                    per_outlet: 10,
+                },
+                invoker_did: INVOKER.to_owned(),
+                origin_invoker_did: INVOKER.to_owned(),
+                cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
+                available_balance: scp_protocol::economy::types::Amount::new(0),
+                reserved_escrow: scp_protocol::economy::types::Amount::new(0),
+                declared_estimated_chunk_count: Some(1),
+                credit_window: 8,
+                caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
+                invoker_pk: operator.verifying_key(),
+                operator_signer: Arc::new(InProcessStreamSigner::new(operator)),
+                stream_credit_stall_secs: 999,
+                stream_cancel_ack_secs: 999,
+                stream_ucan_recheck_secs: 999,
+                ucan_cid: "bafy-shutdown-gate".to_owned(),
+                request_id: RID,
+                revocation_checker: Arc::new(
+                    scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+                ),
+                economic_policy_snapshot: None,
+            };
+            let incoming = OutletStreamOpen {
+                request_id: RID,
+                outlet_id: OUTLET.to_owned(),
+                input: serde_json::json!({}),
+                invoker_did: DID::from(INVOKER),
+                ucan: vec![0x01],
+                caveats_binding: CB,
+                chain_depth: 1,
+                credit_window: 8,
+                estimated_chunk_count: 1,
+                session_id: None,
+                timeout_ms: 1000,
+            };
+            (params, incoming)
+        }
+
+        /// Runs `invoke_outlet_cross_context` against an EMPTY registry, with
+        /// the Supervisor's spawn gate closed or open.
+        async fn cross_context_with_gate(
+            gate_closed: bool,
+        ) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError> {
+            let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+                INVOKER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let supervisor = crate::context::test_supervisor(
+                crypto,
+                Box::new(crate::context::builder::NotConfiguredTransportProvider),
+                Box::new(MerkleEventLogProvider::new()),
+                Arc::new(|_, _| None),
+            );
+            if gate_closed {
+                supervisor.close_spawn_gate();
+            }
+            let (a_log, _a_bytes) = fresh_a_log().await;
+            let (params, incoming) = shutdown_gate_inputs();
+            invoke_outlet_cross_context::<NoopExecutor>(
+                &supervisor,
+                a_log,
+                A_CTX,
+                B_CTX,
+                &OutletRegistry::new(),
+                &OUTLET.to_owned(),
+                serde_json::json!({}),
+                &DID::from(INVOKER),
+                None,
+                Arc::new(NoopExecutor),
+                &incoming,
+                None,
+                params,
+            )
+            .await
+        }
+
+        /// Once shutdown has begun, a cross-context open is refused before the
+        /// registry lookup with the same non-retryable `ContextNotActive`
+        /// surface the same-context open's `SupervisorShutDown` rejection maps
+        /// to, never `ExecutionFailed` (the handler-panic surface).
+        #[tokio::test]
+        async fn closed_spawn_gate_refuses_cross_context_open_as_context_not_active() {
+            let result = cross_context_with_gate(true).await;
+            match result {
+                Err(InvocationError::ContextNotActive { current_state }) => {
+                    assert_eq!(current_state, "supervisor shut down");
+                }
+                other => panic!("expected ContextNotActive, got {other:?}"),
+            }
+        }
+
+        /// With the spawn gate open the shutdown check passes, and the same
+        /// call reaches the registry lookup, which rejects the unknown outlet.
+        #[tokio::test]
+        async fn open_spawn_gate_passes_shutdown_check_to_registry_lookup() {
+            let result = cross_context_with_gate(false).await;
+            assert!(
+                matches!(result, Err(InvocationError::OutletNotFound { .. })),
+                "an open gate must not refuse the open; got {result:?}"
+            );
         }
 
         // ---- AC12: zero-escrow economy gate.

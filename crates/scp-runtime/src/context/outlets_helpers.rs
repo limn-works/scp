@@ -3062,6 +3062,10 @@ pub fn reserve_error_to_open_rejection(
                 slug: error_codes::SLUG_AUTHORIZATION_DENIED.to_owned(),
             }
         }
+        // Shutdown has begun (ADR-049 Decision 16, item 2): no later open on this
+        // Supervisor succeeds, so it takes the non-retryable shutdown rejection,
+        // never the retryable transport slug below.
+        ContextError::SupervisorShutDown(_) => OpenStreamRejection::SupervisorShutDown,
         // A persist failure / mailbox fault / any other reserve error is GENUINELY
         // transient — keep it on the retryable transport-fault path.
         _ => OpenStreamRejection::AdmissionRateLimited {
@@ -3726,6 +3730,16 @@ mod tests {
             assert!(
                 matches!(other, OpenStreamRejection::AdmissionRateLimited { .. }),
                 "{other:?}"
+            );
+
+            // A shutdown refusal is permanent → the non-retryable shutdown
+            // rejection, not the retryable transport slug.
+            let shut = super::super::reserve_error_to_open_rejection(
+                &ContextError::SupervisorShutDown("reserve refused".to_owned()),
+            );
+            assert!(
+                matches!(shut, OpenStreamRejection::SupervisorShutDown),
+                "{shut:?}"
             );
         }
 
