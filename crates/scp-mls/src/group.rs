@@ -62,7 +62,8 @@ pub const SCP_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128
 ///
 /// The serialized signer and the extracted seed `Vec` are zeroized (buffers the
 /// encoder outgrew are wiped by the global allocator, security model spec §9.15,
-/// freed heap memory), and the returned seed rides home in
+/// freed heap memory, and by nothing in an application that links this crate
+/// without `scp-alloc`), and the returned seed rides home in
 /// [`Zeroizing`](zeroize::Zeroizing). Fails closed if the seed is not exactly
 /// 32 bytes, so a non-Ed25519 or malformed signer can never be silently
 /// truncated into a derivation.
