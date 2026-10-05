@@ -128,19 +128,40 @@ pub enum SelfHostError {
 /// tasks to exit.
 pub const SELF_HOST_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Drains `supervisor` (ADR-049 Decision 16) and reports whether every
-/// tracked task exited within [`SELF_HOST_DRAIN_DEADLINE`].
-async fn drained_within_deadline(supervisor: &scp_core::context::supervisor::Supervisor) -> bool {
-    tokio::time::timeout(SELF_HOST_DRAIN_DEADLINE, supervisor.shutdown_all_contexts())
-        .await
-        .is_ok()
+/// Drains `supervisor` (ADR-049 Decision 16) on a detached task and reports
+/// whether that drain finished within [`SELF_HOST_DRAIN_DEADLINE`].
+async fn drained_within_deadline(
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+) -> bool {
+    let supervisor = Arc::clone(supervisor);
+    finished_within(SELF_HOST_DRAIN_DEADLINE, async move {
+        supervisor.shutdown_all_contexts().await;
+    })
+    .await
+}
+
+/// Runs `drain` on a detached task and reports whether it finished within
+/// `deadline`. The deadline bounds only the wait: a drain that misses it keeps
+/// running to completion. A drain that panics counts as unfinished.
+async fn finished_within(
+    deadline: Duration,
+    drain: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    match tokio::time::timeout(deadline, tokio::spawn(drain)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(join_error)) => {
+            tracing::error!(error = %join_error, "self-host Supervisor drain panicked");
+            false
+        }
+        Err(_elapsed) => false,
+    }
 }
 
 /// Drains `supervisor` on a path failing with `cause`. Returns `cause` when
 /// the drain finishes, and [`SelfHostError::DrainTimedOut`] carrying it when
 /// the drain does not.
 async fn drain_after_failure(
-    supervisor: &scp_core::context::supervisor::Supervisor,
+    supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
     cause: SelfHostError,
 ) -> SelfHostError {
     if drained_within_deadline(supervisor).await {
@@ -475,10 +496,9 @@ impl SelfHostDeployer {
         })
     }
 
-    /// Drains the deployer's Supervisor: stops its context and key-package
-    /// actors, refuses further spawns, and waits up to
-    /// [`SELF_HOST_DRAIN_DEADLINE`] for every tracked task to exit (ADR-049
-    /// Decision 16). The owner calls this before it closes the storage the
+    /// Drains the deployer's Supervisor (ADR-049 Decision 16) on a detached
+    /// task and waits up to [`SELF_HOST_DRAIN_DEADLINE`] for that drain to
+    /// finish; a drain that misses the deadline keeps running. The owner calls this before it closes the storage the
     /// deployer's `DurableProviders` wrap. Every later [`deploy`] fails,
     /// because the Supervisor serves no context.
     ///
@@ -2743,6 +2763,36 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A drain that misses the deadline reports unfinished and still runs to
+    /// completion: the deadline bounds the wait, never the drain itself.
+    #[tokio::test]
+    async fn drain_past_deadline_reports_unfinished_and_still_completes() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let finished = finished_within(Duration::from_millis(20), async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = done_tx.send(());
+        })
+        .await;
+        assert!(!finished, "a drain slower than the deadline is unfinished");
+        tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("the drain must keep running past the deadline")
+            .expect("the drain must run to completion, not be dropped");
+    }
+
+    /// A drain that ends within the deadline reports finished, and a drain
+    /// that panics reports unfinished.
+    #[tokio::test]
+    async fn drain_within_deadline_reports_finished_and_panic_unfinished() {
+        assert!(finished_within(Duration::from_secs(5), async {}).await);
+        assert!(
+            !finished_within(Duration::from_secs(5), async {
+                panic!("drain panicked");
+            })
+            .await
+        );
+    }
 
     /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
     /// detects a missing pre-rotation backend by pattern, and the same pattern
