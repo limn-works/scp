@@ -5357,6 +5357,7 @@ mod sdk_shutdown_tests {
         let err = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
             aborted_tasks: 0,
             panicked_tasks: 0,
+            drain: scp_ffi_common::bridge_instance::DrainState::Panicked,
             durable_store_open: true,
         }))
         .err()

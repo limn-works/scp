@@ -318,7 +318,9 @@ failed to open — a wrong `SQLCipher` key or passphrase, an unwritable director
 corrupt file, or a salt-sidecar fail-closed condition. At open, `8005` reports that another
 store, in this process or another, holds the directory's advisory lock. An SDK `shutdown` raises `8005` when it
 leaves the instance's own store holding its lock: the Supervisor drain did not finish
-or panicked (`ShutdownOutcome::TimedOut` with `durable_store_open`), the store refused to close
+(`ShutdownOutcome::TimedOut` with `drain` set to `DrainState::Running` and `durable_store_open`),
+the drain task panicked or was cancelled (`ShutdownOutcome::TimedOut` with `drain` set to
+`DrainState::Panicked` or `DrainState::Cancelled`, and `durable_store_open`), the store refused to close
 (`ShutdownError::DurableStoreClose`), or an earlier shutdown had not closed it by the
 time this call's timeout passed (`ShutdownError::AlreadyShutDown` with
 `durable_store_open`) (ADR-048 §5, amendment 2026-10-04). The `PyO3`, NAPI and `UniFFI` bridges all raise

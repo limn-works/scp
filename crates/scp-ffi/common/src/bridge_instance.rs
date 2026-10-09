@@ -2731,7 +2731,7 @@ impl CoreFields {
         // `timeout` below reads. A wall-clock `elapsed` here would disagree
         // with those timeouts whenever the runtime clock is paused.
         let start = tokio::time::Instant::now();
-        let outcome = drain_under_deadline(&self.tasks, timeout, start).await;
+        let outcome = drain_under_deadline(&self.tasks, timeout).await;
 
         // Run the sync cleanup side effects inside the remaining budget so
         // callers get a true end-to-end deadline on shutdown (including the
@@ -2746,16 +2746,7 @@ impl CoreFields {
         let drain = self
             .run_shutdown_side_effects(remaining, store_closer)
             .await;
-        let elapsed = start.elapsed();
-        combine_shutdown_outcome(outcome, drain, has_durable_store).map(|outcome| match outcome {
-            ShutdownOutcome::GracefulWithin { panicked_tasks, .. } => {
-                ShutdownOutcome::GracefulWithin {
-                    elapsed,
-                    panicked_tasks,
-                }
-            }
-            timed_out @ ShutdownOutcome::TimedOut { .. } => timed_out,
-        })
+        combine_shutdown_outcome(outcome, drain, has_durable_store, start.elapsed())
     }
 
     /// Cleanup body of the async [`shutdown_core_async`](Self::shutdown_core_async)
@@ -3059,39 +3050,41 @@ fn close_durable_store(
 /// [`ShutdownOutcome::GracefulWithin`] requires both the bridge's own tasks
 /// and the Supervisor's tracked tasks to have finished in time. A drain that
 /// did not finish turns the outcome into [`ShutdownOutcome::TimedOut`]; its
-/// `aborted_tasks` still counts only the bridge tasks aborted, because no
-/// tracked task is ever aborted. `durable_store_open` is true only when the
-/// drain did not finish and the instance has a durable store, which then
-/// stayed open.
+/// `aborted_tasks` and `panicked_tasks` count only bridge tasks, because no
+/// tracked task is ever aborted and a drain panic is reported in `drain`.
+/// `durable_store_open` is true only when the drain did not finish and the
+/// instance has a durable store, which then stayed open.
 fn combine_shutdown_outcome(
-    outcome: ShutdownOutcome,
+    bridge: BridgeTasksDrain,
     drain: SupervisorDrain,
     has_durable_store: bool,
+    elapsed: Duration,
 ) -> Result<ShutdownOutcome, ShutdownError> {
-    let drain_panics = usize::from(matches!(
-        drain,
-        SupervisorDrain::Failed(JoinFailure::Panicked)
-    ));
-    match drain {
-        SupervisorDrain::Finished(Err(e)) => Err(ShutdownError::DurableStoreClose(e)),
-        SupervisorDrain::Finished(Ok(())) => Ok(outcome),
-        SupervisorDrain::Pending | SupervisorDrain::Failed(_) => Ok(match outcome {
-            ShutdownOutcome::GracefulWithin { panicked_tasks, .. } => ShutdownOutcome::TimedOut {
-                aborted_tasks: 0,
-                panicked_tasks: panicked_tasks + drain_panics,
-                durable_store_open: has_durable_store,
-            },
-            ShutdownOutcome::TimedOut {
-                aborted_tasks,
-                panicked_tasks,
-                ..
-            } => ShutdownOutcome::TimedOut {
-                aborted_tasks,
-                panicked_tasks: panicked_tasks + drain_panics,
-                durable_store_open: has_durable_store,
-            },
-        }),
-    }
+    let (aborted_tasks, panicked_tasks) = match bridge {
+        BridgeTasksDrain::Finished { panicked } => (None, panicked),
+        BridgeTasksDrain::TimedOut { aborted, panicked } => (Some(aborted), panicked),
+    };
+    let (drain, durable_store_open) = match drain {
+        SupervisorDrain::Finished(Err(e)) => return Err(ShutdownError::DurableStoreClose(e)),
+        SupervisorDrain::Finished(Ok(())) => (DrainState::Finished, false),
+        SupervisorDrain::Pending => (DrainState::Running, has_durable_store),
+        SupervisorDrain::Failed(JoinFailure::Panicked) => (DrainState::Panicked, has_durable_store),
+        SupervisorDrain::Failed(JoinFailure::Cancelled) => {
+            (DrainState::Cancelled, has_durable_store)
+        }
+    };
+    Ok(match (aborted_tasks, drain) {
+        (None, DrainState::Finished) => ShutdownOutcome::GracefulWithin {
+            elapsed,
+            panicked_tasks,
+        },
+        (aborted_tasks, drain) => ShutdownOutcome::TimedOut {
+            aborted_tasks: aborted_tasks.unwrap_or(0),
+            panicked_tasks,
+            drain,
+            durable_store_open,
+        },
+    })
 }
 
 /// Reduces a [`BridgeInstanceCore::shutdown`] result to what an SDK
@@ -3138,11 +3131,21 @@ pub fn sdk_shutdown_result(result: Result<ShutdownOutcome, ShutdownError>) -> Re
     }
 }
 
+/// How the bridge's own `JoinSet` drain ended.
+#[derive(Debug, Clone, Copy)]
+enum BridgeTasksDrain {
+    /// Every task finished before the deadline; `panicked` of them panicked.
+    Finished { panicked: usize },
+    /// The deadline passed: `aborted` tasks were aborted and `panicked`
+    /// panicked, on the drain or on the abort path.
+    TimedOut { aborted: usize, panicked: usize },
+}
+
 /// Locks the `JoinSet` long enough to drain outstanding tasks with a
-/// deadline. On graceful drain, returns [`ShutdownOutcome::GracefulWithin`]
-/// with the elapsed time since `start` and the count of tasks that
-/// panicked. On timeout, aborts the remaining tasks, counts both
-/// aborted and panicked tasks, and returns [`ShutdownOutcome::TimedOut`].
+/// deadline. On graceful drain, returns [`BridgeTasksDrain::Finished`] with
+/// the count of tasks that panicked. On timeout, aborts the remaining tasks,
+/// counts both aborted and panicked tasks, and returns
+/// [`BridgeTasksDrain::TimedOut`].
 ///
 /// The helper exists so the lock guard's scope is obvious and clippy's
 /// `significant_drop_tightening` check is satisfied (the guard cannot be
@@ -3152,8 +3155,7 @@ pub fn sdk_shutdown_result(result: Result<ShutdownOutcome, ShutdownError>) -> Re
 async fn drain_under_deadline(
     tasks: &AsyncMutex<JoinSet<()>>,
     timeout: Duration,
-    start: tokio::time::Instant,
-) -> ShutdownOutcome {
+) -> BridgeTasksDrain {
     // The `JoinSet` lock is held for the full drain — `abort_all` +
     // `join_next` below all need exclusive access to the same set.
     // Clippy's `significant_drop_tightening` flags the wide scope, but
@@ -3165,20 +3167,16 @@ async fn drain_under_deadline(
         .await
         .is_ok()
     {
-        return ShutdownOutcome::GracefulWithin {
-            elapsed: start.elapsed(),
-            panicked_tasks: panicked,
-        };
+        return BridgeTasksDrain::Finished { panicked };
     }
     // Deadline expired: abort remaining tasks and count how many we cut
     // versus how many panicked on the abort path. `abort_all` is a no-op
     // for finished tasks.
     guard.abort_all();
     let (aborted, abort_panicked) = count_and_drain_aborted(&mut guard).await;
-    ShutdownOutcome::TimedOut {
-        aborted_tasks: aborted,
-        panicked_tasks: panicked + abort_panicked,
-        durable_store_open: false,
+    BridgeTasksDrain::TimedOut {
+        aborted,
+        panicked: panicked + abort_panicked,
     }
 }
 
@@ -3571,7 +3569,7 @@ pub enum ShutdownOutcome {
     },
     /// The deadline expired before the bridge's own tasks or the
     /// Supervisor's tracked tasks finished, or the Supervisor drain task
-    /// panicked or was cancelled.
+    /// panicked or was cancelled; `drain` says which.
     TimedOut {
         /// Number of the bridge's own `JoinSet` tasks that were aborted
         /// because the shutdown deadline was reached (tasks that had already
@@ -3579,13 +3577,32 @@ pub enum ShutdownOutcome {
         /// tasks are never aborted, so they never count here.
         aborted_tasks: usize,
         /// Number of the bridge's own `JoinSet` tasks that panicked during
-        /// the drain, plus one when the Supervisor drain task panicked.
+        /// the drain. A Supervisor drain panic is reported in `drain`, not
+        /// here.
         panicked_tasks: usize,
+        /// How the Supervisor drain stood when the shutdown returned.
+        drain: DrainState,
         /// True when the Supervisor drain did not finish and the instance has
         /// a durable store: the store was not closed and keeps its advisory
         /// lock.
         durable_store_open: bool,
     },
+}
+
+/// How the Supervisor drain stood when a [`ShutdownOutcome::TimedOut`]
+/// shutdown returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainState {
+    /// Every tracked task exited before the deadline and the durable store
+    /// close ran; only the bridge's own `JoinSet` missed the deadline.
+    Finished,
+    /// The deadline passed first. The drain keeps running detached and
+    /// closes the durable store when the last tracked task exits.
+    Running,
+    /// The drain task panicked. No task closes the durable store.
+    Panicked,
+    /// The drain task was cancelled. No task closes the durable store.
+    Cancelled,
 }
 
 /// Error produced by [`CoreFields::shutdown_core_async`].
@@ -5469,6 +5486,7 @@ mod tests {
             aborted_tasks,
             panicked_tasks,
             durable_store_open,
+            ..
         } = outcome
         else {
             unreachable!("expected TimedOut, got {outcome:?}");
@@ -5853,11 +5871,13 @@ mod tests {
             matches!(
                 outcome,
                 ShutdownOutcome::TimedOut {
+                    drain: DrainState::Running,
                     durable_store_open: true,
                     ..
                 }
             ),
-            "a wedged drain must report TimedOut with the store open, got {outcome:?}"
+            "a wedged drain must report TimedOut with the drain running and the store open, \
+             got {outcome:?}"
         );
         assert!(
             sdk_shutdown_result(Ok(outcome)).is_err(),
@@ -6183,6 +6203,7 @@ mod tests {
         let timed_out_store_closed = ShutdownOutcome::TimedOut {
             aborted_tasks: 1,
             panicked_tasks: 0,
+            drain: DrainState::Finished,
             durable_store_open: false,
         };
         assert_eq!(sdk_shutdown_result(Ok(timed_out_store_closed)), Ok(()));
@@ -6201,6 +6222,7 @@ mod tests {
         let timed_out_store_open = ShutdownOutcome::TimedOut {
             aborted_tasks: 0,
             panicked_tasks: 0,
+            drain: DrainState::Running,
             durable_store_open: true,
         };
         let msg = sdk_shutdown_result(Ok(timed_out_store_open)).unwrap_err();
@@ -6217,23 +6239,31 @@ mod tests {
 
     /// `durable_store_open` is set only when the drain did not finish and the
     /// instance has a durable store; a finished drain closes the store even
-    /// when the bridge's own tasks timed out.
+    /// when the bridge's own tasks timed out. `drain` tells a drain still
+    /// running past the deadline apart from a panicked or cancelled one, and
+    /// a drain panic never counts in `panicked_tasks`.
     #[test]
-    fn combine_shutdown_outcome_marks_the_store_open_only_for_an_unfinished_drain() {
-        let graceful = || ShutdownOutcome::GracefulWithin {
-            elapsed: Duration::ZERO,
-            panicked_tasks: 0,
+    fn combine_shutdown_outcome_reports_the_drain_state_apart_from_bridge_tasks() {
+        let graceful = || BridgeTasksDrain::Finished { panicked: 1 };
+        let bridge_timed_out = || BridgeTasksDrain::TimedOut {
+            aborted: 2,
+            panicked: 0,
         };
-        let bridge_timed_out = || ShutdownOutcome::TimedOut {
-            aborted_tasks: 2,
-            panicked_tasks: 0,
-            durable_store_open: false,
-        };
+        let elapsed = Duration::from_millis(7);
         assert_eq!(
-            combine_shutdown_outcome(graceful(), SupervisorDrain::Pending, true).unwrap(),
+            combine_shutdown_outcome(graceful(), SupervisorDrain::Finished(Ok(())), true, elapsed)
+                .unwrap(),
+            ShutdownOutcome::GracefulWithin {
+                elapsed,
+                panicked_tasks: 1,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(graceful(), SupervisorDrain::Pending, true, elapsed).unwrap(),
             ShutdownOutcome::TimedOut {
                 aborted_tasks: 0,
-                panicked_tasks: 0,
+                panicked_tasks: 1,
+                drain: DrainState::Running,
                 durable_store_open: true,
             }
         );
@@ -6241,41 +6271,57 @@ mod tests {
             combine_shutdown_outcome(
                 graceful(),
                 SupervisorDrain::Failed(JoinFailure::Panicked),
-                true
+                true,
+                elapsed,
             )
             .unwrap(),
             ShutdownOutcome::TimedOut {
                 aborted_tasks: 0,
                 panicked_tasks: 1,
+                drain: DrainState::Panicked,
                 durable_store_open: true,
-            }
+            },
+            "a drain panic is reported in `drain` and not added to the bridge's panicked tasks"
         );
         assert_eq!(
             combine_shutdown_outcome(
                 graceful(),
                 SupervisorDrain::Failed(JoinFailure::Cancelled),
-                true
+                false,
+                elapsed,
             )
             .unwrap(),
             ShutdownOutcome::TimedOut {
                 aborted_tasks: 0,
-                panicked_tasks: 0,
-                durable_store_open: true,
-            },
-            "a cancelled drain is not counted as a panicked task"
-        );
-        assert_eq!(
-            combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Pending, false).unwrap(),
-            ShutdownOutcome::TimedOut {
-                aborted_tasks: 2,
-                panicked_tasks: 0,
+                panicked_tasks: 1,
+                drain: DrainState::Cancelled,
                 durable_store_open: false,
             }
         );
         assert_eq!(
-            combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Finished(Ok(())), true)
+            combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Pending, false, elapsed)
                 .unwrap(),
-            bridge_timed_out()
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 2,
+                panicked_tasks: 0,
+                drain: DrainState::Running,
+                durable_store_open: false,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(
+                bridge_timed_out(),
+                SupervisorDrain::Finished(Ok(())),
+                true,
+                elapsed,
+            )
+            .unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 2,
+                panicked_tasks: 0,
+                drain: DrainState::Finished,
+                durable_store_open: false,
+            }
         );
         assert!(matches!(
             combine_shutdown_outcome(
@@ -6284,6 +6330,7 @@ mod tests {
                     "close refused".to_owned()
                 ))),
                 true,
+                elapsed,
             ),
             Err(ShutdownError::DurableStoreClose(_))
         ));
