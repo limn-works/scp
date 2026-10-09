@@ -21999,6 +21999,7 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn restore_readmits_the_ids_it_restores() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
         let rt = runtime();
         // `restore_context` reads the snapshot the persistence provider holds;
         // only the Sqlite backend attaches one.
@@ -22054,6 +22055,20 @@ mod tests {
         assert!(
             !has_release_mark(&scp.inner, &all),
             "restore_all_contexts must clear the release mark"
+        );
+
+        // The restored actors run on the process-wide runtime, which no exit
+        // path drops, and write through the SQLCipher connection. Dropping
+        // `scp` only signals cancellation, so without this awaited shutdown
+        // the actors' final drains and the connection's close race process
+        // exit. On Linux, SQLCipher links libcrypto, whose atexit handler
+        // `OPENSSL_cleanup` frees the state SQLCipher is still using, and the
+        // process dies of SIGSEGV after the test reports `ok`.
+        drop(sup);
+        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "the shutdown must drain every actor and close the store: {outcome:?}"
         );
     }
 
