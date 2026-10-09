@@ -3267,11 +3267,10 @@ fn outlet_stream_pure_wrappers_roundtrip() {
 /// call.
 ///
 /// One creator owns two contexts: `wide` holds `messages:write` and `narrow`
-/// omits it. Both register their bridge state with an empty ceiling argument,
-/// and the bridge state holds no ceiling. A `messages:write` token minted in
-/// `wide` passes each call there and fails the ceiling check in `narrow`. An
-/// edit that hands the core `default_ceiling()`, an empty ceiling, or the other
-/// context's ceiling passes one of the two halves and fails the other.
+/// omits it. A `messages:write` token minted in `wide` passes each call there
+/// and fails the ceiling check in `narrow`. An edit that hands the core
+/// `default_ceiling()`, an empty ceiling, or the other context's ceiling passes
+/// one of the two halves and fails the other.
 #[cfg(feature = "testing")]
 #[test]
 fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {

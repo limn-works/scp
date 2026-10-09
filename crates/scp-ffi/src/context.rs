@@ -3131,6 +3131,16 @@ impl crate::scp::PyScp {
     /// are invalid, the reservation id is malformed, or the spawn fails
     /// (bad/duplicate Welcome, single-use replay, first-writer-wins collision,
     /// or fail-closed persist failure).
+    ///
+    /// After the spawn commits, the join tears down the actor and returns
+    /// `ScpContextError`:
+    ///
+    /// - with code `SCP-CTX-2001` when FFI state for the id is already
+    ///   registered;
+    /// - with code `SCP-CTX-2023` when this bridge set the id's release mark
+    ///   after the call began; the mark stays;
+    /// - with code `SCP-CTX-2040` when the FFI state the join registered is
+    ///   gone before the known-context registration.
     #[pyo3(
         name = "context_join_from_welcome",
         signature = (owning_did, sealed, reservation_id)
@@ -3240,9 +3250,7 @@ impl crate::scp::PyScp {
             crate::runtime::readmit_and_register_ffi_state(bi, &sealed.context_id, &[], admitted_at)
         {
             rt.block_on(sup.discard_joined_context(&sealed.context_id));
-            return Err(PyRuntimeError::new_err(format!(
-                "failed to register context state: {e}"
-            )));
+            return Err(PyErr::from(e));
         }
 
         // Runtime join committed. Register the context in the known-contexts
@@ -3267,9 +3275,7 @@ impl crate::scp::PyScp {
 
         // BLACK-2JF-01, post-irreversible-commit compensation: when the FFI
         // state this join registered is gone, the join tears down the actor it
-        // committed. `discard_joined_context` removes the actor handle, destroys
-        // the resident MLS group, and deletes the durable snapshot the join
-        // persisted.
+        // committed.
         if crate::runtime::register_known_context_while_registered(bi, &sealed.context_id, known)
             .is_err()
         {
@@ -3868,8 +3874,6 @@ impl crate::scp::PyScp {
     ///
     /// - `RuntimeError` if deserialization, validation, or import fails.
     /// - `ValueError` if the data is malformed.
-    /// - `ScpContextError` with code `SCP-CTX-2023` when this bridge set the
-    ///   context's release mark after the call began; the mark stays.
     #[pyo3(signature = (data, importer_did))]
     pub fn context_import(&self, data: &[u8], importer_did: &str) -> PyResult<String> {
         let bi = &*self.inner;
@@ -3951,7 +3955,6 @@ impl crate::scp::PyScp {
         let announce_signing_key = resolve_signing_key(bi, importer_did).ok();
         let context_id_for_announce = context_id.clone();
 
-        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             // Dispatch the import carrying BOTH the creator verifying key
             // (verify-before-init, §23.16.8) and the importer's derived
@@ -3962,10 +3965,7 @@ impl crate::scp::PyScp {
             sup.import_context(export, &verifying_key, Some(local_pseudonym))
                 .await
                 .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
-            // Clears the id's release mark, or refuses when the mark was set
-            // after `admitted_at`.
-            crate::runtime::readmit_context(bi, &context_id_for_announce, admitted_at)
-                .map_err(PyErr::from)?;
+            crate::runtime::clear_release_mark(bi, &context_id_for_announce);
 
             // §9.10.4: emit a PseudonymAnnouncement so existing members learn
             // this importer's per-context routing ID. Encrypted contexts only —
@@ -4880,9 +4880,7 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` (SCP-CTX-2064) if restoration fails. Returns
-    /// `ScpContextError` with code `SCP-CTX-2023` when this bridge set the id's
-    /// release mark after the call began; the mark stays.
+    /// Returns `RuntimeError` (SCP-CTX-2064) if restoration fails.
     #[pyo3(signature = (context_id,))]
     pub fn restore_context(&self, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -4892,7 +4890,6 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id_owned = context_id.to_owned();
 
-        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             // Route through the ADR-049 commit-9 lifecycle shim. The handler
             // reconstructs an ephemeral ContextHandle and delegates to the
@@ -4925,9 +4922,8 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("SCP-CTX-2064: restore_context failed: {e}"))
                 })
         })?;
-        // Clears the id's release mark, or refuses when the mark was set after
-        // `admitted_at`.
-        crate::runtime::readmit_context(bi, context_id, admitted_at).map_err(PyErr::from)
+        crate::runtime::clear_release_mark(bi, context_id);
+        Ok(())
     }
 
     /// Restores all persisted contexts from storage.
@@ -4954,17 +4950,12 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
 
-        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             let restored = sup.restore_on_startup().await.map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
             })?;
-            // Clears each restored id's release mark; a mark set after
-            // `admitted_at` stays.
             for context_id in &restored {
-                if let Err(e) = crate::runtime::readmit_context(bi, context_id, admitted_at) {
-                    tracing::warn!(context_id, error = %e, "restored id keeps its release mark");
-                }
+                crate::runtime::clear_release_mark(bi, context_id);
             }
 
             serde_json::to_string(&restored).map_err(|e| {
@@ -8650,6 +8641,58 @@ mod tests {
         // A second close stays idempotent: no state to release, no error.
         scp.context_close(&handle, creator)
             .expect("a repeated close must stay idempotent");
+    }
+
+    /// Persists a supervisor context, despawns its actor, and marks the id
+    /// released on this bridge, the state `restore_context` and
+    /// `restore_all_contexts` start from in the tests below.
+    fn marked_persisted_context(
+        prefix: &str,
+    ) -> (std::sync::Arc<crate::runtime::PyBridgeInstance>, String) {
+        crate::init_runtime().ok();
+        let bi = __bi();
+        let context_id = format!("{prefix}{}", "0".repeat(64 - prefix.len()));
+        crate::runtime::init_context_manager_for_test(&bi);
+        crate::runtime::create_supervisor_context_for_test(
+            &bi,
+            &context_id,
+            "did:dht:z6MkRestoreMarkedCreator",
+            &["messages:read".to_owned()],
+        );
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
+        let rt = crate::runtime().expect("runtime");
+        assert!(rt.block_on(sup.despawn_actor(&context_id)));
+        crate::runtime::release_context_unless_readmitted(&bi, &sup, &context_id);
+        assert!(crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
+        (bi, context_id)
+    }
+
+    /// `restore_context` of an id this bridge marked released returns success
+    /// and leaves the id unmarked.
+    #[test]
+    fn restore_of_a_marked_context_succeeds_and_clears_the_mark() {
+        let (bi, context_id) = marked_persisted_context("a4");
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+        scp.restore_context(&context_id)
+            .expect("restoring a marked persisted context must succeed");
+        assert!(!crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
+    }
+
+    /// `restore_all_contexts` lists an id this bridge marked released and
+    /// leaves it unmarked.
+    #[test]
+    fn restore_all_of_a_marked_context_clears_the_mark() {
+        let (bi, context_id) = marked_persisted_context("a5");
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+        let restored = scp
+            .restore_all_contexts()
+            .expect("restoring persisted contexts must succeed");
+        assert!(restored.contains(&context_id), "{restored}");
+        assert!(!crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
     }
 
     /// A close refuses a context whose actor the supervisor still holds but

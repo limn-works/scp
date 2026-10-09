@@ -1466,11 +1466,6 @@ pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiB
 ///
 /// Contains subsystem state used by `outlets.rs`, `ucan.rs`, `event_log.rs`,
 /// and `mcp.rs`, plus FFI-specific message channel and outlet handler state.
-///
-/// # No role state lives here
-///
-/// This struct holds no role state, no membership set, no capability ceiling,
-/// and no creator DID.
 pub struct FfiBridgeState {
     /// Outlet registry for this context.
     pub outlet_registry: OutletRegistry,
@@ -1522,8 +1517,7 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// Registers FFI-specific state for a new context.
 ///
 /// Creates an [`OutletRegistry`], an [`EventLog`], a [`RevocationList`], a
-/// [`NonceTracker`], and a session store for the context. Role state,
-/// membership, the capability ceiling, and the creator DID are not stored here.
+/// [`NonceTracker`], and a session store for the context.
 ///
 /// `user_ceiling` holds the caller's ceiling entries in colon format (e.g.
 /// `"outlet:call:*"`). This function validates each entry against the
@@ -1969,15 +1963,21 @@ pub fn register_known_context_while_registered(
     }
 }
 
+/// Removes `context_id`'s release mark, if it carries one, under the registry
+/// entry's shard lock.
+pub(crate) fn clear_release_mark(bi: &PyBridgeInstance, context_id: &str) {
+    let _shard = ffi_state_registry(bi).entry(context_id.to_owned());
+    lock_release_marks(bi).remove(context_id);
+}
+
 /// Clears `context_id`'s release mark under the registry entry's shard lock
-/// when the id carries none or a mark set no later than `admitted_at`, the
-/// instant the caller took before it asked the supervisor to serve the id.
+/// when the id carries none or a mark set no later than `admitted_at`.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` with code `SCP-CTX-2023` and the withheld
 /// lifecycle text, clearing nothing, when the mark was set after `admitted_at`.
-pub(crate) fn readmit_context(
+fn readmit_context(
     bi: &PyBridgeInstance,
     context_id: &str,
     admitted_at: std::time::Instant,
@@ -1990,13 +1990,12 @@ pub(crate) fn readmit_context(
 /// removes this bridge's state for it only when the re-read does not report
 /// `Active`.
 ///
-/// A close decides from a lifecycle read taken before it releases, so the id
-/// can return to `Active`, and be readmitted, in between. When the re-read,
-/// taken after the mark went in, reports `Active`, this clears the mark unless
-/// a later mark replaced it, removes nothing, and returns `false`. On any
-/// other answer, a failed read included, it removes the state while the mark
-/// stands, leaves the mark set, and returns `true`. When the mark is gone by the time of the removal, it
-/// removes nothing and returns `false`.
+/// When the re-read, taken after the mark went in, reports `Active`, this
+/// clears the mark unless a later mark replaced it, removes nothing, and
+/// returns `false`. On any other answer, a failed read included, it removes
+/// the state while the mark stands, leaves the mark set, and returns `true`.
+/// When the mark is gone by the time of the removal, it removes nothing and
+/// returns `false`.
 pub fn release_context_unless_readmitted(
     bi: &PyBridgeInstance,
     sup: &Arc<scp_core::context::supervisor::Supervisor>,
@@ -3321,6 +3320,58 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
+    /// `clear_release_mark` removes a mark set after the admission instant,
+    /// which `readmit_context` refuses to clear, and leaves an id with no mark
+    /// unmarked.
+    #[test]
+    fn clear_release_mark_removes_a_mark_a_readmit_refuses() {
+        let (bi, ctx_id) = unserved_context("clear-mark");
+        remove_context(&bi, &ctx_id);
+        let admitted_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        set_release_mark(&bi, &ctx_id);
+        readmit_context(&bi, &ctx_id, admitted_at)
+            .expect_err("a mark set after admission must refuse the readmit");
+        assert!(lock_release_marks(&bi).contains_key(&ctx_id));
+
+        clear_release_mark(&bi, &ctx_id);
+        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+        clear_release_mark(&bi, &ctx_id);
+        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+    }
+
+    /// Both refusals of `readmit_and_register_ffi_state`, an occupied entry and
+    /// a mark set after admission, raise `ScpContextError` carrying their code
+    /// once passed through `PyErr::from`, never `RuntimeError`.
+    #[test]
+    fn a_readmit_refusal_raises_a_typed_context_error() {
+        let (bi, ctx_id) = unserved_context("typed-refusal");
+        let occupied = readmit_and_register_ffi_state(&bi, &ctx_id, &[], std::time::Instant::now())
+            .expect_err("an occupied entry must refuse the readmit");
+        remove_context(&bi, &ctx_id);
+        let admitted_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        set_release_mark(&bi, &ctx_id);
+        let marked = readmit_and_register_ffi_state(&bi, &ctx_id, &[], admitted_at)
+            .expect_err("a mark set after admission must refuse the readmit");
+
+        pyo3::prepare_freethreaded_python();
+        pyo3::Python::with_gil(|py| {
+            for (err, code) in [
+                (occupied, scp_ffi_common::error_codes::CTX_2001),
+                (marked, scp_ffi_common::error_codes::CTX_2023),
+            ] {
+                let py_err = pyo3::PyErr::from(err);
+                assert!(
+                    py_err.is_instance_of::<crate::error::ContextError>(py)
+                        && !py_err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                    "the refusal must raise ScpContextError: {py_err}"
+                );
+                assert!(py_err.to_string().contains(code), "{py_err}");
+            }
+        });
+    }
+
     /// A release whose re-read reports `Active` keeps the state and leaves no
     /// mark, so the context keeps working on this bridge.
     #[test]
@@ -4518,8 +4569,7 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
-    /// `member_context_role_states` reports a member the supervisor actor records,
-    /// with no write to bridge state.
+    /// `member_context_role_states` reports a member the supervisor actor records.
     #[test]
     #[cfg(feature = "testing")]
     fn member_context_role_states_reads_supervisor_membership() {
@@ -4551,7 +4601,7 @@ mod tests {
     }
 
     /// `member_context_role_states` refuses when a context is registered but no
-    /// supervisor is attached, instead of answering from bridge state.
+    /// supervisor is attached.
     #[test]
     fn member_context_role_states_fails_closed_without_a_supervisor() {
         crate::init_runtime().ok();

@@ -2791,8 +2791,8 @@ mod tests {
     ///
     /// Attaches a supervisor, as `register_context` does, and the supervisor
     /// does not hold the context, so the provider's role-state gates deny it
-    /// (see `provider_gates_follow_the_actor_not_the_bridge_state_pyo3`). Tests
-    /// of those gates use [`setup_supervised_context`].
+    /// (see `provider_gates_follow_the_actor_pyo3`). Tests of those gates use
+    /// [`setup_supervised_context`].
     ///
     /// Callers must pass the same `bi` they use for subsequent registry lookups;
     /// each `PyBridgeInstance` has its own `instance_id` and context registry.
@@ -3999,7 +3999,7 @@ mod tests {
         Python::with_gil(|py| {
             assert!(
                 scp.py_mcp_load_contexts(py, creator, "").is_err(),
-                "no supervisor must fail the listing, not answer from bridge state"
+                "no supervisor must fail the listing"
             );
         });
 
@@ -5800,7 +5800,7 @@ mod tests {
     /// The actor exists and holds no such context, the state after the actor
     /// drops a context the agent was removed from, so every gate must deny.
     #[test]
-    fn provider_gates_follow_the_actor_not_the_bridge_state_pyo3() {
+    fn provider_gates_follow_the_actor_pyo3() {
         use scp_mcp::server::ResourceKind;
 
         crate::init_runtime().ok();
@@ -6239,8 +6239,7 @@ mod tests {
     /// returns the unwired bundle, whose server advertises
     /// `resources.subscribe: false`, and reads `resources/list` through the
     /// provider type that entry point builds over the same instance: with no
-    /// supervisor the role-state read fails, so the list fails instead of
-    /// answering from bridge state.
+    /// supervisor the role-state read fails, so the list fails.
     #[test]
     fn missing_supervisor_serves_but_fails_role_state_reads_pyo3() {
         crate::init_runtime().ok();

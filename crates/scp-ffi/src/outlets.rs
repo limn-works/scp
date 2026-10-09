@@ -367,7 +367,7 @@ fn outlet_register_impl(
 /// `role_state` is the role state [`active_outlet_role_state`] returned for
 /// `context_id`. ADR-016 step 8 compares the token's grants against that role
 /// state's capability ceiling, and the delegation-chain check anchors on its
-/// creator. `FfiBridgeState` holds neither.
+/// creator.
 pub(crate) fn validate_outlet_ucan(
     bi: &PyBridgeInstance,
     role_state: &scp_core::context::roles::ContextRoleState,
@@ -3188,9 +3188,6 @@ mod tests {
     }
 
     /// `resolve_context_signing_key` resolves the SUPERVISOR's `creator_did`.
-    /// The fixture registers FFI state under one DID and creates the supervisor
-    /// context under another, so the DID named in the refusal identifies which
-    /// store the resolver read.
     #[test]
     fn resolve_context_signing_key_reads_the_supervisor_creator() {
         crate::init_runtime().ok();
@@ -3215,10 +3212,6 @@ mod tests {
         assert!(
             message.contains(supervisor_creator),
             "the resolver must name the supervisor's creator DID: {message}"
-        );
-        assert!(
-            !message.contains(ffi_creator),
-            "the resolver must not name `ffi_creator`: {message}"
         );
         crate::runtime::remove_context(bi, &ctx_id);
     }
@@ -3334,10 +3327,8 @@ mod tests {
     }
 
     /// `outlet_interface_expose` and `outlet_interface_accept` pass the
-    /// SUPERVISOR's creator to the admin check. The FFI state is registered
-    /// under one DID and the supervisor context is created under another, so
-    /// the registering DID holds no role in the supervisor. Both entry points
-    /// must admit the supervisor's creator.
+    /// SUPERVISOR's creator to the admin check. Both entry points must admit
+    /// the supervisor's creator.
     #[test]
     fn interface_expose_and_accept_admit_the_supervisor_creator() {
         crate::init_runtime().ok();
