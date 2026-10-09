@@ -432,8 +432,8 @@ pub struct PyBridgeInstance {
     pub(crate) ffi_bridge_state: Arc<DashMap<String, FfiBridgeState>>,
 
     /// Release marks: the ids whose [`FfiBridgeState`] a close released, each
-    /// with the instant its mark was last set.
-    pub(crate) released_contexts: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// with its [`ReleaseMark`].
+    pub(crate) released_contexts: std::sync::Mutex<HashMap<String, ReleaseMark>>,
 
     /// MCP server registry (replaces `SERVER_REGISTRY` in `mcp.rs`).
     ///
@@ -1544,18 +1544,15 @@ pub fn register_ffi_state(
 /// in one critical section under the registry entry's shard lock.
 ///
 /// `admitted_at` is the instant the caller took before it asked the supervisor
-/// to serve the id. When the entry is vacant and the id carries no mark, or a
-/// mark set no later than `admitted_at`, it clears the mark and inserts a fresh
-/// [`FfiBridgeState`]. When the entry is occupied, or the mark was set after
-/// `admitted_at`, it returns an error, inserts nothing, and leaves the mark in
-/// place.
+/// to serve the id. When the entry is vacant, it clears a mark set no later
+/// than `admitted_at`, keeps a mark set after it, and inserts a fresh
+/// [`FfiBridgeState`]. When the entry is occupied, it returns an error,
+/// inserts nothing, and leaves the mark in place.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
-/// or if a `user_ceiling` entry fails the ceiling-entry grammar. Returns
-/// `ScpPyError::ContextError` with code `SCP-CTX-2023` and the withheld
-/// lifecycle text when the mark was set after `admitted_at`.
+/// or if a `user_ceiling` entry fails the ceiling-entry grammar.
 pub fn readmit_and_register_ffi_state(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -1576,34 +1573,31 @@ pub fn readmit_and_register_ffi_state(
 enum MarkedId {
     /// Refuse the registration and keep the mark.
     Refuse,
-    /// Clear a mark set no later than `admitted_at` and register; refuse and
-    /// keep a mark set after it.
+    /// Clear a mark set no later than `admitted_at`, keep a mark set after
+    /// it, and register.
     Readmit { admitted_at: std::time::Instant },
 }
 
-/// Clears `context_id`'s release mark in `marks` when the id carries none or a
-/// mark set no later than `admitted_at`.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` with code `SCP-CTX-2023` and the withheld
-/// lifecycle text, clearing nothing, when the mark was set after `admitted_at`.
-fn clear_mark_set_by(
-    marks: &mut HashMap<String, std::time::Instant>,
+/// Removes `context_id`'s release mark from `marks` when the mark was set no
+/// later than `admitted_at`, and keeps a mark set after it.
+fn remove_mark_set_by(
+    marks: &mut HashMap<String, ReleaseMark>,
     context_id: &str,
     admitted_at: std::time::Instant,
-) -> Result<(), ScpPyError> {
-    if marks.get(context_id).is_some_and(|at| *at > admitted_at) {
-        return Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot readmit context: {}",
-                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
-            ),
-            code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
-        });
+) {
+    if marks
+        .get(context_id)
+        .is_some_and(|mark| mark.at <= admitted_at)
+    {
+        marks.remove(context_id);
     }
-    marks.remove(context_id);
-    Ok(())
+}
+
+/// The refusal for a registration whose id already has [`FfiBridgeState`].
+pub(crate) fn ffi_state_already_registered(context_id: &str) -> ScpPyError {
+    ScpPyError::context(format!(
+        "context '{context_id}' FFI state is already registered"
+    ))
 }
 
 fn insert_ffi_state(
@@ -1640,13 +1634,11 @@ fn insert_ffi_state(
     }
 
     match ffi_state_registry(bi).entry(context_id.to_owned()) {
-        Entry::Occupied(_) => Err(ScpPyError::context(format!(
-            "context '{context_id}' FFI state is already registered"
-        ))),
+        Entry::Occupied(_) => Err(ffi_state_already_registered(context_id)),
         Entry::Vacant(vacant) => {
             let mut marks = lock_release_marks(bi);
             if let MarkedId::Readmit { admitted_at } = marked {
-                clear_mark_set_by(&mut marks, vacant.key(), admitted_at)?;
+                remove_mark_set_by(&mut marks, vacant.key(), admitted_at);
             } else if marks.contains_key(vacant.key()) {
                 // The refusal withholds the lifecycle state: registration
                 // authorizes no one, so its answer must not say whether the
@@ -1862,8 +1854,17 @@ pub fn read_live_context_state_on(
         .map_err(ScpPyError::from)
 }
 
-/// The most release marks one [`PyBridgeInstance`] holds.
+/// The most release marks one [`PyBridgeInstance`] holds once every release
+/// that set one has finished.
 pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
+
+/// One release mark: the instant it was set, and whether the release that set
+/// it is still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReleaseMark {
+    pub(crate) at: std::time::Instant,
+    pub(crate) in_flight: bool,
+}
 
 /// Locks the bridge's release marks, recovering the map from a poisoned lock.
 ///
@@ -1872,31 +1873,49 @@ pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
 /// recovered map is safe to use.
 pub(crate) fn lock_release_marks(
     bi: &PyBridgeInstance,
-) -> std::sync::MutexGuard<'_, HashMap<String, std::time::Instant>> {
+) -> std::sync::MutexGuard<'_, HashMap<String, ReleaseMark>> {
     bi.released_contexts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Sets `context_id`'s release mark to the current instant and returns that
-/// instant.
+/// Sets `context_id`'s release mark to the current instant, in flight, and
+/// returns that instant.
 ///
 /// When the map already holds [`MAX_RELEASED_CONTEXTS`] marks and `context_id`
-/// carries none, the mark set earliest is evicted first.
+/// carries none, the earliest mark that is not in flight is evicted first. A
+/// mark in flight is never evicted.
 fn set_release_mark(bi: &PyBridgeInstance, context_id: &str) -> std::time::Instant {
     let mut marks = lock_release_marks(bi);
     if marks.len() >= MAX_RELEASED_CONTEXTS && !marks.contains_key(context_id) {
         let earliest = marks
             .iter()
-            .min_by_key(|(_, at)| **at)
+            .filter(|(_, mark)| !mark.in_flight)
+            .min_by_key(|(_, mark)| mark.at)
             .map(|(id, _)| id.clone());
         if let Some(id) = earliest {
             marks.remove(&id);
         }
     }
     let marked_at = std::time::Instant::now();
-    marks.insert(context_id.to_owned(), marked_at);
+    marks.insert(
+        context_id.to_owned(),
+        ReleaseMark {
+            at: marked_at,
+            in_flight: true,
+        },
+    );
     marked_at
+}
+
+/// Takes `context_id`'s mark out of flight when it is still the mark set at
+/// `marked_at`.
+fn finish_release_mark(bi: &PyBridgeInstance, context_id: &str, marked_at: std::time::Instant) {
+    if let Some(mark) = lock_release_marks(bi).get_mut(context_id)
+        && mark.at == marked_at
+    {
+        mark.in_flight = false;
+    }
 }
 
 /// Removes `context_id`'s [`FfiBridgeState`], its known-context entry, and its
@@ -1930,60 +1949,24 @@ fn remove_context_entry(
     }
 }
 
-/// Registers `known` in the known-contexts registry only while `context_id`'s
-/// [`FfiBridgeState`] is registered, overwriting any entry for the id.
+/// Registers a known context in the discovery registry for the supplied
+/// [`PyBridgeInstance`].
 ///
-/// The presence check and the registration run under the registry entry's
-/// shard lock.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` with code `SCP-CTX-2023` and the
-/// withheld lifecycle text, registering nothing, when no [`FfiBridgeState`] is
-/// registered for `context_id`.
-pub fn register_known_context_while_registered(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-    known: KnownContext,
-) -> Result<(), ScpPyError> {
-    use dashmap::mapref::entry::Entry;
-
-    match ffi_state_registry(bi).entry(context_id.to_owned()) {
-        Entry::Occupied(_held) => {
-            bi.core.register_known_context(context_id, known);
-            Ok(())
-        }
-        Entry::Vacant(_) => Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot register known context: {}",
-                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
-            ),
-            code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
-        }),
-    }
+/// Overwrites any existing entry for the same context ID (idempotent).
+pub fn register_known_context_on(bi: &PyBridgeInstance, context_id: &str, known: KnownContext) {
+    bi.core.register_known_context(context_id, known);
 }
 
-/// Removes `context_id`'s release mark, if it carries one, under the registry
-/// entry's shard lock.
-pub(crate) fn clear_release_mark(bi: &PyBridgeInstance, context_id: &str) {
-    let _shard = ffi_state_registry(bi).entry(context_id.to_owned());
-    lock_release_marks(bi).remove(context_id);
-}
-
-/// Clears `context_id`'s release mark under the registry entry's shard lock
-/// when the id carries none or a mark set no later than `admitted_at`.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` with code `SCP-CTX-2023` and the withheld
-/// lifecycle text, clearing nothing, when the mark was set after `admitted_at`.
-fn readmit_context(
+/// Removes `context_id`'s release mark under the registry entry's shard lock
+/// when the mark was set no later than `admitted_at`, and keeps a mark set
+/// after it.
+pub(crate) fn clear_release_mark_set_by(
     bi: &PyBridgeInstance,
     context_id: &str,
     admitted_at: std::time::Instant,
-) -> Result<(), ScpPyError> {
+) {
     let _shard = ffi_state_registry(bi).entry(context_id.to_owned());
-    clear_mark_set_by(&mut lock_release_marks(bi), context_id, admitted_at)
+    remove_mark_set_by(&mut lock_release_marks(bi), context_id, admitted_at);
 }
 
 /// Marks `context_id` released, re-reads its lifecycle state on `sup`, and
@@ -1995,32 +1978,30 @@ fn readmit_context(
 /// returns `false`. On any other answer, a failed read included, it removes
 /// the state while the mark stands, leaves the mark set, and returns `true`.
 /// When the mark is gone by the time of the removal, it removes nothing and
-/// returns `false`.
+/// returns `false`. The mark stays in flight until this function returns.
 pub fn release_context_unless_readmitted(
     bi: &PyBridgeInstance,
     sup: &Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> bool {
     let marked_at = set_release_mark(bi, context_id);
-    match read_live_context_state_on(Arc::clone(sup), context_id) {
+    let released = match read_live_context_state_on(Arc::clone(sup), context_id) {
         Ok(Some(scp_core::context::ContextState::Active)) => {
-            if let Err(e) = readmit_context(bi, context_id, marked_at) {
-                tracing::debug!(
-                    context_id,
-                    error = %e,
-                    "a release mark set after this one stays"
-                );
-            }
-            return false;
+            clear_release_mark_set_by(bi, context_id, marked_at);
+            false
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            context_id,
-            error = %e,
-            "lifecycle re-read before a release failed; releasing this bridge's state"
-        ),
-    }
-    remove_context_while_released(bi, context_id)
+        Ok(_) => remove_context_while_released(bi, context_id),
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "lifecycle re-read before a release failed; releasing this bridge's state"
+            );
+            remove_context_while_released(bi, context_id)
+        }
+    };
+    finish_release_mark(bi, context_id, marked_at);
+    released
 }
 
 /// Reads `context_id`'s role state for an authorization decision after its
@@ -3234,8 +3215,10 @@ mod tests {
         );
         assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
         assert!(
-            lock_release_marks(&bi).contains_key(&ctx_id),
-            "the release must leave the id marked"
+            lock_release_marks(&bi)
+                .get(&ctx_id)
+                .is_some_and(|mark| !mark.in_flight),
+            "the release must leave the id marked, out of flight"
         );
 
         let refusal = register_ffi_state(&bi, &ctx_id, &[])
@@ -3275,15 +3258,15 @@ mod tests {
             "a failed registration must leave the mark in place"
         );
         assert!(remove_context_while_released(&bi, &ctx_id));
-        readmit_context(&bi, &ctx_id, std::time::Instant::now())
-            .expect("a readmit clears an earlier mark");
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
+        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
     }
 
-    /// A mark set after the admission instant survives both readmits, which
-    /// refuse with `SCP-CTX-2023` and register nothing; a readmit whose
-    /// admission instant follows the mark clears it and registers the id.
+    /// A readmit whose admission instant precedes the mark registers the id and
+    /// keeps the mark; a readmit whose admission instant follows the mark
+    /// clears it.
     #[test]
-    fn a_readmit_refuses_a_mark_set_after_admission() {
+    fn a_readmit_keeps_a_mark_set_after_admission() {
         let (bi, ctx_id) = unserved_context("mark-after-admission");
         remove_context(&bi, &ctx_id);
         let admitted_at = std::time::Instant::now();
@@ -3294,24 +3277,15 @@ mod tests {
             "the mark must follow the admission"
         );
 
-        let refusal = readmit_and_register_ffi_state(&bi, &ctx_id, &[], admitted_at)
-            .expect_err("a mark set after admission must refuse the registration")
-            .to_string();
-        assert!(
-            refusal.contains(scp_ffi_common::error_codes::CTX_2023)
-                && refusal.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
-            "the refusal must carry SCP-CTX-2023 and the withheld text: {refusal}"
-        );
-        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
-        let err = readmit_context(&bi, &ctx_id, admitted_at)
-            .expect_err("a mark set after admission must refuse the readmit")
-            .to_string();
-        assert!(err.contains(scp_ffi_common::error_codes::CTX_2023), "{err}");
+        readmit_and_register_ffi_state(&bi, &ctx_id, &[], admitted_at)
+            .expect("a vacant entry registers whatever the mark");
+        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
         assert_eq!(
-            lock_release_marks(&bi).get(&ctx_id).copied(),
+            lock_release_marks(&bi).get(&ctx_id).map(|mark| mark.at),
             Some(marked_at),
-            "a refused readmit must leave the later mark in place"
+            "a readmit must keep a mark set after its admission"
         );
+        remove_context(&bi, &ctx_id);
 
         readmit_and_register_ffi_state(&bi, &ctx_id, &[], std::time::Instant::now())
             .expect("an admission after the mark registers the id");
@@ -3320,55 +3294,59 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
-    /// `clear_release_mark` removes a mark set after the admission instant,
-    /// which `readmit_context` refuses to clear, and leaves an id with no mark
-    /// unmarked.
+    /// A close that marks the id after an import's admission instant keeps its
+    /// mark through the import's clear, and the close's removal still runs; a
+    /// clear whose admission instant follows the mark removes it, and a clear
+    /// of an unmarked id leaves it unmarked.
     #[test]
-    fn clear_release_mark_removes_a_mark_a_readmit_refuses() {
+    fn clear_release_mark_set_by_keeps_a_later_mark() {
         let (bi, ctx_id) = unserved_context("clear-mark");
-        remove_context(&bi, &ctx_id);
         let admitted_at = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(1));
-        set_release_mark(&bi, &ctx_id);
-        readmit_context(&bi, &ctx_id, admitted_at)
-            .expect_err("a mark set after admission must refuse the readmit");
-        assert!(lock_release_marks(&bi).contains_key(&ctx_id));
+        let marked_at = set_release_mark(&bi, &ctx_id);
 
-        clear_release_mark(&bi, &ctx_id);
+        clear_release_mark_set_by(&bi, &ctx_id, admitted_at);
+        assert_eq!(
+            lock_release_marks(&bi).get(&ctx_id).map(|mark| mark.at),
+            Some(marked_at),
+            "a clear must keep a mark set after its admission"
+        );
+        assert!(
+            remove_context_while_released(&bi, &ctx_id),
+            "the later close's removal must still run"
+        );
+        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
         assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
-        clear_release_mark(&bi, &ctx_id);
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
         assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
     }
 
-    /// Both refusals of `readmit_and_register_ffi_state`, an occupied entry and
-    /// a mark set after admission, raise `ScpContextError` carrying their code
-    /// once passed through `PyErr::from`, never `RuntimeError`.
+    /// The occupied-entry refusal of `readmit_and_register_ffi_state` raises
+    /// `ScpContextError` carrying `SCP-CTX-2001` once passed through
+    /// `PyErr::from`, never `RuntimeError`.
     #[test]
-    fn a_readmit_refusal_raises_a_typed_context_error() {
+    fn an_occupied_readmit_raises_a_typed_context_error() {
         let (bi, ctx_id) = unserved_context("typed-refusal");
         let occupied = readmit_and_register_ffi_state(&bi, &ctx_id, &[], std::time::Instant::now())
             .expect_err("an occupied entry must refuse the readmit");
         remove_context(&bi, &ctx_id);
-        let admitted_at = std::time::Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        set_release_mark(&bi, &ctx_id);
-        let marked = readmit_and_register_ffi_state(&bi, &ctx_id, &[], admitted_at)
-            .expect_err("a mark set after admission must refuse the readmit");
 
         pyo3::prepare_freethreaded_python();
         pyo3::Python::with_gil(|py| {
-            for (err, code) in [
-                (occupied, scp_ffi_common::error_codes::CTX_2001),
-                (marked, scp_ffi_common::error_codes::CTX_2023),
-            ] {
-                let py_err = pyo3::PyErr::from(err);
-                assert!(
-                    py_err.is_instance_of::<crate::error::ContextError>(py)
-                        && !py_err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
-                    "the refusal must raise ScpContextError: {py_err}"
-                );
-                assert!(py_err.to_string().contains(code), "{py_err}");
-            }
+            let py_err = pyo3::PyErr::from(occupied);
+            assert!(
+                py_err.is_instance_of::<crate::error::ContextError>(py)
+                    && !py_err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "the refusal must raise ScpContextError: {py_err}"
+            );
+            assert!(
+                py_err
+                    .to_string()
+                    .contains(scp_ffi_common::error_codes::CTX_2001),
+                "{py_err}"
+            );
         });
     }
 
@@ -3409,12 +3387,10 @@ mod tests {
                 .iter()
                 .any(|(id, _)| id == &ctx_id)
         };
-        register_known_context_while_registered(&bi, &ctx_id, release_fixture_known())
-            .expect("a registered id registers its known context");
+        register_known_context_on(&bi, &ctx_id, release_fixture_known());
 
         set_release_mark(&bi, &ctx_id);
-        readmit_context(&bi, &ctx_id, std::time::Instant::now())
-            .expect("a readmit clears an earlier mark");
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
         assert!(
             !remove_context_while_released(&bi, &ctx_id),
             "a removal must not run once a readmit cleared the mark"
@@ -3432,8 +3408,7 @@ mod tests {
             !is_known(&bi),
             "a marked removal drops the known-context entry"
         );
-        readmit_context(&bi, &ctx_id, std::time::Instant::now())
-            .expect("a readmit clears an earlier mark");
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
     }
 
     fn release_fixture_known() -> KnownContext {
@@ -3445,57 +3420,28 @@ mod tests {
         }
     }
 
-    /// The known-context registration commits only while the id's FFI state is
-    /// registered: it succeeds for a registered id and refuses, registering
-    /// nothing, once the state is removed.
-    #[test]
-    fn a_known_context_registers_only_while_ffi_state_is_registered() {
-        let (bi, ctx_id) = unserved_context("known-while-registered");
-        let is_known = |bi: &PyBridgeInstance| {
-            all_known_contexts_on(bi)
-                .iter()
-                .any(|(id, _)| id == &ctx_id)
-        };
-
-        register_known_context_while_registered(&bi, &ctx_id, release_fixture_known())
-            .expect("a registered id registers its known context");
-        assert!(
-            is_known(&bi),
-            "a registered id gains its known-context entry"
-        );
-
-        remove_context(&bi, &ctx_id);
-        assert!(!is_known(&bi), "removal drops the known-context entry");
-        let refusal =
-            register_known_context_while_registered(&bi, &ctx_id, release_fixture_known())
-                .expect_err("an id with no FFI state must be refused")
-                .to_string();
-        assert!(
-            refusal.contains(scp_ffi_common::error_codes::CTX_2023)
-                && refusal.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
-            "the refusal must carry SCP-CTX-2023 and the withheld text: {refusal}"
-        );
-        assert!(
-            !is_known(&bi),
-            "a refused registration must leave no known-context entry"
-        );
+    /// Sets a release mark on `context_id` and takes it out of flight, as a
+    /// finished release leaves it.
+    fn set_finished_release_mark(bi: &PyBridgeInstance, context_id: &str) {
+        let marked_at = set_release_mark(bi, context_id);
+        finish_release_mark(bi, context_id, marked_at);
     }
 
-    /// The mark map holds at most `MAX_RELEASED_CONTEXTS` marks: a new mark on a
-    /// full map evicts the mark set earliest, and re-marking an id the map
-    /// already holds evicts nothing.
+    /// The mark map holds at most `MAX_RELEASED_CONTEXTS` finished marks: a new
+    /// mark on a full map evicts the finished mark set earliest, and re-marking
+    /// an id the map already holds evicts nothing.
     #[test]
     fn a_full_mark_map_evicts_the_earliest_mark() {
         let bi = PyBridgeInstance::new_py();
-        set_release_mark(&bi, "earliest");
+        set_finished_release_mark(&bi, "earliest");
         // The pause keeps every later mark's instant strictly after the first.
         std::thread::sleep(std::time::Duration::from_millis(2));
         for i in 1..MAX_RELEASED_CONTEXTS {
-            set_release_mark(&bi, &format!("mark-{i}"));
+            set_finished_release_mark(&bi, &format!("mark-{i}"));
         }
         assert_eq!(lock_release_marks(&bi).len(), MAX_RELEASED_CONTEXTS);
 
-        set_release_mark(&bi, "mark-1");
+        set_finished_release_mark(&bi, "mark-1");
         assert!(
             lock_release_marks(&bi).contains_key("earliest"),
             "re-marking a held id must evict nothing"
@@ -3508,6 +3454,42 @@ mod tests {
             !marks.contains_key("earliest") && marks.contains_key("newest"),
             "a new mark on a full map must evict the earliest mark"
         );
+    }
+
+    /// A full mark map never evicts a mark in flight: the release that set the
+    /// earliest mark still finds it and removes the state, while the earliest
+    /// finished mark is evicted in its place.
+    #[test]
+    fn a_full_mark_map_keeps_a_mark_in_flight() {
+        let (bi, ctx_id) = unserved_context("mark-in-flight");
+        let marked_at = set_release_mark(&bi, &ctx_id);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        set_finished_release_mark(&bi, "earliest-finished");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for i in 2..MAX_RELEASED_CONTEXTS {
+            set_finished_release_mark(&bi, &format!("mark-{i}"));
+        }
+        assert_eq!(lock_release_marks(&bi).len(), MAX_RELEASED_CONTEXTS);
+
+        set_finished_release_mark(&bi, "newest");
+        {
+            let marks = lock_release_marks(&bi);
+            assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+            assert!(
+                !marks.contains_key("earliest-finished"),
+                "the earliest finished mark must be evicted"
+            );
+            assert_eq!(
+                marks.get(&ctx_id).copied(),
+                Some(ReleaseMark {
+                    at: marked_at,
+                    in_flight: true
+                }),
+                "a mark in flight must survive a full map"
+            );
+        }
+        assert!(remove_context_while_released(&bi, &ctx_id));
+        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
     }
 
     /// The close-teardown fail-closed ordering: once the FFI bridge state

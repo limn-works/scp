@@ -2647,9 +2647,8 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `TypeError` if params contains invalid types, `ValueError` if
-    /// parameter values are out of range, `RuntimeError` if context creation
-    /// fails, or `ContextError` carrying `SCP-CTX-2023` when the context's
-    /// bridge state is no longer registered at the known-context registration.
+    /// parameter values are out of range, or `RuntimeError` if context creation
+    /// fails.
     #[pyo3(signature = (identity_did, params))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
@@ -2825,7 +2824,7 @@ impl crate::scp::PyScp {
                 member_did: identity_did.to_owned(),
                 last_seen,
             };
-            crate::runtime::register_known_context_while_registered(bi, &context_id, known)?;
+            crate::runtime::register_known_context_on(bi, &context_id, known);
         }
 
         // Transition to "active" -- in the full runtime this happens after MLS
@@ -2852,10 +2851,8 @@ impl crate::scp::PyScp {
     ///
     /// Returns `ContextError` carrying `SCP-CTX-2013` when the supervisor reports
     /// the context in any state but active or no actor serves it,
-    /// `SCP-CTX-2134` when the crash watchdog poisoned it, `SCP-CTX-2135`
-    /// when its actor crashed or is mid-respawn, and `SCP-CTX-2023` when the
-    /// context's bridge state is no longer registered at the known-context
-    /// registration.
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager
     pub fn context_join(
@@ -3019,7 +3016,7 @@ impl crate::scp::PyScp {
                     member_did,
                     last_seen: scp_clock::SystemClock.now_secs(),
                 };
-                crate::runtime::register_known_context_while_registered(bi, &context_id, known)?;
+                crate::runtime::register_known_context_on(bi, &context_id, known);
             }
         }
 
@@ -3132,15 +3129,9 @@ impl crate::scp::PyScp {
     /// (bad/duplicate Welcome, single-use replay, first-writer-wins collision,
     /// or fail-closed persist failure).
     ///
-    /// After the spawn commits, the join tears down the actor and returns
-    /// `ScpContextError`:
-    ///
-    /// - with code `SCP-CTX-2001` when FFI state for the id is already
-    ///   registered;
-    /// - with code `SCP-CTX-2023` when this bridge set the id's release mark
-    ///   after the call began; the mark stays;
-    /// - with code `SCP-CTX-2040` when the FFI state the join registered is
-    ///   gone before the known-context registration.
+    /// Returns `ScpContextError` with code `SCP-CTX-2001` when FFI state for
+    /// the id is already registered, before the spawn or after it; after the
+    /// spawn, the join first tears down the actor it committed.
     #[pyo3(
         name = "context_join_from_welcome",
         signature = (owning_did, sealed, reservation_id)
@@ -3217,10 +3208,7 @@ impl crate::scp::PyScp {
         // `spawn_actor_from_welcome` consumes the single-use `KeyPackage`, and
         // the entry is left untouched.
         if crate::runtime::ffi_state_registry(bi).contains_key(&sealed.context_id) {
-            return Err(PyRuntimeError::new_err(format!(
-                "failed to register context state: context '{}' FFI state is already registered",
-                sealed.context_id
-            )));
+            return Err(crate::runtime::ffi_state_already_registered(&sealed.context_id).into());
         }
 
         let owning = scp_did::DID(owning_did.clone());
@@ -3242,9 +3230,9 @@ impl crate::scp::PyScp {
             .block_on(sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req))
             .map_err(|e| busy_or("context_join_from_welcome", &e))?;
 
-        // Clearing the id's release mark and registering its FFI state run in
-        // one critical section. When the entry is occupied, or the mark was set
-        // after `admitted_at`, the mark stays and the just-committed actor is
+        // Clearing a release mark set no later than `admitted_at` and
+        // registering the id's FFI state run in one critical section. When the
+        // entry is occupied, the mark stays and the just-committed actor is
         // torn down.
         if let Err(e) =
             crate::runtime::readmit_and_register_ffi_state(bi, &sealed.context_id, &[], admitted_at)
@@ -3273,24 +3261,7 @@ impl crate::scp::PyScp {
             last_seen: scp_clock::SystemClock.now_secs(),
         };
 
-        // BLACK-2JF-01, post-irreversible-commit compensation: when the FFI
-        // state this join registered is gone, the join tears down the actor it
-        // committed.
-        if crate::runtime::register_known_context_while_registered(bi, &sealed.context_id, known)
-            .is_err()
-        {
-            rt.block_on(sup.discard_joined_context(&sealed.context_id));
-            crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(crate::error::ScpPyError::ContextError {
-                message: format!(
-                    "FFI state for context '{}' was removed after the committed join; \
-                     the just-committed actor was torn down",
-                    sealed.context_id
-                ),
-                code: scp_ffi_common::error_codes::CTX_2040.to_owned(),
-            }
-            .into());
-        }
+        crate::runtime::register_known_context_on(bi, &sealed.context_id, known);
 
         // Build the returned handle from the AUTHENTICATED params carried by the
         // joined MLS group's signed context binding — NOT from caller input
@@ -3955,6 +3926,7 @@ impl crate::scp::PyScp {
         let announce_signing_key = resolve_signing_key(bi, importer_did).ok();
         let context_id_for_announce = context_id.clone();
 
+        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             // Dispatch the import carrying BOTH the creator verifying key
             // (verify-before-init, §23.16.8) and the importer's derived
@@ -3965,7 +3937,7 @@ impl crate::scp::PyScp {
             sup.import_context(export, &verifying_key, Some(local_pseudonym))
                 .await
                 .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
-            crate::runtime::clear_release_mark(bi, &context_id_for_announce);
+            crate::runtime::clear_release_mark_set_by(bi, &context_id_for_announce, admitted_at);
 
             // §9.10.4: emit a PseudonymAnnouncement so existing members learn
             // this importer's per-context routing ID. Encrypted contexts only —
@@ -4890,6 +4862,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id_owned = context_id.to_owned();
 
+        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             // Route through the ADR-049 commit-9 lifecycle shim. The handler
             // reconstructs an ephemeral ContextHandle and delegates to the
@@ -4922,7 +4895,7 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("SCP-CTX-2064: restore_context failed: {e}"))
                 })
         })?;
-        crate::runtime::clear_release_mark(bi, context_id);
+        crate::runtime::clear_release_mark_set_by(bi, context_id, admitted_at);
         Ok(())
     }
 
@@ -4950,12 +4923,13 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
 
+        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             let restored = sup.restore_on_startup().await.map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
             })?;
             for context_id in &restored {
-                crate::runtime::clear_release_mark(bi, context_id);
+                crate::runtime::clear_release_mark_set_by(bi, context_id, admitted_at);
             }
 
             serde_json::to_string(&restored).map_err(|e| {
@@ -6713,8 +6687,13 @@ mod tests {
             let joiner_did = joiner.did().to_owned();
 
             let ctx_id = "a".repeat(64);
-            crate::runtime::lock_release_marks(&bi)
-                .insert(ctx_id.clone(), std::time::Instant::now());
+            crate::runtime::lock_release_marks(&bi).insert(
+                ctx_id.clone(),
+                crate::runtime::ReleaseMark {
+                    at: std::time::Instant::now(),
+                    in_flight: false,
+                },
+            );
             // A well-formed 32-byte `enc` passes the bridge enc-length check, so
             // the failure is the runtime join itself (bogus reservation +
             // ciphertext).
@@ -6800,8 +6779,10 @@ mod tests {
                 .expect_err("join into an already-registered context must be rejected");
             let msg = err.to_string();
             assert!(
-                msg.contains("already registered"),
-                "expected an occupancy-check rejection before KeyPackage consumption, got: {msg}"
+                msg.contains("already registered")
+                    && msg.contains(scp_ffi_common::error_codes::CTX_2001)
+                    && err.is_instance_of::<crate::error::ContextError>(py),
+                "expected an SCP-CTX-2001 occupancy-check rejection before KeyPackage consumption, got: {msg}"
             );
 
             // The PRE-EXISTING entry must SURVIVE — the failing join must not roll
