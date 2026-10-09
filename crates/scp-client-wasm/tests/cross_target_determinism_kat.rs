@@ -563,14 +563,17 @@ fn relay_wire_encoding_is_target_deterministic() {
 // slice — §9.10.4 pseudonym fan-out / announce)
 // ---------------------------------------------------------------------------
 
-/// Golden §9.10.4 pseudonym public key: §25.19 Vector 30's v1 pseudonym (the
-/// 33-byte compressed P-256 point), copied from `.docs/specs/25-test-vectors.md`.
-/// It is the output of the SHARED `scp_crypto::pseudonym::derive_pseudonym`
-/// recipe that `ScpMlsGroup::derive_pseudonym` feeds the wasm-held MLS key into;
-/// pinning it here guards that the derivation is byte-identical native vs wasm32
-/// (an HKDF/HMAC/P-256 width or ordering divergence would move it).
+/// Golden §9.10.4 v1 pseudonym public key (the 33-byte compressed P-256 point)
+/// for identity seed `0x07 x 32` in context `scp-transport-kat-ctx`, emitted by
+/// the independent Python implementation in `scripts/gen-test-vectors-p256.py`
+/// (`cross_target.pseudonym_public_v1`). The seed and context differ from
+/// §25.19 Vector 30's, so this pins a second point of the shared
+/// `scp_crypto::pseudonym::derive_pseudonym` recipe that
+/// `ScpMlsGroup::derive_pseudonym` feeds the wasm-held MLS key into: an
+/// HKDF/HMAC/P-256 width or ordering divergence between native and wasm32
+/// would move it.
 const GOLDEN_PSEUDONYM_V1_HEX: &str =
-    "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72";
+    "02bb56b677a67ec3c2b630a05b2d34b43d6a81ff65fabe6916ddfb5da924cb60bb";
 
 /// Golden `PseudonymAnnouncement` `MessagePack` (`rmp_serde::to_vec_named`)
 /// encoding for a fixed `tag`/`member_did`/`pseudonym` — the §9.10.4 bootstrap payload
@@ -591,15 +594,15 @@ const GOLDEN_OUTER_ENVELOPE_HEX: &str = "84a776657273696f6ecd0100aa726f7574696e6
 /// fan-out/announce wire path does not diverge across targets.
 fn assert_transport_wire_and_pseudonym_golden_vectors() {
     // (1) Pseudonym derivation over the shared recipe (fixed seed).
-    // §25.19 Vector 30: identity seed 0x01 x 32 → identity P-256 scalar (the
-    // ikm) under the §25.2 label → v1 pseudonym in "context-alpha".
+    // Identity seed 0x07 x 32 → identity P-256 scalar (the ikm) under the
+    // §25.2 label → v1 pseudonym in "scp-transport-kat-ctx".
     let identity = scp_crypto::p256::P256SecretKey::from_seed(
         scp_crypto::p256::SeedLabel::TestVectorKey,
-        &[0x01u8; 32],
+        &[0x07u8; 32],
     );
     let derived = scp_crypto::pseudonym::derive_pseudonym(
         &identity.to_scalar_bytes(),
-        b"context-alpha",
+        b"scp-transport-kat-ctx",
         scp_crypto::pseudonym::PseudonymVersion::Static,
     )
     .to_compressed();
