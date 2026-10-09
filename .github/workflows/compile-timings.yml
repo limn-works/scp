@@ -171,18 +171,19 @@ jobs:
               --manifest-path crates/scp-ffi/uniffi/Cargo.toml --features testing
             rustc_args: ""
           # `maturin develop --profile ci-bridge --features testing` in bindings/python
-          # adds the features `[tool.maturin]` in bindings/python/pyproject.toml lists
-          # (`extension-module`, `vendored-openssl`) and runs `cargo rustc --lib
-          # --crate-type cdylib` with the macOS link arguments below. With
-          # `extension-module` the module links no libpython, so the macOS linker
-          # rejects the undefined Python symbols unless `-undefined dynamic_lookup`
-          # tells it to leave them for the interpreter to resolve at load time.
+          # runs `cargo rustc --lib --crate-type cdylib` over crates/scp-ffi with the
+          # macOS link arguments below. Its `--features testing` takes the place of the
+          # `features` list in `[tool.maturin]` of bindings/python/pyproject.toml, so
+          # the build enables `testing` and not `extension-module`: crates/scp-ffi/src/
+          # lib.rs fails to compile when both are on. `-undefined dynamic_lookup` lets
+          # the macOS linker leave Python symbols for the interpreter to resolve at load
+          # time.
           - bridge: scp-ffi
             lib_rs: crates/scp-ffi/src/lib.rs
             build_cmd: cargo rustc --crate-type cdylib
             cargo_args: >-
               --lib --profile ci-bridge --manifest-path crates/scp-ffi/Cargo.toml
-              --features extension-module,vendored-openssl,testing
+              --features testing
             rustc_args: "-C link-arg=-undefined -C link-arg=dynamic_lookup"
     env:
       BUILD_CMD: ${{ matrix.build_cmd }}
