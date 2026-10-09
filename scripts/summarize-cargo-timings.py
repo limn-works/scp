@@ -27,9 +27,11 @@ import re
 import sys
 from pathlib import Path
 
-# The number of vCPUs a GitHub-hosted `ubuntu-latest` runner gives a job. A sample whose
-# `active` count falls below this number means cargo could not fill the machine.
-RUNNER_CORES = 4
+# The number of vCPUs a GitHub-hosted `ubuntu-latest` runner gives a job, used when the
+# caller names no count. A sample whose `active` count falls below the core count means
+# cargo could not fill the machine. The `bridge-timings` job runs on `macos-latest`, which
+# gives a job 3 vCPUs, so it passes 3 as the second argument.
+DEFAULT_RUNNER_CORES = 4
 TOP_N = 20
 
 
@@ -46,7 +48,7 @@ def extract_array(html: str, name: str) -> list[dict]:
     return json.loads(match.group(1))
 
 
-def summarize(report: Path) -> None:
+def summarize(report: Path, cores: int) -> None:
     html = report.read_text(encoding="utf-8")
     print(f"=== {report.parent.name} ===")
     units = extract_array(html, "UNIT_DATA")
@@ -62,28 +64,32 @@ def summarize(report: Path) -> None:
     print(f"wall time:                 {wall:.1f} s")
     print(f"summed unit time:          {cpu_seconds:.1f} s")
     print(f"mean parallelism:          {cpu_seconds / wall:.2f} units")
-    # A 4-vCPU runner cannot finish sooner than the summed unit time divided by 4, whatever
-    # the dependency graph allows. Comparing the wall time against that floor says whether
-    # the build is short of work to run or short of cores to run it on.
+    # A runner with `cores` vCPUs cannot finish sooner than the summed unit time divided by
+    # `cores`, whatever the dependency graph allows. Comparing the wall time against that
+    # floor says whether the build is short of work to run or short of cores to run it on.
     print(
-        f"{RUNNER_CORES}-core floor (summed/{RUNNER_CORES}): {cpu_seconds / RUNNER_CORES:.1f} s"
-        f"  — wall is {100 * wall / (cpu_seconds / RUNNER_CORES) - 100:+.0f}% against it"
+        f"{cores}-core floor (summed/{cores}): {cpu_seconds / cores:.1f} s"
+        f"  — wall is {100 * wall / (cpu_seconds / cores) - 100:+.0f}% against it"
     )
 
     if concurrency:
         span = concurrency[-1]["t"] / max(len(concurrency) - 1, 1)
-        starved = sum(span for s in concurrency if s["active"] < RUNNER_CORES)
+        starved = sum(span for s in concurrency if s["active"] < cores)
         single = sum(span for s in concurrency if s["active"] <= 1)
-        blocked = sum(span for s in concurrency if s["active"] < RUNNER_CORES and s["waiting"] == 0)
+        blocked = sum(
+            span for s in concurrency if s["active"] < cores and s["waiting"] == 0
+        )
         print(
-            f"wall time under {RUNNER_CORES} active:   {starved:.1f} s "
+            f"wall time under {cores} active:   {starved:.1f} s "
             f"({100 * starved / wall:.0f}% of the build)"
         )
         print(
             f"  of which no unit was ready to start (the dependency graph forced it): "
             f"{blocked:.1f} s ({100 * blocked / wall:.0f}%)"
         )
-        print(f"wall time at 1 or 0 active: {single:.1f} s ({100 * single / wall:.0f}%)")
+        print(
+            f"wall time at 1 or 0 active: {single:.1f} s ({100 * single / wall:.0f}%)"
+        )
 
     last_start = max(u["start"] for u in units)
     print(f"tail after the last unit starts: {wall - last_start:.1f} s")
@@ -117,11 +123,14 @@ def summarize(report: Path) -> None:
 
 def main() -> None:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else "timings")
+    cores = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_RUNNER_CORES
+    if cores < 1:
+        raise SystemExit(f"the core count must be at least 1, got {cores}")
     reports = sorted(root.glob("*/timing.html"))
     if not reports:
         raise SystemExit(f"no timing.html under {root}")
     for report in reports:
-        summarize(report)
+        summarize(report, cores)
 
 
 if __name__ == "__main__":
