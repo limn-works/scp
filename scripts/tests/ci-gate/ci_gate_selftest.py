@@ -5628,12 +5628,36 @@ def leg_step_identities(job: dict, axis: str, value: object) -> set[str] | None:
 
     Each string is the step serialized with sorted keys and every
     `${{ matrix.<axis> }}` replaced by the leg's value, so its `run:` lines,
-    `uses:`, `with:` and `env:` all enter it. Returns None when leg_steps does.
+    `uses:`, `with:` and `env:` all enter it. Returns None when leg_steps does,
+    and when any `${{ }}` expression in the job outside `strategy:`, a step's
+    `if:` and a rust-cache step's `save-if` names `matrix` other than as that
+    exact placeholder: such an expression, in a step or in a job `env:` a step
+    reads, evaluates per leg while its text stays the same on every leg.
     """
     steps = leg_steps(job, axis, value)
     if steps is None:
         return None
     placeholder = leg_placeholder(axis)
+    scanned = {key: item for key, item in job.items() if key != "strategy"}
+    scanned["steps"] = [
+        {
+            key: (
+                {name: text for name, text in item.items() if name != "save-if"}
+                if key == "with"
+                and isinstance(item, dict)
+                and str(step.get("uses", "")).startswith("Swatinem/rust-cache@")
+                else item
+            )
+            for key, item in step.items()
+            if key != "if"
+        }
+        if isinstance(step, dict)
+        else step
+        for step in job.get("steps") or []
+    ]
+    for expression in re.findall(r"\$\{\{.*?\}\}", json.dumps(scanned), re.DOTALL):
+        if re.search(r"\bmatrix\b", expression) and not placeholder.fullmatch(expression):
+            return None
     return {
         placeholder.sub(
             str(value),
@@ -6682,6 +6706,30 @@ def check_push_writer_mutants(doc: dict) -> None:
             ),
         ),
         (
+            "a push-only leg whose run line evaluates an expression on its axis",
+            lambda job: job["steps"].append(
+                {
+                    "run": "cargo test -p scp-transport "
+                    "${{ matrix.leg == 'all' && '--features evil' || '' }}"
+                }
+            ),
+        ),
+        (
+            "a push-only leg reading a job env value built from its axis",
+            lambda job: (
+                job.setdefault("env", {}).update(
+                    {"EXTRA": "${{ matrix.leg == 'all' && './push-only.sh' || 'true' }}"}
+                ),
+                job["steps"].append({"run": "cargo test -p scp-transport && $EXTRA"}),
+            ),
+        ),
+        (
+            "a push-only leg reading a matrix key an include adds",
+            lambda job: job["steps"].append(
+                {"run": "cargo test -p scp-transport ${{ matrix['extra'] }}"}
+            ),
+        ),
+        (
             "a push-only leg that runs no command",
             lambda job: [
                 step.update({"if": step["if"].replace("matrix.leg == 'all' || ", "")})
@@ -6706,6 +6754,17 @@ def check_push_writer_mutants(doc: dict) -> None:
         not any(gap.startswith("rust-test") for gap in push_writer_gaps(doc)),
         f"{push_writer_gaps(doc)}",
     )
+    for job_id in ("rust-test-macos", "rust-clippy"):
+        unrelated = copy.deepcopy(doc)
+        unrelated["jobs"][job_id]["steps"].append(
+            {"run": "cargo test -p scp-transport ${{ github.sha }}"}
+        )
+        check(
+            f"{job_id} with a step every leg runs under a non-matrix expression "
+            "is read without a gap",
+            not any(gap.startswith(job_id) for gap in push_writer_gaps(unrelated)),
+            f"{push_writer_gaps(unrelated)}",
+        )
 
     writing = copy.deepcopy(doc)
     writing["jobs"]["error-codes"].setdefault("steps", []).append(
