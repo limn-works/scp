@@ -152,11 +152,10 @@ nothing:
                shows nothing.
   downloaded-module
                Every real-FFI test module under bindings/python/tests skips
-               itself when the extension is absent from
-               bindings/python/scp_sdk, and the `scp` fixture skips every test
-               that requests it in the same case, so a PyO3 consumer whose
-               downloaded module landed anywhere else leaves pytest exiting 0
-               over zero executed assertions. The check requires
+               itself when the extension does not import, and the `scp` fixture
+               skips every test that requests it when `SCP(storage=...)` raises,
+               so a PyO3 consumer whose downloaded module does not load leaves
+               pytest exiting 0 over zero executed assertions. The check requires
                each fragment in PYO3_ASSERTION_FRAGMENTS in the `run:` text of an
                unguarded step before `pytest tests`.
   downloaded-addon
@@ -3973,14 +3972,14 @@ def pyo3_consumers_missing_an_assertion_fragment(
     comes before the first step whose `run:` text matches `\bpytest tests` and that
     carries no `if:` and no `continue-on-error` other than false.
 
-    WHY: every real-FFI test module under bindings/python/tests skips itself when the
-    extension is absent from bindings/python/scp_sdk, and the `scp` fixture in
-    bindings/python/tests/conftest.py skips every test that requests it in the same
-    case. A consumer whose downloaded module never reached the import path therefore
-    leaves pytest exiting 0 over zero executed assertions in every one of these jobs
-    at once, which is the `zero-test` shape this file names. The fragments also load
-    the module and read its `testing`- and `server`-gated methods, so a module that
-    fails to load or was built without a feature a module calls fails before pytest. `crates/scp-ffi/` compiles `fullstack_create_node` only
+    WHY: every real-FFI test module under bindings/python/tests skips itself when its
+    import of the extension raises ImportError, and the `scp` fixture in
+    bindings/python/tests/conftest.py skips every test that requests it when
+    `scp_sdk` does not import or `SCP(storage=...)` raises anything. A consumer whose
+    downloaded module never reached the import path, failed to load, or was built
+    without a feature a module calls therefore leaves pytest exiting 0 over zero
+    executed assertions in every one of these jobs at once, which is the `zero-test`
+    shape this file names. `crates/scp-ffi/` compiles `fullstack_create_node` only
     under `testing` and `relay_start_in_memory` only under `server`.
     """
     gaps: list[str] = []

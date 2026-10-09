@@ -2870,14 +2870,14 @@ jobs:
           source .venv/bin/activate
           pip install pytest pytest-asyncio
       # THE DEFECT THIS CLOSES: every real-FFI test module under bindings/python/tests
-      # skips itself when the extension is absent from bindings/python/scp_sdk, and the
-      # `scp` fixture in bindings/python/tests/conftest.py skips every test that
-      # requests it in the same case. A download that landed the module anywhere but
-      # bindings/python/scp_sdk would leave pytest exiting 0 over zero executed
-      # assertions, which is the `zero-test` shape
-      # scripts/tests/ci-gate/ci_gate_selftest.py names. This step runs the import and
-      # the construction those guards run, so an absent or unloadable module fails the
-      # job here rather than skipping every real-FFI module. It then reads the two
+      # skips itself when its import of the extension raises ImportError, and the `scp`
+      # fixture in bindings/python/tests/conftest.py skips every test that requests it
+      # when `scp_sdk` does not import or `SCP(storage=...)` raises. A download that
+      # landed the module anywhere but bindings/python/scp_sdk, or a module that does
+      # not load, would leave pytest exiting 0 over zero executed assertions, which is
+      # the `zero-test` shape scripts/tests/ci-gate/ci_gate_selftest.py names. This step
+      # runs the import and the construction those guards run, so such a module fails
+      # the job here rather than skipping every real-FFI module. It then reads the two
       # methods the `server` and `testing` feature lists compile onto the native class,
       # so a build missing either feature fails here, before pytest, with
       # the name of the missing method. Every consumer of a PyO3 artifact runs this step.
