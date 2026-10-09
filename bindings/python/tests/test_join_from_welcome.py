@@ -34,6 +34,7 @@ from scp_sdk.scp import (
     Sealed,
     SealedInvitation,
 )
+from tests.conftest import skip_reason_if_extension_absent
 
 # ---------------------------------------------------------------------------
 # Helpers — minimal bridge mocks (mirrors tests/test_context.py)
@@ -301,16 +302,17 @@ class TestInviteMemberDelegation:
 # Real-FFI — skips without the native module (maturin develop first)
 # ---------------------------------------------------------------------------
 
+_NATIVE_SKIP_REASON: str | None
 try:
     from scp_sdk import _scp_core  # noqa: F401  (installed as scp_sdk._scp_core)
 
-    _HAS_NATIVE = True
-except (ImportError, AttributeError):
-    _HAS_NATIVE = False
+    _NATIVE_SKIP_REASON = None
+except Exception as _exc:
+    _NATIVE_SKIP_REASON = skip_reason_if_extension_absent(_exc)
 
 pytestmark_native = pytest.mark.skipif(
-    not _HAS_NATIVE,
-    reason="Native _scp_core extension not available — run maturin develop first",
+    _NATIVE_SKIP_REASON is not None,
+    reason=_NATIVE_SKIP_REASON or "",
 )
 
 
