@@ -10,9 +10,9 @@
 #     `save-if` does not name `refs/heads/main`. It passes a group with one writer on
 #     main and readers at `false`, including a writer whose `save-if` is a matrix
 #     expression, and it passes a job that restores two groups through two rust-cache
-#     steps, both at `false` — the shape job rust-doc of ci.yml takes, because its
-#     `cargo test --doc` reads build-mode artifacts and its `cargo doc` reads check-mode
-#     ones, and the check counts each step in its own group. It counts a `shared-key`
+#     steps, both at `false` — the shape a job takes when one command reads build-mode
+#     artifacts and another reads check-mode ones — and the check counts each step in
+#     its own group. It counts a `shared-key`
 #     holding `${{ matrix.<axis> }}` as one group per axis value: it passes such a
 #     writer whose groups each have one writer, fails a literal second writer of one of
 #     those groups, fails a key naming an axis the job's matrix gives no list, and

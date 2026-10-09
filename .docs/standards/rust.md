@@ -92,7 +92,7 @@ skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
 
 | Lane | The jobs it guards whose behaviour the pin decides |
 |--------|----------------------------------------------------|
-| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-optional-features`, `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-optional-features`, `rust-test-macos`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-doctest`, `rust-deny`, and `docker-image` |
 | `python` | `pyo3-module` and `pyo3-module-macos` run `maturin develop --profile ci-bridge`, `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge`, `xcframework` runs `bindings/swift/build-xcframework.sh --dev --profile ci-bridge`, and `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing`; `python-test`, `bridge-parity`, `bridge-parity-kotlin` and `bridge-parity-swift` download what those producers upload; `rust-build-pyo3-production` (also on the `rust` lane) builds `scp-ffi` with the wheel's `[tool.maturin] features` |
 | `typescript` | `napi-addon` runs `cargo build -p scp-ffi-napi --profile ci-bridge` and `pyo3-module` runs `maturin develop --profile ci-bridge`; `typescript-check` downloads the NAPI addon and `bridge-parity` downloads both |
 | `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
@@ -408,7 +408,7 @@ cargo nextest run --no-tests=fail -p scp-node --features cloud-blobs,testing --t
 cargo nextest run --no-tests=fail -p scp-relay --features cloud-blobs --test storage_backend
 cargo nextest run --no-tests=fail -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --lib startup::tests
 
-# Doc tests. The `--features` list is the one job `rust-doc` passes; without
+# Doc tests. The `--features` list is the one job `rust-doctest` passes; without
 # the two `cloud-blobs` features, the command compiles no doctest in
 # `postgres_blob.rs` or `s3_blob.rs`.
 cargo test --workspace --doc \
@@ -514,9 +514,9 @@ Every push to a PR branch. Target: < 3 minutes.
 | fmt | ubuntu-latest | `cargo fmt --all -- --check` |
 | clippy | ubuntu-latest | The five `cargo clippy` commands the CI Commands section above gives: the workspace sweep, the optional-transport lint, and the three commands that lint the PostgreSQL and S3 blob backends |
 | test | ubuntu-latest | `cargo nextest run --workspace`. Job `rust-test-optional-features` in `.github/workflows/ci.yml` runs the three `cloud-blobs` test commands the CI Commands section above gives, among its other optional-feature commands. That job splits its commands into three matrix groups: of those three commands, `transport` runs the scp-transport one and `node-relay` runs the scp-node and scp-relay ones, and `platform-testing` runs none of them. |
-| test (macOS) | macos-latest | Job `rust-test-macos` in `.github/workflows/ci.yml` tests scp-transport and scp-platform. |
+| test (macOS) | macos-latest | Job `rust-test-macos` in `.github/workflows/ci.yml` tests scp-transport and scp-platform. On a pull request and in the merge queue it splits its commands into three matrix legs: `transport-local` runs the local scp-transport features, `transport-network` the network transports, and `platform` the scp-platform `apple` feature set. A push to `main` runs every command on one `all` leg, which writes the leg's rust-cache entry. |
 | build-release | ubuntu-latest, macos-latest, windows-latest | `cargo build --workspace --release` |
-| doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
+| doc | ubuntu-latest | The `cargo test --workspace --doc` and the `cargo doc` that the CI Commands section above gives. Job `rust-doctest` in `.github/workflows/ci.yml` runs the first, and job `rust-doc` runs the second. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
 
 A pull request that changes only prose (`.docs/**`, `.claude/**`, a root-level `*.md`, or `docs/guides/**/*.md`) skips every job the `code` output of job `changes` in `.github/workflows/ci.yml` guards, which CODE_JOBS in `scripts/tests/ci-gate/ci_gate_selftest.py` names. Job ci-workflow-selftest runs `scripts/tests/ci-gate/run-tests.sh --group rest`; job ci-workflow-selftest-docs runs `--group docs`, the self-test checks that read tracked prose or list tracked paths, on every pull request. `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` states the routing rules, and `scripts/tests/ci-gate/ci_gate_selftest.py` fails when a tracked path is neither prose nor selected by that output, and when the `docs` and `rest` groups do not split its checks between them.
