@@ -69,6 +69,7 @@ use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::StreamRegistry;
 use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
@@ -278,6 +279,41 @@ pub enum StorageInitError {
         /// The underlying `scp-platform` error rendered via `Display`.
         message: String,
     },
+    /// Another store holds the directory's advisory lock, in this process or
+    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Opener per
+    /// Durable Directory").
+    LockHeld {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl StorageInitError {
+    /// Builds the variant for a failed `SqliteStorage` open: the typed
+    /// lock-still-held condition keeps its own variant, every other open
+    /// failure is [`Self::SqliteOpen`].
+    #[must_use]
+    pub fn from_open_failure(path: String, err: &scp_platform::PlatformError) -> Self {
+        let message = err.to_string();
+        if matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }) {
+            Self::LockHeld { path, message }
+        } else {
+            Self::SqliteOpen { path, message }
+        }
+    }
+
+    /// The registered `SCP-STORAGE-` code for this failure
+    /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
+    /// `8005` for a held lock, `8004` for every other open failure.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SqliteOpen { .. } => scp_ffi_common::error_codes::STORAGE_8004,
+            Self::LockHeld { .. } => scp_ffi_common::error_codes::STORAGE_8005,
+        }
+    }
 }
 
 impl std::fmt::Display for StorageInitError {
@@ -285,6 +321,12 @@ impl std::fmt::Display for StorageInitError {
         match self {
             Self::SqliteOpen { path, message } => {
                 write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+            Self::LockHeld { path, message } => {
+                write!(
+                    f,
+                    "SQLCipher storage at {path} is held by another store: {message}"
+                )
             }
         }
     }
@@ -325,21 +367,25 @@ impl StorageProvider {
         )))
     }
 
-    /// Releases any persistent resources held by the variant.
+    /// Returns the closer for the variant's durable store, or `None` for
+    /// [`StorageProvider::InMemoryEncrypted`], which holds no advisory lock.
     ///
-    /// For [`StorageProvider::Sqlite`] this delegates to
-    /// [`SqliteStorage::close`] to release the advisory lock on
-    /// `scp.db.lock` even when outer `Arc<SqliteStorage>` references
-    /// remain alive. [`StorageProvider::InMemoryEncrypted`] has no
-    /// persistent resources and the call is a no-op.
-    ///
-    /// Called from `bridge_specific_shutdown` on the `PyO3` bridge so
-    /// that `SCP.shutdown()` on a `StorageConfig::Sqlite` instance
-    /// releases the lock at the SDK surface.
-    pub fn close(&self) {
+    /// For [`StorageProvider::Sqlite`] the closer owns a clone of the
+    /// `Arc<SqliteStorage>` and calls [`SqliteStorage::close`], releasing the
+    /// advisory lock on `scp.db.lock` even while other `Arc<SqliteStorage>`
+    /// references remain alive. The `PyO3` bridge returns it from
+    /// `BridgeInstanceCore::durable_store_closer`, so `SCP.shutdown()` closes
+    /// the store after the Supervisor drain (ADR-049 Decision 16).
+    #[must_use]
+    pub fn durable_store_closer(
+        &self,
+    ) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
         match self {
-            Self::InMemoryEncrypted(_) => {}
-            Self::Sqlite(storage) => storage.close(),
+            Self::InMemoryEncrypted(_) => None,
+            Self::Sqlite(storage) => {
+                let storage = Arc::clone(storage);
+                Some(Box::new(move || storage.close()))
+            }
         }
     }
 }
@@ -471,7 +517,8 @@ pub struct PyBridgeInstance {
     /// invisible to another, and instance shutdown drops every live stream
     /// with the `Arc`. Entries are evicted when `poll_next` observes the
     /// terminal (channel-closed) sentinel.
-    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+    pub(crate) outlet_stream_registry:
+        Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
     /// Per-instance active cross-context streaming-saga registry (§5.4.5,
     /// SCP-OUT-047).
@@ -489,7 +536,7 @@ pub struct PyBridgeInstance {
     /// from `outlet_stream_registry` (same-context streams) so the two surfaces
     /// never collide on a handle id.
     pub(crate) outlet_streaming_saga_registry:
-        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+        Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 
     /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
     ///
@@ -507,8 +554,11 @@ impl PyBridgeInstance {
     /// `instance_id`, a fresh `CancellationToken`, and an empty `JoinSet`.
     #[must_use]
     pub fn new_py() -> Self {
+        let core = CoreFields::new();
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::new(),
+            core,
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
             ffi_bridge_state: Arc::new(DashMap::new()),
@@ -516,8 +566,8 @@ impl PyBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
@@ -550,8 +600,11 @@ impl PyBridgeInstance {
     /// provider they used to build the eventual `ContextManager`.
     #[must_use]
     pub fn with_persistence_py(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
+        let core = CoreFields::with_persistence(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence(persistence),
+            core,
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
             ffi_bridge_state: Arc::new(DashMap::new()),
@@ -559,8 +612,8 @@ impl PyBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
@@ -584,14 +637,16 @@ impl PyBridgeInstance {
     ///   trust, and MCP reads hit the same connection pool (one DB
     ///   connection per process — `SQLite` cannot share one across two
     ///   `SqliteStorage::new` calls). If opening fails, the
-    ///   [`StorageInitError::SqliteOpen`] error is returned to the caller
+    ///   [`StorageInitError`] is returned to the caller
     ///   (and logged via `tracing::error!`) — no half-constructed bridge
     ///   is exposed.
     ///
     /// # Errors
     ///
     /// Returns [`StorageInitError::SqliteOpen`] if `SqliteStorage::new`
-    /// fails (bad key, permission denied, corrupt file, schema mismatch).
+    /// fails (bad key, permission denied, corrupt file, schema mismatch), and
+    /// [`StorageInitError::LockHeld`] if another store holds the directory's
+    /// advisory lock.
     pub fn with_storage_py(cfg: StorageConfig) -> Result<Self, StorageInitError> {
         match cfg {
             StorageConfig::InMemory => {
@@ -630,10 +685,7 @@ impl PyBridgeInstance {
                         path = %path.display(),
                         "with_storage_py: SQLCipher open failed — returning error to caller, no in-memory fallback"
                     );
-                    StorageInitError::SqliteOpen {
-                        path: path.display().to_string(),
-                        message: e.to_string(),
-                    }
+                    StorageInitError::from_open_failure(path.display().to_string(), &e)
                 })?;
                 let arc_storage = Arc::new(storage);
                 // Build persistence bridge first so we can share
@@ -641,8 +693,11 @@ impl PyBridgeInstance {
                 let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                 let persistence: Arc<dyn ContextPersistence + Send + Sync> =
                     Arc::new(ProtocolRepositoryContextBridge::new(repo));
+                let core = CoreFields::with_persistence_arc(persistence);
+                let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+                let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
                 let instance = Self {
-                    core: CoreFields::with_persistence_arc(persistence),
+                    core,
                     identity_registry: Arc::new(DashMap::new()),
                     storage_provider: OnceLock::new(),
                     ffi_bridge_state: Arc::new(DashMap::new()),
@@ -650,8 +705,8 @@ impl PyBridgeInstance {
                     mcp_server_registry: Arc::new(DashMap::new()),
                     mcp_client_registry: Arc::new(DashMap::new()),
                     connected_relay_url: RwLock::new(None),
-                    outlet_stream_registry: Arc::new(DashMap::new()),
-                    outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+                    outlet_stream_registry,
+                    outlet_streaming_saga_registry,
                     #[cfg(feature = "testing")]
                     network: std::sync::Mutex::new(None),
                 };
@@ -781,24 +836,29 @@ impl BridgeInstanceCore for PyBridgeInstance {
         &self.core
     }
 
+    fn durable_store_closer(&self) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
+        // The `Sqlite` variant holds an advisory lock on `{dir}/scp.db.lock`
+        // that the shared shutdown releases after the Supervisor drain, so
+        // `SCP(storage=...)` against the same path succeeds after a prior
+        // `SCP.shutdown()` that finished in time.
+        self.storage_provider
+            .get()
+            .and_then(StorageProvider::durable_store_closer)
+    }
+
+    fn release_streams(&self) {
+        // Clear the outlet-stream registry so every live stream's
+        // `StreamSessionHandle` (and its detached chunk receiver) drops.
+        self.outlet_stream_registry.clear();
+        // Clear the cross-context streaming-saga registry so every live saga
+        // stream's chunk receiver drops (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
+    }
+
     fn bridge_specific_shutdown(&self) {
         // Clear the identity registry so held `Arc<FfiKeyCustody>` entries
         // drop, triggering `Zeroizing` on key material.
         self.identity_registry.clear();
-        // `storage_provider` is `OnceLock` — we cannot clear the slot, but
-        // the `Sqlite` variant holds an advisory lock on
-        // `{dir}/scp.db.lock` that must be released at shutdown so
-        // `SCP(storage=...)` against the same path succeeds after a prior
-        // `SCP.shutdown()`. `StorageProvider::close()` delegates to
-        // `SqliteStorage::close()` which drops the `File` inside the
-        // lock-file mutex without dropping the `Arc<SqliteStorage>`
-        // (other Arc holders — `CoreFields::persistence`,
-        // `ContextManager::persistence` — keep the storage struct alive
-        // until the `PyBridgeInstance` itself drops). The
-        // `InMemoryEncrypted` variant's `close()` is a no-op.
-        if let Some(provider) = self.storage_provider.get() {
-            provider.close();
-        }
         // Clear the typed per-context FFI state registry so per-context
         // `OutletRegistry`, `EventLog`, receive channel senders, and
         // registered outlet handlers drop.
@@ -808,16 +868,6 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
-        // Clear the outlet-stream registry so every live stream's
-        // `StreamSessionHandle` (and its detached chunk receiver) drops —
-        // dropping the receiver closes the channel and lets the off-mailbox
-        // pump observe the close and settle out during instance shutdown.
-        self.outlet_stream_registry.clear();
-        // Clear the cross-context streaming-saga registry so every live saga
-        // stream's chunk receiver drops — dropping the receiver closes the
-        // channel and lets the off-mailbox seal task observe the close and
-        // settle out during instance shutdown (SCP-OUT-047).
-        self.outlet_streaming_saga_registry.clear();
         // Reset lifecycle-owned typed slots so their held URLs / networks
         // do not survive past shutdown. Best-effort: on lock poisoning
         // we swallow the error and leave the slot alone — a poisoned
@@ -2921,6 +2971,35 @@ pub fn remove_identity_if_present(bi: &PyBridgeInstance, did: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The stream registries this bridge builds share its core's shutdown
+    /// gate: a streaming-saga entry registers before shutdown begins and is
+    /// refused after `stop_borrowers`.
+    #[test]
+    fn stream_registries_refuse_inserts_once_shutdown_begins() {
+        fn entry(saga_id: &str) -> scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: "ctx".to_owned(),
+                invoker_did: "invoker".to_owned(),
+                request_id: [0u8; 16],
+            }
+        }
+        let bi = PyBridgeInstance::new_py();
+        assert!(
+            bi.outlet_streaming_saga_registry
+                .insert("early".to_owned(), entry("early"))
+        );
+        bi.core.stop_borrowers();
+        assert!(
+            !bi.outlet_streaming_saga_registry
+                .insert("late".to_owned(), entry("late"))
+        );
+        assert!(!bi.outlet_streaming_saga_registry.contains_key("late"));
+        assert!(bi.outlet_streaming_saga_registry.contains_key("early"));
+    }
     // Test-harness key-custody nullifier: used only by the `#[cfg(feature =
     // "testing")]` identity-registry tests below. Gated so the shipped
     // (no-`testing`) test lane — which exists now that this module carries
@@ -3919,6 +3998,72 @@ mod tests {
             bi.storage_provider().is_some(),
             "with_storage_py(InMemory) must initialize the storage provider"
         );
+    }
+
+    /// `from_open_failure` keeps the lock-still-held condition apart from
+    /// every other open failure, and `code()` names each one's registered
+    /// code (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes).
+    #[test]
+    fn open_failure_classification_carries_registered_codes() {
+        let held = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+        );
+        assert!(
+            matches!(held, StorageInitError::LockHeld { .. }),
+            "{held:?}"
+        );
+        assert_eq!(held.code(), scp_ffi_common::error_codes::STORAGE_8005);
+        let other = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageError("bad key".to_owned()),
+        );
+        assert!(
+            matches!(other, StorageInitError::SqliteOpen { .. }),
+            "{other:?}"
+        );
+        assert_eq!(other.code(), scp_ffi_common::error_codes::STORAGE_8004);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": a second open of a
+    /// directory whose store is live fails with `LockHeld`, and a shutdown
+    /// that finished in time closes the store (through the bridge's
+    /// `durable_store_closer`) before it returns, so a reopen succeeds on its
+    /// first attempt even while the shut-down instance is still alive.
+    #[test]
+    fn sqlite_shutdown_releases_the_lock_before_returning() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
+        })
+        .expect("first open");
+        let second = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            matches!(second, Err(StorageInitError::LockHeld { .. })),
+            "a second open of a live store's directory must fail with LockHeld"
+        );
+        let outcome = test_rt().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "{outcome:?}"
+        );
+        let reopened = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            reopened.is_ok(),
+            "a reopen after a shutdown that finished in time must succeed on its first attempt"
+        );
+        drop(bi);
     }
 
     /// Build a dedicated current-thread tokio runtime so the async `Storage`

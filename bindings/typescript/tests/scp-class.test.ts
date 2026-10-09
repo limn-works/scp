@@ -287,8 +287,7 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   test("shutdown is idempotent — a second call resolves without error", async () => {
     const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     await expect(scp.shutdown(1000n)).resolves.toBeUndefined();
-    // Second call should not throw — AlreadyShutDown maps to a harmless
-    // lifecycle observation on the SDK surface.
+    // A second call on an in-memory instance does not throw.
     await expect(scp.shutdown(1000n)).resolves.toBeUndefined();
   });
 });

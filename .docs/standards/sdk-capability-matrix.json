@@ -2116,7 +2116,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."
+          "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on the bridge's own JoinSet up to the timeout and aborts the JoinSet tasks still running at the deadline, then drains the Supervisor within the remaining budget before the store closes; a drain still running at the deadline is never aborted. An SDK shutdown raises SCP-STORAGE-8005 when the instance's own store keeps its advisory lock. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."
         },
         {
           "name": "suspend",

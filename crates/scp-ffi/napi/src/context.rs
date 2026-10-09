@@ -832,17 +832,7 @@ pub(crate) async fn context_create_on(
                     code: codes::CTX_2000.to_owned(),
                 })
             })?
-            .map_err(|e| match e {
-                // The core's empty-ceiling rejection keeps its typed
-                // validation code (construction.md M2).
-                scp_core::context::builder::ContextCreationError::StateTransition(
-                    scp_core::context::ContextError::CeilingRequired(_),
-                ) => NapiError::from(ScpNapiError::from(e)),
-                other => NapiError::from(ScpNapiError::Context {
-                    message: format!("create_context failed: {other}"),
-                    code: codes::CTX_2000.to_owned(),
-                }),
-            })?
+            .map_err(|e| NapiError::from(create_context_failure(e)))?
     };
 
     // Register the creator's DID as a local DID for defense-in-depth. Routes
@@ -1303,10 +1293,16 @@ pub(crate) async fn reserve_key_package_on(
 
     let sup = crate::runtime::supervisor(bi)?;
     let sup = Arc::clone(sup);
-    let (reservation_id, kp_public) = sup
-        .reserve_key_package(DID(owning_did))
-        .await
-        .map_err(|e| NapiError::from(busy_or("reserve_key_package", codes::CTX_2000, &e)))?;
+    let (reservation_id, kp_public) =
+        sup.reserve_key_package(DID(owning_did))
+            .await
+            .map_err(|e| {
+                NapiError::from(typed_supervisor_failure(
+                    "reserve_key_package",
+                    codes::CTX_2000,
+                    &e,
+                ))
+            })?;
 
     Ok(NapiKeyPackageReservation {
         reservation_id: reservation_id.to_string(),
@@ -1467,7 +1463,7 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(NapiError::from(busy_or(
+            return Err(NapiError::from(typed_supervisor_failure(
                 "context_join_from_welcome",
                 codes::CTX_2013,
                 &e,
@@ -1623,8 +1619,13 @@ pub(crate) async fn invite_member_on(
     // is what triggers the wipe here (matching the PyO3 reference bridge).
     drop(signing_key);
 
-    let outcome =
-        outcome.map_err(|e| NapiError::from(busy_or("invite_member", codes::CTX_2013, &e)))?;
+    let outcome = outcome.map_err(|e| {
+        NapiError::from(typed_supervisor_failure(
+            "invite_member",
+            codes::CTX_2013,
+            &e,
+        ))
+    })?;
     Ok(NapiInviteMemberOutcome::from_outcome(outcome))
 }
 
@@ -2198,11 +2199,10 @@ pub(crate) async fn context_subscribe_on(
     // orphan the task, making shutdown falsely report `GracefulWithin`
     // while the subscription still held onto `transport_mgr`,
     // `ContextManager`, and the cancel_token Arcs.
-    // Capture an owned `Arc<Supervisor>` scoped to this bridge so the spawned
-    // task doesn't need to re-resolve it via a per-instance lookup. Falls back
-    // gracefully if the supervisor is not attached yet; the spawned task
-    // signals completion when so.
-    let supervisor_for_task = crate::runtime::supervisor(bi).ok().cloned();
+    // A `Weak` (ADR-049 Decision 16): the subscribe task and the heartbeat
+    // scheduler run in the bridge's `JoinSet` and must not keep the Supervisor
+    // alive past shutdown. Each use upgrades it; a failed upgrade ends the task.
+    let supervisor_for_task = crate::runtime::supervisor(bi).ok().map(Arc::downgrade);
 
     // §9.9.2 send side: resolve the local member's signing key now (the key
     // lives at this FFI boundary, never inside the actor) so a periodic
@@ -2250,7 +2250,10 @@ pub(crate) async fn context_subscribe_on(
             None
         } else {
             use scp_core::context::actor::commands::QueriesCommand;
-            match supervisor_for_task.as_ref() {
+            match supervisor_for_task
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
                 Some(sup) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = QueriesCommand::LocalPseudonym {
@@ -2373,16 +2376,24 @@ pub(crate) async fn context_subscribe_on(
                         envelope_bytes: envelope.encrypted_blob.clone(),
                         reply: tx,
                     };
-                    let dispatch_result = supervisor.dispatch_command(&context_id, cmd).await;
+                    let Some(dispatch_result) =
+                        dispatch_to_live_supervisor(&supervisor, &context_id, cmd).await
+                    else {
+                        tracing::debug!(
+                            context_id = %context_id,
+                            "supervisor dropped; subscription ends"
+                        );
+                        break;
+                    };
                     let reply_result = if dispatch_result.is_ok() {
                         rx.await.ok()
                     } else {
                         None
                     };
                     let deliver_result = match (dispatch_result, reply_result) {
-                        (Ok(_), Some(r)) => r,
+                        (Ok(()), Some(r)) => r,
                         (Err(e), _) => Err(e),
-                        (Ok(_), None) => Err(scp_core::context::ContextError::CryptoFailed(
+                        (Ok(()), None) => Err(scp_core::context::ContextError::CryptoFailed(
                             "deliver shim reply dropped".to_owned(),
                         )),
                     };
@@ -2474,8 +2485,8 @@ pub(crate) async fn context_subscribe_on(
         // `cancel_token`; the other three did not, so without this the
         // `run_heartbeat_scheduler` task (which shares this `cancel_token`)
         // would keep firing `Supervisor::send_heartbeat` on a dead
-        // subscription — leaking the task plus its owned `Arc<Supervisor>`
-        // and exported signing key, and emitting false liveness. A later
+        // subscription — leaking the task and exported signing key, and
+        // emitting false liveness. A later
         // re-subscribe overwrites the handle's cancel token without cancelling
         // the old one, so this teardown is the only thing that stops the
         // orphaned scheduler. Cancelling an already-cancelled token (the
@@ -4655,10 +4666,11 @@ pub(crate) async fn context_restore_on(
         reply: tx,
     };
     sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("supervisor dispatch_lifecycle_command failed: {e}"),
-            code: codes::CTX_2064.to_owned(),
-        })
+        NapiError::from(typed_supervisor_failure(
+            "supervisor dispatch_lifecycle_command",
+            codes::CTX_2064,
+            &e,
+        ))
     })?;
     rx.await
         .map_err(|e| {
@@ -4668,10 +4680,11 @@ pub(crate) async fn context_restore_on(
             })
         })?
         .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("restore_context failed: {e}"),
-                code: codes::CTX_2064.to_owned(),
-            })
+            NapiError::from(typed_supervisor_failure(
+                "restore_context",
+                codes::CTX_2064,
+                &e,
+            ))
         })?;
     crate::runtime::readmit_context(bi, &context_id);
     Ok(())
@@ -4689,10 +4702,11 @@ pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Res
     let sup = crate::runtime::supervisor(bi)?;
 
     let restored = sup.restore_on_startup().await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("restore_all_contexts failed: {e}"),
-            code: codes::CTX_2065.to_owned(),
-        })
+        NapiError::from(typed_supervisor_failure(
+            "restore_all_contexts",
+            codes::CTX_2065,
+            &e,
+        ))
     })?;
     for context_id in &restored {
         crate::runtime::readmit_context(bi, context_id);
@@ -5614,23 +5628,58 @@ fn parse_template_id_napi(
 }
 
 /// Maps a failed supervisor call that otherwise reports every failure under
-/// one fixed `code` to the bridge error, keeping `ActorBusy` apart.
+/// one fixed `code` to the bridge error, keeping `ActorBusy` and
+/// `SupervisorShutDown` apart.
 ///
 /// `ActorBusy` reports `SCP-CTX-2130` (ADR-049 §10), whose producers and retry
-/// behaviour the `ContextError::ActorBusy` doc states. Every other failure
-/// reports `code`.
+/// behaviour the `ContextError::ActorBusy` doc states. `SupervisorShutDown`
+/// reports `SCP-CTX-2138`. Every other failure reports `code`.
 /// The Welcome join, the key-package reservation and the invite map their
 /// errors through it.
-fn busy_or(op: &str, code: &str, e: &scp_core::context::ContextError) -> ScpNapiError {
-    let code = if matches!(e, scp_core::context::ContextError::ActorBusy(_)) {
-        codes::CTX_2130
-    } else {
-        code
+fn typed_supervisor_failure(
+    op: &str,
+    code: &str,
+    e: &scp_core::context::ContextError,
+) -> ScpNapiError {
+    let code = match e {
+        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
+        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
+        _ => code,
     };
     ScpNapiError::Context {
         message: format!("{op} failed: {e}"),
         code: code.to_owned(),
     }
+}
+
+/// Maps a refused `CreateContext` to its SDK error. The core's empty-ceiling
+/// rejection keeps its typed validation code (construction.md M2), and a
+/// create refused because Supervisor shutdown began keeps SCP-CTX-2138; every
+/// other failure carries SCP-CTX-2000.
+fn create_context_failure(e: scp_core::context::builder::ContextCreationError) -> ScpNapiError {
+    match e {
+        scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_),
+        ) => ScpNapiError::from(e),
+        other => ScpNapiError::Context {
+            message: format!("create_context failed: {other}"),
+            code: codes::CTX_2000.to_owned(),
+        },
+    }
+}
+
+/// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still
+/// points at, holding the upgraded `Arc` only for the dispatch. `None` when the
+/// Supervisor has dropped, which ends the relay subscription loop (ADR-049
+/// Decision 16).
+async fn dispatch_to_live_supervisor(
+    supervisor: &std::sync::Weak<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+    cmd: scp_core::context::actor::commands::MessagingCommand,
+) -> Option<Result<(), scp_core::context::ContextError>> {
+    let live = supervisor.upgrade()?;
+    Some(live.dispatch_command(context_id, cmd).await.map(drop))
 }
 
 // ---------------------------------------------------------------------------
@@ -5654,6 +5703,41 @@ mod tests {
     use scp_did::DID;
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
+
+    /// A create refused because Supervisor shutdown began keeps SCP-CTX-2138;
+    /// an unrelated create failure carries SCP-CTX-2000.
+    #[test]
+    fn create_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::builder::ContextCreationError;
+        let code_of = |e: ContextCreationError| match super::create_context_failure(e) {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected a context error, got {other:?}"),
+        };
+        assert_eq!(
+            code_of(ContextCreationError::StateTransition(
+                scp_core::context::ContextError::SupervisorShutDown("create".to_owned()),
+            )),
+            codes::CTX_2138
+        );
+        assert_eq!(
+            code_of(ContextCreationError::TransportNotConnected),
+            codes::CTX_2000
+        );
+    }
+
+    /// A dropped Supervisor yields `None`, which ends the subscription loop.
+    #[tokio::test]
+    async fn dispatch_to_dropped_supervisor_ends_the_subscription() {
+        use scp_core::context::actor::commands::MessagingCommand;
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DeliverIncoming {
+            context_id: "ctx".to_owned(),
+            envelope_bytes: vec![1, 2, 3],
+            reply,
+        };
+        let outcome = super::dispatch_to_live_supervisor(&std::sync::Weak::new(), "ctx", cmd).await;
+        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
+    }
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
     /// supervisor. Mirrors the production rewire pattern but is callable
@@ -7690,10 +7774,11 @@ mod tests {
     }
 
     /// A Welcome join, a key-package reservation or an invite that meets a
-    /// busy actor reports `SCP-CTX-2130`, and any other failure reads the
+    /// busy actor reports `SCP-CTX-2130`, one refused because Supervisor
+    /// shutdown began reports `SCP-CTX-2138`, and any other failure reads the
     /// operation's own code.
     #[test]
-    fn busy_or_keeps_actor_busy_code() {
+    fn typed_supervisor_failure_keeps_typed_codes() {
         use scp_core::context::ContextError;
         let code_of = |e: crate::error::ScpNapiError| match e {
             crate::error::ScpNapiError::Context { code, .. } => code,
@@ -7701,7 +7786,7 @@ mod tests {
         };
         for fallback in [codes::CTX_2013, codes::CTX_2000] {
             assert_eq!(
-                code_of(super::busy_or(
+                code_of(super::typed_supervisor_failure(
                     "reserve_key_package",
                     fallback,
                     &ContextError::ActorBusy("key-package actor".to_owned())
@@ -7709,12 +7794,90 @@ mod tests {
                 codes::CTX_2130
             );
             assert_eq!(
-                code_of(super::busy_or(
+                code_of(super::typed_supervisor_failure(
+                    "context_join_from_welcome",
+                    fallback,
+                    &ContextError::SupervisorShutDown("spawn context actor".to_owned())
+                )),
+                codes::CTX_2138
+            );
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
                     "context_join_from_welcome",
                     fallback,
                     &ContextError::MembershipFailed("bad welcome".to_owned())
                 )),
                 fallback
+            );
+        }
+    }
+
+    /// A single or restore-all restore refused because Supervisor shutdown
+    /// began keeps `SCP-CTX-2138`; any other failure reads the site's own
+    /// code (`SCP-CTX-2064` for one context, `SCP-CTX-2065` for restore-all).
+    #[test]
+    fn restore_failures_keep_supervisor_shut_down_typed() {
+        use scp_core::context::ContextError;
+        let code_of = |e: crate::error::ScpNapiError| match e {
+            crate::error::ScpNapiError::Context { code, .. } => code,
+            other => panic!("expected ScpNapiError::Context, got {other:?}"),
+        };
+        for (op, fallback) in [
+            ("restore_context", codes::CTX_2064),
+            ("restore_all_contexts", codes::CTX_2065),
+        ] {
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    op,
+                    fallback,
+                    &ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+                )),
+                codes::CTX_2138
+            );
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    op,
+                    fallback,
+                    &ContextError::MembershipFailed("bad snapshot".to_owned()),
+                )),
+                fallback
+            );
+        }
+    }
+
+    /// `context_create` and `context_restore`, called through the bridge
+    /// after the Supervisor's shutdown began, fail with `SCP-CTX-2138`.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_and_restore_after_supervisor_shutdown_keep_ctx_2138() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let owner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        crate::runtime::init_supervisor(&bi, &owner.inner.did);
+        crate::runtime::supervisor(&bi)
+            .expect("supervisor initialized")
+            .shutdown_all_contexts()
+            .await;
+        let restore = super::context_restore_on(&bi, "0".repeat(64))
+            .await
+            .expect_err("a restore after shutdown must be refused");
+        let create = super::context_create_on(
+            &bi,
+            &owner,
+            r#"{"memoryScope":"ephemeral","ceiling":["messages:read"]}"#.to_owned(),
+        )
+        .await
+        .err()
+        .expect("a create after shutdown must be refused");
+        for (name, err) in [("restore", restore), ("create", create)] {
+            assert!(
+                err.reason.starts_with(&format!("[{}] ", codes::CTX_2138)),
+                "{name}: expected {}, got: {}",
+                codes::CTX_2138,
+                err.reason
             );
         }
     }

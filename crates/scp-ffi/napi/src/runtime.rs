@@ -20,6 +20,7 @@
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::bridge_instance::StreamRegistry;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `napi_check_handle!` macro can refer to it as `$crate::runtime::CoreFields`
 // without each caller importing the full `scp_ffi_common` path.
@@ -144,6 +145,41 @@ pub enum StorageInitError {
         /// The underlying `scp-platform` error rendered via `Display`.
         message: String,
     },
+    /// Another store holds the directory's advisory lock, in this process or
+    /// another (`PlatformError::StorageLockHeld`; spec §17.6 "One Opener per
+    /// Durable Directory").
+    LockHeld {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl StorageInitError {
+    /// Builds the variant for a failed `SqliteStorage` open: the typed
+    /// lock-still-held condition keeps its own variant, every other open
+    /// failure is [`Self::SqliteOpen`].
+    #[must_use]
+    pub fn from_open_failure(path: String, err: &scp_platform::PlatformError) -> Self {
+        let message = err.to_string();
+        if matches!(err, scp_platform::PlatformError::StorageLockHeld { .. }) {
+            Self::LockHeld { path, message }
+        } else {
+            Self::SqliteOpen { path, message }
+        }
+    }
+
+    /// The registered `SCP-STORAGE-` code for this failure
+    /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
+    /// `8005` for a held lock, `8004` for every other open failure.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SqliteOpen { .. } => scp_ffi_common::error_codes::STORAGE_8004,
+            Self::LockHeld { .. } => scp_ffi_common::error_codes::STORAGE_8005,
+        }
+    }
 }
 
 impl std::fmt::Display for StorageInitError {
@@ -151,6 +187,12 @@ impl std::fmt::Display for StorageInitError {
         match self {
             Self::SqliteOpen { path, message } => {
                 write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+            Self::LockHeld { path, message } => {
+                write!(
+                    f,
+                    "SQLCipher storage at {path} is held by another store: {message}"
+                )
             }
         }
     }
@@ -333,10 +375,10 @@ pub struct NapiBridgeInstance {
     /// control-plane handle + detached chunk receiver. Per-instance (never a
     /// `static` — `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a
     /// stream opened on one instance is invisible to another, and instance
-    /// shutdown drops every live stream with the `Arc`. Cleared by
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// shutdown drops every live stream with the `Arc`. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_stream_registry`.
-    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+    pub(crate) outlet_stream_registry:
+        Arc<StreamRegistry<String, crate::outlet_stream::StreamEntry>>,
 
     /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
     /// (SCP-OUT-047, pass 3a).
@@ -348,11 +390,10 @@ pub struct NapiBridgeInstance {
     /// invoker DID, and `request_id`. Per-instance (never a `static` —
     /// `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a saga opened
     /// on one instance is invisible to another, and instance shutdown drops every
-    /// live saga stream with the `Arc`. Cleared by
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// live saga stream with the `Arc`. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_streaming_saga_registry`.
     pub(crate) outlet_streaming_saga_registry:
-        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+        Arc<StreamRegistry<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
@@ -398,8 +439,11 @@ impl NapiBridgeInstance {
         // the handle is moved into `durable_providers_from_handle`.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::new();
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::new(),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             released_contexts: std::sync::Mutex::new(HashMap::new()),
             next_release_generation: std::sync::atomic::AtomicU64::new(0),
@@ -413,8 +457,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -434,8 +478,11 @@ impl NapiBridgeInstance {
         // selected before the handle is moved into the durable providers.
         let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
+        let core = CoreFields::with_persistence(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             released_contexts: std::sync::Mutex::new(HashMap::new()),
             next_release_generation: std::sync::atomic::AtomicU64::new(0),
@@ -449,8 +496,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -474,8 +521,10 @@ impl NapiBridgeInstance {
     ///
     /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
     /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
-    /// or a salt-sidecar fail-closed condition). FAIL CLOSED (spec §17.6): the
-    /// bridge does NOT silently degrade to in-memory or no-storage on a failed
+    /// or a salt-sidecar fail-closed condition), and
+    /// [`StorageInitError::LockHeld`] if another store holds the directory's
+    /// advisory lock. FAIL CLOSED (spec §17.6): the bridge does NOT silently
+    /// degrade to in-memory or no-storage on a failed
     /// durable-backend open. The error is surfaced to the `SCP.withStorage`
     /// factory and thrown as a JS `ValidationError`.
     pub fn with_storage_napi(config: StorageConfig) -> Result<Self, StorageInitError> {
@@ -505,10 +554,7 @@ impl NapiBridgeInstance {
                         path = %path.display(),
                         "with_storage_napi: SQLCipher open failed — failing closed, no in-memory fallback"
                     );
-                    StorageInitError::SqliteOpen {
-                        path: path.display().to_string(),
-                        message: e.to_string(),
-                    }
+                    StorageInitError::from_open_failure(path.display().to_string(), &e)
                 })?;
 
                 let arc_storage = Arc::new(storage);
@@ -568,8 +614,11 @@ impl NapiBridgeInstance {
         durable_providers: scp_core::context::supervisor::DurableProviders,
         credential_store: FfiCredentialStore,
     ) -> Self {
+        let core = CoreFields::with_persistence_arc(persistence);
+        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
+        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
-            core: CoreFields::with_persistence_arc(persistence),
+            core,
             ucan_registry: Arc::new(DashMap::new()),
             released_contexts: std::sync::Mutex::new(HashMap::new()),
             next_release_generation: std::sync::atomic::AtomicU64::new(0),
@@ -583,8 +632,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
-            outlet_stream_registry: Arc::new(DashMap::new()),
-            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry,
+            outlet_streaming_saga_registry,
         }
     }
 
@@ -680,10 +729,28 @@ impl BridgeInstanceCore for NapiBridgeInstance {
     // gate `scripts/check-bridge-instance-lifecycle.py`.
 
     // `shutdown` inherits the `BridgeInstanceCore` default (ADR-049 §11,
-    // landed in commit 6): `core.shutdown_core_async(timeout).await +
-    // bridge_specific_shutdown()`. Overriding here would diverge from
+    // landed in commit 6). Overriding here would diverge from
     // the shared contract and be caught by the cross-bridge consistency
     // gate `scripts/check-bridge-instance-lifecycle.py`.
+
+    fn durable_store_closer(&self) -> Option<scp_ffi_common::bridge_instance::DurableStoreCloser> {
+        // The `Sqlite` variant's advisory lock on `{dir}/scp.db.lock` is
+        // released after the Supervisor drain, so a later
+        // `new SCP({ storage: { type: 'sqlite', path, key } })` against the
+        // same directory succeeds once a shutdown finished in time.
+        self.protocol_repository.durable_store_closer()
+    }
+
+    fn release_streams(&self) {
+        // Drop every live §5.4.5 stream on this instance — dropping the
+        // `StreamEntry` `Arc`s releases the control handle + chunk receiver
+        // (SCP-OUT-037, C8a).
+        self.outlet_stream_registry.clear();
+        // Drop every live §5.4.5 / §6.2.4 cross-context streaming saga on this
+        // instance — dropping the `StreamingSagaEntry` `Arc`s releases each
+        // saga's chunk receiver (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
+    }
 
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping the `Arc<NapiKeyCustody>` values
@@ -695,29 +762,12 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         lock_release_marks(self).clear();
         self.context_handles.clear();
         self.identity_registry.clear();
-        // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
-        // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
-        // (`CoreFields::persistence`, `ContextManager`) keep the storage
-        // struct alive until the `NapiBridgeInstance` drops, but the
-        // advisory lock must be released now so that a subsequent
-        // `new SCP({ storage: { type: 'sqlite', path, key } })` against
-        // the same directory does not fail with "already open by another
-        // SCP instance". The `InMemory` variant's `close()` is a no-op.
-        self.protocol_repository.close();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         // Migrated off `crate::mcp::clear_registries` (called by a
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
-        // Drop every live §5.4.5 stream on this instance — dropping the
-        // `StreamEntry` `Arc`s releases the control handle + chunk receiver, so
-        // any parked pump task winds down (SCP-OUT-037, C8a).
-        self.outlet_stream_registry.clear();
-        // Drop every live §5.4.5 / §6.2.4 cross-context streaming saga on this
-        // instance — dropping the `StreamingSagaEntry` `Arc`s releases each
-        // saga's chunk receiver (SCP-OUT-047).
-        self.outlet_streaming_saga_registry.clear();
         // Reset the full-stack test network slot. Best-effort: on lock
         // poisoning we leave the slot alone — a poisoned mutex means
         // another thread panicked while holding it, which is a larger
@@ -2725,6 +2775,35 @@ mod tests {
     use super::*;
     use scp_core::context::roles::default_ceiling;
 
+    /// The stream registries this bridge builds share its core's shutdown
+    /// gate: a streaming-saga entry registers before shutdown begins and is
+    /// refused after `stop_borrowers`.
+    #[test]
+    fn stream_registries_refuse_inserts_once_shutdown_begins() {
+        fn entry(saga_id: &str) -> scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: "ctx".to_owned(),
+                invoker_did: "invoker".to_owned(),
+                request_id: [0u8; 16],
+            }
+        }
+        let bi = NapiBridgeInstance::new_napi();
+        assert!(
+            bi.outlet_streaming_saga_registry
+                .insert("early".to_owned(), entry("early"))
+        );
+        bi.core.stop_borrowers();
+        assert!(
+            !bi.outlet_streaming_saga_registry
+                .insert("late".to_owned(), entry("late"))
+        );
+        assert!(!bi.outlet_streaming_saga_registry.contains_key("late"));
+        assert!(bi.outlet_streaming_saga_registry.contains_key("early"));
+    }
+
     // -----------------------------------------------------------------------
     // BridgeInstance tests (#1549)
     // -----------------------------------------------------------------------
@@ -2883,6 +2962,72 @@ mod tests {
             bi.durable_providers_ref().is_some(),
             "in-memory dev path must populate the durable providers"
         );
+    }
+
+    /// `from_open_failure` keeps the lock-still-held condition apart from
+    /// every other open failure, and `code()` names each one's registered
+    /// code (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes).
+    #[test]
+    fn open_failure_classification_carries_registered_codes() {
+        let held = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+        );
+        assert!(
+            matches!(held, StorageInitError::LockHeld { .. }),
+            "{held:?}"
+        );
+        assert_eq!(held.code(), scp_ffi_common::error_codes::STORAGE_8005);
+        let other = StorageInitError::from_open_failure(
+            "/tmp/scp".to_owned(),
+            &scp_platform::PlatformError::StorageError("bad key".to_owned()),
+        );
+        assert!(
+            matches!(other, StorageInitError::SqliteOpen { .. }),
+            "{other:?}"
+        );
+        assert_eq!(other.code(), scp_ffi_common::error_codes::STORAGE_8004);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": a second open of a
+    /// directory whose store is live fails with `LockHeld`, and a shutdown
+    /// that finished in time closes the store (through the bridge's
+    /// `durable_store_closer`) before it returns, so a reopen succeeds on its
+    /// first attempt even while the shut-down instance is still alive.
+    #[test]
+    fn sqlite_shutdown_releases_the_lock_before_returning() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x33u8; 32])),
+        })
+        .expect("first open");
+        let second = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            matches!(second, Err(StorageInitError::LockHeld { .. })),
+            "a second open of a live store's directory must fail with LockHeld"
+        );
+        let outcome = crate::runtime().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "{outcome:?}"
+        );
+        let reopened = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x33u8; 32])),
+        });
+        assert!(
+            reopened.is_ok(),
+            "a reopen after a shutdown that finished in time must succeed on its first attempt"
+        );
+        drop(bi);
     }
 
     #[test]

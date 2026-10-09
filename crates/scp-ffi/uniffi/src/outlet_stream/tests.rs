@@ -498,6 +498,44 @@ async fn live_poll_next_drains_to_terminal() {
         format!("{after}").contains("no active outlet stream"),
         "post-terminal poll is a not-found error: {after}"
     );
+
+    // Once bridge shutdown has begun, the open call site refuses to register a
+    // stream the still-live Supervisor opened: the caller receives
+    // `SCP-CTX-2139` and the registry holds no entry for it. The late open
+    // carries a token of its own, because the nonce check refuses a second use
+    // of the first open's token before the open reaches registration.
+    let late_ucan = scp
+        .ucan_mint(
+            Arc::clone(&handle),
+            invoker.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("ucan_mint should succeed");
+    bi.core.stop_borrowers();
+    let late = outlet_stream_open_impl(
+        &bi,
+        &handle,
+        outlet_id.clone(),
+        r#"{"a":"1","b":"2"}"#.to_owned(),
+        invoker.clone(),
+        late_ucan.encoded(),
+        None,
+        None,
+        None,
+        Some(1),
+    )
+    .await
+    .expect_err("an open after bridge shutdown began must be refused");
+    assert!(
+        format!("{late}").contains(codes::CTX_2139),
+        "a late open is refused with SCP-CTX-2139: {late}"
+    );
+    assert!(
+        bi.outlet_stream_registry.is_empty(),
+        "a refused late open leaves no registry entry"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,4 +1284,95 @@ mod xctx_streaming_saga_tests {
             "the refusal must come from the live role-state read: {err}"
         );
     }
+}
+
+/// A stream or streaming saga the bridge refuses to register once bridge
+/// shutdown has begun had already started, so it reaches the caller as the
+/// Context class with `SCP-CTX-2139` (and, for a saga, its id), never with
+/// `SCP-CTX-2138`, the code of the Supervisor's own stream refusal, which
+/// comes before anything started and is also the Context class.
+#[test]
+fn late_shutdown_refusals_differ_from_supervisor_refusal_code() {
+    let ScpError::Context { code, .. } = late_registration_err(
+        scp_ffi_common::bridge_instance::late_registration_refusal(None),
+    ) else {
+        panic!("a late stream refusal must be the Context class");
+    };
+    assert_eq!(code, codes::CTX_2139);
+    let ScpError::Context { code, .. } = open_rejection_to_err(
+        &scp_core::context::outlets::invoke::OutletStreamOpenError::SupervisorShutDown {
+            message: "open outlet stream refused".to_owned(),
+        },
+    ) else {
+        panic!("the Supervisor's own stream refusal must be the Context class");
+    };
+    assert_eq!(code, codes::CTX_2138);
+    assert!(
+        matches!(
+            open_rejection_to_err(
+                &scp_core::context::outlets::invoke::OutletStreamOpenError::Rejected(
+                    scp_core::context::outlets::OpenStreamRejection::ContextNotActive {
+                        current_state: "Closing".to_owned(),
+                    },
+                ),
+            ),
+            ScpError::Outlet { .. }
+        ),
+        "an open rejection keeps the Outlet class"
+    );
+
+    assert!(
+        matches!(
+            map_saga_error(
+                scp_core::context::supervisor::SagaError::SupervisorShutDown {
+                    message: "start cross-context streaming saga".to_owned(),
+                }
+            ),
+            ScpError::SagaAborted { .. }
+        ),
+        "the Supervisor's own streaming-saga refusal keeps the SagaAborted class"
+    );
+}
+
+/// A started streaming saga registers while the bridge runs, and once
+/// `stop_borrowers` has run the registration is refused with the Context
+/// class, `SCP-CTX-2139` and the saga id, and leaves no registry entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_saga_registration_refused_after_shutdown_began() {
+    let scp = crate::scp::Scp::new_in_memory_for_test();
+    let bi = Arc::clone(&scp.inner);
+    let entry = |id: &str| {
+        let (_tx, rx) = mpsc::channel(1);
+        StreamingSagaEntry {
+            receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+            saga_id: scp_core::context::supervisor::SagaId(id.to_owned()),
+            target_context_id: "target-ctx-late".to_owned(),
+            invoker_did: "did:scp:test-invoker".to_owned(),
+            request_id: [0u8; 16],
+        }
+    };
+
+    let registered = register_streaming_saga(&bi, entry("saga-before-1"))
+        .expect("a saga started before shutdown registers");
+    assert_eq!(registered, "saga-before-1");
+    assert!(
+        bi.outlet_streaming_saga_registry
+            .contains_key("saga-before-1")
+    );
+
+    bi.core.stop_borrowers();
+    let Err(ScpError::Context { msg, code }) = register_streaming_saga(&bi, entry("saga-late-1"))
+    else {
+        panic!("a late streaming-saga registration must be refused with the Context class");
+    };
+    assert_eq!(code, codes::CTX_2139);
+    assert!(
+        msg.contains("saga-late-1"),
+        "the error names the started saga: {msg}"
+    );
+    assert!(
+        !bi.outlet_streaming_saga_registry
+            .contains_key("saga-late-1"),
+        "a refused registration leaves no entry"
+    );
 }

@@ -13,7 +13,9 @@
 //!
 //! See #1549 Phase 4 remainder plan and ADR-048.
 
-use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownError};
+use scp_ffi_common::bridge_instance::{
+    BridgeInstanceCore as _, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+};
 use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,8 +76,10 @@ impl Scp {
     ///
     /// FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
     /// opened — bad key/passphrase, permission denied, corrupt file, or a
-    /// salt-sidecar fail-closed condition — this returns `ScpError::Context`
-    /// rather than silently degrading to in-memory storage. Surfaces to Swift
+    /// salt-sidecar fail-closed condition — this returns
+    /// `ScpError::Validation` with `SCP-STORAGE-8004`, or with
+    /// `SCP-STORAGE-8005` when another store holds the directory's advisory
+    /// lock, rather than silently degrading to in-memory storage. Surfaces to Swift
     /// as `throws` and Kotlin as a thrown exception.
     #[uniffi::constructor]
     #[allow(clippy::needless_pass_by_value)]
@@ -130,24 +134,20 @@ impl Scp {
 
     /// Shuts down this bridge instance with a graceful deadline.
     ///
-    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
-    /// aborts any remaining tasks, then clears registries and runs
-    /// shutdown hooks. Permanent — a shut-down instance cannot be
-    /// reused. A second call is a no-op from the caller's perspective
-    /// (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**.
+    /// Permanent — a shut-down instance cannot be reused.
     ///
     /// The unit is **milliseconds** — unified across all Rust bridges
     /// so the Swift and Kotlin SDKs can share a single conversion
     /// surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+    /// durable store still holds its advisory lock after the call.
     pub async fn shutdown(&self, timeout_millis: u64) -> Result<(), ScpError> {
         let timeout = Duration::from_millis(timeout_millis);
-        match self.inner.shutdown(timeout).await {
-            // AlreadyShutDown is treated as a harmless lifecycle observation —
-            // double-shutdown is idempotent at the SDK surface. No wildcard arm:
-            // a new ShutdownError variant must fail to compile here until it is
-            // mapped to an ScpError, instead of reporting a live engine as shut down.
-            Ok(_) | Err(ShutdownError::AlreadyShutDown) => Ok(()),
-        }
+        sdk_shutdown(self.inner.shutdown(timeout).await)
     }
 }
 
@@ -177,6 +177,66 @@ impl Scp {
 impl Drop for Scp {
     fn drop(&mut self) {
         decrement_handle_count();
+    }
+}
+
+/// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Opener
+/// per Durable Directory"): a durable store the shutdown left holding its
+/// advisory lock raises `SCP-STORAGE-8005`.
+fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpError> {
+    sdk_shutdown_result(result).map_err(|msg| ScpError::Validation {
+        msg,
+        code: codes::STORAGE_8005.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod sdk_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn store_left_locked_raises_storage_8005() {
+        let timed_out = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            drain: scp_ffi_common::bridge_instance::DrainState::Panicked,
+            durable_store_open: true,
+        }));
+        assert!(
+            matches!(&timed_out, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
+            "{timed_out:?}"
+        );
+        let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
+            scp_platform::PlatformError::StorageError("close refused".to_owned()),
+        )));
+        assert!(
+            matches!(&refused, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
+            "{refused:?}"
+        );
+        let repeat = sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }));
+        assert!(
+            matches!(&repeat, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
+            "{repeat:?}"
+        );
+    }
+
+    #[test]
+    fn released_store_reports_success() {
+        assert!(
+            sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
+                elapsed: Duration::ZERO,
+                panicked_tasks: 0,
+            }))
+            .is_ok()
+        );
+        assert!(
+            sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }))
+            .is_ok()
+        );
     }
 }
 

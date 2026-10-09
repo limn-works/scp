@@ -569,9 +569,7 @@ class SCP:
         """Shut down this instance with a graceful deadline.
 
         Drains in-flight tasks within ``timeout`` seconds, aborts any
-        stragglers, then runs typed-field cleanup. A second call is a
-        no-op (the underlying :class:`ShutdownError::AlreadyShutDown` is
-        swallowed at the SDK surface).
+        stragglers, then runs typed-field cleanup.
 
         ``timeout`` is clamped defensively: ``NaN`` and negative values
         map to ``0`` (abort immediately); ``math.inf`` or values that
@@ -593,10 +591,14 @@ class SCP:
         :param timeout: Maximum seconds to wait for in-flight tasks
             (float — fractional seconds are preserved to millisecond
             resolution before crossing the FFI boundary).
-        :raises ContextError: If the tokio runtime is unavailable.
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call.
         """
         millis = self._shutdown_millis(timeout)
-        await asyncio.to_thread(self._native.shutdown, millis)
+        try:
+            await asyncio.to_thread(self._native.shutdown, millis)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     def __enter__(self) -> SCP:
         """Enter the synchronous context-manager scope — returns ``self``."""
@@ -613,9 +615,20 @@ class SCP:
         Calls ``_native.shutdown`` directly — the PyO3 bridge already
         runs ``block_on`` internally, so the sync path is correct here.
         Async callers should use :meth:`__aexit__` / ``async with``.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        self._native.shutdown(self._shutdown_millis(5.0))
+        del exc_type, tb
+        try:
+            self._native.shutdown(self._shutdown_millis(5.0))
+        except Exception as shutdown_exc:
+            coded = _coded_bridge_error(shutdown_exc)
+            if exc is None:
+                raise coded from shutdown_exc
+            logger.warning("SCP shutdown on with-scope exit failed: %s", coded)
 
     async def __aenter__(self) -> SCP:
         """Enter the asynchronous context-manager scope — returns ``self``."""
@@ -631,9 +644,19 @@ class SCP:
 
         Awaits :meth:`shutdown` so the event loop keeps running while
         the tokio runtime drains in-flight tasks.
+
+        :raises StorageError: With ``SCP-STORAGE-8005`` when the durable
+            store still holds its advisory lock after the call and the
+            ``async with`` body raised nothing. When the body raised, the
+            shutdown error is logged and the body's exception propagates.
         """
-        del exc_type, exc, tb
-        await self.shutdown()
+        del exc_type, tb
+        try:
+            await self.shutdown()
+        except ScpError as shutdown_exc:
+            if exc is None:
+                raise
+            logger.warning("SCP shutdown on async-with exit failed: %s", shutdown_exc)
 
     # ------------------------------------------------------------------
     # Operation methods — 159 bridge delegators (PyO3 → asyncio.to_thread)
@@ -2710,11 +2733,9 @@ class SCP:
         receipt and captured output bytes — or reaches a typed terminal,
         which is re-raised as one of the SDK saga exceptions:
 
-        - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase abort:
-          a PERMANENT rejection OR a RETRYABLE transient (rate limit /
-          participant actor unavailable), distinguished by the
-          ``SCP-SAGA-*`` code; carries ``retry_after_ms`` (``None``, never
-          ``0``, when no precise back-off exists).
+        - :class:`~scp_sdk.errors.SagaAbortedError` — the code tells its
+          causes apart; carries ``retry_after_ms`` (``None``, never ``0``,
+          when no precise back-off exists).
         - :class:`~scp_sdk.errors.SagaNeedsRepairError` — Commit retries
           exhausted; carries the durable ``saga_id`` repair handle.
         - :class:`~scp_sdk.errors.SagaBusyError` — the participant context

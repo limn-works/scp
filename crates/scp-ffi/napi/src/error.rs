@@ -112,14 +112,9 @@ pub enum ScpNapiError {
         code: String,
     },
 
-    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase
-    /// (ADR-049 §3a).
+    /// A §6.2.4 cross-context outlet-invocation saga aborted (ADR-049 §3a).
     ///
-    /// This terminal surfaces a §6.2.4 saga `Aborted` and, like its `PyO3` and
-    /// `UniFFI` siblings, may be a PERMANENT rejection (authorization / freshness
-    /// / rate-limit / co-residency policy denial) OR a RETRYABLE transient (a
-    /// rate limit, or a participant actor unavailable to complete the Prepare
-    /// exchange) — distinguished by the `SCP-SAGA-*` code.
+    /// The code tells its causes apart.
     ///
     /// napi-rs collapses every `ScpNapiError` to a single `napi::Error` whose
     /// only payload is a message string (the TypeScript SDK reverses the
@@ -137,7 +132,7 @@ pub enum ScpNapiError {
     SagaAborted {
         /// Human-readable detail.
         message: String,
-        /// The canonical `SCP-SAGA-13xxx` code.
+        /// Stable error code.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -338,6 +333,13 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2136.to_owned(),
             },
+            // ADR-049 Decision 16: the Supervisor refused the operation
+            // because shutdown began. Dedicated SCP-CTX-2138 instead of
+            // CTX_2001. Mirrors the PyO3 bridge for cross-bridge parity.
+            CE::SupervisorShutDown(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2138.to_owned(),
+            },
             // §5.9: a `RestoreAccess` requested capabilities that were not
             // actually suspended for the member (and the member is not
             // read-excluded with read requested). Dedicated SCP-CTX-2137
@@ -412,9 +414,12 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
 impl From<scp_core::context::builder::ContextCreationError> for ScpNapiError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
         // The core's empty-ceiling rejection keeps its own validation code
-        // (construction.md M2), the one the parser's rejection carries.
+        // (construction.md M2), the one the parser's rejection carries, and a
+        // create refused because Supervisor shutdown began keeps SCP-CTX-2138
+        // (ADR-049 Decision 16).
         if let scp_core::context::builder::ContextCreationError::StateTransition(
-            inner @ scp_core::context::ContextError::CeilingRequired(_),
+            inner @ (scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_)),
         ) = e
         {
             return inner.into();
@@ -637,6 +642,23 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpNapiError {
 
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
+        // Spec §17.6 "One Opener per Durable Directory": the closed-store and
+        // lock-still-held conditions carry their registered storage codes.
+        match &e {
+            scp_platform::PlatformError::StorageClosed => {
+                return Self::Validation {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8006.to_owned(),
+                };
+            }
+            scp_platform::PlatformError::StorageLockHeld { .. } => {
+                return Self::Validation {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8005.to_owned(),
+                };
+            }
+            _ => {}
+        }
         Self::Crypto {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
@@ -863,6 +885,52 @@ mod tests {
         let err: ScpNapiError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// ADR-049 Decision 16: an operation the Supervisor refused because
+    /// shutdown began must surface the dedicated SCP-CTX-2138 code, distinct
+    /// from the catch-all.
+    #[test]
+    fn supervisor_shut_down_surfaces_ctx_2138() {
+        let err: ScpNapiError =
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpNapiError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpNapiError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::CeilingImmutable,
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": a held lock and a closed
+    /// store carry their registered storage codes; any other platform error
+    /// keeps the crypto catch-all.
+    #[test]
+    fn storage_platform_errors_carry_registered_codes() {
+        let held: ScpNapiError = scp_platform::PlatformError::StorageLockHeld {
+            dir: "/tmp/scp".to_owned(),
+            lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+        }
+        .into();
+        assert!(
+            matches!(&held, ScpNapiError::Validation { code, .. } if code == codes::STORAGE_8005),
+            "{held:?}"
+        );
+        let closed: ScpNapiError = scp_platform::PlatformError::StorageClosed.into();
+        assert!(
+            matches!(&closed, ScpNapiError::Validation { code, .. } if code == codes::STORAGE_8006),
+            "{closed:?}"
+        );
+        let other: ScpNapiError = scp_platform::PlatformError::StorageError("io".to_owned()).into();
+        assert!(
+            matches!(&other, ScpNapiError::Crypto { code, .. } if code == codes::CRYPTO_4004),
+            "{other:?}"
+        );
     }
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the

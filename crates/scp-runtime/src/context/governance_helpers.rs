@@ -6751,6 +6751,7 @@ mod commit_broadcast_retry_tests {
             Some(clock),
             mls_storage,
         );
+        crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
             .build_actor_deps(&DID(ADMIN.to_owned()))
             .await

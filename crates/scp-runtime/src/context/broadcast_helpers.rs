@@ -987,60 +987,10 @@ fn persist_state_best_effort<'d, 'c>(
     deps: &'d ActorDeps,
     context_id: &'c str,
 ) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
-    let mut snapshot = build_snapshot_from_state(state);
-
-    let ctx_id_bytes = context_id_to_bytes(context_id);
-    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
-    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
-    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
-    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
-    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
-    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
-    // sequence is read from `state.send_tracker` inside the twin.
-    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
-    match state.export_crypto_state(
-        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
-        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
-        wrapping_public_key,
-        &*wrapping_secret_key,
-    ) {
-        Ok(crypto_state) => {
-            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(crypto_state);
-        }
-        Err(e) => {
-            snapshot.needs_reconnect = true;
-            snapshot.mls_crypto_state = crate::context::state::MlsCryptoState::default();
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to export MLS crypto state for persistence; \
-                 snapshot marked needs_reconnect=true so restore \
-                 fires the §23.11 reconnection pipeline"
-            );
-        }
-    }
-
-    async move {
-        if let Err(e) = deps
-            .persistence
-            .persist_context(context_id, &snapshot)
-            .await
-        {
-            crate::metrics::record_persistence_failure();
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to persist context snapshot"
-            );
-        }
-    }
-}
-
-fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::ContextSnapshot {
-    // Single source of truth (ADR-049 §9): delegate to the canonical builder so
-    // the broadcast Class-S fold and the field-round-trip tripwire cover every
-    // persist path. This copy was value-identical to the canonical one.
-    crate::context::messaging_helpers::build_snapshot_from_state(state)
+    // Single source of truth: the canonical best-effort persist builds the
+    // snapshot, exports the crypto state with the Supervisor's floors, and
+    // persists nothing when the Supervisor has dropped.
+    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id)
 }
 
 #[cfg(test)]

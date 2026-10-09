@@ -87,11 +87,9 @@ pyo3::create_exception!(
 // makes load-bearing as a positional Python exception argument (read from
 // `e.args`, never re-parsed from the message text):
 //
-// - `SagaAbortedError(message, code, retry_after_ms)` — a Prepare-phase abort
-//   (§6.2.4) that may be a permanent rejection OR a retryable transient (rate
-//   limit / participant actor unavailable), distinguished by the `SCP-SAGA-*`
-//   code. `retry_after_ms` is the rate-limit back-off hint:
-//   an `int` of milliseconds when the tripped limiter can compute one, or
+// - `SagaAbortedError(message, code, retry_after_ms)` — a §6.2.4 saga abort,
+//   its causes told apart by the code.
+//   `retry_after_ms` is the rate-limit back-off hint: an `int` of milliseconds when the tripped limiter can compute one, or
 //   `None` (NEVER `0`) when no precise back-off instant exists — `0` would
 //   read as "retry immediately" and re-trip the same hard limit. An unavailable
 //   participant actor or a plain (non-rate-limit) rejection also carries `None`.
@@ -102,14 +100,13 @@ pyo3::create_exception!(
 //   context set overlapped an in-flight saga (§5.15.4). `contended_context`
 //   names the shared context id.
 //
-// `code` is the canonical `SCP-SAGA-13xxx` string and is ALSO embedded in
-// `message` (`"[SCP-SAGA-13xxx] …"`) so a flattened log line still
-// disambiguates by `grep`.
+// `code` is ALSO embedded in the exception message (`"[<code>] …"`) so a
+// flattened log line still disambiguates by `grep`.
 pyo3::create_exception!(
     scp_sdk,
     SagaAbortedError,
     ScpError,
-    "A cross-context outlet-invocation saga aborted at a Prepare phase (§6.2.4). \
+    "A cross-context outlet-invocation saga aborted (§6.2.4). \
      args = (message, code, retry_after_ms): retry_after_ms is an int of \
      milliseconds or None (never 0)."
 );
@@ -188,19 +185,17 @@ pub enum ScpPyError {
         /// Stable error code (e.g. `SCP-VALID-7001`).
         code: String,
     },
-    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
+    /// A §6.2.4 cross-context outlet-invocation saga aborted.
     ///
-    /// Maps to the Python `SagaAbortedError`. This terminal may be a permanent
-    /// rejection OR a retryable transient (rate limit / participant actor
-    /// unavailable), distinguished by the `SCP-SAGA-*` code. Carries the
+    /// Maps to the Python `SagaAbortedError`. The code tells its causes
+    /// apart. Carries the
     /// rate-limit back-off hint STRUCTURALLY (`retry_after_ms`): `Some(ms)` is
     /// the limiter's computed cooldown; `None` (NEVER `0`) means no precise
-    /// back-off instant (a token-bucket hard limit, an unavailable participant
-    /// actor, or a permanent rejection).
+    /// back-off instant.
     SagaAborted {
-        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        /// Human-readable detail.
         message: String,
-        /// The canonical `SCP-SAGA-13xxx` code.
+        /// Stable error code.
         code: String,
         /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
         retry_after_ms: Option<u64>,
@@ -251,7 +246,7 @@ impl std::fmt::Display for ScpPyError {
             Self::ValidationError { message, code } => {
                 write!(f, "[{code}] validation error: {message}")
             }
-            // Saga terminals embed the canonical SCP-SAGA-13xxx code so a
+            // Saga terminals embed their code so a
             // flattened log line still `grep`-disambiguates; the structured
             // datum (retry_after_ms / saga_id / contended_context) rides the
             // exception args, not the message text.
@@ -360,8 +355,7 @@ impl From<ScpPyError> for PyErr {
             // exception args so a Python caller reads `retry_after_ms` /
             // `saga_id` / `contended_context` directly from `e.args[2]` —
             // never by re-parsing the message text. `formatted` (carrying the
-            // `[SCP-SAGA-…]` prefix) is `args[0]`; the canonical code is
-            // `args[1]`. `retry_after_ms` maps `None` → Python `None`
+            // `[<code>]` prefix) is `args[0]`; the code is `args[1]`. `retry_after_ms` maps `None` → Python `None`
             // (NEVER `0`), preserving the §6.2.4 back-off semantics across
             // the FFI boundary.
             ScpPyError::SagaAborted {
@@ -563,6 +557,14 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2136.to_owned(),
             },
+            // ADR-049 Decision 16: the Supervisor refused the operation
+            // because shutdown began. Dedicated SCP-CTX-2138 instead of
+            // CTX_2001 so a caller can tell a refusal by shutdown apart from
+            // a failure of the operation.
+            CE::SupervisorShutDown(_) => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2138.to_owned(),
+            },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for outlet-economy and outlet-invocation failures
             // (economy 12xxx, outlet-invocation 6xxx). Recover the embedded
@@ -633,9 +635,12 @@ impl From<scp_core::context::ContextError> for ScpPyError {
 impl From<scp_core::context::builder::ContextCreationError> for ScpPyError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
         // The core's empty-ceiling rejection keeps its own validation code
-        // (construction.md M2), the one the parser's rejection carries.
+        // (construction.md M2), the one the parser's rejection carries, and a
+        // create refused because Supervisor shutdown began keeps SCP-CTX-2138
+        // (ADR-049 Decision 16).
         if let scp_core::context::builder::ContextCreationError::StateTransition(
-            inner @ scp_core::context::ContextError::CeilingRequired(_),
+            inner @ (scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_)),
         ) = e
         {
             return inner.into();
@@ -897,6 +902,23 @@ impl From<scp_transport::TransportError> for ScpPyError {
 
 impl From<scp_platform::PlatformError> for ScpPyError {
     fn from(e: scp_platform::PlatformError) -> Self {
+        // Spec §17.6 "One Opener per Durable Directory": the closed-store and
+        // lock-still-held conditions carry their registered storage codes.
+        match &e {
+            scp_platform::PlatformError::StorageClosed => {
+                return Self::ValidationError {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8006.to_owned(),
+                };
+            }
+            scp_platform::PlatformError::StorageLockHeld { .. } => {
+                return Self::ValidationError {
+                    message: e.to_string(),
+                    code: codes::STORAGE_8005.to_owned(),
+                };
+            }
+            _ => {}
+        }
         Self::CryptoError {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
@@ -1152,6 +1174,52 @@ mod tests {
         let err: ScpPyError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// ADR-049 Decision 16: an operation the Supervisor refused because
+    /// shutdown began must surface the dedicated SCP-CTX-2138 code, distinct
+    /// from the catch-all.
+    #[test]
+    fn supervisor_shut_down_surfaces_ctx_2138() {
+        let err: ScpPyError =
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()).into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpPyError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::SupervisorShutDown("spawn".to_owned()),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2138);
+        let err: ScpPyError = scp_core::context::builder::ContextCreationError::StateTransition(
+            scp_core::context::ContextError::CeilingImmutable,
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2002);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": a held lock and a closed
+    /// store carry their registered storage codes; any other platform error
+    /// keeps the crypto catch-all.
+    #[test]
+    fn storage_platform_errors_carry_registered_codes() {
+        let held: ScpPyError = scp_platform::PlatformError::StorageLockHeld {
+            dir: "/tmp/scp".to_owned(),
+            lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+        }
+        .into();
+        assert!(
+            matches!(&held, ScpPyError::ValidationError { code, .. } if code == codes::STORAGE_8005),
+            "{held:?}"
+        );
+        let closed: ScpPyError = scp_platform::PlatformError::StorageClosed.into();
+        assert!(
+            matches!(&closed, ScpPyError::ValidationError { code, .. } if code == codes::STORAGE_8006),
+            "{closed:?}"
+        );
+        let other: ScpPyError = scp_platform::PlatformError::StorageError("io".to_owned()).into();
+        assert!(
+            matches!(&other, ScpPyError::CryptoError { code, .. } if code == codes::CRYPTO_4004),
+            "{other:?}"
+        );
     }
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the

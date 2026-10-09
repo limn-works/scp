@@ -618,7 +618,7 @@ async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
         // Release the SQLite advisory exclusive lock so process 2 can open the
         // SAME database directory (drop alone would also release it, but close()
         // releases even while outstanding Arc clones persist).
-        storage1.close();
+        storage1.close().expect("close releases the lock");
         drop(journal1);
         drop(storage1);
     }
@@ -663,7 +663,7 @@ async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
          the REAL sqlite file (durable on-disk round-trip), got {unresolved:?}"
     );
 
-    storage2.close();
+    storage2.close().expect("close releases the lock");
 }
 
 // ===========================================================================

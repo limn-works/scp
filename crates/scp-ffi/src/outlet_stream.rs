@@ -60,14 +60,15 @@ use scp_platform::error::PlatformError;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
+use scp_core::context::outlets::invoke::OutletStreamOpenError;
 use scp_core::context::outlets::stream::{
     OutletStreamChunk, OutletStreamCredit, TerminateReason, compute_caveats_binding,
     compute_credit_sig_preimage, verify_chunk_signature,
 };
 use scp_core::context::outlets::{
-    AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
-    OutletExecutorError, StreamIdentity, StreamSessionHandle, StreamSigner,
-    StreamSignerCustodyCategory, StreamSignerError, cancel_error_to_code, grant_error_to_code,
+    AdmissionCaps, CancelIdentity, OpenStreamParams, OutletExecutor, OutletExecutorError,
+    StreamIdentity, StreamSessionHandle, StreamSigner, StreamSignerCustodyCategory,
+    StreamSignerError, cancel_error_to_code, grant_error_to_code,
 };
 
 use crate::custody::FfiKeyCustody;
@@ -301,19 +302,40 @@ impl OutletExecutor for BridgeStreamExecutor {
 }
 
 // ---------------------------------------------------------------------------
-// Error mapping — every code is a canonical SCP-OUTLET-/SCP-PERM- literal
+// Error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps an [`OpenStreamRejection`] onto the bridge error surface, carrying the
-/// rejection's own §5.4.4 `SCP-OUTLET-NNNN` code verbatim.
-fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpPyError {
-    ScpPyError::ContextError {
-        message: format!(
-            "outlet stream open rejected ({}): {}",
-            rejection.error_code(),
-            rejection.slug()
+/// Maps an [`OutletStreamOpenError`] onto the bridge error surface. A
+/// Supervisor shutdown refusal takes the conversion of
+/// `ContextError::SupervisorShutDown`; a rejection carries its own code
+/// verbatim.
+fn open_rejection_to_err(err: &OutletStreamOpenError) -> ScpPyError {
+    match err {
+        OutletStreamOpenError::SupervisorShutDown { message } => ScpPyError::from(
+            scp_core::context::ContextError::SupervisorShutDown(message.clone()),
         ),
-        code: rejection.error_code().to_owned(),
+        OutletStreamOpenError::Rejected(rejection) => ScpPyError::ContextError {
+            message: format!(
+                "outlet stream open rejected ({}): {}",
+                rejection.error_code(),
+                rejection.slug()
+            ),
+            code: rejection.error_code().to_owned(),
+        },
+    }
+}
+
+/// The error for a stream or streaming saga the Supervisor started but the
+/// bridge refused to register because bridge shutdown had begun, built from
+/// the refusal
+/// [`CoreFields::register_or_refuse`](scp_ffi_common::bridge_instance::CoreFields::register_or_refuse)
+/// returns. The stream had already reserved escrow and started its pump, and
+/// the saga had already staged its Prepare phase, so this is the Context class
+/// with `SCP-CTX-2139`.
+fn late_registration_err((code, message): (&'static str, String)) -> ScpPyError {
+    ScpPyError::ContextError {
+        message,
+        code: code.to_owned(),
     }
 }
 
@@ -625,20 +647,24 @@ fn outlet_stream_open_impl(
     };
 
     let handle_id = hex::encode(request_id);
-    bi.outlet_stream_registry.insert(
-        handle_id.clone(),
-        StreamEntry {
-            handle: Arc::new(tokio::sync::Mutex::new(handle)),
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            invoker_did: caller_did.to_owned(),
-            context_id: context_id.to_owned(),
-            outlet_id: outlet_id.to_owned(),
-            caveats_binding,
-            request_id,
-            stream_epoch,
-            cost_per_chunk,
-        },
-    );
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_stream_registry,
+            handle_id.clone(),
+            StreamEntry {
+                handle: Arc::new(tokio::sync::Mutex::new(handle)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                invoker_did: caller_did.to_owned(),
+                context_id: context_id.to_owned(),
+                outlet_id: outlet_id.to_owned(),
+                caveats_binding,
+                request_id,
+                stream_epoch,
+                cost_per_chunk,
+            },
+            None,
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1467,16 +1493,20 @@ fn outlet_streaming_saga_open_impl(
     let saga_id = handle.saga_id;
     let receiver = handle.receiver;
     let handle_id = saga_id.0.clone();
-    bi.outlet_streaming_saga_registry.insert(
-        handle_id.clone(),
-        scp_ffi_common::streaming_saga::StreamingSagaEntry {
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            saga_id,
-            target_context_id: target_context_id.to_owned(),
-            invoker_did: caller_did.to_owned(),
-            request_id,
-        },
-    );
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_streaming_saga_registry,
+            handle_id.clone(),
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                saga_id,
+                target_context_id: target_context_id.to_owned(),
+                invoker_did: caller_did.to_owned(),
+                request_id,
+            },
+            Some(&handle_id),
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1951,6 +1981,11 @@ impl crate::scp::PyScp {
     /// actor-state/budget injection has no bridge-public wiring — same rationale
     /// as the unary-saga bridge tests). The receiver's sender is dropped
     /// immediately (recover never polls it).
+    ///
+    /// # Panics
+    ///
+    /// Panics when bridge shutdown has begun, because the registry then refuses
+    /// the entry and the test would run against an empty registry.
     pub fn insert_test_streaming_saga_entry(
         &self,
         saga_id: &str,
@@ -1958,7 +1993,7 @@ impl crate::scp::PyScp {
         invoker_did: &str,
     ) {
         let (_tx, rx) = mpsc::channel(1);
-        self.inner.outlet_streaming_saga_registry.insert(
+        let registered = self.inner.outlet_streaming_saga_registry.insert(
             saga_id.to_owned(),
             scp_ffi_common::streaming_saga::StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
@@ -1967,6 +2002,10 @@ impl crate::scp::PyScp {
                 invoker_did: invoker_did.to_owned(),
                 request_id: [0u8; 16],
             },
+        );
+        assert!(
+            registered,
+            "bridge shutdown began before the test entry for {saga_id} was registered"
         );
     }
 
@@ -2027,7 +2066,7 @@ mod monotonic_seq_crash_safety_tests {
             // Release the advisory lock exactly as `SCP.shutdown()` does before
             // the handle drops at the end of this scope. After this block the
             // storage — and any in-memory state — is GONE.
-            storage.close();
+            storage.close().expect("close releases the lock");
         }
         assert_eq!(in_flight, vec![0, 1, 2], "grants advance strictly by one");
         let prior_max = *in_flight.iter().max().unwrap();
@@ -2048,6 +2087,91 @@ mod monotonic_seq_crash_safety_tests {
             "resumed monotonic_seq {resumed} must strictly exceed prior in-flight max {prior_max}"
         );
         assert_eq!(resumed, 3, "the cursor continues from the persisted value");
-        storage2.close();
+        storage2.close().expect("close releases the lock");
+    }
+}
+
+#[cfg(test)]
+mod late_shutdown_refusal_tests {
+    use scp_ffi_common::error_codes as codes;
+
+    use scp_ffi_common::bridge_instance::late_registration_refusal;
+
+    use super::late_registration_err;
+    use crate::error::ScpPyError;
+
+    /// The message and code of a `ContextError`, or `None` for any other
+    /// class.
+    fn context_error_parts(err: ScpPyError) -> Option<(String, String)> {
+        match err {
+            ScpPyError::ContextError { message, code } => Some((message, code)),
+            _ => None,
+        }
+    }
+
+    /// A stream or streaming saga the bridge refuses to register once bridge
+    /// shutdown has begun had already started, so it reaches the caller as the
+    /// Context class with `SCP-CTX-2139` (and, for a saga, its id), as the
+    /// NAPI and `UniFFI` bridges report it.
+    #[test]
+    fn late_shutdown_refusals_are_the_context_class() {
+        let stream = context_error_parts(late_registration_err(late_registration_refusal(None)));
+        assert_eq!(
+            stream.map(|(_, code)| code).as_deref(),
+            Some(codes::CTX_2139)
+        );
+
+        let saga = context_error_parts(late_registration_err(late_registration_refusal(Some(
+            "saga-late-1",
+        ))));
+        let (message, code) = saga.unwrap_or_default();
+        assert_eq!(code, codes::CTX_2139);
+        assert!(
+            message.contains("saga-late-1"),
+            "the error names the started saga: {message}"
+        );
+    }
+
+    /// The Supervisor's own stream-open shutdown refusal reaches the caller
+    /// as the Context class with `SCP-CTX-2138`, the conversion of
+    /// `ContextError::SupervisorShutDown`; an open rejection keeps its own
+    /// code.
+    #[test]
+    fn supervisor_stream_refusal_is_ctx_2138() {
+        use scp_core::context::outlets::OpenStreamRejection;
+        use scp_core::context::outlets::invoke::OutletStreamOpenError;
+
+        let refused = context_error_parts(super::open_rejection_to_err(
+            &OutletStreamOpenError::SupervisorShutDown {
+                message: "open outlet stream refused".to_owned(),
+            },
+        ));
+        assert_eq!(
+            refused.map(|(_, code)| code).as_deref(),
+            Some(codes::CTX_2138)
+        );
+        let rejected = context_error_parts(super::open_rejection_to_err(
+            &OutletStreamOpenError::Rejected(OpenStreamRejection::ContextNotActive {
+                current_state: "Closing".to_owned(),
+            }),
+        ));
+        assert_eq!(
+            rejected.map(|(_, code)| code).as_deref(),
+            Some(scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION)
+        );
+    }
+
+    /// The Supervisor's own streaming-saga shutdown refusal, which comes
+    /// before anything is staged, keeps the `SagaAborted` class, so it is not
+    /// the Context class the late refusal returns.
+    #[test]
+    fn supervisor_saga_refusal_is_not_the_context_class() {
+        let supervisor = crate::outlets::map_saga_error(
+            scp_core::context::supervisor::SagaError::SupervisorShutDown {
+                message: "start cross-context streaming saga".to_owned(),
+            },
+        );
+        assert!(matches!(&supervisor, ScpPyError::SagaAborted { .. }));
+        assert_eq!(context_error_parts(supervisor), None);
     }
 }

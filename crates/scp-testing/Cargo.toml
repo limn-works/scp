@@ -93,9 +93,13 @@ zeroize = { workspace = true }
 scp-testing = { path = ".", features = ["testing"] }
 # `tests/integration/node.rs` and `tests/integration/sdk_usability.rs` call
 # `Node::start_for_testing`, which crates/scp-node/src/config.rs compiles under
-# `allow_unencrypted_storage`. The feature rides here rather than on the `[dependencies]`
-# entry above, because no module in this library names the item it gates.
-scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
+# `allow_unencrypted_storage`. Those nodes generate their identity, which
+# crates/scp-node/src/lib.rs mints only under scp-node's `testing` feature (it fails
+# closed with `NoPreRotationBackend` otherwise), so `testing` rides here too; without it
+# only a `--workspace` build, which unifies the feature in from other crates, passes them.
+# The features ride here rather than on the `[dependencies]` entry above, because no
+# module in this library names the items they gate.
+scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage", "testing"] }
 scp-core = { path = "../scp-core", features = ["testing"] }
 # The SDK-usability integration test builds relay wire messages directly; the
 # types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
@@ -128,6 +132,7 @@ ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
 futures = "0.3"
 hex = { workspace = true }
 openmls = { workspace = true }

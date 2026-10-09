@@ -1168,7 +1168,7 @@ fn outlet_invoke_cross_context_impl(
 /// per-bridge tail that carries the `PyO3` field labels (`message:`):
 ///
 /// - `Aborted` → [`ScpPyError::SagaAborted`] (`retry_after_ms`, `None` never
-///   `0`, `SCP-SAGA-{code}`).
+///   `0`).
 /// - `NeedsRepair` → [`ScpPyError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpPyError::SagaBusy`] (`SCP-SAGA-13066`).
@@ -2220,11 +2220,8 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises one of the typed saga exceptions — `SagaAbortedError` (a
-    /// Prepare-phase abort that may be a permanent rejection — authorization,
-    /// freshness, rate limit, or co-residency — OR a retryable transient: a rate
-    /// limit, or a participant actor unavailable to complete the Prepare
-    /// exchange; carries `retry_after_ms`), `SagaNeedsRepairError`
+    /// Raises one of the typed saga exceptions — `SagaAbortedError` (the code
+    /// tells its causes apart; carries `retry_after_ms`), `SagaNeedsRepairError`
     /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
     /// handle), or `SagaBusyError` (the participant context set overlapped an
     /// in-flight saga — §5.15.4). Raises `ValidationError` if an id/DID/outlet-id

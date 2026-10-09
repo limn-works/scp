@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError};
+use scp_ffi_common::bridge_instance::{
+    BridgeInstanceCore, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+};
 
 use crate::error::ScpPyError;
 use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
@@ -214,12 +216,13 @@ impl PyScp {
             }
         };
         // FAIL CLOSED (spec §17.6): a failed durable-backend open raises
-        // `ValidationError` carrying `SCP-STORAGE-8004`, the code the NAPI and
-        // `UniFFI` bridges raise for this same failure.
+        // `ValidationError` carrying `SCP-STORAGE-8004`, or `SCP-STORAGE-8005`
+        // when another store still holds the directory's lock — the codes the
+        // NAPI and `UniFFI` bridges raise for the same failures.
         let bi =
             PyBridgeInstance::with_storage_py(cfg).map_err(|e| ScpPyError::ValidationError {
                 message: e.to_string(),
-                code: scp_ffi_common::error_codes::STORAGE_8004.to_owned(),
+                code: e.code().to_owned(),
             })?;
         Ok(Self {
             inner: Arc::new(bi),
@@ -287,21 +290,18 @@ impl PyScp {
     /// Shuts the instance down with a graceful deadline for in-flight tasks.
     ///
     /// Delegates to [`PyBridgeInstance::shutdown`] via the
-    /// [`BridgeInstanceCore`] trait: fires the cancellation token, drains
-    /// the `JoinSet` inside the `timeout_millis` budget, then runs
-    /// typed-field cleanup. A second call is a no-op from the Python
-    /// caller's perspective (the underlying `ShutdownError::AlreadyShutDown`
-    /// is swallowed — idempotency is expected).
+    /// [`BridgeInstanceCore`] trait, which awaits in-flight tasks up to
+    /// `timeout_millis`.
     ///
     /// The timeout unit is **milliseconds** — unified across all Rust
     /// bridges so the Python, TypeScript, Swift, and Kotlin SDKs can
-    /// share a single conversion surface. Pass 0 for a best-effort
-    /// immediate shutdown (tasks not yet cancelled are aborted without
-    /// waiting).
+    /// share a single conversion surface.
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the tokio runtime is unavailable.
+    /// Raises `RuntimeError` if the tokio runtime is not initialized.
+    /// Raises `ValidationError` with `SCP-STORAGE-8005` when the durable store
+    /// still holds its advisory lock after the call.
     pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {
         let timeout = Duration::from_millis(timeout_millis);
         let rt = crate::runtime()?;
@@ -310,20 +310,7 @@ impl PyScp {
         // drain tasks for up to `timeout_millis`, and we must not block the
         // Python interpreter meanwhile.
         py.allow_threads(|| {
-            rt.block_on(async move {
-                match inner.shutdown(timeout).await {
-                    Ok(_) => Ok::<(), ScpPyError>(()),
-                    // AlreadyShutDown is swallowed: Python callers expect
-                    // `.shutdown()` to be idempotent. No wildcard arm: a new
-                    // ShutdownError variant must fail to compile here until it
-                    // is mapped to a Python error, instead of reporting a live
-                    // engine as shut down.
-                    Err(e @ ShutdownError::AlreadyShutDown) => {
-                        tracing::debug!("SCP.shutdown: {e} — treating as no-op");
-                        Ok(())
-                    }
-                }
-            })
+            rt.block_on(async move { sdk_shutdown(inner.shutdown(timeout).await) })
         })?;
         Ok(())
     }
@@ -376,6 +363,67 @@ impl PyScp {
         Self {
             inner: Arc::new(PyBridgeInstance::new_in_memory_for_test()),
         }
+    }
+}
+
+/// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Opener
+/// per Durable Directory"): a durable store the shutdown left holding its
+/// advisory lock raises `SCP-STORAGE-8005`.
+fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpPyError> {
+    sdk_shutdown_result(result).map_err(|message| ScpPyError::ValidationError {
+        message,
+        code: scp_ffi_common::error_codes::STORAGE_8005.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod sdk_shutdown_tests {
+    use super::*;
+    use scp_ffi_common::error_codes::STORAGE_8005;
+
+    #[test]
+    fn store_left_locked_raises_storage_8005() {
+        let timed_out = sdk_shutdown(Ok(ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            drain: scp_ffi_common::bridge_instance::DrainState::Panicked,
+            durable_store_open: true,
+        }));
+        assert!(
+            matches!(&timed_out, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
+            "{timed_out:?}"
+        );
+        let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
+            scp_platform::PlatformError::StorageError("close refused".to_owned()),
+        )));
+        assert!(
+            matches!(&refused, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
+            "{refused:?}"
+        );
+        let repeat = sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }));
+        assert!(
+            matches!(&repeat, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
+            "{repeat:?}"
+        );
+    }
+
+    #[test]
+    fn released_store_reports_success() {
+        assert!(
+            sdk_shutdown(Ok(ShutdownOutcome::GracefulWithin {
+                elapsed: Duration::ZERO,
+                panicked_tasks: 0,
+            }))
+            .is_ok()
+        );
+        assert!(
+            sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }))
+            .is_ok()
+        );
     }
 }
 

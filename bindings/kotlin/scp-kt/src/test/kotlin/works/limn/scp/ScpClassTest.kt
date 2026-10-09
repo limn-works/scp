@@ -79,9 +79,8 @@ class ScpClassTest {
     @AfterEach
     fun tearDown() {
         if (!this::scp.isInitialized) return
-        // A second shutdown is a no-op at the SDK surface (AlreadyShutDown
-        // is swallowed), so this is safe even if the test already called
-        // shutdown() explicitly.
+        // A second shutdown of this in-memory instance does not throw, so
+        // this is safe even if the test already called shutdown() explicitly.
         runBlocking { scp.shutdown(bridge(), 1.seconds) }
     }
 
@@ -166,8 +165,7 @@ class ScpClassTest {
     fun `shutdown twice is idempotent`() =
         runTest {
             scp.shutdown(bridge(), 1.seconds)
-            // Second shutdown must not throw — the SDK swallows
-            // AlreadyShutDown at the wrapper layer.
+            // A second shutdown of this in-memory instance does not throw.
             scp.shutdown(bridge(), 1.seconds)
             assertTrue(true)
         }

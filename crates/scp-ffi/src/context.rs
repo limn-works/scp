@@ -682,28 +682,33 @@ impl PyContextParams {
 
 /// The Python exception for a failed supervisor call named `op`.
 ///
-/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130`, as the
-/// NAPI and `UniFFI` bridges report it (its doc states producers and retry
-/// behaviour); every other variant raises the uncoded `RuntimeError` this
+/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130` (its
+/// doc states producers and retry behaviour), and
+/// `ContextError::SupervisorShutDown` raises `ContextError` with
+/// `SCP-CTX-2138`; every other variant raises the `RuntimeError` this
 /// call site raised before.
-fn busy_or(op: &str, e: &scp_core::context::ContextError) -> PyErr {
-    actor_busy_error(op, e).map_or_else(
+fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> PyErr {
+    typed_supervisor_error(op, e).map_or_else(
         || PyRuntimeError::new_err(format!("{op} failed: {e}")),
         PyErr::from,
     )
 }
 
-/// The `SCP-CTX-2130` error [`busy_or`] raises for `ContextError::ActorBusy`,
-/// or `None` for every other variant.
-fn actor_busy_error(
+/// The typed error [`typed_supervisor_failure`] raises: `SCP-CTX-2130` for
+/// `ContextError::ActorBusy`, `SCP-CTX-2138` for
+/// `ContextError::SupervisorShutDown`, or `None` for every other variant.
+fn typed_supervisor_error(
     op: &str,
     e: &scp_core::context::ContextError,
 ) -> Option<crate::error::ScpPyError> {
-    matches!(e, scp_core::context::ContextError::ActorBusy(_)).then(|| {
-        crate::error::ScpPyError::ContextError {
-            message: format!("{op} failed: {e}"),
-            code: codes::CTX_2130.to_owned(),
-        }
+    let code = match e {
+        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
+        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
+        _ => return None,
+    };
+    Some(crate::error::ScpPyError::ContextError {
+        message: format!("{op} failed: {e}"),
+        code: code.to_owned(),
     })
 }
 
@@ -2647,8 +2652,10 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `TypeError` if params contains invalid types, `ValueError` if
-    /// parameter values are out of range, or `RuntimeError` if context creation
-    /// fails.
+    /// parameter values are out of range, the typed SDK error for a failure
+    /// `keeps_create_failure_code` keeps (`ContextError` with `SCP-CTX-2138`
+    /// when the Supervisor refused the create because shutdown began), or
+    /// `RuntimeError` if context creation fails otherwise.
     #[pyo3(signature = (identity_did, params))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
@@ -2720,15 +2727,7 @@ impl crate::scp::PyScp {
             rt.block_on(async move {
                 sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
                     .await
-                    .map_err(|e| match e {
-                        // The core's empty-ceiling rejection stays typed so
-                        // it surfaces with its validation code
-                        // (construction.md M2).
-                        scp_core::context::builder::ContextCreationError::StateTransition(
-                            inner @ scp_core::context::ContextError::CeilingRequired(_),
-                        ) => inner,
-                        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
-                    })?;
+                    .map_err(create_context_failure)?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
@@ -2745,13 +2744,10 @@ impl crate::scp::PyScp {
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
-                match e {
-                    scp_core::context::ContextError::CeilingRequired(_) => {
-                        PyErr::from(crate::error::ScpPyError::from(e))
-                    }
-                    other => PyRuntimeError::new_err(format!(
-                        "ContextManager create_context failed: {other}"
-                    )),
+                if keeps_create_failure_code(&e) {
+                    PyErr::from(crate::error::ScpPyError::from(e))
+                } else {
+                    PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
                 }
             })?;
         }
@@ -2851,8 +2847,9 @@ impl crate::scp::PyScp {
     ///
     /// Returns `ContextError` carrying `SCP-CTX-2013` when the supervisor reports
     /// the context in any state but active or no actor serves it,
-    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
-    /// when its actor crashed or is mid-respawn.
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn, and `SCP-CTX-2138` when the
+    /// Supervisor refused the join because shutdown began.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager
     pub fn context_join(
@@ -2949,7 +2946,11 @@ impl crate::scp::PyScp {
                 .await
             })
             .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
+                if keeps_join_failure_code(&e) {
+                    PyErr::from(crate::error::ScpPyError::from(e))
+                } else {
+                    PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
+                }
             })?;
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
@@ -3075,7 +3076,7 @@ impl crate::scp::PyScp {
         let owning = scp_did::DID(owning_did.to_owned());
         let (reservation_id, kp_public) = rt
             .block_on(async move { sup.reserve_key_package(owning).await })
-            .map_err(|e| busy_or("reserve_key_package", &e))?;
+            .map_err(|e| typed_supervisor_failure("reserve_key_package", &e))?;
         Ok((reservation_id.to_string(), kp_public))
     }
 
@@ -3227,7 +3228,7 @@ impl crate::scp::PyScp {
         // state and release mark as they were.
         let joined = rt
             .block_on(sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req))
-            .map_err(|e| busy_or("context_join_from_welcome", &e))?;
+            .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
 
         // Clearing the id's release mark and registering its FFI state run in
         // one critical section. When the entry is occupied, the mark stays and
@@ -3349,7 +3350,7 @@ impl crate::scp::PyScp {
         // `.zeroize()` call — is what triggers the wipe here.
         drop(signing_key);
 
-        let outcome = outcome.map_err(|e| busy_or("invite_member", &e))?;
+        let outcome = outcome.map_err(|e| typed_supervisor_failure("invite_member", &e))?;
         Ok(PyInviteMemberOutcome::from_outcome(outcome))
     }
 
@@ -3405,9 +3406,7 @@ impl crate::scp::PyScp {
             )
             .await
         })
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("ContextManager seed_peer_pseudonym failed: {e}"))
-        })?;
+        .map_err(|e| typed_supervisor_failure("ContextManager seed_peer_pseudonym", &e))?;
 
         Ok(())
     }
@@ -3450,9 +3449,7 @@ impl crate::scp::PyScp {
                 sup.leave_context(&temp_handle, &member_did, &member_did)
                     .await
             })
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
-            })?;
+            .map_err(|e| typed_supervisor_failure("ContextManager leave_context", &e))?;
 
             // Bridge: drain events (MemberLeft) from ContextManager's receive
             // buffer and deliver BEFORE closing the channel (#332).
@@ -3611,9 +3608,7 @@ impl crate::scp::PyScp {
                 )
                 .await
             })
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}"))
-            })?;
+            .map_err(|e| typed_supervisor_failure("ContextManager send_message", &e))?;
         }
 
         // Bridge: drain events from ContextManager's receive buffer and deliver
@@ -3814,7 +3809,7 @@ impl crate::scp::PyScp {
                     }),
                 )
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
+            .map_err(|e| typed_supervisor_failure("context export", &e))?;
 
         scp_core::context::export_import::serialize_export(&export)
             .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
@@ -4020,18 +4015,14 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_governance_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_governance_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_governance_command", &e)
             })?;
             let result = rx
                 .await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("governance execute shim reply dropped: {e}"))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("governance execution failed: {e}"))
-                })?;
+                .map_err(|e| typed_supervisor_failure("governance execution", &e))?;
 
             use scp_core::context::state::GovernanceActionResult;
             let result_str = match result {
@@ -4125,15 +4116,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_governance_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_governance_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_governance_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("tombstone shim reply dropped: {e}")))?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("tombstone_migrated_context failed: {e}"))
-                })?;
+                .map_err(|e| typed_supervisor_failure("tombstone_migrated_context", &e))?;
 
             // Sync FFI handle state to "tombstoned" (§5.11A.5).
             if let Ok(mut s) = handle_state.lock() {
@@ -4176,16 +4163,14 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_governance_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_governance_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_governance_command", &e)
             })?;
             let state = rx
                 .await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("migration_state shim reply dropped: {e}"))
                 })?
-                .map_err(|e| PyRuntimeError::new_err(format!("migration_state failed: {e}")))?;
+                .map_err(|e| typed_supervisor_failure("migration_state", &e))?;
             match state {
                 Some(ms) => {
                     let json = serde_json::json!({
@@ -4259,11 +4244,7 @@ impl crate::scp::PyScp {
             let outcome = sup
                 .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
                 .await
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2041: governance proposal failed: {e}"
-                    ))
-                })?;
+                .map_err(|e| typed_supervisor_failure("SCP-CTX-2041: governance proposal", &e))?;
 
             let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
@@ -4331,9 +4312,7 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_governance_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "SCP-CTX-2042: supervisor dispatch_governance_command failed: {e}"
-                ))
+                typed_supervisor_failure("SCP-CTX-2042: supervisor dispatch_governance_command", &e)
             })?;
             let status = rx
                 .await
@@ -4342,11 +4321,7 @@ impl crate::scp::PyScp {
                         "SCP-CTX-2042: governance approve shim reply dropped: {e}"
                     ))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2042: governance approval failed: {e}"
-                    ))
-                })?;
+                .map_err(|e| typed_supervisor_failure("SCP-CTX-2042: governance approval", &e))?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -4405,9 +4380,7 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_governance_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "SCP-CTX-2043: supervisor dispatch_governance_command failed: {e}"
-                ))
+                typed_supervisor_failure("SCP-CTX-2043: supervisor dispatch_governance_command", &e)
             })?;
             let status = rx
                 .await
@@ -4416,11 +4389,7 @@ impl crate::scp::PyScp {
                         "SCP-CTX-2043: governance reject shim reply dropped: {e}"
                     ))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2043: governance rejection failed: {e}"
-                    ))
-                })?;
+                .map_err(|e| typed_supervisor_failure("SCP-CTX-2043: governance rejection", &e))?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -4467,9 +4436,7 @@ impl crate::scp::PyScp {
                 .withdraw_governance_vote(&context_id, &proposal_id, &voter_did)
                 .await
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2044: governance vote withdrawal failed: {e}"
-                    ))
+                    typed_supervisor_failure("SCP-CTX-2044: governance vote withdrawal", &e)
                 })?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
@@ -4501,9 +4468,7 @@ impl crate::scp::PyScp {
             let proposal = sup
                 .get_proposal(&context_id, &proposal_id)
                 .await
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("SCP-CTX-2045: get proposal failed: {e}"))
-                })?;
+                .map_err(|e| typed_supervisor_failure("SCP-CTX-2045: get proposal", &e))?;
 
             serde_json::to_string(&proposal).map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2045: serialization failed: {e}"))
@@ -4528,9 +4493,10 @@ impl crate::scp::PyScp {
             crate::runtime().map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
 
         rt.block_on(async move {
-            let proposals = sup.list_proposals(&context_id).await.map_err(|e| {
-                PyRuntimeError::new_err(format!("SCP-CTX-2046: list proposals failed: {e}"))
-            })?;
+            let proposals = sup
+                .list_proposals(&context_id)
+                .await
+                .map_err(|e| typed_supervisor_failure("SCP-CTX-2046: list proposals", &e))?;
 
             serde_json::to_string(&proposals).map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2046: serialization failed: {e}"))
@@ -4579,9 +4545,7 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_governance_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "SCP-CTX-2060: supervisor dispatch_governance_command failed: {e}"
-                ))
+                typed_supervisor_failure("SCP-CTX-2060: supervisor dispatch_governance_command", &e)
             })?;
             rx.await
                 .map_err(|e| {
@@ -4590,9 +4554,7 @@ impl crate::scp::PyScp {
                     ))
                 })?
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2060: apply_pending_ceiling_modification failed: {e}"
-                    ))
+                    typed_supervisor_failure("SCP-CTX-2060: apply_pending_ceiling_modification", &e)
                 })
         })
     }
@@ -4633,9 +4595,7 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "SCP-CTX-2061: supervisor dispatch_ttl_close_command failed: {e}"
-                ))
+                typed_supervisor_failure("SCP-CTX-2061: supervisor dispatch_ttl_close_command", &e)
             })?;
             rx.await
                 .map_err(|e| {
@@ -4643,9 +4603,7 @@ impl crate::scp::PyScp {
                         "SCP-CTX-2061: finalize_close shim reply dropped: {e}"
                     ))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("SCP-CTX-2061: finalize_close failed: {e}"))
-                })
+                .map_err(|e| typed_supervisor_failure("SCP-CTX-2061: finalize_close", &e))
         })?;
 
         // Update FFI handle state to reflect close.
@@ -4730,9 +4688,10 @@ impl crate::scp::PyScp {
             sup.dispatch_trust_recovery_command(cmd)
                 .await
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2062: supervisor dispatch_trust_recovery_command failed: {e}"
-                    ))
+                    typed_supervisor_failure(
+                        "SCP-CTX-2062: supervisor dispatch_trust_recovery_command",
+                        &e,
+                    )
                 })?;
             let checkpoint = rx
                 .await
@@ -4742,9 +4701,7 @@ impl crate::scp::PyScp {
                     ))
                 })?
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2062: create_governance_checkpoint failed: {e}"
-                    ))
+                    typed_supervisor_failure("SCP-CTX-2062: create_governance_checkpoint", &e)
                 })?;
 
             serde_json::to_string(&checkpoint).map_err(|e| {
@@ -4813,9 +4770,10 @@ impl crate::scp::PyScp {
             sup.dispatch_trust_recovery_command(cmd)
                 .await
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2063: supervisor dispatch_trust_recovery_command failed: {e}"
-                    ))
+                    typed_supervisor_failure(
+                        "SCP-CTX-2063: supervisor dispatch_trust_recovery_command",
+                        &e,
+                    )
                 })?;
             let (updated_checkpoint, status) = rx
                 .await
@@ -4825,9 +4783,7 @@ impl crate::scp::PyScp {
                     ))
                 })?
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "SCP-CTX-2063: add_checkpoint_cosignature failed: {e}"
-                    ))
+                    typed_supervisor_failure("SCP-CTX-2063: add_checkpoint_cosignature", &e)
                 })?;
 
             let response = serde_json::json!({
@@ -4849,7 +4805,9 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` (SCP-CTX-2064) if restoration fails.
+    /// Returns `ContextError` (SCP-CTX-2138) if the Supervisor refused the
+    /// restore because shutdown began, and `RuntimeError` (SCP-CTX-2064) if
+    /// restoration fails otherwise.
     #[pyo3(signature = (context_id,))]
     pub fn restore_context(&self, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -4877,20 +4835,16 @@ impl crate::scp::PyScp {
                 }),
                 reply: tx,
             };
-            sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "SCP-CTX-2064: supervisor dispatch_lifecycle_command failed: {e}"
-                ))
-            })?;
+            sup.dispatch_lifecycle_command(cmd)
+                .await
+                .map_err(|e| restore_context_failure("supervisor dispatch_lifecycle_command", e))?;
             rx.await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!(
                         "SCP-CTX-2064: restore_context shim reply dropped: {e}"
                     ))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("SCP-CTX-2064: restore_context failed: {e}"))
-                })
+                .map_err(|e| restore_context_failure("restore_context", e))
         })?;
         crate::runtime::clear_release_mark_set_by(bi, context_id, admitted_at);
         Ok(())
@@ -4922,9 +4876,10 @@ impl crate::scp::PyScp {
 
         let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
-            let restored = sup.restore_on_startup().await.map_err(|e| {
-                PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
-            })?;
+            let restored = sup
+                .restore_on_startup()
+                .await
+                .map_err(|e| typed_supervisor_failure("SCP-CTX-2065: restore_all_contexts", &e))?;
             for context_id in &restored {
                 crate::runtime::clear_release_mark_set_by(bi, context_id, admitted_at);
             }
@@ -4989,13 +4944,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("broadcast subscribe failed: {e}")))?;
+                .map_err(|e| typed_supervisor_failure("broadcast subscribe", &e))?;
             Ok(())
         })
     }
@@ -5036,15 +4989,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("broadcast unsubscribe failed: {e}"))
-                })?;
+                .map_err(|e| typed_supervisor_failure("broadcast unsubscribe", &e))?;
             Ok(())
         })
     }
@@ -5432,13 +5381,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("broadcast block failed: {e}")))?;
+                .map_err(|e| typed_supervisor_failure("broadcast block", &e))?;
             Ok(())
         })
     }
@@ -5482,13 +5429,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("broadcast unblock failed: {e}")))?;
+                .map_err(|e| typed_supervisor_failure("broadcast unblock", &e))?;
             Ok(())
         })
     }
@@ -5549,16 +5494,12 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             let decision = rx
                 .await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("broadcast key request handling failed: {e}"))
-                })?;
+                .map_err(|e| typed_supervisor_failure("broadcast key request handling", &e))?;
             // Grant→sealed-JSON / Deny→None via the shared helper (per-SDK error
             // mapping kept here; only the value-shape logic is shared).
             scp_ffi_common::broadcast::seal_decision_to_json(
@@ -5617,9 +5558,7 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
@@ -5649,9 +5588,7 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
@@ -5680,9 +5617,7 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_broadcast_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_broadcast_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
@@ -5863,13 +5798,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_ttl_close_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_ttl_close_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("TTL expiry handling failed: {e}")))?;
+                .map_err(|e| typed_supervisor_failure("TTL expiry handling", &e))?;
             Ok::<(), PyErr>(())
         })?;
 
@@ -5919,13 +5852,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_ttl_close_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_ttl_close_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("TTL extension proposal failed: {e}")))
+                .map_err(|e| typed_supervisor_failure("TTL extension proposal", &e))
         })
     }
 
@@ -5974,13 +5905,11 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "supervisor dispatch_ttl_close_command failed: {e}"
-                ))
+                typed_supervisor_failure("supervisor dispatch_ttl_close_command", &e)
             })?;
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
-                .map_err(|e| PyRuntimeError::new_err(format!("TTL reset failed: {e}")))?;
+                .map_err(|e| typed_supervisor_failure("TTL reset", &e))?;
             Ok::<(), PyErr>(())
         })?;
         Ok(())
@@ -6137,19 +6066,13 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "[SCP-CTX-2070] supervisor dispatch_lifecycle_command failed: {e}"
-                ))
+                typed_supervisor_failure("[SCP-CTX-2070] supervisor dispatch_lifecycle_command", &e)
             })?;
             rx.await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("[SCP-CTX-2070] shim reply dropped: {e}"))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "[SCP-CTX-2070] access key generation failed: {e}"
-                    ))
-                })
+                .map_err(|e| typed_supervisor_failure("[SCP-CTX-2070] access key generation", &e))
         })
     }
 
@@ -6190,19 +6113,13 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "[SCP-CTX-2071] supervisor dispatch_lifecycle_command failed: {e}"
-                ))
+                typed_supervisor_failure("[SCP-CTX-2071] supervisor dispatch_lifecycle_command", &e)
             })?;
             rx.await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("[SCP-CTX-2071] shim reply dropped: {e}"))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "[SCP-CTX-2071] access key revocation failed: {e}"
-                    ))
-                })
+                .map_err(|e| typed_supervisor_failure("[SCP-CTX-2071] access key revocation", &e))
         })
     }
 
@@ -6243,19 +6160,13 @@ impl crate::scp::PyScp {
                 reply: tx,
             };
             sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "[SCP-CTX-2072] supervisor dispatch_lifecycle_command failed: {e}"
-                ))
+                typed_supervisor_failure("[SCP-CTX-2072] supervisor dispatch_lifecycle_command", &e)
             })?;
             rx.await
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("[SCP-CTX-2072] shim reply dropped: {e}"))
                 })?
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "[SCP-CTX-2072] access key restoration failed: {e}"
-                    ))
-                })
+                .map_err(|e| typed_supervisor_failure("[SCP-CTX-2072] access key restoration", &e))
         })
     }
 }
@@ -6300,6 +6211,50 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Whether a refused create keeps its typed SDK code: the core's empty-ceiling
+/// rejection keeps its validation code (construction.md M2), and a create
+/// refused because Supervisor shutdown began keeps SCP-CTX-2138.
+const fn keeps_create_failure_code(e: &scp_core::context::ContextError) -> bool {
+    matches!(
+        e,
+        scp_core::context::ContextError::CeilingRequired(_)
+            | scp_core::context::ContextError::SupervisorShutDown(_)
+    )
+}
+
+/// Whether a refused join keeps its typed SDK code: a join refused because
+/// Supervisor shutdown began keeps SCP-CTX-2138.
+const fn keeps_join_failure_code(e: &scp_core::context::ContextError) -> bool {
+    matches!(e, scp_core::context::ContextError::SupervisorShutDown(_))
+}
+
+/// The Python exception for a refused `RestoreContext` at `stage`: a restore
+/// refused because Supervisor shutdown began raises `ContextError` with
+/// SCP-CTX-2138; every other failure raises the `RuntimeError` naming
+/// SCP-CTX-2064.
+fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> PyErr {
+    if matches!(e, scp_core::context::ContextError::SupervisorShutDown(_)) {
+        PyErr::from(crate::error::ScpPyError::from(e))
+    } else {
+        PyRuntimeError::new_err(format!("SCP-CTX-2064: {stage} failed: {e}"))
+    }
+}
+
+/// Flattens a refused create to a [`scp_core::context::ContextError`], keeping
+/// the variants [`keeps_create_failure_code`] names typed.
+fn create_context_failure(
+    e: scp_core::context::builder::ContextCreationError,
+) -> scp_core::context::ContextError {
+    match e {
+        scp_core::context::builder::ContextCreationError::StateTransition(inner)
+            if keeps_create_failure_code(&inner) =>
+        {
+            inner
+        }
+        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests (SCP-216)
 // ---------------------------------------------------------------------------
@@ -6310,6 +6265,41 @@ mod tests {
     use super::*;
     use crate::runtime::RECEIVE_BUFFER_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A join refused because Supervisor shutdown began keeps its typed code;
+    /// any other join failure does not.
+    #[test]
+    fn join_failure_keeps_only_supervisor_shut_down_typed() {
+        assert!(keeps_join_failure_code(
+            &scp_core::context::ContextError::SupervisorShutDown("join".to_owned())
+        ));
+        assert!(!keeps_join_failure_code(
+            &scp_core::context::ContextError::TransportFailed("join".to_owned())
+        ));
+    }
+
+    /// A create refused because Supervisor shutdown began stays typed and maps
+    /// to SCP-CTX-2138; an unrelated create failure is flattened.
+    #[test]
+    fn create_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::builder::ContextCreationError;
+        let shut_down = create_context_failure(ContextCreationError::StateTransition(
+            scp_core::context::ContextError::SupervisorShutDown("create".to_owned()),
+        ));
+        assert!(keeps_create_failure_code(&shut_down));
+        match crate::error::ScpPyError::from(shut_down) {
+            crate::error::ScpPyError::ContextError { code, .. } => {
+                assert_eq!(code, scp_ffi_common::error_codes::CTX_2138);
+            }
+            other => panic!("expected a context error, got {other:?}"),
+        }
+        let flattened = create_context_failure(ContextCreationError::TransportNotConnected);
+        assert!(!keeps_create_failure_code(&flattened));
+        assert!(matches!(
+            flattened,
+            scp_core::context::ContextError::CreationFailed(_)
+        ));
+    }
 
     fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
         std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())
@@ -9049,14 +9039,24 @@ mod tests {
         })
     }
 
-    /// `busy_or` raises `SCP-CTX-2130` for `ContextError::ActorBusy` and keeps
-    /// the uncoded `RuntimeError` for every other variant, on the
+    /// `typed_supervisor_failure` raises `SCP-CTX-2130` for `ContextError::ActorBusy`,
+    /// `SCP-CTX-2138` for `ContextError::SupervisorShutDown`, and keeps the
+    /// uncoded `RuntimeError` for every other variant, on the
     /// `reserve_key_package`, `context_join_from_welcome` and `invite_member`
     /// failure paths.
     #[test]
-    fn busy_or_raises_ctx_2130_only_for_actor_busy() {
+    fn typed_supervisor_failure_types_only_actor_busy_and_supervisor_shut_down() {
         use scp_core::context::ContextError;
-        match super::actor_busy_error(
+        match super::typed_supervisor_error(
+            "context_join_from_welcome",
+            &ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+        ) {
+            Some(crate::error::ScpPyError::ContextError { code, .. }) => {
+                assert_eq!(code, codes::CTX_2138);
+            }
+            other => panic!("expected an SCP-CTX-2138 ContextError, got {other:?}"),
+        }
+        match super::typed_supervisor_error(
             "reserve_key_package",
             &ContextError::ActorBusy("key-package actor".to_owned()),
         ) {
@@ -9070,7 +9070,7 @@ mod tests {
             other => panic!("expected an SCP-CTX-2130 ContextError, got {other:?}"),
         }
         assert!(
-            super::actor_busy_error(
+            super::typed_supervisor_error(
                 "context_join_from_welcome",
                 &ContextError::MembershipFailed("bad welcome".to_owned()),
             )
@@ -9079,13 +9079,16 @@ mod tests {
         );
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let busy = super::busy_or("invite_member", &ContextError::ActorBusy("c".to_owned()));
+            let busy = super::typed_supervisor_failure(
+                "invite_member",
+                &ContextError::ActorBusy("c".to_owned()),
+            );
             assert!(
                 busy.is_instance_of::<crate::error::ContextError>(py),
                 "ActorBusy raises ContextError, got {busy}"
             );
             assert!(busy.to_string().contains(codes::CTX_2130), "{busy}");
-            let other = super::busy_or(
+            let other = super::typed_supervisor_failure(
                 "invite_member",
                 &ContextError::MembershipFailed("x".to_owned()),
             );
@@ -9093,6 +9096,74 @@ mod tests {
                 other.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
                 "a non-busy failure raises RuntimeError, got {other}"
             );
+        });
+    }
+
+    /// A restore refused because Supervisor shutdown began raises
+    /// `ContextError` with `SCP-CTX-2138`; any other restore failure raises the
+    /// `RuntimeError` naming `SCP-CTX-2064`.
+    #[test]
+    fn restore_context_failure_keeps_supervisor_shut_down_typed() {
+        use scp_core::context::ContextError;
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let shut = super::restore_context_failure(
+                "restore_context",
+                ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+            );
+            assert!(
+                shut.is_instance_of::<crate::error::ContextError>(py),
+                "SupervisorShutDown raises ContextError, got {shut}"
+            );
+            assert!(shut.to_string().contains(codes::CTX_2138), "{shut}");
+            let other = super::restore_context_failure(
+                "restore_context",
+                ContextError::MembershipFailed("bad snapshot".to_owned()),
+            );
+            assert!(
+                other.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "a non-shutdown failure raises RuntimeError, got {other}"
+            );
+            assert!(other.to_string().contains(codes::CTX_2064), "{other}");
+        });
+    }
+
+    /// `context_create` and `restore_context`, called through the bridge after
+    /// the Supervisor's shutdown began, raise `ContextError` with
+    /// `SCP-CTX-2138`. A join after shutdown is refused earlier by the
+    /// active-context gate (`SCP-CTX-2013`), so its SCP-CTX-2138 path is
+    /// reachable only when shutdown begins between that gate and the join.
+    #[test]
+    fn create_and_restore_after_supervisor_shutdown_raise_ctx_2138() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        crate::runtime::init_context_manager_for_test(&bi_arc);
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi_arc).unwrap());
+        crate::runtime()
+            .unwrap()
+            .block_on(sup.shutdown_all_contexts());
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("mode", "broadcast").unwrap();
+            dict.set_item("memory_scope", "full").unwrap();
+            dict.set_item("ceiling", vec!["messages:read"]).unwrap();
+            let create = scp
+                .context_create("did:dht:z6MkShutDownCreator", &dict)
+                .expect_err("a create after shutdown must be refused");
+            let restore = scp
+                .restore_context(&"0".repeat(64))
+                .expect_err("a restore after shutdown must be refused");
+            for (name, err) in [("restore", restore), ("create", create)] {
+                assert!(
+                    err.is_instance_of::<crate::error::ContextError>(py),
+                    "{name} must raise ContextError, got {err}"
+                );
+                assert!(err.to_string().contains(codes::CTX_2138), "{name}: {err}");
+            }
         });
     }
 

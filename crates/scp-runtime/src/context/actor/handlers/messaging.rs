@@ -429,7 +429,6 @@ async fn handle_land_sender_key_response(
         epoch,
         scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
     ) {
-        let e: ContextError = e.into();
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -1232,6 +1231,23 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
         ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
         ContextError::ContextNotActive => ContextError::ContextNotActive,
+        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
+#[cfg(test)]
+mod outcome_sketch_tests {
+    use super::{ContextError, outcome_error_sketch};
+
+    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
+    /// recording it as a crypto failure.
+    #[test]
+    fn sketch_keeps_supervisor_shut_down_typed() {
+        let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
+        assert!(
+            matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
+            "got {sketch:?}"
+        );
     }
 }

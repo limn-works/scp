@@ -578,6 +578,22 @@ The readback and the three checks read SQLite's state, and code in the same proc
 
 §9.15 lists the copies that neither wipe reaches, memory SQLCipher's crypto provider obtains from `malloc` among them.
 
+### One Opener per Durable Directory
+
+A `SqliteStorage` takes an exclusive advisory file lock on `{dir}/scp.db.lock` before it opens `{dir}/scp.db`, and it holds that lock until it releases its database connection. The lock admits one opener, meaning one `SqliteStorage`, per directory (red-hat finding RED-1002). A writer is any task that holds a reference to the store through which the task can write, whichever owner spawned the task. The tasks in a Supervisor's hierarchy (ADR-049, the actor-per-context concurrency model, Decision 16), such as context actors, key-package actors, and supervisor background tasks, and the tasks of a node that an SDK instance started on its own store are writers today; that list names indicators, and the reference decides membership.
+
+The following requirements bind every opener and every owner of a `SqliteStorage` directory:
+
+- **One opener per directory.** An open of a directory whose lock another `SqliteStorage` holds, in the same process or in another process, MUST fail with a typed lock-still-held error and MUST NOT open the database. The opener MUST NOT wait for the lock, and it MUST NOT fall back to another backend (see Storage Selection Fails Closed above).
+- **Release after the Supervisor drain.** A store MUST release its lock and its database connection only after every writer in a Supervisor's hierarchy has exited. An SDK instance shutdown (ADR-048, SCP as a first-class multi-instance SDK object, §5) and a bridge storage close MUST NOT release the lock while any such writer can still write.
+- **Reopen after a completed shutdown succeeds on the first attempt.** When a shutdown reports that every writer in a Supervisor's hierarchy exited before its deadline and the store released its connection, an open of the same directory in the same process MUST succeed on its first attempt. A caller MUST NOT need retries, sleeps, or polling to reopen the directory.
+- **A closed store refuses operations.** After a store releases its connection, every operation on that store handle MUST fail with a typed closed-store error. A closed store MUST NOT reopen its database implicitly.
+- **A timed-out shutdown keeps the lock.** When the bounded shutdown wait of ADR-048 §5 expires before every writer in a Supervisor's hierarchy exits, the bridge returns `ShutdownOutcome::TimedOut`. The drain continues past the deadline, and when the last writer in the Supervisor's hierarchy exits, the bridge closes the store, and a close that succeeds releases the lock. Until the store releases its lock, an open of the same directory in the same process fails with the typed lock-still-held error, so no moment exists at which two openers hold one directory.
+- **A panicked drain keeps the lock.** When the Supervisor drain panics, before or after the deadline, the bridge does not close the store, and the store keeps its lock until the last reference to the store drops. Until then, an open of the same directory in the same process fails with the typed lock-still-held error.
+- **A refused close keeps the lock.** When SQLite refuses to release a store's connection, the store keeps its connection and its lock. An open of the same directory in the same process then fails with the typed lock-still-held error.
+
+ADR-049, the actor-per-context concurrency model, Decision 16 records how the runtime makes every writer in a Supervisor's hierarchy exit before shutdown returns.
+
 ### Browser Clients Run Storage In-Process
 
 Per ADR-057 (which supersedes ADR-055's browser-deployment conclusion), a browser SCP client runs the participant protocol in-tab with keys on-device — it is not a custodial remote thin client. Its persistence is therefore its own concern, held in a browser-local key/value store (`IndexedDB`, or a wa-sqlite/OPFS backend), never a server's.

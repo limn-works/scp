@@ -71,7 +71,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use scp_core::context::ContextPersistence;
-use scp_core::context::supervisor::Supervisor;
+use scp_core::context::supervisor::{DrainWithDeadline, JoinFailure, Supervisor};
 use scp_core::discovery::handles::HandleRegistry;
 use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::scope::ScopeRegistry;
@@ -124,9 +124,8 @@ fn next_instance_id() -> u64 {
 /// A bridge instance owns exactly one storage backend, chosen at construction
 /// (`SCP.with_storage({...})`). `start_node_local` hands a node a clone of that
 /// backend's `Arc`, so an instance and a node write through one handle.
-/// Each bridge's `bridge_specific_shutdown` then calls
-/// `ProtocolRepoVariant::close`, which reaches
-/// [`scp_platform::sqlite::SqliteStorage::close`] and drops an advisory
+/// Each bridge's [`BridgeInstanceCore::durable_store_closer`] then reaches
+/// [`scp_platform::sqlite::SqliteStorage::close`], which drops an advisory
 /// `flock(2)` on `{dir}/scp.db.lock`. That lock is what stops a second process
 /// from opening one `SQLCipher` database while a first writer still holds it,
 /// so releasing it while a node keeps writing invites split-brain writes and
@@ -152,6 +151,136 @@ pub trait InstanceBorrower: Send + Sync {
 
     /// Reports whether this borrower already stopped.
     fn stopped(&self) -> bool;
+}
+
+/// A bridge's stream or streaming-saga registry, which
+/// [`BridgeInstanceCore::release_streams`] clears.
+///
+/// [`insert`](Self::insert) is the only way to add an entry, and it refuses
+/// once shutdown of the [`CoreFields`] passed to [`new`](Self::new) has begun,
+/// so no bridge open site can register a stream behind shutdown's back.
+pub struct StreamRegistry<K, V> {
+    entries: DashMap<K, V>,
+    closed: Arc<AtomicBool>,
+}
+
+impl<K: Eq + std::hash::Hash, V> StreamRegistry<K, V> {
+    /// An empty registry whose inserts refuse once `core`'s shutdown begins.
+    #[must_use]
+    pub fn new(core: &CoreFields) -> Self {
+        Self {
+            entries: DashMap::new(),
+            closed: Arc::clone(&core.stream_registration_closed),
+        }
+    }
+
+    /// Inserts `value` under `key` unless shutdown has begun, and returns
+    /// whether the entry stayed registered.
+    ///
+    /// Returns `false`, with the entry removed again, when the check that
+    /// follows the insert finds shutdown begun: [`CoreFields::stop_borrowers`]
+    /// has run, or the instance is shutting down.
+    /// [`BridgeInstanceCore::shutdown`] calls [`CoreFields::stop_borrowers`]
+    /// before `release_streams`, so an entry this inserts is either cleared by
+    /// that release or removed here.
+    ///
+    /// A bridge registers through [`CoreFields::register_or_refuse`], which
+    /// returns the refusal that [`late_registration_refusal`] builds. A call
+    /// that discards the result does not compile under
+    /// `deny(unused_must_use)`:
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// registry.insert("key".to_owned(), 1);
+    /// ```
+    ///
+    /// The same call compiles when it reads the result:
+    ///
+    /// ```
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// assert!(registry.insert("key".to_owned(), 1));
+    /// ```
+    #[must_use = "a refused insert drops a stream the caller must report refused"]
+    pub fn insert(&self, key: K, value: V) -> bool
+    where
+        K: Clone,
+    {
+        let removal = key.clone();
+        self.entries.insert(key, value);
+        let begun = self.closed.load(Ordering::SeqCst);
+        if begun {
+            self.entries.remove(&removal);
+        }
+        !begun
+    }
+
+    /// The entry under `key`, if registered.
+    pub fn get<Q>(&self, key: &Q) -> Option<dashmap::mapref::one::Ref<'_, K, V>>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.entries.get(key)
+    }
+
+    /// Removes and returns the entry under `key`, if registered.
+    pub fn remove<Q>(&self, key: &Q) -> Option<(K, V)>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.entries.remove(key)
+    }
+
+    /// Whether an entry is registered under `key`.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.entries.contains_key(key)
+    }
+
+    /// Whether no entry is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Removes every entry.
+    pub fn clear(&self) {
+        self.entries.clear();
+    }
+}
+
+/// The code and message for a refused late registration.
+///
+/// A bridge returns them when [`StreamRegistry::insert`] refuses a stream or
+/// streaming saga that the Supervisor had already opened. The code is
+/// `SCP-CTX-2139`, because the refused operation had started. `saga_id` names
+/// a streaming saga; `None` means an outlet stream.
+#[must_use]
+pub fn late_registration_refusal(saga_id: Option<&str>) -> (&'static str, String) {
+    let message = saga_id.map_or_else(
+        || {
+            "outlet stream opened, then dropped unregistered: bridge shutdown began \
+             before the bridge registered it"
+                .to_owned()
+        },
+        |id| {
+            format!(
+                "streaming saga {id} started, then its receiver was dropped unregistered: \
+                 bridge shutdown began before the bridge registered it"
+            )
+        },
+    );
+    (crate::error_codes::CTX_2139, message)
 }
 
 /// Registry backing [`CoreFields::register_borrower`] and
@@ -297,6 +426,12 @@ pub struct CoreFields {
     /// all subsequent bridge operations should return an error immediately.
     /// A shut-down instance cannot be resumed.
     shutdown: AtomicBool,
+
+    /// Whether a shutdown closed the durable store, will never close it, or
+    /// has not settled it yet, so a later shutdown call can report whether
+    /// the store still holds its advisory lock without waiting on a close
+    /// that cannot happen.
+    durable_store_state: Arc<tokio::sync::watch::Sender<DurableStoreState>>,
 
     /// Whether this instance is currently suspended.
     ///
@@ -597,6 +732,10 @@ pub struct CoreFields {
     /// advisory `flock(2)`. See [`InstanceBorrower`] for why that order
     /// matters.
     borrowers: Mutex<BorrowerRegistry>,
+    /// Set once shutdown begins, by [`stop_borrowers`](Self::stop_borrowers)
+    /// or by either shutdown transition, and never cleared. Every
+    /// [`StreamRegistry`] built from this instance reads it on insert.
+    stream_registration_closed: Arc<AtomicBool>,
 }
 
 impl Default for CoreFields {
@@ -628,6 +767,9 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
+                DurableStoreState::Unsettled,
+            )),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
@@ -652,6 +794,7 @@ impl CoreFields {
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
             borrowers: Mutex::new(BorrowerRegistry::default()),
+            stream_registration_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -714,6 +857,9 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
+                DurableStoreState::Unsettled,
+            )),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
@@ -738,6 +884,7 @@ impl CoreFields {
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
             borrowers: Mutex::new(BorrowerRegistry::default()),
+            stream_registration_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1176,8 +1323,8 @@ impl CoreFields {
     /// registrations by stopping them on arrival.
     ///
     /// [`BridgeInstanceCore::shutdown`] calls this first, so a node stops
-    /// writing before [`BridgeInstanceCore::bridge_specific_shutdown`] closes
-    /// a `SQLCipher` handle and drops an advisory `flock(2)`.
+    /// writing before the [`DurableStoreCloser`] closes a `SQLCipher` handle
+    /// and drops an advisory `flock(2)`.
     ///
     /// Idempotent: a second call finds an empty entry list and stops nothing.
     /// Logs how many borrowers a caller had left running, which tells an
@@ -1193,6 +1340,8 @@ impl CoreFields {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             registry.closed = true;
+            self.stream_registration_closed
+                .store(true, Ordering::SeqCst);
             std::mem::take(&mut registry.entries)
         };
         let mut still_running = 0usize;
@@ -1210,6 +1359,68 @@ impl CoreFields {
                 "shutdown stopped borrowers that a caller left running, before \
                  releasing what those borrowers write through"
             );
+        }
+    }
+
+    /// Inserts `value` under `key` into `registry` through
+    /// [`StreamRegistry::insert`], the registry's only insert, and returns
+    /// whether the entry stayed registered. A call that discards the result
+    /// does not compile under `deny(unused_must_use)`:
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// core.insert_stream_entry(&registry, "key".to_owned(), 1);
+    /// ```
+    ///
+    /// The same call compiles when it reads the result:
+    ///
+    /// ```
+    /// #![deny(unused_must_use)]
+    /// use scp_ffi_common::bridge_instance::{CoreFields, StreamRegistry};
+    /// let core = CoreFields::new();
+    /// let registry: StreamRegistry<String, u8> = StreamRegistry::new(&core);
+    /// assert!(core.insert_stream_entry(&registry, "key".to_owned(), 1));
+    /// ```
+    #[must_use = "a refused insert drops a stream the caller must report refused"]
+    pub fn insert_stream_entry<K, V>(
+        &self,
+        registry: &StreamRegistry<K, V>,
+        key: K,
+        value: V,
+    ) -> bool
+    where
+        K: Eq + std::hash::Hash + Clone,
+    {
+        registry.insert(key, value)
+    }
+
+    /// Inserts `value` under `key` into `registry` through
+    /// [`Self::insert_stream_entry`], and on refusal returns the code and
+    /// message [`late_registration_refusal`] builds for `saga_id` (`None` for
+    /// an outlet stream). Every bridge registers a started stream or streaming
+    /// saga through this method.
+    ///
+    /// # Errors
+    ///
+    /// `(SCP-CTX-2139, message)` when shutdown began before the insert; the
+    /// entry is dropped.
+    pub fn register_or_refuse<K, V>(
+        &self,
+        registry: &StreamRegistry<K, V>,
+        key: K,
+        value: V,
+        saga_id: Option<&str>,
+    ) -> Result<(), (&'static str, String)>
+    where
+        K: Eq + std::hash::Hash + Clone,
+    {
+        if self.insert_stream_entry(registry, key, value) {
+            Ok(())
+        } else {
+            Err(late_registration_refusal(saga_id))
         }
     }
 
@@ -1361,6 +1572,9 @@ impl CoreFields {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return; // Already shut down
         }
+        // This path never closes the durable store.
+        self.durable_store_state
+            .send_replace(DurableStoreState::NotClosing);
         // Stop borrowers first, so every terminal transition of `CoreFields`
         // ends borrowed writes — not only whichever transition
         // [`BridgeInstanceCore::shutdown`] drives. This path clears registries
@@ -2442,32 +2656,67 @@ impl CoreFields {
     ///    Tasks that finish within the deadline report
     ///    [`ShutdownOutcome::GracefulWithin`] with the elapsed time.
     /// 4. On timeout, calls `JoinSet::abort_all` and returns
-    ///    [`ShutdownOutcome::TimedOut`] with the number of tasks aborted and
-    ///    the number that panicked.
-    /// 5. Runs the bridge-agnostic cleanup (flush persistence, drop MLS
-    ///    groups, clear registries, run shutdown hooks, clear transport)
+    ///    [`ShutdownOutcome::TimedOut`] with the number of the bridge's own
+    ///    tasks aborted and the number that panicked.
+    /// 5. Runs the bridge-agnostic cleanup (flush persistence, drain the
+    ///    Supervisor, clear registries, run shutdown hooks, clear transport)
     ///    regardless of graceful/timeout outcome — these side effects must
-    ///    happen on *every* shutdown. The persistence flush
-    ///    (`ContextManager::flush_all_contexts_sync`) is executed
-    ///    inside the remaining timeout budget so the caller's deadline is
-    ///    honored end-to-end; if it exceeds the budget, flush is abandoned
-    ///    and a warning is logged.
+    ///    happen on *every* shutdown. The flush and the Supervisor drain run
+    ///    inside the remaining budget, so the caller's deadline is honored
+    ///    end-to-end.
+    /// 6. Closes the durable store through `store_closer` only after the
+    ///    Supervisor's tracked tasks have all exited (ADR-048 §5 as amended,
+    ///    ADR-049 Decision 16). When the drain finishes inside the deadline,
+    ///    the store closes before this returns. When it does not, the result
+    ///    is [`ShutdownOutcome::TimedOut`], no tracked task is aborted, and the
+    ///    drain keeps running detached: the store keeps its advisory lock
+    ///    until the last tracked writer exits and the drain closes it, so a
+    ///    reopen of the same directory meanwhile fails with the lock-still-held
+    ///    error.
     ///
     /// # Errors
     ///
     /// - [`ShutdownError::AlreadyShutDown`] — the instance has already been
-    ///   shut down. The caller is expected to treat this as a harmless
-    ///   lifecycle observation (no additional work to do).
+    ///   shut down, and this call runs no cleanup. When `store_closer` is
+    ///   given, the call waits up to `timeout` for an earlier shutdown to
+    ///   close the durable store, and `durable_store_open` reports whether
+    ///   the store still holds its advisory lock when the call returns.
+    /// - [`ShutdownError::DurableStoreClose`] — the drain finished in time but
+    ///   the store refused to close; it keeps its connection and lock.
     pub async fn shutdown_core_async(
         &self,
         timeout: Duration,
+        store_closer: Option<DurableStoreCloser>,
     ) -> Result<ShutdownOutcome, ShutdownError> {
         // Idempotent terminal transition. The sync `shutdown()` path also
         // swaps this flag; whichever call wins is the one that runs
         // cleanup.
+        self.stream_registration_closed
+            .store(true, Ordering::SeqCst);
         if self.shutdown.swap(true, Ordering::SeqCst) {
-            return Err(ShutdownError::AlreadyShutDown);
+            let durable_store_open = if store_closer.is_some() {
+                let mut state = self.durable_store_state.subscribe();
+                !matches!(
+                    tokio::time::timeout(
+                        timeout,
+                        state.wait_for(|s| *s != DurableStoreState::Unsettled),
+                    )
+                    .await,
+                    Ok(Ok(s)) if *s == DurableStoreState::Closed
+                )
+            } else {
+                false
+            };
+            return Err(ShutdownError::AlreadyShutDown { durable_store_open });
         }
+        let store_closer = store_closer.map_or_else(
+            || {
+                self.durable_store_state
+                    .send_replace(DurableStoreState::NotClosing);
+                None
+            },
+            |close| Some(settling_closer(&self.durable_store_state, close)),
+        );
 
         // Signal cooperating tasks to exit. Cheap and idempotent.
         self.cancel.cancel();
@@ -2478,8 +2727,11 @@ impl CoreFields {
             guard.cancel();
         }
 
-        let start = std::time::Instant::now();
-        let outcome = drain_under_deadline(&self.tasks, timeout, start).await;
+        // One clock for the whole deadline: the runtime clock, which every
+        // `timeout` below reads. A wall-clock `elapsed` here would disagree
+        // with those timeouts whenever the runtime clock is paused.
+        let start = tokio::time::Instant::now();
+        let outcome = drain_under_deadline(&self.tasks, timeout).await;
 
         // Run the sync cleanup side effects inside the remaining budget so
         // callers get a true end-to-end deadline on shutdown (including the
@@ -2490,23 +2742,34 @@ impl CoreFields {
         // (economy accessors), which is already true.
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
-        self.run_shutdown_side_effects(remaining).await;
-
-        Ok(outcome)
+        let has_durable_store = store_closer.is_some();
+        let drain = self
+            .run_shutdown_side_effects(remaining, store_closer)
+            .await;
+        combine_shutdown_outcome(outcome, drain, has_durable_store, start.elapsed())
     }
 
-    /// Shared cleanup body executed by both the sync [`shutdown`](Self::shutdown)
-    /// and the async [`shutdown_core_async`](Self::shutdown_core_async) paths.
+    /// Cleanup body of the async [`shutdown_core_async`](Self::shutdown_core_async)
+    /// path; [`Self::blocking_run_shutdown_side_effects`] is the sync sibling.
     ///
     /// Must only be called after `self.shutdown` has been swapped to `true`.
-    /// Clears transport, flushes persistence (inside `flush_budget` when
-    /// called from the async path, or with no bound from the sync path
-    /// via [`Self::blocking_run_shutdown_side_effects`]), drops MLS groups +
-    /// sender keys, clears bridge-owned registries, and runs any registered
-    /// shutdown hooks. Infallible: lock poisoning, hook panics, and flush
-    /// timeouts are logged and cleanup continues — shutdown must finish
-    /// regardless.
-    async fn run_shutdown_side_effects(&self, flush_budget: Duration) {
+    /// Clears transport, flushes persistence, drains the Supervisor, closes
+    /// the durable store after the drain, clears bridge-owned registries, and
+    /// runs any registered shutdown hooks. `budget` bounds the flush and the
+    /// drain together.
+    ///
+    /// The drain runs through `Supervisor::drain_with_deadline`, followed by
+    /// `store_closer` in the same task. The task is awaited until the deadline
+    /// and never aborted: aborting would cut a tracked writer mid-write, and
+    /// closing the store before that writer exits would release the advisory
+    /// lock while the writer still holds the connection's work in flight
+    /// (ADR-049 Decision 16).
+    async fn run_shutdown_side_effects(
+        &self,
+        budget: Duration,
+        store_closer: Option<DurableStoreCloser>,
+    ) -> SupervisorDrain {
+        let deadline = tokio::time::Instant::now() + budget;
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
@@ -2514,55 +2777,82 @@ impl CoreFields {
             urls.clear();
         }
 
-        if let Some(supervisor) = self.supervisor.get() {
-            // Persistence flush must honor the caller-supplied deadline.
-            // The flush is now natively async (per-context bounded
-            // `Mutex::lock` with a 250ms budget and degraded-snapshot
-            // fallback for wedged contexts); wrap in `tokio::time::timeout`
-            // so aggregate storage latency cannot push us past the caller's
-            // shutdown budget. Zero budget falls through to a best-effort
-            // inline flush (matches the sync shutdown path's contract).
-            //
-            // Supervisor::flush_all_contexts/shutdown_all_contexts are thin
-            // forwarders over the infallible ContextManager methods; the only
-            // reachable error is `NotInitialized` (no manager attached to
-            // the supervisor). Any error returned here we log rather than
-            // panic since shutdown must finish.
-            if flush_budget.is_zero() {
+        let drain = if let Some(supervisor) = self.supervisor.get() {
+            // The flush honors the caller's deadline: a wedged context cannot
+            // push shutdown past it. The flush is natively async (per-context
+            // bounded lock with a degraded-snapshot fallback).
+            if budget.is_zero() {
                 tracing::warn!(
                     "shutdown flush budget exhausted before flush_all_contexts — \
                      context state may not be persisted"
                 );
             } else {
-                match tokio::time::timeout(flush_budget, supervisor.flush_all_contexts()).await {
+                match tokio::time::timeout_at(deadline, supervisor.flush_all_contexts()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(
                             error = %e,
-                            "flush_all_contexts returned an error during shutdown \
-                             (likely supervisor providers detached mid-flight) — \
+                            "flush_all_contexts returned an error during shutdown — \
                              context state may not be persisted"
                         );
                     }
                     Err(_elapsed) => {
                         tracing::warn!(
-                            budget_ms = flush_budget.as_millis(),
+                            budget_ms = budget.as_millis(),
                             "flush_all_contexts exceeded shutdown budget — \
                              context state may not be persisted"
                         );
                     }
                 }
             }
-            if let Err(e) = supervisor.shutdown_all_contexts().await {
-                tracing::warn!(
+            let has_durable_store = store_closer.is_some();
+            // The store closes inside the drain task, after the drain: never
+            // before a tracked writer exits (ADR-049 Decision 16). A drain
+            // that misses the deadline keeps running and closes the store
+            // itself; no caller remains to receive a close failure, so the
+            // late callback logs it.
+            let on_late = move |late: Result<
+                Result<(), scp_platform::PlatformError>,
+                JoinFailure,
+            >| match late {
+                Ok(Ok(())) => {
+                    tracing::info!("{}", late_drain_finished_message(has_durable_store));
+                }
+                Ok(Err(e)) => tracing::error!(
                     error = %e,
-                    "shutdown_all_contexts returned an error during shutdown \
-                     (likely supervisor providers detached mid-flight)"
-                );
+                    "late Supervisor drain finished but the durable store refused \
+                     to close; it keeps its connection and advisory lock"
+                ),
+                Err(failure) => {
+                    tracing::error!("late {}", drain_failed_message(failure, has_durable_store));
+                }
+            };
+            match supervisor
+                .drain_with_deadline(deadline, move || close_durable_store(store_closer), on_late)
+                .await
+            {
+                DrainWithDeadline::Finished(closed) => SupervisorDrain::Finished(closed),
+                DrainWithDeadline::Failed(failure) => {
+                    tracing::error!("{}", drain_failed_message(failure, has_durable_store));
+                    SupervisorDrain::Failed(failure)
+                }
+                DrainWithDeadline::TimedOut => {
+                    tracing::warn!(
+                        budget_ms = budget.as_millis(),
+                        "{}",
+                        drain_timed_out_message(has_durable_store)
+                    );
+                    SupervisorDrain::Pending
+                }
             }
-        }
+        } else {
+            // No Supervisor was ever attached, so no tracked task can write
+            // through the store.
+            SupervisorDrain::Finished(close_durable_store(store_closer))
+        };
 
         self.finish_shutdown_cleanup();
+        drain
     }
 
     /// Non-async sibling of [`Self::run_shutdown_side_effects`] used by the sync
@@ -2581,11 +2871,11 @@ impl CoreFields {
         }
 
         if let Some(supervisor) = self.supervisor.get() {
-            // Supervisor::flush_all_contexts_sync and shutdown_all_contexts
-            // are thin forwarders over the infallible ContextManager methods.
-            // Any non-Ok return indicates the manager was detached
-            // mid-flight (or never attached), which we log since sync
-            // shutdown must finish regardless.
+            // The sync path has no caller to return an error to (it runs
+            // from destructors and atexit hooks). This path never closes the
+            // durable store, so an undrained Supervisor cannot lose its
+            // storage under a live writer: the advisory lock is released when
+            // the last storage `Arc` drops.
             if let Err(e) = supervisor.flush_all_contexts_sync() {
                 tracing::warn!(
                     error = %e,
@@ -2597,8 +2887,8 @@ impl CoreFields {
             if let Err(e) = supervisor.shutdown_all_contexts_sync() {
                 tracing::warn!(
                     error = %e,
-                    "shutdown_all_contexts_sync returned an error during shutdown \
-                     (likely supervisor providers detached mid-flight)"
+                    "shutdown_all_contexts_sync could not drain the Supervisor during \
+                     shutdown"
                 );
             }
         }
@@ -2636,11 +2926,226 @@ impl CoreFields {
     }
 }
 
+/// Closes an instance's durable store and releases its advisory lock.
+///
+/// Returned by [`BridgeInstanceCore::durable_store_closer`] and run by
+/// [`CoreFields::shutdown_core_async`] only after the Supervisor's tracked
+/// tasks have all exited (ADR-049 Decision 16). Owns its own clone of the
+/// storage handle, so it can run from the detached drain task after the
+/// shutdown call has returned.
+pub type DurableStoreCloser =
+    Box<dyn FnOnce() -> Result<(), scp_platform::PlatformError> + Send + 'static>;
+
+/// Where an instance's durable store stands once shutdown has begun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableStoreState {
+    /// No shutdown has settled the store yet: a closer may still run.
+    Unsettled,
+    /// A shutdown's closer closed the store and released its advisory lock.
+    Closed,
+    /// No shutdown will close the store: the winning shutdown had no closer
+    /// (the sync path, or an async call given none), its closer failed, or
+    /// its closer was dropped unrun.
+    NotClosing,
+}
+
+/// Records how a [`DurableStoreCloser`] ended when it is dropped:
+/// [`DurableStoreState::Closed`] after a successful close,
+/// [`DurableStoreState::NotClosing`] otherwise.
+struct SettleOnDrop {
+    state: Arc<tokio::sync::watch::Sender<DurableStoreState>>,
+    closed: bool,
+}
+
+impl Drop for SettleOnDrop {
+    fn drop(&mut self) {
+        self.state.send_replace(if self.closed {
+            DurableStoreState::Closed
+        } else {
+            DurableStoreState::NotClosing
+        });
+    }
+}
+
+/// Wraps `close` so that `state` settles however the closer ends: closed,
+/// failed, or dropped unrun, as when the drain task that owns it panics.
+fn settling_closer(
+    state: &Arc<tokio::sync::watch::Sender<DurableStoreState>>,
+    close: DurableStoreCloser,
+) -> DurableStoreCloser {
+    let settle = SettleOnDrop {
+        state: Arc::clone(state),
+        closed: false,
+    };
+    Box::new(move || {
+        // Bind the whole guard: a closure that names only `settle.closed`
+        // would capture a copy of that `bool` and drop the guard at once.
+        let mut settle = settle;
+        close()?;
+        settle.closed = true;
+        Ok(())
+    })
+}
+
+/// How the Supervisor drain ended inside the shutdown deadline.
+enum SupervisorDrain {
+    /// Every tracked task exited in time; the store close ran and returned
+    /// this result.
+    Finished(Result<(), scp_platform::PlatformError>),
+    /// The deadline passed first. The drain keeps running detached and
+    /// closes the store when it finishes.
+    Pending,
+    /// The drain task panicked or was cancelled. The store was not closed.
+    Failed(JoinFailure),
+}
+
+/// Log line for a Supervisor drain task that ended without returning. A
+/// panic is named as a panic and a cancellation as a cancellation, and a
+/// durable store is named only when the instance has one.
+const fn drain_failed_message(failure: JoinFailure, has_durable_store: bool) -> &'static str {
+    match (failure, has_durable_store) {
+        (JoinFailure::Panicked, true) => {
+            "Supervisor drain panicked during shutdown — the durable store was not closed and \
+             keeps its advisory lock"
+        }
+        (JoinFailure::Panicked, false) => "Supervisor drain panicked during shutdown",
+        (JoinFailure::Cancelled, true) => {
+            "Supervisor drain was cancelled during shutdown — the durable store was not closed \
+             and keeps its advisory lock"
+        }
+        (JoinFailure::Cancelled, false) => "Supervisor drain was cancelled during shutdown",
+    }
+}
+
+/// Log line for a Supervisor drain that missed the shutdown deadline. A
+/// durable store is named only when the instance has one.
+const fn drain_timed_out_message(has_durable_store: bool) -> &'static str {
+    if has_durable_store {
+        "Supervisor drain exceeded the shutdown deadline — tracked tasks keep running, and the \
+         durable store keeps its advisory lock until the last one exits"
+    } else {
+        "Supervisor drain exceeded the shutdown deadline — tracked tasks keep running"
+    }
+}
+
+/// Log line for a detached Supervisor drain that finished after the
+/// deadline. A durable store is named only when the instance has one.
+const fn late_drain_finished_message(has_durable_store: bool) -> &'static str {
+    if has_durable_store {
+        "late Supervisor drain finished; durable store closed"
+    } else {
+        "late Supervisor drain finished"
+    }
+}
+
+/// Runs `store_closer` when one exists.
+fn close_durable_store(
+    store_closer: Option<DurableStoreCloser>,
+) -> Result<(), scp_platform::PlatformError> {
+    store_closer.map_or(Ok(()), |close| close())
+}
+
+/// Folds the Supervisor drain into the bridge-task outcome.
+///
+/// [`ShutdownOutcome::GracefulWithin`] requires both the bridge's own tasks
+/// and the Supervisor's tracked tasks to have finished in time. A drain that
+/// did not finish turns the outcome into [`ShutdownOutcome::TimedOut`]; its
+/// `aborted_tasks` and `panicked_tasks` count only bridge tasks, because no
+/// tracked task is ever aborted and a drain panic is reported in `drain`.
+/// `durable_store_open` is true only when the drain did not finish and the
+/// instance has a durable store, which then stayed open.
+fn combine_shutdown_outcome(
+    bridge: BridgeTasksDrain,
+    drain: SupervisorDrain,
+    has_durable_store: bool,
+    elapsed: Duration,
+) -> Result<ShutdownOutcome, ShutdownError> {
+    let (aborted_tasks, panicked_tasks) = match bridge {
+        BridgeTasksDrain::Finished { panicked } => (None, panicked),
+        BridgeTasksDrain::TimedOut { aborted, panicked } => (Some(aborted), panicked),
+    };
+    let (drain, durable_store_open) = match drain {
+        SupervisorDrain::Finished(Err(e)) => return Err(ShutdownError::DurableStoreClose(e)),
+        SupervisorDrain::Finished(Ok(())) => (DrainState::Finished, false),
+        SupervisorDrain::Pending => (DrainState::Running, has_durable_store),
+        SupervisorDrain::Failed(JoinFailure::Panicked) => (DrainState::Panicked, has_durable_store),
+        SupervisorDrain::Failed(JoinFailure::Cancelled) => {
+            (DrainState::Cancelled, has_durable_store)
+        }
+    };
+    Ok(match (aborted_tasks, drain) {
+        (None, DrainState::Finished) => ShutdownOutcome::GracefulWithin {
+            elapsed,
+            panicked_tasks,
+        },
+        (aborted_tasks, drain) => ShutdownOutcome::TimedOut {
+            aborted_tasks: aborted_tasks.unwrap_or(0),
+            panicked_tasks,
+            drain,
+            durable_store_open,
+        },
+    })
+}
+
+/// Reduces a [`BridgeInstanceCore::shutdown`] result to what an SDK
+/// `shutdown` reports. An SDK `shutdown` returns no [`ShutdownOutcome`], so
+/// this decides whether the caller sees success or an error.
+///
+/// Returns `Ok(())` when no durable store is left holding its advisory lock:
+/// [`ShutdownOutcome::GracefulWithin`], and a `TimedOut` or
+/// [`ShutdownError::AlreadyShutDown`] whose `durable_store_open` is false.
+///
+/// # Errors
+///
+/// Returns the message of the [`crate::error_codes::STORAGE_8005`] error each
+/// bridge raises when the durable store still holds its advisory lock: a
+/// `TimedOut` or `AlreadyShutDown` with `durable_store_open` set, or
+/// [`ShutdownError::DurableStoreClose`].
+pub fn sdk_shutdown_result(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), String> {
+    match result {
+        Ok(
+            ShutdownOutcome::GracefulWithin { .. }
+            | ShutdownOutcome::TimedOut {
+                durable_store_open: false,
+                ..
+            },
+        )
+        | Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: false,
+        }) => Ok(()),
+        Ok(ShutdownOutcome::TimedOut {
+            durable_store_open: true,
+            ..
+        })
+        | Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }) => Err(
+            "shutdown left the durable store open: it keeps its advisory lock, so a reopen of \
+             the same directory fails until the store is released"
+                .to_owned(),
+        ),
+        Err(e @ ShutdownError::DurableStoreClose(_)) => Err(format!(
+            "{e} — the durable store keeps its advisory lock, so a reopen of the same \
+             directory fails until the process releases it"
+        )),
+    }
+}
+
+/// How the bridge's own `JoinSet` drain ended.
+#[derive(Debug, Clone, Copy)]
+enum BridgeTasksDrain {
+    /// Every task finished before the deadline; `panicked` of them panicked.
+    Finished { panicked: usize },
+    /// The deadline passed: `aborted` tasks were aborted and `panicked`
+    /// panicked, on the drain or on the abort path.
+    TimedOut { aborted: usize, panicked: usize },
+}
+
 /// Locks the `JoinSet` long enough to drain outstanding tasks with a
-/// deadline. On graceful drain, returns [`ShutdownOutcome::GracefulWithin`]
-/// with the elapsed time since `start` and the count of tasks that
-/// panicked. On timeout, aborts the remaining tasks, counts both
-/// aborted and panicked tasks, and returns [`ShutdownOutcome::TimedOut`].
+/// deadline. On graceful drain, returns [`BridgeTasksDrain::Finished`] with
+/// the count of tasks that panicked. On timeout, aborts the remaining tasks,
+/// counts both aborted and panicked tasks, and returns
+/// [`BridgeTasksDrain::TimedOut`].
 ///
 /// The helper exists so the lock guard's scope is obvious and clippy's
 /// `significant_drop_tightening` check is satisfied (the guard cannot be
@@ -2650,8 +3155,7 @@ impl CoreFields {
 async fn drain_under_deadline(
     tasks: &AsyncMutex<JoinSet<()>>,
     timeout: Duration,
-    start: std::time::Instant,
-) -> ShutdownOutcome {
+) -> BridgeTasksDrain {
     // The `JoinSet` lock is held for the full drain — `abort_all` +
     // `join_next` below all need exclusive access to the same set.
     // Clippy's `significant_drop_tightening` flags the wide scope, but
@@ -2663,19 +3167,16 @@ async fn drain_under_deadline(
         .await
         .is_ok()
     {
-        return ShutdownOutcome::GracefulWithin {
-            elapsed: start.elapsed(),
-            panicked_tasks: panicked,
-        };
+        return BridgeTasksDrain::Finished { panicked };
     }
     // Deadline expired: abort remaining tasks and count how many we cut
     // versus how many panicked on the abort path. `abort_all` is a no-op
     // for finished tasks.
     guard.abort_all();
     let (aborted, abort_panicked) = count_and_drain_aborted(&mut guard).await;
-    ShutdownOutcome::TimedOut {
-        aborted_tasks: aborted,
-        panicked_tasks: panicked + abort_panicked,
+    BridgeTasksDrain::TimedOut {
+        aborted,
+        panicked: panicked + abort_panicked,
     }
 }
 
@@ -2799,12 +3300,15 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// [`CoreFields::stop_borrowers`] runs before anything else, and this
     /// ordering lives here rather than in each bridge so no bridge can drift
     /// out of it. A node that `start_node_local` started writes through a
-    /// clone of this instance's storage `Arc`, while
-    /// `bridge_specific_shutdown` closes that same `SQLCipher` handle and
-    /// drops an advisory `flock(2)` on `{dir}/scp.db.lock`. Releasing that
+    /// clone of this instance's storage `Arc`, while the
+    /// [`DurableStoreCloser`] closes that same `SQLCipher` handle and drops
+    /// an advisory `flock(2)` on `{dir}/scp.db.lock`. Releasing that
     /// lock while a node still writes invites split-brain writes and WAL
     /// corruption (red-hat RED-1002), so every borrower stops first. See
     /// [`InstanceBorrower`].
+    ///
+    /// The durable store closes inside `shutdown_core_async`, after the
+    /// Supervisor drain, never in `bridge_specific_shutdown`.
     ///
     /// `bridge_specific_shutdown` runs UNCONDITIONALLY — even when
     /// [`CoreFields::shutdown_core_async`] returns
@@ -2821,16 +3325,37 @@ pub trait BridgeInstanceCore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`ShutdownError::AlreadyShutDown`] on a second call.
+    /// Returns [`ShutdownError::AlreadyShutDown`] on a second call, and
+    /// [`ShutdownError::DurableStoreClose`] when the store refuses to close.
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        // Stop every borrower BEFORE any release: `bridge_specific_shutdown`
+        // Stop every borrower BEFORE any release: the durable store closer
         // closes this instance's `SQLCipher` handle, and a node started on
         // that handle must not still be writing when it does.
         self.core().stop_borrowers();
-        let result = self.core().shutdown_core_async(timeout).await;
+        self.release_streams();
+        let result = self
+            .core()
+            .shutdown_core_async(timeout, self.durable_store_closer())
+            .await;
         self.bridge_specific_shutdown();
         result
     }
+
+    /// Returns the closer for this instance's durable store, or `None` when
+    /// the instance holds no store with an advisory lock (an in-memory
+    /// backend).
+    ///
+    /// [`Self::shutdown`] hands it to [`CoreFields::shutdown_core_async`],
+    /// which runs it only after the Supervisor's tracked tasks have exited.
+    /// Every bridge implements this rather than closing storage in
+    /// [`Self::bridge_specific_shutdown`], which runs whether or not the
+    /// drain finished.
+    fn durable_store_closer(&self) -> Option<DurableStoreCloser>;
+
+    /// Override hook for per-bridge concrete structs to drop their outlet-
+    /// stream and streaming-saga registries. [`Self::shutdown`] calls it
+    /// before the Supervisor drain. The default implementation is a no-op.
+    fn release_streams(&self) {}
 
     /// Override hook for per-bridge concrete structs to drop their
     /// bridge-specific typed fields (MCP registries, custody store, etc.).
@@ -3033,38 +3558,70 @@ impl std::error::Error for HandleAffinityError {}
 pub enum ShutdownOutcome {
     /// All outstanding tasks completed before the deadline.
     GracefulWithin {
-        /// Elapsed wall-clock time from the first cancellation signal to the
-        /// last task joining (or panicking). Reported so callers can log
-        /// shutdown latency.
+        /// Time on the runtime clock from the start of the drain until the
+        /// shutdown's cleanup, including the Supervisor drain and the
+        /// durable store close, finished.
         elapsed: Duration,
         /// Number of tasks that panicked during the graceful drain.
         /// Panics are logged at `tracing::error!` level; shutdown continues
         /// regardless.
         panicked_tasks: usize,
     },
-    /// The deadline expired before all tasks finished; the `JoinSet` was
-    /// aborted.
+    /// The deadline expired before the bridge's own tasks or the
+    /// Supervisor's tracked tasks finished, or the Supervisor drain task
+    /// panicked or was cancelled; `drain` says which.
     TimedOut {
-        /// Number of tasks that were aborted because the shutdown deadline
-        /// was reached (tasks that had already completed before the deadline
-        /// are not counted).
+        /// Number of the bridge's own `JoinSet` tasks that were aborted
+        /// because the shutdown deadline was reached (tasks that had already
+        /// completed before the deadline are not counted). Supervisor tracked
+        /// tasks are never aborted, so they never count here.
         aborted_tasks: usize,
-        /// Number of tasks that panicked during the abort drain. A nonzero
-        /// count indicates a task unwound on the abort path — typically a
-        /// secondary failure mode when the primary shutdown path races with
-        /// a panicking task.
+        /// Number of the bridge's own `JoinSet` tasks that panicked during
+        /// the drain. A Supervisor drain panic is reported in `drain`, not
+        /// here.
         panicked_tasks: usize,
+        /// How the Supervisor drain stood when the shutdown returned.
+        drain: DrainState,
+        /// True when the Supervisor drain did not finish and the instance has
+        /// a durable store: the store was not closed and keeps its advisory
+        /// lock.
+        durable_store_open: bool,
     },
 }
 
+/// How the Supervisor drain stood when a [`ShutdownOutcome::TimedOut`]
+/// shutdown returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainState {
+    /// Every tracked task exited before the deadline and the durable store
+    /// close ran; only the bridge's own `JoinSet` missed the deadline.
+    Finished,
+    /// The deadline passed first. The drain keeps running detached and
+    /// closes the durable store when the last tracked task exits.
+    Running,
+    /// The drain task panicked. No task closes the durable store.
+    Panicked,
+    /// The drain task was cancelled. No task closes the durable store.
+    Cancelled,
+}
+
 /// Error produced by [`CoreFields::shutdown_core_async`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ShutdownError {
-    /// The instance has already been shut down; a second call is a no-op
-    /// from the caller's perspective but is surfaced so the caller can
+    /// The instance has already been shut down; surfaced so the caller can
     /// distinguish "I did the work" from "someone else already did."
     #[error("bridge instance has already been shut down")]
-    AlreadyShutDown,
+    AlreadyShutDown {
+        /// True when the call was given a [`DurableStoreCloser`] and no
+        /// shutdown had closed the durable store by the time the call
+        /// returned: the store still holds its advisory lock.
+        durable_store_open: bool,
+    },
+    /// The Supervisor drained in time, but the durable store refused to
+    /// close. The store keeps its connection and advisory lock, so a reopen
+    /// of the same directory fails until the process releases it.
+    #[error("durable store failed to close after shutdown: {0}")]
+    DurableStoreClose(scp_platform::PlatformError),
 }
 
 #[cfg(test)]
@@ -3218,6 +3775,81 @@ mod tests {
         assert!(!instance.has_supervisor());
         assert!(instance.try_supervisor().is_none());
         assert!(!instance.is_shutdown());
+    }
+
+    /// A stream entry inserted before shutdown begins stays registered; one
+    /// inserted after `stop_borrowers`, or after either shutdown transition,
+    /// is removed and reported refused, whether it arrives through
+    /// `StreamRegistry::insert` or `CoreFields::insert_stream_entry`.
+    #[tokio::test]
+    async fn stream_registry_insert_refuses_once_shutdown_begins() {
+        let instance = CoreFields::new();
+        let registry: StreamRegistry<String, u8> = StreamRegistry::new(&instance);
+        assert!(registry.insert("live".to_owned(), 1));
+        assert!(instance.insert_stream_entry(&registry, "live-2".to_owned(), 1));
+        assert!(registry.contains_key("live") && registry.contains_key("live-2"));
+
+        instance.stop_borrowers();
+        assert!(!registry.insert("late".to_owned(), 2));
+        assert!(!instance.insert_stream_entry(&registry, "late-2".to_owned(), 2));
+        assert!(!registry.contains_key("late") && !registry.contains_key("late-2"));
+        assert!(
+            registry.contains_key("live"),
+            "only the late entries are removed"
+        );
+
+        let shut = CoreFields::new();
+        let shut_registry: StreamRegistry<String, u8> = StreamRegistry::new(&shut);
+        shut.shutdown();
+        assert!(!shut_registry.insert("after".to_owned(), 3));
+        assert!(shut_registry.is_empty());
+
+        let drained = CoreFields::new();
+        let drained_registry: StreamRegistry<String, u8> = StreamRegistry::new(&drained);
+        let _ = drained
+            .shutdown_core_async(Duration::from_millis(50), None)
+            .await;
+        assert!(!drained_registry.insert("after-drain".to_owned(), 4));
+        assert!(drained_registry.is_empty());
+    }
+
+    /// `register_or_refuse` accepts an entry before shutdown begins and, once
+    /// `stop_borrowers` has run, refuses it with `SCP-CTX-2139`, names the
+    /// saga when given one, and leaves no entry.
+    #[test]
+    fn register_or_refuse_accepts_then_refuses_with_the_late_code() {
+        let instance = CoreFields::new();
+        let registry: StreamRegistry<String, u8> = StreamRegistry::new(&instance);
+        assert_eq!(
+            instance.register_or_refuse(&registry, "live".to_owned(), 1, None),
+            Ok(())
+        );
+        assert!(registry.contains_key("live"));
+
+        instance.stop_borrowers();
+        assert_eq!(
+            instance.register_or_refuse(&registry, "late".to_owned(), 2, None),
+            Err(late_registration_refusal(None))
+        );
+        let (code, message) = instance
+            .register_or_refuse(&registry, "late-saga".to_owned(), 3, Some("saga-late-1"))
+            .expect_err("a registration after stop_borrowers must be refused");
+        assert_eq!(code, crate::error_codes::CTX_2139);
+        assert!(message.contains("saga-late-1"), "{message}");
+        assert!(!registry.contains_key("late") && !registry.contains_key("late-saga"));
+    }
+
+    /// The late-registration refusal carries `SCP-CTX-2139`, not the
+    /// `SCP-CTX-2138` of an operation refused before it started, and a saga's
+    /// refusal names the saga.
+    #[test]
+    fn late_registration_refusal_names_code_and_saga() {
+        let (code, _) = late_registration_refusal(None);
+        assert_eq!(code, crate::error_codes::CTX_2139);
+        assert_ne!(code, crate::error_codes::CTX_2138);
+        let (code, message) = late_registration_refusal(Some("saga-late-1"));
+        assert_eq!(code, crate::error_codes::CTX_2139);
+        assert!(message.contains("saga-late-1"), "{message}");
     }
 
     #[test]
@@ -4818,7 +5450,7 @@ mod tests {
     async fn shutdown_core_async_graceful_when_no_tasks() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let outcome = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap();
         let ShutdownOutcome::GracefulWithin {
@@ -4847,18 +5479,24 @@ mod tests {
             });
         }
         let outcome = instance
-            .shutdown_core_async(Duration::from_millis(500))
+            .shutdown_core_async(Duration::from_millis(500), None)
             .await
             .unwrap();
         let ShutdownOutcome::TimedOut {
             aborted_tasks,
             panicked_tasks,
+            durable_store_open,
+            ..
         } = outcome
         else {
             unreachable!("expected TimedOut, got {outcome:?}");
         };
         assert_eq!(aborted_tasks, 1);
         assert_eq!(panicked_tasks, 0);
+        assert!(
+            !durable_store_open,
+            "an instance with no durable store never reports one open"
+        );
         assert!(instance.is_shutdown());
     }
 
@@ -4877,7 +5515,7 @@ mod tests {
             });
         }
         let outcome = instance
-            .shutdown_core_async(Duration::from_secs(2))
+            .shutdown_core_async(Duration::from_secs(2), None)
             .await
             .unwrap();
         assert!(
@@ -4935,7 +5573,7 @@ mod tests {
             });
         }
         let outcome = instance
-            .shutdown_core_async(SLOW_PANIC_DEADLINE)
+            .shutdown_core_async(SLOW_PANIC_DEADLINE, None)
             .await
             .unwrap();
         let ShutdownOutcome::GracefulWithin { panicked_tasks, .. } = outcome else {
@@ -4958,7 +5596,7 @@ mod tests {
         }));
 
         instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
@@ -4968,16 +5606,21 @@ mod tests {
     async fn shutdown_core_async_is_idempotent() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let first = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap();
         assert!(matches!(first, ShutdownOutcome::GracefulWithin { .. }));
 
         let err = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap_err();
-        assert_eq!(err, ShutdownError::AlreadyShutDown);
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4988,10 +5631,15 @@ mod tests {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance.shutdown();
         let err = instance
-            .shutdown_core_async(Duration::from_secs(1))
+            .shutdown_core_async(Duration::from_secs(1), None)
             .await
             .unwrap_err();
-        assert_eq!(err, ShutdownError::AlreadyShutDown);
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -5010,9 +5658,13 @@ mod tests {
         fn core(&self) -> &CoreFields {
             &self.core
         }
+        fn durable_store_closer(&self) -> Option<DurableStoreCloser> {
+            None
+        }
         // `shutdown` inherits the trait default (landed in commit 6 of
-        // ADR-049): `self.core().shutdown_core_async(timeout).await +
-        // self.bridge_specific_shutdown()`. Overriding it here would
+        // ADR-049): `self.release_streams()`, then
+        // `self.core().shutdown_core_async(timeout, closer).await`, then
+        // `self.bridge_specific_shutdown()`. Overriding it here would
         // diverge from production behavior and be caught by the
         // cross-bridge consistency gate.
     }
@@ -5037,5 +5689,650 @@ mod tests {
         let outcome = bridge.shutdown(Duration::from_secs(1)).await.unwrap();
         assert!(matches!(outcome, ShutdownOutcome::GracefulWithin { .. }));
         assert!(bridge.core().is_shutdown());
+    }
+
+    // -----------------------------------------------------------------
+    // Drain before close (ADR-049 Decision 16; ADR-048 §5 as amended)
+    // -----------------------------------------------------------------
+
+    /// Event log whose `destroy_event_log` waits for a permit on `gate`. A
+    /// gate with no permits wedges the context actor's `ShutdownSelf`, so the
+    /// Supervisor drain cannot finish until the test adds a permit.
+    struct GatedDestroyEventLog {
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for GatedDestroyEventLog {
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _: scp_event_log::EventType,
+            _: &str,
+            _: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            self.gate
+                .acquire()
+                .await
+                .map(drop)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))
+        }
+    }
+
+    /// Bridge whose durable store is a real `SqliteStorage`, so the drain-then-
+    /// close ordering is observable through the directory's advisory lock.
+    struct SqliteBackedBridge {
+        core: CoreFields,
+        storage: Arc<scp_platform::sqlite::SqliteStorage>,
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeInstanceCore for SqliteBackedBridge {
+        fn core(&self) -> &CoreFields {
+            &self.core
+        }
+        fn durable_store_closer(&self) -> Option<DurableStoreCloser> {
+            let storage = Arc::clone(&self.storage);
+            Some(Box::new(move || storage.close()))
+        }
+    }
+
+    const SQLITE_TEST_KEY: [u8; 32] = [0x5au8; 32];
+
+    fn unique_store_dir(label: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "scp-bridge-drain-{label}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create store dir");
+        dir
+    }
+
+    /// Builds a bridge over a Supervisor whose event-log destroy waits on
+    /// `gate`, with one created context so shutdown has an actor to stop.
+    async fn sqlite_bridge_with_context(
+        dir: &std::path::Path,
+        gate: Arc<tokio::sync::Semaphore>,
+    ) -> SqliteBackedBridge {
+        let key_resolver: scp_core::context::governance::KeyResolver =
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
+        let supervisor = Supervisor::with_providers(
+            Arc::new(NodeMlsFactory::new(
+                "did:dht:zbridgedrain".to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            )),
+            Box::new(LocalTransportProvider),
+            Box::new(GatedDestroyEventLog { gate }),
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            test_mls_storage(),
+        );
+        supervisor
+            .create_context(
+                "bridge-drain-ctx".to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID::from("did:dht:zbridgedraincreator"),
+                None,
+            )
+            .await
+            .expect("create context");
+        let storage = Arc::new(
+            scp_platform::sqlite::SqliteStorage::new(dir, &SQLITE_TEST_KEY).expect("open store"),
+        );
+        SqliteBackedBridge {
+            core: CoreFields::with_supervisor(supervisor),
+            storage,
+        }
+    }
+
+    /// Bridge whose `release_streams` frees the gate a tracked writer waits
+    /// on, standing in for a stream pump that settles once its receiver drops.
+    struct StreamReleasingBridge {
+        inner: SqliteBackedBridge,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeInstanceCore for StreamReleasingBridge {
+        fn core(&self) -> &CoreFields {
+            &self.inner.core
+        }
+        fn durable_store_closer(&self) -> Option<DurableStoreCloser> {
+            self.inner.durable_store_closer()
+        }
+        fn release_streams(&self) {
+            self.gate.add_permits(1);
+        }
+    }
+
+    /// `shutdown` releases stream receivers before the Supervisor drain, so a
+    /// writer that exits only once its stream is released lets the drain
+    /// finish inside the deadline and the store close.
+    #[tokio::test]
+    async fn shutdown_releases_streams_before_the_drain() {
+        let dir = unique_store_dir("release-streams");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let bridge = StreamReleasingBridge {
+            inner: sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await,
+            gate,
+        };
+        let outcome = bridge
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown reports an outcome");
+        assert!(
+            !matches!(outcome, ShutdownOutcome::TimedOut { .. }),
+            "the drain must not wait on a writer that release_streams frees, got {outcome:?}"
+        );
+        assert!(sdk_shutdown_result(Ok(outcome)).is_ok());
+        drop(scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY).expect("reopen"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shutdown whose Supervisor drain misses the deadline reports
+    /// `TimedOut`, leaves the drain running, and keeps the store's lock: a
+    /// reopen of the directory meanwhile fails with `StorageLockHeld`. Once
+    /// the last writer exits, the late drain closes the store and the
+    /// directory reopens.
+    #[tokio::test]
+    async fn timed_out_shutdown_keeps_lock_until_drain_finishes() {
+        let dir = unique_store_dir("timeout");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let bridge = sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await;
+
+        let outcome = bridge
+            .shutdown(Duration::from_millis(200))
+            .await
+            .expect("shutdown reports an outcome");
+        assert!(
+            matches!(
+                outcome,
+                ShutdownOutcome::TimedOut {
+                    drain: DrainState::Running,
+                    durable_store_open: true,
+                    ..
+                }
+            ),
+            "a wedged drain must report TimedOut with the drain running and the store open, \
+             got {outcome:?}"
+        );
+        assert!(
+            sdk_shutdown_result(Ok(outcome)).is_err(),
+            "an SDK shutdown must not report success while the store keeps its lock"
+        );
+
+        let reopen = scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY);
+        assert!(
+            matches!(
+                reopen,
+                Err(scp_platform::PlatformError::StorageLockHeld { .. })
+            ),
+            "a reopen during a timed-out shutdown must fail with StorageLockHeld, got {:?}",
+            reopen.map(|_| ())
+        );
+
+        // Release the wedged writer; the detached drain then closes the store.
+        gate.add_permits(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let reopen = loop {
+            match scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY) {
+                Err(scp_platform::PlatformError::StorageLockHeld { .. })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => break other,
+            }
+        };
+        reopen
+            .expect("the late drain never released the store")
+            .close()
+            .expect("close the reopened store");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A shutdown whose drain finishes inside the deadline reports
+    /// `GracefulWithin` and has closed the store before returning, so the
+    /// directory reopens on the first try.
+    #[tokio::test]
+    async fn graceful_shutdown_closes_store_before_returning() {
+        let dir = unique_store_dir("graceful");
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let bridge = sqlite_bridge_with_context(&dir, gate).await;
+
+        let outcome = bridge
+            .shutdown(Duration::from_secs(10))
+            .await
+            .expect("shutdown reports an outcome");
+        assert!(
+            matches!(outcome, ShutdownOutcome::GracefulWithin { .. }),
+            "an unwedged drain must finish in time, got {outcome:?}"
+        );
+        let reopened = scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY)
+            .expect("the store closed before shutdown returned, so the first reopen succeeds");
+        reopened.close().expect("close the reopened store");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A closer that only reports whether it ran.
+    fn recording_closer(
+        result: Result<(), scp_platform::PlatformError>,
+        ran: &Arc<AtomicBool>,
+    ) -> DurableStoreCloser {
+        let ran = Arc::clone(ran);
+        Box::new(move || {
+            ran.store(true, Ordering::SeqCst);
+            result
+        })
+    }
+
+    /// A repeat shutdown given an hour-long timeout, which must return well
+    /// inside five seconds of wall-clock time.
+    async fn repeat_shutdown_with_long_timeout(
+        instance: &CoreFields,
+        unused: &Arc<AtomicBool>,
+    ) -> ShutdownError {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            instance.shutdown_core_async(
+                Duration::from_secs(3600),
+                Some(recording_closer(Ok(()), unused)),
+            ),
+        )
+        .await
+        .expect("a repeat shutdown returns at once once the store is settled")
+        .unwrap_err()
+    }
+
+    /// A repeat shutdown reports the store released only after an earlier
+    /// shutdown's closer closed it, never runs its own closer, and returns at
+    /// once when no shutdown will ever close the store.
+    #[tokio::test]
+    async fn repeat_shutdown_reports_whether_the_store_still_holds_its_lock() {
+        let unused = Arc::new(AtomicBool::new(false));
+
+        let closed = CoreFields::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        closed
+            .shutdown_core_async(Duration::from_secs(1), Some(recording_closer(Ok(()), &ran)))
+            .await
+            .unwrap();
+        assert!(ran.load(Ordering::SeqCst));
+        let err = repeat_shutdown_with_long_timeout(&closed, &unused).await;
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            }
+        ));
+
+        let refused = CoreFields::new();
+        let close_err = scp_platform::PlatformError::StorageError("close refused".to_owned());
+        let first = refused
+            .shutdown_core_async(
+                Duration::from_secs(1),
+                Some(recording_closer(Err(close_err), &ran)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(first, ShutdownError::DurableStoreClose(_)));
+        let err = repeat_shutdown_with_long_timeout(&refused, &unused).await;
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+
+        // The sync path never closes the durable store.
+        let sync = CoreFields::new();
+        sync.shutdown();
+        let err = repeat_shutdown_with_long_timeout(&sync, &unused).await;
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+
+        // A winner given no closer never closes the store.
+        let no_closer = CoreFields::new();
+        no_closer
+            .shutdown_core_async(Duration::from_secs(1), None)
+            .await
+            .unwrap();
+        let err = repeat_shutdown_with_long_timeout(&no_closer, &unused).await;
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+        assert!(
+            !unused.load(Ordering::SeqCst),
+            "a losing call runs no closer"
+        );
+    }
+
+    /// A settling closer records `Closed` only after a successful close, and
+    /// `NotClosing` when its close fails or it is dropped unrun, as when the
+    /// drain task that owns it panics.
+    #[test]
+    fn settling_closer_records_how_the_close_ended() {
+        let unused = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(tokio::sync::watch::Sender::new(
+            DurableStoreState::Unsettled,
+        ));
+
+        settling_closer(&state, recording_closer(Ok(()), &unused))().unwrap();
+        assert_eq!(*state.borrow(), DurableStoreState::Closed);
+
+        state.send_replace(DurableStoreState::Unsettled);
+        let refused = scp_platform::PlatformError::StorageError("close refused".to_owned());
+        settling_closer(&state, recording_closer(Err(refused), &unused))().unwrap_err();
+        assert_eq!(*state.borrow(), DurableStoreState::NotClosing);
+
+        state.send_replace(DurableStoreState::Unsettled);
+        let ran = Arc::new(AtomicBool::new(false));
+        let closer = settling_closer(&state, recording_closer(Ok(()), &ran));
+        assert_eq!(*state.borrow(), DurableStoreState::Unsettled);
+        drop(closer);
+        assert_eq!(*state.borrow(), DurableStoreState::NotClosing);
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// `GracefulWithin.elapsed` covers the durable store close, not only the
+    /// bridge's own task drain.
+    #[tokio::test]
+    async fn graceful_elapsed_covers_the_store_close() {
+        let instance = CoreFields::new();
+        let slow_close: DurableStoreCloser = Box::new(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        });
+        let outcome = instance
+            .shutdown_core_async(Duration::from_secs(5), Some(slow_close))
+            .await
+            .unwrap();
+        let ShutdownOutcome::GracefulWithin { elapsed, .. } = outcome else {
+            unreachable!("expected GracefulWithin, got {outcome:?}");
+        };
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "elapsed must include the 50 ms close, got {elapsed:?}"
+        );
+    }
+
+    /// A shutdown that loses the race to one still closing the store reports
+    /// the store open when its own timeout passes first, and released when
+    /// the winner's close lands within that timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_shutdown_waits_for_the_winner_to_close_the_store() {
+        let instance = Arc::new(CoreFields::new());
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let closer: DurableStoreCloser = Box::new(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        let winner = {
+            let instance = Arc::clone(&instance);
+            tokio::spawn(async move {
+                instance
+                    .shutdown_core_async(Duration::from_secs(10), Some(closer))
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let unused = Arc::new(AtomicBool::new(false));
+        let err = instance
+            .shutdown_core_async(
+                Duration::from_millis(20),
+                Some(recording_closer(Ok(()), &unused)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShutdownError::AlreadyShutDown {
+                durable_store_open: true
+            }
+        ));
+
+        // Poll the loser once before releasing the winner, so it is parked
+        // waiting on the winner's close rather than reading a store already
+        // released.
+        let mut loser = std::pin::pin!(instance.shutdown_core_async(
+            Duration::from_secs(10),
+            Some(recording_closer(Ok(()), &unused)),
+        ));
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(loser.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(parked, "the loser waits while the winner is still closing");
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            loser.await,
+            Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            })
+        ));
+        assert!(matches!(
+            winner.await.unwrap(),
+            Ok(ShutdownOutcome::GracefulWithin { .. })
+        ));
+        assert!(
+            !unused.load(Ordering::SeqCst),
+            "a losing call runs no closer"
+        );
+    }
+
+    /// The drain log lines name a durable store only for an instance that has
+    /// one.
+    #[test]
+    fn drain_log_lines_name_the_store_only_when_one_exists() {
+        for message in [
+            drain_failed_message(JoinFailure::Panicked, true),
+            drain_failed_message(JoinFailure::Cancelled, true),
+            drain_timed_out_message(true),
+            late_drain_finished_message(true),
+        ] {
+            assert!(message.contains("durable store"), "{message}");
+        }
+        for message in [
+            drain_failed_message(JoinFailure::Panicked, false),
+            drain_failed_message(JoinFailure::Cancelled, false),
+            drain_timed_out_message(false),
+            late_drain_finished_message(false),
+        ] {
+            assert!(!message.contains("store"), "{message}");
+        }
+    }
+
+    /// A drain failure's log line names a panic as a panic and a
+    /// cancellation as a cancellation.
+    #[test]
+    fn drain_failed_message_never_names_a_cancellation_a_panic() {
+        for has_store in [true, false] {
+            let panicked = drain_failed_message(JoinFailure::Panicked, has_store);
+            assert!(panicked.contains("panicked"), "{panicked}");
+            assert!(!panicked.contains("cancelled"), "{panicked}");
+            let cancelled = drain_failed_message(JoinFailure::Cancelled, has_store);
+            assert!(cancelled.contains("cancelled"), "{cancelled}");
+            assert!(!cancelled.contains("panicked"), "{cancelled}");
+        }
+    }
+
+    /// The SDK surface reports success only when no durable store is left
+    /// holding its lock, and an error for each way the store can stay locked.
+    #[test]
+    fn sdk_shutdown_result_fails_only_while_the_store_keeps_its_lock() {
+        let graceful = ShutdownOutcome::GracefulWithin {
+            elapsed: Duration::ZERO,
+            panicked_tasks: 0,
+        };
+        assert_eq!(sdk_shutdown_result(Ok(graceful)), Ok(()));
+        let timed_out_store_closed = ShutdownOutcome::TimedOut {
+            aborted_tasks: 1,
+            panicked_tasks: 0,
+            drain: DrainState::Finished,
+            durable_store_open: false,
+        };
+        assert_eq!(sdk_shutdown_result(Ok(timed_out_store_closed)), Ok(()));
+        assert_eq!(
+            sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown {
+                durable_store_open: false
+            })),
+            Ok(())
+        );
+        let msg = sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown {
+            durable_store_open: true,
+        }))
+        .unwrap_err();
+        assert!(msg.contains("keeps its advisory lock"), "{msg}");
+
+        let timed_out_store_open = ShutdownOutcome::TimedOut {
+            aborted_tasks: 0,
+            panicked_tasks: 0,
+            drain: DrainState::Running,
+            durable_store_open: true,
+        };
+        let msg = sdk_shutdown_result(Ok(timed_out_store_open)).unwrap_err();
+        assert!(msg.contains("keeps its advisory lock"), "{msg}");
+        let msg = sdk_shutdown_result(Err(ShutdownError::DurableStoreClose(
+            scp_platform::PlatformError::StorageError("close refused".to_owned()),
+        )))
+        .unwrap_err();
+        assert!(
+            msg.contains("close refused") && msg.contains("keeps its advisory lock"),
+            "{msg}"
+        );
+    }
+
+    /// `durable_store_open` is set only when the drain did not finish and the
+    /// instance has a durable store; a finished drain closes the store even
+    /// when the bridge's own tasks timed out. `drain` tells a drain still
+    /// running past the deadline apart from a panicked or cancelled one, and
+    /// a drain panic never counts in `panicked_tasks`.
+    #[test]
+    fn combine_shutdown_outcome_reports_the_drain_state_apart_from_bridge_tasks() {
+        let graceful = || BridgeTasksDrain::Finished { panicked: 1 };
+        let bridge_timed_out = || BridgeTasksDrain::TimedOut {
+            aborted: 2,
+            panicked: 0,
+        };
+        let elapsed = Duration::from_millis(7);
+        assert_eq!(
+            combine_shutdown_outcome(graceful(), SupervisorDrain::Finished(Ok(())), true, elapsed)
+                .unwrap(),
+            ShutdownOutcome::GracefulWithin {
+                elapsed,
+                panicked_tasks: 1,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(graceful(), SupervisorDrain::Pending, true, elapsed).unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 0,
+                panicked_tasks: 1,
+                drain: DrainState::Running,
+                durable_store_open: true,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(
+                graceful(),
+                SupervisorDrain::Failed(JoinFailure::Panicked),
+                true,
+                elapsed,
+            )
+            .unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 0,
+                panicked_tasks: 1,
+                drain: DrainState::Panicked,
+                durable_store_open: true,
+            },
+            "a drain panic is reported in `drain` and not added to the bridge's panicked tasks"
+        );
+        assert_eq!(
+            combine_shutdown_outcome(
+                graceful(),
+                SupervisorDrain::Failed(JoinFailure::Cancelled),
+                false,
+                elapsed,
+            )
+            .unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 0,
+                panicked_tasks: 1,
+                drain: DrainState::Cancelled,
+                durable_store_open: false,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Pending, false, elapsed)
+                .unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 2,
+                panicked_tasks: 0,
+                drain: DrainState::Running,
+                durable_store_open: false,
+            }
+        );
+        assert_eq!(
+            combine_shutdown_outcome(
+                bridge_timed_out(),
+                SupervisorDrain::Finished(Ok(())),
+                true,
+                elapsed,
+            )
+            .unwrap(),
+            ShutdownOutcome::TimedOut {
+                aborted_tasks: 2,
+                panicked_tasks: 0,
+                drain: DrainState::Finished,
+                durable_store_open: false,
+            }
+        );
+        assert!(matches!(
+            combine_shutdown_outcome(
+                graceful(),
+                SupervisorDrain::Finished(Err(scp_platform::PlatformError::StorageError(
+                    "close refused".to_owned()
+                ))),
+                true,
+                elapsed,
+            ),
+            Err(ShutdownError::DurableStoreClose(_))
+        ));
     }
 }

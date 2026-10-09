@@ -923,7 +923,7 @@ interface OutletBindings {
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; otherwise throws a [BridgeException] carrying
-     * the typed `SCP-SAGA-13xxx` terminal code (aborted/needs-repair/busy) or
+     * the typed terminal code (aborted/needs-repair/busy) or
      * a bridge-surfaced validation/permission code.
      *
      * @param sourceContextHandle Opaque handle for the calling (source) context.
@@ -937,8 +937,8 @@ interface OutletBindings {
      *   range 0-255 (ADR-043, spec §24.4).
      * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
      * @return JSON-encoded saga result.
-     * @throws BridgeException with a `SCP-SAGA-13xxx` code on a non-committed
-     *   terminal, or a bridge validation/permission code.
+     * @throws BridgeException on a non-committed terminal, or with a bridge
+     *   validation/permission code.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     fun outletInvokeCrossContextSaga(
@@ -1954,7 +1954,7 @@ class OutletBridge internal constructor(
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; a non-committed terminal throws a
-     * [BridgeException] carrying the typed `SCP-SAGA-13xxx` code.
+     * [BridgeException] carrying its typed code.
      *
      * @param sourceContextHandle Handle for the calling (source) context.
      * @param targetContextHandle Handle for the context holding the outlet.

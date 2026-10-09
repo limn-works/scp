@@ -489,6 +489,7 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
         ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
         ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
+        ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
 }
@@ -507,7 +508,10 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 ///
 /// Best-effort: persist failures log via `tracing::warn!` and
 /// increment `crate::metrics::record_persistence_failure()`; the
-/// reply oneshot always carries `Ok(())`.
+/// reply carries `Ok(())` after a persist attempt. When the Supervisor
+/// has dropped, nothing is persisted; the failure is logged and counted
+/// the same way and the reply carries `Ok(())` (ADR-049 Decision 16
+/// item 4).
 // `Send` discipline (ADR-049 Decision 7): SYNC fn returning a future. The
 // snapshot is built from `&PerContextState` in the synchronous prelude; the
 // returned future captures only the owned `context_id` / `snapshot` / `reply`
@@ -534,10 +538,38 @@ fn handle_flush_snapshot_actor<'d>(
     // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
     // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
     // sequence is read from `state.send_tracker` inside the twin.
+    //
+    // The floors come from the Supervisor. When it has dropped (ADR-049
+    // Decision 16), no floor export exists, and persisting a snapshot with
+    // empty floors would durably regress them (re-admitting replays after
+    // restore), so the flush persists nothing. Decision 16 item 4 makes that
+    // a Class C persist failure: logged, counted, and acknowledged with `Ok(())`.
+    let floors = deps
+        .supervisor
+        .export_sender_key_epochs(&ctx_id_bytes)
+        .and_then(|epochs| {
+            Ok((
+                epochs,
+                deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes)?,
+            ))
+        });
+    let (sender_epochs, recv_floors) = match floors {
+        Ok(floors) => floors,
+        Err(e) => {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "flush snapshot skipped: the supervisor holds no floor export"
+            );
+            let _ = reply.send(Ok(()));
+            return futures::future::Either::Left(std::future::ready(Outcome::ok(())));
+        }
+    };
     let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
     match state.export_crypto_state(
-        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
-        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        sender_epochs,
+        recv_floors,
         wrapping_public_key,
         &*wrapping_secret_key,
     ) {
@@ -560,7 +592,7 @@ fn handle_flush_snapshot_actor<'d>(
     // (built by `snapshot_context` above), so the single `persist_context` write
     // covers it atomically — the prior separate best-effort `persist_broadcast`
     // write is gone (ADR-049 §9 / §5.14.8 block-before-serve).
-    async move {
+    futures::future::Either::Right(async move {
         if let Err(e) = deps
             .persistence
             .persist_context(&context_id, &snapshot)
@@ -575,7 +607,7 @@ fn handle_flush_snapshot_actor<'d>(
         }
         let _ = reply.send(Ok(()));
         Outcome::ok(())
-    }
+    })
 }
 
 /// Handle [`LifecycleCommand::ShutdownSelf`] (actor-shape).
@@ -767,5 +799,60 @@ async fn handle_issue_mls_update_actor(
         Outcome::err(ContextError::CryptoFailed(format!(
             "IssueMlsUpdate failed for context {context_id}"
         )))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use crate::context::messaging_helpers::dropped_supervisor_tests::{Fixture, state};
+
+    #[tokio::test]
+    async fn flush_snapshot_persists_with_live_supervisor() {
+        let f = Fixture::new().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_flush_snapshot_actor(&state(), &f.deps, tx).await;
+        assert!(out.result.is_ok(), "flush: {:?}", out.result);
+        rx.await.unwrap().expect("flush ack");
+        assert_eq!(f.persists.load(Ordering::SeqCst), 1);
+    }
+
+    /// ADR-049 Decision 16 item 4: a failed upgrade in this Class C
+    /// best-effort persist is a persist failure, acknowledged with `Ok(())`.
+    #[tokio::test]
+    async fn flush_snapshot_acknowledges_and_persists_nothing_after_supervisor_drops() {
+        let f = Fixture::new().await.drop_supervisor();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let out = super::handle_flush_snapshot_actor(&state(), &f.deps, tx).await;
+        assert!(
+            out.result.is_ok(),
+            "a Class C persist failure records no error: {:?}",
+            out.result
+        );
+        rx.await
+            .unwrap()
+            .expect("a Class C persist failure is acknowledged");
+        assert_eq!(
+            f.persists.load(Ordering::SeqCst),
+            0,
+            "a flush without a floor export must persist nothing"
+        );
+    }
+
+    /// The Outcome sketch keeps a Supervisor shutdown typed rather than
+    /// recording it as a crypto failure.
+    mod outcome_sketch_tests {
+        use super::super::{ContextError, outcome_error_sketch};
+
+        #[test]
+        fn sketch_keeps_supervisor_shut_down_typed() {
+            let sketch = outcome_error_sketch(&ContextError::SupervisorShutDown("gone".to_owned()));
+            assert!(
+                matches!(&sketch, ContextError::SupervisorShutDown(m) if m == "gone"),
+                "got {sketch:?}"
+            );
+        }
     }
 }

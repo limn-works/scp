@@ -576,6 +576,33 @@ pub const CTX_2136: &str = "SCP-CTX-2136";
 ///
 /// Maps from `ContextError::NothingToRestore`.
 pub const CTX_2137: &str = "SCP-CTX-2137";
+/// Supervisor shutting down.
+///
+/// The Supervisor that owns the context set its closed flag in
+/// `shutdown_all_contexts`, or has dropped, so it refused to start the
+/// operation (ADR-049 Decision 16, supervisor task drain). Nothing the
+/// refused operation would have done has happened.
+///
+/// Distinct from the generic `CTX_2001` catch-all so a caller can tell an
+/// operation refused by shutdown apart from a failure of the operation
+/// itself. Construct a new `SCP` instance to continue.
+///
+/// Maps from `ContextError::SupervisorShutDown` and
+/// `SagaError::SupervisorShutDown`.
+pub const CTX_2138: &str = "SCP-CTX-2138";
+/// Stream or streaming saga dropped unregistered by bridge shutdown.
+///
+/// A bridge returns this code, built by
+/// [`late_registration_refusal`](crate::bridge_instance::late_registration_refusal),
+/// when bridge shutdown began after the Supervisor opened an outlet stream or
+/// started a streaming saga and before the bridge registered it. The operation
+/// started before the refusal: its outlet handler may have run, and its pump
+/// may append the stream's `OutletInvokedEvent` and settle its escrow. The
+/// bridge holds no handle to the stream after the refusal.
+///
+/// Distinct from `CTX_2138`, whose refused operation has done nothing, so a
+/// caller does not treat a started operation as one that never ran.
+pub const CTX_2139: &str = "SCP-CTX-2139";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
@@ -1165,8 +1192,8 @@ pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 /// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
 /// rejects the caller's selection: a wrong key or passphrase on an existing
 /// `SQLCipher` database, a directory the process cannot write, a corrupt
-/// file, a salt-sidecar fail-closed condition, or a second handle against a
-/// database another `SCP` instance already holds an advisory lock on.
+/// file, or a salt-sidecar fail-closed condition. A directory whose advisory
+/// lock another store holds is [`STORAGE_8005`] instead.
 /// Spec §17.6 makes this terminal — no bridge downgrades to in-memory
 /// storage after it. All three bridges report this one code, so a caller
 /// reading a code learns the same thing whichever binding raised it.
@@ -1178,6 +1205,29 @@ pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 /// reusing `8001` would make one code string mean both "storage key not
 /// found" and "durable backend failed to open" inside that app.
 pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
+
+/// The durable storage directory's advisory lock is still held.
+///
+/// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
+/// finds `{dir}/scp.db.lock` held by another store, in this process or
+/// another (`scp_platform::PlatformError::StorageLockHeld`). Spec §17.6 "One
+/// Opener per Durable Directory" makes the open fail at once: it does not
+/// wait for the lock and does not fall back to another backend.
+///
+/// Also returned by an SDK `shutdown` that left the instance's own store
+/// holding its lock: the Supervisor drain did not finish
+/// (`ShutdownOutcome::TimedOut` with `durable_store_open`), the store refused
+/// to close (`ShutdownError::DurableStoreClose`), or an earlier shutdown had
+/// not closed it (`ShutdownError::AlreadyShutDown` with
+/// `durable_store_open`). A reopen of the
+/// directory then fails with this code until the store is released.
+pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
+
+/// The store has released its database connection.
+///
+/// Each bridge's `From<scp_platform::PlatformError>` translation maps
+/// `scp_platform::PlatformError::StorageClosed` to this code.
+pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
 
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)

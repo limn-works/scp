@@ -68,14 +68,15 @@ use scp_platform::error::PlatformError;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
+use scp_core::context::outlets::invoke::OutletStreamOpenError;
 use scp_core::context::outlets::stream::{
     OutletStreamChunk, OutletStreamCredit, TerminateReason, compute_caveats_binding,
     compute_credit_sig_preimage, verify_chunk_signature,
 };
 use scp_core::context::outlets::{
-    AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
-    OutletExecutorError, StreamIdentity, StreamSessionHandle, StreamSigner,
-    StreamSignerCustodyCategory, StreamSignerError, cancel_error_to_code, grant_error_to_code,
+    AdmissionCaps, CancelIdentity, OpenStreamParams, OutletExecutor, OutletExecutorError,
+    StreamIdentity, StreamSessionHandle, StreamSigner, StreamSignerCustodyCategory,
+    StreamSignerError, cancel_error_to_code, grant_error_to_code,
 };
 
 use scp_ffi_common::error_codes as codes;
@@ -310,19 +311,40 @@ impl OutletExecutor for NapiStreamExecutor {
 }
 
 // ---------------------------------------------------------------------------
-// Error mapping — every code is a canonical SCP-OUTLET-/SCP-PERM- literal
+// Error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps an [`OpenStreamRejection`] onto the bridge error surface, carrying the
-/// rejection's own §5.4.4 `SCP-OUTLET-NNNN` code verbatim.
-fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpNapiError {
-    ScpNapiError::Outlet {
-        message: format!(
-            "outlet stream open rejected ({}): {}",
-            rejection.error_code(),
-            rejection.slug()
+/// Maps an [`OutletStreamOpenError`] onto the bridge error surface. A
+/// Supervisor shutdown refusal takes the conversion of
+/// `ContextError::SupervisorShutDown`; a rejection carries its own code
+/// verbatim.
+fn open_rejection_to_err(err: &OutletStreamOpenError) -> ScpNapiError {
+    match err {
+        OutletStreamOpenError::SupervisorShutDown { message } => ScpNapiError::from(
+            scp_core::context::ContextError::SupervisorShutDown(message.clone()),
         ),
-        code: rejection.error_code().to_owned(),
+        OutletStreamOpenError::Rejected(rejection) => ScpNapiError::Outlet {
+            message: format!(
+                "outlet stream open rejected ({}): {}",
+                rejection.error_code(),
+                rejection.slug()
+            ),
+            code: rejection.error_code().to_owned(),
+        },
+    }
+}
+
+/// The error for a stream or streaming saga the Supervisor started but the
+/// bridge refused to register because bridge shutdown had begun, built from
+/// the refusal
+/// [`CoreFields::register_or_refuse`](scp_ffi_common::bridge_instance::CoreFields::register_or_refuse)
+/// returns. The stream had already reserved escrow and started its pump, and
+/// the saga had already staged its Prepare phase, so this is the Context class
+/// with `SCP-CTX-2139`.
+fn late_registration_err((code, message): (&'static str, String)) -> ScpNapiError {
+    ScpNapiError::Context {
+        message,
+        code: code.to_owned(),
     }
 }
 
@@ -664,20 +686,24 @@ pub(crate) async fn outlet_stream_open_on(
     };
 
     let handle_id = hex::encode(request_id);
-    bi.outlet_stream_registry.insert(
-        handle_id.clone(),
-        StreamEntry {
-            handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            invoker_did: caller_did,
-            context_id,
-            outlet_id,
-            caveats_binding,
-            request_id,
-            stream_epoch,
-            cost_per_chunk,
-        },
-    );
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_stream_registry,
+            handle_id.clone(),
+            StreamEntry {
+                handle: Arc::new(tokio::sync::Mutex::new(stream_handle)),
+                receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+                invoker_did: caller_did,
+                context_id,
+                outlet_id,
+                caveats_binding,
+                request_id,
+                stream_epoch,
+                cost_per_chunk,
+            },
+            None,
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1497,19 +1523,35 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     .map_err(|e| napi::Error::from(crate::outlets::map_saga_error(e)))?;
 
     // ----- (g) register the promptly-returned receiver ------------------------
-    let saga_id = handle.saga_id;
-    let receiver = handle.receiver;
-    let handle_id = saga_id.0.clone();
-    bi.outlet_streaming_saga_registry.insert(
-        handle_id.clone(),
+    register_streaming_saga(
+        bi,
         StreamingSagaEntry {
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-            saga_id,
+            receiver: Arc::new(tokio::sync::Mutex::new(handle.receiver)),
+            saga_id: handle.saga_id,
             target_context_id,
             invoker_did: caller_did,
             request_id,
         },
-    );
+    )
+    .map_err(napi::Error::from)
+}
+
+/// Registers a started streaming saga's entry under its saga id and returns
+/// the id. Returns [`late_registration_err`], with the entry dropped, when
+/// bridge shutdown began before the insert.
+fn register_streaming_saga(
+    bi: &NapiBridgeInstance,
+    entry: StreamingSagaEntry,
+) -> Result<String, ScpNapiError> {
+    let handle_id = entry.saga_id.0.clone();
+    bi.core
+        .register_or_refuse(
+            &bi.outlet_streaming_saga_registry,
+            handle_id.clone(),
+            entry,
+            Some(&handle_id),
+        )
+        .map_err(late_registration_err)?;
     Ok(handle_id)
 }
 
@@ -1667,6 +1709,11 @@ impl crate::scp::Scp {
     /// budget injection has no bridge-public wiring — same rationale as the
     /// unary-saga bridge tests). The receiver's sender is dropped immediately
     /// (recover never polls it).
+    ///
+    /// # Panics
+    ///
+    /// Panics when bridge shutdown has begun, because the registry then refuses
+    /// the entry and the test would run against an empty registry.
     pub fn insert_test_streaming_saga_entry(
         &self,
         saga_id: &str,
@@ -1674,7 +1721,7 @@ impl crate::scp::Scp {
         invoker_did: &str,
     ) {
         let (_tx, rx) = mpsc::channel(1);
-        self.inner.outlet_streaming_saga_registry.insert(
+        let registered = self.inner.outlet_streaming_saga_registry.insert(
             saga_id.to_owned(),
             StreamingSagaEntry {
                 receiver: Arc::new(tokio::sync::Mutex::new(rx)),
@@ -1683,6 +1730,10 @@ impl crate::scp::Scp {
                 invoker_did: invoker_did.to_owned(),
                 request_id: [0u8; 16],
             },
+        );
+        assert!(
+            registered,
+            "bridge shutdown began before the test entry for {saga_id} was registered"
         );
     }
 

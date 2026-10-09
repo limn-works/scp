@@ -62,7 +62,14 @@ pub struct SqliteStorage {
     // `spawn_blocking` per call. The mutex hold time is bounded by SQLite's
     // single-writer guarantee — only one thread can hold the lock at a time,
     // and each operation completes quickly.
-    conn: Mutex<Connection>,
+    //
+    // `None` once [`close`](Self::close) has run: the connection is gone and
+    // every operation returns [`PlatformError::StorageClosed`] (spec §17.6
+    // "One Opener per Durable Directory": a closed store refuses operations
+    // and never reopens its database implicitly). Field order matters for
+    // `Drop` as well: the connection drops before the lock file, so the lock
+    // is never released while the connection is open.
+    conn: Mutex<Option<Connection>>,
     // Advisory exclusive lock on `{dir}/scp.db.lock`. Held for the lifetime
     // of the `SqliteStorage` — refuses a second process, or a second
     // in-process instance, trying to open the same database directory
@@ -71,28 +78,28 @@ pub struct SqliteStorage {
     // database file without coordinating access. See red-hat RED-1002.
     //
     // Held in `Mutex<Option<File>>` so [`close`](Self::close) can take the
-    // `File` out and drop it explicitly — releasing the flock(2) /
-    // LockFileEx lock even when outer `Arc<SqliteStorage>` references
-    // persist past shutdown (FFI bridge instances hold the storage through
-    // several Arc chains: `StorageProvider`, `CoreFields::persistence`,
-    // `ContextManager::persistence`, event-log repository). Without an
-    // explicit release path, the advisory lock outlived `SCP.shutdown()`
-    // in the Python and NAPI bridges, causing "already open by another
-    // SCP instance" errors on same-process reopen. Dropping the struct
-    // still releases the lock automatically for non-shutdown paths.
+    // `File` out and drop it explicitly, after the connection, while outer
+    // `Arc<SqliteStorage>` references persist (FFI bridge instances hold the
+    // storage through several `Arc` chains: `StorageProvider`,
+    // `CoreFields::persistence`, the Supervisor's persistence, the event-log
+    // repository). The owner calls `close` only after every writer has
+    // exited (spec §17.6, ADR-048 §5 amendment); dropping the struct also
+    // releases both, connection first.
     lock_file: Mutex<Option<File>>,
 }
 
 impl SqliteStorage {
     /// Opens or creates an encrypted `SQLite` database at `{dir}/scp.db`.
     ///
-    /// An advisory exclusive file lock on `{dir}/scp.db.lock` is taken for
-    /// the lifetime of the returned `SqliteStorage`. If the lock is already
-    /// held by another process or another in-process instance, this
-    /// constructor returns [`PlatformError::StorageError`] rather than
-    /// opening a second `SQLite` handle against the same database — a
-    /// configuration that can produce WAL corruption, split-brain writes,
-    /// or silent data loss (red-hat RED-1002).
+    /// An advisory exclusive file lock on `{dir}/scp.db.lock` is taken
+    /// before the database opens and held until [`close`](Self::close) or
+    /// drop releases the connection. If the lock is already held by another
+    /// process or another in-process instance, this constructor returns
+    /// [`PlatformError::StorageLockHeld`] at once, without waiting and
+    /// without opening a second `SQLite` handle against the same database —
+    /// a configuration that can produce WAL corruption, split-brain writes,
+    /// or silent data loss (red-hat RED-1002; spec §17.6 "One Opener per
+    /// Durable Directory").
     ///
     /// The `key` parameter is the raw encryption key material. It is
     /// hex-encoded and passed to `SQLCipher` via `PRAGMA key`. The
@@ -106,10 +113,11 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::StorageError`] if the database cannot be
-    /// opened, the encryption key is rejected, the schema cannot be
-    /// created, or the advisory file lock is already held by another
-    /// `SqliteStorage` instance (same process or other).
+    /// Returns [`PlatformError::StorageLockHeld`] if another `SqliteStorage`
+    /// (same process or other) holds the directory's advisory lock, and
+    /// [`PlatformError::StorageError`] if the lock file or database cannot
+    /// be opened, the encryption key is rejected, or the schema cannot be
+    /// created.
     pub fn new(dir: &Path, key: &[u8]) -> Result<Self, PlatformError> {
         std::fs::create_dir_all(dir)
             .map_err(|e| PlatformError::StorageError(format!("failed to create directory: {e}")))?;
@@ -134,15 +142,7 @@ impl SqliteStorage {
                     lock_path.display()
                 ))
             })?;
-        FileExt::try_lock_exclusive(&lock_file).map_err(|e| {
-            PlatformError::StorageError(format!(
-                "database at {} is already open by another SCP instance \
-                 (advisory lock held on {}): {e} — close the existing \
-                 SqliteStorage before opening a second handle",
-                dir.display(),
-                lock_path.display()
-            ))
-        })?;
+        FileExt::try_lock_exclusive(&lock_file).map_err(|e| lock_error(&e, dir, &lock_path))?;
 
         let db_path = dir.join("scp.db");
         // `scp_sqlite_pools::open` refuses, before it opens the file, unless
@@ -209,7 +209,7 @@ impl SqliteStorage {
         .map_err(|e| PlatformError::StorageError(format!("failed to create schema: {e}")))?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(Some(conn)),
             lock_file: Mutex::new(Some(lock_file)),
         })
     }
@@ -277,39 +277,61 @@ impl SqliteStorage {
         // key internally for the connection lifetime.
     }
 
-    /// Explicitly releases the advisory exclusive lock on `{dir}/scp.db.lock`.
+    /// Releases the database connection, then the advisory exclusive lock
+    /// on `{dir}/scp.db.lock` (spec §17.6 "One Opener per Durable
+    /// Directory").
     ///
-    /// Idempotent — a second call is a no-op. Safe to call while
-    /// outstanding `Arc<SqliteStorage>` references are still alive;
-    /// subsequent `Storage` operations continue to work through the
-    /// cached `SQLCipher` connection but the lock is no longer held.
+    /// After `close` returns `Ok`, every [`Storage`] operation on this handle
+    /// returns [`PlatformError::StorageClosed`]; the store never reopens its
+    /// database implicitly. An open of the same directory then succeeds on
+    /// its first attempt. Safe to call while other `Arc<SqliteStorage>`
+    /// references are alive, and idempotent: a call on a closed store
+    /// returns `Ok` and changes nothing.
     ///
-    /// The FFI bridges (`PyBridgeInstance`, `NapiBridgeInstance`,
-    /// `UniffiBridgeInstance`) invoke this from their
-    /// `bridge_specific_shutdown` so that `SCP.shutdown()` at the SDK
-    /// surface releases the advisory lock even when the caller still
-    /// holds the `scp` handle. Without this, the lock outlived
-    /// `shutdown()` and a subsequent `new SCP({ storage: sqlite })`
-    /// against the same directory failed with "already open by another
-    /// SCP instance" (observed on Python / TS persistence tests).
+    /// The caller owns the "after the last writer" half of the contract:
+    /// call `close` only once every task that can write through this store
+    /// has exited. The FFI bridges call it from the shared
+    /// `scp_ffi_common::bridge_instance` shutdown only after the
+    /// Supervisor's tracked tasks drain (ADR-048 §5 amendment, ADR-049
+    /// Decision 16).
     ///
-    /// Poisoned mutex → best-effort: recover the guard via
-    /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner) and still release the lock. A
-    /// poisoned lock-file mutex would otherwise silently skip the
-    /// release, leaving the advisory lock held until the
-    /// `SqliteStorage` is finally dropped. Since the only other
-    /// access point is `new()` (one-shot, via the constructor) and
-    /// the mutex is only ever taken to move a `File` out on
-    /// shutdown, there is no invariant that poisoning could
-    /// violate — recovery is sound.
-    pub fn close(&self) {
-        let mut guard = match self.lock_file.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Taking drops the `File` when the local goes out of scope,
-        // which releases the flock(2) / LockFileEx lock.
-        let _ = guard.take();
+    /// A poisoned mutex is recovered with
+    /// [`PoisonError::into_inner`](std::sync::PoisonError::into_inner): a
+    /// panic inside an operation leaves the `Option` itself well formed, and
+    /// skipping the release would hold the lock until drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::StorageError`] if `SQLite` refuses to close
+    /// the connection. The store then keeps both its connection and its
+    /// lock, because releasing the lock while the connection may still be
+    /// open would admit a second writer.
+    pub fn close(&self) -> Result<(), PlatformError> {
+        let mut conn_guard = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(conn) = conn_guard.take()
+            && let Err((conn, e)) = conn.close()
+        {
+            *conn_guard = Some(conn);
+            return Err(PlatformError::StorageError(format!(
+                "failed to close database connection: {e} — the store keeps its \
+                     connection and advisory lock"
+            )));
+        }
+        // The connection is closed (now or by an earlier call), so releasing
+        // the lock cannot admit a second writer. Hold the connection guard
+        // across the release so no operation observes a half-closed store.
+        let mut lock_guard = self
+            .lock_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Dropping the taken `File` releases the flock(2) / LockFileEx lock.
+        drop(lock_guard.take());
+        drop(lock_guard);
+        drop(conn_guard);
+        Ok(())
     }
 }
 
@@ -535,13 +557,56 @@ fn prefix_successor(prefix: &str) -> Option<String> {
     None
 }
 
-/// Acquires the connection lock, mapping poison errors to
-/// [`PlatformError::StorageError`].
+/// Classifies a failed `try_lock_exclusive` on `lock_path`. Contention is the
+/// typed lock-still-held condition (spec §17.6); any other lock failure is an
+/// I/O fault on the lock file and stays a generic storage error. The OS error
+/// code is compared, not the `ErrorKind`: std maps the Windows contention code
+/// to no specific kind, so a kind comparison also matches unrelated
+/// uncategorized failures.
+fn lock_error(e: &std::io::Error, dir: &Path, lock_path: &Path) -> PlatformError {
+    let contended = fs2::lock_contended_error().raw_os_error();
+    if contended.is_some() && e.raw_os_error() == contended {
+        PlatformError::StorageLockHeld {
+            dir: dir.display().to_string(),
+            lock_path: lock_path.display().to_string(),
+        }
+    } else {
+        PlatformError::StorageError(format!("failed to lock {}: {e}", lock_path.display()))
+    }
+}
+
+/// Acquires the connection lock. A poisoned mutex maps to
+/// [`PlatformError::StorageClosed`] once [`SqliteStorage::close`] has taken
+/// the connection, and to [`PlatformError::StorageError`] before that.
 fn lock_conn(
-    conn: &Mutex<Connection>,
-) -> Result<std::sync::MutexGuard<'_, Connection>, PlatformError> {
-    conn.lock()
-        .map_err(|e| PlatformError::StorageError(format!("mutex poisoned: {e}")))
+    conn: &Mutex<Option<Connection>>,
+) -> Result<std::sync::MutexGuard<'_, Option<Connection>>, PlatformError> {
+    conn.lock().map_err(|e| {
+        if e.get_ref().is_none() {
+            PlatformError::StorageClosed
+        } else {
+            PlatformError::StorageError(format!("mutex poisoned: {e}"))
+        }
+    })
+}
+
+/// Returns the open connection behind a held guard, or
+/// [`PlatformError::StorageClosed`] once [`SqliteStorage::close`] has run.
+fn open_conn<'g>(
+    guard: &'g std::sync::MutexGuard<'_, Option<Connection>>,
+) -> Result<&'g Connection, PlatformError> {
+    guard.as_ref().ok_or(PlatformError::StorageClosed)
+}
+
+#[cfg(test)]
+impl SqliteStorage {
+    /// Runs `f` on the open connection through the same [`lock_conn`] and
+    /// [`open_conn`] checks every [`Storage`] operation uses, so tests that
+    /// use the connection do not depend on the `conn` field's representation.
+    fn with_open_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> Result<R, PlatformError> {
+        let guard = lock_conn(&self.conn)?;
+        Ok(f(open_conn(&guard)?))
+    }
 }
 
 /// Collects rows from a statement into a `Vec<String>`.
@@ -565,13 +630,14 @@ impl Storage for SqliteStorage {
         let key = key.to_owned();
         let data = data.to_vec();
         async move {
-            let conn = lock_conn(&self.conn)?;
+            let guard = lock_conn(&self.conn)?;
+            let conn = open_conn(&guard)?;
             conn.execute(
                 "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
                 rusqlite::params![key, data],
             )
             .map_err(|e| PlatformError::StorageError(format!("store failed: {e}")))?;
-            drop(conn);
+            drop(guard);
             Ok(())
         }
     }
@@ -582,7 +648,8 @@ impl Storage for SqliteStorage {
     ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
         let key = key.to_owned();
         async move {
-            let conn = lock_conn(&self.conn)?;
+            let guard = lock_conn(&self.conn)?;
+            let conn = open_conn(&guard)?;
             let mut stmt = conn
                 .prepare_cached("SELECT value FROM kv WHERE key = ?1")
                 .map_err(|e| PlatformError::StorageError(format!("prepare failed: {e}")))?;
@@ -591,7 +658,7 @@ impl Storage for SqliteStorage {
                 .optional()
                 .map_err(|e| PlatformError::StorageError(format!("retrieve failed: {e}")))?;
             drop(stmt);
-            drop(conn);
+            drop(guard);
             Ok(result)
         }
     }
@@ -599,10 +666,11 @@ impl Storage for SqliteStorage {
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
         let key = key.to_owned();
         async move {
-            let conn = lock_conn(&self.conn)?;
+            let guard = lock_conn(&self.conn)?;
+            let conn = open_conn(&guard)?;
             conn.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![key])
                 .map_err(|e| PlatformError::StorageError(format!("delete failed: {e}")))?;
-            drop(conn);
+            drop(guard);
             Ok(())
         }
     }
@@ -613,7 +681,8 @@ impl Storage for SqliteStorage {
     ) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
         let prefix = prefix.to_owned();
         async move {
-            let conn = lock_conn(&self.conn)?;
+            let guard = lock_conn(&self.conn)?;
+            let conn = open_conn(&guard)?;
 
             let keys = if prefix.is_empty() {
                 let mut stmt = conn
@@ -650,7 +719,7 @@ impl Storage for SqliteStorage {
                 )
             }?;
 
-            drop(conn);
+            drop(guard);
             Ok(keys)
         }
     }
@@ -661,7 +730,8 @@ impl Storage for SqliteStorage {
     ) -> impl Future<Output = Result<u64, PlatformError>> + Send {
         let prefix = prefix.to_owned();
         async move {
-            let conn = lock_conn(&self.conn)?;
+            let guard = lock_conn(&self.conn)?;
+            let conn = open_conn(&guard)?;
 
             let deleted = prefix_successor(&prefix)
                 .map_or_else(
@@ -675,7 +745,7 @@ impl Storage for SqliteStorage {
                 )
                 .map_err(|e| PlatformError::StorageError(format!("delete_prefix failed: {e}")))?;
 
-            drop(conn);
+            drop(guard);
             Ok(deleted as u64)
         }
     }
@@ -683,7 +753,8 @@ impl Storage for SqliteStorage {
     fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
         let key = key.to_owned();
         async move {
-            let conn = lock_conn(&self.conn)?;
+            let guard = lock_conn(&self.conn)?;
+            let conn = open_conn(&guard)?;
             let mut stmt = conn
                 .prepare_cached("SELECT COUNT(*) FROM kv WHERE key = ?1")
                 .map_err(|e| PlatformError::StorageError(format!("prepare failed: {e}")))?;
@@ -691,7 +762,7 @@ impl Storage for SqliteStorage {
                 .query_row(rusqlite::params![key], |row| row.get(0))
                 .map_err(|e| PlatformError::StorageError(format!("exists failed: {e}")))?;
             drop(stmt);
-            drop(conn);
+            drop(guard);
             Ok(count > 0)
         }
     }
@@ -728,19 +799,20 @@ mod tests {
     fn connection_serves_nothing_from_lookaside() {
         let dir = TempDir::new().expect("tempdir should succeed");
         let storage = SqliteStorage::new(dir.path(), &[0xAB; 32]).expect("new should succeed");
-        let conn = storage
-            .conn
-            .lock()
-            .expect("connection lock should not be poisoned");
-        conn.execute_batch("CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)")
-            .expect("probe table should be created");
-        conn.execute(
-            "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
-            rusqlite::params!["a-key", vec![0x5A_u8; 64]],
-        )
-        .expect("insert should run");
-        let used = scp_sqlite_pools::lookaside_use(&conn).expect("lookaside status should read");
-        drop(conn);
+        let used = storage
+            .with_open_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE lookaside_probe (k TEXT NOT NULL, v BLOB NOT NULL)",
+                )
+                .expect("probe table should be created");
+                conn.execute(
+                    "INSERT INTO lookaside_probe (k, v) VALUES (?1, ?2)",
+                    rusqlite::params!["a-key", vec![0x5A_u8; 64]],
+                )
+                .expect("insert should run");
+                scp_sqlite_pools::lookaside_use(conn).expect("lookaside status should read")
+            })
+            .expect("the connection should be open");
         assert_eq!(
             used,
             scp_sqlite_pools::LookasideUse {
@@ -978,13 +1050,14 @@ mod tests {
              first instance holds the advisory lock"
         );
         match second {
-            Err(PlatformError::StorageError(msg)) => {
-                assert!(
-                    msg.contains("already open"),
-                    "error message must mention lock contention: got {msg}"
+            Err(PlatformError::StorageLockHeld { dir, lock_path }) => {
+                assert_eq!(dir, tmp.path().display().to_string());
+                assert_eq!(
+                    lock_path,
+                    tmp.path().join("scp.db.lock").display().to_string()
                 );
             }
-            Err(other) => panic!("expected StorageError, got {other:?}"),
+            Err(other) => panic!("expected StorageLockHeld, got {other:?}"),
             Ok(_) => unreachable!("second open must fail — already handled above"),
         }
 
@@ -995,13 +1068,11 @@ mod tests {
     }
 
     /// `close()` must release the advisory lock even while the
-    /// `SqliteStorage` value is still alive. The FFI bridges rely on
-    /// this to make `SCP.shutdown()` release the `scp.db.lock` flock
-    /// without requiring the SDK caller to drop the `SCP` handle: a
-    /// `BridgeInstance` holds the storage through multiple Arc chains
-    /// (`StorageProvider`, `CoreFields::persistence`, `ContextManager`,
-    /// event-log repository), so drop-on-shutdown is not available and
-    /// the lock must be released by explicit call.
+    /// `SqliteStorage` value is still alive. The FFI bridges hold the storage
+    /// through several `Arc` chains (`StorageProvider`,
+    /// `CoreFields::persistence`, the Supervisor's persistence, the event-log
+    /// repository), so drop-on-shutdown is not available and the owner
+    /// releases the store by explicit call once its writers have exited.
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     fn close_releases_advisory_lock_while_instance_alive() {
@@ -1011,18 +1082,156 @@ mod tests {
         let first = SqliteStorage::new(tmp.path(), &key).expect("first open must succeed");
 
         // Explicit close releases the lock even though `first` is still alive.
-        first.close();
+        first.close().expect("close must succeed");
 
-        // Re-open while `first` is in scope must now succeed — this is the
-        // behavior `SCP.shutdown()` relies on in the Python and NAPI
-        // bridges.
+        // Re-open while `first` is in scope must now succeed on the first
+        // attempt (spec §17.6).
         let second =
             SqliteStorage::new(tmp.path(), &key).expect("re-open after close must succeed");
 
-        // `close()` is idempotent — a second call is a no-op.
-        first.close();
+        // `close()` is idempotent — a second call is a no-op and must not
+        // touch the lock `second` now holds.
+        first.close().expect("second close must succeed");
+        assert!(
+            matches!(
+                SqliteStorage::new(tmp.path(), &key),
+                Err(PlatformError::StorageLockHeld { .. })
+            ),
+            "a repeated close on the old handle must not release the new handle's lock"
+        );
 
         drop(second);
         drop(first);
+    }
+
+    /// Spec §17.6 "One Opener per Durable Directory": `close()` releases the
+    /// database connection as well as the lock, and every later operation on
+    /// the handle fails with the typed closed-store error rather than
+    /// writing through a connection the lock no longer guards. Each of the
+    /// six `Storage` operations is checked, and the reopened store must not
+    /// see a write attempted on the closed handle.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn close_closes_connection_and_rejects_further_ops() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = [7u8; 32];
+
+        let store = SqliteStorage::new(tmp.path(), &key).expect("open must succeed");
+        store
+            .store("k/live", b"v")
+            .await
+            .expect("store before close");
+        store.close().expect("close must succeed");
+
+        assert!(
+            matches!(
+                store.with_open_conn(|_| ()),
+                Err(PlatformError::StorageClosed)
+            ),
+            "close must drop the connection, not only the lock file"
+        );
+
+        assert!(matches!(
+            store.store("k/after", b"x").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        assert!(matches!(
+            store.retrieve("k/live").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        assert!(matches!(
+            store.delete("k/live").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        assert!(matches!(
+            store.list_keys("k/").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        assert!(matches!(
+            store.delete_prefix("k/").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        assert!(matches!(
+            store.exists("k/live").await,
+            Err(PlatformError::StorageClosed)
+        ));
+
+        // The lock is released: a reopen succeeds on its first attempt and
+        // sees the pre-close write, and none of the refused operations.
+        let reopened = SqliteStorage::new(tmp.path(), &key).expect("reopen must succeed");
+        assert_eq!(
+            reopened.retrieve("k/live").await.unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+        assert!(!reopened.exists("k/after").await.unwrap());
+
+        // The closed handle stays closed while a new store owns the
+        // directory: it never reopens its database implicitly.
+        assert!(matches!(
+            store.retrieve("k/live").await,
+            Err(PlatformError::StorageClosed)
+        ));
+    }
+
+    /// Only the OS contention code is the typed lock-held condition. An error
+    /// with the same `ErrorKind` but no OS code, or a different OS code, is a
+    /// generic storage error.
+    #[test]
+    fn lock_error_matches_the_contention_os_code_only() {
+        let dir = Path::new("/d");
+        let lock_path = Path::new("/d/scp.db.lock");
+        let contended = fs2::lock_contended_error();
+
+        assert!(matches!(
+            lock_error(&contended, dir, lock_path),
+            PlatformError::StorageLockHeld { .. }
+        ));
+        let same_kind = std::io::Error::new(contended.kind(), "same kind, no OS code");
+        assert!(matches!(
+            lock_error(&same_kind, dir, lock_path),
+            PlatformError::StorageError(_)
+        ));
+        let other_code = std::io::Error::from_raw_os_error(9);
+        assert_ne!(other_code.raw_os_error(), contended.raw_os_error());
+        assert!(matches!(
+            lock_error(&other_code, dir, lock_path),
+            PlatformError::StorageError(_)
+        ));
+    }
+
+    /// A poisoned connection mutex refuses operations with a generic storage
+    /// error while the connection is open, and with the typed closed-store
+    /// error once `close()` has taken it.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn poisoned_mutex_after_close_reports_storage_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = [9u8; 32];
+        let store = SqliteStorage::new(tmp.path(), &key).expect("open must succeed");
+
+        let poisoner = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _guard = store.conn.lock().unwrap();
+                panic!("poison the connection mutex");
+            })
+            .join()
+        });
+        assert!(poisoner.is_err(), "the poisoning thread must panic");
+        assert!(store.conn.is_poisoned());
+
+        assert!(matches!(
+            store.store("k", b"v").await,
+            Err(PlatformError::StorageError(_))
+        ));
+        store.close().expect("close recovers a poisoned mutex");
+        assert!(matches!(
+            store.store("k", b"v").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        assert!(matches!(
+            store.retrieve("k").await,
+            Err(PlatformError::StorageClosed)
+        ));
+        SqliteStorage::new(tmp.path(), &key).expect("reopen after close must succeed");
     }
 }

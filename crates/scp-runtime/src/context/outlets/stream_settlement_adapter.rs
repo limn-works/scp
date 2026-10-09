@@ -5,7 +5,7 @@
 //! seams are `Sync` fire-and-forget callbacks the pump invokes without an
 //! `.await`:
 //!
-//! - [`StreamEscrowRefundSink::refund`] — fired from the
+//! - [`StreamEscrowRefundSink::refund`](crate::context::outlets::dispatch::StreamEscrowRefundSink::refund) — fired from the
 //!   [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
 //!   Drop-guard when a debited-but-never-settled open-time escrow HOLD must be
 //!   returned. A `Drop` cannot `.await`.
@@ -14,81 +14,121 @@
 //!   unspent escrow, and capture the §19.15.5 `PaymentReceipt`. It runs ON the
 //!   pump's tokio task, which MUST NOT block.
 //!
-//! Both concrete sinks below hold an `Arc<Supervisor>` plus a
-//! [`tokio::runtime::Handle`] captured at construction, and translate the sync
-//! callback into a `Handle::spawn`ed task that routes the work back ONTO the
-//! actor mailbox via [`Supervisor::reverse_stream_escrow_via_actor`] /
+//! The settlement and close-event sinks below hold a `Weak<Supervisor>` plus
+//! a [`tokio::runtime::Handle`] captured at construction, and translate the
+//! sync callback into a task on the Supervisor's task tracker that routes the
+//! work back ONTO the actor mailbox via
 //! [`Supervisor::settle_outlet_stream_via_actor`] (the analog of the
-//! reference's `ContextManager` method calls). The captured handle is essential
-//! for the escrow-refund sink: its `refund` may run from a `Drop` on a thread
-//! with no ambient runtime (e.g. the open path's own thread), where
-//! `Handle::current()` would panic.
+//! reference's `ContextManager` method calls). [`ActorEscrowRefundSink`] is
+//! not a [`StreamEscrowRefundSink`](crate::context::outlets::dispatch::StreamEscrowRefundSink):
+//! its `refund` is async and awaits
+//! [`Supervisor::reverse_stream_escrow_via_actor`], and the Supervisor's
+//! escrow-ticket sink runs it in a task on the open's spawner.
+//!
+//! # Tracked spawns
+//!
+//! Each callback spawns its work on the Supervisor's tracker,
+//! so `shutdown_all_contexts` waits for an in-flight refund, settlement, or
+//! close-event append before the owner closes storage. These callbacks are
+//! fire-and-forget `()` seams with no caller to return an error to: when the
+//! Supervisor has dropped or shutdown has refused the spawn, the work does not
+//! run and the callback logs at error.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Weak};
 
 use scp_did::DID;
 use scp_protocol::economy::types::Amount;
 
 use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
 
-use crate::context::outlets::dispatch::StreamEscrowRefundSink;
 use crate::context::outlets::invoke::{
     OutletInvokedEventSink, StreamSettlement, StreamSettlementSink,
 };
-use crate::context::supervisor::supervisor::Supervisor;
+use crate::context::supervisor::supervisor::{SinkHandoff, Supervisor};
 
-/// Concrete [`StreamEscrowRefundSink`] routing an open-time escrow reversal to
-/// the actor-owned budget tracker via the supervisor mailbox.
-///
-/// Held as `Arc<dyn StreamEscrowRefundSink>` inside the streaming pump's
-/// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket);
-/// constructed by the streaming open orchestrator with a clone of the
-/// supervisor `Arc`.
-pub(crate) struct ActorEscrowRefundSink {
-    /// The supervisor whose mailbox owns the target context's budget tracker.
-    supervisor: Arc<Supervisor>,
-    /// Runtime handle captured at construction, so the `Drop`-fired `refund`
-    /// can spawn even when it runs off a runtime thread.
-    runtime: tokio::runtime::Handle,
-}
-
-impl ActorEscrowRefundSink {
-    /// Wrap a supervisor `Arc` as the streaming escrow-refund sink, capturing
-    /// the CURRENT runtime handle (the sole construction site — the streaming
-    /// open orchestrator — always runs on the runtime; the captured handle then
-    /// outlives it into the `Drop` that may run off-runtime).
-    ///
-    /// The non-test constructor is the streaming open orchestrator
-    /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
-    pub(crate) fn new(supervisor: Arc<Supervisor>) -> Self {
-        Self {
-            supervisor,
-            runtime: tokio::runtime::Handle::current(),
+/// Runs `op`, a hand-off of kind `kind`, against the Supervisor in a task on
+/// its tracker (ADR-049 Decision 16), on `runtime`. The task holds only the
+/// `Weak` and upgrades it when it starts. When the Supervisor has dropped, or
+/// shutdown refuses the spawn, `op` does not run and the failure logs at error
+/// naming `kind`.
+fn spawn_supervisor_op<F, Fut>(
+    supervisor: &Weak<Supervisor>,
+    runtime: &tokio::runtime::Handle,
+    kind: SinkHandoff,
+    op: F,
+) where
+    F: FnOnce(Arc<Supervisor>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let operation = kind.label();
+    let Some(owner) = supervisor.upgrade() else {
+        tracing::error!(
+            operation,
+            "streaming sink: supervisor dropped; operation not run"
+        );
+        return;
+    };
+    let weak = Weak::clone(supervisor);
+    let task = async move {
+        match weak.upgrade() {
+            Some(sup) => op(sup).await,
+            None => {
+                tracing::error!(
+                    operation,
+                    "streaming sink: supervisor dropped; operation not run"
+                );
+            }
         }
+    };
+    if let Err(e) = owner.spawn_tracked_on(kind, task, runtime) {
+        tracing::error!(operation, error = %e, "streaming sink: operation not run");
     }
 }
 
-impl StreamEscrowRefundSink for ActorEscrowRefundSink {
-    fn refund(&self, context_id: &str, member_did: &DID, amount: Amount) {
-        let supervisor = Arc::clone(&self.supervisor);
-        let context_id = context_id.to_owned();
-        let member_did = member_did.clone();
-        self.runtime.spawn(async move {
-            if let Err(e) = supervisor
-                .reverse_stream_escrow_via_actor(&context_id, &member_did, amount)
-                .await
-            {
-                // Best-effort: a missing actor (context torn down) or a persist
-                // failure leaves the operator log the only record. The refund
-                // itself saturates, so there is no correctness hazard on retry.
-                tracing::warn!(
-                    context_id = %context_id,
-                    member_did = %member_did,
-                    amount = amount.value(),
-                    "stream escrow reverse-spend failed: {e}"
-                );
-            }
-        });
+/// Routes an open-time escrow reversal to the actor-owned budget tracker via
+/// the supervisor mailbox. It spawns nothing: the caller awaits
+/// [`Self::refund`] in a task it already holds, which for a streaming open is
+/// a task on the open's spawner, so a refund fired after shutdown began still
+/// runs (ADR-049 Decision 16, item 2, second exception).
+pub(crate) struct ActorEscrowRefundSink {
+    /// The supervisor whose mailbox owns the target context's budget tracker.
+    supervisor: Weak<Supervisor>,
+}
+
+impl ActorEscrowRefundSink {
+    /// Wrap a `Weak` supervisor reference as the streaming escrow-refund sink.
+    pub(crate) const fn new(supervisor: Weak<Supervisor>) -> Self {
+        Self { supervisor }
+    }
+
+    /// Reverses `amount` of `member_did`'s open-time hold in `context_id`.
+    /// When the Supervisor has dropped, the refund does not run and logs at
+    /// error; a reversal error logs at warn.
+    pub(crate) async fn refund(&self, context_id: &str, member_did: &DID, amount: Amount) {
+        let Some(supervisor) = self.supervisor.upgrade() else {
+            tracing::error!(
+                context_id,
+                member_did = %member_did,
+                amount = amount.value(),
+                "stream escrow refund: supervisor dropped; refund not run"
+            );
+            return;
+        };
+        if let Err(e) = supervisor
+            .reverse_stream_escrow_via_actor(context_id, member_did, amount)
+            .await
+        {
+            // Best-effort: a missing actor (context torn down) or a persist
+            // failure leaves the operator log the only record. The refund
+            // itself saturates, so there is no correctness hazard on retry.
+            tracing::warn!(
+                context_id,
+                member_did = %member_did,
+                amount = amount.value(),
+                "stream escrow reverse-spend failed: {e}"
+            );
+        }
     }
 }
 
@@ -96,14 +136,14 @@ impl StreamEscrowRefundSink for ActorEscrowRefundSink {
 /// settlement to the actor via the supervisor mailbox.
 ///
 /// Held as `Arc<dyn StreamSettlementSink>` inside the streaming pump;
-/// constructed by the streaming open orchestrator with a clone of the
-/// supervisor `Arc` and the reservation's spawn-`generation` (captured in the
+/// constructed by the streaming open orchestrator with a `Weak` to the
+/// supervisor and the reservation's spawn-`generation` (captured in the
 /// adapter, NOT in the settlement payload — the confused-deputy guard compares
 /// it to the live actor's generation at settle time).
 pub(crate) struct ActorStreamSettlementSink {
     /// The supervisor whose mailbox owns the target context's Class-S/economy
     /// state (and the payment adapter for the no-actor fallback capture).
-    supervisor: Arc<Supervisor>,
+    supervisor: Weak<Supervisor>,
     /// Spawn-generation the reservation was made against. Threaded into the
     /// [`SettleOutletStream`](crate::context::actor::commands::OutletsCommand::SettleOutletStream)
     /// command so the handler drops the settlement on a generation mismatch
@@ -116,12 +156,12 @@ pub(crate) struct ActorStreamSettlementSink {
 }
 
 impl ActorStreamSettlementSink {
-    /// Wrap a supervisor `Arc` + the reservation's spawn-`generation` as the
+    /// Wrap a `Weak` supervisor reference + the reservation's spawn-`generation` as the
     /// streaming settlement sink, capturing the current runtime handle.
     ///
     /// The non-test constructor is the streaming open orchestrator
     /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
-    pub(crate) fn new(supervisor: Arc<Supervisor>, generation: u64) -> Self {
+    pub(crate) fn new(supervisor: Weak<Supervisor>, generation: u64) -> Self {
         Self {
             supervisor,
             generation,
@@ -132,22 +172,26 @@ impl ActorStreamSettlementSink {
 
 impl StreamSettlementSink for ActorStreamSettlementSink {
     fn settle(&self, settlement: StreamSettlement) {
-        let supervisor = Arc::clone(&self.supervisor);
         let generation = self.generation;
-        self.runtime.spawn(async move {
-            // Same-context streaming pump: no cross-context witness (its double-
-            // release guard is the `stream_reservations` record), so
-            // `witness_saga_id: None`. The captured receipt is fire-and-forget.
-            if let Err(e) = supervisor
-                .settle_outlet_stream_via_actor(settlement, generation, None)
-                .await
-            {
-                // A dispatch failure (reply channel closed / residual not-
-                // registered TOCTOU) is surfaced to the operator log — the
-                // settlement is fire-and-forget from the pump's perspective.
-                tracing::warn!("outlet stream settlement dispatch failed: {e}");
-            }
-        });
+        spawn_supervisor_op(
+            &self.supervisor,
+            &self.runtime,
+            SinkHandoff::StreamSettlement,
+            move |supervisor| async move {
+                // Same-context streaming pump: no cross-context witness (its double-
+                // release guard is the `stream_reservations` record), so
+                // `witness_saga_id: None`. The captured receipt is fire-and-forget.
+                if let Err(e) = supervisor
+                    .settle_outlet_stream_via_actor(settlement, generation, None)
+                    .await
+                {
+                    // A dispatch failure (reply channel closed / residual not-
+                    // registered TOCTOU) is surfaced to the operator log — the
+                    // settlement is fire-and-forget from the pump's perspective.
+                    tracing::warn!("outlet stream settlement dispatch failed: {e}");
+                }
+            },
+        );
     }
 
     fn persist_reservation<'a>(
@@ -165,9 +209,15 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
         // Stamp the reservation's spawn-generation (this sink's captured
         // generation is exactly the generation the reserve was made against).
         record.generation = self.generation;
-        let supervisor = Arc::clone(&self.supervisor);
+        let supervisor = Weak::clone(&self.supervisor);
         let context_id = context_id.to_owned();
         Box::pin(async move {
+            let supervisor = supervisor.upgrade().ok_or_else(|| {
+                scp_protocol::context::ContextError::SupervisorShutDown(
+                    "ActorStreamSettlementSink::persist_reservation — supervisor dropped"
+                        .to_owned(),
+                )
+            })?;
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             let cmd = crate::context::actor::commands::OutletsCommand::PersistStreamReservation {
                 context_id,
@@ -205,7 +255,7 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
 pub(crate) struct ActorOutletInvokedEventSink {
     /// The supervisor whose shared event-log provider owns the target context's
     /// durable log.
-    supervisor: Arc<Supervisor>,
+    supervisor: Weak<Supervisor>,
     /// The canonical event-log key for the hosting context
     /// (`context_id_to_bytes`), pinned at open.
     context_id_bytes: [u8; 32],
@@ -218,12 +268,12 @@ pub(crate) struct ActorOutletInvokedEventSink {
 }
 
 impl ActorOutletInvokedEventSink {
-    /// Wrap a supervisor `Arc` + the hosting context's event-log key + the
+    /// Wrap a `Weak` supervisor reference + the hosting context's event-log key + the
     /// stream `invoker_did` as the durable close-event sink, capturing the
     /// current runtime handle. Sole non-test constructor: the streaming open
     /// orchestrator (`Supervisor::open_outlet_stream`).
     pub(crate) fn new(
-        supervisor: Arc<Supervisor>,
+        supervisor: Weak<Supervisor>,
         context_id_bytes: [u8; 32],
         actor_did: String,
     ) -> Self {
@@ -238,19 +288,23 @@ impl ActorOutletInvokedEventSink {
 
 impl OutletInvokedEventSink for ActorOutletInvokedEventSink {
     fn record(&self, event: OutletInvokedEvent) {
-        let supervisor = Arc::clone(&self.supervisor);
         let context_id_bytes = self.context_id_bytes;
         let actor_did = self.actor_did.clone();
-        self.runtime.spawn(async move {
-            if let Err(e) = supervisor
-                .append_streaming_outlet_invoked_event(context_id_bytes, event, actor_did)
-                .await
-            {
-                // Best-effort: a torn-down context or persist failure leaves the
-                // operator log the only record of the durable-append failure.
-                tracing::warn!("streaming OutletInvokedEvent durable append failed: {e}");
-            }
-        });
+        spawn_supervisor_op(
+            &self.supervisor,
+            &self.runtime,
+            SinkHandoff::OutletInvokedEventAppend,
+            move |supervisor| async move {
+                if let Err(e) = supervisor
+                    .append_streaming_outlet_invoked_event(context_id_bytes, event, actor_did)
+                    .await
+                {
+                    // Best-effort: a torn-down context or persist failure leaves the
+                    // operator log the only record of the durable-append failure.
+                    tracing::warn!("streaming OutletInvokedEvent durable append failed: {e}");
+                }
+            },
+        );
     }
 }
 
@@ -271,7 +325,6 @@ mod tests {
     use crate::context::actor::class_s::ClassSCell;
     use crate::context::actor::deps::ActorDeps;
     use crate::context::actor::state::PerContextState;
-    use crate::context::outlets::dispatch::StreamEscrowRefundSink;
     use crate::context::outlets::invoke::{
         EconomicPolicySnapshot, StreamReservationRecord, StreamSettlement, StreamSettlementSink,
     };
@@ -279,7 +332,7 @@ mod tests {
         StreamSettleOutcome, reconcile_stream_reservations, reverse_stream_escrow,
         settle_outlet_stream,
     };
-    use crate::context::supervisor::supervisor::Supervisor;
+    use crate::context::supervisor::supervisor::{SinkHandoff, Supervisor};
     use crate::economy::adapter::{
         AdapterCapabilities, CountingPaymentAdapter, PaymentAdapter, PaymentAdapterDyn,
         PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt, RefundConfirmation,
@@ -1139,7 +1192,7 @@ mod tests {
         // MATCHES (a wrong generation would drop the settlement — no capture).
         let generation = 1;
 
-        let sink = ActorStreamSettlementSink::new(Arc::clone(&supervisor), generation);
+        let sink = ActorStreamSettlementSink::new(Arc::downgrade(&supervisor), generation);
         sink.settle(settlement(30, 70, 3, 10, 50, None));
 
         // The sink spawns the dispatch; poll until the capture lands (bounded).
@@ -1158,7 +1211,8 @@ mod tests {
 
     /// The [`ActorEscrowRefundSink`] routes a refund to the registered actor;
     /// the underlying `reverse_stream_escrow_via_actor` returns `Ok` on the
-    /// happy path (persist landed).
+    /// happy path (persist landed). A sink whose Supervisor dropped returns
+    /// without running the refund.
     #[tokio::test]
     async fn reverse_stream_escrow_via_actor_routes_ok() {
         let supervisor = build_supervisor(None);
@@ -1173,9 +1227,105 @@ mod tests {
             .await
             .expect("reverse routes to the actor and persists");
 
-        // Construct the sink to exercise its `Handle::current()` capture + the
-        // sync fire-and-forget `refund` (best-effort; asserted not to panic).
-        let sink = ActorEscrowRefundSink::new(Arc::clone(&supervisor));
-        sink.refund(&ctx_key(), &invoker(), Amount::new(10));
+        let sink = ActorEscrowRefundSink::new(Arc::downgrade(&supervisor));
+        sink.refund(&ctx_key(), &invoker(), Amount::new(10)).await;
+
+        let orphan = ActorEscrowRefundSink::new(std::sync::Weak::new());
+        orphan.refund(&ctx_key(), &invoker(), Amount::new(10)).await;
+    }
+
+    /// ADR-049 Decision 16: a sink operation spawned before shutdown runs on
+    /// the tracker and the drain waits for it; one fired after shutdown, or
+    /// against a dropped Supervisor, does not run.
+    #[tokio::test]
+    async fn sink_op_is_drained_by_shutdown_and_refused_after_it() {
+        let supervisor = build_supervisor(None);
+        let weak = Arc::downgrade(&supervisor);
+        let runtime = tokio::runtime::Handle::current();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in = Arc::clone(&ran);
+        super::spawn_supervisor_op(
+            &weak,
+            &runtime,
+            SinkHandoff::StreamSettlement,
+            move |_sup| async move {
+                let _ = release_rx.await;
+                ran_in.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let shutdown = tokio::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            async move { supervisor.shutdown_all_contexts().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown waits for a sink operation spawned before it"
+        );
+        release_tx.send(()).expect("the probe is still waiting");
+        shutdown.await.expect("shutdown task");
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the in-flight operation ran");
+
+        let late = Arc::new(AtomicUsize::new(0));
+        let late_in = Arc::clone(&late);
+        super::spawn_supervisor_op(
+            &weak,
+            &runtime,
+            SinkHandoff::StreamSettlement,
+            move |_sup| async move {
+                late_in.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let gone = Arc::new(AtomicUsize::new(0));
+        let gone_in = Arc::clone(&gone);
+        super::spawn_supervisor_op(
+            &std::sync::Weak::new(),
+            &runtime,
+            SinkHandoff::StreamSettlement,
+            move |_sup| async move {
+                gone_in.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            late.load(Ordering::SeqCst),
+            0,
+            "shutdown refuses a sink operation fired after it"
+        );
+        assert_eq!(
+            gone.load(Ordering::SeqCst),
+            0,
+            "a dropped Supervisor runs no sink operation"
+        );
+    }
+
+    /// A reservation persist against a dropped Supervisor returns the typed
+    /// `SupervisorShutDown` error, not success.
+    #[tokio::test]
+    async fn persist_reservation_after_supervisor_drop_is_typed_error() {
+        let sink = ActorStreamSettlementSink::new(std::sync::Weak::new(), 1);
+        let result = sink
+            .persist_reservation(
+                &ctx_key(),
+                [3u8; 16],
+                StreamReservationRecord {
+                    invoker_did: invoker(),
+                    ucan_cid: UCAN_CID.to_owned(),
+                    cost_per_chunk: Amount::new(10),
+                    amount_cumulative_reserved: 50,
+                    reserved_escrow: Amount::new(100),
+                    generation: 0,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(scp_protocol::context::ContextError::SupervisorShutDown(_))
+            ),
+            "got {result:?}"
+        );
     }
 }
