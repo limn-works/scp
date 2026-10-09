@@ -430,22 +430,44 @@ pub fn build_broadcast_envelope(
 // 4. verify_and_unwrap
 // ---------------------------------------------------------------------------
 
-/// Verifies signature and unwraps access keys. Pure helper.
+/// Binds the inner sender to the MLS sender, verifies the inner signature,
+/// and unwraps the access-key content layer. Pure helper.
+///
+/// `mls_sender_did` is the DID in the MLS sender's leaf credential, the only
+/// sender identity the receive path authenticates.
+///
+/// # Errors
+///
+/// - [`ContextError::SenderMismatch`] when `inner.sender_did` differs from
+///   `mls_sender_did`, before any key is resolved (§9.8.1).
+/// - [`ContextError::CryptoFailed`] when the key does not resolve, the
+///   signature or the payload hash does not verify, or the content does not
+///   unwrap.
+/// - [`ContextError::PermissionDenied`] for a Recovery message from a
+///   non-admin.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_unwrap(
     key_resolver: &KeyResolver,
     inner: &InnerEnvelope,
-    sender_did: &str,
+    mls_sender_did: &str,
     context_id: &str,
     local_member_did: &str,
     access_key: &AccessKey,
     sender_is_admin: bool,
 ) -> Result<Vec<u8>, ContextError> {
-    // ADR-039: resolve the verification method the sender declared in the
-    // inner envelope (`#active` or `#agent`), so an `#agent`-signed message is
-    // verified against the agent key and an `#active`-signed one against the
-    // human key. The resolver returns `None` when that specific VM is absent
-    // from the sender's DID document (e.g. `#agent` requested but never added).
+    // §9.8.1: the MLS leaf credential authenticates the sender. An inner
+    // envelope that names anyone else is rejected before any key lookup, so a
+    // member holding another member's sender key cannot replay that member's
+    // signed envelope from its own leaf.
+    if inner.sender_did != mls_sender_did {
+        return Err(ContextError::SenderMismatch {
+            mls_sender: mls_sender_did.to_owned(),
+        });
+    }
+    // Resolve the key the inner envelope declares for its own sender
+    // (`09-security-model.md` §9.7.4.2). The resolver returns `None` when that
+    // role is absent from the sender's key state.
+    let sender_did = inner.sender_did.as_str();
     let signing_key_id = inner.signing_key_id;
     let public_key = (key_resolver)(&DID(sender_did.to_owned()), signing_key_id).ok_or_else(|| {
         ContextError::CryptoFailed(format!(
@@ -1499,20 +1521,13 @@ pub async fn deliver_incoming(
 
     let inner = opened_envelope.inner;
     let sender_did = opened_envelope.sender_did;
+    let receive_floor = opened_envelope.receive_floor;
 
     // Cross-context injection defense.
     if inner.context_id != context_id {
         return Err(ContextError::CryptoFailed(format!(
             "inner envelope context_id mismatch: expected {context_id}, got {}",
             inner.context_id
-        )));
-    }
-
-    // Credential-spoof defense.
-    if inner.sender_did != sender_did {
-        return Err(ContextError::CryptoFailed(format!(
-            "inner envelope sender_did mismatch: MLS says {sender_did}, envelope says {}",
-            inner.sender_did
         )));
     }
 
@@ -1537,6 +1552,18 @@ pub async fn deliver_incoming(
         &local_member_did,
         &ak,
         sender_is_admin,
+    )?;
+
+    // Anti-replay floor (§9.8.2): advance the per-sender `(epoch, sequence)`
+    // floor only after the sender binding, signature and payload hash verified.
+    // An envelope that fails verification leaves the floor where it was, so a
+    // forged envelope cannot burn the slot of a genuine one. Checkpoints and
+    // heartbeats pass through the floor like any application envelope.
+    deps.supervisor.check_and_advance_recv_sequence(
+        &context_id_bytes,
+        &sender_did,
+        receive_floor,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
     )?;
 
     // Consistency-checkpoint dispatch (§9.9.3, §23.7). A checkpoint message is
@@ -3029,7 +3056,10 @@ pub(in crate::context) fn stream_reservations_snapshot(
 
 /// Decrypts an incoming envelope and dispatches management/control
 /// messages.
-pub fn decrypt_and_dispatch(
+///
+/// It does not advance the anti-replay floor. The only caller,
+/// [`deliver_incoming`], advances it after the inner envelope verifies.
+pub(super) fn decrypt_and_dispatch(
     deps: &ActorDeps,
     crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
@@ -3059,31 +3089,21 @@ pub fn decrypt_and_dispatch(
 
     match open_result {
         scp_protocol::context::builder::OpenResult::Application(env) => {
-            // ADR-049 PR-6 (read-authority switch): the Supervisor-owned Class-M
-            // floor registry is now AUTHORITATIVE for the receive-side
-            // `(epoch, sequence)` anti-replay floor. `open()` performed pure
-            // decrypt + surfaced `env.receive_floor`; the enforcement is HERE,
-            // FAIL-CLOSED. The `?` fires BEFORE any `OpenedEnvelope` is
-            // dispatched, so a replayed/reordered envelope decrypts harmlessly
-            // and is then rejected — no envelope surfaces (D1 close).
+            // `open()` decrypts and surfaces `env.receive_floor`; the caller
+            // advances the Supervisor-owned anti-replay floor only after the
+            // inner envelope verifies (`deliver_incoming`).
             //
-            // F-3 (black-hat): the receive-side overshoot ceiling reads
-            // `sender_epochs[sender_did]`, which co-mingles remote per-sender
-            // epochs with the LOCAL scalar keyed by `local_did`. This is safe
-            // only while `local_did` never appears as a remote sender on its own
-            // recv path — assert it rather than split the map (splitting ripples
-            // through merge/export/blob format; a violation here is fail-safe).
-            debug_assert_ne!(
-                env.sender_did.as_str(),
-                deps.crypto.local_did(),
-                "F-3: local_did must never appear as a remote sender on its own recv path"
-            );
-            deps.supervisor.check_and_advance_recv_sequence(
-                context_id_bytes,
-                &env.sender_did,
-                env.receive_floor,
-                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-            )?;
+            // The receive-side overshoot ceiling reads `sender_epochs[sender]`,
+            // which also holds the local scalar keyed by `local_did`. An
+            // application message whose MLS sender is the local DID would read
+            // and advance that local entry, so it is rejected. This also rejects
+            // a second device of the same identity; multi-device receive needs
+            // the map split first.
+            if env.sender_did.as_str() == deps.crypto.local_did() {
+                return Err(ContextError::CryptoFailed(
+                    "application message from own DID".to_owned(),
+                ));
+            }
             Ok(Some(*env))
         }
         scp_protocol::context::builder::OpenResult::Control => Ok(None),

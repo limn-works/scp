@@ -254,11 +254,8 @@ pub mod envelope {
     }
     pub mod outer {
         pub use scp_protocol::envelope::outer::*;
-        pub use scp_runtime::envelope::outer::ops;
-        pub use scp_runtime::envelope::outer::ops::{open_envelope, seal_envelope};
     }
     pub use scp_runtime::envelope::inner::sign::create_inner_envelope;
-    pub use scp_runtime::envelope::outer::ops::seal_envelope;
 }
 
 pub mod sync {

@@ -22491,7 +22491,7 @@ mod tests {
     /// `local_floors.is_empty()` short-circuit would have broken — it skips the
     /// merge on an empty live registry, silently losing the blob floors) and that
     /// a replay AT or BELOW the restored recv floor is REJECTED by the same gate
-    /// primitive the `decrypt_and_dispatch` recv seam calls fail-closed
+    /// primitive the `deliver_incoming` recv seam calls fail-closed
     /// (`check_and_advance_recv_sequence`; the seam→gate wiring is enforced
     /// structurally in `pipeline_wiring.rs`).
     #[cfg(feature = "testing")]
@@ -22853,20 +22853,51 @@ mod tests {
         assert_eq!(importer.export_recv_sequence_floors(&ctx), recv_before);
     }
 
+    /// Seals a `Content` inner envelope that Alice (`sender`, signing with
+    /// `alice_signing_key`) sends at `epoch`, through her actor state as the
+    /// send path does.
+    #[cfg(feature = "testing")]
+    fn alice_seals_content(
+        state: &mut crate::context::actor::PerContextState,
+        ctx_str: &str,
+        sender: &str,
+        epoch: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let params = crate::envelope::inner::InnerEnvelopeParams {
+            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+            context_id: ctx_str,
+            sender_did: sender,
+            epoch,
+            generation: 0,
+            sequence: 0,
+            timestamp: 1_700_000_000,
+            message_type: crate::envelope::inner::MessageType::Content,
+            payload,
+            provenance: None,
+            signing_key_id: scp_did::SigningKeyId::Active,
+        };
+        let inner = crate::envelope::inner::sign::create_inner_envelope_raw(
+            &params,
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+        )
+        .expect("the sender signs its inner envelope");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        state
+            .seal(sender, &inner, &routing_id, 3600)
+            .expect("the sender seals the application message")
+    }
+
     /// ADR-049 §9(1) FAIL-CLOSED-BLOCKS (e2e). Alice seals two REAL application
-    /// envelopes through the joined MLS group; Bob drives the production
-    /// `decrypt_and_dispatch` seam. Proves, POST-`open()`-H9-deletion, that (a)
-    /// the surfaced `env.receive_floor` is correct and the recv seam CONSUMES it
-    /// into the authoritative registry, and (b) an out-of-order / replayed older
-    /// floor is REJECTED fail-closed at that seam with NO `OpenedEnvelope`
-    /// surfacing.
+    /// envelopes through the joined MLS group; Bob opens them with the
+    /// production `decrypt_and_dispatch` seam and feeds each surfaced
+    /// `receive_floor` to the Supervisor recv-floor gate, as `deliver_incoming`
+    /// does after verification. Proves that (a) the surfaced floor is correct and
+    /// the gate consumes it into the authoritative registry, and (b) an
+    /// out-of-order or replayed older floor is rejected fail-closed.
     #[cfg(feature = "testing")]
     #[test]
-    fn decrypt_and_dispatch_fail_closed_blocks_reorder_and_replay_e2e() {
-        use crate::envelope::inner::sign::create_inner_envelope_raw;
-        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
-        use scp_did::SigningKeyId;
-
+    fn recv_floor_gate_blocks_reorder_and_replay_e2e() {
         const ALICE: &str = "did:dht:z6MkAliceE2eSenderAliceE2eSenderAlice1";
         const BOB: &str = "did:dht:z6MkBobE2eReceiverBobE2eReceiverBob123";
         let ctx_str = "e2e-decrypt-and-dispatch-fail-closed";
@@ -22895,57 +22926,55 @@ mod tests {
             .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
             .expect("build bob's actor deps");
 
-        // Alice seals an Application envelope; the sender-layer header carries her
-        // current (epoch, send_sequence). First seal → sequence 0, second → 1.
-        let mut seal_app = |payload: &[u8]| -> Vec<u8> {
-            let params = InnerEnvelopeParams {
-                version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-                context_id: ctx_str,
-                sender_did: ALICE,
-                epoch: 1,
-                generation: 0,
-                sequence: 0,
-                timestamp: 1_700_000_000,
-                message_type: MessageType::Content,
-                payload,
-                provenance: None,
-                signing_key_id: SigningKeyId::Active,
-            };
-            let inner = create_inner_envelope_raw(
-                &params,
-                &crate::crypto::mls::two_party_test_support::alice_signing_key(),
-            )
-            .expect("alice signs her inner application envelope");
-            let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-            alice_actor
-                .seal(ALICE, &inner, &routing_id, 3600)
-                .expect("alice seals the application message")
-        };
-
-        let msg_a = seal_app(b"first-application-message"); // header sequence 0
-        let msg_b = seal_app(b"second-application-message"); // header sequence 1
+        let msg_a = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            ALICE,
+            1,
+            b"first-application-message",
+        ); // header sequence 0
+        let msg_b = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            ALICE,
+            1,
+            b"second-application-message",
+        ); // header sequence 1
 
         // Hand `decrypt_and_dispatch` Bob's actor-owned crypto state: the receive
         // seam opens through the actor's `&mut ContextCryptoState`.
-        let bob_cs = match &mut bob_actor.mode {
-            crate::context::actor::ContextModeState::Encrypted(c) => c,
-            crate::context::actor::ContextModeState::Broadcast(_) => {
-                panic!("expected encrypted mode")
-            }
+        let crate::context::actor::ContextModeState::Encrypted(bob_cs) = &mut bob_actor.mode else {
+            panic!("expected encrypted mode")
+        };
+        let mut open = |msg: &[u8]| {
+            crate::context::messaging_helpers::decrypt_and_dispatch(
+                &bob_deps,
+                Some(&mut *bob_cs),
+                ctx_str,
+                &ctx_bytes,
+                msg,
+            )
+        };
+
+        // The gate `deliver_incoming` runs once the inner envelope verifies.
+        let gate = |floor| {
+            bob_sup
+                .check_and_advance_recv_sequence(
+                    &ctx_bytes,
+                    ALICE,
+                    floor,
+                    scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+                )
+                .map_err(ContextError::from)
         };
 
         // Deliver the LATER message (b, sequence 1) FIRST. Accepted; the registry
         // recv floor advances to exactly the surfaced receive_floor.
-        let opened_b = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &msg_b,
-        )
-        .expect("first (in-order) delivery must succeed")
-        .expect("an Application envelope must surface");
+        let opened_b = open(&msg_b)
+            .expect("first (in-order) delivery must succeed")
+            .expect("an Application envelope must surface");
         let floor_b = opened_b.receive_floor;
+        gate(floor_b).expect("the first floor is accepted");
         assert_eq!(
             bob_sup.export_recv_sequence_floors(&ctx_bytes),
             vec![(ALICE.to_owned(), floor_b)],
@@ -22954,14 +22983,11 @@ mod tests {
 
         // Now deliver the EARLIER message (a, sequence 0) — a DISTINCT, never-seen
         // MLS ciphertext (so MLS decrypts it), but an older floor. The authoritative
-        // registry recv gate MUST reject it fail-closed, and NO envelope surfaces.
-        let reorder = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &msg_a,
-        );
+        // registry recv gate MUST reject it fail-closed.
+        let opened_a = open(&msg_a)
+            .expect("MLS decrypts the distinct older ciphertext")
+            .expect("an Application envelope must surface");
+        let reorder = gate(opened_a.receive_floor);
         // Pin the REASON: the rejection must be the registry recv-floor gate
         // (`FloorAdvanceError::RecvSequenceNotMonotonic`, whose Display is
         // "recv-sequence floor … is non-monotonic …"), NOT an MLS-decrypt failure
@@ -22982,17 +23008,16 @@ mod tests {
             "a rejected reorder must not move the registry floor"
         );
 
-        // A replay of the accepted message b is also rejected (no envelope).
-        let replay = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &msg_b,
-        );
+        // A replay of the accepted message b is also rejected: MLS refuses the
+        // reused ciphertext, and its floor would not pass the gate either.
+        let replay = open(&msg_b);
         assert!(
             replay.is_err(),
             "a replay of an already-accepted message must be rejected, got {replay:?}"
+        );
+        assert!(
+            gate(floor_b).is_err(),
+            "the accepted floor must not be accepted twice"
         );
     }
 
@@ -23003,10 +23028,7 @@ mod tests {
     /// from the same registry (no stale-floor over-rejection).
     #[cfg(feature = "testing")]
     #[test]
-    fn decrypt_and_dispatch_catch_up_after_epoch_rotation_e2e() {
-        use crate::envelope::inner::sign::create_inner_envelope_raw;
-        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
-        use scp_did::SigningKeyId;
+    fn recv_floor_gate_catch_up_after_epoch_rotation_e2e() {
         use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
 
         const ALICE: &str = "did:dht:z6MkAliceCatchUpAliceCatchUpAliceCat1";
@@ -23053,28 +23075,13 @@ mod tests {
         // Alice seals at the NEW epoch (2); Bob's recv at epoch 2 is ACCEPTED (the
         // recv ceiling reads the just-advanced sender_epochs[alice]=2, not a stale
         // lower floor).
-        let params = InnerEnvelopeParams {
-            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-            context_id: ctx_str,
-            sender_did: ALICE,
-            epoch: 2,
-            generation: 0,
-            sequence: 0,
-            timestamp: 1_700_000_000,
-            message_type: MessageType::Content,
-            payload: b"post-rotation-application-message",
-            provenance: None,
-            signing_key_id: SigningKeyId::Active,
-        };
-        let inner = create_inner_envelope_raw(
-            &params,
-            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
-        )
-        .expect("alice signs her inner envelope");
-        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-        let sealed = alice_actor
-            .seal(ALICE, &inner, &routing_id, 3600)
-            .expect("alice seals at the rotated epoch");
+        let sealed = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            ALICE,
+            2,
+            b"post-rotation-application-message",
+        );
 
         // Hand Bob's actor-owned crypto state (carrying the rotated key installed
         // above) to the receive seam; it opens through the actor's
@@ -23092,18 +23099,344 @@ mod tests {
             &ctx_bytes,
             &sealed,
         )
-        .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)")
+        .expect("a recv at the just-advanced epoch must open")
         .expect("an Application envelope must surface");
         assert_eq!(
             opened.receive_floor.epoch, 2,
             "the surfaced recv floor must be at the rotated epoch 2"
         );
+        bob_sup
+            .check_and_advance_recv_sequence(
+                &ctx_bytes,
+                ALICE,
+                opened.receive_floor,
+                MAX_EPOCH_ADVANCE,
+            )
+            .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)");
         assert!(
             bob_sup
                 .export_recv_sequence_floors(&ctx_bytes)
                 .iter()
                 .any(|(d, f)| d == ALICE && f.epoch == 2),
             "the registry recv floor must track the epoch-2 receive"
+        );
+    }
+
+    /// Bob's receive side for the `deliver_incoming` tests: his actor-owned
+    /// state (active, holding Bob and Alice as members and Bob's access key) in
+    /// a cell, his production `ActorDeps` over `resolver`, Alice's actor state
+    /// for sealing, and Bob's access key.
+    #[cfg(feature = "testing")]
+    struct DeliverFixture {
+        rt: tokio::runtime::Runtime,
+        bob_cell: crate::context::actor::class_s::ClassSCell,
+        bob_deps: crate::context::actor::deps::ActorDeps,
+        bob_sup: Arc<Supervisor>,
+        alice_state: crate::context::actor::state::PerContextState,
+        bob_access_key: scp_protocol::crypto::access_keys::AccessKey,
+        ctx_bytes: [u8; 32],
+    }
+
+    #[cfg(feature = "testing")]
+    impl DeliverFixture {
+        const ALICE: &'static str = "did:dht:z6MkAliceDeliverAliceDeliverAliceDeli1";
+        const BOB: &'static str = "did:dht:z6MkBobDeliverBobDeliverBobDeliverBo1";
+
+        fn new(ctx_str: &str, resolver: KeyResolver) -> Self {
+            use scp_protocol::context::ContextState;
+
+            let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+                alice_state,
+                bob_provider,
+                mut bob_state,
+                ctx_bytes,
+                ..
+            } = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+                ctx_str,
+                Self::ALICE,
+                Self::BOB,
+            );
+            let bob_sup = supervisor_with_crypto_and_resolver(bob_provider, resolver);
+            let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives Bob's actor dispatch from a sync #[test]; not a production async bridge
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)))
+                .expect("register bob as a local DID");
+            let bob_deps = rt
+                .block_on(bob_sup.build_actor_deps(&DID::from(Self::BOB)))
+                .expect("build bob's actor deps");
+
+            bob_state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition bob's context to Active");
+            for did in [Self::ALICE, Self::BOB] {
+                bob_state
+                    .membership
+                    .add_member(DID::from(did), "member".to_owned(), Vec::new());
+                bob_state.members.insert(DID::from(did));
+                // The receive path delivers only a sender holding
+                // `messages:write`, so each member gets it.
+                bob_state.role_state.members.insert(did.to_owned());
+                bob_state.role_state.member_capabilities.insert(
+                    did.to_owned(),
+                    std::collections::HashSet::from([
+                        scp_protocol::context::roles::Capability::MessagesWrite,
+                    ]),
+                );
+            }
+            let bob_access_key =
+                scp_protocol::crypto::access_keys::generate_access_key(ctx_str, Self::BOB);
+            bob_state
+                .access
+                .access_key_store
+                .set(ctx_str, Self::BOB, bob_access_key.clone());
+
+            Self {
+                rt,
+                bob_cell: crate::context::actor::class_s::ClassSCell::new(bob_state),
+                bob_deps,
+                bob_sup,
+                alice_state,
+                bob_access_key,
+                ctx_bytes,
+            }
+        }
+
+        /// Seals `payload` through Alice's production app-data seal at sender
+        /// sequence `aad_sequence`, naming `claimed_sender` as the inner sender
+        /// and signing with `signing_key`. Sequences start at 1; the receive
+        /// path rejects sequence 0.
+        fn seal_from_alice(
+            &mut self,
+            ctx_str: &str,
+            claimed_sender: &str,
+            signing_key: &ed25519_dalek::SigningKey,
+            aad_sequence: u64,
+            payload: &[u8],
+        ) -> Vec<u8> {
+            let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
+            let recipients = std::collections::HashMap::from([(
+                Self::BOB.to_owned(),
+                self.bob_access_key.clone(),
+            )]);
+            crate::context::messaging_helpers::build_encrypted_envelope_actor(
+                &clock,
+                self.alice_state
+                    .mode
+                    .crypto_mut()
+                    .expect("encrypted context"),
+                Self::ALICE,
+                ctx_str,
+                &DID::from(claimed_sender),
+                payload,
+                crate::context::supervisor::MessageSigner::Active(signing_key),
+                &recipients,
+                aad_sequence,
+                None,
+                scp_protocol::envelope::inner::MessageType::Content,
+            )
+            .expect("alice seals the application message")
+        }
+
+        /// Delivers `blob` to Bob through the production actor receive path
+        /// (`MessagingCommand::DeliverIncoming` → `deliver_incoming`).
+        fn deliver(
+            &mut self,
+            ctx_str: &str,
+            blob: Vec<u8>,
+        ) -> Result<crate::context::messaging_helpers::DeliverOutcome, ContextError> {
+            use crate::context::actor::commands::MessagingCommand;
+            self.rt.block_on(async {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _outcome = crate::context::actor::handlers::messaging::dispatch(
+                    &mut self.bob_cell,
+                    &self.bob_deps,
+                    MessagingCommand::DeliverIncoming {
+                        context_id: ctx_str.to_owned(),
+                        envelope_bytes: blob,
+                        reply: tx,
+                    },
+                )
+                .await;
+                rx.await.expect("deliver reply")
+            })
+        }
+    }
+
+    /// §9.8.1 on the production receive path: Alice, an authenticated MLS
+    /// member, sends an inner envelope whose `sender_did` names Carol. The
+    /// receive path rejects it with `SenderMismatch` naming only the MLS sender,
+    /// and it rejects it before resolving any key.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_rejects_inner_sender_other_than_mls_sender() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAROL: &str = "did:dht:z6MkCarolDeliverCarolDeliverCarolDelive1";
+        let ctx_str = "deliver-incoming-sender-binding";
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&lookups);
+        let inner_resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            inner_resolver(did, kid)
+        });
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let forged = fx.seal_from_alice(
+            ctx_str,
+            CAROL,
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            1,
+            b"claims to come from carol",
+        );
+        let before = lookups.load(Ordering::SeqCst);
+        let result = fx.deliver(ctx_str, forged);
+
+        match &result {
+            Err(ContextError::SenderMismatch { mls_sender }) => {
+                assert_eq!(mls_sender, DeliverFixture::ALICE);
+            }
+            other => panic!("expected SenderMismatch naming the MLS sender, got {other:?}"),
+        }
+        let rendered = format!("{}", result.unwrap_err());
+        assert!(
+            !rendered.contains(CAROL),
+            "the error must not echo the attacker-chosen inner sender: {rendered}"
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst) - before,
+            0,
+            "no key may be resolved for a mismatched sender"
+        );
+    }
+
+    /// §9.8.2 on the production receive path: an envelope whose inner
+    /// signature fails at `(epoch, sequence)` does not advance the recv floor,
+    /// so the genuine envelope at the same `(epoch, sequence)` is still
+    /// accepted.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_failed_verification_does_not_burn_the_floor() {
+        let ctx_str = "deliver-incoming-floor-after-verify";
+        let resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let wrong_key = ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]);
+        let forged = fx.seal_from_alice(
+            ctx_str,
+            DeliverFixture::ALICE,
+            &wrong_key,
+            1,
+            b"forged at (1, 1)",
+        );
+        let genuine = fx.seal_from_alice(
+            ctx_str,
+            DeliverFixture::ALICE,
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            1,
+            b"genuine at (1, 1)",
+        );
+
+        let rejected = fx.deliver(ctx_str, forged);
+        assert!(
+            matches!(&rejected, Err(ContextError::CryptoFailed(m)) if m.contains("signature")),
+            "a bad inner signature must be rejected, got {rejected:?}"
+        );
+        assert!(
+            fx.bob_sup
+                .export_recv_sequence_floors(&fx.ctx_bytes)
+                .is_empty(),
+            "a rejected envelope must not move the recv floor"
+        );
+
+        let accepted = fx
+            .deliver(ctx_str, genuine)
+            .expect("the genuine envelope at the same (epoch, sequence) is accepted");
+        assert!(
+            matches!(
+                &accepted,
+                crate::context::messaging_helpers::DeliverOutcome::Application((pt, sender))
+                    if pt.as_slice() == b"genuine at (1, 1)" && sender == DeliverFixture::ALICE
+            ),
+            "the genuine envelope must surface as Alice's application message, got {accepted:?}"
+        );
+    }
+
+    /// An application message whose MLS sender is the receiving node's own DID
+    /// is rejected with an error, in debug builds too. The receiver here is
+    /// Bob's group state driven by deps whose local DID is Alice's, which is the
+    /// shape a second device of Alice's identity would have.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn decrypt_and_dispatch_rejects_application_message_from_own_did() {
+        use crate::envelope::inner::sign::create_inner_envelope_raw;
+        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
+        use scp_did::SigningKeyId;
+
+        const ALICE: &str = "did:dht:z6MkAliceOwnDidAliceOwnDidAliceOwnDidA1";
+        const BOB: &str = "did:dht:z6MkBobOwnDidBobOwnDidBobOwnDidBobOwnD1";
+        let ctx_str = "decrypt-and-dispatch-own-did";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider,
+            alice_state: mut alice_actor,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let alice_sup = supervisor_with_crypto(Arc::clone(&alice_provider));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let own_did_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build deps whose local DID is alice");
+
+        let inner = create_inner_envelope_raw(
+            &InnerEnvelopeParams {
+                version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+                context_id: ctx_str,
+                sender_did: ALICE,
+                epoch: 1,
+                generation: 0,
+                sequence: 0,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload: b"from alice to her own identity",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+        )
+        .expect("alice signs");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let sealed = alice_actor
+            .seal(ALICE, &inner, &routing_id, 3600)
+            .expect("alice seals");
+
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        let result = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &own_did_deps,
+            Some(bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+        );
+        assert!(
+            matches!(&result, Err(ContextError::CryptoFailed(m)) if m == "application message from own DID"),
+            "an application message from the local DID must be rejected, got {result:?}"
         );
     }
 

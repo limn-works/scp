@@ -9,8 +9,10 @@
 //!
 //! Exercises MLS group lifecycle (create, add, join, remove, destroy),
 //! forward secrecy, sender key generation/encrypt/decrypt, pull protocol
-//! (epoch advance + verify), block notification roundtrip, double encryption
-//! (inner to seal to open), pseudonym derivation, bucket padding, and chunking.
+//! (epoch advance + verify), block notification roundtrip, both encryption
+//! layers of an inner envelope (sender key, then MLS), pseudonym derivation,
+//! bucket padding, and chunking. Sealing and opening a whole envelope run only
+//! in the context actor; `fullstack.rs` covers that path.
 
 use openmls::prelude::*;
 use scp_core::crypto::mls::credential::ScpCredential;
@@ -25,7 +27,7 @@ use scp_core::crypto::sender_keys::{
 };
 use scp_core::envelope::{
     InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
-    derive_pseudonym, pad_to_bucket, seal_envelope, strip_padding,
+    derive_pseudonym, pad_to_bucket, strip_padding,
 };
 use scp_crypto::p256::testing::uncompressed_point_for;
 use scp_did::SigningKeyId;
@@ -593,7 +595,6 @@ async fn double_encryption_roundtrip() {
     )
     .unwrap();
 
-    let mut creator_group = new_group(&creator_cred);
     let sender_key = generate_sender_key();
 
     let payload = b"secret payload for double encryption test";
@@ -622,29 +623,9 @@ async fn double_encryption_roundtrip() {
     assert_eq!(inner.context_id, "ctx-double-enc");
     assert_eq!(inner.sender_did, "did:dht:z6MkCreatorDE");
 
-    // Test seal: inner -> sender key encrypt -> MLS encrypt -> outer envelope.
-    let routing_id = [0x42u8; 32];
-    let outer = seal_envelope(
-        &inner,
-        &mut creator_group,
-        &sender_key,
-        &routing_id,
-        None,
-        3600,
-    )
-    .unwrap();
-
-    assert_eq!(outer.routing_id, routing_id);
-    assert_eq!(outer.blob_ttl, 3600);
-    assert!(!outer.encrypted_blob.is_empty());
-
-    // Verify the layers are applied correctly by checking that the
-    // encrypted blob differs from any plaintext representation.
     let inner_bytes = rmp_serde::to_vec_named(&inner).unwrap();
-    assert_ne!(outer.encrypted_blob, inner_bytes);
 
-    // Also verify the sender key layer independently:
-    // encrypt then decrypt with the same key.
+    // The sender key layer: encrypt then decrypt with the same key.
     let sk_encrypted = encrypt_sender_layer(
         &sender_key,
         &inner_bytes,
@@ -665,7 +646,7 @@ async fn double_encryption_roundtrip() {
     .unwrap();
     assert_eq!(sk_decrypted, inner_bytes);
 
-    // And the MLS layer independently: encrypt then decrypt (needs 2 members).
+    // The MLS layer: encrypt then decrypt (needs 2 members).
     let joiner_cred = ScpCredential::new(
         "did:dht:z6MkJoinerDE".to_owned(),
         None,

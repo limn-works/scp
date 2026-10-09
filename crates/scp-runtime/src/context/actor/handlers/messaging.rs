@@ -249,7 +249,7 @@ pub(crate) async fn dispatch(
 /// surfaces `env.receive_floor`; it does NOT run the authoritative anti-replay
 /// gate (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
 /// mutate `nonce_dedup`, or change the epoch — all of which live at the messaging
-/// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+/// seam (`messaging_helpers::deliver_incoming`),
 /// which this inspection deliberately does NOT invoke. The ONLY state change is
 /// the MLS decryption-ratchet advance intrinsic to decrypting a message (the
 /// deleted provider inspection twin was non-mutating in exactly this same sense);

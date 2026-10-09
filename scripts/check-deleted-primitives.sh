@@ -133,6 +133,14 @@ BAN_ENTRIES=(
     "KeyPackageIn::tls_deserialize|crates|*.rs|Decode peer KeyPackages with scp_mls::wire::parse_key_package_in (catch_unwind over tls_codec's debug assertion)"
     "Welcome::tls_deserialize|crates|*.rs|Decode Welcome bodies with scp_mls::wire::parse_welcome (catch_unwind over tls_codec's debug assertion)"
     "profile\\.dev\\.package\\.tls_codec|.|Cargo.toml|The tls_codec debug-assertions override covered one workspace root only; scp_mls::wire handles the assertion in every build"
+    # Envelopes are sealed and opened only in the context actor
+    # (ContextCryptoState::seal / ContextCryptoState::open, then
+    # messaging_helpers::verify_and_unwrap, which binds the inner sender to the
+    # MLS sender before resolving a key). A free-standing seal or open function
+    # with a caller-supplied sender-layer AAD bypassed that binding.
+    "fn seal_envelope|crates|*.rs|Seal through the context actor (ContextCryptoState::seal); no free-standing envelope seal exists"
+    "fn open_envelope|crates|*.rs|Open through the context actor (ContextCryptoState::open + verify_and_unwrap); no free-standing envelope open exists"
+    "SenderLayerAad|crates|*.rs|The sender-layer AAD is built inside ContextCryptoState from the MLS-authenticated sender, never from caller input"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned

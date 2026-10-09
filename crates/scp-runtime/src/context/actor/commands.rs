@@ -528,7 +528,7 @@ pub enum MessagingCommand {
     /// NOT run the authoritative anti-replay gate
     /// (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
     /// mutate `nonce_dedup`, or change the epoch. Those live at the messaging
-    /// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+    /// seam (`messaging_helpers::deliver_incoming`),
     /// which this inspection deliberately skips. The sole state change is the
     /// unavoidable MLS decryption-ratchet advance inherent to any decrypt (the
     /// deleted provider inspection twin was likewise non-mutating in exactly this
