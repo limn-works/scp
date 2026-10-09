@@ -245,8 +245,7 @@ nothing:
                dropped, or a command deleted while splitting runs that command
                on no leg, and every leg still passes. LEG_COMMANDS pins the
                commands each group ran before the split, and the check fails
-               unless each event's legs run every pinned command exactly once
-               and nothing else.
+               unless each event's legs run every pinned command exactly once.
   package-writers
                Job docker-image-cache writes the Docker layer cache to the
                ghcr.io tag `buildcache:docker-image` with the `docker-cache`
@@ -266,7 +265,7 @@ nothing:
                setup-bun cache, whose key names no job, that no push runs any
                job writing it), a writer's
                matrix that drops on push the leg its `save-if` names, a push
-               leg no other event runs unless every command it runs is one an
+               leg no other event runs unless every step it runs is one an
                other event's leg runs, and any job whose `if:` answers a
                scenario differently from SCENARIOS.
   macos-bridges
@@ -5575,21 +5574,15 @@ def axis_terms(condition: object) -> tuple[str, list[str]] | None:
 LEG_COMMAND_PREFIXES = ("cargo ", "bash ")
 
 
-def leg_commands(job: dict, axis: str | None, value: object) -> list[str] | None:
-    """Return the commands one leg of a job runs, in step order.
+def leg_steps(job: dict, axis: str | None, value: object) -> list[dict] | None:
+    """Return the steps one leg of a job runs, in step order.
 
     A step runs on the leg when it carries no `if:`, or when axis_terms reads its
-    `if:` as picking values of `axis` that include the leg's `value`. Each command
-    is a logical line of the step's `run:` script that starts with one of
-    LEG_COMMAND_PREFIXES, with every `${{ matrix.<axis> }}` replaced by the leg's
-    value, so two legs whose step text is the same but whose matrix value differs
-    run two different commands. With `axis` None the job has one leg. Returns None
-    when a step's `if:` leaves open whether this leg runs it.
+    `if:` as picking values of `axis` that include the leg's `value`. With `axis`
+    None the job has one leg. Returns None when a step's `if:` leaves open whether
+    this leg runs it.
     """
-    placeholder = (
-        re.compile(rf"\$\{{\{{\s*matrix\.{re.escape(axis)}\s*\}}\}}") if axis else None
-    )
-    commands: list[str] = []
+    steps: list[dict] = []
     for step in job.get("steps") or []:
         if not isinstance(step, dict):
             continue
@@ -5600,10 +5593,54 @@ def leg_commands(job: dict, axis: str | None, value: object) -> list[str] | None
                 return None
             if str(value) not in terms[1]:
                 continue
+        steps.append(step)
+    return steps
+
+
+def leg_placeholder(axis: str | None) -> re.Pattern | None:
+    """Return the pattern of `${{ matrix.<axis> }}`, or None with no axis."""
+    return re.compile(rf"\$\{{\{{\s*matrix\.{re.escape(axis)}\s*\}}\}}") if axis else None
+
+
+def leg_commands(job: dict, axis: str | None, value: object) -> list[str] | None:
+    """Return the commands one leg of a job runs, in step order.
+
+    Each command is a logical line of the `run:` script of a step leg_steps finds
+    the leg running that starts with one of LEG_COMMAND_PREFIXES, with every
+    `${{ matrix.<axis> }}` replaced by the leg's value, so two legs whose step text
+    is the same but whose matrix value differs run two different commands. Returns
+    None when leg_steps does.
+    """
+    steps = leg_steps(job, axis, value)
+    if steps is None:
+        return None
+    placeholder = leg_placeholder(axis)
+    commands: list[str] = []
+    for step in steps:
         for line in logical_lines(step.get("run") or ""):
             if line.startswith(LEG_COMMAND_PREFIXES):
                 commands.append(placeholder.sub(str(value), line) if placeholder else line)
     return commands
+
+
+def leg_step_identities(job: dict, axis: str, value: object) -> set[str] | None:
+    """Return one string per step a leg runs, holding every key but `if:`.
+
+    Each string is the step serialized with sorted keys and every
+    `${{ matrix.<axis> }}` replaced by the leg's value, so its `run:` lines,
+    `uses:`, `with:` and `env:` all enter it. Returns None when leg_steps does.
+    """
+    steps = leg_steps(job, axis, value)
+    if steps is None:
+        return None
+    placeholder = leg_placeholder(axis)
+    return {
+        placeholder.sub(
+            str(value),
+            json.dumps({key: item for key, item in step.items() if key != "if"}, sort_keys=True),
+        )
+        for step in steps
+    }
 
 
 def push_runs_step(step: dict, legs: dict[str, str] | None = None) -> bool:
@@ -5672,26 +5709,27 @@ def push_runs_step(step: dict, legs: dict[str, str] | None = None) -> bool:
 def push_only_legs_repeat_other_legs(
     job: dict, axis: str, push_only: list, other_values: list
 ) -> bool:
-    """Report whether every push-only leg repeats commands other events' legs run.
+    """Report whether every push-only leg repeats steps other events' legs run.
 
     A push to `main` may run a leg no other event runs only to write a cache those
     legs restore: job rust-test-macos's `all` leg runs the steps its three
     pull-request legs split between them, so one leg writes one entry holding all
-    three feature sets. Such a leg must run at least one command, and every
-    command it runs (leg_commands, with its own matrix value substituted) must be
-    one some leg of pull_request and merge_group runs, so a push never runs a
-    command a merge did not already pass. A leg whose commands leg_commands cannot
-    read fails.
+    three feature sets. Such a leg must run at least one command (leg_commands),
+    and every step it runs must be, by leg_step_identities, a step some leg of
+    pull_request and merge_group runs: the same `run:` script, `uses:`, `with:`
+    and `env:`. A leg whose steps leg_steps cannot read fails.
     """
     elsewhere: set[str] = set()
     for value in other_values:
-        commands = leg_commands(job, axis, value)
-        if commands is None:
+        identities = leg_step_identities(job, axis, value)
+        if identities is None:
             return False
-        elsewhere.update(commands)
+        elsewhere |= identities
     for value in push_only:
-        commands = leg_commands(job, axis, value)
-        if not commands or not set(commands) <= elsewhere:
+        identities = leg_step_identities(job, axis, value)
+        if not leg_commands(job, axis, value) or identities is None:
+            return False
+        if not identities <= elsewhere:
             return False
     return True
 
@@ -5796,7 +5834,7 @@ def push_writer_gaps(doc: dict) -> list[str]:
                 gaps.append(
                     f"{job_id}'s matrix `{key}` runs {push_values} on push, outside "
                     f"the {other_values} every other event runs, and a push-only leg "
-                    f"runs no command, or a command no leg of another event runs"
+                    f"runs no command, or a step no leg of another event runs"
                 )
             on_push[key] = push_values
             elsewhere[key] = other_values
@@ -5866,7 +5904,7 @@ def push_writer_gaps(doc: dict) -> list[str]:
 # The commands each split job ran before its split into legs, one tuple per
 # group of jobs that together hold them. A push and a pull request each run the
 # group's legs (leg_commands) for that event, and leg_command_gaps requires that
-# those legs run every pinned command exactly once and nothing else, so a split,
+# those legs run every pinned command exactly once, so a split,
 # a merge, or a renamed leg cannot drop a command or run one twice. A job named
 # here that the event does not run contributes no command, so the rust-doc pair
 # pins no command for push. A change to what a job runs edits this table in the
@@ -6584,9 +6622,10 @@ def check_push_writer_mutants(doc: dict) -> None:
         gaps = push_writer_gaps(changed)
         check(f"{label} is reported", any(reported in gap for gap in gaps), f"{gaps}")
 
-    # rust-test-macos's push-only `all` leg is allowed because every command it
-    # runs is one a pull-request leg runs. A push-only leg that runs a command no
-    # pull-request leg runs, or that runs no command, is reported.
+    # rust-test-macos's push-only `all` leg is allowed because every step it runs
+    # is one a pull-request leg runs. A push-only leg that runs a step no
+    # pull-request leg runs, whatever its `run:` line starts with or when it is a
+    # `uses:` or `env:` difference, or that runs no command, is reported.
     def macos_step(job: dict, value: str) -> dict:
         return step_where(
             job,
@@ -6608,6 +6647,37 @@ def check_push_writer_mutants(doc: dict) -> None:
                     "name": "push only",
                     "if": "matrix.leg == 'all'",
                     "run": "cargo test -p scp-push-only",
+                }
+            ),
+        ),
+        (
+            "a push-only leg running a script no LEG_COMMAND_PREFIXES names",
+            lambda job: job["steps"].append(
+                {"if": "matrix.leg == 'all'", "run": "./scripts/push-only.sh"}
+            ),
+        ),
+        (
+            "a push-only leg running a cargo command behind an assignment",
+            lambda job: job["steps"].append(
+                {
+                    "if": "matrix.leg == 'all'",
+                    "run": "RUSTFLAGS=--cfg=x cargo test -p scp-transport",
+                }
+            ),
+        ),
+        (
+            "a push-only leg running an action of its own",
+            lambda job: job["steps"].append(
+                {"if": "matrix.leg == 'all'", "uses": "example/push-only@v1"}
+            ),
+        ),
+        (
+            "a push-only leg running a pull-request step's script under its own env",
+            lambda job: job["steps"].append(
+                {
+                    **{key: item for key, item in macos_step(job, "platform").items() if key != "if"},
+                    "if": "matrix.leg == 'all'",
+                    "env": {"RUSTFLAGS": "--cfg=x"},
                 }
             ),
         ),
