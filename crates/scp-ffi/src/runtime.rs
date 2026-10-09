@@ -1845,10 +1845,51 @@ pub fn read_live_context_state(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
-    let sup = Arc::clone(supervisor(bi)?);
+    read_live_context_state_on(Arc::clone(supervisor(bi)?), context_id)
+}
+
+/// Runs the [`read_live_context_state`] read on `sup`.
+///
+/// `sup` is a supervisor the caller already resolved, so a caller that makes a
+/// second supervisor call after the read resolves the bridge's supervisor once
+/// for both.
+///
+/// # Errors
+///
+/// Returns every error [`read_live_context_state`] returns except the
+/// supervisor-resolution error, which the caller met when it resolved `sup`.
+pub fn read_live_context_state_on(
+    sup: Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
     let ctx = context_id.to_owned();
     block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
         .map_err(ScpPyError::from)
+}
+
+/// Re-reads `context_id`'s lifecycle state on `sup` and removes this bridge's
+/// state for it unless the read reports `Active`.
+///
+/// Returns `false` and removes nothing when the read reports `Active`. On any
+/// other answer, a failed read included, it removes the state and returns
+/// `true`. The read and the removal are two steps, so a readmit that lands
+/// between them loses this bridge's state for the id.
+pub fn release_context_unless_readmitted(
+    bi: &PyBridgeInstance,
+    sup: &Arc<scp_core::context::supervisor::Supervisor>,
+    context_id: &str,
+) -> bool {
+    match read_live_context_state_on(Arc::clone(sup), context_id) {
+        Ok(Some(scp_core::context::ContextState::Active)) => return false,
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            context_id,
+            error = %e,
+            "lifecycle re-read before a release failed; releasing this bridge's state"
+        ),
+    }
+    remove_context(bi, context_id);
+    true
 }
 
 /// Reads `context_id`'s role state for an authorization decision after its
