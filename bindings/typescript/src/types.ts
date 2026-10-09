@@ -40,7 +40,6 @@ export const Capabilities = {
   CONTEXT_CLOSE: "context:close",
   CHILD_CONTEXT_CREATE: "context:child:create",
   OUTLET_INTERFACE: "outlet:interface",
-  BRIDGING: "bridging",
   MEDIA_VOICE: "media:voice",
   MEDIA_VIDEO: "media:video",
   MEDIA_SCREEN_SHARE: "media:screen_share",
@@ -188,7 +187,6 @@ export type UnitCapability =
   | "ContextClose"
   | "ChildContextCreate"
   | "OutletInterface"
-  | "Bridging"
   | "MediaVoice"
   | "MediaVideo"
   | "MediaScreenShare"

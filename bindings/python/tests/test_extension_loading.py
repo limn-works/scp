@@ -41,7 +41,6 @@ FOREIGN_TAGGED_EXTENSION = "_scp_core.cpython-000-scp-test.so"
 #: `import _scp_core` / `except ImportError` block, and each copy reported a load
 #: failure with the absence code.
 BRIDGE_ACCESSORS = [
-    ("scp_sdk.bridge", "_bridge"),
     ("scp_sdk.context", "_bridge"),
     ("scp_sdk.discovery", "_bridge"),
     ("scp_sdk.economy", "_bridge"),
