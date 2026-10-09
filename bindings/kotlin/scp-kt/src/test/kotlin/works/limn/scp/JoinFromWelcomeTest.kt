@@ -26,8 +26,10 @@
 // These mirror the Python reference (tests/test_join_from_welcome.py) and the
 // TypeScript SDK (tests/context-join-from-welcome.test.ts).
 //
-// All tests require the compiled UniFFI cdylib; without a loadable native
-// library the suite skips via JUnit 5 assumptions, matching ScpClassTest.
+// All tests require the compiled UniFFI cdylib. The suite skips via JUnit 5
+// assumptions only when the generated `uniffi.scp` classes are absent; a cdylib
+// that is absent or fails to load throws `UnsatisfiedLinkError` from the first
+// native call and fails the test.
 //
 // Provenance: ADR-049 Phase 2J; FFI-02 Option A. Kotlin SDK slice.
 
@@ -70,12 +72,6 @@ class JoinFromWelcomeTest {
                 nativeAvailable = true
             } catch (e: ClassNotFoundException) {
                 skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
             }
         }
 

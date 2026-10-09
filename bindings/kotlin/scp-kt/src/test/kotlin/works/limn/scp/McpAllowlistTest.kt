@@ -4,9 +4,10 @@
 // The Kotlin wrapper requires `iTrustAllCommands = true` before delegating
 // to the inner UniFFI-generated `Scp` and writes a runtime warning when
 // proceeding. The throw happens at the wrapper layer before any native
-// call — but constructing `SCP()` itself requires the UniFFI library, so
-// the suite skips gracefully when the binary is unavailable, matching
-// `ScpClassTest`'s pattern.
+// call — but constructing `SCP()` itself requires the UniFFI library. The
+// suite skips via JUnit 5 assumptions only when the generated `uniffi.scp`
+// classes are absent; a cdylib that is absent or fails to load throws
+// `UnsatisfiedLinkError` from the first native call and fails the test.
 //
 // Provenance: ADR-048 §1 multi-instance neutrality.
 
@@ -39,12 +40,6 @@ class McpAllowlistTest {
                 nativeAvailable = true
             } catch (e: ClassNotFoundException) {
                 skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
             }
         }
     }

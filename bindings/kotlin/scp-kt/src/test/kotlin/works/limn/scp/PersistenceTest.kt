@@ -22,8 +22,10 @@
 // → restore` path is exercised at the Rust integration layer
 // (`crates/scp-testing/tests/integration/persistence_sdk.rs`).
 //
-// The suite skips (via JUnit 5 `assumeTrue`) when the UniFFI cdylib
-// is not loadable, matching the pattern in `ScpClassTest`.
+// All tests require the compiled UniFFI cdylib. The suite skips via JUnit 5
+// assumptions only when the generated `uniffi.scp` classes are absent; a cdylib
+// that is absent or fails to load throws `UnsatisfiedLinkError` from the first
+// native call and fails the test.
 
 package works.limn.scp
 
@@ -76,12 +78,6 @@ class PersistenceTest {
                 nativeAvailable = true
             } catch (e: ClassNotFoundException) {
                 skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
             }
         }
     }

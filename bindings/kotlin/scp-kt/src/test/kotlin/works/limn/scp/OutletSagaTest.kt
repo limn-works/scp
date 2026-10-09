@@ -67,12 +67,6 @@ class OutletSagaTest {
                 nativeAvailable = true
             } catch (e: ClassNotFoundException) {
                 skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
             }
         }
 
