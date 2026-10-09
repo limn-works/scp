@@ -120,10 +120,7 @@ type NativeAddon = RawNativeAddon & {
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
-  // P-256 custody-host helpers (§9.10.4, §9.5), module-level free functions.
-  p256PseudonymScalar?: unknown;
-  p256PublicKey?: unknown;
-  p256SignPrehashRfc6979?: unknown;
+  // P-256 pseudonym point helpers (§9.10.4.A), module-level free functions.
   p256PseudonymPoint?: unknown;
   p256SoftwarePseudonymPoint?: unknown;
 };
@@ -617,62 +614,6 @@ export interface KeyCustodyProvider {
 // P-256 custody-host helpers
 // ---------------------------------------------------------------------------
 
-/** Calls the addon's P-256 host helper `name`, mapping its errors. */
-function p256HostCall(
-  name: "p256PseudonymScalar" | "p256PublicKey" | "p256SignPrehashRfc6979" | "p256PseudonymPoint",
-  ...args: Uint8Array[]
-): Uint8Array {
-  return __p256HostInvokeForTests(nativeFreeFn<(...a: number[][]) => number[]>(name), args);
-}
-
-/**
- * Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
- * scalar in `[1, n − 1]`.
- *
- * FIPS 186-5 A.2.1, spec §9.10.4:
- * `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48)` read as a
- * big-endian integer, `mod (n − 1) + 1`, returned as 32 big-endian bytes. The
- * label is fixed inside the helper, so no host passes it. A
- * {@link KeyCustodyProvider} host stores the result as the pseudonym key and
- * passes it to {@link p256PublicKey} and {@link p256SignPrehashRfc6979}.
- *
- * The Rust side and the SDK wipe their own copies of the seed and the
- * scalar. The SDK returns the scalar as one mutable `Uint8Array` that no
- * other SDK code holds; the host wipes it with `fill(0)` when it destroys the
- * key, and wipes the seed it passed in. The transfer buffers napi-rs copies
- * across the JS boundary cannot be reached from JS and are not wiped.
- *
- * @throws {ValidationError} `SCP-VALID-7005` when `contextSeed` is not 32 bytes.
- * @throws {CryptoError} `SCP-CRYPTO-4001` if the reduction fails.
- */
-export function p256PseudonymScalar(contextSeed: Uint8Array): Uint8Array {
-  return p256HostCall("p256PseudonymScalar", contextSeed);
-}
-
-/**
- * Returns the 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
- *
- * @throws {ValidationError} `SCP-VALID-7005` when `scalar` is not 32 bytes.
- * @throws {CryptoError} `SCP-CRYPTO-4001` when it is zero or not below `n`.
- */
-export function p256PublicKey(scalar: Uint8Array): Uint8Array {
-  return p256HostCall("p256PublicKey", scalar);
-}
-
-/**
- * Signs a 32-byte digest with the scalar (spec §9.5): RFC 6979 deterministic
- * nonce (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
- * that {@link KeyCustodyProvider.sign} returns for a pseudonym key id.
- *
- * @throws {ValidationError} `SCP-VALID-7005` when `scalar` or `digest` is not
- *   32 bytes.
- * @throws {CryptoError} `SCP-CRYPTO-4001` when the scalar is out of range or
- *   signing fails.
- */
-export function p256SignPrehashRfc6979(scalar: Uint8Array, digest: Uint8Array): Uint8Array {
-  return p256HostCall("p256SignPrehashRfc6979", scalar, digest);
-}
-
 /**
  * Returns the 33-byte SEC1 compressed pseudonym point of a 32-byte §9.10.4
  * `context_seed` (v1 or v2), for a host that computes the seed itself, such
@@ -685,7 +626,10 @@ export function p256SignPrehashRfc6979(scalar: Uint8Array, digest: Uint8Array): 
  * @throws {ValidationError} `SCP-VALID-7005` when `contextSeed` is not 32 bytes.
  */
 export function p256PseudonymPoint(contextSeed: Uint8Array): Uint8Array {
-  return p256HostCall("p256PseudonymPoint", contextSeed);
+  return __p256HostInvokeForTests(
+    nativeFreeFn<(...a: number[][]) => number[]>("p256PseudonymPoint"),
+    [contextSeed],
+  );
 }
 
 /**

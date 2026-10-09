@@ -21,7 +21,7 @@
 //! [`P256PublicKey`], so every point reaching [`verify_prehash_strict`],
 //! [`verify_prehash_lenient`], or [`ecdh_p256`] has passed it.
 //!
-//! Seed to scalar (§9.10.4, §25.2): [`seed_to_scalar`] is the FIPS 186-5
+//! Seed to scalar (§9.10.4, §25.2): [`P256SecretKey::from_seed`] runs the FIPS 186-5
 //! Appendix A.2.1 extra-random-bits method: HKDF-Expand-SHA256 the 32-byte seed
 //! to 48 bytes under a label, reduce modulo `n − 1`, add one.
 
@@ -99,7 +99,7 @@ pub enum P256Error {
     SigningFailed,
 }
 
-/// The HKDF-Expand `info` label of a [`seed_to_scalar`] derivation. Each label
+/// The HKDF-Expand `info` label of a [`P256SecretKey::from_seed`] derivation. Each label
 /// is a separate domain, so the same seed yields unrelated scalars under two
 /// labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -221,11 +221,12 @@ impl P256SecretKey {
 
     /// Builds a key from a scalar already known to lie in `[1, n − 1]`.
     #[must_use]
-    pub fn from_nonzero_scalar(scalar: NonZeroScalar) -> Self {
+    pub(crate) fn from_nonzero_scalar(scalar: NonZeroScalar) -> Self {
         Self(SigningKey::from(scalar))
     }
 
-    /// Derives a key from a 32-byte seed by [`seed_to_scalar`] under `label`.
+    /// Derives a key from a 32-byte seed by the FIPS 186-5 A.2.1
+    /// seed-to-scalar reduction under `label` (§9.10.4, §25.2).
     #[must_use]
     pub fn from_seed(label: SeedLabel, seed: &[u8; 32]) -> Self {
         Self::from_nonzero_scalar(seed_to_scalar(label, seed))
@@ -260,7 +261,7 @@ impl P256SecretKey {
 /// is below 2^-128. There is no reject-and-retry and no direct reduction of the
 /// 32-byte seed, both of which §9.10.4 forbids.
 #[must_use]
-pub fn seed_to_scalar(label: SeedLabel, seed: &[u8; 32]) -> NonZeroScalar {
+pub(crate) fn seed_to_scalar(label: SeedLabel, seed: &[u8; 32]) -> NonZeroScalar {
     // A 32-byte PRK is `HashLen`, and 48 ≤ 255 · HashLen, so neither call fails.
     let Ok(hkdf) = hkdf::Hkdf::<sha2::Sha256>::from_prk(seed) else {
         unreachable!("a 32-byte PRK is HashLen")

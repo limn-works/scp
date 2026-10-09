@@ -32,8 +32,7 @@ import { CryptoError, IdentityError, mapBridgeError } from "../src/errors";
 import { toNativeCustodyProvider } from "../src/internal/custody-adapter";
 import { loadNativeAddon } from "../src/internal/native";
 import type { KeyCustodyProvider } from "../src/scp";
-import { p256PseudonymScalar, p256PublicKey } from "../src/scp";
-import { pseudonymSeedV1 } from "./pseudonym-recipe";
+import { p256SoftwarePseudonymPoint } from "../src/scp";
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
@@ -111,8 +110,8 @@ class StoreKeychain implements KeyCustodyProvider {
   }
 
   derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
-    // The host computes the context seed; the SDK helpers map it to the point.
-    const point = p256PublicKey(p256PseudonymScalar(pseudonymSeedV1(this.#seed(keyId), contextId)));
+    // The SDK's software helper derives the point; the host stores nothing.
+    const point = p256SoftwarePseudonymPoint(this.#seed(keyId), contextId);
     // A host still on the retired 32-byte Ed25519 pseudonym shape.
     return this.fault === "legacy32" ? point.subarray(1) : point;
   }

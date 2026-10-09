@@ -110,23 +110,8 @@ SDK_EXTENSIONS: dict[str, str] = {
 # Do NOT "simplify" by deleting these entries: removing one re-opens a
 # fail-closed gap for that op.
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
-    # P-256 custody-host helpers are module-level free functions named without
-    # a domain prefix in every SDK.
-    ("Crypto", "p256_pseudonym_scalar"): {
-        "python": ["p256_pseudonym_scalar"],
-        "typescript": ["p256PseudonymScalar"],
-        "swift": ["p256PseudonymScalar"],
-    },
-    ("Crypto", "p256_public_key"): {
-        "python": ["p256_public_key"],
-        "typescript": ["p256PublicKey"],
-        "swift": ["p256PublicKey"],
-    },
-    ("Crypto", "p256_sign_prehash_rfc6979"): {
-        "python": ["p256_sign_prehash_rfc6979"],
-        "typescript": ["p256SignPrehashRfc6979"],
-        "swift": ["p256SignPrehashRfc6979"],
-    },
+    # P-256 pseudonym point helpers are module-level free functions named
+    # without a domain prefix in every SDK.
     ("Crypto", "p256_pseudonym_point"): {
         "python": ["p256_pseudonym_point"],
         "typescript": ["p256PseudonymPoint"],

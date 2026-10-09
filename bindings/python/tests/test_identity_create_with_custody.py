@@ -25,15 +25,7 @@ from typing import Literal
 
 import pytest
 
-from scp_sdk import (
-    p256_pseudonym_scalar,
-    p256_public_key,
-)
-
-from .pseudonym_recipe import (
-    canonical_pseudonym_seed,
-    canonical_rotatable_pseudonym_seed,
-)
+from scp_sdk import p256_software_pseudonym_point
 
 # ---------------------------------------------------------------------------
 # Minimal pure-Python Ed25519 (RFC 8032) — stdlib only.
@@ -173,10 +165,10 @@ class _FakeKeychain:
         # stand-in keeps the protocol surface complete.
         return hashlib.sha256(self._seeds[key_id] + bytes(peer_public)).digest()
 
-    def _point(self, seed: bytes) -> bytes:
-        # The host computes the context seed; the SDK helpers map it to the
-        # point. Nothing is stored.
-        point = p256_public_key(p256_pseudonym_scalar(seed))
+    def _point(self, key_id: str, context_id: bytes, epoch: int | None = None) -> bytes:
+        # The SDK's software helper derives the point from the Ed25519
+        # identity seed (the native interim ikm until S12). Nothing is stored.
+        point = p256_software_pseudonym_point(self._seeds[key_id], bytes(context_id), epoch)
         if self._fault == "legacy32":
             point = point[1:]
         if self._tuple_result:
@@ -184,20 +176,17 @@ class _FakeKeychain:
         return point
 
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
-        # Canonical v1 recipe (§9.10.4.A) over the Ed25519 identity seed (the
-        # native interim ikm until S12).
+        # The v1 recipe (§9.10.4.A).
         self.derive_calls.append((key_id, bytes(context_id)))
-        return self._point(canonical_pseudonym_seed(self._seeds[key_id], context_id))
+        return self._point(key_id, context_id)
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
     ) -> bytes:
-        # Canonical v2 recipe (§9.10.4.A): HMAC(context_id || epoch_BE ||
-        # "scp-pseudonym-v2"). Same return shape as the v1 path.
+        # The v2 recipe (§9.10.4.1) at the epoch. Same return shape as the v1
+        # path.
         self.derive_calls.append((key_id, bytes(context_id)))
-        return self._point(
-            canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
-        )
+        return self._point(key_id, context_id, pseudonym_epoch)
 
     def export_signing_key_bytes(self, key_id: str) -> bytes:
         return self._seeds[key_id]

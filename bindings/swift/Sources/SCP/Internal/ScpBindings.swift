@@ -17309,8 +17309,8 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
  * The compressed pseudonym point of a §9.10.4 `context_seed`.
  *
  * The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
- * host that computes the seed inside its
- * keystore. No scalar reaches the host.
+ * host that computes the seed inside its keystore. No scalar reaches the
+ * host.
  *
  * # Errors
  *
@@ -17320,60 +17320,6 @@ public func p256PseudonymPoint(contextSeed: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_p256_pseudonym_point(
         FfiConverterData.lower(contextSeed),$0
-    )
-})
-}
-/**
- * Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
- * scalar in `[1, n − 1]`.
- *
- * FIPS 186-5 A.2.1, §9.10.4:
- * `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`,
- * with the label fixed inside the helper. Returns the 32-byte big-endian
- * scalar.
- *
- * # Errors
- *
- * `SCP-VALID-7005` when `context_seed` is not 32 bytes; `SCP-CRYPTO-4001` if
- * the reduction fails (unreachable for a 32-byte seed).
- */
-public func p256PseudonymScalar(contextSeed: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_pseudonym_scalar(
-        FfiConverterData.lower(contextSeed),$0
-    )
-})
-}
-/**
- * The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
- *
- * # Errors
- *
- * `SCP-VALID-7005` when `scalar` is not 32 bytes; `SCP-CRYPTO-4001` when it
- * is zero or not below `n`.
- */
-public func p256PublicKey(scalar: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_public_key(
-        FfiConverterData.lower(scalar),$0
-    )
-})
-}
-/**
- * Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
- * (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
- * (§9.5).
- *
- * # Errors
- *
- * `SCP-VALID-7005` when `scalar` or `digest` is not 32 bytes;
- * `SCP-CRYPTO-4001` when the scalar is out of range or signing fails.
- */
-public func p256SignPrehashRfc6979(scalar: Data, digest: Data)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_p256_sign_prehash_rfc6979(
-        FfiConverterData.lower(scalar),
-        FfiConverterData.lower(digest),$0
     )
 })
 }
@@ -17786,16 +17732,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_point() != 20989) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_scalar() != 7172) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_public_key() != 39495) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_p256_sign_prehash_rfc6979() != 49215) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_point() != 15648) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_p256_software_pseudonym_point() != 30231) {

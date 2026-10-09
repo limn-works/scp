@@ -1,38 +1,21 @@
 /**
- * The SDK's P-256 custody-host helpers (`p256PseudonymPoint`,
- * `p256SoftwarePseudonymPoint`, `p256PseudonymScalar`, `p256PublicKey`,
- * `p256SignPrehashRfc6979`, exported from the package root) against pinned
- * outputs:
- *   - spec §25.19 Vectors 30 and 31: each `identity_scalar` over
- *     "context-alpha" gives the v1 point, and at epoch 1 the v2 point; each
- *     context seed gives its point directly;
- *   - spec §25.19 Vectors 30 and 31: each `context_seed_v1` and
- *     `context_seed_v2` maps through `p256PseudonymScalar` (whose
- *     `SCP-PSEUDONYM-P256-V1` label is fixed inside the helper) and
- *     `p256PublicKey` to the spec's v1 and v2 points;
- *   - RFC 6979 A.2.5 (P-256, SHA-256, "sample"): the RFC's `r`, and the low-s
- *     form of the RFC's `s` (the two sum to `n`, §9.5);
- *   - the independent recipe in `./pseudonym-recipe`, which signs the same
- *     bytes for the same scalar and digest;
- *   - malformed input rejected with `SCP-VALID-7005` or `SCP-CRYPTO-4001`.
+ * The SDK's P-256 pseudonym point helpers (`p256PseudonymPoint`,
+ * `p256SoftwarePseudonymPoint`, exported from the package root) against spec
+ * §25.19 Vectors 30 and 31: each `identity_scalar` over "context-alpha" gives
+ * the v1 point, and at epoch 1 the v2 point; each context seed gives its
+ * point directly. A wrong-length input or a negative epoch is rejected with
+ * `SCP-VALID-7005`.
  *
- * Skips when the native addon is not installed.
+ * Skips when the native addon is not installed (the wiping tests at the end
+ * stub the native function and always run).
  */
 
 import { describe, expect, test } from "bun:test";
-import * as crypto from "node:crypto";
 
-import { CryptoError, type ScpError, ValidationError } from "../src/errors";
-import {
-  p256PseudonymPoint,
-  p256PseudonymScalar,
-  p256PublicKey,
-  p256SignPrehashRfc6979,
-  p256SoftwarePseudonymPoint,
-} from "../src/index";
+import { type ScpError, ValidationError } from "../src/errors";
+import { p256PseudonymPoint, p256SoftwarePseudonymPoint } from "../src/index";
 import { loadNativeAddon } from "../src/internal/native";
 import { __p256HostInvokeForTests } from "../src/scp";
-import { bytesToBigInt, P256_N, p256SignPrehash } from "./pseudonym-recipe";
 
 let skipReason = "";
 try {
@@ -111,83 +94,11 @@ describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
     expect(caught).toBeInstanceOf(ValidationError);
     expect((caught as ScpError).code).toBe("SCP-VALID-7005");
   });
-
-  for (const v of VECTORS) {
-    test(`${v.name}: context seeds map to the spec's v1 and v2 points`, () => {
-      const d1 = p256PseudonymScalar(unhex(v.seedV1));
-      expect(d1.length).toBe(32);
-      expect(hex(p256PublicKey(d1))).toBe(v.v1);
-      expect(hex(p256PublicKey(p256PseudonymScalar(unhex(v.seedV2))))).toBe(v.v2);
-    });
-  }
-
-  test("returns a fresh scalar on each call and leaves the caller's seed intact", () => {
-    // §25.19 Vector 30, v1.
-    const seedHex = "47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b";
-    const seed = unhex(seedHex);
-    const d = p256PseudonymScalar(seed);
-    const dHex = hex(d);
-    expect(hex(seed)).toBe(seedHex);
-    // Wiping the returned scalar must not reach a later call's result.
-    d.fill(0);
-    expect(hex(p256PseudonymScalar(seed))).toBe(dHex);
-  });
-
-  test("RFC 6979 A.2.5: the RFC's r and the low-s form of its s", () => {
-    const x = unhex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
-    const digest = new Uint8Array(crypto.createHash("sha256").update("sample").digest());
-    const sig = p256SignPrehashRfc6979(x, digest);
-    expect(sig.length).toBe(64);
-    expect(hex(sig.subarray(0, 32))).toBe(
-      "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716",
-    );
-    const rfcS = 0xf7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8n;
-    expect(bytesToBigInt(sig.subarray(32)) + rfcS).toBe(P256_N);
-    expect(hex(p256SignPrehashRfc6979(x, digest))).toBe(hex(sig));
-  });
-
-  test("signatures equal the independent recipe's for the same scalar and digest", () => {
-    const d = p256PseudonymScalar(
-      unhex("47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b"),
-    );
-    for (let i = 0; i < 8; i++) {
-      const digest = new Uint8Array(crypto.createHash("sha256").update(`msg-${i}`).digest());
-      expect(hex(p256SignPrehashRfc6979(d, digest))).toBe(
-        hex(p256SignPrehash(bytesToBigInt(d), digest)),
-      );
-    }
-  });
-
-  test("malformed input is rejected with its code", () => {
-    const expectCode = (
-      f: () => unknown,
-      cls: new (...args: never[]) => ScpError,
-      code: string,
-    ) => {
-      let caught: unknown;
-      try {
-        f();
-      } catch (e: unknown) {
-        caught = e;
-      }
-      expect(caught).toBeInstanceOf(cls);
-      expect((caught as ScpError).code).toBe(code);
-    };
-    expectCode(() => p256PseudonymScalar(new Uint8Array(31)), ValidationError, "SCP-VALID-7005");
-    expectCode(() => p256PublicKey(new Uint8Array(33).fill(1)), ValidationError, "SCP-VALID-7005");
-    expectCode(() => p256PublicKey(new Uint8Array(32)), CryptoError, "SCP-CRYPTO-4001");
-    expectCode(() => p256PublicKey(new Uint8Array(32).fill(0xff)), CryptoError, "SCP-CRYPTO-4001");
-    expectCode(
-      () => p256SignPrehashRfc6979(new Uint8Array(32).fill(1), new Uint8Array(12)),
-      ValidationError,
-      "SCP-VALID-7005",
-    );
-  });
 });
 
 describe("P-256 host call wiping (stubbed native function)", () => {
   const seed = new Uint8Array(32).fill(0x11);
-  const digest = new Uint8Array(32).fill(0x22);
+  const contextId = new Uint8Array(32).fill(0x22);
 
   test("passes number[] copies of the arguments, then wipes them and leaves the caller's seed intact", () => {
     let passed: number[][] = [];
@@ -198,9 +109,9 @@ describe("P-256 host call wiping (stubbed native function)", () => {
         valuesAtCall = a.map((r) => r.slice());
         return new Array<number>(32).fill(0x33);
       },
-      [seed, digest],
+      [seed, contextId],
     );
-    expect(valuesAtCall).toEqual([Array.from(seed), Array.from(digest)]);
+    expect(valuesAtCall).toEqual([Array.from(seed), Array.from(contextId)]);
     expect(passed.length).toBe(2);
     for (const r of passed) {
       expect(r).toEqual(new Array<number>(32).fill(0));
@@ -224,7 +135,7 @@ describe("P-256 host call wiping (stubbed native function)", () => {
           passed = a;
           throw new Error("boom");
         },
-        [seed, digest],
+        [seed, contextId],
       ),
     ).toThrow();
     expect(passed.length).toBe(2);

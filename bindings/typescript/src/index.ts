@@ -242,9 +242,6 @@ export type {
 } from "./scp";
 export {
   p256PseudonymPoint,
-  p256PseudonymScalar,
-  p256PublicKey,
-  p256SignPrehashRfc6979,
   p256SoftwarePseudonymPoint,
   SCP,
 } from "./scp";

@@ -1,17 +1,15 @@
-//! P-256 primitives a TypeScript custody host calls so that it does not
-//! re-implement the §9.10.4 scalar reduction or the §9.5 nonce.
+//! P-256 pseudonym point helpers a TypeScript custody host calls so that it
+//! does not re-implement the §9.10.4 derivation (§9.10.4.A).
 //!
 //! Each export wraps the function of the same name in
 //! `scp_ffi_common::p256_host`, as the `PyO3` and `UniFFI` exports do, so the
-//! argument order, the checks and the error codes (`SCP-VALID-7005` for a
-//! wrong length, `SCP-CRYPTO-4001` for an out-of-range scalar or a failed
-//! reduction or signature) are the same in every binding.
+//! argument order, the checks and the error code (`SCP-VALID-7005` for a
+//! wrong length) are the same in every binding. Each returns the 33-byte
+//! compressed point: no scalar reaches the host.
 //!
-//! Wiping is best-effort: the Rust side wipes the seed and scalar `Vec`s it
-//! is handed and its own copies (`Zeroizing`), but napi-rs copies each
-//! JavaScript array into a `Vec` and each returned `Vec` into a JavaScript
-//! array without wiping either, and the returned scalar `Vec` is freed
-//! unwiped. The host wipes its own arrays.
+//! Wiping is best-effort: the Rust side wipes the seed and `ikm` `Vec`s it
+//! is handed (`Zeroizing`), but napi-rs copies each JavaScript array into a
+//! `Vec` without wiping the source. The host wipes its own arrays.
 
 use napi::bindgen_prelude::BigInt;
 use napi_derive::napi;
@@ -24,64 +22,13 @@ fn napi_error(e: P256HostError) -> napi::Error {
     let code = e.code().to_owned();
     napi::Error::from(match e {
         P256HostError::Validation(message) => ScpNapiError::Validation { message, code },
-        P256HostError::Crypto(message) => ScpNapiError::Crypto { message, code },
     })
-}
-
-/// Maps a 32-byte §9.10.4 `context_seed` (v1 or v2) to its P-256 pseudonym
-/// scalar in `[1, n − 1]`.
-///
-/// FIPS 186-5 A.2.1, §9.10.4:
-/// `HKDF-Expand(context_seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n − 1) + 1`,
-/// with the label fixed inside the helper. Returns the 32-byte big-endian
-/// scalar.
-///
-/// # Errors
-///
-/// `SCP-VALID-7005` when `context_seed` is not 32 bytes; `SCP-CRYPTO-4001` if
-/// the reduction fails (unreachable for a 32-byte seed).
-#[napi(js_name = "p256PseudonymScalar")]
-pub fn p256_pseudonym_scalar(context_seed: Vec<u8>) -> napi::Result<Vec<u8>> {
-    let context_seed = Zeroizing::new(context_seed);
-    let scalar = shared::p256_pseudonym_scalar(&context_seed).map_err(napi_error)?;
-    Ok(scalar.to_vec())
-}
-
-/// The 33-byte SEC1 compressed public key `d·G` of a 32-byte scalar.
-///
-/// # Errors
-///
-/// `SCP-VALID-7005` when `scalar` is not 32 bytes; `SCP-CRYPTO-4001` when it
-/// is zero or not below `n`.
-#[napi(js_name = "p256PublicKey")]
-pub fn p256_public_key(scalar: Vec<u8>) -> napi::Result<Vec<u8>> {
-    let scalar = Zeroizing::new(scalar);
-    Ok(shared::p256_public_key(&scalar)
-        .map_err(napi_error)?
-        .to_vec())
-}
-
-/// Signs a 32-byte digest with the scalar: RFC 6979 deterministic nonce
-/// (`h1 = digest`), low-`s` normalized, returned as the 64-byte `r || s`
-/// (§9.5).
-///
-/// # Errors
-///
-/// `SCP-VALID-7005` when `scalar` or `digest` is not 32 bytes;
-/// `SCP-CRYPTO-4001` when the scalar is out of range or signing fails.
-#[napi(js_name = "p256SignPrehashRfc6979")]
-pub fn p256_sign_prehash_rfc6979(scalar: Vec<u8>, digest: Vec<u8>) -> napi::Result<Vec<u8>> {
-    let scalar = Zeroizing::new(scalar);
-    Ok(shared::p256_sign_prehash_rfc6979(&scalar, &digest)
-        .map_err(napi_error)?
-        .to_vec())
 }
 
 /// The compressed pseudonym point of a §9.10.4 `context_seed`.
 ///
 /// The 33-byte SEC1 point of a 32-byte `context_seed` (v1 or v2), for a
-/// host that computes the seed itself. No
-/// scalar reaches the host.
+/// host that computes the seed itself. No scalar reaches the host.
 ///
 /// # Errors
 ///
@@ -136,17 +83,25 @@ fn epoch_u64(epoch: &BigInt) -> napi::Result<u64> {
 mod tests {
     use super::*;
 
-    /// §25.19 Vector 30: the spec's `context_seed_v1` maps to the spec's v1
-    /// point through the napi exports.
+    /// §25.19 Vector 30 through the exports: the `identity_scalar` over
+    /// "context-alpha" gives the spec's v1 point, and at epoch 1 its v2
+    /// point (passed as a `bigint`); `context_seed_v1` gives the v1 point.
     #[test]
-    fn exports_reproduce_vector_30_v1_point() {
-        let seed = hex::decode("47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b")
+    fn point_exports_reproduce_spec_25_19_vector_30() {
+        let ikm = hex::decode("32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64")
             .unwrap();
-        let scalar = p256_pseudonym_scalar(seed).expect("scalar");
-        assert_eq!(
-            hex::encode(p256_public_key(scalar).expect("point")),
-            "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72"
-        );
+        let seed_v1 =
+            hex::decode("47ea801c24e8a4d577f04837eca0674fbbf160127fa2d1a4bb1420150b0a048b")
+                .unwrap();
+        let v1 = "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72";
+        let v2 = "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479";
+        let ctx = b"context-alpha".to_vec();
+        let point = p256_software_pseudonym_point(ikm.clone(), ctx.clone(), None).unwrap();
+        assert_eq!(hex::encode(point), v1);
+        let one = BigInt::from(1u64);
+        let point = p256_software_pseudonym_point(ikm, ctx, Some(one)).unwrap();
+        assert_eq!(hex::encode(point), v2);
+        assert_eq!(hex::encode(p256_pseudonym_point(seed_v1).unwrap()), v1);
     }
 
     /// An epoch of 2^64, wider than 64 bits, is `SCP-VALID-7005` rather than
@@ -163,12 +118,11 @@ mod tests {
     }
 
     #[test]
-    fn exports_carry_the_shared_error_codes() {
-        let err = p256_pseudonym_scalar(vec![0; 31]).expect_err("31-byte seed");
+    fn point_exports_carry_valid_7005_for_a_wrong_length_input() {
+        let err = p256_pseudonym_point(vec![0; 31]).expect_err("31-byte seed");
         assert!(err.reason.contains("SCP-VALID-7005"), "{}", err.reason);
-        let err = p256_public_key(vec![0; 32]).expect_err("zero scalar");
-        assert!(err.reason.contains("SCP-CRYPTO-4001"), "{}", err.reason);
-        let err = p256_sign_prehash_rfc6979(vec![1; 32], vec![0; 12]).expect_err("12-byte digest");
+        let err = p256_software_pseudonym_point(vec![0; 33], b"ctx".to_vec(), None)
+            .expect_err("33-byte ikm");
         assert!(err.reason.contains("SCP-VALID-7005"), "{}", err.reason);
     }
 }

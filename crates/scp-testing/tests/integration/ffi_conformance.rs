@@ -1452,7 +1452,14 @@ fn discovery_and_provenance_coverage() {
 // keystore host and a software host each get the pseudonym point without any
 // scalar reaching them, exported by all three native bridges. Pure coverage
 // expansion, not a swap for the removed `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 114;
+//
+// Subsequently LOWERED 114 -> 111, with human approval, by removing the three
+// scalar and sign helpers (`p256_pseudonym_scalar` / `p256_public_key` /
+// `p256_sign_prehash_rfc6979`) from every bridge and SDK: under SCP-307 and
+// §9.10.4.A a pseudonym is a point with no private key that any party holds
+// or signs with, so no host may receive a pseudonym scalar. The two point
+// helpers above replace them, and nothing is added in their place.
+const MIN_PARITY_OPERATIONS: usize = 111;
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement

@@ -21,8 +21,7 @@ import * as crypto from "node:crypto";
 
 import { CryptoError, ScpError } from "../src/errors";
 import type { KeyCustodyProvider } from "../src/scp";
-import { p256PseudonymScalar, p256PublicKey, SCP } from "../src/scp";
-import { pseudonymSeedV1, pseudonymSeedV2 } from "./pseudonym-recipe";
+import { p256SoftwarePseudonymPoint, SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // Probe: is the NAPI-backed SCP class available in this environment?
@@ -110,11 +109,11 @@ class CryptoKeychain implements KeyCustodyProvider {
     return seed;
   }
 
-  // The §9.10.4.A P-256 pseudonym point of a context seed. Native software
-  // custody keys the recipe on the Ed25519 identity seed; nothing is stored.
-  #pseudonymPoint(contextSeed: Uint8Array): Uint8Array {
-    // The host computes the context seed; the SDK helpers map it to the point.
-    const point = p256PublicKey(p256PseudonymScalar(contextSeed));
+  // The §9.10.4.A P-256 pseudonym point. Native software custody keys the
+  // recipe on the Ed25519 identity seed; the SDK's software helper derives the
+  // point and nothing is stored.
+  #pseudonymPoint(keyId: string, contextId: Uint8Array, epoch?: bigint): Uint8Array {
+    const point = p256SoftwarePseudonymPoint(this.#identitySeed(keyId), contextId, epoch);
     // A host still on the retired 32-byte Ed25519 pseudonym shape.
     return this.#fault === "legacy32" ? point.subarray(1) : point;
   }
@@ -124,7 +123,7 @@ class CryptoKeychain implements KeyCustodyProvider {
     if (this.#fault === "deriveKeyNotFound") {
       throw new CryptoError(`key not found: ${keyId}`, "SCP-CRYPTO-4006");
     }
-    return this.#pseudonymPoint(pseudonymSeedV1(this.#identitySeed(keyId), contextId));
+    return this.#pseudonymPoint(keyId, contextId);
   }
 
   deriveRotatablePseudonym(
@@ -132,9 +131,7 @@ class CryptoKeychain implements KeyCustodyProvider {
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
   ): Uint8Array {
-    return this.#pseudonymPoint(
-      pseudonymSeedV2(this.#identitySeed(keyId), contextId, pseudonymEpoch),
-    );
+    return this.#pseudonymPoint(keyId, contextId, pseudonymEpoch);
   }
 
   exportSigningKeyBytes(keyId: string): Uint8Array {
