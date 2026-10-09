@@ -577,8 +577,7 @@ class TestSagaAbortedTranslation:
         """A bridge abort that omits the code (1-tuple ``args``) surfaces the
         generic ``SCP-SAGA-13067`` class default — never a more specific code.
 
-        The bridge always supplies an explicit ``SCP-SAGA-13xxx`` code; this
-        exercises the ``code is None`` translation branch so the class default
+        This exercises the ``code is None`` translation branch so the class default
         stays load-bearing (the generic abort code, not a Prepare-reason code).
         """
         from scp_sdk.errors import SagaAbortedError

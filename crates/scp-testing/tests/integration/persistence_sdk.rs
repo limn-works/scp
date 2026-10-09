@@ -432,8 +432,8 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-049 Decision 16 (Verification); spec §17.6: drain, then close, then
-// reopen the same directory on the first attempt
+// ADR-048 Consequences; spec §17.6, One Opener per Durable Directory: drain,
+// then close, then reopen the same directory on the first attempt
 // ---------------------------------------------------------------------------
 
 /// Builds a supervisor whose persistence writes through `storage`, the same
@@ -460,7 +460,7 @@ fn supervisor_over(storage: Arc<SqliteStorage>) -> Arc<Supervisor> {
 }
 
 /// A store reopens on the first try, with no retry, once its owner has
-/// drained the supervisor (ADR-049 Decision 16; spec §17.6, One Opener per
+/// drained the supervisor (ADR-048 Consequences; spec §17.6, One Opener per
 /// Durable Directory).
 ///
 /// Two ways out of a "process" are checked:
