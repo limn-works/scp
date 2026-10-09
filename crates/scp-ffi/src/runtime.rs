@@ -1543,10 +1543,8 @@ pub fn register_ffi_state(
 /// Registers FFI-specific state for `context_id` and clears its release mark
 /// in one critical section under the registry entry's shard lock.
 ///
-/// `admitted_at` is the instant the caller took before it asked the supervisor
-/// to serve the id. When the entry is vacant, it clears a mark set no later
-/// than `admitted_at`, keeps a mark set after it, and inserts a fresh
-/// [`FfiBridgeState`]. When the entry is occupied, it returns an error,
+/// When the entry is vacant, it clears the id's release mark and inserts a
+/// fresh [`FfiBridgeState`]. When the entry is occupied, it returns an error,
 /// inserts nothing, and leaves the mark in place.
 ///
 /// # Errors
@@ -1557,14 +1555,8 @@ pub fn readmit_and_register_ffi_state(
     bi: &PyBridgeInstance,
     context_id: &str,
     user_ceiling: &[String],
-    admitted_at: std::time::Instant,
 ) -> Result<(), ScpPyError> {
-    insert_ffi_state(
-        bi,
-        context_id,
-        user_ceiling,
-        MarkedId::Readmit { admitted_at },
-    )
+    insert_ffi_state(bi, context_id, user_ceiling, MarkedId::Readmit)
 }
 
 /// What [`insert_ffi_state`] does with a vacant entry whose id carries a
@@ -1573,9 +1565,8 @@ pub fn readmit_and_register_ffi_state(
 enum MarkedId {
     /// Refuse the registration and keep the mark.
     Refuse,
-    /// Clear a mark set no later than `admitted_at`, keep a mark set after
-    /// it, and register.
-    Readmit { admitted_at: std::time::Instant },
+    /// Clear the mark and register.
+    Readmit,
 }
 
 /// Removes `context_id`'s release mark from `marks` when the mark was set no
@@ -1637,8 +1628,8 @@ fn insert_ffi_state(
         Entry::Occupied(_) => Err(ffi_state_already_registered(context_id)),
         Entry::Vacant(vacant) => {
             let mut marks = lock_release_marks(bi);
-            if let MarkedId::Readmit { admitted_at } = marked {
-                remove_mark_set_by(&mut marks, vacant.key(), admitted_at);
+            if matches!(marked, MarkedId::Readmit) {
+                marks.remove(vacant.key());
             } else if marks.contains_key(vacant.key()) {
                 // The refusal withholds the lifecycle state: registration
                 // authorizes no one, so its answer must not say whether the
@@ -1882,20 +1873,14 @@ pub(crate) fn lock_release_marks(
 /// Sets `context_id`'s release mark to the current instant, in flight, and
 /// returns that instant.
 ///
-/// When the map already holds [`MAX_RELEASED_CONTEXTS`] marks and `context_id`
-/// carries none, the earliest mark that is not in flight is evicted first. A
-/// mark in flight is never evicted.
+/// When `context_id` carries no mark, marks that are not in flight are evicted
+/// first, earliest first, until the map holds fewer than
+/// [`MAX_RELEASED_CONTEXTS`] marks or none of them is out of flight. A mark in
+/// flight is never evicted.
 fn set_release_mark(bi: &PyBridgeInstance, context_id: &str) -> std::time::Instant {
     let mut marks = lock_release_marks(bi);
-    if marks.len() >= MAX_RELEASED_CONTEXTS && !marks.contains_key(context_id) {
-        let earliest = marks
-            .iter()
-            .filter(|(_, mark)| !mark.in_flight)
-            .min_by_key(|(_, mark)| mark.at)
-            .map(|(id, _)| id.clone());
-        if let Some(id) = earliest {
-            marks.remove(&id);
-        }
+    if !marks.contains_key(context_id) {
+        evict_finished_marks(&mut marks, MAX_RELEASED_CONTEXTS - 1);
     }
     let marked_at = std::time::Instant::now();
     marks.insert(
@@ -1909,12 +1894,32 @@ fn set_release_mark(bi: &PyBridgeInstance, context_id: &str) -> std::time::Insta
 }
 
 /// Takes `context_id`'s mark out of flight when it is still the mark set at
-/// `marked_at`.
+/// `marked_at`, then evicts marks that are not in flight, earliest first,
+/// until the map holds at most [`MAX_RELEASED_CONTEXTS`] marks or none of them
+/// is out of flight.
 fn finish_release_mark(bi: &PyBridgeInstance, context_id: &str, marked_at: std::time::Instant) {
-    if let Some(mark) = lock_release_marks(bi).get_mut(context_id)
+    let mut marks = lock_release_marks(bi);
+    if let Some(mark) = marks.get_mut(context_id)
         && mark.at == marked_at
     {
         mark.in_flight = false;
+    }
+    evict_finished_marks(&mut marks, MAX_RELEASED_CONTEXTS);
+}
+
+/// Evicts marks that are not in flight from `marks`, earliest first, until it
+/// holds at most `limit` marks or none of them is out of flight.
+fn evict_finished_marks(marks: &mut HashMap<String, ReleaseMark>, limit: usize) {
+    while marks.len() > limit {
+        let Some(earliest) = marks
+            .iter()
+            .filter(|(_, mark)| !mark.in_flight)
+            .min_by_key(|(_, mark)| mark.at)
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        marks.remove(&earliest);
     }
 }
 
@@ -3232,8 +3237,7 @@ mod tests {
         );
         assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
 
-        readmit_and_register_ffi_state(&bi, &ctx_id, &[], std::time::Instant::now())
-            .expect("a readmit registers a vacant id");
+        readmit_and_register_ffi_state(&bi, &ctx_id, &[]).expect("a readmit registers a vacant id");
         assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
         assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
         remove_context(&bi, &ctx_id);
@@ -3246,7 +3250,7 @@ mod tests {
         let (bi, ctx_id) = unserved_context("readmit-occupied");
         set_release_mark(&bi, &ctx_id);
 
-        let err = readmit_and_register_ffi_state(&bi, &ctx_id, &[], std::time::Instant::now())
+        let err = readmit_and_register_ffi_state(&bi, &ctx_id, &[])
             .expect_err("an occupied entry must refuse the registration")
             .to_string();
         assert!(
@@ -3262,34 +3266,25 @@ mod tests {
         assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
     }
 
-    /// A readmit whose admission instant precedes the mark registers the id and
-    /// keeps the mark; a readmit whose admission instant follows the mark
-    /// clears it.
+    /// A readmit clears a mark set at any instant before it, so a close whose
+    /// re-read came before the join's spawn committed finds no mark and leaves
+    /// the registered state in place.
     #[test]
-    fn a_readmit_keeps_a_mark_set_after_admission() {
-        let (bi, ctx_id) = unserved_context("mark-after-admission");
+    fn a_readmit_clears_a_mark_set_before_it_and_the_close_removes_nothing() {
+        let (bi, ctx_id) = unserved_context("mark-before-readmit");
         remove_context(&bi, &ctx_id);
-        let admitted_at = std::time::Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        let marked_at = set_release_mark(&bi, &ctx_id);
-        assert!(
-            marked_at > admitted_at,
-            "the mark must follow the admission"
-        );
+        set_release_mark(&bi, &ctx_id);
 
-        readmit_and_register_ffi_state(&bi, &ctx_id, &[], admitted_at)
+        readmit_and_register_ffi_state(&bi, &ctx_id, &[])
             .expect("a vacant entry registers whatever the mark");
-        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
-        assert_eq!(
-            lock_release_marks(&bi).get(&ctx_id).map(|mark| mark.at),
-            Some(marked_at),
-            "a readmit must keep a mark set after its admission"
+        assert!(
+            !lock_release_marks(&bi).contains_key(&ctx_id),
+            "a readmit must clear the mark"
         );
-        remove_context(&bi, &ctx_id);
-
-        readmit_and_register_ffi_state(&bi, &ctx_id, &[], std::time::Instant::now())
-            .expect("an admission after the mark registers the id");
-        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+        assert!(
+            !remove_context_while_released(&bi, &ctx_id),
+            "the close that set the mark must not remove the readmitted state"
+        );
         assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
         remove_context(&bi, &ctx_id);
     }
@@ -3329,7 +3324,7 @@ mod tests {
     #[test]
     fn an_occupied_readmit_raises_a_typed_context_error() {
         let (bi, ctx_id) = unserved_context("typed-refusal");
-        let occupied = readmit_and_register_ffi_state(&bi, &ctx_id, &[], std::time::Instant::now())
+        let occupied = readmit_and_register_ffi_state(&bi, &ctx_id, &[])
             .expect_err("an occupied entry must refuse the readmit");
         remove_context(&bi, &ctx_id);
 
@@ -3454,6 +3449,47 @@ mod tests {
             !marks.contains_key("earliest") && marks.contains_key("newest"),
             "a new mark on a full map must evict the earliest mark"
         );
+    }
+
+    /// Marks in flight can push the map past `MAX_RELEASED_CONTEXTS`; as each
+    /// of those releases finishes, finished marks are evicted until the map
+    /// holds `MAX_RELEASED_CONTEXTS` again, and a new mark keeps it there.
+    #[test]
+    fn an_overshoot_from_marks_in_flight_returns_to_the_bound() {
+        const OVER: usize = 3;
+        let bi = PyBridgeInstance::new_py();
+        for i in 0..MAX_RELEASED_CONTEXTS {
+            set_finished_release_mark(&bi, &format!("finished-{i}"));
+        }
+        let in_flight: Vec<(String, std::time::Instant)> = (0..OVER)
+            .map(|i| {
+                let id = format!("in-flight-{i}");
+                let at = std::time::Instant::now();
+                lock_release_marks(&bi).insert(
+                    id.clone(),
+                    ReleaseMark {
+                        at,
+                        in_flight: true,
+                    },
+                );
+                (id, at)
+            })
+            .collect();
+        assert_eq!(lock_release_marks(&bi).len(), MAX_RELEASED_CONTEXTS + OVER);
+
+        for (id, at) in &in_flight {
+            finish_release_mark(&bi, id, *at);
+        }
+        assert_eq!(
+            lock_release_marks(&bi).len(),
+            MAX_RELEASED_CONTEXTS,
+            "finished releases must bring the map back to the bound"
+        );
+
+        set_finished_release_mark(&bi, "newest");
+        let marks = lock_release_marks(&bi);
+        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+        assert!(marks.contains_key("newest"));
     }
 
     /// A full mark map never evicts a mark in flight: the release that set the
