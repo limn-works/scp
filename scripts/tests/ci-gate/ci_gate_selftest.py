@@ -280,6 +280,12 @@ nothing:
                fails on each tracked path rust-test reads, found by scanning
                `crates/**/*.rs` for include and workspace_root literals, that
                the `rust` output does not select and no always-on step mirrors.
+  group-partition
+               CI runs `--group docs` on every pull request and `--group rest`
+               only under the `code` output, so a check missing from GROUPS
+               would run in no job and a check in both would run twice. The
+               assertion fails unless the two groups name every check in
+               CHECKS exactly once.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -287,11 +293,12 @@ that expectation by calling `evaluate` in scripts/ci-aggregate-result.py, the
 same function whose verdict they then judged, so each one agreed with that
 function however it behaved.
 
-Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py
+Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py [--group docs|rest|all]
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
 import functools
 import json
@@ -302,7 +309,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -657,9 +666,12 @@ DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
 
 # Jobs the `code` output selects: true for every change outside prose, so every
 # scenario below but docs-only runs them. wiping-allocator also runs on a push;
-# the rest are in NOT_ON_PUSH_FILTER_JOBS.
+# fix-round-check-selftest is in PULL_REQUEST_ONLY_FILTER_JOBS; the rest are in
+# NOT_ON_PUSH_FILTER_JOBS.
 CODE_JOBS = (
+    "ci-workflow-selftest",
     "fail-closed-pre-rotation",
+    "fix-round-check-selftest",
     "protocol-deps",
     "shipped-feature-graph",
     "toolchain-wiring-cases",
@@ -670,13 +682,18 @@ CODE_JOBS = (
 
 # Jobs whose `if:` reads `github.event_name` rather than a `changes` filter
 # output, so a filter scenario decides nothing about them and each scenario
-# below states them for itself. Both carry
+# below states them for itself. It carries
 # `if: github.event_name == 'pull_request'`, and check-cross-layer.sh is why:
 # it reads a declared exemption out of a pull request's body, which a
-# merge_group event does not publish. Job cross-layer runs that script as its
-# own step, and job fix-round-check-selftest runs it as one of the 29 gates
-# scripts/fix-round-check.sh names.
-EVENT_ONLY_JOBS = ("cross-layer", "fix-round-check-selftest")
+# merge_group event does not publish.
+EVENT_ONLY_JOBS = ("cross-layer",)
+
+# Jobs a `changes` filter output selects whose `if:` also reads
+# `github.event_name == 'pull_request' && …`. Job fix-round-check-selftest runs
+# check-cross-layer.sh as one of the gates scripts/fix-round-check.sh names, so
+# it carries cross-layer's event condition, and the `code` output skips it on a
+# prose-only change.
+PULL_REQUEST_ONLY_FILTER_JOBS = ("fix-round-check-selftest",)
 
 # Jobs a `changes` filter output selects whose `if:` also reads
 # `github.event_name == 'push' && …`.
@@ -691,7 +708,7 @@ NOT_ON_PUSH_JOBS = (
     "bridge-globals",
     "bridge-instance-lifecycle",
     "bridge-symmetry",
-    "ci-workflow-selftest",
+    "ci-workflow-selftest-docs",
     "construction-pattern",
     "deleted-primitives",
     "doc-citations",
@@ -719,6 +736,7 @@ NOT_ON_PUSH_JOBS = (
 NOT_ON_PUSH_FILTER_JOBS = (
     "bridge-parity",
     "bridge-parity-swift",
+    "ci-workflow-selftest",
     "docker-image",
     "fail-closed-pre-rotation",
     "protocol-deps",
@@ -746,6 +764,8 @@ def on_event(filter_runs: dict[str, bool], event: str) -> dict[str, bool]:
     push = event == "push"
     runs = dict(filter_runs)
     runs |= dict.fromkeys(NOT_ON_PUSH_FILTER_JOBS if push else PUSH_ONLY_FILTER_JOBS, False)
+    if event != "pull_request":
+        runs |= dict.fromkeys(PULL_REQUEST_ONLY_FILTER_JOBS, False)
     return (
         runs
         | dict.fromkeys(EVENT_ONLY_JOBS, event == "pull_request")
@@ -6951,9 +6971,16 @@ def check_matrix_axis_controls(doc: dict) -> None:
     )
 
 
-def main() -> int:
+class Inputs(NamedTuple):
+    """The parsed workflows every check in CHECKS reads."""
+
+    workflow: dict
+    jobs: dict
+    documents: list[tuple[Path, dict]]
+
+
+def load_inputs() -> Inputs:
     workflow = yaml.safe_load(WORKFLOW.read_text())
-    jobs = workflow["jobs"]
     # GitHub Actions runs a workflow file whose extension is `.yml` or `.yaml`,
     # and scripts/check-toolchain-wiring.sh enumerates both. This glob read
     # `.yml` alone, so a workflow written with the other spelling would have
@@ -6967,7 +6994,11 @@ def main() -> int:
             | set((REPO / ".github/workflows").glob("*.yaml"))
         )
     ]
+    return Inputs(workflow=workflow, jobs=workflow["jobs"], documents=documents)
 
+
+def run_timeout(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("timeout — every job in every workflow bounds its own runtime")
     for path, doc in documents:
         ceiling = (
@@ -6993,6 +7024,9 @@ def main() -> int:
                 )
             check_scaling_input_sizes_budget(label, job, budget)
 
+
+def run_action_ref(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("action-ref — every rust-toolchain `uses:` names a ref that resolves")
     for path, doc in documents:
         check_toolchain_refs(path, doc)
@@ -7010,20 +7044,33 @@ def main() -> int:
         f"fuzz run under another",
     )
 
+
+def run_doc_flag(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("doc-flag — the required check's rustdoc reads every other rustdoc's surface")
     check_required_rustdoc_surface(documents)
     check_rustdoc_surface_detects_a_dropped_flag(documents)
 
+
+def run_doc_command(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("doc-command — a documented rustdoc reports what the merge waits on")
     check_documented_rustdoc_reproduces_the_required_job(documents)
     check_documented_rustdoc_detects_a_feature_drift(documents)
     check_rustdoc_enumerations_sit_in_a_shell_block()
     check_enumeration_scan_reads_the_text_it_is_given()
 
+
+def run_win_shell(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("win-shell — every `run:` step a Windows runner can execute names a shell")
     for path, doc in documents:
         check_windows_shell(path, doc)
 
+
+def run_matrix_axis(inputs: Inputs) -> None:
+    workflow = inputs.workflow
+    documents = inputs.documents
     print(
         "matrix-axis — each matrix axis a step gates on and its steps' `if:` "
         "values agree"
@@ -7032,12 +7079,18 @@ def main() -> int:
         check_matrix_axes(path, doc)
     check_matrix_axis_controls(workflow)
 
+
+def run_empty_input(inputs: Inputs) -> None:
+    documents = inputs.documents
     print(
         "empty-input — a job publishing a -signed artifact rejects an empty "
         "input set first"
     )
     check_signing_guard(documents)
 
+
+def run_downloaded_module(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print(
         "downloaded-module — a PyO3 consumer's unguarded steps before pytest contain "
         "each PyO3 assertion fragment"
@@ -7066,6 +7119,9 @@ def main() -> int:
                 workflow, pyo3_artifacts, pyo3_job, "PyO3"
             )
 
+
+def run_downloaded_addon(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print(
         "downloaded-addon — a NAPI consumer's unguarded steps before its tests "
         "contain each NAPI assertion fragment"
@@ -7090,26 +7146,41 @@ def main() -> int:
                 workflow, napi_artifacts, napi_job, "NAPI"
             )
 
+
+def run_retention(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print("retention — a downloaded artifact outlives the re-run window")
     check_shared_uploads_outlive_the_rerun_window(workflow)
 
+
+def run_profile_env(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print("profile-env — CARGO_PROFILE_* is set for the whole workflow or not at all")
     check_profile_env_is_workflow_level(workflow, "ci.yml")
     check_profile_env_is_workflow_level(
         yaml.safe_load(COMPILE_TIMINGS.read_text()), "compile-timings.yml"
     )
 
+
+def run_artifact_key(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print(
         "artifact-key — a bridge producer reuses an artifact only for unchanged inputs"
     )
     check_artifact_cache_keys(workflow)
 
+
+def run_artifact_digest(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print(
         "artifact-digest — an artifact-inputs step fails when a hashed input is "
         "missing and hashes the workflow env"
     )
     check_artifact_input_digests_fail_closed(workflow)
 
+
+def run_producer_outputs(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print(
         "producer-outputs — a producer uploading several paths fails on a missing "
         "output"
@@ -7120,28 +7191,46 @@ def main() -> int:
             workflow, job_id, artifact, marker_name, tracked, rejects_empty
         )
 
+
+def run_package_writers(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print("package-writers — no `packages: write`; the cache token stays in docker-cache")
     check_package_write_and_cache_token(workflow)
 
+
+def run_needs_condition(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)
     check_dependency_conditions_detect_a_narrowed_producer(workflow)
     check_dependency_conditions_detect_a_conditionless_consumer(workflow)
     check_dependency_conditions_read_a_status_guarded_consumer(workflow)
 
+
+def run_push_writers(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print("push-writers — a push to `main` runs every cache writer, and only a push skips")
     check_condition_grammar()
     check_aggregate_grammar()
     check_push_runs_every_cache_writer(workflow)
     check_push_writer_mutants(workflow)
 
+
+def run_macos_bridges(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print("macos-bridges — a pull request runs the macOS bridge jobs only on their paths")
     check_macos_bridges_follow_their_paths(workflow)
     check_macos_bridge_mutants(workflow)
 
+
+def run_prose_route(inputs: Inputs) -> None:
+    workflow = inputs.workflow
     print("prose-route — every tracked path is prose or reaches the `code` output")
     check_every_path_routed(workflow)
 
+
+def run_coverage(inputs: Inputs) -> None:
+    jobs = inputs.jobs
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
     declared = set(jobs["ci"]["needs"])
@@ -7161,11 +7250,17 @@ def main() -> int:
         f"{sorted(RUST_ONLY)}",
     )
 
+
+def run_path_closure(inputs: Inputs) -> None:
+    jobs = inputs.jobs
     print("path-closure — a path filter covers every crate its jobs compile")
     check_closure_reads_workspace_inheritance()
     check_resolution_manifests_reach_the_workspace()
     check_path_dep_closures(jobs)
 
+
+def run_workspace_scope(inputs: Inputs) -> None:
+    documents = inputs.documents
     print(
         "workspace-scope — a filter gating a `--workspace` compile covers every member"
     )
@@ -7176,6 +7271,9 @@ def main() -> int:
         check_workspace_scoped_filters(path, doc)
     check_workspace_scope_detects_a_narrowed_filter(documents)
 
+
+def run_private_items(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("private-items — every `cargo doc` reads the links private modules write")
     check_rustdoc_lint_reaches_every_member()
     check_rustdoc_lint_readers_detect_a_lowered_level()
@@ -7183,15 +7281,27 @@ def main() -> int:
     check_private_items_detects_a_dropped_flag(documents)
     check_workspace_and_rustdoc_readers(documents)
 
+
+def run_no_cargo_gradle(inputs: Inputs) -> None:
+    jobs = inputs.jobs
     print("no-cargo-gradle — kotlin-lint's cargo-free Gradle calls skip the daemon")
     check_no_cargo_gradle_calls_skip_the_daemon(jobs)
 
+
+def run_merge_queue(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("merge-queue — a workflow that skips to a success status runs in the queue")
     check_merge_queue_triggers(documents)
 
+
+def run_step_filter(inputs: Inputs) -> None:
+    jobs = inputs.jobs
     print("step-filter — a filter output gates a job, never a step")
     check_filter_outputs_gate_jobs(jobs)
 
+
+def run_filter_source(inputs: Inputs) -> None:
+    documents = inputs.documents
     print("filter-source — a `changes` output reads a filter key that exists")
     # Every workflow, not ci.yml alone: docs.yml declares a `dorny/paths-filter`
     # step of its own, and its `docs` output reads two keys off that step.
@@ -7199,6 +7309,9 @@ def main() -> int:
         check_filter_keys_agree(path, doc)
     check_filter_key_agreement_detects_a_rename(documents)
 
+
+def run_shipped_config(inputs: Inputs) -> None:
+    jobs = inputs.jobs
     print(
         "shipped-config — a production-config lane runs its bridge's fail-closed "
         "assertions"
@@ -7208,6 +7321,9 @@ def main() -> int:
     check_shipped_build_assertions_run(jobs)
     check_shipped_assertion_tripwires(jobs)
 
+
+def run_zero_test(inputs: Inputs) -> None:
+    documents = inputs.documents
     print(
         "zero-test — a filtered test selection that matches nothing must exit non-zero"
     )
@@ -7238,12 +7354,11 @@ def main() -> int:
                             "when a selection is empty",
                         )
 
-    rust_pr = SCENARIOS["rust-only, pull_request"]
-    docs_pr = SCENARIOS["docs-only, pull_request"]
-    docs_push = SCENARIOS["docs-only, push"]
-    rust_merge = SCENARIOS["rust-only, merge_group"]
-    python_pr = SCENARIOS["python-only, pull_request"]
 
+def run_rust_fanout(inputs: Inputs) -> None:
+    jobs = inputs.jobs
+    rust_pr = SCENARIOS["rust-only, pull_request"]
+    rust_merge = SCENARIOS["rust-only, merge_group"]
     print("rust-fanout — a Rust-only change runs binding test jobs")
     # SCENARIOS says each job below runs on a Rust-only change, so reporting it
     # `skipped` must reach an aggregate as one named failure. Narrowing that
@@ -7266,6 +7381,12 @@ def main() -> int:
             out,
         )
 
+
+def run_macos_bridge_verdicts(inputs: Inputs) -> None:
+    jobs = inputs.jobs
+    rust_pr = SCENARIOS["rust-only, pull_request"]
+    rust_merge = SCENARIOS["rust-only, merge_group"]
+    python_pr = SCENARIOS["python-only, pull_request"]
     print("macos-bridges — the aggregate judges a macOS bridge skip by event and path")
     # A Rust-only pull request skips the four macOS bridge jobs and passes. The
     # same skip fails a Rust-only merge_group run and a swift pull request, and
@@ -7295,6 +7416,10 @@ def main() -> int:
                 f"exit {code}: {out}",
             )
 
+
+def run_python_fanout(inputs: Inputs) -> None:
+    jobs = inputs.jobs
+    python_pr = SCENARIOS["python-only, pull_request"]
     print("python-fanout — a change under bindings/python/ runs the wheel-features build")
     # rust-build-pyo3-production builds scp-ffi with bindings/python/pyproject.toml's
     # [tool.maturin] features, so an edit to that file alone must run it.
@@ -7315,6 +7440,12 @@ def main() -> int:
             out,
         )
 
+
+def run_skip(inputs: Inputs) -> None:
+    jobs = inputs.jobs
+    rust_pr = SCENARIOS["rust-only, pull_request"]
+    docs_pr = SCENARIOS["docs-only, pull_request"]
+    docs_push = SCENARIOS["docs-only, push"]
     print("skip — an aggregate separates a skipped dependency from a passing one")
 
     needs = build_needs(jobs, rust_pr)
@@ -7369,6 +7500,14 @@ def main() -> int:
     code, out = run_aggregate(needs, docs_push.event)
     check("push event, a pull-request-only job skipped -> exit 0", code == 0, out)
 
+
+def run_push_skips(inputs: Inputs) -> None:
+    workflow = inputs.workflow
+    jobs = inputs.jobs
+    rust_pr = SCENARIOS["rust-only, pull_request"]
+    docs_pr = SCENARIOS["docs-only, pull_request"]
+    docs_push = SCENARIOS["docs-only, push"]
+    rust_merge = SCENARIOS["rust-only, merge_group"]
     print("push-skips")
     # SCENARIOS states which jobs a push runs, so an
     # aggregate given that skipped set must pass, every writer reported skipped
@@ -7466,6 +7605,10 @@ def main() -> int:
         f"exit {code}: {out}",
     )
 
+
+def run_filter_key(inputs: Inputs) -> None:
+    jobs = inputs.jobs
+    rust_pr = SCENARIOS["rust-only, pull_request"]
     print("filter-key — an `if:` naming an unpublished filter output stops a gate")
     referenced = {
         match.group(1)
@@ -7491,6 +7634,171 @@ def main() -> int:
             code == 2 and key in out,
             f"exit {code}: {out}",
         )
+
+
+CHECKS: dict[str, Callable[[Inputs], None]] = {
+    "timeout": run_timeout,
+    "action-ref": run_action_ref,
+    "doc-flag": run_doc_flag,
+    "doc-command": run_doc_command,
+    "win-shell": run_win_shell,
+    "matrix-axis": run_matrix_axis,
+    "empty-input": run_empty_input,
+    "downloaded-module": run_downloaded_module,
+    "downloaded-addon": run_downloaded_addon,
+    "retention": run_retention,
+    "profile-env": run_profile_env,
+    "artifact-key": run_artifact_key,
+    "artifact-digest": run_artifact_digest,
+    "producer-outputs": run_producer_outputs,
+    "package-writers": run_package_writers,
+    "needs-condition": run_needs_condition,
+    "push-writers": run_push_writers,
+    "macos-bridges": run_macos_bridges,
+    "prose-route": run_prose_route,
+    "coverage": run_coverage,
+    "path-closure": run_path_closure,
+    "workspace-scope": run_workspace_scope,
+    "private-items": run_private_items,
+    "no-cargo-gradle": run_no_cargo_gradle,
+    "merge-queue": run_merge_queue,
+    "step-filter": run_step_filter,
+    "filter-source": run_filter_source,
+    "shipped-config": run_shipped_config,
+    "zero-test": run_zero_test,
+    "rust-fanout": run_rust_fanout,
+    "macos-bridge-verdicts": run_macos_bridge_verdicts,
+    "python-fanout": run_python_fanout,
+    "skip": run_skip,
+    "push-skips": run_push_skips,
+    "filter-key": run_filter_key,
+}
+
+# CRITERION for GROUPS: a check belongs to `docs` when a file outside the `code`
+# output's patterns can change its verdict — it opens such a file (any root-level
+# `*.md`, anything under `.docs/` or `.claude/`, a `*.md` under `docs/guides/`), or
+# it lists tracked paths, which a prose-only change adds to or removes from. Job
+# ci-workflow-selftest runs `rest` under `needs.changes.outputs.code == 'true'`,
+# so a prose-only pull request skips it; a check in `rest` that read prose would
+# then let that pull request merge without the check ever reading the change.
+# Job ci-workflow-selftest-docs runs `docs` on every pull request. Every other
+# check opens only `.github/workflows/*`, `scripts/**`, `Cargo.toml` files and
+# `crates/**`, which the `code` output selects. The two docs checks:
+#   doc-command  `git ls-files '*.md'` and the text of every Markdown file it
+#                lists, to compare each documented `cargo doc` with job rust-doc.
+#   prose-route  `git ls-files` over the whole tree, and whether `.docs/adrs/`,
+#                `.docs/prds/` and AGENTS.md are tracked, which rust-test reads.
+GROUPS: dict[str, tuple[str, ...]] = {
+    "docs": ("doc-command", "prose-route"),
+    "rest": (
+        "timeout",
+        "action-ref",
+        "doc-flag",
+        "win-shell",
+        "matrix-axis",
+        "empty-input",
+        "downloaded-module",
+        "downloaded-addon",
+        "retention",
+        "profile-env",
+        "artifact-key",
+        "artifact-digest",
+        "producer-outputs",
+        "package-writers",
+        "needs-condition",
+        "push-writers",
+        "macos-bridges",
+        "coverage",
+        "path-closure",
+        "workspace-scope",
+        "private-items",
+        "no-cargo-gradle",
+        "merge-queue",
+        "step-filter",
+        "filter-source",
+        "shipped-config",
+        "zero-test",
+        "rust-fanout",
+        "macos-bridge-verdicts",
+        "python-fanout",
+        "skip",
+        "push-skips",
+        "filter-key",
+    ),
+}
+
+
+def group_partition_gaps(
+    checks: dict[str, Callable[[Inputs], None]], groups: dict[str, tuple[str, ...]]
+) -> list[str]:
+    """Return each way `groups` fails to split `checks` into `docs` and `rest`.
+
+    CRITERION: CI runs `--group docs` in one job and `--group rest` in another, so
+    a check in neither group runs in no job, and a check in both runs twice. The
+    two groups together must name every check, each exactly once.
+    """
+    gaps = []
+    if set(groups) != {"docs", "rest"}:
+        gaps.append(f"groups are {sorted(groups)}, not ['docs', 'rest']")
+    assigned = [name for names in groups.values() for name in names]
+    gaps += [f"{name} is in no group" for name in checks if name not in assigned]
+    gaps += [f"{name} names no check" for name in sorted(set(assigned) - set(checks))]
+    gaps += [
+        f"{name} is in more than one group"
+        for name in sorted({name for name in assigned if assigned.count(name) > 1})
+    ]
+    return gaps
+
+
+def check_group_partition() -> None:
+    gaps = group_partition_gaps(CHECKS, GROUPS)
+    check(
+        "docs ∪ rest is every check, and docs ∩ rest is empty",
+        not gaps,
+        "; ".join(gaps),
+    )
+    # Controls: a check registered in neither group, and one in both, each report.
+    planted = {**CHECKS, "planted-unassigned": lambda _inputs: None}
+    check(
+        "a check registered in neither group is reported",
+        "planted-unassigned is in no group" in group_partition_gaps(planted, GROUPS),
+        f"{group_partition_gaps(planted, GROUPS)}",
+    )
+    shared = GROUPS["rest"][0]
+    overlap = {"docs": (*GROUPS["docs"], shared), "rest": GROUPS["rest"]}
+    check(
+        "a check registered in both groups is reported",
+        f"{shared} is in more than one group" in group_partition_gaps(CHECKS, overlap),
+        f"{group_partition_gaps(CHECKS, overlap)}",
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--group",
+        choices=("docs", "rest", "all"),
+        default="all",
+        help="run the checks GROUPS names under this group; `all` runs every check",
+    )
+    group = parser.parse_args(argv).group
+    print("group-partition — `--group docs` and `--group rest` run every check once")
+    check_group_partition()
+    inputs = load_inputs()
+    selected = [
+        name for name in CHECKS if group == "all" or name in GROUPS.get(group, ())
+    ]
+    timings: list[tuple[float, str]] = []
+    for name in selected:
+        started = time.perf_counter()
+        CHECKS[name](inputs)
+        timings.append((time.perf_counter() - started, name))
+
+    print(f"\ntiming — seconds per check, group {group}, slowest first")
+    for seconds, name in sorted(timings, reverse=True):
+        owner = next((g for g, names in GROUPS.items() if name in names), "none")
+        print(f"  {seconds:7.2f}s  {name} ({owner})")
+    print(f"  {sum(seconds for seconds, _ in timings):7.2f}s  total")
 
     print(f"\n{checks - len(failures)} of {checks} assertions passed")
     if failures:
