@@ -274,7 +274,9 @@ nothing:
                those jobs skipped and `ci` green. The check lists every path
                `git ls-files` reports and fails on each one the `code` output
                does not select and that is not under `.docs/` or `.claude/`, a
-               root-level `*.md`, or a `*.md` under `docs/guides/`.
+               root-level `*.md`, or a `*.md` under `docs/guides/`. It also
+               fails on each tracked path RUST_TEST_INPUTS names that the
+               `rust` output does not select.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -6461,16 +6463,52 @@ def unrouted_paths(doc: dict, paths: list[str]) -> list[str]:
     pattern covering it; pattern_covers reads a pattern shape it does not know as
     covering nothing, which reports a path rather than passing it.
     """
+    patterns = output_patterns(doc, "code")
+    if isinstance(patterns, str):
+        return [patterns]
+    return [path for path in paths if not is_prose(path) and not pattern_covers(patterns, path)]
+
+
+def output_patterns(doc: dict, output: str) -> set[str] | str:
+    """Every pattern of every filter the `changes` output `output` reads, or an error."""
     filters = path_filters(doc["jobs"])
-    expression = (doc["jobs"]["changes"].get("outputs") or {}).get("code")
+    expression = (doc["jobs"]["changes"].get("outputs") or {}).get(output)
     if expression is None:
-        return ["`changes` publishes no `code` output"]
+        return f"`changes` publishes no `{output}` output"
     keys = STEP_FILTER_OUTPUT.findall(str(expression))
     missing = [key for key in keys if key not in filters]
     if not keys or missing:
-        return [f"`changes` output `code` reads {keys}, not a filter key"]
-    patterns = set().union(*(filters[key] for key in keys))
-    return [path for path in paths if not is_prose(path) and not pattern_covers(patterns, path)]
+        return f"`changes` output `{output}` reads {keys}, not a filter key"
+    return set().union(*(filters[key] for key in keys))
+
+
+# Files outside `crates/` that rust-test reads: the `include_str!` calls in
+# crates/scp-testing/tests/integration/ffi_conformance.rs, in the outlet
+# conformance tests and in crates/scp-client-wasm/tests/out048_ts_invoker_fixture_kat.rs,
+# and the run-time read of `.docs/adrs/` and `.docs/prds/` in ffi_conformance.rs.
+# An entry ending in `/` stands for every tracked path under it.
+RUST_TEST_INPUTS = (
+    "scripts/bridge-aliases.json",
+    "scripts/ffi-export-allowlist.json",
+    ".docs/standards/sdk-capability-matrix.json",
+    ".docs/adrs/",
+    ".docs/prds/",
+    "tests/conformance/",
+    "bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json",
+)
+
+
+def rust_test_inputs_unselected(doc: dict, paths: list[str]) -> list[str]:
+    """Return each tracked rust-test input the `rust` output does not select."""
+    patterns = output_patterns(doc, "rust")
+    if isinstance(patterns, str):
+        return [patterns]
+    inputs = [
+        path
+        for path in paths
+        if any(path == entry or (entry.endswith("/") and path.startswith(entry)) for entry in RUST_TEST_INPUTS)
+    ]
+    return [path for path in inputs if not pattern_covers(patterns, path)]
 
 
 def tracked_paths() -> list[str]:
@@ -6517,6 +6555,30 @@ def check_every_path_routed(doc: dict) -> None:
     check(
         "a `code` filter that drops scripts/** reports scripts/ci-aggregate-result.py",
         "scripts/ci-aggregate-result.py" in unrouted_paths(mutant, paths),
+    )
+    for entry in RUST_TEST_INPUTS:
+        check(f"the checkout tracks rust-test input {entry}", any(p.startswith(entry) for p in paths))
+    gaps = rust_test_inputs_unselected(doc, paths)
+    check("ci.yml: the `rust` output selects every file rust-test reads", not gaps, f"{gaps[:20]}")
+    check(
+        "the `rust` output does not select a spec file rust-test never reads",
+        not pattern_covers(output_patterns(doc, "rust"), ".docs/specs/01-thesis.md"),
+    )
+    mutant = copy.deepcopy(doc)
+    step = next(
+        step
+        for step in mutant["jobs"]["changes"]["steps"]
+        if str(step.get("uses") or "").startswith("dorny/paths-filter")
+    )
+    filters = yaml.safe_load(step["with"]["filters"])
+    check("filter rust lists '.docs/adrs/**' for the mutant", ".docs/adrs/**" in filters["rust"])
+    filters["rust"] = [entry for entry in filters["rust"] if entry != ".docs/adrs/**"]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    unselected = rust_test_inputs_unselected(mutant, paths)
+    check(
+        "a `rust` filter that drops .docs/adrs/** reports every ADR file and nothing else",
+        bool(unselected) and unselected == [p for p in paths if p.startswith(".docs/adrs/")],
+        f"{unselected[:5]}",
     )
 
 

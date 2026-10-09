@@ -356,13 +356,20 @@ jobs:
               - '.clippy.toml'
               - 'rustfmt.toml'
               # rust-test runs `crates/scp-testing/tests/integration/ffi_conformance.rs`,
-              # which compiles the first three of these in with `include_str!`, and the
-              # outlet conformance tests compile vectors out of `tests/conformance/`. A
-              # pull request that edits only one of them changes what rust-test asserts.
+              # which compiles the first three of these in with `include_str!` and, at
+              # run time, fails an exemption whose reason cites an `ADR-NNN` or `SCP-NNN`
+              # token that no file under `.docs/adrs/` or `.docs/prds/` holds. The outlet
+              # conformance tests compile vectors out of `tests/conformance/`, and
+              # `crates/scp-client-wasm/tests/out048_ts_invoker_fixture_kat.rs` compiles
+              # in the typescript-wasm fixture listed last. A pull request that edits
+              # only one of them changes what rust-test asserts.
               - 'scripts/bridge-aliases.json'
               - 'scripts/ffi-export-allowlist.json'
               - '.docs/standards/sdk-capability-matrix.json'
+              - '.docs/adrs/**'
+              - '.docs/prds/**'
               - 'tests/conformance/**'
+              - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`
