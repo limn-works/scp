@@ -27,9 +27,8 @@ therefore merges with every job that reads it skipped.
   later without that clause fails the gate.
 - **A job that reads no prose skips on a prose-only change, through the `code` output.** The
   `code` filter lists every path a job compiles, executes, or feeds a gate as input, and its
-  output ORs in `toolchain` like every other lane. Jobs that ran on every pull request but read
-  only code (fail-closed-pre-rotation, shipped-feature-graph, wiping-allocator, protocol-deps,
-  wasm-protocol, wasm-test, toolchain-wiring-cases, fix-round-check-selftest) are guarded by it. A job that reads a prose
+  output ORs in `toolchain` like every other lane. CODE_JOBS in
+  `scripts/tests/ci-gate/ci_gate_selftest.py` names the jobs it guards. A job that reads a prose
   file needs a filter that selects that file: the `rust` filter lists `.docs/adrs/**`,
   `.docs/prds/**` and `.docs/standards/sdk-capability-matrix.json`, which rust-test reads. Job
   `toolchain-wiring` checks on every pull request that `AGENTS.md` keeps the two headings

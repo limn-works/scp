@@ -502,12 +502,9 @@ jobs:
             # the complement of prose rather than as `'**'` minus exclusions. A pull
             # request that changes only prose (`.docs/**`, `.claude/**`, a root-level
             # `*.md`, or `docs/guides/**/*.md`) leaves the `code` output false, and
-            # every job it guards skips: fail-closed-pre-rotation,
-            # shipped-feature-graph, wiping-allocator, protocol-deps, wasm-protocol,
-            # wasm-test and toolchain-wiring-cases. None of those jobs reads a prose
-            # path: each compiles crates, resolves `cargo tree` or `cargo metadata`,
-            # walks `git ls-files '*.rs'`, or runs a fixture suite in a `mktemp -d`
-            # tree. `scripts/tests/ci-gate/ci_gate_selftest.py` lists every tracked
+            # every job it guards skips; CODE_JOBS in
+            # `scripts/tests/ci-gate/ci_gate_selftest.py` names those jobs. That
+            # self-test also lists every tracked
             # path and fails when one is selected neither by the `code` output nor by
             # the prose patterns, so a file added outside these entries fails that
             # check until someone classifies it.
