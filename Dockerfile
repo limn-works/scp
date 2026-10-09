@@ -47,8 +47,15 @@ ADD --checksum=sha256:cd59b90fce5fa84c4189648fec33404ec5491791eebdb812df5e7fca83
     /cargo-chef.tar.xz
 FROM cargo-chef-${TARGETARCH} AS cargo-chef
 
+# WHY BOTH BASE IMAGES COME FROM mirror.gcr.io. They are Docker Hub's official `rust` and
+# `debian` images, read through Google's public mirror of Docker Hub, which serves the same
+# tags at the same index digests. A pull from Docker Hub itself is anonymous on a CI runner
+# and rate-limited per runner IP; on 2026-10-09 CI jobs failed on that limit (a
+# `429 Too Many Requests`, and a timeout at auth.docker.io) before building anything. A
+# local `docker build` reads the mirror the same way and needs no Docker Hub account.
+#
 # Stage 1: Chef — install the pinned toolchain and cargo-chef
-FROM rust:slim-bookworm AS chef
+FROM mirror.gcr.io/library/rust:slim-bookworm AS chef
 WORKDIR /app
 # Build-script dependencies of `scp-relay` and `scp-node` that the slim image omits:
 # `aws-lc-sys` runs cmake, `ring` runs perl, and `libsqlite3-sys` compiles SQLCipher,
@@ -92,7 +99,7 @@ RUN cargo build --release -p scp-relay -p scp-node
 # Both binaries link `libcrypto.so.3` dynamically, because `libsqlite3-sys` builds
 # SQLCipher against OpenSSL. `libssl3` is named explicitly rather than left to arrive as
 # a dependency of `ca-certificates`, which is what supplied it before.
-FROM debian:bookworm-slim AS runtime
+FROM mirror.gcr.io/library/debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
