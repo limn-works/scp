@@ -146,15 +146,10 @@
     },
     {
       "id": "gate-5",
-      "name": "Phase 5: Platform Adapters + Swift + Bridges + Media",
+      "name": "Phase 5: Platform Adapters + Swift + Media",
       "priority": "P1",
       "status": "done",
       "stories": [
-        "SCP-084",
-        "SCP-085",
-        "SCP-086",
-        "SCP-087",
-        "SCP-088",
         "SCP-089",
         "SCP-090",
         "SCP-091",
@@ -4660,7 +4655,7 @@
       "status": "done",
       "files": [
         "bindings/typescript/src/index.ts",
-        "bindings/typescript/src/bridge.ts",
+        "bindings/typescript/src/internal/bridge.ts",
         "bindings/typescript/package.json",
         "bindings/typescript/tsup.config.ts"
       ],
@@ -4678,7 +4673,7 @@
       "actionItems": [
         "Create bindings/typescript/package.json with @limn-works/scp-ts package configuration",
         "Create bindings/typescript/tsup.config.ts for dual ESM/CJS output",
-        "Create bindings/typescript/src/bridge.ts exposing the napi backend",
+        "Create bindings/typescript/src/internal/bridge.ts exposing the napi backend",
         "Create bindings/typescript/src/index.ts with public API re-exports",
         "Implement Identity module wrapping bridge calls",
         "Implement Context module wrapping bridge calls",
@@ -4826,278 +4821,6 @@
       },
       "result": "ADR-026 completed in .docs/adrs/phase-5.md: Swift SDK actor isolation, AsyncStream<Message>, @Observable, SPM Package.swift structure, deinit+close() resource management.",
       "completedAt": "2026-02-27T02:55:57Z"
-    },
-    {
-      "id": "SCP-084",
-      "title": "Define bridge core types and module structure",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/mod.rs"
-      ],
-      "description": "Create the `scp-core/bridge/` module root with all bridge protocol types from ADR-023. Bridge connector as registered protocol entity with accountable operator identifier. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain.\n\nKey types:\n\n```rust\npub struct BridgeConnector {\n    pub bridge_id: String,\n    pub operator_did: DID,\n    pub platform: String,\n    pub mode: BridgeMode,\n    pub status: BridgeStatus,\n    pub registration_context: ContextId,\n    pub registered_at: u64,\n}\n\npub enum BridgeMode {\n    Relay,        // Read-only mirroring from external platform\n    Puppet,       // Bridge acts on behalf of external users\n    Api,          // Platform API integration\n    Cooperative,  // Native SCP support on external platform\n}\n\npub enum BridgeStatus {\n    Active,\n    Suspended,\n    Revoked,\n}\n\npub struct ShadowIdentity {\n    pub shadow_id: String,\n    pub platform_handle: String,\n    pub bridge_id: String,\n    pub attributed_role: String,     // Default: \"observer\"\n    pub provenance_status: ShadowProvenanceStatus,\n    pub created_at: u64,\n}\n\npub enum ShadowProvenanceStatus {\n    Shadow,   // Unclaimed — attributed via bridge\n    Claimed,  // Bound to an identifier via identity attestation\n}\n```\n\nModule declares `pub mod registration; pub mod shadow; pub mod claiming; pub mod provenance;` and re-exports all public types.",
-      "acceptanceCriteria": [
-        "`cargo build -p scp-core` succeeds with zero warnings",
-        "BridgeConnector struct has fields: bridge_id (String), operator_did (DID), platform (String), mode (BridgeMode), status (BridgeStatus), registration_context (ContextId), registered_at (u64)",
-        "BridgeMode enum has variants: Relay, Puppet, Api, Cooperative",
-        "BridgeStatus enum has variants: Active, Suspended, Revoked",
-        "ShadowIdentity struct has fields: shadow_id (String), platform_handle (String), bridge_id (String), attributed_role (String), provenance_status (ShadowProvenanceStatus), created_at (u64)",
-        "ShadowProvenanceStatus enum has variants: Shadow, Claimed",
-        "mod.rs declares pub mod for registration, shadow, claiming, provenance",
-        "All public items have /// doc comments",
-        "All types derive Debug, Clone, serde::Serialize, serde::Deserialize"
-      ],
-      "actionItems": [
-        "Create crates/scp-core/src/bridge/mod.rs with BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus",
-        "Add pub mod declarations for registration, shadow, claiming, provenance sub-modules (empty stubs)",
-        "Add re-exports for all public types",
-        "Add pub mod bridge to scp-core/src/lib.rs",
-        "Verify cargo build and clippy pass"
-      ],
-      "blockedBy": [],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "protocolSection": "§12",
-        "keyTypes": {
-          "BridgeConnector": "bridge_id, operator_did, platform, mode, status, registration_context, registered_at",
-          "BridgeMode": "Relay | Puppet | Api | Cooperative",
-          "BridgeStatus": "Active | Suspended | Revoked",
-          "ShadowIdentity": "shadow_id, platform_handle, bridge_id, attributed_role, provenance_status, created_at",
-          "ShadowProvenanceStatus": "Shadow | Claimed"
-        }
-      },
-      "result": "BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus. Stub submodules. 12 tests."
-    },
-    {
-      "id": "SCP-085",
-      "title": "Implement bridge registration with governance approval",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/registration.rs"
-      ],
-      "description": "Implement bridge registration in `scp-core/bridge/registration.rs`. Operator identifier presents registration request to context governance. Context governance approves or rejects. Registered bridge visible in context metadata (visible before opt-in, per legibility tenet). Registration is a context event in the Merkle log.\n\nBridge revocation: context governance removes bridge at any time. Severing bridge disconnects all shadow identities from external platform. Shadows retain their attributed actions but can no longer receive/send.\n\nContext isolation: bridge in Context A has zero access to Context B. Same platform bridged into two contexts = two separate bridge instances with separate registrations.\n\nSelf-hosted bridges: protocol treats self-hosted and managed identically. Self-hosted eliminates third-party credential delegation (puppet mode).",
-      "acceptanceCriteria": [
-        "Operator identifier presents registration request to context governance",
-        "Context governance approves or rejects registration",
-        "Registered bridge visible in context metadata (visible before opt-in, per legibility tenet)",
-        "Registration is a context event in the Merkle log",
-        "Context governance removes bridge at any time (revocation)",
-        "Severing bridge disconnects all shadow identities from external platform",
-        "Shadows retain their attributed actions but can no longer receive/send after revocation",
-        "Bridge in Context A has zero access to Context B (context isolation)",
-        "Same platform bridged into two contexts = two separate bridge instances with separate registrations",
-        "Protocol treats self-hosted and managed bridges identically",
-        "Self-hosted eliminates third-party credential delegation (puppet mode)",
-        "`cargo test -p scp-core` passes all bridge registration tests"
-      ],
-      "actionItems": [
-        "Implement register_bridge(operator_did, platform, mode, context) -> Result<BridgeConnector, BridgeError>",
-        "Implement approve_registration(bridge_id, governance_decision) -> Result<BridgeConnector, BridgeError>",
-        "Implement revoke_bridge(bridge_id, governance_action) -> Result<(), BridgeError>",
-        "Implement list_bridges(context_id) -> Vec<BridgeConnector> for context metadata visibility",
-        "Emit context events for registration and revocation into event log",
-        "Enforce context isolation — bridge instance scoped to single context",
-        "Write unit tests for registration, approval, rejection, revocation, context isolation"
-      ],
-      "blockedBy": [
-        "SCP-084",
-        "SCP-018",
-        "SCP-030"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "2. Bridge registration",
-          "9. Bridge revocation",
-          "10. Context isolation",
-          "11. Self-hosted bridges"
-        ],
-        "dependencies": {
-          "ADR-008": "Bridge registration requires context governance approval. Bridge revocation is a governance action.",
-          "ADR-011": "Bridge registration, shadow creation, and claiming are context events."
-        }
-      },
-      "result": "Bridge registration with governance approval/revocation, context isolation. 44 tests."
-    },
-    {
-      "id": "SCP-086",
-      "title": "Implement shadow identity creation and role management",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/shadow.rs"
-      ],
-      "description": "Implement shadow identity creation and role management in `scp-core/bridge/shadow.rs`. Bridge creates protocol entity per external platform participant. Shadow carries platform handle, bridge reference, and operating mode.\n\nShadow default role: observer-equivalent with restricted capabilities. Cannot exercise capabilities requiring verified identity. Specific role upgradeable by context governance.\n\nShadow creation is a context event in the Merkle log.",
-      "acceptanceCriteria": [
-        "Bridge creates protocol entity per external platform participant",
-        "Shadow carries platform handle, bridge reference, and operating mode",
-        "Shadow default role is observer-equivalent with restricted capabilities",
-        "Shadows cannot exercise capabilities requiring verified identity",
-        "Specific role upgradeable by context governance",
-        "Shadow creation is a context event in the Merkle log",
-        "`cargo test -p scp-core` passes all shadow identity tests"
-      ],
-      "actionItems": [
-        "Implement create_shadow(bridge_id, platform_handle) -> Result<ShadowIdentity, BridgeError>",
-        "Enforce observer default role on shadow creation",
-        "Implement upgrade_shadow_role(shadow_id, new_role, governance_action) -> Result<(), BridgeError>",
-        "Implement list_shadows(bridge_id) -> Vec<ShadowIdentity>",
-        "Emit shadow creation event to context event log",
-        "Write unit tests for shadow creation, default role enforcement, role upgrade"
-      ],
-      "blockedBy": [
-        "SCP-084",
-        "SCP-023",
-        "SCP-030"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "3. Shadow identity creation",
-          "4. Shadow default role"
-        ],
-        "dependencies": {
-          "ADR-011": "Shadow creation is a context event.",
-          "ADR-009": "Role management uses context governance roles."
-        }
-      },
-      "result": "Already implemented in prior iteration. ShadowRegistry with create_shadow, role management, collision guard, 62 shadow-specific tests."
-    },
-    {
-      "id": "SCP-087",
-      "title": "Implement BridgeProvenance for bridged content attribution",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/provenance.rs"
-      ],
-      "description": "Implement BridgeProvenance and provenance marking for all bridged content in `scp-core/bridge/provenance.rs`.\n\nAll actions/content attributed to shadow identities carry `BridgeProvenance`. `BridgeProvenance` includes: originating platform, bridge connector ID, operator identifier, operating mode, shadow/claimed status. No shadow action mistakable for native SCP action.\n\nTrust hierarchy (two axes per §12.5):\n- Native identity + native transport (strongest).\n- Native identity + bridged transport.\n- Claimed shadow + historical bridged.\n- Shadow + bridged (weakest).\n- Both identity confidence and transport confidence factor into evaluation.\n\nKey type:\n\n```rust\n/// Extension of DataProvenance for bridged content.\npub struct BridgeProvenance {\n    pub base: DataProvenance,\n    pub originating_platform: String,\n    pub bridge_connector_id: String,\n    pub operator_did: DID,\n    pub bridge_mode: BridgeMode,\n    pub shadow_status: ShadowProvenanceStatus,\n}\n```",
-      "acceptanceCriteria": [
-        "BridgeProvenance struct extends DataProvenance with fields: originating_platform, bridge_connector_id, operator_did, bridge_mode, shadow_status",
-        "All actions/content attributed to shadow identities carry BridgeProvenance",
-        "BridgeProvenance includes: originating platform, bridge connector ID, operator identifier, operating mode, shadow/claimed status",
-        "No shadow action mistakable for native SCP action",
-        "Trust hierarchy implements four levels: native+native (strongest), native+bridged, claimed+bridged, shadow+bridged (weakest)",
-        "Both identity confidence and transport confidence factor into trust evaluation",
-        "`cargo test -p scp-core` passes all bridge provenance tests"
-      ],
-      "actionItems": [
-        "Implement BridgeProvenance struct extending DataProvenance",
-        "Implement mark_bridge_provenance(action, bridge, shadow) -> BridgeProvenance",
-        "Implement trust_level(provenance) -> TrustLevel with four-tier hierarchy",
-        "Implement is_native_action(provenance) -> bool to distinguish native from bridged",
-        "Write unit tests for provenance marking, trust hierarchy ordering, native vs bridged distinction"
-      ],
-      "blockedBy": [
-        "SCP-084"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "5. Provenance marking",
-          "6. Trust hierarchy"
-        ],
-        "dependencies": {
-          "ADR-019": "All bridged content carries BridgeProvenance extending DataProvenance."
-        },
-        "trustHierarchy": [
-          "Native identity + native transport (strongest)",
-          "Native identity + bridged transport",
-          "Claimed shadow + historical bridged",
-          "Shadow + bridged (weakest)"
-        ]
-      },
-      "result": "Bridge provenance with 4-tier trust hierarchy. 34 new tests."
-    },
-    {
-      "id": "SCP-088",
-      "title": "Implement shadow claiming with identity attestation",
-      "gate": "gate-5",
-      "priority": "P1",
-      "severity": "critical",
-      "status": "done",
-      "files": [
-        "crates/scp-core/src/bridge/claiming.rs"
-      ],
-      "description": "Implement shadow claiming via identity attestation in `scp-core/bridge/claiming.rs`. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.\n\nClaimant publishes identity attestation (§3.5) binding external handle to identifier. Protocol verifies attestation matches shadow's platform handle. Shadow retired, historical actions retroattributed to claimant identifier.\n\nClaiming is one-way and irreversible: claimed shadow cannot be unclaimed. Claimed shadow cannot be re-assigned to a different identifier.\n\nClaiming is a context event in the Merkle log.\n\nKey types:\n\n```rust\npub struct ClaimRequest {\n    pub shadow_id: String,\n    pub claimant_did: DID,\n    pub platform_handle: String,\n    pub identity_attestation: Attestation,  // §3.5 attestation binding handle to identifier\n    pub timestamp: u64,\n    pub signature: Ed25519Signature,\n}\n\n// claim_shadow returns Result<ShadowClaimEvent, ClaimError>\n\npub enum ClaimError {\n    HandleMismatch,\n    AttestationInvalid,\n    AlreadyClaimed,\n    ShadowNotFound,\n}\n```",
-      "acceptanceCriteria": [
-        "ClaimRequest struct has fields: shadow_id, claimant_did, platform_handle, identity_attestation (Attestation per §3.5), timestamp, signature (Ed25519Signature)",
-        "claim_shadow returns Result<ShadowClaimEvent, ClaimError>",
-        "ClaimError enum has variants: HandleMismatch, AttestationInvalid, AlreadyClaimed, ShadowNotFound",
-        "Claimant publishes identity attestation (§3.5) binding external handle to identifier",
-        "Protocol verifies attestation matches shadow's platform handle",
-        "Shadow retired, historical actions retroattributed to claimant identifier",
-        "Claimed shadow cannot be unclaimed (one-way)",
-        "Claimed shadow cannot be re-assigned to a different identifier (irreversible)",
-        "Claiming is a context event in the Merkle log",
-        "`cargo test -p scp-core` passes all shadow claiming tests"
-      ],
-      "actionItems": [
-        "Implement ClaimRequest, ClaimError types",
-        "Implement claim_shadow(registry, request: ClaimRequest) -> Result<ShadowClaimEvent, ClaimError>",
-        "Verify attestation matches shadow's platform handle",
-        "Implement retroattribute_actions(shadow_id, claimant_did) to retroattribute historical actions",
-        "Enforce one-way irreversibility: reject unclaim and re-assignment attempts",
-        "Emit claiming event to context event log",
-        "Write unit tests for successful claim, handle mismatch, invalid attestation, already-claimed rejection, shadow-not-found"
-      ],
-      "blockedBy": [
-        "SCP-084",
-        "SCP-086",
-        "SCP-006",
-        "SCP-030"
-      ],
-      "sources": [
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "### Acceptance Criteria"
-        }
-      ],
-      "details": {
-        "adr": "ADR-023",
-        "acceptanceCriteriaRefs": [
-          "7. Shadow claiming",
-          "8. Claiming is one-way and irreversible"
-        ],
-        "dependencies": {
-          "ADR-003": "Shadow claiming uses identity attestation (§3.5) to bind external handle to identifier.",
-          "ADR-011": "Claiming is a context event."
-        }
-      },
-      "result": "Created crates/scp-core/src/bridge/claiming.rs with ClaimRequest, ClaimError types and claim_shadow() function. One-way irreversible claiming with attestation verification."
     },
     {
       "id": "SCP-089",
@@ -6011,7 +5734,7 @@
     },
     {
       "id": "SCP-104",
-      "title": "Phase 5 end-to-end integration test across all four ADRs",
+      "title": "Phase 5 end-to-end integration test across all three ADRs",
       "gate": "gate-5",
       "priority": "P1",
       "severity": "critical",
@@ -6019,13 +5742,11 @@
       "files": [
         "tests/phase5_integration.rs"
       ],
-      "description": "Phase 5 end-to-end integration test validating all four ADRs work together. Tests the full bridge-to-media-to-platform-to-SDK pipeline:\n\n1. **Bridge (ADR-023):** Register bridge, create shadow identity, bridge message with provenance, claim shadow, verify retroattribution.\n2. **Media (ADR-024):** Initiate media session with capability ceiling check, export MLS keys, exchange signaling messages, end session, verify event log.\n3. **Apple Platform (ADR-025):** Key custody operations through Secure Enclave/Keychain adapters, App Attest attestation, APNs push registration.\n4. **Swift SDK (ADR-026):** Identity create/load, context create/join/send/receive/leave, outlet invocation, UCAN validation — all through Swift wrapper layer.\n\nThis test validates that Phase 5 components integrate with Phase 1-4 foundation (MLS, envelope, identifier, context, UCAN, transport, event log, provenance, UniFFI).",
+      "description": "Phase 5 end-to-end integration test validating all three ADRs work together. Tests the full media-to-platform-to-SDK pipeline:\n\n1. **Media (ADR-024):** Initiate media session with capability ceiling check, export MLS keys, exchange signaling messages, end session, verify event log.\n2. **Apple Platform (ADR-025):** Key custody operations through Secure Enclave/Keychain adapters, App Attest attestation, APNs push registration.\n3. **Swift SDK (ADR-026):** Identity create/load, context create/join/send/receive/leave, outlet invocation, UCAN validation — all through Swift wrapper layer.\n\nThis test validates that Phase 5 components integrate with Phase 1-4 foundation (MLS, envelope, identifier, context, UCAN, transport, event log, provenance, UniFFI).",
       "acceptanceCriteria": [
-        "Bridge registration, shadow creation, provenance marking, and claiming all succeed end-to-end",
         "Media session initiation with ceiling check, MLS key export, signaling exchange, and teardown all succeed end-to-end",
         "Apple platform adapters (Secure Enclave, Keychain, App Attest, APNs) pass integration tests on macOS",
         "Swift SDK identity, context, outlets, UCAN, transport, event log wrappers pass end-to-end through UniFFI bridge",
-        "Bridged content carries correct BridgeProvenance through entire pipeline",
         "Media session keys are correctly derived from MLS group state",
         "All operations recorded in context event log",
         "`cargo test --test phase5_integration` passes",
@@ -6033,19 +5754,12 @@
       ],
       "actionItems": [
         "Create tests/phase5_integration.rs with end-to-end test scenario",
-        "Test bridge lifecycle: register -> shadow -> message -> claim -> retroattribute",
         "Test media lifecycle: ceiling check -> initiate -> MLS key export -> signaling -> end",
         "Test Apple platform: SE key generate/sign, Keychain store/retrieve, App Attest, APNs register",
         "Test Swift SDK: Identity.create -> Context.create -> send -> receive -> leave through UniFFI",
-        "Verify cross-ADR integration: bridged media session, platform-backed identity in bridge claim",
         "Ensure all context events logged correctly"
       ],
       "blockedBy": [
-        "SCP-084",
-        "SCP-085",
-        "SCP-086",
-        "SCP-087",
-        "SCP-088",
         "SCP-089",
         "SCP-090",
         "SCP-091",
@@ -6065,12 +5779,11 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-5.md",
-          "section": "# Phase 5 Architecture Decision Records — Bridges, Media, Apple Platform, Swift SDK"
+          "section": "# Phase 5 Architecture Decision Records — Media, Apple Platform, Swift SDK"
         }
       ],
       "details": {
         "adrs": [
-          "ADR-023",
           "ADR-024",
           "ADR-025",
           "ADR-026"
@@ -6082,7 +5795,7 @@
           "Phase 4 (UniFFI)"
         ]
       },
-      "result": "Phase 5 integration test created at crates/scp-core/tests/phase5_integration.rs with 11 tests covering bridge lifecycle (ADR-023), media lifecycle (ADR-024), platform adapters (ADR-025), and cross-ADR integration. All tests pass. Swift SDK tests (ACs 4, 9) deferred to XCFramework build (SCP-103)."
+      "result": "Phase 5 integration test created at crates/scp-core/tests/phase5_integration.rs with 8 tests covering media lifecycle (ADR-024), platform adapters (ADR-025), and cross-ADR integration. All tests pass. Swift SDK tests (ACs 4, 9) deferred to XCFramework build (SCP-103)."
     },
     {
       "id": "SCP-105",
@@ -9958,7 +9671,7 @@
         ".docs/adrs/phase-3.md",
         ".docs/sketch.md"
       ],
-      "description": "The Python receive() iterator (py_context_receive / PyMessageReceiver.__anext__) has placeholder semantics that conflate empty and closed channels. The __anext__ method uses sync try_recv() and maps both TryRecvError::Empty and TryRecvError::Disconnected to StopAsyncIteration. The sender _tx is dropped immediately after channel creation, meaning the channel is always disconnected.\n\nNo spec, ADR, or PRD story captures the intended lifecycle semantics. ADR-014 has only a function signature (line 291-293). By contrast, TypeScript (ADR-019 phase-4.md) specifies full onMessage/onError/onComplete callbacks, Swift (ADR-023 phase-5.md) specifies AsyncStream with continuation.yield/finish, and Kotlin (ADR-027 phase-6.md) specifies callbackFlow/awaitClose. sketch.md (lines 371-389) specifies AsyncStream<ContextEvent>, 1000-event buffer, oldest-drop overflow, and BufferOverflow warning event.\n\nThis story adds the missing lifecycle specification to ADR-014 and implements it.",
+      "description": "The Python receive() iterator (py_context_receive / PyMessageReceiver.__anext__) has placeholder semantics that conflate empty and closed channels. The __anext__ method uses sync try_recv() and maps both TryRecvError::Empty and TryRecvError::Disconnected to StopAsyncIteration. The sender _tx is dropped immediately after channel creation, meaning the channel is always disconnected.\n\nNo spec, ADR, or PRD story captures the intended lifecycle semantics. ADR-014 has only a function signature (line 291-293). By contrast, TypeScript (ADR-022 phase-4.md) specifies full onMessage/onError/onComplete callbacks, Swift (ADR-026 phase-5.md) specifies AsyncStream with continuation.yield/finish, and Kotlin (ADR-028 phase-6.md) specifies callbackFlow/awaitClose. sketch.md (lines 371-389) specifies AsyncStream<ContextEvent>, 1000-event buffer, oldest-drop overflow, and BufferOverflow warning event.\n\nThis story adds the missing lifecycle specification to ADR-014 and implements it.",
       "acceptanceCriteria": [
         "ADR-014 specifies receive() lifecycle: async channel receive (not sync try_recv), empty vs closed distinction, transport wiring, buffer overflow, shutdown triggers",
         "__anext__ uses async recv() and distinguishes empty channel (await more) from closed channel (StopAsyncIteration)",
@@ -9991,10 +9704,6 @@
         {
           "file": ".docs/adrs/phase-4.md",
           "section": "## ADR-019: Data Provenance"
-        },
-        {
-          "file": ".docs/adrs/phase-5.md",
-          "section": "## ADR-023: Bridge Connector Protocol"
         },
         {
           "file": ".docs/adrs/phase-6.md",
@@ -10506,13 +10215,13 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt",
         "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/TrustTest.kt"
       ],
-      "description": "ADR-059 and §7.2.4 decide that capability/trust validation crosses the FFI as a typed structured record (CapabilityValidation: six per-stage booleans) and that SDKs MUST consume that result — never reverse-engineer which check failed by parsing human-readable error prose. The structured bridge op (ucan_evaluate / evaluate_ucan returning CapabilityValidation) already exists at the Rust core and all three FFI bridges; only the SDK consumers are wrong. A first-principles audit of the trust/capability SDK surface found the Python SDK string-matching error prose in trust.py to reconstruct the per-check breakdown, an antipattern that is brittle by construction and that masked a multi-attestation nonce bug (mocks emitted prose without modeling nonce state). This story is the C3c SDK rebuild: delete the Python prose-classification apparatus and consume the structured ucan_evaluate op; add the TypeScript public evaluateTrust wrapper over a ucanEvaluate bridge call plumbed through all TS bridge layers, exposing a CapabilityValidation interface, with all bridge-error typing routed through a single mapping chokepoint keyed on the [SCP-CAT-NNNN] error-code taxonomy rather than per-call prose classification; and rebuild the test mocks to model nonce state so the masked-bug class is surfaced. Per ADR-059 §Decision-5 and the per-SDK-idiom lesson, ALL FOUR bindings expose an idiomatic wrapper over the structured result: the per-SDK-idiom lesson governs HOW each binding surfaces the op (language-native naming/types), never WHETHER it does. The UniFFI bridge already exports CapabilityValidationRecord, so the Swift and Kotlin SDKs add the idiomatic sugar (SCP.ucanEvaluate / evaluateTrust plus a CapabilityValidation type) on top of it, at parity with Python and TypeScript. This story also lands the bundled SDK-parity wrappers the same audit identified as missing on the affected SDKs (per the UCAN.evaluate / Trust.evaluate_trust / Bridge.* / Identity.* / Discovery.discover / Economy.verify_payment_receipts capability-matrix exemptions that name \"the C3c SDK-parity follow-up\"). Per-SDK idiom is preserved throughout; the structured-result field set is identical across bindings (snake_case in Python, camelCase in TypeScript), only the wrappers are language-idiomatic.",
+      "description": "ADR-059 and §7.2.4 decide that capability/trust validation crosses the FFI as a typed structured record (CapabilityValidation: six per-stage booleans) and that SDKs MUST consume that result — never reverse-engineer which check failed by parsing human-readable error prose. The structured bridge op (ucan_evaluate / evaluate_ucan returning CapabilityValidation) already exists at the Rust core and all three FFI bridges; only the SDK consumers are wrong. A first-principles audit of the trust/capability SDK surface found the Python SDK string-matching error prose in trust.py to reconstruct the per-check breakdown, an antipattern that is brittle by construction and that masked a multi-attestation nonce bug (mocks emitted prose without modeling nonce state). This story is the C3c SDK rebuild: delete the Python prose-classification apparatus and consume the structured ucan_evaluate op; add the TypeScript public evaluateTrust wrapper over a ucanEvaluate bridge call plumbed through all TS bridge layers, exposing a CapabilityValidation interface, with all bridge-error typing routed through a single mapping chokepoint keyed on the [SCP-CAT-NNNN] error-code taxonomy rather than per-call prose classification; and rebuild the test mocks to model nonce state so the masked-bug class is surfaced. Per ADR-059 §Decision-5 and the per-SDK-idiom lesson, ALL FOUR bindings expose an idiomatic wrapper over the structured result: the per-SDK-idiom lesson governs HOW each binding surfaces the op (language-native naming/types), never WHETHER it does. The UniFFI bridge already exports CapabilityValidationRecord, so the Swift and Kotlin SDKs add the idiomatic sugar (SCP.ucanEvaluate / evaluateTrust plus a CapabilityValidation type) on top of it, at parity with Python and TypeScript. This story also lands the bundled SDK-parity wrappers the same audit identified as missing on the affected SDKs (per the UCAN.evaluate / Trust.evaluate_trust / Identity.* / Discovery.discover / Economy.verify_payment_receipts capability-matrix exemptions that name \"the C3c SDK-parity follow-up\"). Per-SDK idiom is preserved throughout; the structured-result field set is identical across bindings (snake_case in Python, camelCase in TypeScript), only the wrappers are language-idiomatic.",
       "acceptanceCriteria": [
         "bindings/python/scp_sdk/trust.py contains zero occurrences of _classify_ucan_error, _extract_core_error, _PASSED_BEFORE, _TOKEN_PARSE_PREFIXES, _SIGNATURE_CHAIN_PREFIXES, _CAPABILITY_CEILING_PREFIXES, _NONCE_PREFIXES, _REVOCATION_PREFIXES, and _EXPIRY_PREFIXES (grep -c each returns 0), and evaluate_trust calls the structured ucan_evaluate bridge op per token and AND-combines the six CapabilityValidation booleans across the token set instead of catching and string-classifying error prose",
         "TypeScript exposes the structured op end-to-end: a ucanEvaluate signature is declared in bindings/typescript/src/internal/bridge.ts and implemented in bindings/typescript/src/internal/native.ts and surfaced via bindings/typescript/src/scp.ts; a CapabilityValidation interface with the six camelCase booleans (tokensValid, signaturesValid, withinCeiling, nonceValid, notRevoked, timeBoundsValid) is defined in bindings/typescript/src/types.ts and re-exported from bindings/typescript/src/index.ts; and a public method named exactly evaluateTrust consuming the structured CapabilityValidation result exists on the SCP class in bindings/typescript/src/scp.ts",
         "TypeScript trust/capability error typing flows through a single mapping function keyed on the [SCP-CAT-NNNN] error code: one mapBridgeError function (bindings/typescript/src/errors.ts) is applied at one site per dispatch surface — the wrapBridgeErrors Proxy (bindings/typescript/src/internal/bridge.ts) over the native bridge factory, plus the SCP-class methods in bindings/typescript/src/scp.ts that dispatch through the raw addon directly (e.g. evaluateTrust's event-log query); mapBridgeError passes already-typed ScpError instances through untouched (no downgrade to SCP-UNKNOWN-0000); and grep finds zero error.message / .message prose-branching (e.g. .includes(, .startsWith(, .match() on a message string) in the TypeScript trust-signal code paths",
-        "The bundled SDK-parity wrappers land on the SDKs the audit flagged: TypeScript public Identity wrappers identityRotateKey, identityAddAgentKey, identityRotateAgentKey, identityRemoveAgentKey, and identityMigrate exist on the SCP class (the bare rotateKey/addAgentKey/rotateAgentKey/removeAgentKey/migrate names are the underlying Identity-handle methods, not the SCP-class wrappers); a TypeScript public bridgeRegister wrapper exists as a module-level export in bindings/typescript/src/bridge.ts re-exported from bindings/typescript/src/index.ts (the TS free-function idiom — NOT a method on the SCP class); a Python public discover() method exists in bindings/python/scp_sdk/discovery.py; and a Python public verify_payment_receipts() method exists in bindings/python/scp_sdk/economy.py",
-        "The capability matrix .docs/standards/sdk-capability-matrix.json flips these cells true and removes the now-stale C3c-follow-up exemption for each flipped cell: UCAN.evaluate (python, typescript, kotlin, and swift all true, with the kotlin and swift C3c-follow-up exemptions removed), Trust.evaluate_trust (typescript true), Bridge.evaluate_trust (typescript true), Identity.rotate_key / Identity.add_agent_key / Identity.rotate_agent_key / Identity.remove_agent_key / Identity.migrate (typescript true), Bridge.register (typescript true), Discovery.discover (python true), and Economy.verify_payment_receipts (python true); the (\"UCAN\", \"evaluate\") alias in the ALIASES table of scripts/check-sdk-coverage.py lists all four bindings (python: ucan_evaluate/evaluate_trust, typescript: ucanEvaluate/evaluateTrust, kotlin: ucanEvaluate/evaluateTrust, swift: ucanEvaluate/evaluateTrust); and python3.12 scripts/check-sdk-coverage.py exits 0",
+        "The bundled SDK-parity wrappers land on the SDKs the audit flagged: TypeScript public Identity wrappers identityRotateKey, identityAddAgentKey, identityRotateAgentKey, identityRemoveAgentKey, and identityMigrate exist on the SCP class (the bare rotateKey/addAgentKey/rotateAgentKey/removeAgentKey/migrate names are the underlying Identity-handle methods, not the SCP-class wrappers); a Python public discover() method exists in bindings/python/scp_sdk/discovery.py; and a Python public verify_payment_receipts() method exists in bindings/python/scp_sdk/economy.py",
+        "The capability matrix .docs/standards/sdk-capability-matrix.json flips these cells true and removes the now-stale C3c-follow-up exemption for each flipped cell: UCAN.evaluate (python, typescript, kotlin, and swift all true, with the kotlin and swift C3c-follow-up exemptions removed), Trust.evaluate_trust (typescript true), Identity.rotate_key / Identity.add_agent_key / Identity.rotate_agent_key / Identity.remove_agent_key / Identity.migrate (typescript true), Discovery.discover (python true), and Economy.verify_payment_receipts (python true); the (\"UCAN\", \"evaluate\") alias in the ALIASES table of scripts/check-sdk-coverage.py lists all four bindings (python: ucan_evaluate/evaluate_trust, typescript: ucanEvaluate/evaluateTrust, kotlin: ucanEvaluate/evaluateTrust, swift: ucanEvaluate/evaluateTrust); and python3.12 scripts/check-sdk-coverage.py exits 0",
         "Tests model nonce state instead of emitting prose: TypeScript bun-addon-backed tests and Python pytest mocks for ucan_evaluate distinguish that the read-only diagnostic records NO nonce while the throwing gate (ucan_validate) DOES record it, a multi-token AND test asserts evaluate_trust is false when any single token fails a stage, and real-addon evaluate assertions run unskipped (the real-napi evaluate test cases are not gated out)",
         "All gates pass on the changed surfaces: in bindings/typescript with the .node addon built, bun run check && bun run lint && bun test succeed; in bindings/python, python3.12 -m ruff check . && python3.12 -m ruff format --check . && python3.12 -m pytest tests/ succeed (with DYLD_LIBRARY_PATH set); python3.12 scripts/validate-prd.py exits 0; and the Rust workspace build and clippy are unchanged and green",
         "The narrow optional-challenge core+bridge change lands and is fail-closed: the read-only diagnostic crates/scp-protocol/src/crypto/ucan/validate.rs fn evaluate_ucan takes required_capability: Option<&CapabilityUri> (grep finds the Option signature), while the enforcement gate fn validate_ucan keeps required_capability: &CapabilityUri (mandatory, not Option); and all three bridges accept an optional capability on ucan_evaluate (crates/scp-ffi/src/ucan.rs capability: Option<&str>; crates/scp-ffi/napi/src/ucan.rs and crates/scp-ffi/uniffi/src/bridge.rs capability: Option<String>), coercing an empty/whitespace capability to no-challenge (capability.filter(|c| !c.trim().is_empty()) appears in each of the three bridge files); the Rust workspace build and clippy stay green",
@@ -10532,7 +10241,7 @@
         "Delete the prose-classification apparatus from bindings/python/scp_sdk/trust.py (_classify_ucan_error, _extract_core_error, _PASSED_BEFORE, and the six *_PREFIXES tuples) and rewrite evaluate_trust to call the structured ucan_evaluate bridge op per token and AND-combine the six CapabilityValidation booleans across the token set",
         "Add ucanEvaluate to bindings/typescript/src/internal/bridge.ts and implement it in internal/native.ts; define the CapabilityValidation interface (six camelCase booleans) in types.ts and re-export from index.ts; add the public evaluateTrust method on the SCP class in scp.ts consuming the structured result",
         "Route TypeScript bridge-error typing through one mapBridgeError function (bindings/typescript/src/errors.ts) applied per dispatch surface — the wrapBridgeErrors Proxy over the native bridge factory plus the SCP-class methods that dispatch through the raw addon directly; remove any per-call message-string branching from TS trust-signal code",
-        "Add the bundled SDK-parity wrappers: TS SCP-class Identity wrappers identityRotateKey/identityAddAgentKey/identityRotateAgentKey/identityRemoveAgentKey/identityMigrate; the module-level bridgeRegister free-function export (bindings/typescript/src/bridge.ts, re-exported from index.ts — NOT an SCP-class method); Python discover() in discovery.py and verify_payment_receipts() in economy.py",
+        "Add the bundled SDK-parity wrappers: TS SCP-class Identity wrappers identityRotateKey/identityAddAgentKey/identityRotateAgentKey/identityRemoveAgentKey/identityMigrate; Python discover() in discovery.py and verify_payment_receipts() in economy.py",
         "Flip the capability-matrix cells listed in the acceptance criteria, remove each now-stale C3c-follow-up exemption, and add the (\"UCAN\", \"evaluate\") alias to scripts/check-sdk-coverage.py",
         "Rebuild the test mocks to model nonce state (diagnostic records no nonce, gate records it), add a multi-token AND test, and ensure the real-napi evaluate assertions run unskipped",
         "Run all local gates (bun check/lint/test with the addon built, ruff + pytest with DYLD, check-sdk-coverage.py, validate-prd.py, Rust build + clippy) and confirm green before opening the PR"

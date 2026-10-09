@@ -51,13 +51,13 @@ Detection heuristic during code review: if a `&self` method body never reference
 
 **SDK wrapper layer is governed by §7, not §1.** Each SDK (Python, TypeScript, Swift, Kotlin) chooses whether to surface a pure helper as an `SCP` class method or as a module-level export based on its own language idiom. §1 governs the FFI Rust source; §7 governs the language-specific wrapper layer above it.
 
-The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`, `BridgeConnector` in spec §12).
+The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`).
 
 ### 2. `BridgeInstance` splits into three per-bridge concrete structs behind a shared trait
 
 `BridgeInstance` stops being a single struct hosting four `Box<dyn Any>` slots. It refactors into:
 
-- `PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance` — concrete per-bridge structs holding typed fields for all bridge-specific registries (FFI_BRIDGE_STATE, MCP server/client registries, CREDENTIAL_STORE, identity_custody_registry, identity_link_attestation_registry, context_handle_registry, etc.).
+- `PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance` — concrete per-bridge structs holding typed fields for all bridge-specific registries (FFI_BRIDGE_STATE, MCP server/client registries, identity_custody_registry, identity_link_attestation_registry, context_handle_registry, etc.).
 - `BridgeInstanceCore` — a shared trait in `scp-ffi-common` exposing the bridge-agnostic fields (ContextManager, transport manager, known_contexts, rate_limiters, economy trackers, persistence, relay_url, shutdown_hooks, petname/handle/scope maps, MCP stdio allowlist) and lifecycle helpers (`suspend()`, `resume()`, `shutdown(timeout)`, `check_ready()`).
 
 Every shared helper in `scp-ffi-common` operates on `&dyn BridgeInstanceCore`. Per-bridge callers pass their concrete instance. The four `Box<dyn Any>` slots introduced in Phase 4a are removed. Type safety is compile-time; there are no runtime downcasts. This satisfies the CLAUDE.md rule "enforce mechanically — type system over documentation."

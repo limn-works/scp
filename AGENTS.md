@@ -120,6 +120,7 @@ mise installs every tool except Rust. **Never use npm or npx** (bun only). Use `
 | Writing standard | Before any prose | `.docs/standards/concrete-prose.md`, `.docs/lessons/bad-prose-and-its-rewrite.md` |
 | Architecture, sketches, scaffolds | Crate ownership, API shape, SDK layout | `.docs/architecture.md` §2.1, `.docs/sketch.md`, `.docs/scaffold/` |
 | Runbooks | Production incidents | `.docs/runbooks/` |
+| Archived features | Only when reviving a cut feature; never as current protocol | `.docs/archive/` (README.md) |
 | Lessons | Before debugging a possible environment or CI fault, or writing a gate | `.docs/lessons/` |
 | CI commands | Exact commands and feature lists | `.github/workflows/ci.yml` |
 | Agents and review rules | Writing an agent definition; conducting a review or audit | `.claude/agents/README.md` |

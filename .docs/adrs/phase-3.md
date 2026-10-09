@@ -331,9 +331,9 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
    - **Concurrency:** Multiple concurrent `async for` loops on the same iterator race for
      messages — each message is delivered to exactly one consumer.
 
-   This matches the detail level of the TypeScript (ADR-019: `onMessage`/`onError`/`onComplete`
-   callbacks → async generator), Swift (ADR-023: `AsyncStream<Message>` with
-   `continuation.yield`/`finish`), and Kotlin (ADR-027: `callbackFlow`/`awaitClose`) receive
+   This matches the detail level of the TypeScript (ADR-022: `onMessage`/`onError`/`onComplete`
+   callbacks → async generator), Swift (ADR-026: `AsyncStream<Message>` with
+   `continuation.yield`/`finish`), and Kotlin (ADR-028: `callbackFlow`/`awaitClose`) receive
    specifications.
 
 3. **`OutletDefinition` dataclass:**
