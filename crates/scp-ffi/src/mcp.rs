@@ -373,10 +373,6 @@ impl FfiBridgeProvider {
     /// Reads `context_id`'s current role state for an MCP authorization.
     ///
     /// With a supervisor attached, the answer is the actor's role state.
-    /// `FfiBridgeState` holds no role state, so a change the actor applies from
-    /// an inbound commit, such as another admin revoking this agent's
-    /// `messages:read` or removing it, reaches the next gate that reads. The
-    /// `UniFFI` provider asks the actor on every read for the same reason.
     ///
     /// # Errors
     ///
@@ -740,10 +736,9 @@ impl ContextProvider for FfiBridgeProvider {
         // A dropped bridge or an unreadable context is an error, never an
         // empty outlet registry.
         let bi = self.upgrade_bi()?;
-        // Outlets register only in this bridge's FFI state, and only this
-        // bridge's create and join paths register that state, so a context the
-        // actor holds by any other path has no FFI state here and no outlet
-        // registered through this bridge: its registry is empty.
+        // Outlets register only in this bridge's FFI state, so a context with
+        // no FFI state here has no outlet registered through this bridge: its
+        // registry is empty.
         if !crate::runtime::ffi_state_registry(&bi).contains_key(context_id) {
             return match Self::supervised_role_state(&bi, context_id)? {
                 Some(_) => Ok(Vec::new()),
@@ -2802,7 +2797,7 @@ mod tests {
     ///
     /// Attaches a supervisor, as `register_context` does, and the supervisor
     /// does not hold the context, so the provider's role-state gates deny it
-    /// (see `provider_gates_follow_the_actor_not_the_bridge_copy_pyo3`). Tests
+    /// (see `provider_gates_follow_the_actor_not_the_bridge_state_pyo3`). Tests
     /// of those gates use [`setup_supervised_context`].
     ///
     /// Callers must pass the same `bi` they use for subsequent registry lookups;
@@ -3611,8 +3606,7 @@ mod tests {
 
     /// The UCAN step of `validate_capability` takes the ceiling and the
     /// creator from the supervisor actor: the token the actor's creator
-    /// issued within the actor's ceiling passes. FFI state holds no ceiling
-    /// and no creator, so the actor is the only source the step can read.
+    /// issued within the actor's ceiling passes.
     #[test]
     #[cfg(feature = "testing")]
     fn validate_capability_ucan_step_reads_the_supervisor_ceiling_and_creator() {

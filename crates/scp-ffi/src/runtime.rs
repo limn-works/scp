@@ -440,8 +440,7 @@ pub struct PyBridgeInstance {
     /// [`release_context_unless_readmitted`] removes state only while the id's
     /// mark stands. [`readmit_context`] clears a mark. Holding
     /// [`MAX_RELEASED_CONTEXTS`] marks, a new mark first evicts the one set
-    /// earliest. Every reader takes this lock after the registry shard lock for
-    /// the same id, never before it.
+    /// earliest.
     pub(crate) released_contexts: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 
     /// MCP server registry (replaces `SERVER_REGISTRY` in `mcp.rs`).
@@ -1479,28 +1478,15 @@ pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiB
 /// # No role state lives here
 ///
 /// This struct holds no role state, no membership set, no capability ceiling,
-/// and no creator DID. The UCAN gates in `ucan.rs`, the outlet gates in
-/// `outlets.rs`, and the MCP provider in `mcp.rs` read those from the
-/// context's supervisor actor through [`active_role_state_before_authz`],
-/// [`live_role_state`], and [`member_context_role_states`]. A bridge-local
-/// copy was refreshed only by this bridge's own join, leave, and governance
-/// calls, so a change the supervisor applied by any other route, such as an
-/// inbound commit from another member, left the copy granting authority the
-/// supervisor had already withdrawn. With the fields deleted, no caller can
-/// read a copy.
+/// and no creator DID.
 pub struct FfiBridgeState {
     /// Outlet registry for this context.
     pub outlet_registry: OutletRegistry,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
     /// UCAN revocation list for this context.
-    ///
-    /// The bridge owns this list: `PyScp::ucan_revoke` writes it and the
-    /// supervisor keeps no counterpart.
     pub revocation_list: RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
-    ///
-    /// The bridge owns this tracker, and the supervisor keeps no counterpart.
     pub nonce_tracker: NonceTracker<SystemClock>,
     /// Registered outlet handlers keyed by outlet ID.
     ///
@@ -1545,22 +1531,15 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 ///
 /// Creates an [`OutletRegistry`], an [`EventLog`], a [`RevocationList`], a
 /// [`NonceTracker`], and a session store for the context. Role state,
-/// membership, the capability ceiling, and the creator DID are not stored here:
-/// the supervisor actor owns them, and [`live_role_state`] reads them.
+/// membership, the capability ceiling, and the creator DID are not stored here.
 ///
 /// `user_ceiling` holds the caller's ceiling entries in colon format (e.g.
 /// `"outlet:call:*"`). This function validates each entry against the
-/// ceiling-entry grammar (spec §5.3.1.1) and then discards the parsed values,
-/// because `Supervisor::create_context` stores the ceiling that authorization
-/// reads. Validating here rejects a malformed entry with a bridge-native
-/// message before the supervisor sees it. `context_create` passes the ceiling
-/// `PyContextParams::from_py_dict` parsed, and `context_join_from_welcome`
-/// passes an empty slice, because a joiner declares no ceiling.
+/// ceiling-entry grammar (spec §5.3.1.1) and then discards the parsed values.
 ///
 /// The function refuses an id that carries a release mark, so state a close
 /// released is never rebuilt for it; [`readmit_context`] clears the mark. The
-/// mark check and the insert run under the registry entry's shard lock, the
-/// lock [`release_context_unless_readmitted`] holds while it removes state.
+/// mark check and the insert run under the registry entry's shard lock.
 ///
 /// # Errors
 ///
@@ -1824,9 +1803,7 @@ pub fn read_live_context_state_on(
 ///
 /// A mark stays until [`readmit_context`] clears it, so without a bound the map
 /// grows by one entry for every context the instance ever closed. Evicting a
-/// mark lets [`register_ffi_state`] build state for that id again; no caller
-/// asks it to for a closed context, because `context_create` generates a fresh
-/// id and the Welcome join readmits the id before it registers.
+/// mark lets [`register_ffi_state`] build state for that id again.
 pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
 
 /// Locks the bridge's release marks, recovering the map from a poisoned lock.
@@ -1863,10 +1840,6 @@ fn set_release_mark(bi: &PyBridgeInstance, context_id: &str) {
 /// Removes `context_id`'s [`FfiBridgeState`], its known-context entry, and its
 /// connector and economy state, only while its release mark stands, and returns
 /// whether the mark stood.
-///
-/// The mark check and the removals run under the registry entry's shard lock,
-/// the lock [`register_ffi_state`] and [`readmit_context`] take before they
-/// touch the mark.
 fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> bool {
     use dashmap::mapref::entry::Entry;
 
@@ -1885,8 +1858,6 @@ fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> boo
 
 /// Clears the release mark a close left for `context_id`.
 ///
-/// `context_import`, `restore_context`, `restore_all_contexts`, and
-/// `context_join_from_welcome` call it once the supervisor serves the id again.
 /// It clears the mark under the registry entry's shard lock.
 pub fn readmit_context(bi: &PyBridgeInstance, context_id: &str) {
     let _shard = ffi_state_registry(bi).entry(context_id.to_owned());
@@ -2734,9 +2705,7 @@ pub fn register_context(
     #[cfg(not(test))]
     init_context_manager(bi, creator_did);
 
-    // Register FFI-specific state. `creator_did` reaches the MLS factory above;
-    // FFI state stores no creator DID, because authorization reads the
-    // supervisor's `creator_did` through `live_role_state`.
+    // Register FFI-specific state. `creator_did` reaches the MLS factory above.
     register_ffi_state(bi, context_id, user_ceiling)
 }
 
@@ -3371,11 +3340,6 @@ mod tests {
 
     /// The supervisor reports a context declaring every `default_ceiling()`
     /// capability in UCAN underscore format.
-    ///
-    /// `context_create` substitutes no default ceiling: `PyContextParams::from_py_dict`
-    /// rejects an absent, `None`, or empty ceiling, which
-    /// `absent_ceiling_rejects` and `empty_ceiling_list_rejects` in
-    /// `context.rs` cover. This test covers the format the supervisor reports.
     #[test]
     fn default_ceiling_reads_in_ucan_format() {
         crate::init_runtime().ok();

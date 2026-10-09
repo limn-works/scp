@@ -3373,7 +3373,7 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
 /// results.
 #[cfg(feature = "testing")]
 #[test]
-fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_bridge_copy() {
+fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_registration_did() {
     Python::with_gil(|py| {
         setup();
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
@@ -3920,12 +3920,11 @@ fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
 /// The outlet UCAN validation anchors the delegation chain on the creator the
 /// SUPERVISOR holds.
 ///
-/// The fixture mints the invocation UCAN as `owner`, the supervisor's creator.
-/// `FfiBridgeState` holds no creator, so the supervisor is the only source the
-/// validation can anchor on, and this test requires the token to validate.
+/// The fixture mints the invocation UCAN as `owner`, the supervisor's creator,
+/// and this test requires the token to validate.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
-fn session_invoke_anchors_the_ucan_on_the_supervisor_creator_not_the_bridge_copy() {
+fn session_invoke_anchors_the_ucan_on_the_supervisor_creator() {
     Python::with_gil(|py| {
         setup();
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
@@ -3957,10 +3956,9 @@ fn session_invoke_anchors_the_ucan_on_the_supervisor_creator_not_the_bridge_copy
 /// The unary cross-context saga signs with the keys of the creators the
 /// SUPERVISOR holds for the caller and target contexts.
 ///
-/// `FfiBridgeState` holds no creator, so the supervisor is the only source of
-/// either signer, and this test requires the saga to reach `Committed`.
+/// This test requires the saga to reach `Committed`.
 #[test]
-fn xctx_saga_signs_as_the_supervisor_creators_not_the_bridge_copies() {
+fn xctx_saga_signs_as_the_supervisor_creators() {
     Python::with_gil(|py| {
         let (scp, ctx_a, ctx_b, owner, outlet_id) = establish_xctx_saga_commit_preconditions(py);
 
@@ -3999,11 +3997,10 @@ fn xctx_saga_signs_as_the_supervisor_creators_not_the_bridge_copies() {
 /// The cross-context streaming saga open signs with the keys of the creators
 /// the SUPERVISOR holds for the caller and target contexts.
 ///
-/// `FfiBridgeState` holds no creator, so the supervisor is the only source of
-/// either signer, and this test requires the open to return a saga id.
+/// This test requires the open to return a saga id.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
-fn xctx_streaming_saga_open_signs_as_the_supervisor_creators_not_the_bridge_copies() {
+fn xctx_streaming_saga_open_signs_as_the_supervisor_creators() {
     Python::with_gil(|py| {
         let (scp, ctx_a, ctx_b, invoker, outlet_id, ucan, release_tx) =
             establish_xctx_streaming_saga_preconditions(py);

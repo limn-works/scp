@@ -1328,15 +1328,13 @@ mod tests {
     // -----------------------------------------------------------------------
     // Every UCAN authorization input reaches the supervisor actor
     //
-    // `register_context` receives an EMPTY ceiling argument below, and a
-    // bridge-local copy built from that argument carried `default_ceiling()` and
-    // named the registering DID as creator. `FfiBridgeState` no longer holds
-    // either field, so the compiler, not these tests, blocks a revert to a copy.
+    // `register_context` receives an EMPTY ceiling argument below.
     // `ucan_mint_reads_the_supervisor_creator_as_issuer`,
-    // `ucan_revoke_authorizes_the_supervisor_creator_not_the_bridge_copy`, and
-    // the e2e_bridge.rs test
-    // `ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_bridge_copy`
-    // prove each entry point takes the creator from the supervisor actor.
+    // `ucan_revoke_authorizes_the_supervisor_creator_not_the_registration_did`,
+    // and the e2e_bridge.rs test
+    // `ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_registration_did`
+    // each fail when their entry point takes the creator from the registration
+    // DID.
     // The absence tests below build a context no supervisor actor serves, so
     // each entry point refuses at `active_ucan_role_state`, the lifecycle gate
     // that runs before the live role-state read; the refusal carries
@@ -1892,7 +1890,7 @@ mod tests {
     /// the creator from the registration DID refuses `supervisor_creator` and
     /// admits `ffi_creator`, failing both assertions below.
     #[test]
-    fn ucan_revoke_authorizes_the_supervisor_creator_not_the_bridge_copy() {
+    fn ucan_revoke_authorizes_the_supervisor_creator_not_the_registration_did() {
         crate::init_runtime().ok();
         let ffi_creator = "did:dht:z6MkUcanRevokeFfiCreator";
         let supervisor_creator = "did:dht:z6MkUcanRevokeSupervisorCreator";

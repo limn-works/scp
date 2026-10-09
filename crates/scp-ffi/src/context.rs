@@ -2979,10 +2979,6 @@ impl crate::scp::PyScp {
                 });
             }
 
-            // No bridge-side membership write follows the join: `Supervisor::join_context`
-            // recorded the new member, and every UCAN/outlet capability check reads
-            // that record through `crate::runtime::live_role_state`.
-
             // Bridge: drain events (MemberJoined) from ContextManager's receive
             // buffer and deliver to the FFI receive channel (#332).
             drain_and_deliver(bi, &context_id);
@@ -3219,14 +3215,11 @@ impl crate::scp::PyScp {
         // BEFORE the irreversible runtime join. Mirrors `context_create`, which
         // registers FFI state first and rolls it back via `remove_context` if the
         // runtime step fails. The FFI state holds no role state and no
-        // membership; `spawn_actor_from_welcome` records both in the supervisor.
+        // membership.
         //
-        // FLAG-1: the caller supplies no ceiling, and none is stored here. FFI
-        // state holds no ceiling at all; UCAN validation reads the ceiling that
-        // `spawn_actor_from_welcome` took from the creator-signed bundle, through
-        // `crate::runtime::active_role_state_before_authz`. The Occupied dedup is keyed on
-        // `context_id`, so the "detect a duplicate BEFORE consuming the single-use
-        // KeyPackage" crash-safety is preserved.
+        // FLAG-1: the caller supplies no ceiling, and none is stored here. The
+        // Occupied dedup is keyed on `context_id`, so the "detect a duplicate
+        // BEFORE consuming the single-use KeyPackage" crash-safety is preserved.
         //
         // Ordering matters for two reasons:
         //   1. `register_ffi_state` hard-errors on an already-registered context
@@ -3240,16 +3233,11 @@ impl crate::scp::PyScp {
         //
         // A close of this id on this bridge instance left a release mark, and
         // `register_ffi_state` refuses a marked id. This join is about to make
-        // the supervisor serve the id again, so it clears the mark first. A
-        // close that races in after this point marks the id again and removes
-        // the state; the presence probe after the spawn catches that removal.
+        // the supervisor serve the id again, so it clears the mark first.
         crate::runtime::readmit_context(bi, &sealed.context_id);
         crate::runtime::register_ffi_state(bi, &sealed.context_id, &[]).map_err(|e| {
             PyRuntimeError::new_err(format!("failed to register context state: {e}"))
         })?;
-        // No bridge-side membership write follows: `spawn_actor_from_welcome`
-        // records the joiner in the supervisor's role state, and every later
-        // capability check reads that record through `live_role_state`.
 
         let owning = scp_did::DID(owning_did.clone());
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
@@ -3276,24 +3264,13 @@ impl crate::scp::PyScp {
                 }
             };
 
-        // FLAG-1: no ceiling copy is written here. `spawn_actor_from_welcome`
-        // stored the ceiling the creator signed into the supervisor's role state,
-        // and UCAN validation reads it through `active_role_state_before_authz`, so the
-        // authenticated ceiling reaches every check without a bridge-side copy
-        // that a later governance `ModifyCeiling` would leave stale.
-        //
         // BLACK-2JF-01, post-irreversible-commit compensation: the presence
         // probe below misses only when a concurrent close or leave removed the
         // FFI state this join registered while the spawn ran or after it
-        // returned. A close on an older handle for the same context id reads no
-        // actor while the spawn runs, so `context_close` skips the dispatch and
-        // releases that state. This join holds the GIL across the spawn, which
-        // keeps other Python threads out of the window; the probe does not rely
-        // on that, so the detection survives a later change that releases the
-        // GIL. A close or leave does not despawn the actor, so returning without
-        // a teardown would strand a live actor behind a handle with no FFI
-        // state. `discard_joined_context` removes the actor handle, destroys the
-        // resident MLS group, and deletes the durable snapshot the join
+        // returned. A close or leave does not despawn the actor, so returning
+        // without a teardown would strand a live actor behind a handle with no
+        // FFI state. `discard_joined_context` removes the actor handle, destroys
+        // the resident MLS group, and deletes the durable snapshot the join
         // persisted; a bare `despawn_actor` would leave the group and the
         // snapshot behind, so a restart would restore the context and a fresh
         // re-join would collide with it.
@@ -3533,10 +3510,6 @@ impl crate::scp::PyScp {
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
             })?;
-
-            // No bridge-side membership write follows the leave: `Supervisor::leave_context`
-            // dropped the member, and every UCAN/outlet capability check reads that
-            // record through `crate::runtime::live_role_state`.
 
             // Bridge: drain events (MemberLeft) from ContextManager's receive
             // buffer and deliver BEFORE closing the channel (#332).
@@ -4118,12 +4091,6 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("governance execution failed: {e}"))
                 })?;
 
-            // No role-state copy follows a governance action (#560 closed by
-            // deletion). The action mutated the supervisor's role state, and the
-            // next capability check reads that role state through
-            // `crate::runtime::live_role_state`, so no window exists in which a
-            // bridge copy still grants what the action revoked.
-
             use scp_core::context::state::GovernanceActionResult;
             let result_str = match result {
                 GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
@@ -4356,9 +4323,6 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            // No role-state copy follows a governance action: the supervisor
-            // holds the mutation and `crate::runtime::live_role_state` reads it.
-
             let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
             let response = serde_json::json!({
@@ -4442,9 +4406,6 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            // No role-state copy follows a governance action: the supervisor
-            // holds the mutation and `crate::runtime::live_role_state` reads it.
-
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
     }
@@ -4519,9 +4480,6 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            // No role-state copy follows a governance action: the supervisor
-            // holds the mutation and `crate::runtime::live_role_state` reads it.
-
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
     }
@@ -4571,9 +4529,6 @@ impl crate::scp::PyScp {
                         "SCP-CTX-2044: governance vote withdrawal failed: {e}"
                     ))
                 })?;
-
-            // No role-state copy follows a governance action: the supervisor
-            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
