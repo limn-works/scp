@@ -5505,13 +5505,23 @@ PUSH_MATRIX = re.compile(
     r"^\$\{\{\s*fromJSON\(\s*github\.event_name\s*==\s*'push'\s*&&\s*'(\[[^']*\])'"
     r"\s*\|\|\s*'(\[[^']*\])'\s*\)\s*\}\}$"
 )
-SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?")
+# GitHub Actions reads context and property names, and compares strings with
+# `==`, without regard to case, so every pattern that reads a `matrix`,
+# `strategy` or `runner` reference matches in any case, and a name it captures
+# is looked up in any case (matrix_key).
+SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?", re.IGNORECASE)
 # A matrix axis a cache key expands, so that each value of the axis writes its own
 # entry: `shared-key: transport-optional-${{ matrix.group }}`.
-KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}")
+KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}", re.IGNORECASE)
 # A key that names the runner's platform, so each runner writes its own entry.
 # Swatinem/rust-cache puts the platform into every key without the text naming it.
-KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b")
+KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b", re.IGNORECASE)
+
+
+def matrix_key(name: str, keys) -> str | None:
+    """Return the one key of `keys` that `name` names in any case, else None."""
+    found = [key for key in keys if str(key).lower() == name.lower()]
+    return found[0] if len(found) == 1 else None
 
 
 def axis_event_values(values: object) -> dict[str, list] | None:
@@ -5558,7 +5568,7 @@ def axis_terms(condition: object) -> tuple[str, list[str]] | None:
     for leaf in disjuncts(tree):
         if leaf[0] != "==":
             return None
-        axis = re.fullmatch(r"matrix\.([A-Za-z0-9_-]+)", leaf[1])
+        axis = re.fullmatch(r"matrix\.([A-Za-z0-9_-]+)", leaf[1], re.IGNORECASE)
         value = re.fullmatch(r"'([^']*)'", leaf[2])
         if axis is None or value is None:
             return None
@@ -5591,15 +5601,19 @@ def leg_steps(job: dict, axis: str | None, value: object) -> list[dict] | None:
             terms = axis_terms(condition)
             if axis is None or terms is None or terms[0] != axis:
                 return None
-            if str(value) not in terms[1]:
+            if str(value).lower() not in {term.lower() for term in terms[1]}:
                 continue
         steps.append(step)
     return steps
 
 
 def leg_placeholder(axis: str | None) -> re.Pattern | None:
-    """Return the pattern of `${{ matrix.<axis> }}`, or None with no axis."""
-    return re.compile(rf"\$\{{\{{\s*matrix\.{re.escape(axis)}\s*\}}\}}") if axis else None
+    """Return the pattern of `${{ matrix.<axis> }}` in any case, or None with no axis."""
+    return (
+        re.compile(rf"\$\{{\{{\s*matrix\.{re.escape(axis)}\s*\}}\}}", re.IGNORECASE)
+        if axis
+        else None
+    )
 
 
 def leg_commands(job: dict, axis: str | None, value: object) -> list[str] | None:
@@ -5661,8 +5675,9 @@ def leg_step_identities(job: dict, axis: str, value: object) -> set[str] | None:
         for step in job.get("steps") or []
     ]
     for expression in re.findall(r"\$\{\{.*?\}\}", json.dumps(scanned), re.DOTALL):
-        if re.search(r"\bstrategy\b", expression) or (
-            re.search(r"\bmatrix\b", expression) and not placeholder.fullmatch(expression)
+        if re.search(r"\bstrategy\b", expression, re.IGNORECASE) or (
+            re.search(r"\bmatrix\b", expression, re.IGNORECASE)
+            and not placeholder.fullmatch(expression)
         ):
             return None
     context = {key: item for key, item in job.items() if key not in ("strategy", "steps", "name")}
@@ -5702,15 +5717,24 @@ def push_runs_step(step: dict, legs: dict[str, str] | None = None) -> bool:
     if not parts:
         return True
     tree = parse_condition(" && ".join(parts))
-    known = {"github.event_name": "push", "github.ref": "refs/heads/main", **(legs or {})}
+    known = {
+        name.lower(): text
+        for name, text in {
+            "github.event_name": "push",
+            "github.ref": "refs/heads/main",
+            **(legs or {}),
+        }.items()
+    }
 
+    # GitHub reads names and compares strings without regard to case.
     def operand(token: str) -> str | None:
         quoted = re.fullmatch(r"'([^']*)'", token)
         if quoted:
-            return quoted.group(1)
+            return quoted.group(1).lower()
         if token in ("true", "false") or token.isdigit():
             return token
-        return known.get(token)
+        found = known.get(token.lower())
+        return None if found is None else found.lower()
 
     free: list[tuple[str, ...]] = []
 
@@ -5719,7 +5743,7 @@ def push_runs_step(step: dict, legs: dict[str, str] | None = None) -> bool:
             for part in node[1]:
                 collect(part)
         elif None in (operand(node[1]), operand(node[2])):
-            pair = tuple(sorted((node[1], node[2])))
+            pair = tuple(sorted((node[1].lower(), node[2].lower())))
             if pair not in free:
                 free.append(pair)
 
@@ -5729,7 +5753,7 @@ def push_runs_step(step: dict, legs: dict[str, str] | None = None) -> bool:
             return any(results) if node[0] == "or" else all(results)
         left, right = operand(node[1]), operand(node[2])
         if None in (left, right):
-            equal = answers[tuple(sorted((node[1], node[2])))]
+            equal = answers[tuple(sorted((node[1].lower(), node[2].lower())))]
         else:
             equal = left == right
         return equal if node[0] == "==" else not equal
@@ -5892,8 +5916,8 @@ def push_writer_gaps(doc: dict) -> list[str]:
             leg_conditions = f"{inputs.get('save-if', '')} {step.get('if') or ''}"
             named = [
                 (key, value)
-                for key, value in SAVE_IF_MATRIX.findall(leg_conditions)
-                if key in on_push
+                for name, value in SAVE_IF_MATRIX.findall(leg_conditions)
+                if (key := matrix_key(name, on_push)) is not None
             ]
             axes = sorted({key for key, _ in named})
             if axes:
@@ -5919,13 +5943,12 @@ def push_writer_gaps(doc: dict) -> list[str]:
                         f"{legs}, and a push runs {pushed} alone"
                     )
             key_text = f"{inputs.get('shared-key', '')} {inputs.get('key', '')}"
-            key_axes = set(KEY_MATRIX_AXIS.findall(key_text))
+            named_axes = KEY_MATRIX_AXIS.findall(key_text)
             action = str(step.get("uses") or "").split("@", 1)[0]
             if action == "Swatinem/rust-cache" or KEY_RUNNER.search(key_text):
-                key_axes |= set(KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or "")))
+                named_axes += KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or ""))
+            key_axes = {matrix_key(name, on_push) for name in named_axes} - {None}
             for key in sorted(key_axes):
-                if key not in on_push:
-                    continue
                 pushed_values = set(map(str, on_push[key]))
                 unwritten = [v for v in elsewhere[key] if str(v) not in pushed_values]
                 if unwritten:
@@ -6276,7 +6299,9 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
                 if lists["push"] == lists["other"]
                 else (("push", lists["push"]), ("pull_request", lists["other"]))
             )
-            mention = re.compile(rf"\bmatrix\.{re.escape(axis_name)}(?![A-Za-z0-9_-])")
+            mention = re.compile(
+                rf"\bmatrix\.{re.escape(axis_name)}(?![A-Za-z0-9_-])", re.IGNORECASE
+            )
             named: set[str] = set()
             for label, condition in steps:
                 if not mention.search(condition):
@@ -6556,6 +6581,22 @@ def check_push_writer_mutants(doc: dict) -> None:
     no_push = "github.event_name != 'push'"
     for label, job_id, locate, field, text, reported in (
         (
+            "a push exclusion spelled in another case on rust-clippy's rust-cache `if:`",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "matrix.leg == 'workspace' && GitHub.Event_Name != 'Push'",
+            "no push to `main` meets",
+        ),
+        (
+            "a rust-clippy rust-cache `if:` naming a pull-request-only leg in another case",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "MATRIX.LEG == 'packages-network'",
+            "only from matrix leg",
+        ),
+        (
             "a push exclusion on rust-clippy's workspace rust-cache `if:`",
             "rust-clippy",
             clippy_workspace,
@@ -6739,6 +6780,40 @@ def check_push_writer_mutants(doc: dict) -> None:
             "a push-only leg whose run line reads its strategy job index",
             lambda job: job["steps"].append(
                 {"run": "cargo test -p scp-transport ${{ strategy.job-index }}"}
+            ),
+        ),
+        (
+            "a push-only leg whose run line reads its strategy job index in another case",
+            lambda job: job["steps"].append(
+                {"run": "cargo test -p scp-transport ${{ Strategy.job-index }}"}
+            ),
+        ),
+        (
+            "a push-only leg reading a job env value that is its leg in another case",
+            lambda job: (
+                job.setdefault("env", {}).update({"LEG": "${{ Matrix.leg }}"}),
+                job["steps"].append(
+                    {
+                        "run": "cargo test -p scp-transport && "
+                        'if [ "$LEG" = all ]; then ./push-only.sh; fi'
+                    }
+                ),
+            ),
+        ),
+        (
+            "a push-only leg reading a step env value that is its leg in another case",
+            lambda job: job["steps"].append(
+                {
+                    "env": {"LEG": "${{ matrix.LEG }}"},
+                    "run": 'cargo test -p scp-transport && if [ "$LEG" = all ]; '
+                    "then ./push-only.sh; fi",
+                }
+            ),
+        ),
+        (
+            "a push-only leg running a step whose `if:` names its leg in another case",
+            lambda job: job["steps"].append(
+                {"if": "matrix.leg == 'ALL'", "run": "./scripts/push-only.sh"}
             ),
         ),
         (
