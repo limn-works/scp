@@ -122,6 +122,19 @@ pub enum SelfHostError {
         /// The setup error that started the drain, when one did.
         cause: Option<String>,
     },
+    /// The Supervisor drain task panicked or was cancelled before it finished.
+    /// The caller must not close the storage the deployer's
+    /// `DurableProviders` wrap: a task may still write through it.
+    #[error(
+        "supervisor drain failed: {failure}{}",
+        cause.as_deref().map(|c| format!(" (draining after: {c})")).unwrap_or_default()
+    )]
+    DrainFailed {
+        /// How the drain task ended.
+        failure: scp_core::context::supervisor::JoinFailure,
+        /// The setup error that started the drain, when one did.
+        cause: Option<String>,
+    },
 }
 
 /// How long a self-host drain waits for the Supervisor's tracked
@@ -129,30 +142,55 @@ pub enum SelfHostError {
 pub const SELF_HOST_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Drains `supervisor` (ADR-049 Decision 16) through
-/// `Supervisor::drain_with_deadline` and reports whether that drain finished
-/// within [`SELF_HOST_DRAIN_DEADLINE`]. A drain that misses the deadline keeps
-/// running to completion. A drain that panics or is cancelled counts as
-/// unfinished.
-async fn drained_within_deadline(
+/// `Supervisor::drain_with_deadline`, waiting up to
+/// [`SELF_HOST_DRAIN_DEADLINE`]. A drain that misses the deadline keeps
+/// running to completion.
+///
+/// # Errors
+///
+/// [`SelfHostError::DrainTimedOut`] when the deadline passes first, and
+/// [`SelfHostError::DrainFailed`] when the drain task panics or is cancelled;
+/// each carries `cause`.
+async fn drain_supervisor(
     supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
-) -> bool {
-    use scp_core::context::supervisor::{DrainWithDeadline, JoinFailure};
+    cause: Option<String>,
+) -> Result<(), SelfHostError> {
+    use scp_core::context::supervisor::JoinFailure;
     let deadline = tokio::time::Instant::now() + SELF_HOST_DRAIN_DEADLINE;
     let on_late = |late: Result<(), JoinFailure>| {
         if let Err(failure) = late {
             tracing::error!("late {}", self_host_drain_failed_message(failure));
         }
     };
-    match supervisor
-        .drain_with_deadline(deadline, || (), on_late)
-        .await
-    {
-        DrainWithDeadline::Finished(()) => true,
+    drain_result(
+        &supervisor
+            .drain_with_deadline(deadline, || (), on_late)
+            .await,
+        cause,
+    )
+}
+
+/// Maps a self-host drain outcome onto [`SelfHostError`]: a timeout to
+/// [`SelfHostError::DrainTimedOut`] and a panicked or cancelled drain to
+/// [`SelfHostError::DrainFailed`], each carrying `cause`.
+fn drain_result(
+    outcome: &scp_core::context::supervisor::DrainWithDeadline<()>,
+    cause: Option<String>,
+) -> Result<(), SelfHostError> {
+    use scp_core::context::supervisor::DrainWithDeadline;
+    match outcome {
+        DrainWithDeadline::Finished(()) => Ok(()),
         DrainWithDeadline::Failed(failure) => {
-            tracing::error!("{}", self_host_drain_failed_message(failure));
-            false
+            tracing::error!("{}", self_host_drain_failed_message(*failure));
+            Err(SelfHostError::DrainFailed {
+                failure: *failure,
+                cause,
+            })
         }
-        DrainWithDeadline::TimedOut => false,
+        DrainWithDeadline::TimedOut => Err(SelfHostError::DrainTimedOut {
+            deadline: SELF_HOST_DRAIN_DEADLINE,
+            cause,
+        }),
     }
 }
 
@@ -173,19 +211,15 @@ const fn self_host_drain_failed_message(
 }
 
 /// Drains `supervisor` on a path failing with `cause`. Returns `cause` when
-/// the drain finishes, and [`SelfHostError::DrainTimedOut`] carrying it when
+/// the drain finishes, and the [`drain_supervisor`] error carrying it when
 /// the drain does not.
 async fn drain_after_failure(
     supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
     cause: SelfHostError,
 ) -> SelfHostError {
-    if drained_within_deadline(supervisor).await {
-        cause
-    } else {
-        SelfHostError::DrainTimedOut {
-            deadline: SELF_HOST_DRAIN_DEADLINE,
-            cause: Some(cause.to_string()),
-        }
+    match drain_supervisor(supervisor, Some(cause.to_string())).await {
+        Ok(()) => cause,
+        Err(drain) => drain,
     }
 }
 
@@ -347,8 +381,9 @@ fn inject_did_meta(html: &str, did: &str) -> String {
 /// enable, or deploy commit.
 ///
 /// Returns [`SelfHostError::DrainTimedOut`] when the Supervisor drain exceeds
-/// [`SELF_HOST_DRAIN_DEADLINE`]; the caller must then leave the storage behind
-/// `durable` open. Its `cause` is `Some` when a stage
+/// [`SELF_HOST_DRAIN_DEADLINE`], and [`SelfHostError::DrainFailed`] when the
+/// drain task panics or is cancelled; the caller must then leave the storage
+/// behind `durable` open. Either error's `cause` is `Some` when a stage
 /// failed before the drain, and `None` when the deploy had already committed:
 /// a `None` cause means the assets are published, so a retry would publish a
 /// second deploy.
@@ -429,8 +464,9 @@ impl SelfHostDeployer {
     /// context creation, key resolution, or projection enable fails.
     /// Returns [`SelfHostError::DrainTimedOut`], carrying that failure as its
     /// `cause`, when the Supervisor drain after the failure exceeds
-    /// [`SELF_HOST_DRAIN_DEADLINE`]; the caller must then leave the storage
-    /// behind `durable` open.
+    /// [`SELF_HOST_DRAIN_DEADLINE`], and [`SelfHostError::DrainFailed`],
+    /// carrying it the same way, when that drain task panics or is cancelled;
+    /// the caller must then leave the storage behind `durable` open.
     // Provider-bootstrap entry: each argument is a distinct, required provider
     // the loopback supervisor needs (node, identity, hostname, signing key,
     // governance resolver, durable providers). The durable saga journal and the
@@ -521,18 +557,13 @@ impl SelfHostDeployer {
     /// # Errors
     ///
     /// [`SelfHostError::DrainTimedOut`] when a tracked task is still running
-    /// at the deadline; the owner must then leave the storage open.
+    /// at the deadline, and [`SelfHostError::DrainFailed`] when the drain
+    /// task panics or is cancelled; the owner must then leave the storage
+    /// open.
     ///
     /// [`deploy`]: Self::deploy
     pub async fn shutdown(&self) -> Result<(), SelfHostError> {
-        if drained_within_deadline(&self.supervisor).await {
-            Ok(())
-        } else {
-            Err(SelfHostError::DrainTimedOut {
-                deadline: SELF_HOST_DRAIN_DEADLINE,
-                cause: None,
-            })
-        }
+        drain_supervisor(&self.supervisor, None).await
     }
 
     /// Publishes `assets` under `deploy_id` through the reused supervisor/group
@@ -1211,9 +1242,8 @@ pub enum HostSiteError {
     /// Supervisor drained. The store keeps its connection and advisory lock.
     #[error("storage close error: {0}")]
     StorageClose(String),
-    /// The deployer's Supervisor did not drain within
-    /// [`SELF_HOST_DRAIN_DEADLINE`], so the MLS store was left open and keeps
-    /// its connection and advisory lock.
+    /// The deployer's Supervisor drain timed out or failed, so the MLS store
+    /// was left open and keeps its connection and advisory lock.
     #[error("self-host deployer drain error: {0}")]
     Drain(SelfHostError),
     /// The persistent key custody backend failed to initialize.
@@ -1831,10 +1861,10 @@ async fn retire_deployer_after_failure(
 
 /// Picks the error a failing path returns after it settles the MLS store.
 /// A successful teardown returns `cause`. A teardown that left the store
-/// open returns its own error with `cause` attached: a drain timeout as
-/// [`HostSiteError::Drain`] carrying `cause` in
-/// [`SelfHostError::DrainTimedOut`], and a refused close as
-/// [`HostSiteError::StorageClose`] naming `cause`.
+/// open returns its own error with `cause` attached: a drain timeout or
+/// failure as [`HostSiteError::Drain`] carrying `cause` in
+/// [`SelfHostError::DrainTimedOut`] or [`SelfHostError::DrainFailed`], and a
+/// refused close as [`HostSiteError::StorageClose`] naming `cause`.
 fn teardown_outcome(teardown: Result<(), HostSiteError>, cause: HostSiteError) -> HostSiteError {
     match teardown {
         Ok(()) => cause,
@@ -1843,6 +1873,13 @@ fn teardown_outcome(teardown: Result<(), HostSiteError>, cause: HostSiteError) -
             cause: None,
         })) => HostSiteError::Drain(SelfHostError::DrainTimedOut {
             deadline,
+            cause: Some(cause.to_string()),
+        }),
+        Err(HostSiteError::Drain(SelfHostError::DrainFailed {
+            failure,
+            cause: None,
+        })) => HostSiteError::Drain(SelfHostError::DrainFailed {
+            failure,
             cause: Some(cause.to_string()),
         }),
         Err(HostSiteError::StorageClose(close)) => {
@@ -2592,9 +2629,11 @@ where
 /// settles the MLS store behind it.
 fn deployer_setup_failure(e: SelfHostError, mls_store: &SqliteStorage) -> HostSiteError {
     match e {
-        // The drain timed out, so a tracked task may still write: leave the
-        // store open.
-        e @ SelfHostError::DrainTimedOut { .. } => HostSiteError::Drain(e),
+        // The drain timed out or failed, so a tracked task may still write:
+        // leave the store open.
+        e @ (SelfHostError::DrainTimedOut { .. } | SelfHostError::DrainFailed { .. }) => {
+            HostSiteError::Drain(e)
+        }
         // `start` drained any Supervisor it built before failing, so the
         // store has no writer left.
         e => teardown_outcome(
@@ -2793,6 +2832,43 @@ mod tests {
         assert!(!cancelled.contains("panicked"), "{cancelled}");
     }
 
+    /// A finished drain is `Ok`, a timeout is `DrainTimedOut` naming the
+    /// deadline, and a panicked or cancelled drain is `DrainFailed` naming the
+    /// failure and no deadline; both errors carry the cause.
+    #[test]
+    fn drain_result_keeps_a_failed_drain_apart_from_a_timeout() {
+        use scp_core::context::supervisor::{DrainWithDeadline, JoinFailure};
+        assert!(drain_result(&DrainWithDeadline::Finished(()), None).is_ok());
+
+        let timed_out = drain_result(&DrainWithDeadline::TimedOut, Some("c".to_owned()));
+        assert!(
+            matches!(
+                &timed_out,
+                Err(SelfHostError::DrainTimedOut { deadline, cause: Some(c) })
+                    if *deadline == SELF_HOST_DRAIN_DEADLINE && c == "c"
+            ),
+            "a timeout must be DrainTimedOut: {timed_out:?}"
+        );
+
+        for failure in [JoinFailure::Panicked, JoinFailure::Cancelled] {
+            let failed = drain_result(&DrainWithDeadline::Failed(failure), Some("c".to_owned()));
+            assert!(
+                matches!(
+                    &failed,
+                    Err(SelfHostError::DrainFailed { failure: f, cause: Some(c) })
+                        if *f == failure && c == "c"
+                ),
+                "a {failure:?} drain must be DrainFailed: {failed:?}"
+            );
+            let text = failed.err().map(|e| e.to_string()).unwrap_or_default();
+            assert_eq!(
+                text,
+                format!("supervisor drain failed: {failure} (draining after: c)")
+            );
+            assert!(!text.contains("within"), "{text}");
+        }
+    }
+
     /// `HostSiteError::NodeBuild` keeps the typed `NodeError`, so a caller
     /// detects a missing pre-rotation backend by pattern, and the same pattern
     /// rejects every other node-build failure. `NodeBuild` and `Deploy` each
@@ -2838,11 +2914,11 @@ mod tests {
         assert!(!is_missing_backend(&other_config));
     }
 
-    /// A setup drain timeout reaches the caller as the typed
+    /// A setup drain that times out or fails reaches the caller as the typed
     /// `HostSiteError::Drain` and leaves the MLS store open with its lock; any
     /// other setup failure is `DeployerSetup` and closes the store.
     #[test]
-    fn deployer_setup_failure_keeps_store_open_only_on_drain_timeout() {
+    fn deployer_setup_failure_keeps_store_open_only_on_unfinished_drain() {
         let key = [7u8; 32];
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("mls");
@@ -2874,6 +2950,28 @@ mod tests {
             held.err()
         );
 
+        let drain_failed = SelfHostError::DrainFailed {
+            failure: scp_core::context::supervisor::JoinFailure::Panicked,
+            cause: Some("x".to_owned()),
+        };
+        let err = deployer_setup_failure(drain_failed, &store);
+        assert!(
+            matches!(err, HostSiteError::Drain(SelfHostError::DrainFailed { .. })),
+            "a failed setup drain must be HostSiteError::Drain, got {err:?}"
+        );
+        let held = open_sqlite(&dir, &Zeroizing::new(key));
+        assert!(
+            matches!(
+                &held,
+                Err(HostSiteError::StorageOpen {
+                    error: PlatformError::StorageLockHeld { .. },
+                    ..
+                })
+            ),
+            "the store must keep its lock after a failed setup drain: {:?}",
+            held.err()
+        );
+
         let failed = SelfHostError::CommitDeploy("y".to_owned());
         let err = deployer_setup_failure(failed, &store);
         assert!(
@@ -2889,7 +2987,7 @@ mod tests {
     }
 
     /// A failing path returns its own error only when the teardown settles the
-    /// store; a drain timeout or refused close replaces it with the typed
+    /// store; a drain timeout, failed drain or refused close replaces it with the typed
     /// teardown error carrying it, so the caller learns the store stays open.
     #[test]
     fn teardown_outcome_surfaces_a_store_left_open() {
@@ -2914,6 +3012,22 @@ mod tests {
                         && c == "deploy error: failed to commit deploy: x"
             ),
             "a drain timeout must be Drain carrying the original error, got {err:?}"
+        );
+
+        let failed = Err(HostSiteError::Drain(SelfHostError::DrainFailed {
+            failure: scp_core::context::supervisor::JoinFailure::Panicked,
+            cause: None,
+        }));
+        let err = teardown_outcome(failed, cause());
+        assert!(
+            matches!(
+                &err,
+                HostSiteError::Drain(SelfHostError::DrainFailed {
+                    failure: scp_core::context::supervisor::JoinFailure::Panicked,
+                    cause: Some(c),
+                }) if c == "deploy error: failed to commit deploy: x"
+            ),
+            "a failed drain must be Drain carrying the original error, got {err:?}"
         );
 
         let refused = Err(HostSiteError::StorageClose("refused".to_owned()));
