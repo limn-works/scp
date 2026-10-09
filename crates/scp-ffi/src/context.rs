@@ -3264,17 +3264,38 @@ impl crate::scp::PyScp {
                 }
             };
 
+        // Runtime join committed. Register the context in the known-contexts
+        // discovery registry so a Welcome-joined context is surfaced by
+        // `py_mcp_load_contexts`. spawn-from-Welcome always stands up an
+        // ENCRYPTED context, so the routing id is the joiner's derived §9.10.4
+        // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
+        // move). The member is the JOINER (`owning_did`).
+        let relay_url = match self.transport_status() {
+            Ok(status) => status.relay_url,
+            Err(e) => {
+                tracing::warn!("failed to query transport status during join registration: {e}");
+                None
+            }
+        };
+        let known = crate::runtime::KnownContext {
+            routing_id: local_pseudonym,
+            relay_url,
+            member_did: owning_did,
+            last_seen: scp_clock::SystemClock.now_secs(),
+        };
+
         // BLACK-2JF-01, post-irreversible-commit compensation: the presence
-        // probe below misses only when a concurrent close or leave removed the
-        // FFI state this join registered while the spawn ran or after it
-        // returned. A close or leave does not despawn the actor, so returning
+        // probe misses only when a concurrent close or leave removed the FFI
+        // state this join registered while the spawn ran or after it returned.
+        // The probe and the known-context registration run under one registry
+        // entry lock. A close or leave does not despawn the actor, so returning
         // without a teardown would strand a live actor behind a handle with no
         // FFI state. `discard_joined_context` removes the actor handle, destroys
         // the resident MLS group, and deletes the durable snapshot the join
         // persisted; a bare `despawn_actor` would leave the group and the
         // snapshot behind, so a restart would restore the context and a fresh
         // re-join would collide with it.
-        if !crate::runtime::ffi_state_registry(bi).contains_key(&sealed.context_id) {
+        if !crate::runtime::register_known_context_while_registered(bi, &sealed.context_id, known) {
             rt.block_on(sup.discard_joined_context(&sealed.context_id));
             crate::runtime::remove_context(bi, &sealed.context_id);
             return Err(crate::error::ScpPyError::ContextError {
@@ -3287,34 +3308,6 @@ impl crate::scp::PyScp {
                 code: scp_ffi_common::error_codes::CTX_2040.to_owned(),
             }
             .into());
-        }
-
-        // Runtime join committed. Register the context in the known-contexts
-        // discovery registry so a Welcome-joined context is surfaced by
-        // `py_mcp_load_contexts`, exactly as `context_create` does post-create.
-        // Mirrors `context_create`'s POST-success registration: infallible and
-        // idempotent (overwrites), so it is safe after the irreversible commit
-        // and needs no rollback. spawn-from-Welcome always stands up an ENCRYPTED
-        // context, so the routing id is the joiner's derived §9.10.4 pseudonym
-        // (`local_pseudonym` is `Copy`, still valid after the request move). The
-        // member is the JOINER (`owning_did`).
-        {
-            let relay_url = match self.transport_status() {
-                Ok(status) => status.relay_url,
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to query transport status during join registration: {e}"
-                    );
-                    None
-                }
-            };
-            let known = crate::runtime::KnownContext {
-                routing_id: local_pseudonym,
-                relay_url,
-                member_did: owning_did,
-                last_seen: scp_clock::SystemClock.now_secs(),
-            };
-            crate::runtime::register_known_context_on(bi, &sealed.context_id, known);
         }
 
         // Build the returned handle from the AUTHENTICATED params carried by the

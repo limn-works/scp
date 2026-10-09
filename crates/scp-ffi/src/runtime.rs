@@ -1840,6 +1840,9 @@ fn set_release_mark(bi: &PyBridgeInstance, context_id: &str) {
 /// Removes `context_id`'s [`FfiBridgeState`], its known-context entry, and its
 /// connector and economy state, only while its release mark stands, and returns
 /// whether the mark stood.
+///
+/// The mark check and all four removals run under the registry entry's shard
+/// lock, and the [`FfiBridgeState`] is removed last.
 fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> bool {
     use dashmap::mapref::entry::Entry;
 
@@ -1847,13 +1850,34 @@ fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> boo
     if !lock_release_marks(bi).contains_key(context_id) {
         return false;
     }
-    if let Entry::Occupied(occupied) = entry {
-        occupied.remove();
-    }
     bi.core.remove_known_context(context_id);
     bi.core.remove_bridge_state(context_id);
     bi.core.remove_economy_state(context_id);
+    if let Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
     true
+}
+
+/// Registers `known` in the known-contexts registry only while `context_id`'s
+/// [`FfiBridgeState`] is registered, and returns whether it was.
+///
+/// The presence check and the registration run under the registry entry's
+/// shard lock.
+pub fn register_known_context_while_registered(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    known: KnownContext,
+) -> bool {
+    use dashmap::mapref::entry::Entry;
+
+    match ffi_state_registry(bi).entry(context_id.to_owned()) {
+        Entry::Occupied(_held) => {
+            bi.core.register_known_context(context_id, known);
+            true
+        }
+        Entry::Vacant(_) => false,
+    }
 }
 
 /// Clears the release mark a close left for `context_id`.
@@ -2147,13 +2171,21 @@ pub fn register_outlet_handler(
 /// closes the receive channel and causes `__anext__` to raise
 /// `StopAsyncIteration`. Does not error if the context was not found
 /// (idempotent).
+///
+/// All four removals run under the registry entry's shard lock, and the
+/// `FfiBridgeState` is removed last.
 pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
-    ffi_state_registry(bi).remove(context_id);
+    use dashmap::mapref::entry::Entry;
+
+    let entry = ffi_state_registry(bi).entry(context_id.to_owned());
     // Clean up known-context discovery entry via CoreFields.
     bi.core.remove_known_context(context_id);
     // Clean up per-context bridge connector state and economy state via CoreFields.
     bi.core.remove_bridge_state(context_id);
     bi.core.remove_economy_state(context_id);
+    if let Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
 }
 
 /// Test-only: spawns the per-context supervisor actor whose lifecycle state
@@ -3175,6 +3207,13 @@ mod tests {
     fn a_removal_after_a_readmit_leaves_the_state() {
         let (bi, ctx_id) = unserved_context("mark-readmitted");
 
+        let is_known = |bi: &PyBridgeInstance| {
+            all_known_contexts_on(bi)
+                .iter()
+                .any(|(id, _)| id == &ctx_id)
+        };
+        register_known_context_on(&bi, &ctx_id, release_fixture_known());
+
         set_release_mark(&bi, &ctx_id);
         readmit_context(&bi, &ctx_id);
         assert!(
@@ -3182,11 +3221,62 @@ mod tests {
             "a removal must not run once a readmit cleared the mark"
         );
         assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
+        assert!(
+            is_known(&bi),
+            "a readmitted id keeps its known-context entry"
+        );
 
         set_release_mark(&bi, &ctx_id);
         assert!(remove_context_while_released(&bi, &ctx_id));
         assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+        assert!(
+            !is_known(&bi),
+            "a marked removal drops the known-context entry"
+        );
         readmit_context(&bi, &ctx_id);
+    }
+
+    fn release_fixture_known() -> KnownContext {
+        KnownContext {
+            routing_id: [0xAB; 32],
+            relay_url: None,
+            member_did: "did:dht:z6MkReleaseMark".to_owned(),
+            last_seen: 0,
+        }
+    }
+
+    /// The known-context registration commits only while the id's FFI state is
+    /// registered: it succeeds for a registered id and refuses, registering
+    /// nothing, once the state is removed.
+    #[test]
+    fn a_known_context_registers_only_while_ffi_state_is_registered() {
+        let (bi, ctx_id) = unserved_context("known-while-registered");
+        let is_known = |bi: &PyBridgeInstance| {
+            all_known_contexts_on(bi)
+                .iter()
+                .any(|(id, _)| id == &ctx_id)
+        };
+
+        assert!(register_known_context_while_registered(
+            &bi,
+            &ctx_id,
+            release_fixture_known()
+        ));
+        assert!(
+            is_known(&bi),
+            "a registered id gains its known-context entry"
+        );
+
+        remove_context(&bi, &ctx_id);
+        assert!(!is_known(&bi), "removal drops the known-context entry");
+        assert!(
+            !register_known_context_while_registered(&bi, &ctx_id, release_fixture_known()),
+            "an id with no FFI state must be refused"
+        );
+        assert!(
+            !is_known(&bi),
+            "a refused registration must leave no known-context entry"
+        );
     }
 
     /// The mark map holds at most `MAX_RELEASED_CONTEXTS` marks: a new mark on a
