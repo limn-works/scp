@@ -1,4 +1,4 @@
-//! T1: three members interoperate on ciphersuite 2
+//! Three members interoperate on ciphersuite 2
 //! (`MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, 09 §9.5).
 //!
 //! A creates the group and adds B, then C. A's message reaches B and C, and B's

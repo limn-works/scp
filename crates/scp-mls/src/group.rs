@@ -112,7 +112,7 @@ impl Deref for EagerDropSigner {
 ///
 /// Every group restore (snapshot load, runtime provider restore) calls this
 /// right after `MlsGroup::load` and before the signer check. SCP pins one
-/// ciphersuite and migrates no older state (plan decision C1), so a group
+/// ciphersuite and migrates no older state (ADR-063), so a group
 /// persisted under another suite fails closed.
 ///
 /// # Errors
@@ -1449,7 +1449,7 @@ mod tests {
         ));
     }
 
-    /// T6: `extract_p256_scalar` over signers built with
+    /// `extract_p256_scalar` over signers built with
     /// `SignatureKeyPair::from_raw`. Each row fails a different check:
     ///
     /// | row | input | rejected by |

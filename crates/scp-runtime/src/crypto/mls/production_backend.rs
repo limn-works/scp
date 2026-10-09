@@ -747,7 +747,7 @@ mod tests {
         signer_and_provider_from_wrapper(wrapper).map(|_| ())
     }
 
-    /// T7 / C19(c): the `join_from_welcome` signer restore refuses a P-256
+    /// ADR-063: the `join_from_welcome` signer restore refuses a P-256
     /// signer whose public key is a valid point that is not `scalar·G`, and an
     /// Ed25519 signer, each with a typed `InvalidSigner`; a valid pair passes.
     #[test]

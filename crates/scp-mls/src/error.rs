@@ -207,8 +207,8 @@ pub enum MlsError {
     /// A restored MLS group runs a ciphersuite other than `SCP_CIPHERSUITE`.
     ///
     /// Raised on every group restore (snapshot load, runtime provider
-    /// restore). SCP pins one ciphersuite and migrates no older state (plan
-    /// decision C1), so a group persisted under another suite fails closed.
+    /// restore). SCP pins one ciphersuite and migrates no older state
+    /// (ADR-063), so a group persisted under another suite fails closed.
     #[error("unsupported MLS ciphersuite {got:#06x}, expected {expected:#06x}")]
     UnsupportedCiphersuite {
         /// The ciphersuite SCP requires (`SCP_CIPHERSUITE` as its RFC 9420

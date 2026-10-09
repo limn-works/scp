@@ -2393,7 +2393,7 @@ mod tests {
         }
     }
 
-    /// T7: a snapshot whose P-256 signer carries a public key that is not
+    /// A snapshot whose P-256 signer carries a public key that is not
     /// `scalar · G` fails the signer check on restore.
     #[test]
     fn build_restored_owned_rejects_mismatched_signer() {
@@ -2429,7 +2429,7 @@ mod tests {
         );
     }
 
-    /// T2(a): a snapshot of a ciphersuite-1 group (X25519 / Ed25519) fails
+    /// A snapshot of a ciphersuite-1 group (X25519 / Ed25519) fails
     /// the restore closed with the ciphersuite error, which runs before the
     /// signer check: without it the Ed25519 signer would surface as
     /// a signer error instead, and this test fails.

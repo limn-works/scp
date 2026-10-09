@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(extracted, None);
     }
 
-    /// T4: the 0xFF01 payload must be a valid 65-byte uncompressed P-256
+    /// The 0xFF01 payload must be a valid 65-byte uncompressed P-256
     /// point. 3, 32, 33 and 66 bytes, a wrong prefix, and an off-curve point are
     /// all rejected with `ExtensionError`.
     #[test]
@@ -288,7 +288,7 @@ mod tests {
         );
     }
 
-    /// T4: a real cs2 `KeyPackage` carries the 65-byte key: the adder's
+    /// A real cs2 `KeyPackage` carries the 65-byte key: the adder's
     /// admission reports it, and the joiner reads the same key back through
     /// `extract_member_wrapping_key` on its own leaf.
     #[test]

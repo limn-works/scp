@@ -596,7 +596,7 @@ mod tests {
         )
     }
 
-    /// T2(a): a snapshot of a ciphersuite-1 group fails closed on restore with
+    /// A snapshot of a ciphersuite-1 group fails closed on restore with
     /// `UnsupportedCiphersuite { expected: 2, got: 1 }`. The ciphersuite check
     /// runs before the signer check; without it the Ed25519 signer
     /// would surface as `InvalidSigner` instead, and this test fails.
@@ -617,7 +617,7 @@ mod tests {
         );
     }
 
-    /// T2(a): a pending join loads no group, so an Ed25519 signer fails the
+    /// A pending join loads no group, so an Ed25519 signer fails the
     /// signer check with `WrongScheme`.
     #[test]
     fn restore_pending_join_rejects_ed25519_signer() {
@@ -635,7 +635,7 @@ mod tests {
         );
     }
 
-    /// T7: a pending join whose P-256 signer carries a public key that does not
+    /// A pending join whose P-256 signer carries a public key that does not
     /// match its scalar fails `check_keypair` on restore.
     #[test]
     fn restore_pending_join_rejects_mismatched_signer() {
@@ -659,7 +659,7 @@ mod tests {
         );
     }
 
-    /// T7: a cs2 group snapshot whose signer bytes are swapped for a
+    /// A cs2 group snapshot whose signer bytes are swapped for a
     /// mismatched P-256 pair fails `check_keypair` in `deserialize_state`.
     #[test]
     fn deserialize_state_rejects_mismatched_signer() {
