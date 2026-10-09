@@ -5624,15 +5624,20 @@ def leg_commands(job: dict, axis: str | None, value: object) -> list[str] | None
 
 
 def leg_step_identities(job: dict, axis: str, value: object) -> set[str] | None:
-    """Return one string per step a leg runs, holding every key but `if:`.
+    """Return one string per step a leg runs, holding the step and its job.
 
-    Each string is the step serialized with sorted keys and every
-    `${{ matrix.<axis> }}` replaced by the leg's value, so its `run:` lines,
-    `uses:`, `with:` and `env:` all enter it. Returns None when leg_steps does,
-    and when any `${{ }}` expression in the job outside `strategy:`, a step's
-    `if:` and a rust-cache step's `save-if` names `matrix` other than as that
-    exact placeholder: such an expression, in a step or in a job `env:` a step
-    reads, evaluates per leg while its text stays the same on every leg.
+    Each string serializes, with sorted keys, the step without its `if:` beside
+    every job key but `strategy:`, `steps:` and `name:`, and replaces every
+    `${{ matrix.<axis> }}` in it with the leg's value. A step's `run:`, `uses:`,
+    `with:` and `env:`, and a job `env:`, `defaults:`, `runs-on:` or any other
+    job key that can change what the step does, therefore differ between two
+    legs whenever the leg value they hold does. `name:` is left out because it
+    is a display label no step can read.
+
+    Returns None when leg_steps does, and when any `${{ }}` expression in the
+    job outside `strategy:`, a step's `if:` and a rust-cache step's `save-if`
+    names `matrix` other than as that exact placeholder, or names `strategy`:
+    such an expression evaluates per leg while its text stays the same.
     """
     steps = leg_steps(job, axis, value)
     if steps is None:
@@ -5656,12 +5661,18 @@ def leg_step_identities(job: dict, axis: str, value: object) -> set[str] | None:
         for step in job.get("steps") or []
     ]
     for expression in re.findall(r"\$\{\{.*?\}\}", json.dumps(scanned), re.DOTALL):
-        if re.search(r"\bmatrix\b", expression) and not placeholder.fullmatch(expression):
+        if re.search(r"\bstrategy\b", expression) or (
+            re.search(r"\bmatrix\b", expression) and not placeholder.fullmatch(expression)
+        ):
             return None
+    context = {key: item for key, item in job.items() if key not in ("strategy", "steps", "name")}
     return {
         placeholder.sub(
             str(value),
-            json.dumps({key: item for key, item in step.items() if key != "if"}, sort_keys=True),
+            json.dumps(
+                {"job": context, "step": {key: item for key, item in step.items() if key != "if"}},
+                sort_keys=True,
+            ),
         )
         for step in steps
     }
@@ -5741,7 +5752,8 @@ def push_only_legs_repeat_other_legs(
     three feature sets. Such a leg must run at least one command (leg_commands),
     and every step it runs must be, by leg_step_identities, a step some leg of
     pull_request and merge_group runs: the same `run:` script, `uses:`, `with:`
-    and `env:`. A leg whose steps leg_steps cannot read fails.
+    and `env:`, under the same job keys. A leg whose steps leg_steps cannot read
+    fails.
     """
     elsewhere: set[str] = set()
     for value in other_values:
@@ -6724,6 +6736,12 @@ def check_push_writer_mutants(doc: dict) -> None:
             ),
         ),
         (
+            "a push-only leg whose run line reads its strategy job index",
+            lambda job: job["steps"].append(
+                {"run": "cargo test -p scp-transport ${{ strategy.job-index }}"}
+            ),
+        ),
+        (
             "a push-only leg reading a matrix key an include adds",
             lambda job: job["steps"].append(
                 {"run": "cargo test -p scp-transport ${{ matrix['extra'] }}"}
@@ -6749,6 +6767,51 @@ def check_push_writer_mutants(doc: dict) -> None:
             ),
             f"{gaps}",
         )
+    # A job key outside `steps` holding the exact `${{ matrix.leg }}` placeholder
+    # hands each leg its own value, which a step every leg runs reads with text
+    # that is the same on every leg: a job `env:` a step's shell reads, or a
+    # `defaults:` working directory a step's relative path resolves under. Both
+    # jobs with a push-only leg report it; the same keys holding no matrix value
+    # report nothing.
+    for job_id in ("rust-test-macos", "rust-clippy"):
+        for label, key, item, run, reported in (
+            (
+                "a job env value that is its leg",
+                "env",
+                {"LEG": "${{ matrix.leg }}"},
+                'cargo test -p scp-transport && if [ "$LEG" = all ]; then ./push-only.sh; fi',
+                True,
+            ),
+            (
+                "a job defaults working directory named after its leg",
+                "defaults",
+                {"run": {"working-directory": "legs/${{ matrix.leg }}"}},
+                "cargo test -p scp-transport && ./run.sh",
+                True,
+            ),
+            (
+                "a job env value that names no matrix axis",
+                "env",
+                {"LEG": "${{ github.sha }}"},
+                'cargo test -p scp-transport && if [ "$LEG" = all ]; then ./push-only.sh; fi',
+                False,
+            ),
+        ):
+            changed = copy.deepcopy(doc)
+            job = changed["jobs"][job_id]
+            job[key] = item
+            job["steps"].append({"run": run})
+            gaps = [
+                gap
+                for gap in push_writer_gaps(changed)
+                if gap.startswith(f"{job_id}'s matrix `leg` runs") and "push-only leg" in gap
+            ]
+            check(
+                f"{job_id} with a push-only leg reading {label} is "
+                f"{'reported' if reported else 'not reported'}",
+                bool(gaps) is reported,
+                f"{push_writer_gaps(changed)}",
+            )
     check(
         "the unmutated rust-test matrix is read without a gap",
         not any(gap.startswith("rust-test") for gap in push_writer_gaps(doc)),
