@@ -962,7 +962,8 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpPyError {
 /// Registers all SCP exception classes on the given Python module.
 ///
 /// Called from the `_scp_core` module init function in `lib.rs`. This makes
-/// the exception classes importable as `from _scp_core import ScpError, ...`
+/// the exception classes importable as
+/// `from scp_sdk._scp_core import ScpError, ...`
 /// and also available in the `scp_sdk` namespace via re-export.
 ///
 /// # Errors

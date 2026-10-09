@@ -433,8 +433,7 @@ def test_no_sdk_or_test_file_imports_the_extension_by_its_bare_name() -> None:
     ``import _scp_core`` inside its body passes collection and then raises
     ``ModuleNotFoundError`` on a runner that has the extension, so this scan
     reads both test directories as well. The repository-root ``tests/``
-    directory holds ``tests/integration/phase3_integration_test.py``, whose
-    former bare-name guard skipped its real-bridge class over a working build.
+    directory holds ``tests/integration/phase3_integration_test.py``.
     """
     python_root = Path(_extension.__file__).resolve().parent.parent
     repo_root = python_root.parent.parent

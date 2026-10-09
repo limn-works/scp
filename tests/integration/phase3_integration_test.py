@@ -39,9 +39,14 @@ import pytest
 # not load for a file under the repository-root ``tests/`` directory, so this
 # module loads it by path. It skips only when no extension file is installed
 # (SCP-VALID-7081) and raises for a present extension that failed to load
-# (SCP-VALID-7082). maturin installs the extension as ``scp_sdk._scp_core``;
-# a bare ``import _scp_core`` finds nothing there and would skip over a
-# working build.
+# (SCP-VALID-7082). maturin installs the extension as ``scp_sdk._scp_core``.
+#
+# Status: this module fails at import on every machine, because the
+# ``from scp_sdk import (... ToolDefinition ...)`` below names an export
+# ``scp_sdk`` does not define, so pytest collects and runs no test
+# here, and no CI step runs the module. Its tests also patch
+# ``sys.modules["_scp_core"]``, a name no SDK code reads. The guard below is
+# inert until the suite is rewritten.
 _CONFTEST_SPEC = importlib.util.spec_from_file_location(
     "_scp_python_tests_conftest",
     Path(__file__).resolve().parents[2] / "bindings" / "python" / "tests" / "conftest.py",
@@ -59,8 +64,6 @@ try:
 except Exception as _exc:
     _NATIVE_SKIP_REASON = skip_reason_if_extension_absent(_exc)
 
-# When the extension IS installed, every bridge-marked test runs against the
-# real Rust stack; a broken extension fails collection instead of skipping.
 requires_bridge = pytest.mark.skipif(
     _NATIVE_SKIP_REASON is not None,
     reason=_NATIVE_SKIP_REASON or "",
