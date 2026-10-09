@@ -227,15 +227,26 @@ nothing:
                tables.
   matrix-axis
                Job rust-test-optional-features runs its commands on three
-               legs, one per value of a matrix `group` axis, and job
-               rust-clippy runs on three values of a `leg` axis. GitHub runs a
-               leg whose value no step names and reports it green over none of
-               the gated commands, and it skips a step whose value the axis
-               lacks on every leg, so deleting `platform-testing` from the
-               `group` axis would have dropped eight commands from every run
-               while `ci` passed. The check reports a step gated with
-               `if: matrix.<axis> == '<value>'` on an axis the job's matrix does
-               not define.
+               legs, one per value of a matrix `group` axis, and jobs
+               rust-clippy and rust-test-macos run on the values of a `leg`
+               axis that names one list for push and another for every other
+               event. GitHub runs a leg whose value no step names and reports
+               it green over none of the gated commands, and it skips a step
+               whose value the axis lacks on every leg, so deleting
+               `platform-testing` from the `group` axis would have dropped
+               eight commands from every run while `ci` passed. A step gated
+               with `if: matrix.<axis> == '<value>'`, or an `||` of such
+               comparisons, must name a value each event's list holds. The
+               check reports a step gated that way on an axis the job's matrix
+               does not define.
+  leg-commands
+               Jobs rust-test-macos and rust-clippy split their commands
+               across legs, and rust-doc's two commands split across rust-doc
+               and rust-doctest. A step moved to the wrong leg, a leg value
+               dropped, or a command deleted while splitting runs that command
+               on no leg, and every leg still passes. LEG_COMMANDS pins the
+               commands each group ran before the split, and the check fails
+               unless each event's legs run every pinned command exactly once.
   package-writers
                Job docker-image-cache writes the Docker layer cache to the
                ghcr.io tag `buildcache:docker-image` with the `docker-cache`
@@ -254,8 +265,10 @@ nothing:
                merge_group run selects and the same push does not (for the
                setup-bun cache, whose key names no job, that no push runs any
                job writing it), a writer's
-               matrix that drops on push the leg its `save-if` names, and any
-               job whose `if:` answers a scenario differently from SCENARIOS.
+               matrix that drops on push the leg its `save-if` names, a push
+               leg no other event runs unless every step it runs is one an
+               other event's leg runs, and any job whose `if:` answers a
+               scenario differently from SCENARIOS.
   macos-bridges
                A pull request runs the four macOS bridge jobs (xcframework,
                pyo3-module-macos, swift-build-test and bridge-parity-swift)
@@ -302,6 +315,7 @@ from __future__ import annotations
 import argparse
 import copy
 import functools
+import itertools
 import json
 import os
 import posixpath
@@ -460,6 +474,7 @@ RUSTDOC_LINT_LEVEL = "forbid"
 WORKSPACE_SCOPED_JOBS = {
     ("ci.yml", "rust-clippy"),
     ("ci.yml", "rust-doc"),
+    ("ci.yml", "rust-doctest"),
     ("ci.yml", "rust-test"),
     ("docs.yml", "rust-docs"),
 }
@@ -747,6 +762,7 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "rust-build-uniffi-production",
     "rust-deny",
     "rust-doc",
+    "rust-doctest",
     "rust-fmt",
     "rust-test-napi-production",
     "scaffold-typescript-web-check",
@@ -794,6 +810,7 @@ RUST_ONLY_RUNS = {
     "rust-clippy": True,
     "rust-deny": True,
     "rust-doc": True,
+    "rust-doctest": True,
     "rust-fmt": True,
     "rust-test": True,
     "rust-test-optional-features": True,
@@ -5492,16 +5509,208 @@ PUSH_MATRIX = re.compile(
     r"^\$\{\{\s*fromJSON\(\s*github\.event_name\s*==\s*'push'\s*&&\s*'(\[[^']*\])'"
     r"\s*\|\|\s*'(\[[^']*\])'\s*\)\s*\}\}$"
 )
-SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?")
+# GitHub Actions reads context and property names, and compares strings with
+# `==`, without regard to case, so every pattern that reads a `matrix`,
+# `strategy` or `runner` reference matches in any case, and a name it captures
+# is looked up in any case (matrix_key).
+SAVE_IF_MATRIX = re.compile(r"matrix\.([\w-]+)\s*==\s*'?([\w.-]+)'?", re.IGNORECASE)
 # A matrix axis a cache key expands, so that each value of the axis writes its own
 # entry: `shared-key: transport-optional-${{ matrix.group }}`.
-KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}")
+KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}", re.IGNORECASE)
 # A key that names the runner's platform, so each runner writes its own entry.
 # Swatinem/rust-cache puts the platform into every key without the text naming it.
-KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b")
+KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b", re.IGNORECASE)
 
 
-def push_runs_step(step: dict) -> bool:
+class AmbiguousMatrixKey(ValueError):
+    """Two matrix keys differ only in case, so a reference names neither for certain."""
+
+
+def matrix_key(name: str, keys) -> str | None:
+    """Return the key of `keys` that `name` names in any case.
+
+    Returns None when no key matches, a state the caller may skip. Raises
+    AmbiguousMatrixKey when two or more keys match, which the caller reports.
+    """
+    found = [key for key in keys if str(key).lower() == name.lower()]
+    if len(found) > 1:
+        raise AmbiguousMatrixKey(
+            f"`matrix.{name}` names each of {sorted(map(str, found))}, matrix keys "
+            f"that differ only in case"
+        )
+    return found[0] if found else None
+
+
+def axis_event_values(values: object) -> dict[str, list] | None:
+    """Return the values one matrix axis runs, as {"push": [...], "other": [...]}.
+
+    A literal list runs on every event. A PUSH_MATRIX expression runs its first
+    list on push and its second on pull_request and merge_group. Any other value
+    returns None.
+    """
+    if isinstance(values, list):
+        return {"push": values, "other": values}
+    chosen = PUSH_MATRIX.match(str(values))
+    if chosen is None:
+        return None
+    push_values, other_values = (json.loads(group) for group in chosen.groups())
+    return {"push": push_values, "other": other_values}
+
+
+def axis_terms(condition: object) -> tuple[str, list[str]] | None:
+    """Read a step `if:` that picks legs of one matrix axis by value.
+
+    Returns (axis, values) when the condition, with or without the `${{ … }}`
+    wrapper, is `matrix.<axis> == '<value>'` or an `||` of such comparisons that
+    all name one axis. Returns None for every other condition, including an empty
+    one, so a caller can report what it cannot read.
+    """
+    text = str(condition or "").strip()
+    wrapped = re.fullmatch(r"\$\{\{(.*)\}\}", text, re.DOTALL)
+    text = (wrapped.group(1) if wrapped else text).strip()
+    if not text:
+        return None
+    try:
+        tree = parse_condition(text)
+    except ValueError:
+        return None
+
+    def disjuncts(node: tuple) -> list[tuple]:
+        if node[0] == "or":
+            return [leaf for part in node[1] for leaf in disjuncts(part)]
+        return [node]
+
+    axes: set[str] = set()
+    values: list[str] = []
+    for leaf in disjuncts(tree):
+        if leaf[0] != "==":
+            return None
+        axis = re.fullmatch(r"matrix\.([A-Za-z0-9_-]+)", leaf[1], re.IGNORECASE)
+        value = re.fullmatch(r"'([^']*)'", leaf[2])
+        if axis is None or value is None:
+            return None
+        axes.add(axis.group(1))
+        values.append(value.group(1))
+    if len(axes) != 1:
+        return None
+    return axes.pop(), values
+
+
+# The lines of a `run:` script that leg_commands counts as a command: a cargo
+# invocation, or a bash script a job starts.
+LEG_COMMAND_PREFIXES = ("cargo ", "bash ")
+
+
+def leg_steps(job: dict, axis: str | None, value: object) -> list[dict] | None:
+    """Return the steps one leg of a job runs, in step order.
+
+    A step runs on the leg when it carries no `if:`, or when axis_terms reads its
+    `if:` as picking values of `axis` that include the leg's `value`. With `axis`
+    None the job has one leg. Returns None when a step's `if:` leaves open whether
+    this leg runs it.
+    """
+    steps: list[dict] = []
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        condition = step.get("if")
+        if condition:
+            terms = axis_terms(condition)
+            if axis is None or terms is None or terms[0] != axis:
+                return None
+            if str(value).lower() not in {term.lower() for term in terms[1]}:
+                continue
+        steps.append(step)
+    return steps
+
+
+def leg_placeholder(axis: str | None) -> re.Pattern | None:
+    """Return the pattern of `${{ matrix.<axis> }}` in any case, or None with no axis."""
+    return (
+        re.compile(rf"\$\{{\{{\s*matrix\.{re.escape(axis)}\s*\}}\}}", re.IGNORECASE)
+        if axis
+        else None
+    )
+
+
+def leg_commands(job: dict, axis: str | None, value: object) -> list[str] | None:
+    """Return the commands one leg of a job runs, in step order.
+
+    Each command is a logical line of the `run:` script of a step leg_steps finds
+    the leg running that starts with one of LEG_COMMAND_PREFIXES, with every
+    `${{ matrix.<axis> }}` replaced by the leg's value, so two legs whose step text
+    is the same but whose matrix value differs run two different commands. Returns
+    None when leg_steps does.
+    """
+    steps = leg_steps(job, axis, value)
+    if steps is None:
+        return None
+    placeholder = leg_placeholder(axis)
+    commands: list[str] = []
+    for step in steps:
+        for line in logical_lines(step.get("run") or ""):
+            if line.startswith(LEG_COMMAND_PREFIXES):
+                commands.append(placeholder.sub(str(value), line) if placeholder else line)
+    return commands
+
+
+def leg_step_identities(job: dict, axis: str, value: object) -> set[str] | None:
+    """Return one string per step a leg runs, holding the step and its job.
+
+    Each string serializes, with sorted keys, the step without its `if:` beside
+    every job key but `strategy:`, `steps:` and `name:`, and replaces every
+    `${{ matrix.<axis> }}` in it with the leg's value. A step's `run:`, `uses:`,
+    `with:` and `env:`, and a job `env:`, `defaults:`, `runs-on:` or any other
+    job key that can change what the step does, therefore differ between two
+    legs whenever the leg value they hold does. `name:` is left out because it
+    is a display label no step can read.
+
+    Returns None when leg_steps does, and when any `${{ }}` expression in the
+    job outside `strategy:`, a step's `if:` and a rust-cache step's `save-if`
+    names `matrix` other than as that exact placeholder, or names `strategy`:
+    such an expression evaluates per leg while its text stays the same.
+    """
+    steps = leg_steps(job, axis, value)
+    if steps is None:
+        return None
+    placeholder = leg_placeholder(axis)
+    scanned = {key: item for key, item in job.items() if key != "strategy"}
+    scanned["steps"] = [
+        {
+            key: (
+                {name: text for name, text in item.items() if name != "save-if"}
+                if key == "with"
+                and isinstance(item, dict)
+                and str(step.get("uses", "")).startswith("Swatinem/rust-cache@")
+                else item
+            )
+            for key, item in step.items()
+            if key != "if"
+        }
+        if isinstance(step, dict)
+        else step
+        for step in job.get("steps") or []
+    ]
+    for expression in re.findall(r"\$\{\{.*?\}\}", json.dumps(scanned), re.DOTALL):
+        if re.search(r"\bstrategy\b", expression, re.IGNORECASE) or (
+            re.search(r"\bmatrix\b", expression, re.IGNORECASE)
+            and not placeholder.fullmatch(expression)
+        ):
+            return None
+    context = {key: item for key, item in job.items() if key not in ("strategy", "steps", "name")}
+    return {
+        placeholder.sub(
+            str(value),
+            json.dumps(
+                {"job": context, "step": {key: item for key, item in step.items() if key != "if"}},
+                sort_keys=True,
+            ),
+        )
+        for step in steps
+    }
+
+
+def push_runs_step(step: dict, legs: dict[str, str] | None = None) -> bool:
     """Report whether a push to `main` can run one step and meet its `save-if`.
 
     The step's `if:` and its `save-if`, each with or without the `${{ … }}`
@@ -5510,6 +5719,8 @@ def push_runs_step(step: dict) -> bool:
     Every other comparison that names some other name may come out either way,
     and one pair of operands gets one answer wherever it appears. The step runs
     on push when some choice of those answers makes the whole expression true.
+    `legs` maps `matrix.<axis>` operands to one leg's values, which the
+    expression then reads as known rather than free.
     An expression outside the grammar raises ValueError.
     """
     inputs = step.get("with") or {}
@@ -5523,15 +5734,24 @@ def push_runs_step(step: dict) -> bool:
     if not parts:
         return True
     tree = parse_condition(" && ".join(parts))
-    known = {"github.event_name": "push", "github.ref": "refs/heads/main"}
+    known = {
+        name.lower(): text
+        for name, text in {
+            "github.event_name": "push",
+            "github.ref": "refs/heads/main",
+            **(legs or {}),
+        }.items()
+    }
 
+    # GitHub reads names and compares strings without regard to case.
     def operand(token: str) -> str | None:
         quoted = re.fullmatch(r"'([^']*)'", token)
         if quoted:
-            return quoted.group(1)
+            return quoted.group(1).lower()
         if token in ("true", "false") or token.isdigit():
             return token
-        return known.get(token)
+        found = known.get(token.lower())
+        return None if found is None else found.lower()
 
     free: list[tuple[str, ...]] = []
 
@@ -5540,7 +5760,7 @@ def push_runs_step(step: dict) -> bool:
             for part in node[1]:
                 collect(part)
         elif None in (operand(node[1]), operand(node[2])):
-            pair = tuple(sorted((node[1], node[2])))
+            pair = tuple(sorted((node[1].lower(), node[2].lower())))
             if pair not in free:
                 free.append(pair)
 
@@ -5550,7 +5770,7 @@ def push_runs_step(step: dict) -> bool:
             return any(results) if node[0] == "or" else all(results)
         left, right = operand(node[1]), operand(node[2])
         if None in (left, right):
-            equal = answers[tuple(sorted((node[1], node[2])))]
+            equal = answers[tuple(sorted((node[1].lower(), node[2].lower())))]
         else:
             equal = left == right
         return equal if node[0] == "==" else not equal
@@ -5560,6 +5780,35 @@ def push_runs_step(step: dict) -> bool:
         value(tree, {pair: bool(mask >> index & 1) for index, pair in enumerate(free)})
         for mask in range(2 ** len(free))
     )
+
+
+def push_only_legs_repeat_other_legs(
+    job: dict, axis: str, push_only: list, other_values: list
+) -> bool:
+    """Report whether every push-only leg repeats steps other events' legs run.
+
+    A push to `main` may run a leg no other event runs only to write a cache those
+    legs restore: job rust-test-macos's `all` leg runs the steps its three
+    pull-request legs split between them, so one leg writes one entry holding all
+    three feature sets. Such a leg must run at least one command (leg_commands),
+    and every step it runs must be, by leg_step_identities, a step some leg of
+    pull_request and merge_group runs: the same `run:` script, `uses:`, `with:`
+    and `env:`, under the same job keys. A leg whose steps leg_steps cannot read
+    fails.
+    """
+    elsewhere: set[str] = set()
+    for value in other_values:
+        identities = leg_step_identities(job, axis, value)
+        if identities is None:
+            return False
+        elsewhere |= identities
+    for value in push_only:
+        identities = leg_step_identities(job, axis, value)
+        if not leg_commands(job, axis, value) or identities is None:
+            return False
+        if not identities <= elsewhere:
+            return False
+    return True
 
 
 def push_writer_gaps(doc: dict) -> list[str]:
@@ -5655,10 +5904,14 @@ def push_writer_gaps(doc: dict) -> list[str]:
                 )
                 continue
             push_values, other_values = (json.loads(group) for group in chosen.groups())
-            if not set(map(str, push_values)) <= set(map(str, other_values)):
+            push_only = [v for v in push_values if str(v) not in set(map(str, other_values))]
+            if push_only and not push_only_legs_repeat_other_legs(
+                job, key, push_only, other_values
+            ):
                 gaps.append(
                     f"{job_id}'s matrix `{key}` runs {push_values} on push, outside "
-                    f"the {other_values} every other event runs"
+                    f"the {other_values} every other event runs, and a push-only leg "
+                    f"runs no command, or a step no leg of another event runs"
                 )
             on_push[key] = push_values
             elsewhere[key] = other_values
@@ -5678,21 +5931,51 @@ def push_writer_gaps(doc: dict) -> list[str]:
                     f"`save-if` this check cannot read ({unreadable})"
                 )
             leg_conditions = f"{inputs.get('save-if', '')} {step.get('if') or ''}"
-            for key, value in SAVE_IF_MATRIX.findall(leg_conditions):
-                if key in on_push and value not in map(str, on_push[key]):
+            named = []
+            for name, value in SAVE_IF_MATRIX.findall(leg_conditions):
+                try:
+                    key = matrix_key(name, on_push)
+                except AmbiguousMatrixKey as ambiguous:
+                    gaps.append(f"{job_id} saves {cache_write(step)} where {ambiguous}")
+                    continue
+                if key is not None:
+                    named.append((key, value))
+            axes = sorted({key for key, _ in named})
+            if axes:
+                # Fix each named axis at each combination of the values a push runs,
+                # and ask whether one of those legs runs this step and saves.
+                try:
+                    saved = any(
+                        push_runs_step(
+                            step,
+                            {f"matrix.{key}": leg for key, leg in zip(axes, combination)},
+                        )
+                        for combination in itertools.product(
+                            *(list(map(str, on_push[key])) for key in axes)
+                        )
+                    )
+                except ValueError:
+                    saved = True  # The unreadable expression is reported above.
+                if not saved:
+                    legs = " or ".join(f"`{key} == {value}`" for key, value in named)
+                    pushed = ", ".join(f"`{key}` over {on_push[key]}" for key in axes)
                     gaps.append(
                         f"{job_id} saves {cache_write(step)} only from matrix leg "
-                        f"`{key} == {value}`, and a push runs `{key}` over "
-                        f"{on_push[key]} alone"
+                        f"{legs}, and a push runs {pushed} alone"
                     )
             key_text = f"{inputs.get('shared-key', '')} {inputs.get('key', '')}"
-            key_axes = set(KEY_MATRIX_AXIS.findall(key_text))
+            named_axes = KEY_MATRIX_AXIS.findall(key_text)
             action = str(step.get("uses") or "").split("@", 1)[0]
             if action == "Swatinem/rust-cache" or KEY_RUNNER.search(key_text):
-                key_axes |= set(KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or "")))
+                named_axes += KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or ""))
+            key_axes = set()
+            for name in named_axes:
+                try:
+                    key_axes.add(matrix_key(name, on_push))
+                except AmbiguousMatrixKey as ambiguous:
+                    gaps.append(f"{job_id} writes {cache_write(step)} where {ambiguous}")
+            key_axes.discard(None)
             for key in sorted(key_axes):
-                if key not in on_push:
-                    continue
                 pushed_values = set(map(str, on_push[key]))
                 unwritten = [v for v in elsewhere[key] if str(v) not in pushed_values]
                 if unwritten:
@@ -5704,26 +5987,284 @@ def push_writer_gaps(doc: dict) -> list[str]:
     return gaps
 
 
-# A step's `if:` that selects one value of one matrix axis, with or without the
-# `${{ … }}` wrapper GitHub accepts around a step condition.
-AXIS_CONDITION = re.compile(
-    r"^\s*(?:\$\{\{\s*)?matrix\.([A-Za-z0-9_-]+)\s*==\s*'([^']*)'\s*(?:\}\})?\s*$"
+# The commands each split job ran before its split into legs, one tuple per
+# group of jobs that together hold them. A push and a pull request each run the
+# group's legs (leg_commands) for that event, and leg_command_gaps requires that
+# those legs run every pinned command exactly once, so a split,
+# a merge, or a renamed leg cannot drop a command or run one twice. A job named
+# here that the event does not run contributes no command, so the rust-doc pair
+# pins no command for push. A change to what a job runs edits this table in the
+# same pull request.
+TRANSPORT_FEATURES = "quic,http3,udp,coap,nostr,webrtc"
+APPLE_FEATURES = "apple,sync,sqlite,filesystem,file,encrypting,testing"
+DOC_FEATURES = (
+    "scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,"
+    "scp-runtime/testing,scp-runtime/saga-witness-test-mint,"
+    "scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,"
+    "scp-ffi-uniffi/outlet-capability-test-grant,scp-node/cloud-blobs,scp-relay/cloud-blobs"
 )
+CLIPPY_WORKSPACE_FEATURES = (
+    "scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,"
+    "scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,"
+    "scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,"
+    "scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,"
+    "scp-ffi-uniffi/outlet-capability-test-grant"
+)
+NEXTEST = "cargo nextest run --no-tests=fail"
+LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("rust-test-macos",),
+        ("push", "pull_request"),
+        (
+            "cargo test -p scp-transport --features combined,local-cache",
+            (
+                f"{NEXTEST} -p scp-transport --features {TRANSPORT_FEATURES} -E "
+                "'not (binary(nostr_roundtrip) | binary(webrtc_roundtrip) | "
+                "test(/^nostr::/) | test(/^webrtc::/))'"
+            ),
+            f"{NEXTEST} -p scp-transport --features {TRANSPORT_FEATURES} --test nostr_roundtrip",
+            f"{NEXTEST} -p scp-transport --features {TRANSPORT_FEATURES} --test webrtc_roundtrip",
+            (
+                f"{NEXTEST} -p scp-transport --features {TRANSPORT_FEATURES} --lib "
+                "-E 'test(/^nostr::/)'"
+            ),
+            (
+                f"{NEXTEST} -p scp-transport --features {TRANSPORT_FEATURES} --lib "
+                "-E 'test(/^webrtc::/)'"
+            ),
+            f"{NEXTEST} -p scp-transport --features sqlite-blob,redb-blob,startup",
+            f"{NEXTEST} -p scp-platform --features {APPLE_FEATURES} --lib -E 'test(/^apple::/)'",
+            (
+                f"{NEXTEST} -p scp-platform --features {APPLE_FEATURES} --lib "
+                "-E 'test(/^syncable::tests::storage_conformance::/)'"
+            ),
+            (
+                f"{NEXTEST} -p scp-platform --features {APPLE_FEATURES} --lib "
+                "-E 'test(/^syncable::tests::/) - test(/^syncable::tests::storage_conformance::/)'"
+            ),
+            (
+                f"{NEXTEST} -p scp-platform --features {APPLE_FEATURES} "
+                "-E 'not (test(/^apple::/) | test(/^syncable::tests::/))'"
+            ),
+        ),
+    ),
+    (
+        ("rust-clippy",),
+        ("push", "pull_request"),
+        (
+            (
+                f"cargo clippy --workspace --all-targets --features {CLIPPY_WORKSPACE_FEATURES} "
+                "-- -D warnings"
+            ),
+            "bash scripts/check-examples-compile.sh",
+            "bash scripts/tests/examples-compile/run-tests.sh",
+            (
+                f"cargo clippy -p scp-transport --features {TRANSPORT_FEATURES} --all-targets "
+                "-- -D warnings"
+            ),
+            "cargo clippy -p scp-node --features quic,http3,udp,testing --all-targets -- -D warnings",
+            (
+                f"cargo clippy -p scp-platform --features {APPLE_FEATURES} --all-targets "
+                "-- -D warnings"
+            ),
+            "cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings",
+            (
+                "cargo clippy -p scp-transport --features "
+                "sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings"
+            ),
+            "cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings",
+            "cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings",
+        ),
+    ),
+    (
+        ("rust-doc", "rust-doctest"),
+        ("pull_request",),
+        (
+            f"cargo test --workspace --doc --features {DOC_FEATURES}",
+            f"cargo doc --workspace --no-deps --document-private-items --features {DOC_FEATURES}",
+        ),
+    ),
+)
+
+
+def event_runs_job(job: dict, event: str) -> bool:
+    """Report whether a job's `if:` can hold on `event`, through push_runs_step.
+
+    Only `github.event_name` (and `github.ref`, which push_runs_step fixes at
+    `main`) is known; every filter output stays free, so the answer is no only
+    when the condition rules the event out whatever the outputs say. A condition
+    outside the grammar counts as running, so the commands it guards still count.
+    """
+    try:
+        return push_runs_step({"if": job.get("if")}, {"github.event_name": event})
+    except ValueError:
+        return True
+
+
+def leg_command_gaps(doc: dict) -> list[str]:
+    """Return each way a split job's legs disagree with LEG_COMMANDS.
+
+    CRITERION: for each group of jobs in LEG_COMMANDS and each event it names,
+    the legs that event runs (every value of the job's `leg` axis for that event,
+    or the one leg of a job with no such axis; a job whose `if:` rules the event
+    out runs none) run, by leg_commands, each pinned command exactly once, and no
+    command the table does not pin. A leg whose steps leg_commands cannot read is
+    reported. A job named in the table and absent from the workflow is reported.
+    """
+    gaps = []
+    for job_ids, events, pinned in LEG_COMMANDS:
+        label = " + ".join(job_ids)
+        missing = [job_id for job_id in job_ids if job_id not in doc["jobs"]]
+        if missing:
+            gaps.append(f"{label}: the workflow has no job {', '.join(missing)}")
+            continue
+        for event in events:
+            ran: list[str] = []
+            for job_id in job_ids:
+                job = doc["jobs"][job_id]
+                if not event_runs_job(job, event):
+                    continue
+                matrix = (job.get("strategy") or {}).get("matrix") or {}
+                lists = axis_event_values(matrix.get("leg")) if "leg" in matrix else None
+                if "leg" in matrix and lists is None:
+                    gaps.append(f"{job_id}: matrix axis leg {matrix['leg']!r} is unreadable")
+                    continue
+                key = "push" if event == "push" else "other"
+                for value in lists[key] if lists else [None]:
+                    commands = leg_commands(job, "leg" if lists else None, value)
+                    if commands is None:
+                        gaps.append(
+                            f"{job_id} leg {value}: a step `if:` leaves open whether "
+                            f"the leg runs it"
+                        )
+                        continue
+                    ran.extend(commands)
+            for command in pinned:
+                count = ran.count(command)
+                if count != 1:
+                    gaps.append(
+                        f"{label} on {event}: {command!r} runs on {count} legs, not one"
+                    )
+            for command in dict.fromkeys(ran):
+                if command not in pinned:
+                    gaps.append(
+                        f"{label} on {event}: {command!r} runs, and LEG_COMMANDS does "
+                        f"not pin it"
+                    )
+    return gaps
+
+
+def check_leg_commands(doc: dict) -> None:
+    """The live legs run the pinned commands, and mutants of them are reported."""
+    gaps = leg_command_gaps(doc)
+    check("every split job's legs run each pinned command exactly once", not gaps, f"{gaps}")
+
+    def steps_running(mutant: dict, job_id: str, command: str) -> list[dict]:
+        return [
+            step
+            for step in mutant["jobs"][job_id]["steps"]
+            if isinstance(step, dict) and command in logical_lines(step.get("run") or "")
+        ]
+
+    for job_ids, events, pinned in LEG_COMMANDS:
+        command = pinned[-1]
+        holder = next(
+            (job_id for job_id in job_ids if steps_running(doc, job_id, command)), None
+        )
+        check(
+            f"{' + '.join(job_ids)} has a step running {command[:40]!r} for the controls",
+            holder is not None,
+            "no step runs it",
+        )
+        if holder is None:
+            continue
+        event = events[-1]
+
+        deleted = copy.deepcopy(doc)
+        step = steps_running(deleted, holder, command)[0]
+        step["run"] = "\n".join(
+            line for line in logical_lines(step["run"]) if line != command
+        ) or "true"
+        gaps = leg_command_gaps(deleted)
+        check(
+            f"deleting {command[:40]!r} from {holder} is reported",
+            any(f"on {event}: {command!r} runs on 0 legs" in gap for gap in gaps),
+            f"{gaps}",
+        )
+
+        twice = copy.deepcopy(doc)
+        step = steps_running(twice, holder, command)[0]
+        job = twice["jobs"][holder]
+        if "if" in step:
+            step.pop("if")
+        else:
+            job["steps"].append(copy.deepcopy(step))
+        gaps = leg_command_gaps(twice)
+        check(
+            f"running {command[:40]!r} on every {holder} leg is reported",
+            any(f"on {event}: {command!r} runs on " in gap and "not one" in gap for gap in gaps),
+            f"{gaps}",
+        )
+
+        added = copy.deepcopy(doc)
+        added["jobs"][holder]["steps"].append({"run": "cargo test -p scp-unpinned"})
+        gaps = leg_command_gaps(added)
+        check(
+            f"a command LEG_COMMANDS does not pin in {holder} is reported",
+            any("'cargo test -p scp-unpinned' runs, and LEG_COMMANDS" in gap for gap in gaps),
+            f"{gaps}",
+        )
+
+    # Dropping one pull-request leg value leaves that leg's commands unrun.
+    for job_id, value in (("rust-test-macos", "platform"), ("rust-clippy", "packages-blob")):
+        dropped = copy.deepcopy(doc)
+        matrix = dropped["jobs"][job_id]["strategy"]["matrix"]
+        lists = axis_event_values(matrix["leg"])
+        check(f"{job_id}'s pull-request legs include {value}", bool(lists) and value in lists["other"], f"{matrix['leg']!r}")
+        if not lists:
+            continue
+        other = [leg for leg in lists["other"] if leg != value]
+        matrix["leg"] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && "
+            f"'{json.dumps(lists['push'])}' || '{json.dumps(other)}') }}}}"
+        )
+        gaps = leg_command_gaps(dropped)
+        check(
+            f"dropping {job_id}'s {value} leg is reported",
+            any(gap.startswith(f"{job_id} on pull_request: ") and "runs on 0 legs" in gap for gap in gaps),
+            f"{gaps}",
+        )
+
+    split = copy.deepcopy(doc)
+    split["jobs"]["rust-doctest"]["if"] = (
+        f"github.event_name == 'push' && ({doc['jobs']['rust-doctest'].get('if') or 'true'})"
+    )
+    gaps = leg_command_gaps(split)
+    check(
+        "a rust-doctest that a pull request skips is reported",
+        any("rust-doc + rust-doctest on pull_request: 'cargo test --workspace --doc" in gap and "runs on 0 legs" in gap for gap in gaps),
+        f"{gaps}",
+    )
 
 
 def matrix_axis_gaps(doc: dict) -> list[str]:
     """Return each disagreement between a job's matrix axes and its steps.
 
     CRITERION: in every job, an axis of `strategy.matrix` is read when at least
-    one step's `if:` reads exactly `matrix.<axis> == '<value>'`. For each axis
-    read, every value such a step names is in the axis list, and, unless the
-    job's `runs-on` reads that axis, every value the axis lists is named by at
-    least one such step. A value no step names runs legs that skip every gated
-    step, and a step naming a value the axis lacks never runs on any leg, so
-    its commands run nowhere while every leg passes. An axis `runs-on` reads
-    picks each leg's runner, so a step gated to one of its values (a macOS-only
-    install) leaves the other legs running every ungated step. Another step whose `if:` mentions `matrix.<axis>` for an axis read
-    is reported rather than read, because this check could not say which legs
+    one step's `if:` reads as axis_terms states: `matrix.<axis> == '<value>'`,
+    or an `||` of such comparisons on that one axis. An axis is a list of
+    names, or a PUSH_MATRIX expression choosing one list for push and another
+    for every other event. For each axis read, every value such a step names
+    is in one of the axis lists; when the two lists differ, every such step
+    names a value of each, so each event runs it on some leg; and, unless the
+    job's `runs-on` reads that axis, every value either list holds is named by
+    at least one such step. A value no step names runs legs that skip every
+    gated step, and a step naming a value the axis lacks never runs on any
+    leg, so its commands run nowhere while every leg passes. An axis `runs-on`
+    reads picks each leg's runner, so a step gated to one of its values (a
+    macOS-only install) leaves the other legs running every ungated step.
+    Another step whose `if:` mentions `matrix.<axis>` for an axis read is
+    reported rather than read, because this check could not say which legs
     run it. A matrix carrying `include` or `exclude` is reported rather than
     read, because either one can add or remove an axis value's legs while the
     axis list stays the same. A step whose `if:` reads that form on an axis the
@@ -5745,19 +6286,19 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
             if isinstance(entry, dict):
                 defined.update(entry)
         for label, condition in steps:
-            match = AXIS_CONDITION.match(condition)
-            if match and match.group(1) not in defined:
+            terms = axis_terms(condition)
+            if terms and terms[0] not in defined:
                 gaps.append(
                     f"{job_id}: {label!r} has `if: {condition}`, but the job's "
-                    f"matrix defines no axis {match.group(1)}, so it runs on no leg"
+                    f"matrix defines no axis {terms[0]}, so it runs on no leg"
                 )
         read_axes = sorted(
             {
-                match.group(1)
+                terms[0]
                 for _, condition in steps
-                if (match := AXIS_CONDITION.match(condition))
-                and match.group(1) in matrix
-                and match.group(1) not in ("include", "exclude")
+                if (terms := axis_terms(condition))
+                and terms[0] in matrix
+                and terms[0] not in ("include", "exclude")
             }
         )
         if not read_axes:
@@ -5771,34 +6312,54 @@ def matrix_axis_gaps(doc: dict) -> list[str]:
             continue
         for axis_name in read_axes:
             axis = matrix[axis_name]
-            if not isinstance(axis, list) or not all(isinstance(v, str) for v in axis):
+            lists = axis_event_values(axis)
+            if lists is None or not all(
+                isinstance(v, str) for values in lists.values() for v in values
+            ):
                 gaps.append(
                     f"{job_id}: matrix axis {axis_name} {axis!r} is not a list of names"
                 )
                 continue
-            mention = re.compile(rf"\bmatrix\.{re.escape(axis_name)}(?![A-Za-z0-9_-])")
+            every = list(dict.fromkeys([*lists["push"], *lists["other"]]))
+            by_event = (
+                ()
+                if lists["push"] == lists["other"]
+                else (("push", lists["push"]), ("pull_request", lists["other"]))
+            )
+            mention = re.compile(
+                rf"\bmatrix\.{re.escape(axis_name)}(?![A-Za-z0-9_-])", re.IGNORECASE
+            )
             named: set[str] = set()
             for label, condition in steps:
                 if not mention.search(condition):
                     continue
-                match = AXIS_CONDITION.match(condition)
-                if match is None or match.group(1) != axis_name:
+                terms = axis_terms(condition)
+                if terms is None or terms[0] != axis_name:
                     gaps.append(
                         f"{job_id}: {label!r} has `if: {condition}`, which is not "
-                        f"`matrix.{axis_name} == '<value>'`"
+                        f"`matrix.{axis_name} == '<value>'` or an `||` of such "
+                        f"comparisons on that one axis"
                     )
                     continue
-                value = match.group(2)
-                named.add(value)
-                if value not in axis:
-                    gaps.append(
-                        f"{job_id}: {label!r} names {axis_name} {value!r}, which "
-                        f"matrix axis {axis_name} {axis} lacks, so its commands "
-                        f"run on no leg"
-                    )
+                values = terms[1]
+                named.update(values)
+                for value in values:
+                    if value not in every:
+                        gaps.append(
+                            f"{job_id}: {label!r} names {axis_name} {value!r}, which "
+                            f"matrix axis {axis_name} {axis} lacks, so its commands "
+                            f"run on no leg"
+                        )
+                for event, event_values in by_event:
+                    if not set(values) & set(event_values):
+                        gaps.append(
+                            f"{job_id}: {label!r} names {axis_name} {values}, none of "
+                            f"which a {event} run's legs {event_values} take, so a "
+                            f"{event} run skips its commands"
+                        )
             if mention.search(str(job.get("runs-on") or "")):
                 continue
-            for value in axis:
+            for value in every:
                 if value not in named:
                     gaps.append(
                         f"{job_id}: matrix axis {axis_name} value {value!r} has no "
@@ -5947,16 +6508,26 @@ def check_push_writer_mutants(doc: dict) -> None:
             "one entry per value of matrix `os`, and a push never runs ['macos-latest']",
         ),
         ("rust-clippy", "leg", "examples", "only from matrix leg `leg == examples`"),
+        ("rust-test-macos", "leg", "all", "only from matrix leg `leg == all`"),
     ):
         base = with_os_axis(doc, job_id) if axis == "os" else doc
         live_axis = base["jobs"][job_id]["strategy"]["matrix"][axis]
+        # A literal axis runs one list on every event; an axis that is already a
+        # PUSH_MATRIX expression keeps its pull-request list and loses the value
+        # from its push list. A push list the drop empties takes the pull-request
+        # list instead, since a matrix of no legs is not a push GitHub runs.
+        lists = axis_event_values(live_axis)
         check(
             f"{job_id}'s `{axis}` axis lists {dropped_value} for the push-matrix control",
-            isinstance(live_axis, list) and dropped_value in live_axis,
+            lists is not None and dropped_value in lists["push"],
             f"{live_axis!r}",
         )
-        every = json.dumps(live_axis)
-        fewer = json.dumps([value for value in live_axis if value != dropped_value])
+        if lists is None:
+            continue
+        every = json.dumps(lists["other"])
+        pushed = json.dumps(lists["push"])
+        fewer_values = [value for value in lists["push"] if value != dropped_value]
+        fewer = json.dumps(fewer_values or lists["other"])
         narrowed = copy.deepcopy(base)
         narrowed["jobs"][job_id]["strategy"]["matrix"][axis] = (
             f"${{{{ fromJSON(github.event_name == 'push' && '{fewer}' || '{every}') }}}}"
@@ -5969,7 +6540,7 @@ def check_push_writer_mutants(doc: dict) -> None:
         )
         whole = copy.deepcopy(base)
         whole["jobs"][job_id]["strategy"]["matrix"][axis] = (
-            f"${{{{ fromJSON(github.event_name == 'push' && '{every}' || '{every}') }}}}"
+            f"${{{{ fromJSON(github.event_name == 'push' && '{pushed}' || '{every}') }}}}"
         )
         check(
             f"a push matrix keeping every {job_id} `{axis}` value is not reported",
@@ -6036,6 +6607,22 @@ def check_push_writer_mutants(doc: dict) -> None:
 
     no_push = "github.event_name != 'push'"
     for label, job_id, locate, field, text, reported in (
+        (
+            "a push exclusion spelled in another case on rust-clippy's rust-cache `if:`",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "matrix.leg == 'workspace' && GitHub.Event_Name != 'Push'",
+            "no push to `main` meets",
+        ),
+        (
+            "a rust-clippy rust-cache `if:` naming a pull-request-only leg in another case",
+            "rust-clippy",
+            clippy_workspace,
+            "if",
+            "MATRIX.LEG == 'packages-network'",
+            "only from matrix leg",
+        ),
         (
             "a push exclusion on rust-clippy's workspace rust-cache `if:`",
             "rust-clippy",
@@ -6138,11 +6725,221 @@ def check_push_writer_mutants(doc: dict) -> None:
             strategy["matrix"][key] = value
         gaps = push_writer_gaps(changed)
         check(f"{label} is reported", any(reported in gap for gap in gaps), f"{gaps}")
+
+    # rust-test-macos's push-only `all` leg is allowed because every step it runs
+    # is one a pull-request leg runs. A push-only leg that runs a step no
+    # pull-request leg runs, whatever its `run:` line starts with or when it is a
+    # `uses:` or `env:` difference, or that runs no command, is reported.
+    def macos_step(job: dict, value: str) -> dict:
+        return step_where(
+            job,
+            lambda step: (terms := axis_terms(step.get("if"))) is not None
+            and terms[1] == ["all", value],
+        )
+
+    for label, mutate in (
+        (
+            "a push-only leg running a command no pull-request leg runs",
+            lambda job: macos_step(job, "platform").update(
+                {"if": "matrix.leg == 'all'"}
+            ),
+        ),
+        (
+            "a push-only leg running a command of its own",
+            lambda job: job["steps"].append(
+                {
+                    "name": "push only",
+                    "if": "matrix.leg == 'all'",
+                    "run": "cargo test -p scp-push-only",
+                }
+            ),
+        ),
+        (
+            "a push-only leg running a script no LEG_COMMAND_PREFIXES names",
+            lambda job: job["steps"].append(
+                {"if": "matrix.leg == 'all'", "run": "./scripts/push-only.sh"}
+            ),
+        ),
+        (
+            "a push-only leg running a cargo command behind an assignment",
+            lambda job: job["steps"].append(
+                {
+                    "if": "matrix.leg == 'all'",
+                    "run": "RUSTFLAGS=--cfg=x cargo test -p scp-transport",
+                }
+            ),
+        ),
+        (
+            "a push-only leg running an action of its own",
+            lambda job: job["steps"].append(
+                {"if": "matrix.leg == 'all'", "uses": "example/push-only@v1"}
+            ),
+        ),
+        (
+            "a push-only leg running a pull-request step's script under its own env",
+            lambda job: job["steps"].append(
+                {
+                    **{key: item for key, item in macos_step(job, "platform").items() if key != "if"},
+                    "if": "matrix.leg == 'all'",
+                    "env": {"RUSTFLAGS": "--cfg=x"},
+                }
+            ),
+        ),
+        (
+            "a push-only leg whose run line evaluates an expression on its axis",
+            lambda job: job["steps"].append(
+                {
+                    "run": "cargo test -p scp-transport "
+                    "${{ matrix.leg == 'all' && '--features evil' || '' }}"
+                }
+            ),
+        ),
+        (
+            "a push-only leg reading a job env value built from its axis",
+            lambda job: (
+                job.setdefault("env", {}).update(
+                    {"EXTRA": "${{ matrix.leg == 'all' && './push-only.sh' || 'true' }}"}
+                ),
+                job["steps"].append({"run": "cargo test -p scp-transport && $EXTRA"}),
+            ),
+        ),
+        (
+            "a push-only leg whose run line reads its strategy job index",
+            lambda job: job["steps"].append(
+                {"run": "cargo test -p scp-transport ${{ strategy.job-index }}"}
+            ),
+        ),
+        (
+            "a push-only leg whose run line reads its strategy job index in another case",
+            lambda job: job["steps"].append(
+                {"run": "cargo test -p scp-transport ${{ Strategy.job-index }}"}
+            ),
+        ),
+        (
+            "a push-only leg reading a job env value that is its leg in another case",
+            lambda job: (
+                job.setdefault("env", {}).update({"LEG": "${{ Matrix.leg }}"}),
+                job["steps"].append(
+                    {
+                        "run": "cargo test -p scp-transport && "
+                        'if [ "$LEG" = all ]; then ./push-only.sh; fi'
+                    }
+                ),
+            ),
+        ),
+        (
+            "a push-only leg reading a step env value that is its leg in another case",
+            lambda job: job["steps"].append(
+                {
+                    "env": {"LEG": "${{ matrix.LEG }}"},
+                    "run": 'cargo test -p scp-transport && if [ "$LEG" = all ]; '
+                    "then ./push-only.sh; fi",
+                }
+            ),
+        ),
+        (
+            "a push-only leg running a step whose `if:` names its leg in another case",
+            lambda job: job["steps"].append(
+                {"if": "matrix.leg == 'ALL'", "run": "./scripts/push-only.sh"}
+            ),
+        ),
+        (
+            "a push-only leg reading a matrix key an include adds",
+            lambda job: job["steps"].append(
+                {"run": "cargo test -p scp-transport ${{ matrix['extra'] }}"}
+            ),
+        ),
+        (
+            "a push-only leg that runs no command",
+            lambda job: [
+                step.update({"if": step["if"].replace("matrix.leg == 'all' || ", "")})
+                for step in job["steps"]
+                if isinstance(step, dict) and "matrix.leg == 'all' || " in str(step.get("if"))
+            ],
+        ),
+    ):
+        changed = copy.deepcopy(doc)
+        mutate(changed["jobs"]["rust-test-macos"])
+        gaps = push_writer_gaps(changed)
+        check(
+            f"{label} is reported",
+            any(
+                gap.startswith("rust-test-macos's matrix `leg` runs") and "push-only leg" in gap
+                for gap in gaps
+            ),
+            f"{gaps}",
+        )
+    # A job key outside `steps` holding the exact `${{ matrix.leg }}` placeholder
+    # hands each leg its own value, which a step every leg runs reads with text
+    # that is the same on every leg: a job `env:` a step's shell reads, or a
+    # `defaults:` working directory a step's relative path resolves under. Both
+    # jobs with a push-only leg report it; the same keys holding no matrix value
+    # report nothing.
+    for job_id in ("rust-test-macos", "rust-clippy"):
+        for label, key, item, run, reported in (
+            (
+                "a job env value that is its leg",
+                "env",
+                {"LEG": "${{ matrix.leg }}"},
+                'cargo test -p scp-transport && if [ "$LEG" = all ]; then ./push-only.sh; fi',
+                True,
+            ),
+            (
+                "a job defaults working directory named after its leg",
+                "defaults",
+                {"run": {"working-directory": "legs/${{ matrix.leg }}"}},
+                "cargo test -p scp-transport && ./run.sh",
+                True,
+            ),
+            (
+                "a job env value that names no matrix axis",
+                "env",
+                {"LEG": "${{ github.sha }}"},
+                'cargo test -p scp-transport && if [ "$LEG" = all ]; then ./push-only.sh; fi',
+                False,
+            ),
+        ):
+            changed = copy.deepcopy(doc)
+            job = changed["jobs"][job_id]
+            job[key] = item
+            job["steps"].append({"run": run})
+            gaps = [
+                gap
+                for gap in push_writer_gaps(changed)
+                if gap.startswith(f"{job_id}'s matrix `leg` runs") and "push-only leg" in gap
+            ]
+            check(
+                f"{job_id} with a push-only leg reading {label} is "
+                f"{'reported' if reported else 'not reported'}",
+                bool(gaps) is reported,
+                f"{push_writer_gaps(changed)}",
+            )
+    # GitHub reads `matrix.leg` and `matrix.LEG` as one name, so a matrix holding
+    # both axes leaves a writing step's `matrix.leg` naming neither for certain.
+    ambiguous = copy.deepcopy(doc)
+    ambiguous["jobs"]["rust-clippy"]["strategy"]["matrix"]["LEG"] = ["workspace"]
+    gaps = push_writer_gaps(ambiguous)
+    check(
+        "a writer matrix holding axes leg and LEG is reported",
+        any(gap.startswith("rust-clippy ") and "differ only in case" in gap for gap in gaps),
+        f"{gaps}",
+    )
     check(
         "the unmutated rust-test matrix is read without a gap",
         not any(gap.startswith("rust-test") for gap in push_writer_gaps(doc)),
         f"{push_writer_gaps(doc)}",
     )
+    for job_id in ("rust-test-macos", "rust-clippy"):
+        unrelated = copy.deepcopy(doc)
+        unrelated["jobs"][job_id]["steps"].append(
+            {"run": "cargo test -p scp-transport ${{ github.sha }}"}
+        )
+        check(
+            f"{job_id} with a step every leg runs under a non-matrix expression "
+            "is read without a gap",
+            not any(gap.startswith(job_id) for gap in push_writer_gaps(unrelated)),
+            f"{push_writer_gaps(unrelated)}",
+        )
 
     writing = copy.deepcopy(doc)
     writing["jobs"]["error-codes"].setdefault("steps", []).append(
@@ -6804,23 +7601,53 @@ def check_matrix_axes(path: Path, doc: dict) -> None:
 def check_matrix_axis_controls(doc: dict) -> None:
     """Mutants of the live jobs, each of which the check must report.
 
-    They mutate rust-test-optional-features' `group` axis and rust-clippy's
-    `leg` axis in ci.yml, so a control fails if either job loses its axis as
+    They mutate rust-test-optional-features' `group` axis, a literal list, and
+    the `leg` axes of rust-clippy and rust-test-macos in ci.yml, which are
+    PUSH_MATRIX expressions, so a control fails if any job loses its axis as
     well as if the reader stops working.
     """
+
+    def edit_axis(mutant: dict, job_id: str, axis_name: str, edit) -> None:
+        """Apply `edit` to each list an axis holds, rewriting an expression axis."""
+        matrix = mutant["jobs"][job_id]["strategy"]["matrix"]
+        axis = matrix[axis_name]
+        if isinstance(axis, list):
+            edit(axis)
+            return
+        lists = axis_event_values(axis)
+        assert lists is not None
+        push_values, other_values = list(lists["push"]), list(lists["other"])
+        edit(push_values)
+        edit(other_values)
+        matrix[axis_name] = (
+            f"${{{{ fromJSON(github.event_name == 'push' && "
+            f"'{json.dumps(push_values)}' || '{json.dumps(other_values)}') }}}}"
+        )
+
     for job_id, axis_name, kept, dropped_value in (
         ("rust-test-optional-features", "group", "transport", "platform-testing"),
-        ("rust-clippy", "leg", "workspace", "packages"),
+        ("rust-clippy", "leg", "workspace", "examples"),
+        ("rust-test-macos", "leg", "platform", "transport-network"),
     ):
         live = doc["jobs"].get(job_id) or {}
         axis = ((live.get("strategy") or {}).get("matrix") or {}).get(axis_name)
-        prefix = f"matrix.{axis_name} =="
-        has_gated_step = any(
-            str(step.get("if") or "").startswith(prefix)
-            for step in live.get("steps") or []
-            if isinstance(step, dict)
+        lists = axis_event_values(axis)
+
+        def gated(mutant: dict, job_id: str = job_id, axis_name: str = axis_name) -> list:
+            return [
+                step
+                for step in mutant["jobs"][job_id]["steps"]
+                if isinstance(step, dict)
+                and (terms := axis_terms(step.get("if")))
+                and terms[0] == axis_name
+            ]
+
+        has_gated_step = bool(gated(doc)) if live else False
+        ready = (
+            lists is not None
+            and dropped_value in [*lists["push"], *lists["other"]]
+            and has_gated_step
         )
-        ready = isinstance(axis, list) and dropped_value in axis and has_gated_step
         check(
             f"{job_id} carries the {axis_name} axis and gated steps the controls "
             f"mutate",
@@ -6830,20 +7657,11 @@ def check_matrix_axis_controls(doc: dict) -> None:
         if not ready:
             continue
 
-        def gated(mutant: dict, job_id: str = job_id, prefix: str = prefix) -> list:
-            return [
-                step
-                for step in mutant["jobs"][job_id]["steps"]
-                if str(step.get("if") or "").startswith(prefix)
-            ]
-
         extra = copy.deepcopy(doc)
-        extra["jobs"][job_id]["strategy"]["matrix"][axis_name].append(
-            "added-by-the-control"
-        )
+        edit_axis(extra, job_id, axis_name, lambda v: v.append("added-by-the-control"))
         gaps = matrix_axis_gaps(extra)
         check(
-            f"a {axis_name} value no step names is reported",
+            f"a {job_id} {axis_name} value no step names is reported",
             any(
                 f"{job_id}: matrix axis {axis_name} value 'added-by-the-control' "
                 f"has no step" in gap
@@ -6856,7 +7674,7 @@ def check_matrix_axis_controls(doc: dict) -> None:
         gated(unknown)[0]["if"] = f"matrix.{axis_name} == 'absent-from-the-matrix'"
         gaps = matrix_axis_gaps(unknown)
         check(
-            f"a step gated on a {axis_name} value the matrix lacks is reported",
+            f"a {job_id} step gated on a {axis_name} value the matrix lacks is reported",
             any(
                 f"names {axis_name} 'absent-from-the-matrix', which matrix axis" in gap
                 for gap in gaps
@@ -6864,14 +7682,70 @@ def check_matrix_axis_controls(doc: dict) -> None:
             f"a step no leg runs went unreported: {gaps}",
         )
 
+        either = copy.deepcopy(doc)
+        gated(either)[0]["if"] = (
+            f"matrix.{axis_name} == '{kept}' || matrix.{axis_name} == "
+            f"'absent-from-the-matrix'"
+        )
+        gaps = matrix_axis_gaps(either)
+        check(
+            f"a {job_id} step whose `||` names a {axis_name} value the matrix lacks "
+            f"is reported",
+            any(
+                f"names {axis_name} 'absent-from-the-matrix', which matrix axis" in gap
+                for gap in gaps
+            ),
+            f"an `||` naming a value no leg takes went unreported: {gaps}",
+        )
+
+        for unreadable in (
+            f"matrix.{axis_name} != '{kept}'",
+            f"matrix.{axis_name} == '{kept}' && github.event_name == 'push'",
+            f"matrix.{axis_name} == '{kept}' || matrix.other-axis == '{kept}'",
+        ):
+            mutant = copy.deepcopy(doc)
+            gated(mutant)[0]["if"] = unreadable
+            gaps = matrix_axis_gaps(mutant)
+            check(
+                f"a {job_id} step gated on `{unreadable}` is reported as unreadable",
+                any(
+                    f"which is not `matrix.{axis_name} == '<value>'`" in gap
+                    for gap in gaps
+                ),
+                f"a step whose legs this check cannot read went unreported: {gaps}",
+            )
+
         dropped = copy.deepcopy(doc)
-        dropped["jobs"][job_id]["strategy"]["matrix"][axis_name].remove(dropped_value)
+        edit_axis(
+            dropped,
+            job_id,
+            axis_name,
+            lambda v, gone=dropped_value: v.remove(gone) if gone in v else None,
+        )
         gaps = matrix_axis_gaps(dropped)
         check(
-            f"deleting {dropped_value} from the {axis_name} list is reported",
+            f"deleting {dropped_value} from the {job_id} {axis_name} list is reported",
             any(f"names {axis_name} {dropped_value!r}" in gap for gap in gaps),
             f"steps left without a leg went unreported: {gaps}",
         )
+
+        if lists["push"] != lists["other"]:
+            # A step whose every named value is a push-only leg skips on a pull
+            # request, and one whose every named value is a pull-request leg
+            # skips on push.
+            for event, values in (("pull_request", lists["push"]), ("push", lists["other"])):
+                elsewhere = lists["other"] if event == "pull_request" else lists["push"]
+                only = [v for v in values if v not in elsewhere]
+                if not only:
+                    continue
+                one_event = copy.deepcopy(doc)
+                gated(one_event)[0]["if"] = f"matrix.{axis_name} == '{only[0]}'"
+                gaps = matrix_axis_gaps(one_event)
+                check(
+                    f"a {job_id} step only a {event} run skips is reported",
+                    any(f"so a {event} run skips its commands" in gap for gap in gaps),
+                    f"a step one event never runs went unreported: {gaps}",
+                )
 
         for expander, entries in (
             ("include", [{"os": "ubuntu-latest", axis_name: "added-by-the-control"}]),
@@ -6881,7 +7755,7 @@ def check_matrix_axis_controls(doc: dict) -> None:
             expanded["jobs"][job_id]["strategy"]["matrix"][expander] = entries
             gaps = matrix_axis_gaps(expanded)
             check(
-                f"a matrix carrying {expander} over {axis_name} is reported",
+                f"a {job_id} matrix carrying {expander} over {axis_name} is reported",
                 any(f"{job_id}: matrix carries {expander}," in gap for gap in gaps),
                 f"a matrix whose legs {expander} changes went unreported: {gaps}",
             )
@@ -6897,19 +7771,6 @@ def check_matrix_axis_controls(doc: dict) -> None:
                 for gap in gaps
             ),
             f"a step gated on an undefined axis went unreported: {gaps}",
-        )
-
-        either = copy.deepcopy(doc)
-        gated(either)[0]["if"] = (
-            f"matrix.{axis_name} == '{kept}' || matrix.{axis_name} == '{dropped_value}'"
-        )
-        gaps = matrix_axis_gaps(either)
-        check(
-            f"a step gated on an `||` of two {axis_name} values is reported",
-            any(
-                f"which is not `matrix.{axis_name} == '<value>'`" in gap for gap in gaps
-            ),
-            f"a step whose condition names two values went unreported: {gaps}",
         )
 
     ungated = {"jobs": {"j": {"strategy": {"matrix": {"os": ["a", "b"]}}, "steps": []}}}
@@ -7082,6 +7943,11 @@ def run_matrix_axis(inputs: Inputs) -> None:
     for path, doc in documents:
         check_matrix_axes(path, doc)
     check_matrix_axis_controls(workflow)
+
+
+def run_leg_commands(inputs: Inputs) -> None:
+    print("leg-commands — each split job's legs run its pinned commands exactly once")
+    check_leg_commands(inputs.workflow)
 
 
 def run_empty_input(inputs: Inputs) -> None:
@@ -7647,6 +8513,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "doc-command": run_doc_command,
     "win-shell": run_win_shell,
     "matrix-axis": run_matrix_axis,
+    "leg-commands": run_leg_commands,
     "empty-input": run_empty_input,
     "downloaded-module": run_downloaded_module,
     "downloaded-addon": run_downloaded_addon,
@@ -7700,6 +8567,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "doc-flag",
         "win-shell",
         "matrix-axis",
+        "leg-commands",
         "empty-input",
         "downloaded-module",
         "downloaded-addon",
