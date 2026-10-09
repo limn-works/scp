@@ -274,7 +274,7 @@ pub trait MlsBackend: Send + Sync {
         &self,
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
-    ) -> Result<Vec<(String, [u8; 65])>, MlsError>;
+    ) -> Result<Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>, MlsError>;
 
     /// Advances the group epoch via a self-update Commit that republishes
     /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1), the 65-byte

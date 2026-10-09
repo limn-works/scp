@@ -875,7 +875,7 @@ pub fn handle_broadcast_key_request(
     deps: &ActorDeps,
     author_did: &DID,
     requester_did: &DID,
-    wrapping_pubkey: &[u8; 65],
+    wrapping_pubkey: &scp_protocol::crypto::hpke::p256::P256Point,
 ) -> Result<KeyRequestDecision, ContextError> {
     if !deps.local_dids.load().contains(author_did) {
         return Err(ContextError::PermissionDenied(format!(

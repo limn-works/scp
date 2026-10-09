@@ -3067,7 +3067,7 @@ impl MlsBackend for FailingBackend {
         &self,
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
-    ) -> Result<Vec<(String, [u8; 65])>, MlsError> {
+    ) -> Result<Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>, MlsError> {
         self.inner.process_commit(group, commit_bytes).await
     }
     async fn advance_epoch(

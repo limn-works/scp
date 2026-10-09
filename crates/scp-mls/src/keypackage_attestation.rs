@@ -911,7 +911,8 @@ impl<'a> Cursor<'a> {
     /// point (§9.5.2), naming `field` in the error.
     fn take_point(&mut self, field: &str) -> Result<[u8; LEAF_PUBLIC_KEY_SIZE], MlsError> {
         let bytes = self.take(LEAF_PUBLIC_KEY_SIZE)?;
-        scp_protocol::crypto::hpke::p256::validate_uncompressed_point(bytes)
+        scp_protocol::crypto::hpke::p256::P256Point::try_from(bytes)
+            .map(|point| *point.as_bytes())
             .map_err(|e| ext_err(format!("scp_keypackage_attestation {field}: {e}")))
     }
 

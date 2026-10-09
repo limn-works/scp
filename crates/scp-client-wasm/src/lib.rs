@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use scp_client::{ContextStatus, RelaySink, ScpClient, Signer, Storage};
 use scp_clock::Clock;
-use scp_protocol::serde_util::serde_wrapping_key_list_65;
+use scp_protocol::crypto::hpke::p256::P256Point;
 use wasm_bindgen::prelude::*;
 
 use crate::error::{WASM_INPUT_VALIDATION_CODE, map_err};
@@ -1123,7 +1123,7 @@ fn deserialize_event_log(bytes: &[u8]) -> Result<Vec<scp_event_log::Event>, JsVa
 /// joiner (`MessagePack`, width-/endianness-independent — same transport idiom as
 /// the event-log stream). Each key is the 65-byte uncompressed DHKEM(P-256)
 /// point, encoded as binary (§9.5).
-fn serialize_wrapping_keys(wrapping_keys: &[(String, [u8; 65])]) -> Result<Vec<u8>, JsValue> {
+fn serialize_wrapping_keys(wrapping_keys: &[(String, P256Point)]) -> Result<Vec<u8>, JsValue> {
     encode_wrapping_keys(wrapping_keys).map_err(|e| {
         JsValue::from_str(&format!(
             "[{WASM_INPUT_VALIDATION_CODE}] serializing wrapping keys: {e}"
@@ -1131,10 +1131,10 @@ fn serialize_wrapping_keys(wrapping_keys: &[(String, [u8; 65])]) -> Result<Vec<u
     })
 }
 
-/// Deserializes the member-wrapping-key directory the joiner adopts. A key of
-/// any length other than 65 bytes is rejected here; the point itself is
-/// validated by `ScpClient::join_context_encrypted` before it is adopted.
-fn deserialize_wrapping_keys(bytes: &[u8]) -> Result<Vec<(String, [u8; 65])>, JsValue> {
+/// Deserializes the member-wrapping-key directory the joiner adopts. Each key
+/// decodes as a [`P256Point`], so a key that is not a valid 65-byte
+/// uncompressed P-256 point is rejected here, before the join (§9.5).
+fn deserialize_wrapping_keys(bytes: &[u8]) -> Result<Vec<(String, P256Point)>, JsValue> {
     decode_wrapping_keys(bytes).map_err(|e| {
         JsValue::from_str(&format!(
             "[{WASM_INPUT_VALIDATION_CODE}] deserializing wrapping keys: {e}"
@@ -1145,20 +1145,17 @@ fn deserialize_wrapping_keys(bytes: &[u8]) -> Result<Vec<(String, [u8; 65])>, Js
 /// The target-independent `MessagePack` encoding behind
 /// [`serialize_wrapping_keys`].
 fn encode_wrapping_keys(
-    wrapping_keys: &[(String, [u8; 65])],
+    wrapping_keys: &[(String, P256Point)],
 ) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    let mut out = Vec::new();
-    serde_wrapping_key_list_65::serialize(
-        wrapping_keys,
-        &mut rmp_serde::Serializer::new(&mut out),
-    )?;
-    Ok(out)
+    rmp_serde::to_vec(wrapping_keys)
 }
 
 /// The target-independent `MessagePack` decoding behind
 /// [`deserialize_wrapping_keys`].
-fn decode_wrapping_keys(bytes: &[u8]) -> Result<Vec<(String, [u8; 65])>, rmp_serde::decode::Error> {
-    serde_wrapping_key_list_65::deserialize(&mut rmp_serde::Deserializer::new(bytes))
+fn decode_wrapping_keys(
+    bytes: &[u8],
+) -> Result<Vec<(String, P256Point)>, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(bytes)
 }
 
 /// The variant name of a non-`MessageReceived` context event (forward-safety
@@ -1215,6 +1212,38 @@ mod pure_wrapper_tests {
         bytes.extend_from_slice(&[0x42; 32]);
         let msg = decode_wrapping_keys(&bytes).unwrap_err().to_string();
         assert!(msg.contains("got 32 bytes"), "got: {msg}");
+    }
+
+    /// A 65-byte directory key led by `0x04` that is not on the curve, or a
+    /// 64-byte key, is rejected at decode (§9.5); a valid point in the same
+    /// encoding decodes.
+    #[test]
+    fn wrapping_key_directory_rejects_invalid_points() {
+        // MessagePack: [ ["d", bin8(n bytes)] ].
+        let entry = |key: &[u8]| {
+            let mut bytes = vec![
+                0x91,
+                0x92,
+                0xa1,
+                b'd',
+                0xc4,
+                u8::try_from(key.len()).unwrap(),
+            ];
+            bytes.extend_from_slice(key);
+            bytes
+        };
+        let (valid, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        assert_eq!(
+            decode_wrapping_keys(&entry(valid.as_bytes())).unwrap(),
+            vec![("d".to_owned(), valid)]
+        );
+
+        let mut off_curve = [0u8; 65];
+        off_curve[0] = 0x04;
+        for bad in [&off_curve[..], &valid.as_bytes()[..64]] {
+            let msg = decode_wrapping_keys(&entry(bad)).unwrap_err().to_string();
+            assert!(msg.contains("P-256 point"), "{}-byte key: {msg}", bad.len());
+        }
     }
 
     /// `outletStreamComputeCaveatsBinding` produces the 32-byte binding that the

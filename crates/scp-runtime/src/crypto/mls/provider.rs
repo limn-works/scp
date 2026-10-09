@@ -148,9 +148,8 @@ pub(crate) struct MlsCryptoSnapshot {
     #[serde(default)]
     pub(crate) send_sequence: u64,
     /// Remote members' DHKEM(P-256) wrapping public keys: `(did, pubkey)`
-    /// pairs, each a 65-byte uncompressed point (length checked on decode).
-    #[serde(with = "scp_protocol::serde_util::serde_wrapping_key_list_65")]
-    pub(crate) member_wrapping_keys: Vec<(String, [u8; 65])>,
+    /// pairs, each a validated uncompressed point (§9.5, checked on decode).
+    pub(crate) member_wrapping_keys: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
     /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
     /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
     /// feature, so we serialize it separately and store the blob here.
@@ -315,7 +314,7 @@ pub struct OwnedMlsCryptoState {
     /// Nonce dedup cache for sender-key requests (replay protection).
     pub nonce_dedup: NonceDedup,
     /// Remote members' DHKEM(P-256) wrapping public keys (by DID).
-    pub member_wrapping_keys: HashMap<String, [u8; 65]>,
+    pub member_wrapping_keys: HashMap<String, scp_protocol::crypto::hpke::p256::P256Point>,
 }
 
 // SECURITY: Redacts the MLS group (holds OpenMLS epoch secrets) and
@@ -1016,7 +1015,7 @@ impl NodeMlsFactory {
         }
 
         // Reconstruct member wrapping keys.
-        let member_wrapping_keys: HashMap<String, [u8; 65]> =
+        let member_wrapping_keys: HashMap<String, scp_protocol::crypto::hpke::p256::P256Point> =
             snapshot.member_wrapping_keys.drain(..).collect();
 
         // Take the local_sender_key and leave a zeroed placeholder. SenderKey
@@ -1548,7 +1547,7 @@ mod tests {
             .expect("group present");
         let extracted = scp_mls::wrapping_extension::extract_own_wrapping_key(group).unwrap();
         assert_eq!(
-            extracted,
+            extracted.map(|key| *key.as_bytes()),
             Some(*wrapping.public()),
             "own leaf node must contain the wrapping public key it was born with"
         );
@@ -1591,7 +1590,8 @@ mod tests {
 
         let ctx_hex = hex::encode(ctx_id);
         let bob_wrapping = WrappingKeyPair::generate();
-        let bob_wrapping_pk = *bob_wrapping.public();
+        let bob_wrapping_pk =
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_wrapping.public()).unwrap();
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
@@ -1672,7 +1672,10 @@ mod tests {
                 .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
             state.member_wrapping_keys.insert(
                 bob.to_owned(),
-                scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+                scp_protocol::crypto::hpke::p256::P256Point::try_from(
+                    scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+                )
+                .unwrap(),
             );
             state.sender_key_epoch = 42;
         }
@@ -1792,7 +1795,10 @@ mod tests {
                 .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
             state.member_wrapping_keys.insert(
                 bob.to_owned(),
-                scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+                scp_protocol::crypto::hpke::p256::P256Point::try_from(
+                    scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+                )
+                .unwrap(),
             );
         }
 
@@ -1851,7 +1857,10 @@ mod tests {
             .map(|k| k.as_bytes().to_vec());
         assert_eq!(owned_bob, Some(orig_bob_key));
         assert_eq!(
-            owned.member_wrapping_keys.get(bob).copied(),
+            owned
+                .member_wrapping_keys
+                .get(bob)
+                .map(|key| *key.as_bytes()),
             Some(scp_crypto::p256::testing::valid_uncompressed_point(0xAA))
         );
         assert!(owned.pending_distributions.is_empty());

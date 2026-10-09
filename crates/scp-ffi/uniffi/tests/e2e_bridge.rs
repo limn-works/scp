@@ -1567,7 +1567,7 @@ async fn broadcast_key_request_requires_a_65_byte_p256_wrapping_key() {
             Arc::clone(&handle),
             author.did(),
             subscriber.did(),
-            public.to_vec(),
+            public.as_bytes().to_vec(),
         )
         .await
         .unwrap()

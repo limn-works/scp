@@ -16821,7 +16821,9 @@ mod tests {
             &mls_state,
         )
         .unwrap();
-        scp_mls::wrapping_extension::extract_own_wrapping_key(&owned.mls_group).unwrap()
+        scp_mls::wrapping_extension::extract_own_wrapping_key(&owned.mls_group)
+            .unwrap()
+            .map(|key| *key.as_bytes())
     }
 
     /// One identity publishes one wrapping key (spec 09 §9.16.1): two
@@ -16890,6 +16892,7 @@ mod tests {
             .unwrap();
         scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
             .unwrap()
+            .map(|key| *key.as_bytes())
     }
 
     /// A KeyPackage the production store actor mints publishes, in `0xFF01`,
@@ -23582,10 +23585,12 @@ mod tests {
                     scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
                         requester_did,
                         ALICE,
-                        1,
                         &wrapping_pub,
                         &nonce,
-                        timestamp,
+                        scp_protocol::crypto::sender_keys::key_protocol_verify::RequestHashInput {
+                            epoch: 1,
+                            requested_at: timestamp,
+                        },
                     )
                     .unwrap();
                 let signature: [u8; 64] = bob_sk.sign(&hash).to_bytes();

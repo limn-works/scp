@@ -986,7 +986,7 @@ fn pending_join_with_mismatched_wrapping_keypair_fails_construction_closed() {
     store
         .put(
             "scp-client/pending/ctx-pending-wk",
-            rewrite_pending_wrapping_public(&blob, other_public.to_vec()),
+            rewrite_pending_wrapping_public(&blob, other_public.as_bytes().to_vec()),
         )
         .expect("put");
     match expect_construction_error(store) {

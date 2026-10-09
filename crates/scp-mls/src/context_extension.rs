@@ -393,7 +393,7 @@ mod tests {
                 kp.key_package().leaf_node().extensions()
             )
             .unwrap(),
-            Some(wrapping),
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(wrapping).unwrap()),
         );
     }
 

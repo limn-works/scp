@@ -241,6 +241,9 @@ pub struct FullStackNode {
     pub event_log: Arc<MerkleEventLogProvider>,
     /// Deterministic signing key derived from this node's DID.
     signing_key: ed25519_dalek::SigningKey,
+    /// The network's `#active` key resolver, the one the supervisor holds. A
+    /// §9.17 holder resolves a requester's verification key through it.
+    key_resolver: KeyResolver,
     /// Ciphertexts captured by the transport, shared with the supervisor.
     sent: SentBuffer,
     /// Registry of all nodes' crypto helpers in the network (creator side
@@ -275,7 +278,7 @@ impl FullStackNode {
             Arc::clone(&crypto.provider),
             transport_box,
             event_log_box,
-            key_resolver,
+            Arc::clone(&key_resolver),
         );
 
         Self {
@@ -284,6 +287,7 @@ impl FullStackNode {
             crypto,
             event_log,
             signing_key,
+            key_resolver,
             sent,
             registry,
             pending_events: Mutex::new(Vec::new()),
@@ -683,7 +687,8 @@ impl FullStackNode {
                 })?;
             let response_bytes = handle_access_key_request(
                 &parsed_request,
-                self.signing_key.verifying_key().as_bytes(),
+                context_id_str,
+                &self.key_resolver,
                 &member_key,
                 scp_clock::SystemClock.now_secs(),
                 &mut nonce_dedup,

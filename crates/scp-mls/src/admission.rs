@@ -32,7 +32,8 @@ use scp_clock::Clock;
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
 use crate::lifetime::validate_key_package_lifetime;
-use crate::wrapping_extension::{P256_WRAPPING_KEY_SIZE, extract_wrapping_key};
+use crate::wrapping_extension::extract_wrapping_key;
+use scp_protocol::crypto::hpke::p256::P256Point;
 
 /// The most leaves one DID may hold in a group: one per device
 /// (spec 10 §10.8.1(7)).
@@ -45,7 +46,7 @@ pub struct AdmittedLeaf {
     /// The SCP DID from the leaf credential.
     pub did: String,
     /// The leaf's 65-byte uncompressed P-256 wrapping public key.
-    pub wrapping_key: [u8; P256_WRAPPING_KEY_SIZE],
+    pub wrapping_key: P256Point,
 }
 
 /// Why a leaf that openmls accepted was refused by SCP admission.
@@ -81,7 +82,7 @@ impl std::fmt::Display for LeafAdmissionRejection {
 pub(crate) struct TreeLeaf {
     index: u32,
     did: String,
-    wrapping_key: Option<[u8; P256_WRAPPING_KEY_SIZE]>,
+    wrapping_key: Option<P256Point>,
 }
 
 /// What a staged Commit changes about members' identities, once every added
@@ -92,7 +93,7 @@ pub(crate) struct CommitAdmission {
     pub(crate) added: Vec<AdmittedLeaf>,
     /// `(did, key)` for each replaced leaf whose `0xFF01` differs from the
     /// leaf it replaces, in the order the Commit applies them.
-    pub(crate) wrapping_key_updates: Vec<(String, [u8; P256_WRAPPING_KEY_SIZE])>,
+    pub(crate) wrapping_key_updates: Vec<(String, P256Point)>,
 }
 
 fn leaf_did(leaf: &LeafNode) -> Result<String, MlsError> {
@@ -105,10 +106,7 @@ fn leaf_did(leaf: &LeafNode) -> Result<String, MlsError> {
 
 /// The leaf's `0xFF01` key. A member no peer can HPKE-seal a sender key to
 /// must not be admitted (spec 09 §9.16.1).
-fn required_wrapping_key(
-    leaf: &LeafNode,
-    did: &str,
-) -> Result<[u8; P256_WRAPPING_KEY_SIZE], MlsError> {
+fn required_wrapping_key(leaf: &LeafNode, did: &str) -> Result<P256Point, MlsError> {
     extract_wrapping_key(leaf.extensions())?.ok_or_else(|| MlsError::LeafAdmissionRejected {
         did: did.to_owned(),
         reason: LeafAdmissionRejection::MissingWrappingKey,
@@ -203,7 +201,7 @@ fn admit_replacing_leaf(
     leaf: &LeafNode,
     replaced_index: LeafNodeIndex,
     tree: &[TreeLeaf],
-) -> Result<Option<(String, [u8; P256_WRAPPING_KEY_SIZE])>, MlsError> {
+) -> Result<Option<(String, P256Point)>, MlsError> {
     let replaced = tree
         .iter()
         .find(|l| l.index == replaced_index.u32())
@@ -479,7 +477,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(add.admitted_did, did("bob"));
-        assert_eq!(add.admitted_wrapping_key, bob_key);
+        assert_eq!(
+            add.admitted_wrapping_key,
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(bob_key).unwrap()
+        );
 
         let bytes = add.commit.tls_serialize_detached().unwrap();
         match decrypt_with_membership_changes(&mut f.dave, &bytes, &SystemClock).unwrap() {
@@ -489,7 +490,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(added_dids, vec![did("bob")]);
-                assert_eq!(added_wrapping_keys, vec![bob_key]);
+                assert_eq!(
+                    added_wrapping_keys,
+                    vec![scp_protocol::crypto::hpke::p256::P256Point::try_from(bob_key).unwrap()]
+                );
             }
             other => panic!("expected a Commit, got {other:?}"),
         }
@@ -558,7 +562,13 @@ mod tests {
                 wrapping_key_updates,
             } => {
                 assert_eq!(sender_did, did("bob"));
-                assert_eq!(wrapping_key_updates, vec![(did("bob"), new_key)]);
+                assert_eq!(
+                    wrapping_key_updates,
+                    vec![(
+                        did("bob"),
+                        scp_protocol::crypto::hpke::p256::P256Point::try_from(new_key).unwrap()
+                    )]
+                );
             }
             other => panic!("expected a Commit, got {other:?}"),
         }
@@ -566,7 +576,13 @@ mod tests {
             InboundChange::Commit {
                 wrapping_key_updates,
                 ..
-            } => assert_eq!(wrapping_key_updates, vec![(did("bob"), new_key)]),
+            } => assert_eq!(
+                wrapping_key_updates,
+                vec![(
+                    did("bob"),
+                    scp_protocol::crypto::hpke::p256::P256Point::try_from(new_key).unwrap()
+                )]
+            ),
             other => panic!("expected a Commit, got {other:?}"),
         }
         assert_eq!(f.dave.epoch().unwrap(), 3);

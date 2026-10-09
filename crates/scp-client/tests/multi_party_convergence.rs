@@ -647,7 +647,7 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     let (carol_wrapping_public, _carol_wrapping_secret) =
         scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
     let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
-        generate_key_package(&carol_cred, &carol_wrapping_public, &SystemClock)
+        generate_key_package(&carol_cred, carol_wrapping_public.as_bytes(), &SystemClock)
             .expect("carol key package");
     let carol_kp_in = scp_mls::wire::parse_key_package_in(
         &carol_bundle

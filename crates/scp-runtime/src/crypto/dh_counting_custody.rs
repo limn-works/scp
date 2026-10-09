@@ -1,6 +1,5 @@
-//! Test custody that counts `dh_agree` calls, so a test can prove the
-//! sender-key and access-key open paths validate a wire `enc` (§9.5) before
-//! any key agreement: a rejected `enc` must leave the count at zero.
+//! Test custody that counts `dh_agree` calls, so a round-trip test can prove
+//! the access-key open path performs exactly one key agreement.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30,28 +29,6 @@ impl DhCountingCustody {
     pub fn dh_calls(&self) -> usize {
         self.dh_calls.load(Ordering::SeqCst)
     }
-}
-
-/// A 65-byte `enc` led by `0x04` whose coordinates are not on P-256
-/// (`x = 0, y = 1`).
-pub const OFF_CURVE_ENC: [u8; 65] = {
-    let mut enc = [0u8; 65];
-    enc[0] = 0x04;
-    enc[64] = 0x01;
-    enc
-};
-
-/// The wire `enc` values §9.5 rejects before key agreement: 32 bytes (the
-/// X25519 length), an off-curve point, and a valid point under the `0x02`
-/// compressed prefix (the same 65-byte length, wrong form).
-pub fn rejected_encs(valid_point: &[u8; 65]) -> [(&'static str, Vec<u8>); 3] {
-    let mut wrong_prefix = *valid_point;
-    wrong_prefix[0] = 0x02;
-    [
-        ("32-byte enc", valid_point[1..33].to_vec()),
-        ("off-curve enc", OFF_CURVE_ENC.to_vec()),
-        ("0x02-prefixed enc", wrong_prefix.to_vec()),
-    ]
 }
 
 impl KeyCustody for DhCountingCustody {

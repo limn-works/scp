@@ -25,7 +25,10 @@ impl WrappingKeyPair {
     #[must_use]
     pub fn generate() -> Self {
         let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
-        Self { secret, public }
+        Self {
+            secret,
+            public: *public.as_bytes(),
+        }
     }
 
     /// Rebuilds the keypair from its 32-byte big-endian scalar, deriving the

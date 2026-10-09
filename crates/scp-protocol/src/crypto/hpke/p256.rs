@@ -146,28 +146,31 @@ fn select_candidate(source: &mut impl CandidateSource) -> Result<P256SigningKey,
 
 /// Single-shot Base-mode HPKE seal to a P-256 recipient.
 ///
-/// Validates `recipient_pk` (§9.5 point validation), draws a fresh ephemeral
-/// key, performs DHKEM Encap, runs `KeySchedule_base`, and AEAD-seals `pt` at
-/// sequence 0.
+/// `recipient_pk` is a [`P256Point`], so §9.5 point validation ran when it was
+/// decoded or constructed. Draws a fresh ephemeral key, performs DHKEM Encap,
+/// runs `KeySchedule_base`, and AEAD-seals `pt` at sequence 0.
 ///
-/// Returns `(enc, ct)`: `enc` is the 65-byte uncompressed ephemeral public key
-/// and `ct` is `ciphertext || tag` (`pt.len() + 16` bytes).
+/// Returns `(enc, ct)`: `enc` is the ephemeral public key and `ct` is
+/// `ciphertext || tag` (`pt.len() + 16` bytes).
 ///
 /// # Errors
 ///
-/// [`HpkeError::InvalidKey`] if `recipient_pk` is not a valid uncompressed
-/// P-256 point; [`HpkeError::SealFailed`] if KDF or AEAD encryption fails
-/// (operationally unreachable with valid inputs).
+/// [`HpkeError::SealFailed`] if KDF or AEAD encryption fails (operationally
+/// unreachable with valid inputs).
 pub fn seal(
-    recipient_pk: &[u8; PUBLIC_KEY_LEN],
+    recipient_pk: &P256Point,
     info: &[u8],
     aad: &[u8],
     pt: &[u8],
-) -> Result<([u8; ENC_LEN], Vec<u8>), HpkeError> {
+) -> Result<(P256Point, Vec<u8>), HpkeError> {
     let mut ikm = Zeroizing::new([0u8; PRIVATE_KEY_LEN]);
     OsRng.fill_bytes(ikm.as_mut());
     let ephemeral = derive_key_pair(ikm.as_ref())?;
-    seal_with_ephemeral(&ephemeral, recipient_pk, info, aad, pt)
+    let (enc, ct) = seal_with_ephemeral(&ephemeral, recipient_pk.as_bytes(), info, aad, pt)?;
+    // `enc` is the encoding of `ephemeral`'s public key; the point is taken
+    // from the key itself, so no parse runs.
+    debug_assert_eq!(enc, ephemeral.public_key().to_uncompressed());
+    Ok((P256Point::from(&ephemeral.public_key()), ct))
 }
 
 /// Single-shot Base-mode HPKE open with a **software-held** recipient scalar.
@@ -267,19 +270,139 @@ pub fn validate_enc(enc: &[u8]) -> Result<ValidatedEnc, HpkeError> {
     })
 }
 
-/// §9.5 point validation of any 65-byte wire key in the DHKEM(P-256) form: an
-/// MLS leaf key, a 0xFF01 wrapping key, a sender-, access- or broadcast-key
-/// wrapping public key.
+/// A peer's DHKEM(P-256) public key read from the wire, validated (§9.5).
 ///
-/// The same check as [`validate_enc`], which it calls, so SCP has one P-256
-/// wire-point parser. Returns the validated 65 bytes.
+/// It serves every role: an MLS leaf key, a 0xFF01 wrapping key, a sender-,
+/// access- or broadcast-key wrapping public key, or an HPKE `enc`. It is a
+/// 65-byte uncompressed SEC1 point led by `0x04`, on the curve, and not the
+/// point at infinity.
 ///
-/// # Errors
+/// Every wire field that carries a peer wrapping key or an HPKE `enc` holds
+/// this type, so decoding is validation: a 64-byte, compressed, or off-curve
+/// key fails at deserialization and never reaches a hash, a signature check,
+/// or a key agreement. Every constructor validates: [`TryFrom<&[u8]>`],
+/// [`TryFrom<[u8; 65]>`] and `Deserialize` call [`validate_enc`], the one
+/// P-256 wire-point parser; `From<ValidatedEnc>` and `From<&P256PublicKey>`
+/// take an already validated point; [`seal`] returns its ephemeral public key.
+/// It holds the [`ValidatedEnc`] it was built from, so an open path converts
+/// it with `ValidatedEnc::from` and never parses the point twice.
 ///
-/// [`HpkeError::InvalidKey`] if `bytes` is not 65 bytes, is not led by `0x04`,
-/// is not on the curve, or is the point at infinity.
-pub fn validate_uncompressed_point(bytes: &[u8]) -> Result<[u8; PUBLIC_KEY_LEN], HpkeError> {
-    validate_enc(bytes).map(|v| *v.as_bytes())
+/// The serde encoding is the 65 raw bytes through `serde_bytes`: a binary
+/// string in `MessagePack` and an array of numbers in JSON, the same bytes the
+/// earlier `[u8; 65]` and `Vec<u8>` fields produced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct P256Point(ValidatedEnc);
+
+impl P256Point {
+    /// The 65-byte uncompressed SEC1 encoding.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; PUBLIC_KEY_LEN] {
+        self.0.as_bytes()
+    }
+}
+
+/// Hashes the encoding, which determines the point, so equal points hash
+/// equally.
+impl core::hash::Hash for P256Point {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl core::fmt::Debug for P256Point {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "P256Point({})", hex::encode(self.as_bytes()))
+    }
+}
+
+impl TryFrom<&[u8]> for P256Point {
+    type Error = HpkeError;
+
+    /// §9.5 point validation.
+    ///
+    /// # Errors
+    ///
+    /// [`HpkeError::InvalidKey`] if `bytes` is not 65 bytes, is not led by
+    /// `0x04`, is not on the curve, or is the point at infinity.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        validate_enc(bytes).map(Self)
+    }
+}
+
+impl TryFrom<[u8; PUBLIC_KEY_LEN]> for P256Point {
+    type Error = HpkeError;
+
+    /// §9.5 point validation.
+    ///
+    /// # Errors
+    ///
+    /// [`HpkeError::InvalidKey`] if `bytes` is not led by `0x04`, is not on
+    /// the curve, or is the point at infinity.
+    fn try_from(bytes: [u8; PUBLIC_KEY_LEN]) -> Result<Self, Self::Error> {
+        Self::try_from(bytes.as_slice())
+    }
+}
+
+/// Infallible: a [`P256PublicKey`] is already a validated, non-identity point.
+impl From<&P256PublicKey> for P256Point {
+    fn from(key: &P256PublicKey) -> Self {
+        Self(ValidatedEnc {
+            bytes: key.to_uncompressed(),
+            point: *key,
+        })
+    }
+}
+
+impl From<ValidatedEnc> for P256Point {
+    fn from(enc: ValidatedEnc) -> Self {
+        Self(enc)
+    }
+}
+
+/// Infallible: a [`P256Point`] was validated when it was built, so an open
+/// path takes its `enc` without a second parse.
+impl From<P256Point> for ValidatedEnc {
+    fn from(point: P256Point) -> Self {
+        point.0
+    }
+}
+
+impl serde::Serialize for P256Point {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(self.as_bytes().as_slice(), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for P256Point {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: serde_bytes::ByteBuf = serde_bytes::deserialize(deserializer)?;
+        Self::try_from(bytes.as_slice()).map_err(|e| {
+            serde::de::Error::custom(format!(
+                "expected a 65-byte uncompressed P-256 point, got {} bytes: {e}",
+                bytes.len()
+            ))
+        })
+    }
+}
+
+impl serde::Serialize for ValidatedEnc {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(self.bytes.as_slice(), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ValidatedEnc {
+    /// Decoding runs [`validate_enc`], so a decoded `ValidatedEnc` carries the
+    /// same guarantee as one built by [`validate_enc`].
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: serde_bytes::ByteBuf = serde_bytes::deserialize(deserializer)?;
+        validate_enc(bytes.as_slice()).map_err(|e| {
+            serde::de::Error::custom(format!(
+                "expected a 65-byte uncompressed P-256 enc, got {} bytes: {e}",
+                bytes.len()
+            ))
+        })
+    }
 }
 
 /// HPKE open paths for P-256 recipient keys held inside a `KeyCustody`
@@ -675,6 +798,19 @@ mod tests {
         Ok(())
     }
 
+    /// [`seal`] over raw bytes, for tests that compare and slice wire bytes.
+    /// An invalid recipient fails here at [`P256Point::try_from`], the only way
+    /// raw bytes reach [`seal`].
+    fn seal_bytes(
+        recipient: &[u8; 65],
+        info: &[u8],
+        aad: &[u8],
+        pt: &[u8],
+    ) -> Result<([u8; 65], Vec<u8>), HpkeError> {
+        let (enc, ct) = seal(&P256Point::try_from(*recipient)?, info, aad, pt)?;
+        Ok((*enc.as_bytes(), ct))
+    }
+
     fn fresh_recipient() -> Result<([u8; 32], [u8; 65]), HpkeError> {
         let mut ikm = [0u8; 32];
         OsRng.fill_bytes(&mut ikm);
@@ -688,7 +824,7 @@ mod tests {
         let (sk, pk) = fresh_recipient()?;
         for len in [0usize, 1, 16, 32, 64, 1000] {
             let pt = vec![0xA5u8; len];
-            let (enc, ct) = seal(&pk, b"info", b"aad", &pt)?;
+            let (enc, ct) = seal_bytes(&pk, b"info", b"aad", &pt)?;
             assert_eq!(ct.len(), pt.len() + TAG_LEN);
             let opened: Zeroizing<Vec<u8>> = open(&sk, &enc, b"info", b"aad", &ct)?;
             assert_eq!(*opened, pt, "len {len}");
@@ -712,7 +848,7 @@ mod tests {
     #[test]
     fn open_rejects_enc_not_65_bytes() -> TestResult {
         let (sk, pk) = fresh_recipient()?;
-        let (enc, ct) = seal(&pk, b"i", b"a", b"secret")?;
+        let (enc, ct) = seal_bytes(&pk, b"i", b"a", b"secret")?;
         assert!(validate_enc(&enc).is_ok(), "a sealed enc must validate");
         let compressed = P256PublicKey::from_sec1(&enc)?.to_compressed();
         let mut long = enc.to_vec();
@@ -743,7 +879,7 @@ mod tests {
     #[test]
     fn open_rejects_enc_off_curve() -> TestResult {
         let (sk, pk) = fresh_recipient()?;
-        let (_, ct) = seal(&pk, b"i", b"a", b"secret")?;
+        let (_, ct) = seal_bytes(&pk, b"i", b"a", b"secret")?;
 
         let mut off_curve = arr::<65>(ENC)?;
         off_curve[64] ^= 0x01;
@@ -776,8 +912,11 @@ mod tests {
                 hex::encode(bad)
             );
             assert!(
-                matches!(seal(&bad, b"i", b"a", b"x"), Err(HpkeError::InvalidKey(_))),
-                "seal accepted invalid recipient {}",
+                matches!(
+                    seal_bytes(&bad, b"i", b"a", b"x"),
+                    Err(HpkeError::InvalidKey(_))
+                ),
+                "an invalid recipient reached seal {}",
                 hex::encode(bad)
             );
         }
@@ -790,7 +929,7 @@ mod tests {
     #[test]
     fn open_fails_on_any_mismatch() -> TestResult {
         let (sk, pk) = fresh_recipient()?;
-        let (enc, ct) = seal(&pk, b"info", b"aad", b"secret")?;
+        let (enc, ct) = seal_bytes(&pk, b"info", b"aad", b"secret")?;
 
         let mut tampered = ct.clone();
         tampered[0] ^= 0x01;
@@ -799,7 +938,7 @@ mod tests {
             Err(HpkeError::OpenFailed(_))
         ));
 
-        let (other_enc, _) = seal(&pk, b"info", b"aad", b"secret")?;
+        let (other_enc, _) = seal_bytes(&pk, b"info", b"aad", b"secret")?;
         assert!(matches!(
             open(&sk, &other_enc, b"info", b"aad", &ct),
             Err(HpkeError::OpenFailed(_))
@@ -919,12 +1058,29 @@ mod tests {
         Ok(())
     }
 
+    /// A wire point encodes as one msgpack `bin 8` of 65 bytes (`0xc4 0x41`),
+    /// the encoding the `serde_bytes` `Vec<u8>` fields it replaced
+    /// produced, so the type change moves no byte on the wire. A sequence
+    /// encoding would emit an array of 65 integers instead.
+    #[test]
+    fn wire_points_encode_as_msgpack_bin() -> TestResult {
+        let (_, pk) = fresh_recipient()?;
+        let point = P256Point::try_from(pk.as_slice())?;
+        let mut expected = vec![0xc4, 0x41];
+        expected.extend_from_slice(point.as_bytes());
+        assert_eq!(rmp_serde::to_vec(&point)?, expected, "P256Point");
+        let enc = ValidatedEnc::from(point);
+        assert_eq!(rmp_serde::to_vec(&enc)?, expected, "ValidatedEnc");
+        assert_eq!(rmp_serde::from_slice::<P256Point>(&expected)?, point);
+        Ok(())
+    }
+
     /// Negative: a recipient scalar of zero or of the group order is rejected,
     /// and `DeriveKeyPair` rejects `ikm` shorter than `Nsk`.
     #[test]
     fn rejects_invalid_scalars_and_short_ikm() -> TestResult {
         let (_, pk) = fresh_recipient()?;
-        let (enc, ct) = seal(&pk, b"i", b"a", b"x")?;
+        let (enc, ct) = seal_bytes(&pk, b"i", b"a", b"x")?;
         let order = arr::<32>(ORDER)?;
         for sk in [[0u8; 32], order] {
             assert!(matches!(

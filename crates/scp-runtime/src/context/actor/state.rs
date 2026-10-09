@@ -536,7 +536,7 @@ pub struct ContextCryptoState {
     /// uncompressed points, §9.16.1), keyed by DID. Populated from key
     /// packages during `add_member`. Mirrors legacy
     /// `NodeMlsFactory::ContextCryptoState::member_wrapping_keys`.
-    pub member_wrapping_keys: HashMap<String, [u8; 65]>,
+    pub member_wrapping_keys: HashMap<String, scp_protocol::crypto::hpke::p256::P256Point>,
 
     /// Receive-side sequence tracking for MLS replay detection.
     /// Maps `sender_did` -> (`last_epoch`, `last_sequence`).
@@ -1972,7 +1972,7 @@ impl ContextCryptoState {
     pub(crate) fn admit_member_wrapping_key(
         &mut self,
         member_did: String,
-        wrapping_key: [u8; 65],
+        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
     ) -> Result<(), ContextError> {
         match self.member_wrapping_keys.entry(member_did) {
             std::collections::hash_map::Entry::Occupied(recorded) => {
@@ -2907,7 +2907,7 @@ impl PerContextState {
 
         // 4. HPKE-seal new key to each remaining member's wrapping pubkey and
         //    queue distributions (§9.16.2).
-        let member_keys: Vec<(String, [u8; 65])> = crypto
+        let member_keys: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)> = crypto
             .member_wrapping_keys
             .iter()
             .map(|(did, key)| (did.clone(), *key))
@@ -4324,7 +4324,7 @@ mod crypto_ops_golden {
 
         let (valid, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
         alice_a
-            .add_member(CAROL, Some(&kp_bytes(&valid)), &SystemClock)
+            .add_member(CAROL, Some(&kp_bytes(valid.as_bytes())), &SystemClock)
             .expect("a valid 0xFF01 point is admitted");
         assert_eq!(epoch_of(&alice_a), epoch_before + 1, "the MLS add ran");
         assert_eq!(recorded(&alice_a), Some(valid));
@@ -4340,7 +4340,10 @@ mod crypto_ops_golden {
         bundle.key_package().tls_serialize_detached().unwrap()
     }
 
-    fn cached_key(state: &PerContextState, did: &str) -> Option<[u8; 65]> {
+    fn cached_key(
+        state: &PerContextState,
+        did: &str,
+    ) -> Option<scp_protocol::crypto::hpke::p256::P256Point> {
         match &state.mode {
             ContextModeState::Encrypted(c) => c.member_wrapping_keys.get(did).copied(),
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
@@ -4354,13 +4357,18 @@ mod crypto_ops_golden {
     #[test]
     fn add_of_existing_member_with_a_different_wrapping_key_is_refused() {
         let (_alice_p, mut alice_a, bob_p, _bob_a, _ctx) = setup();
-        let bob_key = *bob_p.public();
+        let bob_key =
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_p.public()).unwrap();
         assert_eq!(cached_key(&alice_a, BOB), Some(bob_key));
         let epoch_before = actor_mls_epoch(&alice_a);
 
         let (other_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
         let err = alice_a
-            .add_member(BOB, Some(&key_package_bytes(BOB, &other_key)), &SystemClock)
+            .add_member(
+                BOB,
+                Some(&key_package_bytes(BOB, other_key.as_bytes())),
+                &SystemClock,
+            )
             .expect_err("a different key for a recorded DID is refused");
         let expected = scp_mls::MlsError::LeafAdmissionRejected {
             did: BOB.to_owned(),
@@ -4379,7 +4387,11 @@ mod crypto_ops_golden {
         );
 
         alice_a
-            .add_member(BOB, Some(&key_package_bytes(BOB, &bob_key)), &SystemClock)
+            .add_member(
+                BOB,
+                Some(&key_package_bytes(BOB, bob_key.as_bytes())),
+                &SystemClock,
+            )
             .expect("a second device with the same key is admitted");
         assert_eq!(actor_mls_epoch(&alice_a), epoch_before + 1);
         assert_eq!(cached_key(&alice_a, BOB), Some(bob_key));
@@ -4399,7 +4411,7 @@ mod crypto_ops_golden {
         let err = alice_a
             .add_member(
                 DAVE,
-                Some(&key_package_bytes(CAROL, &carol_key)),
+                Some(&key_package_bytes(CAROL, carol_key.as_bytes())),
                 &SystemClock,
             )
             .expect_err("a KeyPackage for Carol cannot admit Dave");
@@ -4424,11 +4436,17 @@ mod crypto_ops_golden {
         bob_a
             .encrypted_crypto_mut()
             .unwrap()
-            .admit_member_wrapping_key(ALICE.to_owned(), *alice_p.public())
+            .admit_member_wrapping_key(
+                ALICE.to_owned(),
+                scp_protocol::crypto::hpke::p256::P256Point::try_from(*alice_p.public()).unwrap(),
+            )
             .unwrap();
         let (new_key, _secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
 
-        let commit = alice_a.advance_epoch(new_key).unwrap().commit_bytes;
+        let commit = alice_a
+            .advance_epoch(*new_key.as_bytes())
+            .unwrap()
+            .commit_bytes;
         let outer =
             scp_protocol::envelope::outer::create_outer_envelope(&routing(&ctx), None, 300, commit)
                 .unwrap()
@@ -5048,10 +5066,12 @@ mod crypto_ops_golden {
         let hash = scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
             BOB,
             ALICE,
-            1,
             &wrapping_pub,
             &nonce,
-            timestamp,
+            scp_protocol::crypto::sender_keys::key_protocol_verify::RequestHashInput {
+                epoch: 1,
+                requested_at: timestamp,
+            },
         )
         .unwrap();
         let signature: [u8; 64] = bob_request_signing_key.sign(&hash).to_bytes();

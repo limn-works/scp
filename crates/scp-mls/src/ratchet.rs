@@ -55,13 +55,7 @@ pub fn process_commit(
     commit_bytes: &[u8],
     grace_store: &mut EpochGraceStore,
     clock: &dyn Clock,
-) -> Result<
-    Vec<(
-        String,
-        [u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
-    )>,
-    MlsError,
-> {
+) -> Result<Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>, MlsError> {
     // Record the current epoch before processing the Commit. This epoch will
     // enter the grace window after the Commit is merged.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;

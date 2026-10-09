@@ -32,6 +32,7 @@
 use openmls::prelude::*;
 
 use crate::error::MlsError;
+use scp_protocol::crypto::hpke::p256::P256Point;
 
 /// Extension type ID for `scp_wrapping_key` in the RFC 9420 §17.3
 /// private-use range.
@@ -56,7 +57,7 @@ pub fn make_wrapping_key_extension(public_key: &[u8; P256_WRAPPING_KEY_SIZE]) ->
 ///
 /// Returns `None` if the extension is not present. A present payload passes
 /// §9.5 point validation
-/// ([`validate_uncompressed_point`](scp_protocol::crypto::hpke::p256::validate_uncompressed_point)):
+/// ([`P256Point`](scp_protocol::crypto::hpke::p256::P256Point)):
 /// exactly 65 bytes, led by `0x04`, on the curve.
 ///
 /// # Errors
@@ -65,11 +66,11 @@ pub fn make_wrapping_key_extension(public_key: &[u8; P256_WRAPPING_KEY_SIZE]) ->
 /// validation.
 pub fn extract_wrapping_key(
     extensions: &Extensions<LeafNode>,
-) -> Result<Option<[u8; P256_WRAPPING_KEY_SIZE]>, MlsError> {
+) -> Result<Option<P256Point>, MlsError> {
     extensions
         .unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE)
         .map(|ext| {
-            scp_protocol::crypto::hpke::p256::validate_uncompressed_point(&ext.0)
+            P256Point::try_from(ext.0.as_slice())
                 .map_err(|e| MlsError::ExtensionError(format!("scp_wrapping_key extension: {e}")))
         })
         .transpose()
@@ -128,7 +129,7 @@ pub fn leaf_node_params_with_wrapping_key(
 /// Returns [`MlsError::ExtensionError`] if the extension data is malformed.
 pub fn extract_own_wrapping_key(
     group: &crate::group::ScpMlsGroup,
-) -> Result<Option<[u8; P256_WRAPPING_KEY_SIZE]>, MlsError> {
+) -> Result<Option<P256Point>, MlsError> {
     let g = group.inner()?;
     let own_index = g.own_leaf_index().u32();
     let leaf = g
@@ -164,7 +165,7 @@ pub fn extract_own_wrapping_key(
 pub fn extract_member_wrapping_key(
     group: &crate::group::ScpMlsGroup,
     target_did: &str,
-) -> Result<Option<[u8; P256_WRAPPING_KEY_SIZE]>, MlsError> {
+) -> Result<Option<P256Point>, MlsError> {
     let g = group.inner()?;
 
     // Check if target is the local member — we can access own leaf node.
@@ -238,7 +239,10 @@ mod tests {
         // Build an Extensions<LeafNode> with the wrapping key.
         let extensions = Extensions::<LeafNode>::single(ext).unwrap();
         let extracted = extract_wrapping_key(&extensions).unwrap();
-        assert_eq!(extracted, Some(key));
+        assert_eq!(
+            extracted,
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(key).unwrap())
+        );
     }
 
     #[test]
@@ -280,7 +284,7 @@ mod tests {
         }
         assert_eq!(
             extract_wrapping_key(&extensions_with(valid.to_vec())).unwrap(),
-            Some(valid)
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(valid).unwrap())
         );
     }
 
@@ -304,11 +308,14 @@ mod tests {
                 .unwrap();
         let add = crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
         assert_eq!(add.admitted_did, bob_cred.did);
-        assert_eq!(add.admitted_wrapping_key, bob_wrapping);
+        assert_eq!(
+            add.admitted_wrapping_key,
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(bob_wrapping).unwrap()
+        );
         let bob_group = crate::group::join_group(&add.welcome, bob_provider, bob_signer).unwrap();
         assert_eq!(
             extract_member_wrapping_key(&bob_group, &bob_cred.did).unwrap(),
-            Some(bob_wrapping)
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(bob_wrapping).unwrap())
         );
     }
 
@@ -328,7 +335,10 @@ mod tests {
         let params = leaf_node_params_with_wrapping_key(&key).unwrap();
         let extensions = params.extensions().unwrap();
         let extracted = extract_wrapping_key(extensions).unwrap();
-        assert_eq!(extracted, Some(key));
+        assert_eq!(
+            extracted,
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(key).unwrap())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -357,7 +367,7 @@ mod tests {
         let extracted = extract_own_wrapping_key(&group).unwrap();
         assert_eq!(
             extracted,
-            Some(wrapping_key),
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(wrapping_key).unwrap()),
             "own leaf node must contain scp_wrapping_key extension"
         );
     }
@@ -387,7 +397,7 @@ mod tests {
         let bob_extracted = extract_own_wrapping_key(&bob_group).unwrap();
         assert_eq!(
             bob_extracted,
-            Some(bob_wrapping),
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(bob_wrapping).unwrap()),
             "Bob's own leaf node must contain scp_wrapping_key after joining"
         );
     }
@@ -433,7 +443,7 @@ mod tests {
         let alice_extracted = extract_own_wrapping_key(&alice_group).unwrap();
         assert_eq!(
             alice_extracted,
-            Some(wrapping_key),
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(wrapping_key).unwrap()),
             "scp_wrapping_key must remain identical after epoch advance"
         );
     }
@@ -467,12 +477,12 @@ mod tests {
         let extracted = extract_own_wrapping_key(&group).unwrap();
         assert_eq!(
             extracted,
-            Some(new_key),
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(new_key).unwrap()),
             "scp_wrapping_key must change after rotation"
         );
         assert_ne!(
             extracted,
-            Some(original_key),
+            Some(scp_protocol::crypto::hpke::p256::P256Point::try_from(original_key).unwrap()),
             "scp_wrapping_key must differ from original after rotation"
         );
     }

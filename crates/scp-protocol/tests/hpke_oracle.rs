@@ -200,7 +200,8 @@ fn p256_round_trips_against_reference() -> TestResult {
         let (sk, pk) = fresh_p256_recipient()?;
 
         // Ours → reference.
-        let (enc, ct) = hpke::p256::seal(&pk, info, aad, pt)?;
+        let (enc, ct) = hpke::p256::seal(&hpke::p256::P256Point::try_from(pk)?, info, aad, pt)?;
+        let enc = *enc.as_bytes();
         assert_eq!(enc.len(), hpke::p256::ENC_LEN, "case {idx}: enc length");
         assert_eq!(enc[0], 0x04, "case {idx}: enc is uncompressed SEC1");
         let recovered = ref_hpke_p256()

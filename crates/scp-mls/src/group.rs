@@ -702,7 +702,7 @@ pub struct AddMemberResult {
     /// The DID the added leaf's credential names.
     pub admitted_did: String,
     /// The `0xFF01` wrapping public key the added leaf publishes.
-    pub admitted_wrapping_key: [u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
+    pub admitted_wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
 }
 
 /// Adds a member to the group using their pre-published `KeyPackage`.

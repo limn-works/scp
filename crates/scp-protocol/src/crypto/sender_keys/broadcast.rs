@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{SenderKey, SenderKeyError};
+use crate::crypto::hpke::p256::P256Point;
 
 /// AES-256-GCM nonce size in bytes.
 const NONCE_SIZE: usize = 12;
@@ -880,16 +881,14 @@ pub fn build_broadcast_key_hpke_aad(context_id: &str, author_did: &str, epoch: u
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if
-/// `subscriber_wrapping_pub` is not a valid uncompressed P-256 point or HPKE
-/// sealing fails.
+/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HPKE sealing fails.
 pub fn seal_broadcast_key_to_subscriber(
     broadcast_key: &SenderKey,
-    subscriber_wrapping_pub: &[u8; 65],
+    subscriber_wrapping_pub: &P256Point,
     context_id: &str,
     author_did: &str,
     epoch: u64,
-) -> Result<(Vec<u8>, [u8; 65]), SenderKeyError> {
+) -> Result<(Vec<u8>, P256Point), SenderKeyError> {
     let info = build_broadcast_key_hpke_info(context_id, author_did, epoch);
     let aad = build_broadcast_key_hpke_aad(context_id, author_did, epoch);
 
@@ -919,7 +918,7 @@ pub fn seal_broadcast_key_to_subscriber(
 /// plaintext is not exactly 32 bytes.
 pub fn open_broadcast_key(
     sealed: &[u8],
-    enc: &[u8; 65],
+    enc: &P256Point,
     wrapping_secret: &[u8; 32],
     context_id: &str,
     author_did: &str,
@@ -942,8 +941,9 @@ pub fn open_broadcast_key(
     let info = build_broadcast_key_hpke_info(context_id, author_did, epoch);
     let aad = build_broadcast_key_hpke_aad(context_id, author_did, epoch);
 
-    let plaintext = crate::crypto::hpke::p256::open(wrapping_secret, enc, &info, &aad, sealed)
-        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
+    let plaintext =
+        crate::crypto::hpke::p256::open(wrapping_secret, enc.as_bytes(), &info, &aad, sealed)
+            .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
 
     let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
         SenderKeyError::HpkeDecryptionFailed(format!(
@@ -1776,7 +1776,7 @@ mod tests {
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_uncompressed(),
+            &P256Point::from(&subscriber_pub),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1806,7 +1806,7 @@ mod tests {
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_uncompressed(),
+            &P256Point::from(&subscriber_pub),
             "ctx-A",
             "did:dht:author",
             0,
@@ -1854,7 +1854,7 @@ mod tests {
 
         let (mut ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_uncompressed(),
+            &P256Point::from(&subscriber_pub),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1883,20 +1883,23 @@ mod tests {
         let subscriber_secret = scp_crypto::p256::P256SigningKey::random(&mut OsRng);
         let subscriber_pub = subscriber_secret.public_key();
 
-        let (ct, mut enc) = seal_broadcast_key_to_subscriber(
+        let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_uncompressed(),
+            &P256Point::from(&subscriber_pub),
             "ctx-broadcast",
             "did:dht:author",
             0,
         )
         .unwrap();
 
-        enc[0] ^= 0x01;
+        // A malformed enc cannot be a `P256Point`; substitute another valid point.
+        let tampered =
+            P256Point::try_from(scp_crypto::p256::testing::valid_uncompressed_point(7)).unwrap();
+        assert_ne!(tampered, enc);
 
         let result = open_broadcast_key(
             &ct,
-            &enc,
+            &tampered,
             &subscriber_secret.to_scalar_bytes(),
             "ctx-broadcast",
             "did:dht:author",
@@ -1918,7 +1921,7 @@ mod tests {
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &recipient_pub.to_uncompressed(),
+            &P256Point::from(&recipient_pub),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -1961,7 +1964,7 @@ mod tests {
         let sender_info = build_sender_key_hpke_info("ctx-broadcast", "did:dht:author", 0);
         let sender_aad = build_sender_key_hpke_aad("ctx-broadcast", "did:dht:author", 0);
         let (enc, ct) = crate::crypto::hpke::p256::seal(
-            &subscriber_pub.to_uncompressed(),
+            &P256Point::from(&subscriber_pub),
             &sender_info,
             &sender_aad,
             &payload,
@@ -1992,7 +1995,8 @@ mod tests {
         // not the slower AEAD-failure path. A valid 65-byte `enc` point and a
         // dummy wrapping secret are supplied to prove the gate is reached purely
         // on length, independent of any key agreement.
-        let enc = scp_crypto::p256::testing::valid_uncompressed_point(0);
+        let enc =
+            P256Point::try_from(scp_crypto::p256::testing::valid_uncompressed_point(0)).unwrap();
         let wrapping_secret = [7u8; 32];
 
         for bad_len in [47usize, 49usize] {
@@ -2029,7 +2033,7 @@ mod tests {
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_uncompressed(),
+            &P256Point::from(&subscriber_pub),
             "ctx-broadcast",
             "did:dht:author",
             0,
@@ -2059,7 +2063,7 @@ mod tests {
 
         let (ct, enc) = seal_broadcast_key_to_subscriber(
             key.key(),
-            &subscriber_pub.to_uncompressed(),
+            &P256Point::from(&subscriber_pub),
             "ctx-broadcast",
             "did:dht:alice",
             0,

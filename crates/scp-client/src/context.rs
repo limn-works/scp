@@ -153,7 +153,7 @@ impl PerContextState {
     pub fn admit_member_record(
         &mut self,
         member_did: &str,
-        wrapping_key: [u8; 65],
+        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
     ) -> Result<(), ClientError> {
         self.crypto
             .admit_member_wrapping_key(member_did, wrapping_key)?;
@@ -172,7 +172,7 @@ impl PerContextState {
     pub fn refresh_member_wrapping_key(
         &mut self,
         member_did: &str,
-        wrapping_key: [u8; 65],
+        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
     ) -> Result<(), ClientError> {
         self.crypto
             .refresh_member_wrapping_key(member_did, wrapping_key)

@@ -18,6 +18,14 @@
 
 use std::borrow::Cow;
 
+use scp_protocol::crypto::hpke::p256::P256Point;
+
+/// A valid uncompressed P-256 point: wrapping-key and `enc` fields are
+/// `P256Point`s, which reject anything else at decode.
+fn valid_point() -> P256Point {
+    scp_protocol::crypto::sender_keys::key_protocol_verify::generate_wrapping_keypair().0
+}
+
 // ---------------------------------------------------------------------------
 // Helper: inject unknown fields into a MessagePack named map
 // ---------------------------------------------------------------------------
@@ -692,7 +700,7 @@ mod sender_key_types {
             requester_did: "did:dht:requester".to_string(),
             sender_did: "did:dht:sender".to_string(),
             epoch: 3,
-            wrapping_pubkey: [0xBB; 65],
+            wrapping_pubkey: valid_point(),
             nonce: [0xCC; 16],
             timestamp: 1_700_000_000,
             signature: [0xDD; 64],
@@ -718,7 +726,7 @@ mod sender_key_types {
             sender_did: "did:dht:sender".to_string(),
             epoch: 3,
             hpke_sealed_key: [0xEE; 48],
-            ephemeral_pubkey: [0xFF; 65],
+            ephemeral_pubkey: valid_point(),
             request_nonce: [0xAA; 16],
         };
         let bytes = rmp_serde::to_vec_named(&response).unwrap();
@@ -987,10 +995,11 @@ mod access_key_types {
     /// §13.9 item 3: `AccessKeyRequest` MUST ignore unknown fields.
     #[test]
     fn request_ignores_unknown_fields_msgpack() {
+        let wrapping_pubkey = valid_point();
         let request = AccessKeyRequest {
             requester_did: "did:dht:requester".to_string(),
             context_id: "ctx-access-test".to_string(),
-            wrapping_pubkey: vec![0xBB; 65],
+            wrapping_pubkey,
             nonce: [0xCC; 16],
             timestamp: 1_700_000_000,
             signature: vec![0xDD; 64],
@@ -1007,7 +1016,7 @@ mod access_key_types {
         let decoded = result.unwrap();
         assert_eq!(decoded.requester_did, "did:dht:requester");
         assert_eq!(decoded.context_id, "ctx-access-test");
-        assert_eq!(decoded.wrapping_pubkey, vec![0xBB; 65]);
+        assert_eq!(decoded.wrapping_pubkey, wrapping_pubkey);
         assert_eq!(decoded.nonce, [0xCC; 16]);
         assert_eq!(decoded.timestamp, 1_700_000_000);
         assert_eq!(decoded.signature, vec![0xDD; 64]);
@@ -1016,12 +1025,13 @@ mod access_key_types {
     /// §13.9 item 3: `AccessKeyResponse` MUST ignore unknown fields.
     #[test]
     fn response_ignores_unknown_fields_msgpack() {
+        let ephemeral_pubkey = valid_point();
         let response = AccessKeyResponse {
             context_id: "ctx-access-test".to_string(),
             member_did: "did:dht:member".to_string(),
             epoch: 5,
             hpke_sealed_key: [0xEE; 48],
-            ephemeral_pubkey: vec![0xFF; 65],
+            ephemeral_pubkey,
         };
         let bytes = rmp_serde::to_vec_named(&response).unwrap();
         let with_extras = inject_unknown_msgpack_fields(&bytes, &future_msgpack_fields());
@@ -1037,6 +1047,6 @@ mod access_key_types {
         assert_eq!(decoded.member_did, "did:dht:member");
         assert_eq!(decoded.epoch, 5);
         assert_eq!(decoded.hpke_sealed_key, [0xEE; 48]);
-        assert_eq!(decoded.ephemeral_pubkey, vec![0xFF; 65]);
+        assert_eq!(decoded.ephemeral_pubkey, ephemeral_pubkey);
     }
 }

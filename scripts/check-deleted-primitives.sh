@@ -144,6 +144,12 @@ BAN_ENTRIES=(
     # HPKE is a direct call to scp_protocol::crypto::hpke::p256. The runtime's
     # HpkeBackend trait had one implementation and no method callers.
     "HpkeBackend|crates|*.rs|Call scp_protocol::crypto::hpke::p256 directly; the HPKE backend trait is deleted"
+    # A peer P-256 key on the wire is a P256Point, validated when it is
+    # decoded; byte-array serde helpers and a second point parser would let
+    # an unvalidated key reach a hash, a seal or a key agreement.
+    "serde_pubkey_65|crates|*.rs|Type the field as scp_protocol::crypto::hpke::p256::P256Point, which validates at decode"
+    "serde_wrapping_key_list_65|crates|*.rs|Type the list as Vec<(String, P256Point)>, which validates each key at decode"
+    "validate_uncompressed_point|crates|*.rs|Parse a wire point with P256Point::try_from (or validate_enc for an HPKE enc), the one P-256 wire-point parser"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned

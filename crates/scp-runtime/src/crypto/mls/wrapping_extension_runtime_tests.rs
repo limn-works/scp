@@ -32,8 +32,7 @@ fn generate_wrapping_keypair_produces_valid_keypair() {
     let (pub1, sec1) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
     let (pub2, sec2) = crate::crypto::sender_keys::key_protocol::generate_wrapping_keypair();
 
-    assert_eq!(pub1.len(), 65);
-    assert_eq!(pub1[0], 0x04);
+    assert_eq!(pub1.as_bytes()[0], 0x04);
     assert_eq!(sec1.len(), 32);
     assert_ne!(pub1, pub2, "wrapping keypairs must be distinct");
     assert_ne!(sec1, sec2, "wrapping secret keys must be distinct");
@@ -43,7 +42,11 @@ fn generate_wrapping_keypair_produces_valid_keypair() {
         .unwrap()
         .public_key()
         .to_uncompressed();
-    assert_eq!(pub1, derived_pub, "public key must derive from secret key");
+    assert_eq!(
+        pub1.as_bytes(),
+        &derived_pub,
+        "public key must derive from secret key"
+    );
 }
 
 /// AC: send SenderKeyRequest -> response is HPKE-sealed to the requester's
@@ -209,10 +212,10 @@ fn sender_keys_wrapping_stable_001() {
         .unwrap()
         .public_key()
         .to_uncompressed();
-    assert_eq!(pub_key, derived_pub, "public key derivation");
+    assert_eq!(pub_key.as_bytes(), &derived_pub, "public key derivation");
 
     // 2. Extension publishes the 65-byte DHKEM(P-256) public key.
-    let ext = make_wrapping_key_extension(&pub_key);
+    let ext = make_wrapping_key_extension(pub_key.as_bytes());
     assert_eq!(
         ext.extension_type(),
         ExtensionType::Unknown(SCP_WRAPPING_KEY_EXTENSION_TYPE),
@@ -221,7 +224,8 @@ fn sender_keys_wrapping_stable_001() {
 
     // 3. Create group with wrapping key -> LeafNode contains extension.
     let cred = test_credential("conformance");
-    let group = scp_mls::group::create_group(&cred, &pub_key, &scp_clock::SystemClock).unwrap();
+    let group =
+        scp_mls::group::create_group(&cred, pub_key.as_bytes(), &scp_clock::SystemClock).unwrap();
     let extracted = extract_own_wrapping_key(&group).unwrap();
     assert_eq!(extracted, Some(pub_key), "wrapping key in LeafNode");
 
@@ -241,7 +245,8 @@ fn sender_keys_wrapping_stable_001() {
         scp_mls::group::add_member(&mut group_mut, bob_kp_in, &scp_clock::SystemClock).unwrap();
 
     let _commit =
-        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, &pub_key).unwrap();
+        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, pub_key.as_bytes())
+            .unwrap();
 
     let after_update = extract_own_wrapping_key(&group_mut).unwrap();
     assert_eq!(
@@ -253,7 +258,8 @@ fn sender_keys_wrapping_stable_001() {
     // 5. Wrapping key can be rotated (identity key rotation simulation).
     let (new_pub, _new_sec) = generate_wrapping_keypair();
     let _commit2 =
-        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, &new_pub).unwrap();
+        scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, new_pub.as_bytes())
+            .unwrap();
 
     let after_rotation = extract_own_wrapping_key(&group_mut).unwrap();
     assert_eq!(

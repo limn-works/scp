@@ -26,6 +26,7 @@
 
 use scp_core::context::broadcast::{KeyRequestDecision, SealedBroadcastKey};
 use scp_core::crypto::sender_keys::broadcast::open_broadcast_key;
+use scp_protocol::crypto::hpke::p256::P256Point;
 
 /// The exact byte length of a legitimate wrapping secret: the DHKEM(P-256)
 /// scalar (§9.5).
@@ -82,9 +83,9 @@ impl std::error::Error for WrappingPubkeyError {}
 /// Returns [`WrappingPubkeyError::InvalidLength`] for any length other than
 /// 65, and [`WrappingPubkeyError::InvalidPoint`] for a 65-byte value that is
 /// not a valid uncompressed P-256 point.
-pub fn parse_wrapping_pubkey(bytes: &[u8]) -> Result<[u8; 65], WrappingPubkeyError> {
+pub fn parse_wrapping_pubkey(bytes: &[u8]) -> Result<P256Point, WrappingPubkeyError> {
     match scp_crypto::p256::P256PublicKey::from_uncompressed(bytes) {
-        Ok(point) => Ok(point.to_uncompressed()),
+        Ok(point) => Ok(P256Point::from(&point)),
         Err(scp_crypto::p256::P256Error::InvalidUncompressedLength(actual)) => {
             Err(WrappingPubkeyError::InvalidLength { actual })
         }
@@ -252,7 +253,7 @@ mod tests {
     /// Builds a real granted decision by sealing a freshly generated broadcast
     /// key to a known DHKEM(P-256) keypair, so the round-trip exercises real
     /// crypto.
-    fn grant_for(wrapping_pub: &[u8; 65], epoch: u64) -> KeyRequestDecision {
+    fn grant_for(wrapping_pub: &P256Point, epoch: u64) -> KeyRequestDecision {
         let key = generate_broadcast_key(AUTHOR);
         let (ct, enc) =
             seal_broadcast_key_to_subscriber(key.key(), wrapping_pub, CTX, AUTHOR, epoch).unwrap();
@@ -261,7 +262,7 @@ mod tests {
 
     /// A fresh DHKEM(P-256) wrapping keypair: the 32-byte scalar and its
     /// 65-byte uncompressed public point.
-    fn wrapping_keypair() -> ([u8; 32], [u8; 65]) {
+    fn wrapping_keypair() -> ([u8; 32], P256Point) {
         let (public, secret) = generate_wrapping_keypair();
         (*secret, public)
     }
@@ -317,7 +318,7 @@ mod tests {
     #[test]
     fn parse_wrapping_pubkey_accepts_a_valid_point() {
         let (_secret, public) = wrapping_keypair();
-        assert_eq!(parse_wrapping_pubkey(&public).unwrap(), public);
+        assert_eq!(parse_wrapping_pubkey(public.as_bytes()).unwrap(), public);
     }
 
     #[test]
@@ -340,7 +341,8 @@ mod tests {
             WrappingPubkeyError::InvalidPoint { .. }
         ));
         // A valid point under the compressed tag is rejected too.
-        let (_secret, mut public) = wrapping_keypair();
+        let (_secret, public) = wrapping_keypair();
+        let mut public = *public.as_bytes();
         public[0] = 0x02;
         assert!(matches!(
             parse_wrapping_pubkey(&public).unwrap_err(),

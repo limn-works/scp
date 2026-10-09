@@ -164,11 +164,11 @@ pub enum Inbound {
         /// fail-closed if absent — §9.16.1, ADR-057). The driver records each in
         /// its member-wrapping-key directory and HPKE-seals its own sender key to
         /// each new member (the bystander re-distribution trigger, INVARIANT 2).
-        added_wrapping_keys: Vec<[u8; 65]>,
+        added_wrapping_keys: Vec<scp_protocol::crypto::hpke::p256::P256Point>,
         /// `(did, key)` for each member whose own Update replaced its leaf
         /// with a new `scp_wrapping_key`; the driver refreshes each directory
         /// entry. Empty when no leaf's key changed.
-        wrapping_key_updates: Vec<(String, [u8; 65])>,
+        wrapping_key_updates: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
         /// The **authenticated** convergent committer timestamp (Unix seconds),
         /// recovered from the Commit's verified MLS AAD *before* the merge and
         /// adopted **verbatim** by `scp-mls` (ADR-057). The driver stamps this on
@@ -332,7 +332,7 @@ pub struct ContextCryptoState {
     /// HPKE-seal their sender keys to it; it is published in this member's MLS
     /// leaf `scp_wrapping_key` extension and transported in the member-wrapping-key
     /// directory. Stable across MLS epochs (does not rotate on Update).
-    pub wrapping_public: [u8; 65],
+    pub wrapping_public: scp_protocol::crypto::hpke::p256::P256Point,
     /// This participant's **stable wrapping secret key** (the 32-byte
     /// DHKEM(P-256) scalar, §9.16.1). Used
     /// to HPKE-open sender-key distributions sealed to [`Self::wrapping_public`].
@@ -344,7 +344,7 @@ pub struct ContextCryptoState {
     /// every member recorded here is recorded *with* the wrapping key a peer needs
     /// to HPKE-seal a sender key to it, by construction. Includes this member's
     /// own entry (`did → wrapping_public`); the seal loop skips self.
-    pub member_wrapping_keys: HashMap<String, [u8; 65]>,
+    pub member_wrapping_keys: HashMap<String, scp_protocol::crypto::hpke::p256::P256Point>,
 }
 
 impl ContextCryptoState {
@@ -387,7 +387,7 @@ impl ContextCryptoState {
     pub fn from_group_with_wrapping(
         context_id: impl Into<String>,
         mls_group: ScpMlsGroup,
-        wrapping_public: [u8; 65],
+        wrapping_public: scp_protocol::crypto::hpke::p256::P256Point,
         wrapping_secret: Zeroizing<[u8; 32]>,
     ) -> Self {
         Self {
@@ -422,7 +422,7 @@ impl ContextCryptoState {
     pub fn admit_member_wrapping_key(
         &mut self,
         member_did: &str,
-        wrapping_key: [u8; 65],
+        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
     ) -> Result<(), ClientError> {
         match self.member_wrapping_keys.get(member_did) {
             Some(recorded) if *recorded == wrapping_key => Ok(()),
@@ -450,7 +450,7 @@ impl ContextCryptoState {
     pub fn refresh_member_wrapping_key(
         &mut self,
         member_did: &str,
-        wrapping_key: [u8; 65],
+        wrapping_key: scp_protocol::crypto::hpke::p256::P256Point,
     ) -> Result<(), ClientError> {
         let recorded = self
             .member_wrapping_keys
@@ -470,8 +470,10 @@ impl ContextCryptoState {
     /// [`AddMemberOutput::wrapping_keys`](crate::AddMemberOutput) (all members
     /// incl. self) so a joiner adopts the full directory.
     #[must_use]
-    pub fn wrapping_keys_snapshot(&self) -> Vec<(String, [u8; 65])> {
-        let mut out: Vec<(String, [u8; 65])> = self
+    pub fn wrapping_keys_snapshot(
+        &self,
+    ) -> Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)> {
+        let mut out: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)> = self
             .member_wrapping_keys
             .iter()
             .map(|(did, wk)| (did.clone(), *wk))
@@ -498,7 +500,7 @@ impl ContextCryptoState {
         &mut self,
         local_did: &str,
         target_did: &str,
-        target_wrapping_key: &[u8; 65],
+        target_wrapping_key: &scp_protocol::crypto::hpke::p256::P256Point,
     ) -> Result<SenderKeyDistribution, ClientError> {
         let (sealed_vec, ephemeral_pubkey) = hpke_seal_sender_key(
             self.local_sender_key.as_bytes(),
@@ -561,7 +563,7 @@ impl ContextCryptoState {
     pub fn distribute_local_key_to(
         &mut self,
         local_did: &str,
-        recipients: &[(String, [u8; 65])],
+        recipients: &[(String, scp_protocol::crypto::hpke::p256::P256Point)],
     ) -> Result<Vec<SenderKeyDistribution>, ClientError> {
         // Keep the local member's own key discoverable in the store under its DID
         // (mirrors native `distribute_sender_key`).
@@ -1072,7 +1074,7 @@ mod tests {
         // (ADR-057 sender-key distribution INVARIANT 3).
         let (bob_wk, _bob_wsec) = generate_wrapping_keypair();
         let (bob_bundle, _bob_signer, _bob_provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB), &bob_wk, &SystemClock).unwrap();
+            generate_key_package(&credential(BOB), bob_wk.as_bytes(), &SystemClock).unwrap();
         let bob_kp_in = scp_mls::wire::parse_key_package_in(
             &bob_bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -1357,13 +1359,14 @@ mod tests {
         use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
 
         let (alice_wpub, alice_wsec) = generate_wrapping_keypair();
-        let alice_group = create_group(&credential(ALICE), &alice_wpub, &SystemClock).unwrap();
+        let alice_group =
+            create_group(&credential(ALICE), alice_wpub.as_bytes(), &SystemClock).unwrap();
         let mut alice =
             ContextCryptoState::from_group_with_wrapping(CTX, alice_group, alice_wpub, alice_wsec);
 
         let (bob_wpub, bob_wsec) = generate_wrapping_keypair();
         let (bundle, signer, provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB), &bob_wpub, &SystemClock).unwrap();
+            generate_key_package(&credential(BOB), bob_wpub.as_bytes(), &SystemClock).unwrap();
         let kp_in = scp_mls::wire::parse_key_package_in(
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -1660,7 +1663,10 @@ mod tests {
         );
     }
 
-    fn recorded_key(state: &ContextCryptoState, did: &str) -> Option<[u8; 65]> {
+    fn recorded_key(
+        state: &ContextCryptoState,
+        did: &str,
+    ) -> Option<scp_protocol::crypto::hpke::p256::P256Point> {
         state
             .wrapping_keys_snapshot()
             .into_iter()
@@ -1727,7 +1733,8 @@ mod tests {
         // can commit without scp-mls admission.
         let (mallory_key, _mallory_secret) = generate_wrapping_keypair();
         let (bundle, mallory_signer, mallory_provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(MALLORY), &mallory_key, &SystemClock).unwrap();
+            generate_key_package(&credential(MALLORY), mallory_key.as_bytes(), &SystemClock)
+                .unwrap();
         let kp_in = scp_mls::wire::parse_key_package_in(
             &bundle.key_package().tls_serialize_detached().unwrap(),
         )
@@ -1752,7 +1759,7 @@ mod tests {
         // Mallory's KeyPackage claims Bob's DID with Mallory's key.
         let (forged_key, _forged_secret) = generate_wrapping_keypair();
         let (forged, _forged_signer, _forged_provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB), &forged_key, &SystemClock).unwrap();
+            generate_key_package(&credential(BOB), forged_key.as_bytes(), &SystemClock).unwrap();
         let (commit, _welcome, _info) = mallory
             .add_members(
                 &mallory_provider,

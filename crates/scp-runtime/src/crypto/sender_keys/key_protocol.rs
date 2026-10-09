@@ -122,7 +122,7 @@ pub async fn request_sender_key(
         .await
         .map_err(|e| SenderKeyError::Custody(e.into()))?;
     // Validate before signing, so the request never commits to a malformed key.
-    let wrap_bytes = hpke_p256::validate_uncompressed_point(wrapping_pubkey.as_bytes())
+    let wrap_point = hpke_p256::P256Point::try_from(wrapping_pubkey.as_bytes())
         .map_err(|e| SenderKeyError::MalformedWrappingPublicKey(e.to_string()))?;
 
     // Generate cryptographic nonce and timestamp for replay protection.
@@ -134,10 +134,12 @@ pub async fn request_sender_key(
     let hash = compute_request_hash(
         requester_did,
         sender_did,
-        epoch,
-        &wrap_bytes,
+        &wrap_point,
         &nonce,
-        timestamp,
+        RequestHashInput {
+            epoch,
+            requested_at: timestamp,
+        },
     )?;
 
     let signature = key_custody
@@ -154,7 +156,7 @@ pub async fn request_sender_key(
         requester_did: requester_did.to_owned(),
         sender_did: sender_did.to_owned(),
         epoch,
-        wrapping_pubkey: wrap_bytes,
+        wrapping_pubkey: wrap_point,
         nonce,
         timestamp,
         signature: sig_bytes,
@@ -329,10 +331,10 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if `enc` is not a valid
-/// uncompressed P-256 point (checked before any key agreement), if HPKE open
-/// fails (wrong key/`info`/`aad`, tampered `enc`/`ct`), or if the recovered
-/// plaintext is not exactly 32 bytes. Returns [`SenderKeyError::Custody`] if
+/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if HPKE open fails (wrong
+/// key/`info`/`aad`, tampered `enc`/`ct`) or the recovered plaintext is not
+/// exactly 32 bytes. The response's `enc` was validated (§9.5) when it was
+/// decoded. Returns [`SenderKeyError::Custody`] if
 /// the DH agreement or public-key lookup fails in custody, and
 /// [`SenderKeyError::MalformedWrappingPublicKey`] if custody returns a
 /// wrapping public key that is not 65 bytes.
@@ -342,10 +344,9 @@ pub async fn open_sender_key_response(
     context_id: &str,
     response: &SenderKeyResponse,
 ) -> Result<SenderKey, SenderKeyError> {
-    // C16 order: validate `enc` (§9.5) before any key agreement. Serde fixed
-    // its length at 65 bytes; this checks the prefix and the curve.
-    let enc = hpke_p256::validate_enc(&response.ephemeral_pubkey)
-        .map_err(|e| SenderKeyError::HpkeDecryptionFailed(e.to_string()))?;
+    // Spec 09 §9.16.2 order: `enc` is validated (§9.5) before any key
+    // agreement. Decoding the `P256Point` validated it.
+    let enc = hpke_p256::ValidatedEnc::from(response.ephemeral_pubkey);
 
     // Compute the KEM DH output inside the custody boundary (same handle,
     // same enc — the only sound inputs to open_with_external_dh).
@@ -527,6 +528,7 @@ mod tests {
 
     use super::*;
     use crate::crypto::key_loss_custody::{KeyLoss, KeyLossCustody};
+    use scp_protocol::crypto::hpke::p256::P256Point;
     use scp_protocol::crypto::sender_keys::key_protocol_verify::{
         BLOCK_NOTIFICATION_FRESHNESS_MS, REQUEST_FRESHNESS_SECS,
     };
@@ -620,62 +622,77 @@ mod tests {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: [0u8; 48],
-            ephemeral_pubkey: secret.public_key().to_uncompressed(),
+            ephemeral_pubkey: P256Point::from(&secret.public_key()),
             request_nonce: [0u8; REQUEST_NONCE_SIZE],
         }
     }
 
-    /// §9.5 order on the custody open: an `enc` that is not a valid
-    /// uncompressed point is rejected before `dh_agree`, so custody never
-    /// multiplies its key by an unvalidated point. `ephemeral_pubkey` is a
-    /// `[u8; 65]` that serde fills only from exactly 65 bytes, so a 32-byte
-    /// `enc` cannot reach this function; the deserialize rejection is asserted
-    /// here too.
-    #[tokio::test]
-    async fn open_sender_key_response_rejects_invalid_enc_before_dh_agree() {
-        let custody = crate::crypto::dh_counting_custody::DhCountingCustody::new();
-        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
-        let mut response = response_with_valid_enc();
-        let valid = response.ephemeral_pubkey;
-        for (case, enc) in crate::crypto::dh_counting_custody::rejected_encs(&valid) {
-            let Ok(enc) = <[u8; 65]>::try_from(enc.as_slice()) else {
-                #[derive(serde::Serialize)]
-                struct ShortEnc<'a> {
-                    sender_did: &'a str,
-                    epoch: u64,
-                    #[serde(with = "serde_bytes")]
-                    hpke_sealed_key: &'a [u8],
-                    #[serde(with = "serde_bytes")]
-                    ephemeral_pubkey: &'a [u8],
-                    #[serde(with = "serde_bytes")]
-                    request_nonce: &'a [u8],
+    /// Re-encodes the named-map `MessagePack` form of `value` with `field`
+    /// replaced by the binary `bytes`, as a peer could put on the wire.
+    fn with_wire_field(value: &impl serde::Serialize, field: &str, bytes: &[u8]) -> Vec<u8> {
+        let encoded = rmp_serde::to_vec_named(value).unwrap();
+        let mut map = rmpv::decode::read_value(&mut encoded.as_slice()).unwrap();
+        let rmpv::Value::Map(entries) = &mut map else {
+            panic!("a named struct encodes as a map");
+        };
+        let entry = entries
+            .iter_mut()
+            .find(|(k, _)| k.as_str() == Some(field))
+            .unwrap();
+        entry.1 = rmpv::Value::Binary(bytes.to_vec());
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &map).unwrap();
+        out
+    }
+
+    /// §9.5: a wire key that is not a 65-byte uncompressed P-256 point fails
+    /// at decode, in the request's `wrapping_pubkey` and the response's
+    /// `ephemeral_pubkey` (`enc`), so no hash, seal or key agreement reads
+    /// it. The positive control re-encodes each field with valid point bytes
+    /// through the same path; a short key's error names its length.
+    #[test]
+    fn sender_key_wire_points_reject_invalid_encodings_at_decode() {
+        let valid = scp_crypto::p256::testing::valid_uncompressed_point(2);
+        let point = P256Point::try_from(valid).unwrap();
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            wrapping_pubkey: point,
+            nonce: [0u8; REQUEST_NONCE_SIZE],
+            timestamp: 1_700_000_000,
+            signature: [0u8; 64],
+        };
+        let response = response_with_valid_enc();
+
+        let decoded: SenderKeyRequest =
+            rmp_serde::from_slice(&with_wire_field(&request, "wrapping_pubkey", &valid)).unwrap();
+        assert_eq!(decoded.wrapping_pubkey, point);
+        let decoded: SenderKeyResponse =
+            rmp_serde::from_slice(&with_wire_field(&response, "ephemeral_pubkey", &valid)).unwrap();
+        assert_eq!(decoded.ephemeral_pubkey, point);
+
+        for (case, bad) in scp_crypto::p256::testing::invalid_point_encodings(2) {
+            let request_err = rmp_serde::from_slice::<SenderKeyRequest>(&with_wire_field(
+                &request,
+                "wrapping_pubkey",
+                &bad,
+            ))
+            .unwrap_err()
+            .to_string();
+            let response_err = rmp_serde::from_slice::<SenderKeyResponse>(&with_wire_field(
+                &response,
+                "ephemeral_pubkey",
+                &bad,
+            ))
+            .unwrap_err()
+            .to_string();
+            for err in [&request_err, &response_err] {
+                assert!(err.contains("P-256 point"), "{case}: {err}");
+                if bad.len() == 32 {
+                    assert!(err.contains("got 32 bytes"), "{case}: {err}");
                 }
-                let bytes = rmp_serde::to_vec_named(&ShortEnc {
-                    sender_did: "did:dht:alice",
-                    epoch: 1,
-                    hpke_sealed_key: &[0u8; 48],
-                    ephemeral_pubkey: &enc,
-                    request_nonce: &[0u8; REQUEST_NONCE_SIZE],
-                })
-                .unwrap();
-                assert!(
-                    rmp_serde::from_slice::<SenderKeyResponse>(&bytes).is_err(),
-                    "{case}: a non-65-byte enc must not deserialize"
-                );
-                continue;
-            };
-            response.ephemeral_pubkey = enc;
-            let result =
-                open_sender_key_response(&custody, &wrapping_key, "ctx-1", &response).await;
-            assert!(
-                matches!(&result, Err(SenderKeyError::HpkeDecryptionFailed(_))),
-                "{case}: expected HpkeDecryptionFailed, got {result:?}"
-            );
-            assert_eq!(
-                custody.dh_calls(),
-                0,
-                "{case}: dh_agree ran on an invalid enc"
-            );
+            }
         }
     }
 
@@ -1010,12 +1027,10 @@ mod tests {
 
         assert_eq!(response.sender_did, "did:dht:alice");
         assert_eq!(response.epoch, 1);
-        // DHKEM(P-256): `enc` is the 65-byte uncompressed ephemeral point, the
-        // sealed key 32 + 16 bytes; Bob's wrapping key is 65 bytes too.
-        assert_eq!(response.ephemeral_pubkey.len(), hpke_p256::ENC_LEN);
-        assert_eq!(response.ephemeral_pubkey[0], 0x04);
+        // DHKEM(P-256): `enc` is an uncompressed ephemeral point (its type
+        // fixes the 65 bytes), the sealed key 32 + 16 bytes.
+        assert_eq!(response.ephemeral_pubkey.as_bytes()[0], 0x04);
         assert_eq!(response.hpke_sealed_key.len(), 48);
-        assert_eq!(request.wrapping_pubkey.len(), hpke_p256::PUBLIC_KEY_LEN);
 
         // Bob opens the response using his wrapping key.
         let recovered_key = open_sender_key_response(

@@ -427,7 +427,7 @@ impl MlsBackend for ProductionMlsBackend {
         &self,
         group: &mut ScpMlsGroup,
         commit_bytes: &[u8],
-    ) -> Result<Vec<(String, [u8; 65])>, MlsError> {
+    ) -> Result<Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>, MlsError> {
         // Parse the incoming Commit bytes and process via `decrypt_with_sender_did`
         // path, but only accept Commit outcomes. This reuses the existing
         // `process_message` + `merge_staged_commit` sequence verbatim.
@@ -942,7 +942,7 @@ mod tests {
         let own_wrap = scp_mls::wrapping_extension::extract_own_wrapping_key(&grp)
             .expect("extension present")
             .expect("wrapping key bytes");
-        assert_eq!(own_wrap, wrap_pub);
+        assert_eq!(own_wrap.as_bytes(), &wrap_pub);
     }
 
     #[tokio::test]

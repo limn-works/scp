@@ -86,10 +86,7 @@ pub enum DecryptedContent {
         /// or the committer's `UpdatePath`) whose `0xFF01` wrapping key
         /// changed, in the order the Commit applies them. The member directory
         /// refreshes these entries; an Add never changes a recorded key.
-        wrapping_key_updates: Vec<(
-            String,
-            [u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
-        )>,
+        wrapping_key_updates: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
     },
     /// A Proposal message cached by `OpenMLS` during `process_message`.
     /// No explicit merge is needed — `OpenMLS` caches proposals automatically.
@@ -419,13 +416,10 @@ pub enum InboundChange {
         /// HPKE-seal a sender key to would silently break §9.16 distribution. This
         /// vector is therefore always exactly as long as `added_dids`; it is empty
         /// only for a no-add Commit.
-        added_wrapping_keys: Vec<[u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE]>,
+        added_wrapping_keys: Vec<scp_protocol::crypto::hpke::p256::P256Point>,
         /// `(did, key)` for each leaf this Commit replaced whose `0xFF01`
         /// wrapping key changed; see [`DecryptedContent::Commit`].
-        wrapping_key_updates: Vec<(
-            String,
-            [u8; crate::wrapping_extension::P256_WRAPPING_KEY_SIZE],
-        )>,
+        wrapping_key_updates: Vec<(String, scp_protocol::crypto::hpke::p256::P256Point)>,
         /// The authenticated convergent committer timestamp (Unix seconds),
         /// recovered from the Commit's verified MLS AAD *before* the merge and
         /// adopted **verbatim** (ADR-057). The receiver stamps this exact value
@@ -1245,7 +1239,7 @@ mod tests {
                 );
                 assert_eq!(
                     added_wrapping_keys,
-                    vec![carol_wk],
+                    vec![scp_protocol::crypto::hpke::p256::P256Point::try_from(carol_wk).unwrap()],
                     "the seam surfaces Carol's scp_wrapping_key from the Add proposal's leaf, \
                      1:1 with added_dids (ADR-057 sender-key distribution)"
                 );

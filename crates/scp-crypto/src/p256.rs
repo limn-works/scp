@@ -630,6 +630,34 @@ pub mod testing {
         };
         key.public_key().to_uncompressed()
     }
+
+    /// The wire encodings §9.5 rejects where a 65-byte uncompressed point is
+    /// required, one row per rejection class.
+    ///
+    /// Each row derives from the [`valid_uncompressed_point`] for `seed`, so
+    /// the caller's positive control uses the same point: 32 bytes (the X25519
+    /// length), 64 bytes (the coordinates without the tag), the 33-byte
+    /// compressed form, a valid point under the `0x02` tag at full length, and
+    /// an off-curve point (`x = 0, y = 1`).
+    #[must_use]
+    pub fn invalid_point_encodings(seed: u8) -> [(&'static str, Vec<u8>); 5] {
+        let valid = valid_uncompressed_point(seed);
+        let Ok(point) = super::P256PublicKey::from_uncompressed(&valid) else {
+            unreachable!("valid_uncompressed_point returns a valid point");
+        };
+        let mut wrong_tag = valid;
+        wrong_tag[0] = 0x02;
+        let mut off_curve = [0u8; UNCOMPRESSED_POINT_LEN];
+        off_curve[0] = 0x04;
+        off_curve[64] = 0x01;
+        [
+            ("32 bytes", valid[1..33].to_vec()),
+            ("64 bytes", valid[1..].to_vec()),
+            ("33-byte compressed", point.to_compressed().to_vec()),
+            ("0x02 tag at 65 bytes", wrong_tag.to_vec()),
+            ("off curve", off_curve.to_vec()),
+        ]
+    }
 }
 
 #[cfg(test)]

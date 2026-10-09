@@ -387,7 +387,7 @@ async fn handle_handle_broadcast_key_request(
     context_id: &str,
     author_did: &scp_did::DID,
     requester_did: &scp_did::DID,
-    wrapping_pubkey: [u8; 65],
+    wrapping_pubkey: scp_protocol::crypto::hpke::p256::P256Point,
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
     let key_req_fut = async {
