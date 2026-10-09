@@ -11183,14 +11183,6 @@ impl Scp {
                             code: codes::CTX_2014.to_owned(),
                         })?;
 
-                // Resolve the supervisor handle BEFORE the reversible atomic
-                // occupy. The lookup needs no registered bridge state and
-                // short-circuits on `?` — resolving it AFTER
-                // `register_ucan_occupied` would leak the just-occupied
-                // (reversible) UCAN state with no rollback on its failure, and a
-                // later same-id retry would then hard-fail the Occupied check.
-                // Order: custody-derive (above) → supervisor-resolve →
-                // register-reversible → spawn → rollback-on-Err.
                 let sup = bi.context_manager_or_error()?;
 
                 // Resolve the joiner's OWN custody provider + `#active` KeyHandle
@@ -11219,45 +11211,11 @@ impl Scp {
                         code: codes::IDENT_1054.to_owned(),
                     })?;
 
-                // Atomic occupy — register the bridge-side UCAN validation state
-                // (revocation list, nonce tracker, event log, ceiling) and gate on
-                // collision in ONE indivisible step, fail-closed BEFORE
-                // `spawn_actor_from_welcome` consumes the single-use KeyPackage.
-                // Mirrors the PyO3/napi reference bridges' `register_ffi_state`
-                // Entry::Occupied hard-error: because the DashMap Vacant/Occupied
-                // decision and the insert are atomic, exactly one caller can occupy
-                // the slot for this id. A losing concurrent same-id join errors HERE
-                // — before consuming the KeyPackage — and never reaches the rollback
-                // below, so it can never delete the winner's shared UCAN state. The
-                // prior non-atomic `context_handle_registry` precheck plus a
-                // separate `ucan_preexisted` read could let a loser mis-classify the
-                // entry as its own and roll back the winner's state (the handle
-                // registers only POST-commit, so the precheck never excluded a
-                // concurrent joiner). Cross-instance / cross-node races remain
-                // resolved authoritatively by the supervisor's first-writer-wins
-                // spawn lock below.
-                //
                 // FLAG-1: the caller supplies no ceiling, and the UCAN state
                 // stores none. The Occupied dedup is keyed on `context_id`, so the
                 // "detect a duplicate BEFORE consuming the single-use KeyPackage"
                 // crash-safety holds. The AUTHENTICATED ceiling reaches the actor
                 // through `spawn_actor_from_welcome` (below).
-                //
-                // This is the one registration that runs before an actor serves
-                // the context, so it cannot go through
-                // `ensure_ucan_registered_while_active`: it fails on an occupied
-                // entry instead of building over it, the join rolls it back when
-                // the spawn fails, and the id's release mark stays until the
-                // spawn commits and the readmit below clears it.
-                bi.register_ucan_occupied(&context_id)?;
-
-                // Irreversible: open + authenticate the sealed bundle, consume the
-                // KeyPackage, install the joined MLS group, persist the keyed
-                // snapshot, register the context actor. On failure, roll back the
-                // UCAN state THIS call just created (we are the caller that occupied
-                // the vacant slot above, so this removes only our own state — never
-                // an entry another caller owns) so an errored join leaves no orphaned
-                // bridge state beside a runtime that never committed.
                 let owning = scp_did::DID(identity.did.clone());
                 let req = scp_core::context::supervisor::WelcomeJoinRequest {
                     creator_did: scp_did::DID(creator_did.clone()),
@@ -11267,20 +11225,9 @@ impl Scp {
                     reservation_id: reservation,
                     local_pseudonym: Some(local_pseudonym),
                 };
-                let joined = match sup
-                    .spawn_actor_from_welcome(owning, &*custody, &active_handle, req)
-                    .await
-                {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        bi.remove_ucan_state(&context_id);
-                        return Err(ScpError::from(e));
-                    }
-                };
-
-                // The supervisor serves the id again, so clear any release
-                // mark a prior close left on it.
-                bi.readmit_context(&context_id);
+                let joined = bi
+                    .join_from_welcome_occupied(sup, owning, &*custody, &active_handle, req)
+                    .await?;
 
                 // FLAG-1: the AUTHENTICATED ceiling lives in the bundle the
                 // creator signed, and `spawn_actor_from_welcome` stored it in the
@@ -21319,7 +21266,7 @@ mod tests {
         let removed = scp.inner.remove_ucan_state_while_released(ticket, || {
             assert!(
                 !matches!(
-                    scp.inner.ucan_registry.try_get(&ctx_id),
+                    scp.inner.ucan_registry_for_test().try_get(&ctx_id),
                     dashmap::try_result::TryResult::Locked
                 ),
                 "the teardown must run with no UCAN registry guard on the id"
@@ -21360,7 +21307,7 @@ mod tests {
         scp.inner.ensure_ucan_registered_for_test(&held);
         let guard = scp
             .inner
-            .ucan_registry
+            .ucan_registry_for_test()
             .get_mut(&held)
             .expect("the held id has UCAN state");
 
@@ -21390,7 +21337,7 @@ mod tests {
         let other = std::iter::repeat_with(scp_ffi_common::generate_context_id)
             .find(|id| {
                 !matches!(
-                    scp.inner.ucan_registry.try_get(id),
+                    scp.inner.ucan_registry_for_test().try_get(id),
                     dashmap::try_result::TryResult::Locked
                 )
             })

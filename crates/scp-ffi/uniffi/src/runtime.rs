@@ -204,6 +204,27 @@ impl From<StorageInitError> for crate::ScpError {
 // the "shared-variant types for storage-backed repositories" exemption.
 pub use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
 
+// ---------------------------------------------------------------------------
+// UniffiStreamRevocationChecker — LIVE per-context revocation view
+// ---------------------------------------------------------------------------
+
+/// [`RevocationChecker`](scp_core::crypto::ucan::validate::RevocationChecker)
+/// that reads `context_id`'s revocation list in the UCAN registry at each
+/// `is_revoked` call, with no `await`. An id with no UCAN state reports no
+/// token revoked.
+struct UniffiStreamRevocationChecker {
+    states: Arc<DashMap<String, UcanContextState>>,
+    context_id: String,
+}
+
+impl scp_core::crypto::ucan::validate::RevocationChecker for UniffiStreamRevocationChecker {
+    fn is_revoked(&self, token_cid: &str) -> bool {
+        self.states
+            .get(&self.context_id)
+            .is_some_and(|state| state.revocation_list.is_revoked(token_cid))
+    }
+}
+
 /// `UniFFI`-specific concrete bridge instance.
 ///
 /// Embeds the bridge-agnostic [`CoreFields`] and adds typed fields for the
@@ -232,7 +253,7 @@ pub struct UniffiBridgeInstance {
     /// Previously stored type-erased in `CoreFields::ucan_registry`.
     /// Post PR 1, the registry lives here as a typed field and is cleared by
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
-    pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
+    ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
     /// Release marks, keyed by context id.
     pub(crate) released_contexts: std::sync::Mutex<std::collections::HashMap<String, ReleaseMark>>,
@@ -657,9 +678,22 @@ impl UniffiBridgeInstance {
         &self.credential_store
     }
 
-    /// Returns a reference to the typed UCAN registry.
-    #[must_use]
-    pub const fn ucan_registry(&self) -> &Arc<DashMap<String, UcanContextState>> {
+    /// Returns a revocation checker that reads `context_id`'s revocation list
+    /// in this instance's UCAN registry at each call.
+    pub(crate) fn live_revocation_checker(
+        &self,
+        context_id: String,
+    ) -> Arc<dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync> {
+        Arc::new(UniffiStreamRevocationChecker {
+            states: Arc::clone(&self.ucan_registry),
+            context_id,
+        })
+    }
+
+    /// Returns this instance's UCAN registry, for a test that inspects its
+    /// entry locks.
+    #[cfg(test)]
+    pub(crate) fn ucan_registry_for_test(&self) -> &DashMap<String, UcanContextState> {
         &self.ucan_registry
     }
 
@@ -1188,11 +1222,7 @@ impl UniffiBridgeInstance {
     /// The release-mark check and the insert run while this call holds the
     /// registry entry for `context_id` and then the release-mark lock.
     ///
-    /// This function is private to this module, so code outside it reaches
-    /// the registry only through [`Self::ensure_ucan_registered_while_active`],
-    /// which builds state only for a context the supervisor reports `Active`,
-    /// or through [`Self::register_ucan_occupied`], the Welcome join's entry
-    /// that runs before the joined context's actor exists.
+    /// This function is private to this module.
     fn ensure_ucan_registered(&self, context_id: &str) {
         let entry = self.ucan_registry.entry(context_id.to_owned());
         let marks = self.lock_release_marks();
@@ -1211,9 +1241,7 @@ impl UniffiBridgeInstance {
     /// caller turns into its own refusal, so this call surfaces no answer
     /// about the context.
     ///
-    /// Code outside this module registers per-context UCAN state through this
-    /// entry or [`Self::register_ucan_occupied`]; the ungated builder is
-    /// private, so a direct call does not compile:
+    /// The ungated builder is private, so a direct call does not compile:
     ///
     /// ```compile_fail
     /// # fn ungated(bi: &scp_ffi_uniffi::runtime::UniffiBridgeInstance) {
@@ -1446,15 +1474,47 @@ impl UniffiBridgeInstance {
         }
     }
 
+    /// Joins a context from a sealed Welcome: registers its UCAN validation
+    /// state through [`Self::register_ucan_occupied`], then runs
+    /// `supervisor.spawn_actor_from_welcome` with `req`. When the spawn fails,
+    /// it removes the UCAN state it registered and leaves any release mark on
+    /// `req.context_id` in place; when the spawn commits, it clears that mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (`SCP-CTX-2014`) without running the spawn
+    /// when this instance already holds UCAN state for `req.context_id`, and
+    /// the spawn's error converted to `ScpError` when the spawn fails.
+    pub(crate) async fn join_from_welcome_occupied<C: scp_platform::KeyCustody>(
+        &self,
+        supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
+        owning_did: scp_did::DID,
+        custody: &C,
+        active_key_handle: &scp_platform::KeyHandle,
+        req: scp_core::context::supervisor::WelcomeJoinRequest,
+    ) -> Result<scp_core::context::ContextHandle, crate::ScpError> {
+        let context_id = req.context_id.clone();
+        self.register_ucan_occupied(&context_id)?;
+        match supervisor
+            .spawn_actor_from_welcome(owning_did, custody, active_key_handle, req)
+            .await
+        {
+            Ok(handle) => {
+                self.readmit_context(&context_id);
+                Ok(handle)
+            }
+            Err(e) => {
+                self.remove_ucan_state(&context_id);
+                Err(crate::ScpError::from(e))
+            }
+        }
+    }
+
     /// Atomically registers per-context UCAN validation state for a
     /// Welcome-join, failing CLOSED on a pre-existing entry.
     ///
-    /// The Welcome-join analog of the `PyO3`/napi reference bridges'
-    /// `register_ffi_state`: [`crate::Scp::context_join_from_welcome`] calls
-    /// this as a single ATOMIC gate BEFORE the irreversible
-    /// `Supervisor::spawn_actor_from_welcome`. Unlike the idempotent
-    /// [`Self::ensure_ucan_registered_while_active`] (the lazy UCAN-op path), a
-    /// pre-existing entry is a HARD error here.
+    /// This function is private to this module. A pre-existing entry is a
+    /// HARD error here.
     ///
     /// The `DashMap` `Entry::Occupied`/`Vacant` decision is what makes the
     /// gate atomic — the collision test and the state insert are one
@@ -1469,7 +1529,7 @@ impl UniffiBridgeInstance {
     ///
     /// Returns `ScpError::Context` (`SCP-CTX-2014`) if the context's UCAN
     /// state is already registered on this instance.
-    pub fn register_ucan_occupied(&self, context_id: &str) -> Result<(), crate::ScpError> {
+    fn register_ucan_occupied(&self, context_id: &str) -> Result<(), crate::ScpError> {
         use dashmap::mapref::entry::Entry;
 
         match self.ucan_registry.entry(context_id.to_owned()) {
@@ -2056,7 +2116,7 @@ mod tests {
         // Typed registries start empty and support insertion via their
         // typed interface (DashMap, Arc).
         let bi = UniffiBridgeInstance::new_uniffi();
-        assert!(bi.ucan_registry().is_empty());
+        assert!(bi.ucan_registry.is_empty());
         assert!(bi.identity_custody_registry().is_empty());
 
         // ucan_registry is `Arc<DashMap<...>>` — typed, not Box<dyn Any>.
@@ -2068,7 +2128,28 @@ mod tests {
                 event_log: EventLog::new("test-ctx".to_owned()),
             },
         );
-        assert_eq!(bi.ucan_registry().len(), 1);
+        assert_eq!(bi.ucan_registry.len(), 1);
+    }
+
+    /// The checker reads the registry at each call: a revocation recorded
+    /// after the checker was built is reported, an unrevoked token is not,
+    /// and an id with no UCAN state reports nothing revoked.
+    #[test]
+    fn live_revocation_checker_reads_revocations_recorded_after_it_was_built() {
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.ensure_ucan_registered("ctx-live");
+        let checker = bi.live_revocation_checker("ctx-live".to_owned());
+        let absent = bi.live_revocation_checker("ctx-absent".to_owned());
+        assert!(!checker.is_revoked("cid-1"));
+
+        bi.with_ucan_state("ctx-live", |state| {
+            state.revocation_list.revoke("cid-1".to_owned());
+        })
+        .expect("ctx-live has UCAN state");
+
+        assert!(checker.is_revoked("cid-1"));
+        assert!(!checker.is_revoked("cid-2"));
+        assert!(!absent.is_revoked("cid-1"));
     }
 
     #[test]

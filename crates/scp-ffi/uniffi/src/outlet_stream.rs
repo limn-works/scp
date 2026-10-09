@@ -66,7 +66,6 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use ed25519_dalek::VerifyingKey;
 use scp_platform::KeyHandle;
 use scp_platform::error::PlatformError;
@@ -257,33 +256,6 @@ async fn resolve_stream_signer(
         handle,
         verifying_key,
     })
-}
-
-// ---------------------------------------------------------------------------
-// UniffiStreamRevocationChecker — LIVE per-context revocation view
-// ---------------------------------------------------------------------------
-
-/// [`RevocationChecker`](scp_core::crypto::ucan::validate::RevocationChecker)
-/// giving the runtime pump a LIVE view of this instance's per-context revocation
-/// list, so the §5.4.5 authoritative UCAN-revocation re-check timer
-/// (`stream_ucan_recheck_secs`) observes revocations that land AFTER the stream
-/// opened — not a stale open-time snapshot.
-///
-/// Holds an `Arc` clone of the per-instance UCAN-state registry and the hosting
-/// context id; `is_revoked` does a brief (sync, no-`await`) `DashMap` lookup per
-/// tick. A vanished context returns `false` — the separate
-/// context-closed-mid-stream termination path handles substrate loss.
-struct UniffiStreamRevocationChecker {
-    states: Arc<DashMap<String, crate::runtime::UcanContextState>>,
-    context_id: String,
-}
-
-impl scp_core::crypto::ucan::validate::RevocationChecker for UniffiStreamRevocationChecker {
-    fn is_revoked(&self, token_cid: &str) -> bool {
-        self.states
-            .get(&self.context_id)
-            .is_some_and(|state| state.revocation_list.is_revoked(token_cid))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -581,12 +553,7 @@ pub(crate) async fn outlet_stream_open_impl(
     });
 
     // LIVE revocation view for the runtime's authoritative re-check timer.
-    let revocation_checker: Arc<
-        dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync,
-    > = Arc::new(UniffiStreamRevocationChecker {
-        states: Arc::clone(bi.ucan_registry()),
-        context_id: context_id.clone(),
-    });
+    let revocation_checker = bi.live_revocation_checker(context_id.clone());
 
     let identity = StreamIdentity {
         context_id: context_id.clone(),
@@ -1093,8 +1060,7 @@ pub(crate) fn outlet_stream_compute_caveats_binding_impl(
 // `bridge.rs`, sharing its `enforce_caller_principal_binding`,
 // `resolve_uniffi_signing_key`, `validate_outlet_ucan_uniffi`, `map_saga_error`,
 // and `decode_asserted_nonce` verbatim, and the SAME `UniffiStreamExecutor` /
-// `resolve_stream_signer` / `UniffiStreamRevocationChecker` this module already
-// defines. Mirrors the CANONICAL `PyO3` reference bridge's cross-context
+// `resolve_stream_signer` this module already defines. Mirrors the CANONICAL `PyO3` reference bridge's cross-context
 // section.
 //
 // Like the `UniFFI` unary cross-context saga (and the 037 same-context open)
@@ -1398,12 +1364,7 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
 
     // LIVE revocation view (B's per-context list) for the runtime pump's
     // authoritative re-check timer.
-    let revocation_checker: Arc<
-        dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync,
-    > = Arc::new(UniffiStreamRevocationChecker {
-        states: Arc::clone(bi.ucan_registry()),
-        context_id: target_context_id.clone(),
-    });
+    let revocation_checker = bi.live_revocation_checker(target_context_id.clone());
 
     let identity = StreamIdentity {
         context_id: target_context_id.clone(),
