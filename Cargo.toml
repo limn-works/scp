@@ -138,11 +138,9 @@ uuid = { version = "1", features = ["v4", "v7"] }
 # ["dep:openmls_libcrux_crypto", "openmls_test?/libcrux-provider"]`) — and
 # openmls itself names that crate only under `#[cfg(test)]` and
 # `#[cfg(feature = "libcrux-provider")]`. No file in this repository names libcrux, and
-# every SCP call site takes a provider: `scp-runtime`'s `ScpMlsProvider` wraps
-# `openmls_rust_crypto::RustCrypto` (crates/scp-runtime/src/crypto/mls/storage.rs) and
-# `scp-mls`'s `InMemoryMlsProvider` wraps `openmls_rust_crypto::OpenMlsRustCrypto`
-# (crates/scp-mls/src/provider.rs); both take their randomness from
-# `scp_mls::provider::OsRand`, a stateless operating-system source. Enabling it
+# every SCP call site takes a provider: `scp-mls`'s `InMemoryMlsProvider` wraps
+# `openmls_rust_crypto::RustCrypto` (crates/scp-mls/src/provider.rs) and takes its
+# randomness from `scp_mls::provider::OsRand`, a stateless operating-system source. Enabling it
 # compiled 23 libcrux crates, 2 hax crates, `openmls_libcrux_crypto` and
 # `hpke-rs-libcrux` into every build, and carried eleven RUSTSEC advisories that
 # `deny.toml` had to ignore.

@@ -46,7 +46,7 @@
         { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 6. `ContextCryptoProvider` (26 methods) is deleted; replaced by two narrow traits" },
         { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" }
       ],
-      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep" }
+      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep", "superseded_acceptance_criteria": "The primitive list in the fifth criterion names `process_commit`, which no longer exists. On 2026-10-09 Alec ruled that the MLS paths with no production caller are deleted, and this change deletes `MlsBackend::process_commit`, `ProductionMlsBackend::process_commit`, and `scp_mls::ratchet::process_commit`; a received Commit merges through `MlsBackend::decrypt`. The criterion's property, that MLS primitives stay on the backends, still holds. Read this story against the commit that merged it, not against current HEAD." }
     },
     {
       "id": "SCP-CRYPTOMOVE-000b",

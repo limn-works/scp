@@ -86,9 +86,7 @@
 //!   against the injected clock first, and `join_group_from_bytes` checks the joiner's
 //!   own leaf against the injected clock it takes.
 //! - `process_message` on the receive side: the Add proposals in
-//!   [`crate::encrypt::decrypt_with_sender_did`] (which
-//!   [`crate::ratchet::process_commit`] reaches through
-//!   [`crate::encrypt::decrypt_commit`]) and
+//!   [`crate::encrypt::decrypt_with_sender_did`] and
 //!   [`crate::encrypt::decrypt_with_membership_changes`], in a staged Commit
 //!   before the merge and in a received Proposal. SCP's own check there is
 //!   range-only and reads no clock. SCP carries no openmls patch, so
