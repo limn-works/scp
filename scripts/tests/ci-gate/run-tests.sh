@@ -11,4 +11,4 @@ cd "$REPO_ROOT"
 PYTHON="python3"
 command -v python3.12 >/dev/null 2>&1 && PYTHON="python3.12"
 
-exec "$PYTHON" scripts/tests/ci-gate/ci_gate_selftest.py
+exec "$PYTHON" scripts/tests/ci-gate/ci_gate_selftest.py "$@"

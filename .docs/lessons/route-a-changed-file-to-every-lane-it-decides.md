@@ -29,11 +29,17 @@ therefore merges with every job that reads it skipped.
   `code` filter lists every path a job compiles, executes, or feeds a gate as input, and its
   output ORs in `toolchain` like every other lane. Jobs that ran on every pull request but read
   only code (fail-closed-pre-rotation, shipped-feature-graph, wiping-allocator, protocol-deps,
-  wasm-protocol, wasm-test, toolchain-wiring-cases) are guarded by it. A job that reads a prose
+  wasm-protocol, wasm-test, toolchain-wiring-cases, fix-round-check-selftest) are guarded by it. A job that reads a prose
   file needs a filter that selects that file: the `rust` filter lists `.docs/adrs/**`,
   `.docs/prds/**` and `.docs/standards/sdk-capability-matrix.json`, which rust-test reads. Job
   `toolchain-wiring` checks on every pull request that `AGENTS.md` keeps the two headings
   `pipeline_wiring.rs` asserts, because no filter of job `changes` selects `AGENTS.md`.
+- **Split a suite whose checks read both prose and code, and prove the split covers it.**
+  `scripts/tests/ci-gate/ci_gate_selftest.py` assigns each check to `docs` (it opens a file
+  outside the `code` patterns, or lists tracked paths) or `rest`. Job
+  ci-workflow-selftest-docs runs `--group docs` on every pull request, and job
+  ci-workflow-selftest runs `--group rest` under `code`. The `group-partition` assertion fails
+  when a check is in neither group or in both, so a new check cannot run in no job.
 - **A positive list needs a coverage check, or a new file falls between it and prose.**
   `scripts/tests/ci-gate/ci_gate_selftest.py` (`prose-route`) lists every `git ls-files` path
   and fails on each one that the `code` output does not select and that is not prose: under

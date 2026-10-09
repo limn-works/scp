@@ -956,9 +956,20 @@ jobs:
   # request whose exemption the cross-layer job accepted would fail this job in
   # the merge queue over an exemption the queue cannot read. Every fix round
   # pushes to a pull request, so the suite runs on the head each round produces.
+  #
+  # The `code` clause skips it on a prose-only pull request (Alec's 2026-10-09
+  # ruling: "Skip on docs-only"). Every file the suite's cases open is under
+  # `scripts/`, which `code` selects. Case 3's verdict can still turn on prose,
+  # because it runs the runner's gates over this checkout, but only through a
+  # gate whose own job runs on every pull request (doc-citations, doc-includes,
+  # agent-verdict-criterion, error-codes, sdk-coverage and toolchain-wiring among
+  # them). The five gates in that list whose jobs the `code` output guards
+  # (protocol-deps, no-shim-reexports, shipped-feature-graph, wiping-allocator,
+  # workflow-compile-steps) open no prose file, so a prose change still reaches
+  # every gate that reads it.
   fix-round-check-selftest:
-    needs: check-draft
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
     name: enforcement / fix-round-check runner
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -4234,9 +4245,33 @@ jobs:
   # every `cargo doc` a tracked Markdown file writes with a `--features` list
   # sits inside a fenced shell block, which is the only place that comparison
   # reads a command.
-  ci-workflow-selftest:
+  #
+  # The self-test runs as two jobs, split by GROUPS in ci_gate_selftest.py, whose
+  # comment states the criterion and which asserts that the two groups together
+  # name every check, each once. The `docs` group holds the checks a prose file
+  # can turn red: it reads every tracked Markdown file and lists every tracked
+  # path, so it runs on every pull request. The `rest` group reads only
+  # workflows, scripts, manifests and crate sources, all of which the `code`
+  # output selects, so job ci-workflow-selftest skips it on a prose-only change,
+  # along with the signing-guard cases and the selection-chain evaluation, which
+  # read release.yml, scripts/ and nothing else.
+  ci-workflow-selftest-docs:
     needs: check-draft
     if: github.event_name != 'push'
+    name: CI workflow / self-test (prose readers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install 'pyyaml>=6,<7'
+      - run: bash scripts/tests/ci-gate/run-tests.sh --group docs
+
+  ci-workflow-selftest:
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     name: CI workflow / self-test
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -4248,7 +4283,7 @@ jobs:
       # Pinned to a compatible range so a breaking upstream release cannot red
       # one required status check, matching a pytest pin in sdk-coverage.
       - run: pip install 'pyyaml>=6,<7'
-      - run: bash scripts/tests/ci-gate/run-tests.sh
+      - run: bash scripts/tests/ci-gate/run-tests.sh --group rest
       # A ci-gate assertion pins every release.yml job that uploads a
       # `-signed` artifact — sign-apple, sign-windows and sign-maven — to
       # running scripts/assert-nonempty-signing-set.sh before that upload.
@@ -4352,6 +4387,7 @@ jobs:
       - bridge-parity-kotlin
       - bridge-parity-swift
       - ci-workflow-selftest
+      - ci-workflow-selftest-docs
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

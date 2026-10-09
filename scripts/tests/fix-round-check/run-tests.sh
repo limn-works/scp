@@ -208,7 +208,9 @@
 # time, so raising the pin does not turn these two cases into copies of case 1.
 #
 # WHO RUNS THIS SUITE. The `fix-round-check-selftest` job of `.github/workflows/ci.yml`
-# runs it on every pull-request head, which is the head every fix round pushes. That job
+# runs it on every pull-request head that changes code (its `code` output), which is
+# the head every fix round of a code change pushes; a prose-only pull request skips it,
+# as Alec ruled on 2026-10-09 ("Skip on docs-only"). That job
 # names no merge_group event, for the reason its own comment gives: one of the 29 gates
 # case 3 runs reads an exemption out of the pull request's body, and a merge_group event
 # publishes no body. The job installs what case 3 needs: the tree-sitter
@@ -218,6 +220,9 @@
 # the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the twelve
 # `cargo tree` resolutions two gates run, and the base ref `scripts/check-cross-layer.sh`
 # diffs against. A developer runs the same command by hand.
+#
+# The cases run concurrently; the driver after the last case says how, and prints each
+# case's output in case order once every case has finished.
 #
 # Usage: bash scripts/tests/fix-round-check/run-tests.sh
 # Exit: 0 when every case passes, 1 otherwise.
@@ -489,6 +494,7 @@ report() {
 
 printf 'fix-round-check tests (pin %s)\n' "$PIN_CHANNEL"
 
+case_1() {
 # ── Case 1: the refusal ──────────────────────────────────────────────────────────────
 run_case wrong-toolchain 1.2.3 0
 rc=$(cat "$WORK/wrong-toolchain/rc.txt")
@@ -507,7 +513,9 @@ if grep -q '1\.2\.3' "$WORK/wrong-toolchain/out.txt"; then
 else
     report "case 1 names the compiler it found" 1 "the output never mentions 1.2.3"
 fi
+}
 
+case_2() {
 # ── Case 2: the propagation ──────────────────────────────────────────────────────────
 run_case failing-compile "$PIN_CHANNEL" 1
 rc=$(cat "$WORK/failing-compile/rc.txt")
@@ -526,7 +534,9 @@ if grep -q '^check ' "$WORK/failing-compile/cargo.log"; then
 else
     report "case 2 ran cargo check" 1 "the stub cargo log holds no check invocation"
 fi
+}
 
+case_3() {
 # ── Case 3: the control ──────────────────────────────────────────────────────────────
 run_case passing "$PIN_CHANNEL" 0
 rc=$(cat "$WORK/passing/rc.txt")
@@ -555,7 +565,9 @@ if grep -q "gates $GATE_COUNT/$GATE_COUNT passed" "$WORK/passing/out.txt"; then
 else
     report "case 3 ran all $GATE_COUNT gates against this repository" 1 "the summary holds no 'gates $GATE_COUNT/$GATE_COUNT passed': $(tail -n 3 "$WORK/passing/out.txt")"
 fi
+}
 
+case_5() {
 # ── Case 5: the format step's failure reaches the exit code ──────────────────────────
 #
 # Case 2 fails only the compile step, so without this case the suite proves propagation
@@ -580,7 +592,9 @@ if grep -q 'compile ok' "$WORK/failing-format/out.txt"; then
 else
     report "case 5 leaves the passing compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-format/out.txt")"
 fi
+}
 
+case_6() {
 # ── Case 6: a failing gate reaches the exit code ─────────────────────────────────────
 #
 # Cases 2 and 5 fail the compile and format steps, and until this case no case failed a
@@ -604,7 +618,9 @@ if grep -q 'compile ok' "$WORK/failing-gate/out.txt"; then
 else
     report "case 6 leaves the compile step reported as passing" 1 "the summary holds no 'compile ok': $(tail -n 3 "$WORK/failing-gate/out.txt")"
 fi
+}
 
+case_4() {
 # ── Case 4: an unknown crate ─────────────────────────────────────────────────────────
 #
 # Naming a package the workspace does not hold has to fail rather than check a smaller set,
@@ -618,7 +634,9 @@ if [[ $rc -eq 0 ]]; then
 else
     report "case 4 rejects a package the workspace does not hold" 0 ""
 fi
+}
 
+case_7() {
 # ── Case 7: the crate set derived from the files the branch changed ──────────────────
 #
 # Cases 1 through 6 each name a crate, so each takes the `$# -gt 0` branch and none of them
@@ -652,7 +670,9 @@ if grep -qF 'check -p scp-clock -p scp-ffi-napi --all-targets --features scp-ffi
 else
     report "case 7 compiles the derived crates with the features they own" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE7.harness/cargo.log")"
 fi
+}
 
+case_8() {
 # ── Case 8: no origin/main ref ───────────────────────────────────────────────────────
 #
 # The fixture holds an uncommitted edit under `crates/scp-clock`, so the working-tree half
@@ -685,7 +705,9 @@ if grep -qF 'holds no merge base between HEAD and origin/main' "$FIXTURE8.harnes
 else
     report "case 8 names the ref it could not read" 1 "the output never names the missing merge base: $(tail -n 3 "$FIXTURE8.harness/out.txt")"
 fi
+}
 
+case_9() {
 # ── Case 9: a branch that changed no file inside a crate ─────────────────────────────
 #
 # Case 8 asserts that a derivation which could not read the branch's files fails. This case
@@ -719,7 +741,9 @@ if grep -q '^check ' "$FIXTURE9.harness/cargo.log" 2>/dev/null; then
 else
     report "case 9 starts no cargo check" 0 ""
 fi
+}
 
+case_10() {
 # ── Case 10: a gate the list names and the repository does not hold ──────────────────
 #
 # Every one of the 29 gates exists in this repository, so case 3 exercises the branch that
@@ -749,7 +773,9 @@ if grep -qE 'gates [0-9]+/[0-9]+ passed, 1 FAILED' "$FIXTURE10.harness/out.txt";
 else
     report "case 10 counts the absent gate as a failure rather than dropping it" 1 "the summary holds no gate-failure count: $(tail -n 3 "$FIXTURE10.harness/out.txt")"
 fi
+}
 
+case_11() {
 # ── Case 11: a branch that changed only a workspace-wide input ───────────────────────
 #
 # `Cargo.toml` sits under no crate directory, so `crate_of_path` maps it to no package and
@@ -781,7 +807,9 @@ if grep -q '^check ' "$FIXTURE11.harness/cargo.log" 2>/dev/null; then
 else
     report "case 11 starts no cargo check it cannot narrow" 0 ""
 fi
+}
 
+case_12() {
 # ── Case 12: a branch that changed a file under bindings/ ────────────────────────────
 #
 # The runner runs no ruff, no biome, no detekt and no SwiftLint, and four of its gates read
@@ -811,7 +839,9 @@ if grep -qF 'ruff and pytest, which the python-lint and python-test jobs' "$FIXT
 else
     report "case 12 names the programs and the CI jobs that run them" 1 "the NOT CHECKED line names no program: $(tail -n 4 "$FIXTURE12.harness/out.txt")"
 fi
+}
 
+case_13() {
 # ── Case 13: the optional-feature compile the workspace command does not reach ───────
 #
 # `.github/workflows/ci.yml` runs `cargo clippy -p scp-transport --features
@@ -851,7 +881,9 @@ if grep -qF 'check -p scp-transport --all-targets --features sqlite-blob,redb-bl
 else
     report "case 13 compiles the cloud blob backends the rust-clippy job lints" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE13.harness/cargo.log")"
 fi
+}
 
+case_13b() {
 # ── Case 13b: each binary's cloud-blobs feature in checks of its own ─────────────────
 #
 # CI lints and tests the PostgreSQL and S3 blob backends of the two binaries in one
@@ -919,7 +951,9 @@ if joint_cloud_blobs_check "$FIXTURE13B.harness/cargo.log"; then
 else
     report "case 13b starts no check that turns on cloud-blobs for both binaries at once" 0 ""
 fi
+}
 
+case_14() {
 # ── Case 14: the gate whose diff range holds no uncommitted edit ─────────────────────
 #
 # `scripts/check-cross-layer.sh` decides from `git diff <merge base with origin/main>…HEAD`
@@ -950,7 +984,9 @@ if grep -qF 'scripts/check-cross-layer.sh decides from git diff' "$FIXTURE14.har
 else
     report "case 14 names the gate and the range it decides from" 1 "the NOT CHECKED line names no gate: $(tail -n 4 "$FIXTURE14.harness/out.txt")"
 fi
+}
 
+case_15() {
 # ── Case 15: a caller-named crate set narrower than the branch's own edits ───────────
 #
 # Naming a crate takes the `$# -gt 0` branch, which compiles the set the caller asked for.
@@ -984,7 +1020,9 @@ if grep -qF 'check -p scp-clock --all-targets' "$HARNESS15/cargo.log"; then
 else
     report "case 15 compiles the crate set the caller asked for and no other" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS15/cargo.log")"
 fi
+}
 
+case_16() {
 # ── Case 16: the wasm target the host compile does not reach ─────────────────────────
 #
 # The `wasm-protocol` job of `.github/workflows/ci.yml` runs one `cargo check` over ten
@@ -1014,7 +1052,9 @@ if grep -qF -- '--target wasm32-unknown-unknown' "$FIXTURE16.harness/cargo.log";
 else
     report "case 16 starts no wasm compile of its own" 0 ""
 fi
+}
 
+case_17() {
 # ── Case 17: a branch that changed a workflow file ───────────────────────────────────
 #
 # Three gates the runner holds read a workflow file, each for rules of its own and none as
@@ -1048,7 +1088,9 @@ if grep -qF 'ci-workflow-selftest job' "$FIXTURE17.harness/out.txt"; then
 else
     report "case 17 names the suites and the CI job that runs them" 1 "the NOT CHECKED line names no job: $(tail -n 5 "$FIXTURE17.harness/out.txt")"
 fi
+}
 
+case_18() {
 # ── Case 18: a file moved from one crate to another ──────────────────────────────────
 #
 # Git reports a rename as one filepair, so `git status --porcelain` prints
@@ -1085,7 +1127,9 @@ if grep -qF 'check -p scp-clock -p scp-ffi --all-targets' "$FIXTURE18.harness/ca
 else
     report "case 18 compiles both sides of the move" 1 "the stub cargo log holds: $(tr '\n' '|' < "$FIXTURE18.harness/cargo.log")"
 fi
+}
 
+case_19() {
 # ── Case 19: a staged move the working-tree half has to report ───────────────────────
 #
 # Case 18 covers the `git diff` half of `changed_files`. This one covers the
@@ -1100,7 +1144,9 @@ if grep -qF 'crates scp-clock scp-ffi (derived from the files this branch change
 else
     report "case 19 derives the crate a staged rename moved the file out of" 1 "the summary names another crate set: $(tail -n 3 "$FIXTURE19.harness/out.txt")"
 fi
+}
 
+case_20() {
 # ── Case 20: an enforcement gate the runner's list does not classify ─────────────────
 #
 # The GATES array of `scripts/fix-round-check.sh` is written by hand, and both halves of
@@ -1127,7 +1173,9 @@ if grep -qF 'UNCLASSIFIED scripts/check-brand-new-rule.sh' "$FIXTURE20.harness/o
 else
     report "case 20 names the gate it neither ran nor excused" 1 "the output never names the unclassified gate: $(tail -n 5 "$FIXTURE20.harness/out.txt")"
 fi
+}
 
+case_21() {
 # ── Case 21: the features a sibling manifest activates on the selected package ───────
 #
 # `cargo clippy --workspace` resolves one feature set across every member, so a
@@ -1179,7 +1227,9 @@ if grep -qF 'only-on-ios' "$HARNESS21/cargo.log"; then
 else
     report "case 21 activates no feature a target-specific declaration alone requests" 0 ""
 fi
+}
 
+case_22() {
 # ── Case 22: the run that could not read those declarations says so ──────────────────
 #
 # Case 21 covers the run that read them. `cargo metadata` carries a 60-second bound and
@@ -1213,7 +1263,9 @@ if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh assertion 1 sourc
 else
     report "case 22 names the examples source scan over every package when it cannot read targets" 1 "the output holds no qualified source-scan line for scripts/check-examples-compile.sh: $(tail -n 6 "$FIXTURE22.harness/out.txt")"
 fi
+}
 
+case_22b() {
 # ── Case 22b: the examples gate over the packages each of its assertions reads ──────
 #
 # `scripts/check-examples-compile.sh` assertion 1 lints every `example` target, one at a
@@ -1307,7 +1359,9 @@ if grep -qF 'NOT CHECKED — scripts/check-examples-compile.sh over this reposit
 else
     report "case 22b names no unrun gate edit on a branch that left the gate alone" 0 ""
 fi
+}
 
+case_22c() {
 # ── Case 22c: a branch that edits the examples gate alone ───────────────────────────
 #
 # GATES_NOT_RUN lists scripts/check-examples-compile.sh, so no run starts it, and a
@@ -1373,7 +1427,9 @@ if grep -q '^  UNCLASSIFIED' "$FIXTURE22E.harness/out.txt"; then
 else
     report "case 22c classifies the gate its fixture added" 0 ""
 fi
+}
 
+case_22d() {
 # ── Case 22d: the DOES-NOT-RUN header names every gate the run never starts ──────────
 #
 # The header's DOES-NOT-RUN list is what a reader consults for the CI commands a green run
@@ -1399,7 +1455,9 @@ if [[ $HEADER_LIST == *'cargo package --list'* ]]; then
 else
     report "case 22d names cargo package --list in the DOES-NOT-RUN list" 1 "the DOES-NOT-RUN list names no cargo package --list, which the examples gate runs in the rust-clippy job"
 fi
+}
 
+case_23() {
 # ── Case 23: the scripts/ lane against the suites CI runs over that directory ────────
 #
 # The `scripts/` entry of UNRUN_LANES is a hand-written enumeration, and a fix agent that
@@ -1479,7 +1537,9 @@ if [[ $LANE_SUITE_COUNT -gt 0 ]]; then
 else
     report "case 23 read a non-empty suite set out of .github/workflows/ci.yml" 1 "subtracting the GATES and GATES_NOT_RUN arrays from the scripts/ programs .github/workflows/ci.yml starts left no path, so the assertion above iterated over nothing and could not fail"
 fi
+}
 
+case_24() {
 # ── Case 24: a caller-named run in a checkout that resolves no origin/main ───────────
 #
 # Naming a crate takes the `$# -gt 0` branch, which compiles that set whether or not
@@ -1518,7 +1578,9 @@ if grep -qF 'check -p scp-clock --all-targets' "$HARNESS24/cargo.log"; then
 else
     report "case 24 compiles the crate the caller named although the ref is missing" 1 "the stub cargo log holds: $(tr '\n' '|' < "$HARNESS24/cargo.log")"
 fi
+}
 
+case_25() {
 # ── Case 25: the .github/ lane against the suites that read this repository's workflows ─
 #
 # THE CRITERION the `.github/` entry of UNRUN_LANES states, and that this case holds it
@@ -1591,7 +1653,9 @@ if [[ $GITHUB_LANE_QUALIFIED -gt 0 ]]; then
 else
     report "case 25 found at least one suite that reads this repository's workflow files" 1 "no suite .github/workflows/ci.yml starts under scripts/ matched the repository-rooted workflow read this case looks for, so the assertion above compared an empty set and could not fail"
 fi
+}
 
+case_26() {
 # ── Case 26: the wiping-allocator gate exits non-zero when it dies mid-run ──────────────
 #
 # THE CRITERION: a run of `scripts/check-wiping-allocator.sh` that dies before a deliberate
@@ -1639,6 +1703,67 @@ if grep -qF 'PASSED:' "$HARNESS26/out.txt"; then
 else
     report "case 26 printed no PASSED line" 0 ""
 fi
+}
+
+# ── Running the cases ─────────────────────────────────────────────────────────────────
+# Every case above builds its own stub directory under $WORK, and every fixture case its
+# own fixture and `<fixture>.harness` directory, so no case reads a file another case
+# writes and the cases run at the same time. Cases 2, 3, 5 and 6 each run every gate in
+# the runner's GATES array against this repository, about 67 seconds apiece on a CI
+# runner, and run one after another they made this suite the slowest job on a pull
+# request's critical path.
+#
+# CASES is every case in the order this file declares them, which is the order their
+# output prints in. UNITS groups them into the subshells that run concurrently: a unit
+# runs its cases in sequence in one subshell, and each case writes its output to its own
+# log. Case 23 reads NOT_RUN_PATHS, which case 22d computes, and case 25 reads LANE_SUITES,
+# which case 23 computes, so the three share a unit; every other case is a unit of its own.
+CASES=(1 2 3 5 6 4 7 8 9 10 11 12 13 13b 14 15 16 17 18 19 20 21 22 22b 22c 22d 23 24 25 26)
+UNITS=(1 2 3 5 6 4 7 8 9 10 11 12 13 13b 14 15 16 17 18 19 20 21 22 22b 22c "22d 23 25" 24 26)
+
+# A case function no list names would run in no unit and report nothing, and a case two
+# units name would run twice, so the lists are checked against the functions this file
+# defines before any case starts.
+DEFINED_CASES=$(declare -F | sed -nE 's/^declare -f case_(.+)$/\1/p' | sort)
+LISTED_CASES=$(printf '%s\n' "${CASES[@]}" | sort)
+# shellcheck disable=SC2048,SC2086
+UNIT_CASES=$(printf '%s\n' ${UNITS[*]} | sort)
+if [[ $DEFINED_CASES != "$LISTED_CASES" || $LISTED_CASES != "$UNIT_CASES" ]]; then
+    printf 'run-tests: CASES, UNITS and the case_* functions disagree, so no case ran.\n' >&2
+    printf '  defined: %s\n  CASES:   %s\n  UNITS:   %s\n' \
+        "$(printf '%s ' $DEFINED_CASES)" "$(printf '%s ' $LISTED_CASES)" "$(printf '%s ' $UNIT_CASES)" >&2
+    exit 1
+fi
+
+# Run one unit's cases in sequence, each with a fresh FAILURES count, writing each case's
+# output and its count of failed assertions to files of its own under $WORK.
+run_unit() {
+    local id
+    for id in "$@"; do
+        FAILURES=0
+        "case_$id" > "$WORK/case-$id.log" 2>&1
+        printf '%s' "$FAILURES" > "$WORK/case-$id.failures"
+    done
+}
+
+for unit in "${UNITS[@]}"; do
+    # shellcheck disable=SC2086
+    run_unit $unit &
+done
+wait
+
+# A case whose subshell died before it wrote its count, such as on an unbound variable,
+# counts as one failure, so a crash cannot read as a pass.
+FAILURES=0
+for id in "${CASES[@]}"; do
+    cat "$WORK/case-$id.log" 2>/dev/null
+    if [[ -f "$WORK/case-$id.failures" ]]; then
+        FAILURES=$((FAILURES + $(cat "$WORK/case-$id.failures")))
+    else
+        printf '  FAIL case %s stopped before it finished; its output above is all it wrote\n' "$id"
+        FAILURES=$((FAILURES + 1))
+    fi
+done
 
 printf '\n'
 if [[ $FAILURES -eq 0 ]]; then
