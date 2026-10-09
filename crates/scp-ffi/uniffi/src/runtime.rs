@@ -1474,37 +1474,36 @@ impl UniffiBridgeInstance {
         }
     }
 
-    /// Joins a context from a sealed Welcome: registers its UCAN validation
-    /// state through [`Self::register_ucan_occupied`], then runs
-    /// `supervisor.spawn_actor_from_welcome` with `req`. When the spawn fails,
-    /// it removes the UCAN state it registered and leaves any release mark on
-    /// `req.context_id` in place; when the spawn commits, it clears that mark.
+    /// Registers UCAN validation state for `context_id` through
+    /// [`Self::register_ucan_occupied`], then awaits `spawn`. When `spawn`
+    /// returns an error, it removes the UCAN state it registered and leaves any
+    /// release mark on `context_id` in place; when `spawn` returns a handle, it
+    /// clears that mark. When the registration fails, `spawn` is dropped
+    /// without being polled.
     ///
     /// # Errors
     ///
-    /// Returns `ScpError::Context` (`SCP-CTX-2014`) without running the spawn
-    /// when this instance already holds UCAN state for `req.context_id`, and
-    /// the spawn's error converted to `ScpError` when the spawn fails.
-    pub(crate) async fn join_from_welcome_occupied<C: scp_platform::KeyCustody>(
+    /// Returns `ScpError::Context` (`SCP-CTX-2014`) when this instance already
+    /// holds UCAN state for `context_id`, and `spawn`'s error converted to
+    /// `ScpError` when `spawn` fails.
+    pub(crate) async fn join_from_welcome_occupied<F>(
         &self,
-        supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
-        owning_did: scp_did::DID,
-        custody: &C,
-        active_key_handle: &scp_platform::KeyHandle,
-        req: scp_core::context::supervisor::WelcomeJoinRequest,
-    ) -> Result<scp_core::context::ContextHandle, crate::ScpError> {
-        let context_id = req.context_id.clone();
-        self.register_ucan_occupied(&context_id)?;
-        match supervisor
-            .spawn_actor_from_welcome(owning_did, custody, active_key_handle, req)
-            .await
-        {
+        context_id: &str,
+        spawn: F,
+    ) -> Result<scp_core::context::ContextHandle, crate::ScpError>
+    where
+        F: std::future::Future<
+                Output = Result<scp_core::context::ContextHandle, scp_core::context::ContextError>,
+            >,
+    {
+        self.register_ucan_occupied(context_id)?;
+        match spawn.await {
             Ok(handle) => {
-                self.readmit_context(&context_id);
+                self.readmit_context(context_id);
                 Ok(handle)
             }
             Err(e) => {
-                self.remove_ucan_state(&context_id);
+                self.remove_ucan_state(context_id);
                 Err(crate::ScpError::from(e))
             }
         }
@@ -2129,6 +2128,52 @@ mod tests {
             },
         );
         assert_eq!(bi.ucan_registry.len(), 1);
+    }
+
+    fn has_mark(bi: &UniffiBridgeInstance, context_id: &str) -> bool {
+        bi.released_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(context_id)
+    }
+
+    /// An id this instance already holds UCAN state for refuses with
+    /// `SCP-CTX-2014`, drops the spawn future unpolled, and keeps the state.
+    #[test]
+    fn join_from_welcome_occupied_refuses_a_held_id_without_polling_the_spawn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.ensure_ucan_registered("ctx-held");
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let result = rt.block_on(bi.join_from_welcome_occupied("ctx-held", async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(scp_core::context::ContextError::CeilingImmutable)
+        }));
+        assert!(
+            matches!(&result, Err(crate::ScpError::Context { code, .. }) if code == codes::CTX_2014),
+            "expected SCP-CTX-2014, got: {result:?}"
+        );
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(bi.ucan_registry.contains_key("ctx-held"));
+    }
+
+    /// A failed spawn removes the state the call registered and keeps the
+    /// release mark a close left on the id.
+    #[test]
+    fn join_from_welcome_occupied_removes_its_state_and_keeps_the_mark_on_a_failed_spawn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let bi = UniffiBridgeInstance::new_uniffi();
+        bi.release_ucan_state("ctx-released");
+        let result = rt.block_on(bi.join_from_welcome_occupied("ctx-released", async {
+            Err(scp_core::context::ContextError::CeilingImmutable)
+        }));
+        assert!(result.is_err(), "a failed spawn must fail the join");
+        assert!(!bi.ucan_registry.contains_key("ctx-released"));
+        assert!(has_mark(&bi, "ctx-released"));
     }
 
     /// The checker reads the registry at each call: a revocation recorded

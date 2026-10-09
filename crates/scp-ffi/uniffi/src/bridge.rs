@@ -11226,7 +11226,10 @@ impl Scp {
                     local_pseudonym: Some(local_pseudonym),
                 };
                 let joined = bi
-                    .join_from_welcome_occupied(sup, owning, &*custody, &active_handle, req)
+                    .join_from_welcome_occupied(
+                        &context_id,
+                        sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req),
+                    )
                     .await?;
 
                 // FLAG-1: the AUTHENTICATED ceiling lives in the bundle the
