@@ -1416,7 +1416,7 @@ async fn execute_remove_member_clears_read_exclusion() {
     let export = manager
         .export_context(ctx_id, alice(), |digest| {
             use ed25519_dalek::Signer;
-            Ok::<_, std::convert::Infallible>(sk_alice.sign(digest).to_bytes())
+            Ok::<_, scp_crypto::CustodyFailure>(sk_alice.sign(digest).to_bytes())
         })
         .await
         .unwrap();
@@ -1444,7 +1444,7 @@ async fn execute_remove_member_clears_read_exclusion() {
     let export = manager
         .export_context(ctx_id, alice(), |digest| {
             use ed25519_dalek::Signer;
-            Ok::<_, std::convert::Infallible>(sk_alice.sign(digest).to_bytes())
+            Ok::<_, scp_crypto::CustodyFailure>(sk_alice.sign(digest).to_bytes())
         })
         .await
         .unwrap();

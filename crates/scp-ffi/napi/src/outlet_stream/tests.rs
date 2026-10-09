@@ -1489,3 +1489,32 @@ mod xctx_streaming_saga_tests {
         );
     }
 }
+
+/// A stream signer for an identity whose `#active` key custody no longer holds
+/// fails with key-not-found `SCP-CRYPTO-4006`, the code every other custody
+/// operation reports, never the context code of the verifying-key check.
+#[cfg(feature = "testing")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_signer_under_a_destroyed_custody_key_is_crypto_4006() {
+    use scp_platform::KeyCustody as _;
+    let scp = crate::scp::Scp::new_in_memory_for_test();
+    let bi = std::sync::Arc::clone(&scp.inner);
+    let identity = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .expect("identity_create should succeed");
+    let did = identity.inner.did.clone();
+    let (custody, active) = crate::runtime::with_identity(&bi, &did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .expect("registered identity");
+    custody
+        .destroy_key(&active)
+        .await
+        .expect("destroy_key should succeed");
+    match resolve_stream_signer(&bi, &did).await {
+        Err(ScpNapiError::Crypto { code, .. }) => assert_eq!(code, codes::CRYPTO_4006),
+        Err(other) => panic!("expected Crypto CRYPTO_4006, got {other:?}"),
+        Ok(_) => panic!("a destroyed #active key must not resolve a stream signer"),
+    }
+}

@@ -527,20 +527,30 @@ async fn run_join_with(
         committed,
         request_params,
         request_ctx_id,
-        false,
+        None,
     )
     .await
 }
 
-/// [`run_join_with`], and when `destroy_active` is set, Bob's custody destroys
-/// his `#active` key after the bundle is sealed to it and before the spawn.
+/// When a join test makes Bob's custody lose his `#active` key.
+#[derive(Clone, Copy)]
+enum ActiveKeyLoss {
+    /// After the bundle is sealed to the key and before the spawn, so the
+    /// spawn's KEM agreement is key-not-found.
+    BeforeSpawn,
+    /// Inside the spawn, right after the KEM agreement used the key, so the
+    /// spawn's read of the `#active` public key is key-not-found.
+    AfterAgree,
+}
+
+/// [`run_join_with`], with Bob's custody losing his `#active` key at `loss`.
 async fn run_join_with_active_key(
     seed: u8,
     persistence: Option<Box<dyn ContextPersistence>>,
     committed: Option<ContextParams>,
     request_params: ContextParams,
     request_ctx_id: Option<String>,
-    destroy_active: bool,
+    loss: Option<ActiveKeyLoss>,
 ) -> (
     Result<crate::context::ContextHandle, crate::context::ContextError>,
     Joined,
@@ -600,16 +610,24 @@ async fn run_join_with_active_key(
         &DID::from(ALICE_DID),
         reservation_id,
     );
-    if destroy_active {
+    if matches!(loss, Some(ActiveKeyLoss::BeforeSpawn)) {
         bob_custody
             .destroy_key(&bob_handle)
             .await
             .expect("bob's custody destroys his #active key");
     }
 
-    let result = sup
-        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
-        .await;
+    let result = if matches!(loss, Some(ActiveKeyLoss::AfterAgree)) {
+        let custody = crate::crypto::key_loss_custody::KeyLossCustody {
+            inner: bob_custody,
+            loss: crate::crypto::key_loss_custody::KeyLoss::AfterEd25519Agree,
+        };
+        sup.spawn_actor_from_welcome(bob, &custody, &bob_handle, req)
+            .await
+    } else {
+        sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+            .await
+    };
     (
         result,
         Joined {
@@ -652,7 +670,7 @@ async fn spawn_from_welcome_carries_a_destroyed_active_key_as_custody_key_not_fo
         Some(joiner_params()),
         joiner_params(),
         None,
-        true,
+        Some(ActiveKeyLoss::BeforeSpawn),
     )
     .await;
     // `assert!` rather than `panic!`: `check-handler-no-panic.sh` reads file
@@ -665,6 +683,32 @@ async fn spawn_from_welcome_carries_a_destroyed_active_key_as_custody_key_not_fo
     assert!(
         failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
         "a join under a destroyed #active key must fail with ContextError::Custody key-not-found, got {:?}",
+        result.as_ref().err()
+    );
+}
+
+/// A joiner whose custody loses the `#active` key between the KEM agreement
+/// and the read of its public key fails that read with the typed custody
+/// failure, so every bridge reports `SCP-CRYPTO-4006` there too.
+#[tokio::test]
+async fn spawn_from_welcome_carries_an_active_key_lost_after_agreement_as_custody_key_not_found() {
+    let (result, _j) = run_join_with_active_key(
+        0x5f,
+        None,
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+        Some(ActiveKeyLoss::AfterAgree),
+    )
+    .await;
+    // `assert!` rather than `panic!`, as in the test above.
+    let failure = match &result {
+        Err(crate::context::ContextError::Custody(failure)) => Some(failure),
+        _ => None,
+    };
+    assert!(
+        failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
+        "a join whose #active key is lost after the KEM agreement must fail with ContextError::Custody key-not-found, got {:?}",
         result.as_ref().err()
     );
 }

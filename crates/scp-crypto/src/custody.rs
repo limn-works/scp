@@ -40,11 +40,3 @@ impl CustodyFailure {
         matches!(self.kind, CustodyFailureKind::KeyNotFound)
     }
 }
-
-/// A signer that cannot fail (a software key in a test or a KAT) converts its
-/// uninhabited error into a [`CustodyFailure`].
-impl From<core::convert::Infallible> for CustodyFailure {
-    fn from(never: core::convert::Infallible) -> Self {
-        match never {}
-    }
-}

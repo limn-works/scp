@@ -24,23 +24,6 @@
 use scp_platform::error::PlatformError;
 use scp_platform::traits::{KeyHandle, Pseudonym};
 
-/// The bridge error code for a custody [`PlatformError`], one mapping for the
-/// `PyO3`, napi-rs and `UniFFI` bridges.
-///
-/// Defined as [`custody_failure_code`](crate::error_codes::custody_failure_code)
-/// of the error's [`CustodyFailure`](scp_crypto::CustodyFailure), so a
-/// [`PlatformError`] and a runtime-carried custody failure share one code
-/// table: [`PlatformError::KeyNotFound`] is
-/// [`CRYPTO_4006`](crate::error_codes::CRYPTO_4006),
-/// [`PlatformError::PseudonymRejected`] is
-/// [`IDENT_1055`](crate::error_codes::IDENT_1055) (the code ADR-021's
-/// 2026-09-29 amendment gives a host pseudonym point the bridge rejects), and
-/// every other variant is [`CRYPTO_4060`](crate::error_codes::CRYPTO_4060).
-#[must_use]
-pub fn platform_error_code(e: &PlatformError) -> &'static str {
-    crate::error_codes::custody_failure_code(&scp_crypto::CustodyFailure::from(e))
-}
-
 /// Maps a host custody callback's failure to a [`PlatformError`], one mapping
 /// for the `PyO3`, napi-rs and `UniFFI` bridges.
 ///
@@ -148,58 +131,48 @@ mod tests {
         }
     }
 
+    /// Every [`PlatformError`] variant reaches a bridge with one code:
+    /// key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
+    /// `SCP-IDENT-1055` (ADR-021, 2026-09-29 amendment), and every other
+    /// variant `SCP-CRYPTO-4060`.
     #[test]
-    fn platform_error_code_names_key_not_found_and_custody_codes() {
+    fn custody_failure_code_covers_every_platform_error() {
         use crate::error_codes as codes;
-        assert_eq!(
-            platform_error_code(&PlatformError::KeyNotFound),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            platform_error_code(&PlatformError::CustodyError("x".to_owned())),
-            codes::CRYPTO_4060
-        );
-        assert_eq!(
-            platform_error_code(&PlatformError::PseudonymRejected("x".to_owned())),
-            codes::IDENT_1055
-        );
-        for other in [
-            PlatformError::WrongKeyType {
-                expected: scp_platform::traits::KeyType::Ed25519,
-                actual: scp_platform::traits::KeyType::X25519,
-            },
-            PlatformError::StorageError("x".to_owned()),
-            PlatformError::AttestationError("x".to_owned()),
-            PlatformError::PushError("x".to_owned()),
-            PlatformError::Unsupported("x"),
-        ] {
-            assert_eq!(
-                platform_error_code(&other),
+        let table = [
+            (PlatformError::KeyNotFound, codes::CRYPTO_4006),
+            (
+                PlatformError::PseudonymRejected("x".to_owned()),
+                codes::IDENT_1055,
+            ),
+            (
+                PlatformError::WrongKeyType {
+                    expected: scp_platform::traits::KeyType::Ed25519,
+                    actual: scp_platform::traits::KeyType::X25519,
+                },
                 codes::CRYPTO_4060,
-                "{other:?} is a custody failure, the same code a runtime-carried \
-                 CustodyFailure of it gets"
+            ),
+            (
+                PlatformError::StorageError("x".to_owned()),
+                codes::CRYPTO_4060,
+            ),
+            (
+                PlatformError::AttestationError("x".to_owned()),
+                codes::CRYPTO_4060,
+            ),
+            (PlatformError::PushError("x".to_owned()), codes::CRYPTO_4060),
+            (
+                PlatformError::CustodyError("x".to_owned()),
+                codes::CRYPTO_4060,
+            ),
+            (PlatformError::Unsupported("x"), codes::CRYPTO_4060),
+        ];
+        for (error, expected) in table {
+            assert_eq!(
+                codes::custody_failure_code(&scp_crypto::CustodyFailure::from(&error)),
+                expected,
+                "{error:?}"
             );
         }
-    }
-
-    #[test]
-    fn custody_failure_code_follows_the_platform_error_kind() {
-        use crate::error_codes as codes;
-        let code =
-            |e: PlatformError| codes::custody_failure_code(&scp_crypto::CustodyFailure::from(e));
-        assert_eq!(code(PlatformError::KeyNotFound), codes::CRYPTO_4006);
-        assert_eq!(
-            code(PlatformError::PseudonymRejected("x".to_owned())),
-            codes::IDENT_1055
-        );
-        assert_eq!(
-            code(PlatformError::CustodyError("x".to_owned())),
-            codes::CRYPTO_4060
-        );
-        assert_eq!(
-            code(PlatformError::StorageError("x".to_owned())),
-            codes::CRYPTO_4060
-        );
     }
 
     /// §25.2 reference key, compressed:

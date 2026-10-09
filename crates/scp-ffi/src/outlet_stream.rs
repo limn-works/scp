@@ -197,9 +197,9 @@ fn resolve_stream_signer(
     let public_key = rt
         .block_on(async { custody.public_key(&handle).await })
         .map_err(|e| {
-            ScpPyError::custody(
+            ScpPyError::custody_failure(
                 format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-                &e,
+                &scp_crypto::CustodyFailure::from(&e),
             )
         })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
@@ -2013,6 +2013,7 @@ impl crate::scp::PyScp {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod custody_error_tests {
     use super::*;
     use scp_core::context::outlets::CancelError;
@@ -2061,6 +2062,44 @@ mod custody_error_tests {
             code(&cancel_rejected_error(&CancelError::SignatureInvalid)),
             cancel_error_to_code(&CancelError::SignatureInvalid)
         );
+    }
+
+    /// A stream signer for an identity whose `#active` key custody no longer
+    /// holds fails with key-not-found `SCP-CRYPTO-4006`, the code every other
+    /// custody operation reports, never the context code of the
+    /// verifying-key check.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn stream_signer_under_a_destroyed_custody_key_is_crypto_4006() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let identity = scp
+                .identity_create(py, "in_memory", None)
+                .expect("identity_create should succeed");
+            let did = identity.did().to_owned();
+            let (custody, active) = crate::runtime::with_identity(&bi, &did, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .expect("registered identity");
+            crate::runtime()
+                .expect("runtime")
+                .block_on(custody.destroy_key(&active))
+                .expect("destroy_key should succeed");
+            let err = resolve_stream_signer(&bi, &did)
+                .err()
+                .expect("a destroyed #active key must not resolve a stream signer")
+                .to_string();
+            assert!(
+                err.contains(codes::CRYPTO_4006),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
     }
 }
 

@@ -578,6 +578,31 @@ impl TestingCallbackCustody {
             .map_err(custody_err)
     }
 
+    /// Runs the adapter's `dh_agree` for `key_id` against `peer_public` and
+    /// returns the 32-byte shared secret the bridge read from the host.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-VALID-7005` when `peer_public` is not 32 bytes; otherwise
+    /// `SCP-CRYPTO-4006` for key-not-found and `SCP-CRYPTO-4060` for any other
+    /// custody error, as production reports them.
+    #[napi(js_name = "dhAgree")]
+    pub async fn dh_agree(&self, key_id: String, peer_public: Buffer) -> napi::Result<Buffer> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        let peer: [u8; 32] = peer_public.as_ref().try_into().map_err(|_| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("peer_public must be 32 bytes, got {}", peer_public.len()),
+                code: codes::VALID_7005.to_owned(),
+            })
+        })?;
+        self.inner
+            .dh_agree(&key, &peer)
+            .await
+            .map(|shared| Buffer::from(shared.as_bytes().to_vec()))
+            .map_err(custody_err)
+    }
+
     /// Destroys `key_id` through the adapter.
     ///
     /// # Errors

@@ -1150,9 +1150,9 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::custody(
+                            ScpPyError::custody_failure(
                                 format!("failed to read identity key after identity create: {e}"),
-                                &e,
+                                &scp_crypto::CustodyFailure::from(&e),
                             )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
@@ -1274,9 +1274,9 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::custody(
+                            ScpPyError::custody_failure(
                                 format!("failed to read identity key after identity create: {e}"),
-                                &e,
+                                &scp_crypto::CustodyFailure::from(&e),
                             )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
@@ -1430,9 +1430,9 @@ impl crate::scp::PyScp {
                         .public_key(&identity.identity_key)
                         .await
                         .map_err(|e| {
-                            ScpPyError::custody(
+                            ScpPyError::custody_failure(
                                 format!("failed to read identity key after identity create: {e}"),
-                                &e,
+                                &scp_crypto::CustodyFailure::from(&e),
                             )
                         })?;
                     let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
@@ -2499,7 +2499,7 @@ impl crate::scp::PyScp {
             let sig = rt
                 .block_on(custody.sign(&key_handle, &built.canonical_bytes))
                 .map_err(|e| {
-                    ScpPyError::custody(format!("link attestation signing failed: {e}"), &e)
+                    ScpPyError::custody_failure(format!("link attestation signing failed: {e}"), &scp_crypto::CustodyFailure::from(&e))
                 })?;
             attestation.signature = sig.as_bytes().to_vec();
 

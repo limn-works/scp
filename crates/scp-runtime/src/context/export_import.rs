@@ -940,7 +940,7 @@ mod tests {
     // (`FnOnce(&[u8; 32]) -> Result<[u8; 64], E>`); the test signer is
     // infallible.
     #[allow(clippy::unnecessary_wraps)]
-    fn sign_with_test_key(hash: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+    fn sign_with_test_key(hash: &[u8; 32]) -> Result<[u8; 64], scp_crypto::CustodyFailure> {
         use ed25519_dalek::Signer;
         Ok(test_signing_key().sign(hash).to_bytes())
     }

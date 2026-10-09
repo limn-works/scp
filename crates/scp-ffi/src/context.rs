@@ -1589,9 +1589,9 @@ fn resolve_verifying_key(
         let public_key = rt
             .block_on(async move { custody.public_key(&handle).await })
             .map_err(|e| {
-                crate::error::ScpPyError::custody(
+                crate::error::ScpPyError::custody_failure(
                     format!("failed to resolve verifying key: {e}"),
-                    &e,
+                    &scp_crypto::CustodyFailure::from(&e),
                 )
             })?;
         // 32-byte length + canonical-point decode: the shared conversion tail
@@ -1722,7 +1722,10 @@ pub(crate) fn pseudonym_routing_id_on(
     // 33-byte P-256 pseudonym. `Pseudonym::from_point` already rejected a
     // malformed host-returned point, which surfaces here as SCP-IDENT-1055.
     let pseudonym = pseudonym.map_err(|e| {
-        crate::error::ScpPyError::custody(format!("pseudonym derivation failed: {e}"), &e)
+        crate::error::ScpPyError::custody_failure(
+            format!("pseudonym derivation failed: {e}"),
+            &scp_crypto::CustodyFailure::from(&e),
+        )
     })?;
     Ok(*pseudonym.routing_id())
 }
@@ -6646,9 +6649,7 @@ mod tests {
         if let Err(err) = result {
             let msg = err.to_string();
             assert!(
-                !msg.contains("SCP-IDENT-1054")
-                    && !msg.contains("SCP-IDENT-1055")
-                    && !msg.contains("SCP-IDENT-1057"),
+                !msg.contains("SCP-IDENT-1054") && !msg.contains("SCP-IDENT-1055"),
                 "broadcast join must skip derivation — got a derivation-code error: {msg}"
             );
         }

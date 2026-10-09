@@ -23,6 +23,11 @@
  * error carrying that code, the custody error `SCP-CRYPTO-4060` otherwise)
  * and never reach the process as an uncaught exception or an unhandled
  * rejection.
+ *
+ * The secret-wipe tests fail if `dhAgree` or `exportSigningKeyBytes` in
+ * `src/internal/custody-adapter.ts` stops zero-filling the adapter's copy of
+ * the host secret once napi-rs has read it, wipes it before the bridge reads
+ * it (the bridge would then return zeros), or writes to the host's buffer.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -45,6 +50,8 @@ interface TestingCustody {
     epoch: bigint,
   ): Promise<Buffer>;
   sign(keyId: string, data: Buffer): Promise<Buffer>;
+  /** Returns the 32-byte shared secret the bridge read from the host. */
+  dhAgree(keyId: string, peerPublic: Buffer): Promise<Buffer>;
   destroyKey(keyId: string): Promise<void>;
 }
 
@@ -308,4 +315,44 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
       expect(mapped.code).toBe("SCP-CRYPTO-4060");
     }
   });
+
+  test("the bridge reads the host's shared secret intact, then the adapter's copy is zeroed", async () => {
+    // A secret no wipe or truncation produces: 32 distinct non-zero bytes.
+    const secret = Uint8Array.from({ length: 32 }, (_, i) => 0xa0 + i);
+    const peer = Buffer.alloc(32, 0x5c);
+    const seen: unknown[][] = [];
+    const custody = adapterWith({
+      dhAgree: (...args: unknown[]) => {
+        seen.push(args);
+        return secret;
+      },
+    });
+    const identity = await custody.generateKeypair();
+    const shared = await custody.dhAgree(identity, peer);
+    expect(Buffer.from(shared).toString("hex")).toBe(Buffer.from(secret).toString("hex"));
+    expect(seen).toEqual([[identity, new Uint8Array(peer)]]);
+    // The host's own buffer is the host's to wipe.
+    expect(secret.every((b, i) => b === 0xa0 + i)).toBe(true);
+  });
+
+  for (const method of ["dhAgree", "exportSigningKeyBytes"] as const) {
+    test(`${method}: the adapter's copy of the host secret is zero after the bridge's synchronous read`, async () => {
+      const secret = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
+      const provider = Object.assign(new StoreKeychain(), {
+        [method]: () => secret,
+      }) as KeyCustodyProvider;
+      const record = toNativeCustodyProvider(provider);
+      const result =
+        method === "dhAgree"
+          ? record.dhAgree(["1", Array.from(Buffer.alloc(32, 1))])
+          : record.exportSigningKeyBytes("1");
+      if (!result.ok) throw new Error(`host call failed: ${result.message}`);
+      const copy = result.value;
+      // What napi-rs copies into Rust as the callback returns.
+      expect(copy).toEqual(Array.from(secret));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(copy).toEqual(new Array(32).fill(0));
+      expect(secret.every((b, i) => b === 0x40 + i)).toBe(true);
+    });
+  }
 });

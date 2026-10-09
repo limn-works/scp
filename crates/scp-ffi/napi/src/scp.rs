@@ -991,9 +991,9 @@ impl Scp {
             rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
         })
         .map_err(|e| {
-            NapiError::from(ScpNapiError::custody(
+            NapiError::from(ScpNapiError::custody_failure(
                 format!("link attestation signing failed: {e}"),
-                &e,
+                &scp_crypto::CustodyFailure::from(&e),
             ))
         })?;
         attestation.signature = sig.as_bytes().to_vec();

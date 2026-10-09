@@ -207,9 +207,9 @@ async fn resolve_stream_signer(
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })?;
     let public_key = custody.public_key(&handle).await.map_err(|e| {
-        ScpNapiError::custody(
+        ScpNapiError::custody_failure(
             format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            &e,
+            &scp_crypto::CustodyFailure::from(&e),
         )
     })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)

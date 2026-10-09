@@ -291,7 +291,8 @@ impl ScpPyError {
 
     /// Identity error with the given message and an explicit canonical code.
     /// Used by the §9.10.4 pseudonym-derivation paths to carry the specific
-    /// `SCP-IDENT-1054..1057` codes instead of the generic identity code.
+    /// `SCP-IDENT-1054` and `SCP-IDENT-1055` codes instead of the generic
+    /// identity code.
     pub fn identity_with_code(msg: impl Into<String>, code: &str) -> Self {
         Self::IdentityError {
             message: msg.into(),
@@ -891,23 +892,6 @@ impl From<scp_transport::TransportError> for ScpPyError {
 // Platform errors → ScpPyError::CryptoError (key custody)
 
 impl ScpPyError {
-    /// A custody [`PlatformError`](scp_platform::PlatformError) carrying
-    /// `message`, coded by
-    /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
-    /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
-    /// custody failure as `SCP-CRYPTO-4060`, and a rejected host pseudonym as
-    /// `SCP-IDENT-1055`.
-    pub(crate) fn custody(message: String, e: &scp_platform::PlatformError) -> Self {
-        let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
-        if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
-            Self::IdentityError { message, code }
-        } else {
-            Self::CryptoError { message, code }
-        }
-    }
-}
-
-impl ScpPyError {
     /// A custody failure the runtime carried as a typed
     /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
     /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
@@ -923,11 +907,26 @@ impl ScpPyError {
     }
 }
 
+impl ScpPyError {
+    /// A failed checkpoint generation: a custody failure keeps its custody code
+    /// ([`Self::custody_failure`]), and any other event-log failure is
+    /// `SCP-CTX-2001`.
+    pub(crate) fn checkpoint_error(e: &scp_event_log::EventLogError) -> Self {
+        let message = format!("checkpoint generation failed: {e}");
+        match e {
+            scp_event_log::EventLogError::Custody(failure) => {
+                Self::custody_failure(message, failure)
+            }
+            _ => Self::context(message),
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpPyError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        Self::custody(
+        Self::custody_failure(
             format!("platform key operation failed: {e} — check key custody configuration"),
-            &e,
+            &scp_crypto::CustodyFailure::from(&e),
         )
     }
 }
@@ -1058,6 +1057,19 @@ mod tests {
         );
         assert_eq!(
             crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        use scp_platform::PlatformError;
+        assert_eq!(
+            crypto_code(PlatformError::KeyNotFound.into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            identity_code(PlatformError::PseudonymRejected("x".to_owned()).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(PlatformError::CustodyError("x".to_owned()).into()),
             codes::CRYPTO_4060
         );
     }

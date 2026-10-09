@@ -103,6 +103,24 @@ function asBytes(method: string): (raw: unknown) => number[] {
 }
 
 /**
+ * `asBytes` for key material (`dhAgree`, `exportSigningKeyBytes`). napi-rs
+ * reads a Rust `Vec<u8>` only from a JS `Array<number>`, so the adapter must
+ * hand the bridge a copy of the host's secret. napi-rs copies that array into
+ * Rust synchronously, as soon as the callback returns; the microtask below
+ * then zero-fills the adapter's copy, so no second copy of the secret stays
+ * on the JS heap. The host's own `Uint8Array` belongs to the host and is left
+ * untouched.
+ */
+function asSecretBytes(method: string): (raw: unknown) => number[] {
+  const convert = asBytes(method);
+  return (raw) => {
+    const copy = convert(raw);
+    queueMicrotask(() => copy.fill(0));
+    return copy;
+  };
+}
+
+/**
  * Wraps `provider` in the record the napi `NapiKeyCustodyProvider` object
  * reads.
  */
@@ -142,7 +160,7 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
       hostCall(
         "dhAgree",
         () => provider.dhAgree(keyId, Uint8Array.from(peerPublic)),
-        asBytes("dhAgree"),
+        asSecretBytes("dhAgree"),
       ),
     derivePseudonym: ([keyId, contextId]: [string, number[]]): NativeHostResult<number[]> =>
       hostCall(
@@ -175,7 +193,7 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
       hostCall(
         "exportSigningKeyBytes",
         () => provider.exportSigningKeyBytes(keyId),
-        asBytes("exportSigningKeyBytes"),
+        asSecretBytes("exportSigningKeyBytes"),
       ),
     custodyType: (keyId: string): NativeHostResult<string> =>
       hostCall("custodyType", () => provider.custodyType(keyId), asString("custodyType")),

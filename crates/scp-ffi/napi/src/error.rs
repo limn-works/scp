@@ -631,23 +631,6 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpNapiError {
 }
 
 impl ScpNapiError {
-    /// A custody [`PlatformError`](scp_platform::PlatformError) carrying
-    /// `message`, coded by
-    /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
-    /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
-    /// custody failure as `SCP-CRYPTO-4060`, and a rejected host pseudonym as
-    /// `SCP-IDENT-1055`.
-    pub(crate) fn custody(message: String, e: &scp_platform::PlatformError) -> Self {
-        let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
-        if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
-            Self::Identity { message, code }
-        } else {
-            Self::Crypto { message, code }
-        }
-    }
-}
-
-impl ScpNapiError {
     /// A custody failure the runtime carried as a typed
     /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
     /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
@@ -663,11 +646,45 @@ impl ScpNapiError {
     }
 }
 
+impl ScpNapiError {
+    /// A failed checkpoint generation: a custody failure keeps its custody code
+    /// ([`Self::custody_failure`]), and any other event-log failure is
+    /// `SCP-CTX-2023`.
+    pub(crate) fn checkpoint_error(e: &scp_event_log::EventLogError) -> Self {
+        let message = format!("checkpoint generation failed: {e}");
+        match e {
+            scp_event_log::EventLogError::Custody(failure) => {
+                Self::custody_failure(message, failure)
+            }
+            _ => Self::Context {
+                message,
+                code: codes::CTX_2023.to_owned(),
+            },
+        }
+    }
+
+    /// A failed inner-envelope signing: a custody failure keeps its custody
+    /// code ([`Self::custody_failure`]), and any other envelope failure is
+    /// `SCP-CRYPTO-4001`.
+    pub(crate) fn inner_envelope_error(e: &scp_core::envelope::EnvelopeError) -> Self {
+        let message = format!("inner envelope signing failed: {e}");
+        match e {
+            scp_core::envelope::EnvelopeError::Custody(failure) => {
+                Self::custody_failure(message, failure)
+            }
+            _ => Self::Crypto {
+                message,
+                code: codes::CRYPTO_4001.to_owned(),
+            },
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpNapiError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        Self::custody(
+        Self::custody_failure(
             format!("platform key operation failed: {e} — check key custody configuration"),
-            &e,
+            &scp_crypto::CustodyFailure::from(&e),
         )
     }
 }
@@ -807,6 +824,19 @@ mod tests {
         );
         assert_eq!(
             crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        use scp_platform::PlatformError;
+        assert_eq!(
+            crypto_code(PlatformError::KeyNotFound.into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            identity_code(PlatformError::PseudonymRejected("x".to_owned()).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(PlatformError::CustodyError("x".to_owned()).into()),
             codes::CRYPTO_4060
         );
     }

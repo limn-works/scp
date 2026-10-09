@@ -502,7 +502,12 @@ async fn derive_member_pseudonym_required(
     let pseudonym = if let Some(ref cb) = identity.callback_custody {
         cb.derive_pseudonym(&identity_key, context_id.as_bytes())
             .await
-            .map_err(|e| ScpError::custody(format!("pseudonym derivation failed: {e}"), &e))?
+            .map_err(|e| {
+                ScpError::custody_failure(
+                    format!("pseudonym derivation failed: {e}"),
+                    &scp_crypto::CustodyFailure::from(&e),
+                )
+            })?
     } else {
         #[cfg(feature = "testing")]
         {
@@ -518,7 +523,12 @@ async fn derive_member_pseudonym_required(
             imc.0
                 .derive_pseudonym(&identity_key, context_id.as_bytes())
                 .await
-                .map_err(|e| ScpError::custody(format!("pseudonym derivation failed: {e}"), &e))?
+                .map_err(|e| {
+                    ScpError::custody_failure(
+                        format!("pseudonym derivation failed: {e}"),
+                        &scp_crypto::CustodyFailure::from(&e),
+                    )
+                })?
         }
         #[cfg(not(feature = "testing"))]
         {
@@ -757,11 +767,13 @@ impl KeyCustody for CallbackKeyCustody {
         key: &KeyHandle,
         peer_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        let shared = self
-            .provider
-            .dh_agree(key.id().to_string(), peer_public.to_vec())
-            .await
-            .map_err(|e| host_err("dh_agree", &e))?;
+        // The host's shared secret is key material: wipe the buffer on drop.
+        let shared = Zeroizing::new(
+            self.provider
+                .dh_agree(key.id().to_string(), peer_public.to_vec())
+                .await
+                .map_err(|e| host_err("dh_agree", &e))?,
+        );
         Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "dh_agree", &shared,
         )?))
@@ -809,11 +821,13 @@ impl KeyCustody for CallbackKeyCustody {
     ) -> Result<SharedSecret, PlatformError> {
         // The callback protocol does not expose ed25519→x25519 conversion.
         // Delegates to dh_agree since the callback provider manages key types internally.
-        let shared = self
-            .provider
-            .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
-            .await
-            .map_err(|e| host_err("dh_agree", &e))?;
+        // The host's shared secret is key material: wipe the buffer on drop.
+        let shared = Zeroizing::new(
+            self.provider
+                .dh_agree(ed25519_handle.id().to_string(), peer_x25519_public.to_vec())
+                .await
+                .map_err(|e| host_err("dh_agree", &e))?,
+        );
         Ok(SharedSecret::new(scp_ffi_common::custody_parse::expect_32(
             "ed25519_to_x25519_agree",
             &shared,
@@ -914,14 +928,15 @@ impl CallbackKeyCustody {
         &self,
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        let key_bytes = self
-            .provider
-            .export_signing_key_bytes(handle.id().to_string())
-            .await
-            .map_err(|e| host_err("export_signing_key_bytes", &e))?;
-        // Private seed material: wrap the parsed 32-byte array in `Zeroizing`
-        // so the intermediate seed buffer is wiped on drop, matching the PyO3
-        // and NAPI callback custody paths (ADR-006).
+        // Private seed material: the host's buffer and the parsed 32-byte
+        // array are both `Zeroizing`, so each is wiped on drop, matching the
+        // PyO3 and NAPI callback custody paths (ADR-006).
+        let key_bytes = Zeroizing::new(
+            self.provider
+                .export_signing_key_bytes(handle.id().to_string())
+                .await
+                .map_err(|e| host_err("export_signing_key_bytes", &e))?,
+        );
         let arr = zeroize::Zeroizing::new(scp_ffi_common::custody_parse::expect_32(
             "export_signing_key_bytes",
             &key_bytes,
@@ -1730,23 +1745,6 @@ impl From<scp_transport::TransportError> for ScpError {
 }
 
 impl ScpError {
-    /// A custody [`PlatformError`] carrying `msg`,
-    /// coded by
-    /// [`platform_error_code`](scp_ffi_common::custody_parse::platform_error_code):
-    /// every bridge path reports key-not-found as `SCP-CRYPTO-4006`, any other
-    /// custody failure as `SCP-CRYPTO-4060`, and a rejected host pseudonym as
-    /// `SCP-IDENT-1055`.
-    pub(crate) fn custody(msg: String, e: &scp_platform::PlatformError) -> Self {
-        let code = scp_ffi_common::custody_parse::platform_error_code(e).to_owned();
-        if matches!(e, scp_platform::PlatformError::PseudonymRejected(_)) {
-            Self::Identity { msg, code }
-        } else {
-            Self::Crypto { msg, code }
-        }
-    }
-}
-
-impl ScpError {
     /// A custody failure the runtime carried as a typed
     /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
     /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code):
@@ -1762,11 +1760,43 @@ impl ScpError {
     }
 }
 
+impl ScpError {
+    /// A failed checkpoint generation: a custody failure keeps its custody code
+    /// ([`Self::custody_failure`]), and any other event-log failure is
+    /// `SCP-CTX-2027`.
+    pub(crate) fn checkpoint_error(e: &scp_event_log::EventLogError) -> Self {
+        let msg = format!("checkpoint generation failed: {e}");
+        match e {
+            scp_event_log::EventLogError::Custody(failure) => Self::custody_failure(msg, failure),
+            _ => Self::Context {
+                msg,
+                code: codes::CTX_2027.to_owned(),
+            },
+        }
+    }
+
+    /// A failed inner-envelope signing: a custody failure keeps its custody
+    /// code ([`Self::custody_failure`]), and any other envelope failure is
+    /// `SCP-CRYPTO-4001`.
+    pub(crate) fn inner_envelope_error(e: &scp_core::envelope::EnvelopeError) -> Self {
+        let msg = format!("inner envelope signing failed: {e}");
+        match e {
+            scp_core::envelope::EnvelopeError::Custody(failure) => {
+                Self::custody_failure(msg, failure)
+            }
+            _ => Self::Crypto {
+                msg,
+                code: codes::CRYPTO_4001.to_owned(),
+            },
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        Self::custody(
+        Self::custody_failure(
             format!("platform key operation failed: {e} — check key custody configuration"),
-            &e,
+            &scp_crypto::CustodyFailure::from(&e),
         )
     }
 }
@@ -4297,7 +4327,12 @@ async fn identity_create_link_attestation_impl(
             msg: format!("tokio join error: {e}"),
             code: codes::IDENT_1041.to_owned(),
         })?
-        .map_err(|e| ScpError::custody(format!("link attestation signing failed: {e}"), &e))?;
+        .map_err(|e| {
+            ScpError::custody_failure(
+                format!("link attestation signing failed: {e}"),
+                &scp_crypto::CustodyFailure::from(&e),
+            )
+        })?;
     attestation.signature = sig.as_bytes().to_vec();
 
     // Store custody for later verification lookups. Shared with
@@ -5873,18 +5908,7 @@ async fn event_log_checkpoint_impl(
                                 &signer,
                             )
                             .await
-                            .map_err(|e| match &e {
-                                scp_event_log::EventLogError::Custody(failure) => {
-                                    ScpError::custody_failure(
-                                        format!("checkpoint generation failed: {e}"),
-                                        failure,
-                                    )
-                                }
-                                _ => ScpError::Context {
-                                    msg: format!("checkpoint generation failed: {e}"),
-                                    code: codes::CTX_2027.to_owned(),
-                                },
-                            })
+                            .map_err(|e| ScpError::checkpoint_error(&e))
                         })
                     })
                 })
@@ -6006,18 +6030,7 @@ async fn event_log_checkpoint_by_did_impl(
                                 &signer,
                             )
                             .await
-                            .map_err(|e| match &e {
-                                scp_event_log::EventLogError::Custody(failure) => {
-                                    ScpError::custody_failure(
-                                        format!("checkpoint generation failed: {e}"),
-                                        failure,
-                                    )
-                                }
-                                _ => ScpError::Context {
-                                    msg: format!("checkpoint generation failed: {e}"),
-                                    code: codes::CTX_2027.to_owned(),
-                                },
-                            })
+                            .map_err(|e| ScpError::checkpoint_error(&e))
                         })
                     })
                 })
@@ -11421,18 +11434,7 @@ impl Scp {
                             &core_id.active_signing_key,
                         )
                         .await
-                        .map_err(|e| match &e {
-                            scp_core::envelope::EnvelopeError::Custody(failure) => {
-                                ScpError::custody_failure(
-                                    format!("inner envelope signing failed: {e}"),
-                                    failure,
-                                )
-                            }
-                            _ => ScpError::Crypto {
-                                msg: format!("inner envelope signing failed: {e}"),
-                                code: codes::CRYPTO_4001.to_owned(),
-                            },
-                        })?;
+                        .map_err(|e| ScpError::inner_envelope_error(&e))?;
                     } else {
                         #[cfg(feature = "testing")]
                         if let Some(ref imc) = handle.in_memory_custody {
@@ -11442,18 +11444,7 @@ impl Scp {
                                 &core_id.active_signing_key,
                             )
                             .await
-                            .map_err(|e| match &e {
-                                scp_core::envelope::EnvelopeError::Custody(failure) => {
-                                    ScpError::custody_failure(
-                                        format!("inner envelope signing failed: {e}"),
-                                        failure,
-                                    )
-                                }
-                                _ => ScpError::Crypto {
-                                    msg: format!("inner envelope signing failed: {e}"),
-                                    code: codes::CRYPTO_4001.to_owned(),
-                                },
-                            })?;
+                            .map_err(|e| ScpError::inner_envelope_error(&e))?;
                         }
                     }
                 }
@@ -19431,6 +19422,19 @@ mod tests {
         );
         assert_eq!(
             crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        use scp_platform::PlatformError;
+        assert_eq!(
+            crypto_code(PlatformError::KeyNotFound.into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            identity_code(PlatformError::PseudonymRejected("x".to_owned()).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(PlatformError::CustodyError("x".to_owned()).into()),
             codes::CRYPTO_4060
         );
     }

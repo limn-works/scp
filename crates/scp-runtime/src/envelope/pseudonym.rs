@@ -189,6 +189,22 @@ mod tests {
     // v2 (rotatable) pseudonym tests — BLACK-001 mitigation
     // -----------------------------------------------------------------------
 
+    /// A destroyed identity key fails v2 derivation with a typed key-not-found
+    /// custody failure, as v1 does, so every bridge reports `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn derive_rotatable_pseudonym_with_a_destroyed_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&key_handle).await.unwrap();
+        let err = derive_rotatable_pseudonym(&custody, &key_handle, b"test-context-1", 3)
+            .await
+            .expect_err("v2 derivation under a destroyed key must fail");
+        assert!(
+            matches!(&err, EnvelopeError::Custody(failure) if failure.is_key_not_found()),
+            "expected EnvelopeError::Custody key-not-found, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn rotatable_pseudonym_is_deterministic() {
         let custody = InMemoryKeyCustody::new();

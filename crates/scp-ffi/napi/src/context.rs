@@ -424,12 +424,16 @@ async fn derive_context_pseudonym_required(
 }
 
 /// The error a failed custody pseudonym derivation surfaces as, coded by
-/// `platform_error_code`: key-not-found → `SCP-CRYPTO-4006` (a key destroyed
-/// mid-derivation fails as key-not-found, §9.10.4.A), a host pseudonym the
-/// bridge cannot bind → `SCP-IDENT-1055`, any other custody failure →
-/// `SCP-CRYPTO-4060`.
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// of its [`CustodyFailure`](scp_crypto::CustodyFailure): key-not-found →
+/// `SCP-CRYPTO-4006` (a key destroyed mid-derivation fails as key-not-found,
+/// §9.10.4.A), a host pseudonym the bridge cannot bind → `SCP-IDENT-1055`, any
+/// other custody failure → `SCP-CRYPTO-4060`.
 pub(crate) fn pseudonym_derivation_failed(e: &scp_platform::PlatformError) -> ScpNapiError {
-    ScpNapiError::custody(format!("pseudonym derivation failed: {e}"), e)
+    ScpNapiError::custody_failure(
+        format!("pseudonym derivation failed: {e}"),
+        &scp_crypto::CustodyFailure::from(e),
+    )
 }
 
 /// Core pseudonym-derivation sequence shared by every NAPI entry point.
@@ -1800,20 +1804,7 @@ pub(crate) async fn context_send_on(
 
         scp_core::envelope::create_inner_envelope(&params, custody.as_ref(), &signing_key)
             .await
-            .map_err(|e| {
-                NapiError::from(match &e {
-                    scp_core::envelope::EnvelopeError::Custody(failure) => {
-                        ScpNapiError::custody_failure(
-                            format!("inner envelope signing failed: {e}"),
-                            failure,
-                        )
-                    }
-                    _ => ScpNapiError::Crypto {
-                        message: format!("inner envelope signing failed: {e}"),
-                        code: codes::CRYPTO_4001.to_owned(),
-                    },
-                })
-            })?;
+            .map_err(|e| NapiError::from(ScpNapiError::inner_envelope_error(&e)))?;
     }
 
     // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
@@ -7419,7 +7410,7 @@ mod tests {
         /// custody can fail (the JS callback may throw), so the `Result` is part
         /// of the contract even though this in-test signer is infallible.
         #[allow(clippy::unnecessary_wraps)]
-        fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+        fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], scp_crypto::CustodyFailure> {
             use ed25519_dalek::Signer;
             Ok(self.signing_key.sign(digest).to_bytes())
         }
