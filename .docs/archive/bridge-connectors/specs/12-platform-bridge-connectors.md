@@ -1,3 +1,7 @@
+> **ARCHIVED — NOT LIVE PROTOCOL.** Spec 12 was cut on 2026-09-26 (Alec: "let's cut.") and archived on 2026-10-09. Read `../HISTORY.md` before reviving any part. Everything below the rule is the file as it stood on main when archived, byte for byte. To restore it, `git mv` it back to `.docs/specs/` and delete these lines.
+>
+> ---
+
 # 12. Platform Bridge Connectors
 
 ## 12.1 The Problem

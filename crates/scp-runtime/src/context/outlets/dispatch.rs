@@ -45,7 +45,7 @@
 //!    - calls [`StreamAdmissionTracker::release`] to decrement all three
 //!      cap counters — the per-invoker + per-outlet counters on the
 //!      per-context tracker and the per-origin-invoker counter on the
-//!      operator-scoped [`OriginAdmissionTracker`] (§05-contexts.md:448),
+//!      operator-scoped [`OriginAdmissionTracker`] (§5.4.5),
 //!      both under the sanctioned lock order,
 //!    - publishes the frontier-derived `chunks_billed` value into the
 //!      `OutletInvokedEvent` field; the event-local wire-invariant
@@ -612,7 +612,7 @@ pub(crate) struct SharedSessionState {
     /// releases the per-invoker + per-outlet counters here at
     /// terminal-chunk emission.
     pub admission: Arc<RwLock<StreamAdmissionTracker>>,
-    /// Operator-scoped origin admission tracker (§05-contexts.md:448):
+    /// Operator-scoped origin admission tracker (§5.4.5):
     /// a SINGLE instance shared across every context the operator hosts.
     /// The pump releases the per-origin-invoker counter here at
     /// terminal-chunk emission, in lock-step with `admission`.
@@ -1358,7 +1358,7 @@ fn run_admission_gate(
     params: &OpenStreamParams,
 ) -> Result<(), OpenStreamRejection> {
     let admission_outcome = {
-        // LOCK ORDER (§05-contexts.md:448 split): the per-context
+        // LOCK ORDER (§5.4.5 split): the per-context
         // `admission` lock is ALWAYS acquired before the operator-scoped
         // `origin_admission` lock. `origin_admission` is a single leaf
         // lock always taken innermost, so no acquisition cycle is
@@ -2193,7 +2193,7 @@ pub async fn open_stream_session<E>(
     settlement_sink: Option<Arc<dyn StreamSettlementSink>>,
     params: OpenStreamParams,
     admission: Arc<RwLock<StreamAdmissionTracker>>,
-    // §05-contexts.md:448: the operator-scoped origin admission tracker,
+    // §5.4.5: the operator-scoped origin admission tracker,
     // a SINGLE instance the supervisor owns and shares across every
     // context it hosts. Carries the per-origin-invoker dimension so a
     // caller cannot fan out across N of the operator's contexts to open
@@ -3356,7 +3356,7 @@ async fn run_stream_pump_v2(
         // through the invoke.rs public helper (which lifts the type
         // reference into invoke.rs for grep enforcement). The
         // operator-scoped `origin_admission` MUST be decremented here too
-        // (§05-contexts.md:448) — else the origin's operator-wide count
+        // (§5.4.5) — else the origin's operator-wide count
         // leaks and permanently caps the origin.
         let admission_arc = Arc::clone(&guard.admission);
         let origin_admission_arc = Arc::clone(&guard.origin_admission);

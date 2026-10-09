@@ -613,34 +613,6 @@ Fingerprint:
 
 An implementation that concatenates the caller's own block first computes two different values for one honest pair and raises §9.11's maximum-severity MITM alert against an honest counterparty.
 
-## 25.10 Claim Validation Vectors (§12.3)
-
-Domain: `"SCP-CLAIM-V1:"`
-
-### Vector 22: Shadow Claim Hash
-
-```
-Input:
-  shadow_id:    "shadow-alice-x-12345"
-  claimant_did: "did:dht:z6MkClaim"
-  context_id:   "bridge-test-context"
-  timestamp:    1700000000
-
-Canonical hash input:
-  "SCP-CLAIM-V1:"                              (13 bytes)
-  || BE32(20) || "shadow-alice-x-12345"         (4 + 20 = 24 bytes)
-  || BE32(17) || "did:dht:z6MkClaim"           (4 + 17 = 21 bytes)
-  || BE32(19) || "bridge-test-context"          (4 + 19 = 23 bytes)
-  || BE64(1700000000)                           (8 bytes)
-
-Total: 13 + 24 + 21 + 23 + 8 = 89 bytes
-
-Expected SHA-256:
-  0xf3469482bb1d91d18e7167d21666fad9476b0559625257589075df6ebca23642
-```
-
-The domain separator is 13 ASCII bytes and the preimage is 89. Before 2026-09-10 this vector stated 14 and 90, so an implementer following §25.17 step 3 would have read a correct encoding as wrong. The claim hash is new here: §25.17 step 4 tells an implementer to compare each canonical byte sequence's SHA-256 against an expected hash, and this vector carried none.
-
 ## 25.11 Proposal ID Vectors (§6.4 [no such section])
 
 Domain: `"SCP-PROPOSAL-V1:"`

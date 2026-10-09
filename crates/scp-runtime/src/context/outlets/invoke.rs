@@ -2684,7 +2684,7 @@ pub const fn accrue_data_chunk_if_billable(
 ///
 /// Decrements the per-invoker and per-outlet counters on the per-context
 /// `admission` tracker AND the per-origin-invoker counter on the
-/// operator-scoped `origin_admission` tracker (§05-contexts.md:448),
+/// operator-scoped `origin_admission` tracker (§5.4.5),
 /// under both trackers' critical sections. Idempotent on a
 /// never-admitted triple (matches
 /// [`super::stream::StreamAdmissionTracker::release`] semantics). The

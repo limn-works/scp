@@ -60,8 +60,8 @@ site projection** machinery:
    origin-root mount reuses the **same content handler** as the canonical path, so
    `ContentPath` traversal protection, decryption, `ETag`, `Cache-Control`, and CSP
    apply identically. It routes only to the single designated default site and
-   **never** re-exposes the relay upgrade (`/scp/v1`) or bridge routes
-   (`/v1/scp/bridge/*`), which are not mounted on the self-host public surface.
+   **never** re-exposes the relay upgrade (`/scp/v1`), which is not mounted on the
+   self-host public surface.
 
    `routing_id = SHA-256(context_id)` (no domain separator —
    `crates/scp-protocol/src/context/mod.rs:122` `broadcast_routing_id`).
@@ -279,7 +279,7 @@ via `host_site_until`, plus **PRD stories** (validate with
 self-host is **opt-in only** (`--self-host` flag / `SCP_NODE_SELF_HOST=1`, never a
 default; `upnp` stays a non-default cargo feature); a **loud, legible startup log**
 ("opening TCP <port> to the public internet; home IP <x> now publicly bound to DID
-<y>"); **clean teardown** releases the mapping on shutdown; dev/bridge endpoints
+<y>"); **clean teardown** releases the mapping on shutdown; dev endpoints
 stay **loopback-only** (verify, don't assume); IP-doxing and the self-signed-cert
 (no-CA) posture stated explicitly (the self-host surface serves self-signed HTTPS
 by default per §10.12.11, with plaintext available only as an explicit

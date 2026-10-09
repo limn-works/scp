@@ -54,18 +54,18 @@
 │  │  ┌──────────────────────────┼──────────────────────────────┐ │  │
 │  │  │  ADAPTER LAYER           │                               │ │  │
 │  │  │                          │                               │ │  │
-│  │  │  ┌──────────┐ ┌─────────┴┐ ┌──────────┐ ┌───────────┐ │ │  │
-│  │  │  │Transport │ │ Platform │ │ MCP      │ │ Bridge    │ │ │  │
-│  │  │  │          │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • SCP    │ │ • Keys   │ │ • Server │ │ • X       │ │ │  │
-│  │  │  │   native │ │ • Attest  │ │ • Client │ │ • Bluesky │ │ │  │
-│  │  │  │ • Nostr  │ │ • Push   │ │          │ │ • Discord │ │ │  │
-│  │  │  │ • Matrix │ │ • Storage│ │          │ │           │ │ │  │
-│  │  │  │ • Hyper* │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • libp2p │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • WS/RTC │ │          │ │          │ │           │ │ │  │
-│  │  │  │ • +more  │ │          │ │          │ │           │ │ │  │
-│  │  │  └──────────┘ └──────────┘ └──────────┘ └───────────┘ │ │  │
+│  │  │  ┌──────────┐ ┌─────────┴┐ ┌──────────┐               │ │  │
+│  │  │  │Transport │ │ Platform │ │ MCP      │               │ │  │
+│  │  │  │          │ │          │ │          │               │ │  │
+│  │  │  │ • SCP    │ │ • Keys   │ │ • Server │               │ │  │
+│  │  │  │   native │ │ • Attest  │ │ • Client │               │ │  │
+│  │  │  │ • Nostr  │ │ • Push   │ │          │               │ │  │
+│  │  │  │ • Matrix │ │ • Storage│ │          │               │ │  │
+│  │  │  │ • Hyper* │ │          │ │          │               │ │  │
+│  │  │  │ • libp2p │ │          │ │          │               │ │  │
+│  │  │  │ • WS/RTC │ │          │ │          │               │ │  │
+│  │  │  │ • +more  │ │          │ │          │               │ │  │
+│  │  │  └──────────┘ └──────────┘ └──────────┘               │ │  │
 │  │  └──────────────────────────────────────────────────────────┘ │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                    │
@@ -258,7 +258,6 @@ scp/
 │   │   ├── crypto/            # UCAN, sender keys, access keys, canonical hashing
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
-│   │   ├── bridge/            # Bridge connector protocol types (§12)
 │   │   ├── economy/           # Economic governance, pricing, spend auth (§19)
 │   │   └── sync/              # Offline/sync strategy (§23)
 │   │
@@ -268,7 +267,7 @@ scp/
 │   │   ├── identity/          # SCPID, custody migration, recovery
 │   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
 │   │   ├── event_log/         # Tiered storage, cold-tier provider
-│   │   └── ...                # envelope, discovery, bridge, economy async modules
+│   │   └── ...                # envelope, discovery, economy async modules
 │   │
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
@@ -635,9 +634,6 @@ State:
         ├──► scp-core
         ├──► scp-transport
         └──► scp-platform
-
-   Note: Bridge protocol types live in scp-protocol/bridge/,
-   not in a separate scp-bridge crate.
 ```
 
 Build order follows the dependency graph bottom-up: platform traits → transport → core → FFI → bindings.
@@ -1164,13 +1160,12 @@ Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 
 ### Phase 5: Platform Adapters + Swift + Reference App
 
-**Goal:** iOS SDK, reference app integration, bridge adapters, real-time media transport.
+**Goal:** iOS SDK, reference app integration, real-time media transport.
 
 ```
 Build:
   • bindings/swift/Sources/SCP/Platform/ — Keychain, App Attest, APNs, SQLCipher
   • bindings/swift/ — UniFFI-generated + Swift ergonomics layer
-  • scp-core/bridge/ — Bridge protocol types and per-platform adapters
   • scp-media/ — WebRTC adapter, MLS key export for DTLS-SRTP (§10.9.1), signaling via context messages
   • Reference app integration: quests as contexts, AI guide as agent
 
@@ -1179,7 +1174,6 @@ Test:
   • Apple platform conformance: key_custody_conformance!(), attestation_conformance!(),
     push_conformance!() pass for Keychain/App Attest/APNs adapters (§16.12.3-5)
   • Quest runs as SCP context
-  • Bridge: X user participates in quest via bridge
   • End-to-end: Python agent ↔ Swift app via SCP
   • Media: voice/video call between two context members, keys derived from MLS group state
   • PostgresBlobStore, S3BlobStore pass blob_store_conformance!() (§16.12.6, §17.7)
@@ -1187,7 +1181,6 @@ Test:
 Ship:
   • Swift package
   • Reference app beta with SCP
-  • Bridge adapters
   • Media transport with WebRTC
 
 Deliverable: Reference app runs on SCP. Cross-platform: Python ↔ Swift ↔ TypeScript. Real-time media via delegated WebRTC transport.
