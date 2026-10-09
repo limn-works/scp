@@ -131,6 +131,9 @@ scp-event-log = { path = "../../scp-event-log" }
 # artifact fails that gate whatever spelling the edge uses.
 scp-identity = { path = "../../scp-identity", features = ["testing"] }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+# `p256::testing::invalid_point_encodings`, the shared table of invalid P-256
+# wire encodings the broadcast wrapping-key tests run over.
+scp-crypto = { path = "../../scp-crypto", features = ["testing"] }
 # The crate's own tests (resolvers.rs, dht_capability_injection.rs) construct
 # `InMemoryDhtClient`; activate `scp-dht/testing` for this crate's test build.
 scp-dht = { path = "../../scp-dht", features = ["testing"] }

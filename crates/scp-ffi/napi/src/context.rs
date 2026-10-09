@@ -3338,7 +3338,7 @@ pub(crate) async fn broadcast_handle_key_request_on(
         scp_ffi_common::broadcast::parse_wrapping_pubkey(&wrapping_pubkey).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: e.to_string(),
-                code: codes::VALID_7007.to_owned(),
+                code: e.error_code().to_owned(),
             })
         })?;
     let sup = crate::runtime::supervisor(bi)?;
@@ -3399,22 +3399,16 @@ pub fn broadcast_open_key(sealed_json: String, wrapping_secret: Vec<u8>) -> napi
     scp_ffi_common::broadcast::open_sealed_broadcast_key(&sealed_json, &wrapping_secret).map_err(
         |e| {
             // Malformed JSON / wrong-length secret are caller-input validation
-            // errors; a failed HPKE open is a context/crypto error. Mirrors the
-            // PyO3/UniFFI classification so the error variant is consistent
-            // across every SDK.
-            let scp_err = match &e {
-                OpenSealedKeyError::InvalidJson { .. } => ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7002.to_owned(),
-                },
-                OpenSealedKeyError::InvalidSecretLength { .. } => ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7007.to_owned(),
-                },
-                OpenSealedKeyError::OpenFailed { .. } => ScpNapiError::Context {
-                    message: e.to_string(),
-                    code: codes::CTX_2023.to_owned(),
-                },
+            // errors; a failed HPKE open is a context error. The code comes
+            // from `error_code`, which every bridge shares.
+            let message = e.to_string();
+            let code = e.error_code().to_owned();
+            let scp_err = match e {
+                OpenSealedKeyError::InvalidJson { .. }
+                | OpenSealedKeyError::InvalidSecretLength { .. } => {
+                    ScpNapiError::Validation { message, code }
+                }
+                OpenSealedKeyError::OpenFailed { .. } => ScpNapiError::Context { message, code },
             };
             NapiError::from(scp_err)
         },

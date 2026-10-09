@@ -648,9 +648,10 @@ public extension Context {
     ///   - wrappingPubkey: The requester's 65-byte uncompressed DHKEM(P-256)
     ///     public key.
     /// - Returns: The sealed-broadcast-key JSON on grant, or `nil` on deny.
-    /// - Throws: ``ScpError/Validation(msg:code:)`` if `wrappingPubkey` is not
-    ///   65 bytes or not a valid P-256 point, or ``ScpError/Context(msg:code:)``
-    ///   if the operation fails.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7007` if
+    ///   `wrappingPubkey` is not a 65-byte uncompressed P-256 point, or
+    ///   ``ScpError/Context(msg:code:)`` if the context is not active or the
+    ///   operation fails.
     func broadcastHandleKeyRequest(
         authorDid: String,
         requesterDid: String,
@@ -677,8 +678,10 @@ public extension Context {
     ///   - sealedJson: The sealed-broadcast-key JSON from a granted request.
     ///   - wrappingSecret: The subscriber's 32-byte DHKEM(P-256) scalar.
     /// - Returns: The raw 32-byte AES-256 broadcast key.
-    /// - Throws: ``ScpError/Validation(msg:code:)`` if inputs are malformed, or
-    ///   ``ScpError/Context(msg:code:)`` if the HPKE open fails.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7002` if
+    ///   `sealedJson` is malformed or `SCP-VALID-7007` if `wrappingSecret` is
+    ///   not 32 bytes, or ``ScpError/Context(msg:code:)`` with `SCP-CTX-2023`
+    ///   if the HPKE open fails.
     func broadcastOpenKey(sealedJson: String, wrappingSecret: Data) throws -> Data {
         try scp.broadcastOpenKey(sealedJson: sealedJson, wrappingSecret: wrappingSecret)
     }

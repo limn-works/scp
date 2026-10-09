@@ -462,8 +462,8 @@ class SCP internal constructor(
     /**
      * Forwards to [NativeScp.broadcastHandleKeyRequest] on [inner].
      * [wrappingPubkey] is the requester's 65-byte uncompressed DHKEM(P-256)
-     * public key (§5.14.2, §9.5); any other length or an invalid point throws a
-     * validation error.
+     * public key (§5.14.2, §9.5); any other length or an invalid point throws
+     * [uniffi.scp.ScpException.Validation] with code `SCP-VALID-7007`.
      */
     suspend fun broadcastHandleKeyRequest(
         handle: ContextHandle,

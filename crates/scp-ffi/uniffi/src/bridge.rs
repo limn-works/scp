@@ -6960,21 +6960,19 @@ pub fn broadcast_open_key(
 ) -> Result<Vec<u8>, ScpError> {
     use scp_ffi_common::broadcast::OpenSealedKeyError;
     scp_ffi_common::broadcast::open_sealed_broadcast_key(&sealed_json, &wrapping_secret).map_err(
-        |e| match e {
+        |e| {
             // Malformed JSON / wrong-length secret are caller-input validation
-            // errors; a failed HPKE open is a context/crypto error.
-            OpenSealedKeyError::InvalidJson { .. } => ScpError::Validation {
-                msg: e.to_string(),
-                code: codes::VALID_7002.to_owned(),
-            },
-            OpenSealedKeyError::InvalidSecretLength { .. } => ScpError::Validation {
-                msg: e.to_string(),
-                code: codes::VALID_7007.to_owned(),
-            },
-            OpenSealedKeyError::OpenFailed { .. } => ScpError::Context {
-                msg: e.to_string(),
-                code: codes::CTX_2023.to_owned(),
-            },
+            // errors; a failed HPKE open is a context error. The code comes
+            // from `error_code`, which every bridge shares.
+            let msg = e.to_string();
+            let code = e.error_code().to_owned();
+            match e {
+                OpenSealedKeyError::InvalidJson { .. }
+                | OpenSealedKeyError::InvalidSecretLength { .. } => {
+                    ScpError::Validation { msg, code }
+                }
+                OpenSealedKeyError::OpenFailed { .. } => ScpError::Context { msg, code },
+            }
         },
     )
 }
@@ -13361,7 +13359,7 @@ impl Scp {
             scp_ffi_common::broadcast::parse_wrapping_pubkey(&wrapping_pubkey).map_err(|e| {
                 ScpError::Validation {
                     msg: e.to_string(),
-                    code: codes::VALID_7007.to_owned(),
+                    code: e.error_code().to_owned(),
                 }
             })?;
         let bi = Arc::clone(&self.inner);

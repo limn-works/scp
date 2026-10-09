@@ -36,37 +36,35 @@ const WRAPPING_SECRET_LEN: usize = 32;
 /// DHKEM(P-256) point (§9.5).
 const WRAPPING_PUBKEY_LEN: usize = 65;
 
-/// Failure modes for [`parse_wrapping_pubkey`].
+/// A requester's `wrapping_pubkey` that is not a 65-byte uncompressed P-256
+/// point (§9.5): wrong length, wrong tag, a coordinate at or above the field
+/// prime, or off the curve.
 ///
-/// Each bridge maps both variants to its caller-input validation error.
+/// Every bridge reports it as a validation error with [`Self::error_code`].
 #[derive(Debug)]
-pub enum WrappingPubkeyError {
-    /// The key was not exactly 65 bytes.
-    InvalidLength {
-        /// The actual length supplied.
-        actual: usize,
-    },
-    /// The key was 65 bytes but not a valid uncompressed P-256 point (wrong
-    /// tag, a coordinate at or above the field prime, or off the curve).
-    InvalidPoint {
-        /// Crypto-layer detail.
-        detail: String,
-    },
+pub struct WrappingPubkeyError {
+    /// The length the caller supplied.
+    actual: usize,
+    /// Point-validation detail.
+    detail: String,
+}
+
+impl WrappingPubkeyError {
+    /// Returns the `SCP-VALID-` code every bridge reports: invalid input format.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        crate::error_codes::VALID_7007
+    }
 }
 
 impl core::fmt::Display for WrappingPubkeyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::InvalidLength { actual } => write!(
-                f,
-                "wrapping_pubkey must be {WRAPPING_PUBKEY_LEN} bytes (an uncompressed P-256 \
-                 point), got {actual}"
-            ),
-            Self::InvalidPoint { detail } => write!(
-                f,
-                "wrapping_pubkey is not a valid uncompressed P-256 point: {detail}"
-            ),
-        }
+        write!(
+            f,
+            "wrapping_pubkey must be a {WRAPPING_PUBKEY_LEN}-byte uncompressed P-256 point, got \
+             {} bytes: {}",
+            self.actual, self.detail
+        )
     }
 }
 
@@ -74,25 +72,17 @@ impl std::error::Error for WrappingPubkeyError {}
 
 /// Parses a broadcast key requester's wrapping public key (§5.14.2, §9.5).
 ///
-/// The key must be exactly 65 bytes and a valid uncompressed P-256 point, so a
-/// malformed key fails at the bridge with a validation error instead of
-/// reaching the author's seal.
+/// The key must be a 65-byte uncompressed P-256 point, so a malformed key fails
+/// at the bridge with a validation error instead of reaching the author's seal.
 ///
 /// # Errors
 ///
-/// Returns [`WrappingPubkeyError::InvalidLength`] for any length other than
-/// 65, and [`WrappingPubkeyError::InvalidPoint`] for a 65-byte value that is
-/// not a valid uncompressed P-256 point.
+/// Returns [`WrappingPubkeyError`] for any value [`P256Point`] rejects.
 pub fn parse_wrapping_pubkey(bytes: &[u8]) -> Result<P256Point, WrappingPubkeyError> {
-    match scp_crypto::p256::P256PublicKey::from_uncompressed(bytes) {
-        Ok(point) => Ok(P256Point::from(&point)),
-        Err(scp_crypto::p256::P256Error::InvalidUncompressedLength(actual)) => {
-            Err(WrappingPubkeyError::InvalidLength { actual })
-        }
-        Err(e) => Err(WrappingPubkeyError::InvalidPoint {
-            detail: e.to_string(),
-        }),
-    }
+    P256Point::try_from(bytes).map_err(|e| WrappingPubkeyError {
+        actual: bytes.len(),
+        detail: e.to_string(),
+    })
 }
 
 /// Builds and JSON-serializes a [`SealedBroadcastKey`] from a broadcast
@@ -133,7 +123,8 @@ pub fn seal_decision_to_json(
 
 /// Failure modes for [`open_sealed_broadcast_key`].
 ///
-/// Each bridge maps every variant to its own error type and code. The variants
+/// Each bridge maps every variant to its own error type, with the code from
+/// [`OpenSealedKeyError::error_code`]. The variants
 /// carry enough detail for a bridge to build an actionable message without
 /// re-deriving context.
 #[derive(Debug)]
@@ -166,6 +157,20 @@ impl core::fmt::Display for OpenSealedKeyError {
                 write!(f, "wrapping_secret must be 32 bytes, got {actual}")
             }
             Self::OpenFailed { detail } => write!(f, "broadcast key open failed: {detail}"),
+        }
+    }
+}
+
+impl OpenSealedKeyError {
+    /// Returns the code every bridge reports: `SCP-VALID-7002` for malformed
+    /// JSON, `SCP-VALID-7007` for a wrapping secret that is not 32 bytes, and
+    /// `SCP-CTX-2023` for a failed HPKE open.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::InvalidJson { .. } => crate::error_codes::VALID_7002,
+            Self::InvalidSecretLength { .. } => crate::error_codes::VALID_7007,
+            Self::OpenFailed { .. } => crate::error_codes::CTX_2023,
         }
     }
 }
@@ -321,33 +326,48 @@ mod tests {
         assert_eq!(parse_wrapping_pubkey(public.as_bytes()).unwrap(), public);
     }
 
+    /// Every invalid encoding is one error with code `SCP-VALID-7007`, and its
+    /// message names the length the caller supplied.
     #[test]
-    fn parse_wrapping_pubkey_rejects_32_bytes() {
-        let err = parse_wrapping_pubkey(&[0x42; 32]).unwrap_err();
-        assert!(matches!(
-            err,
-            WrappingPubkeyError::InvalidLength { actual: 32 }
-        ));
-        assert!(err.to_string().contains("must be 65 bytes"), "{err}");
+    fn parse_wrapping_pubkey_rejects_every_invalid_encoding_with_valid_7007() {
+        for (case, bytes) in scp_crypto::p256::testing::invalid_point_encodings(5) {
+            let err = parse_wrapping_pubkey(&bytes).unwrap_err();
+            assert_eq!(err.error_code(), crate::error_codes::VALID_7007, "{case}");
+            let message = err.to_string();
+            assert!(
+                message.contains("must be a 65-byte uncompressed P-256 point"),
+                "{case}: {message}"
+            );
+            assert!(
+                message.contains(&format!("got {} bytes", bytes.len())),
+                "{case}: {message}"
+            );
+        }
     }
 
     #[test]
-    fn parse_wrapping_pubkey_rejects_an_off_curve_point() {
-        // The uncompressed tag with the point (0, 0), which is not on the curve.
-        let mut off_curve = [0u8; 65];
-        off_curve[0] = 0x04;
-        assert!(matches!(
-            parse_wrapping_pubkey(&off_curve).unwrap_err(),
-            WrappingPubkeyError::InvalidPoint { .. }
-        ));
-        // A valid point under the compressed tag is rejected too.
+    fn open_sealed_key_errors_carry_the_bridge_codes() {
         let (_secret, public) = wrapping_keypair();
-        let mut public = *public.as_bytes();
-        public[0] = 0x02;
-        assert!(matches!(
-            parse_wrapping_pubkey(&public).unwrap_err(),
-            WrappingPubkeyError::InvalidPoint { .. }
-        ));
+        let json = seal_decision_to_json(grant_for(&public, 0), AUTHOR, CTX)
+            .unwrap()
+            .unwrap();
+        let (wrong, _) = wrapping_keypair();
+        for (err, code) in [
+            (
+                open_sealed_broadcast_key("not json", &[0u8; 32]).unwrap_err(),
+                crate::error_codes::VALID_7002,
+            ),
+            (
+                open_sealed_broadcast_key(&json, b"short").unwrap_err(),
+                crate::error_codes::VALID_7007,
+            ),
+            (
+                open_sealed_broadcast_key(&json, &wrong).unwrap_err(),
+                crate::error_codes::CTX_2023,
+            ),
+        ] {
+            assert_eq!(err.error_code(), code, "{err}");
+        }
     }
 
     #[test]

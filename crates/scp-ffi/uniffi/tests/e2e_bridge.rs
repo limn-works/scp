@@ -1522,42 +1522,29 @@ async fn broadcast_key_request_requires_a_65_byte_p256_wrapping_key() {
         .await
         .unwrap();
 
-    // A 32-byte key (the retired X25519 width) is a validation error.
-    match scp
-        .broadcast_handle_key_request(
-            Arc::clone(&handle),
-            author.did(),
-            subscriber.did(),
-            vec![0x42; 32],
-        )
-        .await
-    {
-        Err(ScpError::Validation { msg, code }) => {
-            assert_eq!(code, "SCP-VALID-7007");
-            assert!(msg.contains("must be 65 bytes"), "got: {msg}");
-        }
-        other => panic!("expected a validation error, got {other:?}"),
-    }
-
-    // A 65-byte value that is not on the curve is a validation error too.
+    // A 32-byte key (the retired X25519 width), a 64-byte key (the point
+    // without its 0x04 tag) and a 65-byte value off the curve are each a
+    // validation error with SCP-VALID-7007.
     let mut off_curve = vec![0u8; 65];
     off_curve[0] = 0x04;
-    match scp
-        .broadcast_handle_key_request(
-            Arc::clone(&handle),
-            author.did(),
-            subscriber.did(),
-            off_curve,
-        )
-        .await
-    {
-        Err(ScpError::Validation { msg, .. }) => {
-            assert!(
-                msg.contains("not a valid uncompressed P-256 point"),
-                "got: {msg}"
-            );
+    for (case, key) in [
+        ("32 bytes", vec![0x42; 32]),
+        ("64 bytes", vec![0x42; 64]),
+        ("off curve", off_curve),
+    ] {
+        match scp
+            .broadcast_handle_key_request(Arc::clone(&handle), author.did(), subscriber.did(), key)
+            .await
+        {
+            Err(ScpError::Validation { msg, code }) => {
+                assert_eq!(code, "SCP-VALID-7007", "{case}");
+                assert!(
+                    msg.contains("must be a 65-byte uncompressed P-256 point"),
+                    "{case}: {msg}"
+                );
+            }
+            other => panic!("{case}: expected a validation error, got {other:?}"),
         }
-        other => panic!("expected a validation error, got {other:?}"),
     }
 
     // A valid point is accepted, and its secret opens the sealed key.

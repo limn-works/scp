@@ -1275,25 +1275,35 @@ class TestBroadcastKeyDistribution:
         )
         assert decision is None
 
-    async def test_key_request_rejects_malformed_wrapping_key(self, scp: SCP):
+    @pytest.mark.parametrize(
+        "wrapping_pubkey",
+        [bytes(32), bytes(64), b"\x04" + bytes(64)],
+        ids=["32-bytes", "64-bytes", "off-curve"],
+    )
+    async def test_key_request_rejects_malformed_wrapping_key(
+        self, scp: SCP, wrapping_pubkey: bytes
+    ):
         """§9.5: the requester's wrapping key is a 65-byte uncompressed P-256
-        point. A 32-byte key (the retired X25519 width) and a 65-byte value off
-        the curve are both rejected with ``ValueError`` before any decision."""
+        point. A 32-byte key (the retired X25519 width), a 64-byte key (the
+        point without its tag) and a 65-byte value off the curve are each a
+        ``ValidationError`` with ``SCP-VALID-7007`` before any decision."""
         author = await scp.identity_create(CustodyType.IN_MEMORY)
         subscriber = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = self._broadcast_handle(scp, author.did)
         await scp.broadcast_subscribe(handle, subscriber.did)
 
-        with pytest.raises(ValueError, match="must be 65 bytes"):
-            await scp.broadcast_handle_key_request(handle, author.did, subscriber.did, bytes(32))
-        off_curve = b"\x04" + bytes(64)
-        with pytest.raises(ValueError, match="not a valid uncompressed P-256 point"):
-            await scp.broadcast_handle_key_request(handle, author.did, subscriber.did, off_curve)
+        with pytest.raises(
+            _scp_core.ValidationError,
+            match=r"^\[SCP-VALID-7007\] .*must be a 65-byte uncompressed P-256 point",
+        ):
+            await scp.broadcast_handle_key_request(
+                handle, author.did, subscriber.did, wrapping_pubkey
+            )
 
     async def test_open_key_rejects_malformed_sealed_json(self, scp: SCP):
         """``broadcast_open_key`` must reject a sealed payload that is not valid
         JSON before attempting any HPKE open."""
-        with pytest.raises(ValueError):
+        with pytest.raises(_scp_core.ValidationError, match=r"^\[SCP-VALID-7002\] "):
             await scp.broadcast_open_key("not valid json", bytes(32))
 
     async def test_open_key_rejects_wrong_length_secret(self, scp: SCP):
@@ -1303,14 +1313,16 @@ class TestBroadcastKeyDistribution:
         not deserialization."""
         sealed_json = json.dumps(
             {
-                "enc": [4] + [0] * 64,
+                "enc": list(self.P256_G),
                 "ct": [0] * 48,
                 "epoch": 0,
                 "author_did": "did:dht:z6MkBroadcastAuthorForLenCheck",
                 "context_id": "ctx-broadcast-len-check",
             }
         )
-        with pytest.raises(ValueError, match="must be 32 bytes"):
+        with pytest.raises(
+            _scp_core.ValidationError, match=r"^\[SCP-VALID-7007\] .*must be 32 bytes"
+        ):
             await scp.broadcast_open_key(sealed_json, b"short")
 
     async def test_key_request_grants_registered_subscriber_shape(self, scp: SCP):

@@ -2189,17 +2189,18 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       );
       await napi.broadcastSubscribe(ctx, subscriber.did);
 
-      // A 32-byte key (the retired X25519 width) is a validation error.
-      await expect(
-        napi.broadcastHandleKeyRequest(ctx, identity.did, subscriber.did, new Uint8Array(32)),
-      ).rejects.toThrow(/must be 65 bytes/);
-
-      // A 65-byte value off the curve is a validation error too.
+      // A 32-byte key (the retired X25519 width), a 64-byte key (the point
+      // without its 0x04 tag) and a 65-byte value off the curve are each a
+      // validation error with SCP-VALID-7007.
       const offCurve = new Uint8Array(65);
       offCurve[0] = 0x04;
-      await expect(
-        napi.broadcastHandleKeyRequest(ctx, identity.did, subscriber.did, offCurve),
-      ).rejects.toThrow(/not a valid uncompressed P-256 point/);
+      for (const key of [new Uint8Array(32), new Uint8Array(64), offCurve]) {
+        await expect(
+          napi.broadcastHandleKeyRequest(ctx, identity.did, subscriber.did, key),
+        ).rejects.toThrow(
+          /^\[SCP-VALID-7007\] validation error: wrapping_pubkey must be a 65-byte uncompressed P-256 point/,
+        );
+      }
     });
   });
 

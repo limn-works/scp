@@ -5421,9 +5421,9 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `ValueError` if `wrapping_pubkey` is not exactly 65 bytes or not
-    /// a valid uncompressed P-256 point, or
-    /// `RuntimeError` if the operation fails.
+    /// Returns `ValidationError` with `SCP-VALID-7007` if `wrapping_pubkey` is
+    /// not a 65-byte uncompressed P-256 point, or `RuntimeError` if the
+    /// operation fails.
     #[pyo3(signature = (handle, author_did, requester_did, wrapping_pubkey))]
     pub fn broadcast_handle_key_request(
         &self,
@@ -5436,8 +5436,13 @@ impl crate::scp::PyScp {
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(author_did)?;
         validate::validate_did(requester_did)?;
-        let wrapping = scp_ffi_common::broadcast::parse_wrapping_pubkey(wrapping_pubkey)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let wrapping =
+            scp_ffi_common::broadcast::parse_wrapping_pubkey(wrapping_pubkey).map_err(|e| {
+                crate::error::ScpPyError::ValidationError {
+                    message: e.to_string(),
+                    code: e.error_code().to_owned(),
+                }
+            })?;
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -5489,21 +5494,29 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `ValueError` if `sealed_json` is malformed or `wrapping_secret`
-    /// is not 32 bytes, or `RuntimeError` if HPKE open fails.
+    /// Returns `ValidationError` with `SCP-VALID-7002` if `sealed_json` is
+    /// malformed or `SCP-VALID-7007` if `wrapping_secret` is not 32 bytes, or
+    /// `ContextError` with `SCP-CTX-2023` if the HPKE open fails.
     #[staticmethod]
     #[pyo3(signature = (sealed_json, wrapping_secret))]
     pub fn broadcast_open_key(sealed_json: &str, wrapping_secret: &[u8]) -> PyResult<Vec<u8>> {
         use scp_ffi_common::broadcast::OpenSealedKeyError;
         scp_ffi_common::broadcast::open_sealed_broadcast_key(sealed_json, wrapping_secret).map_err(
-            |e| match e {
-                // Malformed JSON / wrong-length secret are caller-input errors
-                // (ValueError); a failed HPKE open is a runtime crypto error.
-                OpenSealedKeyError::InvalidJson { .. }
-                | OpenSealedKeyError::InvalidSecretLength { .. } => {
-                    PyValueError::new_err(e.to_string())
-                }
-                OpenSealedKeyError::OpenFailed { .. } => PyRuntimeError::new_err(e.to_string()),
+            |e| {
+                // Malformed JSON / wrong-length secret are caller-input
+                // validation errors; a failed HPKE open is a context error. The
+                // code comes from `error_code`, which every bridge shares.
+                let message = e.to_string();
+                let code = e.error_code().to_owned();
+                PyErr::from(match e {
+                    OpenSealedKeyError::InvalidJson { .. }
+                    | OpenSealedKeyError::InvalidSecretLength { .. } => {
+                        crate::error::ScpPyError::ValidationError { message, code }
+                    }
+                    OpenSealedKeyError::OpenFailed { .. } => {
+                        crate::error::ScpPyError::ContextError { message, code }
+                    }
+                })
             },
         )
     }
