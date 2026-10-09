@@ -132,6 +132,7 @@ ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
 futures = "0.3"
 hex = { workspace = true }
 openmls = { workspace = true }

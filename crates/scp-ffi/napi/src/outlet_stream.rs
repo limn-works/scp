@@ -68,14 +68,15 @@ use scp_platform::error::PlatformError;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
+use scp_core::context::outlets::invoke::OutletStreamOpenError;
 use scp_core::context::outlets::stream::{
     OutletStreamChunk, OutletStreamCredit, TerminateReason, compute_caveats_binding,
     compute_credit_sig_preimage, verify_chunk_signature,
 };
 use scp_core::context::outlets::{
-    AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
-    OutletExecutorError, StreamIdentity, StreamSessionHandle, StreamSigner,
-    StreamSignerCustodyCategory, StreamSignerError, cancel_error_to_code, grant_error_to_code,
+    AdmissionCaps, CancelIdentity, OpenStreamParams, OutletExecutor, OutletExecutorError,
+    StreamIdentity, StreamSessionHandle, StreamSigner, StreamSignerCustodyCategory,
+    StreamSignerError, cancel_error_to_code, grant_error_to_code,
 };
 
 use scp_ffi_common::error_codes as codes;
@@ -313,16 +314,23 @@ impl OutletExecutor for NapiStreamExecutor {
 // Error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps an [`OpenStreamRejection`] onto the bridge error surface, carrying the
-/// rejection's own code verbatim.
-fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpNapiError {
-    ScpNapiError::Outlet {
-        message: format!(
-            "outlet stream open rejected ({}): {}",
-            rejection.error_code(),
-            rejection.slug()
+/// Maps an [`OutletStreamOpenError`] onto the bridge error surface. A
+/// Supervisor shutdown refusal takes the conversion of
+/// `ContextError::SupervisorShutDown`; a rejection carries its own code
+/// verbatim.
+fn open_rejection_to_err(err: &OutletStreamOpenError) -> ScpNapiError {
+    match err {
+        OutletStreamOpenError::SupervisorShutDown { message } => ScpNapiError::from(
+            scp_core::context::ContextError::SupervisorShutDown(message.clone()),
         ),
-        code: rejection.error_code().to_owned(),
+        OutletStreamOpenError::Rejected(rejection) => ScpNapiError::Outlet {
+            message: format!(
+                "outlet stream open rejected ({}): {}",
+                rejection.error_code(),
+                rejection.slug()
+            ),
+            code: rejection.error_code().to_owned(),
+        },
     }
 }
 

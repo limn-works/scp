@@ -212,6 +212,7 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
         None,
         None,
         &|task| drop(tokio::spawn(task)),
+        tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("open_stream_session accepts a well-formed open");

@@ -449,7 +449,7 @@ pub enum SagaError {
 }
 
 /// The step of a cross-context streaming saga's B-side open that returned an
-/// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection).
+/// [`OutletStreamOpenError`](crate::context::outlets::invoke::OutletStreamOpenError).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamingSagaOpenStep {
     /// Phase 1: the B-side escrow reserve.
@@ -474,24 +474,26 @@ impl StreamingSagaOpenStep {
 /// item 2), the error the saga's own tracker refusal returns; every other
 /// rejection aborts the saga with `SCP-SAGA-13067`.
 fn stream_open_rejection_to_saga_error(
-    rejection: &crate::context::outlets::dispatch::OpenStreamRejection,
+    rejection: &crate::context::outlets::invoke::OutletStreamOpenError,
     step: StreamingSagaOpenStep,
 ) -> SagaError {
     match rejection {
-        crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown => {
+        crate::context::outlets::invoke::OutletStreamOpenError::SupervisorShutDown { .. } => {
             SagaError::SupervisorShutDown {
                 message: format!("{} of a cross-context streaming saga", step.label()),
             }
         }
-        other => SagaError::Aborted {
-            reason: SagaAbortReason::Rejected,
-            code: 13067,
-            message: format!(
-                "streaming saga {} rejected: {}",
-                step.label(),
-                other.to_open_error()
-            ),
-        },
+        crate::context::outlets::invoke::OutletStreamOpenError::Rejected(other) => {
+            SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: format!(
+                    "streaming saga {} rejected: {}",
+                    step.label(),
+                    other.to_open_error()
+                ),
+            }
+        }
     }
 }
 
@@ -1304,8 +1306,8 @@ impl TrackedSpawner {
 /// `Drop` refund to a task spawned through the open's
 /// [`TrackedSpawner`], so a refund fired after `shutdown_all_contexts` has
 /// begun still runs (ADR-049 Decision 16, item 2, second exception). That
-/// task runs the [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink)
-/// refund as a tracked task, which item 2's first exception admits.
+/// task awaits the [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink)
+/// refund itself and spawns nothing further.
 struct SpawnerEscrowRefundSink {
     /// The sink the spawned task runs.
     inner: Arc<crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink>,
@@ -1343,7 +1345,7 @@ impl crate::context::outlets::dispatch::StreamEscrowRefundSink for SpawnerEscrow
         let context_id = context_id.to_owned();
         let member_did = member_did.clone();
         drop(self.spawner.spawn_on(
-            async move { inner.refund(&context_id, &member_did, amount) },
+            async move { inner.refund(&context_id, &member_did, amount).await },
             &self.runtime,
         ));
     }
@@ -1364,7 +1366,7 @@ pub enum DrainWithDeadline<T> {
 }
 
 /// The kind of work a tracked task hands to a task of its own through
-/// [`Supervisor::spawn_tracked_on`]. The variants are the three kinds ADR-049
+/// [`Supervisor::spawn_tracked_on`]. The variants are the two kinds ADR-049
 /// Decision 16 item 2 admits after the closed flag is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::context) enum SinkHandoff {
@@ -1372,8 +1374,6 @@ pub(in crate::context) enum SinkHandoff {
     StreamSettlement,
     /// The append of a stream's close-time `OutletInvokedEvent`.
     OutletInvokedEventAppend,
-    /// The refund of a stream's open-time escrow hold.
-    EscrowRefund,
 }
 
 impl SinkHandoff {
@@ -1382,7 +1382,6 @@ impl SinkHandoff {
         match self {
             Self::StreamSettlement => "stream settlement",
             Self::OutletInvokedEventAppend => "streaming OutletInvokedEvent append",
-            Self::EscrowRefund => "stream escrow refund",
         }
     }
 }
@@ -1772,6 +1771,11 @@ pub struct Supervisor {
     /// `std::sync::RwLock` is the workspace-permitted lock for a synchronous
     /// critical section.
     spawn_gate: std::sync::RwLock<bool>,
+    /// Cancelled when the closed flag is set. Every streaming pump selects on
+    /// it, so a pump parked on a credit grant or on its executor closes with
+    /// `ContextClosedMidStream` instead of holding the drain (ADR-049
+    /// Decision 16).
+    shutdown_token: tokio_util::sync::CancellationToken,
     /// Configuration.
     // Operational in Phase 2 of post-review-round-1 plan (saga + watchdog
     // configuration plumbed through ActorDeps).
@@ -2245,6 +2249,7 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
             spawn_gate: std::sync::RwLock::new(false),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
             health_config,
             crash_windows: DashMap::new(),
             // ADR-049 (read-authority switch): supervisor-owned authoritative Class-M floor registry.
@@ -7497,6 +7502,7 @@ impl Supervisor {
             caveat_post_input_check,
             counter_reservation,
             &|task| drop(spawner.spawn(task)),
+            self.shutdown_token.clone(),
         )
         .await;
         let mut handle = match open_result {
@@ -7508,7 +7514,7 @@ impl Supervisor {
                     .await;
                 drop(reservation);
                 return Err(stream_open_rejection_to_saga_error(
-                    &rejection,
+                    &rejection.into(),
                     StreamingSagaOpenStep::StreamOpen,
                 ));
             }
@@ -11389,7 +11395,7 @@ impl Supervisor {
     /// the closed flag is set when the caller is itself a tracked task: the
     /// tracker is not empty while the caller runs, so the drain awaits the
     /// spawned task. `kind` is a [`SinkHandoff`], so a caller can name only one
-    /// of the three kinds ADR-049 Decision 16 item 2 admits after the flag is
+    /// of the two kinds ADR-049 Decision 16 item 2 admits after the flag is
     /// set.
     ///
     /// # Errors
@@ -11429,8 +11435,8 @@ impl Supervisor {
 
     /// Issues a [`TrackedSpawner`] for an operation that spawns tasks after
     /// `.await`s of its own. Refused once the closed flag is set, from any
-    /// caller: item 2's first exception covers handing a settlement or a refund to
-    /// a task, not starting an operation.
+    /// caller: item 2's first exception covers handing a settlement or its
+    /// `OutletInvokedEvent` append to a task, not starting an operation.
     ///
     /// # Errors
     ///
@@ -11499,12 +11505,14 @@ impl Supervisor {
 
     /// Sets the closed flag (ADR-049 Decision 16, step 2). Blocks only until
     /// every live [`SpawnPermit`] drops, and a permit is never held across an
-    /// `.await`, so the wait is bounded by one synchronous spawn.
+    /// `.await`, so the wait is bounded by one synchronous spawn. Then cancels
+    /// the shutdown token every streaming pump selects on.
     pub(in crate::context) fn close_spawn_gate(&self) {
         *self
             .spawn_gate
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.shutdown_token.cancel();
     }
 
     /// Stops every key-package actor and clears `key_package_stores`
@@ -13535,10 +13543,10 @@ impl Supervisor {
     ///
     /// The actor-mailbox analog of the reference
     /// `ContextManager::outlet_stream_reverse_spend`. Called from
-    /// [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink)
-    /// via a spawned task (the sink's `refund` is a sync fire-and-forget fired
-    /// from the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
-    /// Drop-guard). A missing actor drops the best-effort refund (the torn-down
+    /// [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink),
+    /// which the escrow ticket's sink awaits in a task on the open's spawner
+    /// when the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+    /// drops unconsumed. A missing actor drops the best-effort refund (the torn-down
     /// context's budget tracker is gone).
     ///
     /// # Errors
@@ -13736,7 +13744,7 @@ impl Supervisor {
     /// rolls back only the admission slot / pump permit / counter it consumed.
     /// So this orchestrator guards the debited hold with a
     /// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
-    /// backed by an [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink):
+    /// backed by a [`SpawnerEscrowRefundSink`]:
     /// on a successful open the ticket is `consume`d (the pump's close-time
     /// settlement now owns the unspent-portion refund); on ANY rejection the
     /// ticket's `Drop` reverses the full hold via
@@ -13756,11 +13764,15 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// The reserve's [`ContextError`] is reverse-mapped into the open-time
+    /// [`OutletStreamOpenError`](crate::context::outlets::invoke::OutletStreamOpenError).
+    /// A shutdown refusal, of the spawner or of the reserve, is
+    /// `SupervisorShutDown`. Any other reserve [`ContextError`] is
+    /// reverse-mapped into the open-time
     /// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
     /// taxonomy via
-    /// [`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection);
-    /// any rejection `open_stream_session` returns propagates verbatim.
+    /// [`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection)
+    /// and returned as `Rejected`; any rejection `open_stream_session` returns
+    /// propagates as `Rejected`.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_outlet_stream<E>(
         self: &Arc<Self>,
@@ -13782,7 +13794,7 @@ impl Supervisor {
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
-        crate::context::outlets::dispatch::OpenStreamRejection,
+        crate::context::outlets::invoke::OutletStreamOpenError,
     >
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
@@ -13793,8 +13805,8 @@ impl Supervisor {
         // 16).
         let spawner = self
             .tracked_spawner("open outlet stream")
-            .map_err(|_refused| {
-                crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown
+            .map_err(|refused| {
+                crate::context::outlets_helpers::reserve_error_to_open_rejection(&refused)
             })?;
         self.open_outlet_stream_with_spawner(
             &spawner,
@@ -13845,7 +13857,7 @@ impl Supervisor {
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
-        crate::context::outlets::dispatch::OpenStreamRejection,
+        crate::context::outlets::invoke::OutletStreamOpenError,
     >
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
@@ -13926,6 +13938,7 @@ impl Supervisor {
             caveat_post_input_check,
             counter_reservation,
             &|task| drop(spawner.spawn(task)),
+            self.shutdown_token.clone(),
         )
         .await;
 
@@ -13942,7 +13955,7 @@ impl Supervisor {
                 // fires).
                 self.release_stream_escrow(spawner, escrow_ticket, context_id, invoker_did)
                     .await;
-                Err(rejection)
+                Err(rejection.into())
             }
         }
     }
@@ -13967,9 +13980,11 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// The reserve's [`ContextError`] reverse-mapped to the open-time
+    /// `SupervisorShutDown` when the reserve is refused by shutdown; otherwise
+    /// `Rejected` with the reserve's [`ContextError`] reverse-mapped to the
+    /// open-time
     /// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
-    /// taxonomy; a §7.3.8 hook build rejection; or the transport-fault admission
+    /// taxonomy, a §7.3.8 hook build rejection; or the transport-fault admission
     /// slug when the hosting context vanished between the reserve and the
     /// authoritative caps read.
     async fn open_outlet_stream_phase1(
@@ -13979,7 +13994,7 @@ impl Supervisor {
         invoker_did: &DID,
         caveat_binding: Option<&crate::context::outlets_helpers::InvocationCaveatBinding>,
         mut params: crate::context::outlets::dispatch::OpenStreamParams,
-    ) -> Result<OutletStreamPhase1, crate::context::outlets::dispatch::OpenStreamRejection> {
+    ) -> Result<OutletStreamPhase1, crate::context::outlets::invoke::OutletStreamOpenError> {
         use crate::context::outlets::dispatch;
         use scp_protocol::context::outlets::error_codes;
 
@@ -13995,7 +14010,8 @@ impl Supervisor {
             None => {
                 return Err(dispatch::OpenStreamRejection::AdmissionRateLimited {
                     slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
-                });
+                }
+                .into());
             }
         };
 
@@ -14084,7 +14100,7 @@ impl Supervisor {
                 Err(rejection) => {
                     self.release_stream_escrow(spawner, escrow_ticket, context_id, invoker_did)
                         .await;
-                    return Err(rejection);
+                    return Err(rejection.into());
                 }
             },
             None => (None, None),
@@ -14105,7 +14121,8 @@ impl Supervisor {
                 .await;
             return Err(dispatch::OpenStreamRejection::AdmissionRateLimited {
                 slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
-            });
+            }
+            .into());
         };
         params.caps = crate::context::outlets::stream::AdmissionCaps {
             per_invoker: ctx_params.max_concurrent_inbound_streams_per_invoker,
@@ -20513,26 +20530,39 @@ mod tests {
         );
     }
 
-    /// The three kinds ADR-049 Decision 16 item 2 admits after the closed flag
+    /// ADR-049 Decision 16: the shutdown token every streaming pump selects on
+    /// is live until the closed flag is set, and setting the flag cancels it.
+    #[tokio::test]
+    async fn close_spawn_gate_cancels_the_pump_shutdown_token() {
+        let supervisor = supervisor_with_providers();
+        assert!(
+            !supervisor.shutdown_token.is_cancelled(),
+            "the token is live while the gate is open"
+        );
+        supervisor.close_spawn_gate();
+        assert!(
+            supervisor.shutdown_token.is_cancelled(),
+            "closing the gate cancels the token"
+        );
+    }
+
+    /// The two kinds ADR-049 Decision 16 item 2 admits after the closed flag
     /// is set. The exhaustive match fails to compile when a variant is added
     /// without a row here.
-    fn every_sink_handoff() -> [SinkHandoff; 3] {
+    fn every_sink_handoff() -> [SinkHandoff; 2] {
         const fn listed(kind: SinkHandoff) -> SinkHandoff {
             match kind {
-                SinkHandoff::StreamSettlement
-                | SinkHandoff::OutletInvokedEventAppend
-                | SinkHandoff::EscrowRefund => kind,
+                SinkHandoff::StreamSettlement | SinkHandoff::OutletInvokedEventAppend => kind,
             }
         }
         [
             listed(SinkHandoff::StreamSettlement),
             listed(SinkHandoff::OutletInvokedEventAppend),
-            listed(SinkHandoff::EscrowRefund),
         ]
     }
 
     /// ADR-049 Decision 16, item 2: after the closed flag is set, a tracked
-    /// caller's `spawn_tracked_on` accepts each of the three hand-off kinds,
+    /// caller's `spawn_tracked_on` accepts each of the two hand-off kinds,
     /// and each spawned task runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_tracked_on_after_close_accepts_each_handoff_kind_from_a_tracked_caller() {
@@ -20582,8 +20612,12 @@ mod tests {
             supervisor.await_tracked_tasks(),
         )
         .await
-        .expect("the drain finishes once the three tasks exit");
-        assert_eq!(ran.load(Ordering::SeqCst), 3, "each accepted hand-off ran");
+        .expect("the drain finishes once the hand-off tasks exit");
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            every_sink_handoff().len(),
+            "each accepted hand-off ran"
+        );
     }
 
     /// ADR-049 Decision 16, item 2: after the closed flag is set, a spawn
@@ -21760,9 +21794,9 @@ mod tests {
     }
 
     /// After shutdown has begun, an unconsumed escrow ticket that an untracked
-    /// caller drops still reverses its hold when its sink holds the open's
-    /// spawner (ADR-049 Decision 16, item 2). The same drop through a bare
-    /// `ActorEscrowRefundSink` is refused and leaves the hold debited.
+    /// caller drops still reverses its hold through the open's spawner
+    /// (ADR-049 Decision 16, item 2), and the reversal returns exactly the
+    /// ticket's amount.
     #[tokio::test]
     async fn escrow_ticket_dropped_after_shutdown_began_refunds_through_the_spawner() {
         async fn remaining(supervisor: &Arc<Supervisor>, context_id: &str, member: &DID) -> u64 {
@@ -21805,11 +21839,6 @@ mod tests {
             .await
             .expect("spawn registers the live context");
         let context_id = hex::encode([0x5f; 32]);
-        let actor_sink = Arc::new(
-            crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
-                Arc::downgrade(&supervisor),
-            ),
-        );
         let spawner = supervisor
             .tracked_spawner("refund test")
             .expect("an open gate issues a spawner");
@@ -21821,23 +21850,16 @@ mod tests {
                 scp_protocol::economy::types::Amount::new(25),
             )
         };
-        let bare = ticket(actor_sink);
         let through_spawner = ticket(Arc::new(SpawnerEscrowRefundSink::new(
             &supervisor,
             &spawner,
         )));
 
         supervisor.close_spawn_gate();
-
-        // The bare sink's refund is refused once the gate is closed.
-        drop(bare);
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
         assert_eq!(
             remaining(&supervisor, &context_id, &member).await,
             50,
-            "a bare sink's refund is refused after shutdown began"
+            "no refund runs before the ticket drops"
         );
 
         drop(through_spawner);
@@ -21855,7 +21877,7 @@ mod tests {
         assert_eq!(
             remaining(&supervisor, &context_id, &member).await,
             75,
-            "only the refund through the spawner ran"
+            "the refund through the spawner ran once"
         );
     }
 
@@ -35062,7 +35084,9 @@ mod open_outlet_stream_tests {
             Err(rejection) => assert!(
                 matches!(
                     rejection,
-                    crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited { .. }
+                    crate::context::outlets::invoke::OutletStreamOpenError::Rejected(
+                        crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited { .. }
+                    )
                 ),
                 "the open is rejected at the Phase-2 admission gate: {rejection:?}"
             ),
@@ -35269,9 +35293,11 @@ mod open_outlet_stream_tests {
             Ok(_) => {
                 panic!("the (N+1)-th open must be rejected by the ContextParams per_invoker cap")
             }
-            Err(crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited {
-                slug,
-            }) => {
+            Err(crate::context::outlets::invoke::OutletStreamOpenError::Rejected(
+                crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited {
+                    slug,
+                },
+            )) => {
                 assert_eq!(
                     slug, SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_INVOKER,
                     "rejection carries the per-invoker concurrent-streams slug \
@@ -36558,7 +36584,7 @@ mod streaming_saga_tests {
 
     /// ADR-049 Decision 16 — a same-context streaming open started after
     /// shutdown has begun returns
-    /// `OpenStreamRejection::SupervisorShutDown`, not the retryable transport
+    /// `OutletStreamOpenError::SupervisorShutDown`, not the retryable transport
     /// rate limit, and debits nothing. The open-gate case is
     /// `open_outlet_stream_reserve_pump_settle_end_to_end`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36602,7 +36628,9 @@ mod streaming_saga_tests {
         assert!(
             matches!(
                 result,
-                Err(crate::context::outlets::dispatch::OpenStreamRejection::SupervisorShutDown)
+                Err(
+                    crate::context::outlets::invoke::OutletStreamOpenError::SupervisorShutDown { .. }
+                )
             ),
             "an open after shutdown began must return SupervisorShutDown"
         );
@@ -36773,6 +36801,7 @@ mod streaming_saga_tests {
     #[test]
     fn streaming_saga_open_shutdown_rejection_keeps_supervisor_shut_down() {
         use crate::context::outlets::dispatch::OpenStreamRejection;
+        use crate::context::outlets::invoke::OutletStreamOpenError;
         use crate::context::supervisor::supervisor::{
             StreamingSagaOpenStep, stream_open_rejection_to_saga_error,
         };
@@ -36781,8 +36810,12 @@ mod streaming_saga_tests {
             (StreamingSagaOpenStep::EscrowReserve, "escrow reserve"),
             (StreamingSagaOpenStep::StreamOpen, "stream open"),
         ] {
-            let shut =
-                stream_open_rejection_to_saga_error(&OpenStreamRejection::SupervisorShutDown, step);
+            let shut = stream_open_rejection_to_saga_error(
+                &OutletStreamOpenError::SupervisorShutDown {
+                    message: "refused".to_owned(),
+                },
+                step,
+            );
             let SagaError::SupervisorShutDown { message } = &shut else {
                 panic!(
                     "a shutdown rejection at {step:?} must map to SupervisorShutDown, got {shut:?}"
@@ -36798,9 +36831,9 @@ mod streaming_saga_tests {
             );
 
             let other = stream_open_rejection_to_saga_error(
-                &OpenStreamRejection::ContextNotActive {
+                &OutletStreamOpenError::Rejected(OpenStreamRejection::ContextNotActive {
                     current_state: "Closing".to_owned(),
-                },
+                }),
                 step,
             );
             assert!(
@@ -36978,7 +37011,7 @@ mod streaming_saga_tests {
         let outlet_id: OutletId = SS_OUTLET.to_owned();
         let target_hex = hex::encode(SS_TARGET);
 
-        let Err(err) = supervisor
+        let Err(crate::context::outlets::invoke::OutletStreamOpenError::Rejected(err)) = supervisor
             .open_outlet_stream(
                 &target_hex,
                 &registry,
@@ -36995,7 +37028,7 @@ mod streaming_saga_tests {
             )
             .await
         else {
-            panic!("a Closing context must reject a same-context stream open");
+            panic!("a Closing context must reject a same-context stream open with a rejection");
         };
 
         match &err {

@@ -332,16 +332,7 @@ pub enum OpenStreamRejection {
         /// message names the actual state.
         current_state: String,
     },
-    /// The Supervisor refused the open because `shutdown_all_contexts` has
-    /// begun ([`ContextError::SupervisorShutDown`](crate::context::ContextError::SupervisorShutDown),
-    /// ADR-049 Decision 16 item 2). Nothing was reserved or debited. Carries
-    /// `SCP-CTX-2138`, the code ADR-049 Decision 16 gives a shutdown refusal,
-    /// and [`Self::ContextNotActive`]'s slug.
-    SupervisorShutDown,
 }
-
-/// The canonical code of [`ContextError::SupervisorShutDown`](crate::context::ContextError::SupervisorShutDown).
-const SUPERVISOR_SHUT_DOWN_CODE: &str = "SCP-CTX-2138";
 
 impl OpenStreamRejection {
     /// Returns the §5.4.4 slug for this rejection.
@@ -363,14 +354,11 @@ impl OpenStreamRejection {
             Self::CaveatsBindingMismatch => error_codes::SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
             Self::StreamCapExhausted => error_codes::SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
             // #2196 — reuse the mid-stream teardown slug for a pre-open teardown.
-            Self::ContextNotActive { .. } | Self::SupervisorShutDown => {
-                error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM
-            }
+            Self::ContextNotActive { .. } => error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
         }
     }
 
-    /// Returns the error code for this rejection: a §5.4.4 code, or
-    /// `SCP-CTX-2138` for [`Self::SupervisorShutDown`].
+    /// Returns the §5.4.4 error code for this rejection.
     #[must_use]
     pub fn error_code(&self) -> &'static str {
         match self {
@@ -385,10 +373,6 @@ impl OpenStreamRejection {
             // failure must NOT be reported through the retryable transport-fault
             // band the pre-fix catch-all used.
             Self::ContextNotActive { .. } => error_codes::CODE_PROTOCOL_SESSION,
-            // ADR-049 Decision 16 item 2: the caller of a spawn refused by
-            // shutdown receives `ContextError::SupervisorShutDown`'s code, the
-            // code the streaming-saga refusal also carries.
-            Self::SupervisorShutDown => SUPERVISOR_SHUT_DOWN_CODE,
             // Mirror `caveat_violation_chunk`'s slug→code routing: the
             // input-schema slug is Input-class (`SCP-OUTLET-6120`), every
             // other caveat slug is Authorization-class (`SCP-OUTLET-6110`).
@@ -418,13 +402,6 @@ impl OpenStreamRejection {
             Self::ContextNotActive { current_state } => InvocationError::ContextNotActive {
                 current_state: current_state.clone(),
             },
-            // ADR-049 Decision 16 item 2: crosses to the caller as
-            // `ContextError::SupervisorShutDown` (`SCP-CTX-2138`).
-            Self::SupervisorShutDown => {
-                return OutletOpenError::SupervisorShutDown {
-                    message: "outlet stream open refused: Supervisor shutdown has begun".to_owned(),
-                };
-            }
             _ => InvocationError::CaveatViolation {
                 slug: self.slug().to_owned(),
                 message: format!("stream open rejected: {}", self.slug()),
@@ -2077,6 +2054,7 @@ fn spawn_pump_task(
     // when the task panics and its stack unwinds.
     pump_permit: tokio::sync::OwnedSemaphorePermit,
     spawn_pump: &(dyn Fn(StreamTask) + Send + Sync),
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let stream_credit_stall = Duration::from_secs(u64::from(stream_credit_stall_secs));
     let stream_cancel_ack = Duration::from_secs(u64::from(stream_cancel_ack_secs));
@@ -2108,6 +2086,7 @@ fn spawn_pump_task(
             stream_cancel_ack,
             request_id,
             event_inputs,
+            shutdown,
         ));
         if futures::future::FutureExt::catch_unwind(pump)
             .await
@@ -2256,6 +2235,9 @@ pub async fn open_stream_session<E>(
     // Starts the pump task. The Supervisor's open paths spawn it onto the
     // Supervisor's task tracker (ADR-049 Decision 16).
     spawn_pump: &(dyn Fn(StreamTask) + Send + Sync),
+    // Cancelled when Supervisor shutdown begins; the pump then arms
+    // `ContextClosedMidStream` and closes (ADR-049 Decision 16).
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<StreamSessionHandle, OpenStreamRejection>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -2568,6 +2550,7 @@ where
         },
         pump_permit,
         spawn_pump,
+        shutdown,
     );
 
     Ok(StreamSessionHandle {
@@ -2801,6 +2784,23 @@ async fn try_arm_context_closed_mid_stream(
     true
 }
 
+/// Arms [`TerminateReason::ContextClosedMidStream`] once Supervisor shutdown
+/// has begun (ADR-049 Decision 16): the shutdown tears down the stream's
+/// context, so the pump emits its terminal chunk and settles instead of
+/// holding the drain while it waits on a credit grant or on the executor. A
+/// prior arm wins.
+fn arm_shutdown_terminate(state: &Arc<RwLock<SharedSessionState>>) {
+    let mut guard = state
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.pending_terminate.is_none() {
+        guard.pending_terminate = Some(PendingTerminate {
+            reason: TerminateReason::ContextClosedMidStream,
+            message_override: None,
+        });
+    }
+}
+
 /// Runs one §5.4.5 round-8 re-check tick: consults context teardown FIRST
 /// (Protocol-class precedence), then — only if the context is still live —
 /// the UCAN revocation checker. When either arms `pending_terminate`, wakes
@@ -2853,6 +2853,7 @@ async fn run_stream_pump_v2(
     stream_cancel_ack: Duration,
     request_id: RequestId,
     event_inputs: PumpEventEmissionInputs,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     // §5.4.5 / ADR-061: fold each emitted (renumbered, re-signed) chunk
     // into the O(log n) RFC-6962 Merkle frontier + O(1) terminal summary
@@ -3064,6 +3065,10 @@ async fn run_stream_pump_v2(
                     // path re-engages.
                     continue;
                 }
+                () = shutdown.cancelled() => {
+                    arm_shutdown_terminate(&state);
+                    continue;
+                }
                 _ = recheck_interval.tick() => {
                     // §5.4.5 round-8 re-check (runtime-authoritative).
                     // Context teardown takes PRECEDENCE over revocation:
@@ -3122,6 +3127,10 @@ async fn run_stream_pump_v2(
                     // Loop back so the eager `pending_terminate`
                     // check at the top emits the synthetic terminal
                     // and breaks.
+                    continue;
+                }
+                () = shutdown.cancelled() => {
+                    arm_shutdown_terminate(&state);
                     continue;
                 }
                 _ = recheck_interval.tick() => {
@@ -3622,45 +3631,6 @@ mod tests {
         }
     }
 
-    /// A shutdown refusal carries `SCP-CTX-2138` (ADR-049 Decision 16 item 2),
-    /// so a caller tells it apart from a closed context and from the retryable
-    /// transport rate limit an admission rejection carries.
-    #[test]
-    fn supervisor_shut_down_rejection_carries_ctx_2138() {
-        let rej = OpenStreamRejection::SupervisorShutDown;
-        assert_eq!(rej.error_code(), "SCP-CTX-2138");
-        let closed = OpenStreamRejection::ContextNotActive {
-            current_state: "Closing".to_owned(),
-        };
-        assert_ne!(
-            closed.error_code(),
-            rej.error_code(),
-            "a closed context keeps its own code"
-        );
-        let rate_limited = OpenStreamRejection::AdmissionRateLimited {
-            slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
-        };
-        assert_ne!(
-            rate_limited.error_code(),
-            rej.error_code(),
-            "the transport rate limit keeps its own code"
-        );
-        assert!(
-            matches!(
-                rej.to_open_error(),
-                OutletOpenError::SupervisorShutDown { .. }
-            ),
-            "the open error keeps the shutdown refusal typed"
-        );
-        assert!(
-            matches!(
-                closed.to_open_error(),
-                OutletOpenError::Invocation(InvocationError::ContextNotActive { .. })
-            ),
-            "a closed context keeps the context-not-active surface"
-        );
-    }
-
     /// #2196 error-masking — EVERY permanent synchronous `invoke_outlet` open
     /// failure maps to a NON-retryable class, NEVER the retryable transport
     /// rate-limit the pre-fix `let _ = err` code collapsed all of them into.
@@ -4061,6 +4031,7 @@ mod tests {
             },
             permit,
             &|task| drop(tokio::spawn(task)),
+            tokio_util::sync::CancellationToken::new(),
         );
 
         // Send one Data chunk — the pump's signing path will panic.
@@ -4121,6 +4092,70 @@ mod tests {
         );
     }
 
+    /// ADR-049 Decision 16: an idle pump stays open while the Supervisor's
+    /// shutdown token is live, and closes with a terminal
+    /// `ContextClosedMidStream` chunk once the token is cancelled, so it
+    /// does not hold the shutdown drain.
+    #[tokio::test]
+    async fn shutdown_token_closes_an_idle_pump() {
+        let state = build_test_state();
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (summary_tx, _summary_rx) = tokio::sync::oneshot::channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let pump = tokio::spawn(run_stream_pump_v2(
+            Arc::clone(&state),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            inner_rx,
+            outer_tx,
+            summary_tx,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            [0x7a; 16],
+            PumpEventEmissionInputs {
+                sink: None,
+                settlement_sink: None,
+                context_id: "ctx-test".to_owned(),
+                outlet_id: "outlet-test".to_owned(),
+                invoker_did: scp_did::DID("did:dht:invoker".to_owned()),
+                input_hash: "0".repeat(64),
+                start: Instant::now(),
+                economic_policy_snapshot: None,
+                counter_reserve: CounterReserveSettlement::zero(),
+            },
+            shutdown.clone(),
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), outer_rx.recv())
+                .await
+                .is_err(),
+            "a live token leaves the idle pump open"
+        );
+        assert!(
+            !pump.is_finished(),
+            "a live token leaves the idle pump open"
+        );
+
+        shutdown.cancel();
+        let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("the cancelled token closes the pump within 2s")
+            .expect("the pump emits a terminal chunk");
+        let ChunkPayload::Error { code, terminal, .. } = chunk.payload else {
+            panic!("expected a terminal Error chunk");
+        };
+        assert_eq!(code, TerminateReason::ContextClosedMidStream.code());
+        assert!(terminal);
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("the pump exits after its terminal chunk")
+            .expect("the pump does not panic");
+        drop(inner_tx);
+    }
+
     /// §5.4.5 receiver-side revocation re-check: `terminate_with_error`
     /// arms `pending_terminate` and the pump emits a synthetic terminal
     /// `Error{terminal:true}` chunk on its next iteration with the
@@ -4163,6 +4198,7 @@ mod tests {
                     economic_policy_snapshot: None,
                     counter_reserve: CounterReserveSettlement::zero(),
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });
@@ -4294,6 +4330,7 @@ mod tests {
                     economic_policy_snapshot: None,
                     counter_reserve: CounterReserveSettlement::zero(),
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });
@@ -4415,6 +4452,7 @@ mod tests {
                         economic_policy_snapshot: None,
                         counter_reserve: CounterReserveSettlement::zero(),
                     },
+                    tokio_util::sync::CancellationToken::new(),
                 )
                 .await;
             });
@@ -4542,6 +4580,7 @@ mod tests {
                     economic_policy_snapshot: None,
                     counter_reserve: CounterReserveSettlement::zero(),
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });
@@ -5139,6 +5178,7 @@ mod tests {
                         cost_per_chunk: Amount::new(cost_per_chunk),
                     },
                 },
+                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         });

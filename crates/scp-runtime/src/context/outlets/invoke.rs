@@ -263,6 +263,45 @@ pub enum OutletOpenError {
     Invocation(#[from] InvocationError),
 }
 
+/// Why [`Supervisor::open_outlet_stream`](crate::context::supervisor::Supervisor::open_outlet_stream)
+/// failed.
+///
+/// The Supervisor refused the open because `shutdown_all_contexts` has begun,
+/// or the open was rejected for a reason in the open-time taxonomy.
+#[derive(Debug)]
+pub enum OutletStreamOpenError {
+    /// The Supervisor refused the open because shutdown has begun (ADR-049
+    /// Decision 16 item 2).
+    ///
+    /// Error code: `SCP-CTX-2138`, the code of
+    /// `ContextError::SupervisorShutDown`.
+    SupervisorShutDown {
+        /// The refusal detail carried by `ContextError::SupervisorShutDown`.
+        message: String,
+    },
+    /// The open was rejected for a reason in the open-time taxonomy.
+    Rejected(crate::context::outlets::dispatch::OpenStreamRejection),
+}
+
+impl From<crate::context::outlets::dispatch::OpenStreamRejection> for OutletStreamOpenError {
+    fn from(rejection: crate::context::outlets::dispatch::OpenStreamRejection) -> Self {
+        Self::Rejected(rejection)
+    }
+}
+
+impl From<OutletStreamOpenError> for OutletOpenError {
+    /// Keeps a shutdown refusal typed; routes a rejection through
+    /// [`OpenStreamRejection::to_open_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_open_error).
+    fn from(err: OutletStreamOpenError) -> Self {
+        match err {
+            OutletStreamOpenError::SupervisorShutDown { message } => {
+                Self::SupervisorShutDown { message }
+            }
+            OutletStreamOpenError::Rejected(rejection) => rejection.to_open_error(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Economy context for outlet invocation
 // ---------------------------------------------------------------------------
@@ -5733,8 +5772,9 @@ pub(crate) async fn record_streaming_saga_a_event(
 /// # Errors
 ///
 /// Returns [`OutletOpenError`]:
-/// - [`SupervisorShutDown`](OutletOpenError::SupervisorShutDown) — the
-///   Supervisor's tracker refused the spawner because shutdown has begun.
+/// - [`SupervisorShutDown`](OutletOpenError::SupervisorShutDown) — shutdown
+///   has begun: the Supervisor's tracker refused the spawner, or the B-side
+///   reserve was refused.
 /// - [`Invocation`](OutletOpenError::Invocation) wrapping
 ///   [`OutletNotFound`](InvocationError::OutletNotFound) — the outlet is not in
 ///   B's registry.
@@ -5742,7 +5782,7 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///   — a paid Action outlet OR a positive billed `cost_per_chunk` (zero-escrow
 ///   rejection on the value actually billed).
 /// - the mapped B-side open rejection
-///   ([`OpenStreamRejection::to_open_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_open_error)),
+///   ([`From<OutletStreamOpenError>`](OutletStreamOpenError)),
 ///   including a §7.3.8 counter-CAS rejection when `caveat_binding`'s cap is
 ///   exhausted.
 #[allow(clippy::too_many_arguments)]
@@ -5850,8 +5890,7 @@ where
             caveat_binding,
             params,
         )
-        .await
-        .map_err(|rejection| rejection.to_open_error())?;
+        .await?;
 
     // Take B's plaintext operator-signed chunk receiver.
     let inner_rx = handle

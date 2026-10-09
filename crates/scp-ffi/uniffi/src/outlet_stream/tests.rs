@@ -1288,22 +1288,37 @@ mod xctx_streaming_saga_tests {
 
 /// A stream or streaming saga the bridge refuses to register once bridge
 /// shutdown has begun had already started, so it reaches the caller as the
-/// Context class with `SCP-CTX-2139` (and, for a saga, its id), never as the
-/// class of the Supervisor's own refusal, which comes before anything started.
+/// Context class with `SCP-CTX-2139` (and, for a saga, its id), never with
+/// `SCP-CTX-2138`, the code of the Supervisor's own stream refusal, which
+/// comes before anything started and is also the Context class.
 #[test]
-fn late_shutdown_refusals_differ_from_supervisor_refusal_class() {
+fn late_shutdown_refusals_differ_from_supervisor_refusal_code() {
     let ScpError::Context { code, .. } = late_registration_err(
         scp_ffi_common::bridge_instance::late_registration_refusal(None),
     ) else {
         panic!("a late stream refusal must be the Context class");
     };
     assert_eq!(code, codes::CTX_2139);
+    let ScpError::Context { code, .. } = open_rejection_to_err(
+        &scp_core::context::outlets::invoke::OutletStreamOpenError::SupervisorShutDown {
+            message: "open outlet stream refused".to_owned(),
+        },
+    ) else {
+        panic!("the Supervisor's own stream refusal must be the Context class");
+    };
+    assert_eq!(code, codes::CTX_2138);
     assert!(
         matches!(
-            open_rejection_to_err(&OpenStreamRejection::SupervisorShutDown),
+            open_rejection_to_err(
+                &scp_core::context::outlets::invoke::OutletStreamOpenError::Rejected(
+                    scp_core::context::outlets::OpenStreamRejection::ContextNotActive {
+                        current_state: "Closing".to_owned(),
+                    },
+                ),
+            ),
             ScpError::Outlet { .. }
         ),
-        "the Supervisor's own stream refusal keeps the Outlet class"
+        "an open rejection keeps the Outlet class"
     );
 
     assert!(

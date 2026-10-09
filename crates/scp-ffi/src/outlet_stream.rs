@@ -60,14 +60,15 @@ use scp_platform::error::PlatformError;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
+use scp_core::context::outlets::invoke::OutletStreamOpenError;
 use scp_core::context::outlets::stream::{
     OutletStreamChunk, OutletStreamCredit, TerminateReason, compute_caveats_binding,
     compute_credit_sig_preimage, verify_chunk_signature,
 };
 use scp_core::context::outlets::{
-    AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
-    OutletExecutorError, StreamIdentity, StreamSessionHandle, StreamSigner,
-    StreamSignerCustodyCategory, StreamSignerError, cancel_error_to_code, grant_error_to_code,
+    AdmissionCaps, CancelIdentity, OpenStreamParams, OutletExecutor, OutletExecutorError,
+    StreamIdentity, StreamSessionHandle, StreamSigner, StreamSignerCustodyCategory,
+    StreamSignerError, cancel_error_to_code, grant_error_to_code,
 };
 
 use crate::custody::FfiKeyCustody;
@@ -304,16 +305,23 @@ impl OutletExecutor for BridgeStreamExecutor {
 // Error mapping
 // ---------------------------------------------------------------------------
 
-/// Maps an [`OpenStreamRejection`] onto the bridge error surface, carrying the
-/// rejection's own code verbatim.
-fn open_rejection_to_err(rejection: &OpenStreamRejection) -> ScpPyError {
-    ScpPyError::ContextError {
-        message: format!(
-            "outlet stream open rejected ({}): {}",
-            rejection.error_code(),
-            rejection.slug()
+/// Maps an [`OutletStreamOpenError`] onto the bridge error surface. A
+/// Supervisor shutdown refusal takes the conversion of
+/// `ContextError::SupervisorShutDown`; a rejection carries its own code
+/// verbatim.
+fn open_rejection_to_err(err: &OutletStreamOpenError) -> ScpPyError {
+    match err {
+        OutletStreamOpenError::SupervisorShutDown { message } => ScpPyError::from(
+            scp_core::context::ContextError::SupervisorShutDown(message.clone()),
         ),
-        code: rejection.error_code().to_owned(),
+        OutletStreamOpenError::Rejected(rejection) => ScpPyError::ContextError {
+            message: format!(
+                "outlet stream open rejected ({}): {}",
+                rejection.error_code(),
+                rejection.slug()
+            ),
+            code: rejection.error_code().to_owned(),
+        },
     }
 }
 
@@ -2121,6 +2129,35 @@ mod late_shutdown_refusal_tests {
         assert!(
             message.contains("saga-late-1"),
             "the error names the started saga: {message}"
+        );
+    }
+
+    /// The Supervisor's own stream-open shutdown refusal reaches the caller
+    /// as the Context class with `SCP-CTX-2138`, the conversion of
+    /// `ContextError::SupervisorShutDown`; an open rejection keeps its own
+    /// code.
+    #[test]
+    fn supervisor_stream_refusal_is_ctx_2138() {
+        use scp_core::context::outlets::OpenStreamRejection;
+        use scp_core::context::outlets::invoke::OutletStreamOpenError;
+
+        let refused = context_error_parts(super::open_rejection_to_err(
+            &OutletStreamOpenError::SupervisorShutDown {
+                message: "open outlet stream refused".to_owned(),
+            },
+        ));
+        assert_eq!(
+            refused.map(|(_, code)| code).as_deref(),
+            Some(codes::CTX_2138)
+        );
+        let rejected = context_error_parts(super::open_rejection_to_err(
+            &OutletStreamOpenError::Rejected(OpenStreamRejection::ContextNotActive {
+                current_state: "Closing".to_owned(),
+            }),
+        ));
+        assert_eq!(
+            rejected.map(|(_, code)| code).as_deref(),
+            Some(scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION)
         );
     }
 
