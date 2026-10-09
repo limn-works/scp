@@ -5518,10 +5518,23 @@ KEY_MATRIX_AXIS = re.compile(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}", re.IGNORECASE)
 KEY_RUNNER = re.compile(r"\brunner\.(?:os|arch)\b", re.IGNORECASE)
 
 
+class AmbiguousMatrixKey(ValueError):
+    """Two matrix keys differ only in case, so a reference names neither for certain."""
+
+
 def matrix_key(name: str, keys) -> str | None:
-    """Return the one key of `keys` that `name` names in any case, else None."""
+    """Return the key of `keys` that `name` names in any case.
+
+    Returns None when no key matches, a state the caller may skip. Raises
+    AmbiguousMatrixKey when two or more keys match, which the caller reports.
+    """
     found = [key for key in keys if str(key).lower() == name.lower()]
-    return found[0] if len(found) == 1 else None
+    if len(found) > 1:
+        raise AmbiguousMatrixKey(
+            f"`matrix.{name}` names each of {sorted(map(str, found))}, matrix keys "
+            f"that differ only in case"
+        )
+    return found[0] if found else None
 
 
 def axis_event_values(values: object) -> dict[str, list] | None:
@@ -5914,11 +5927,15 @@ def push_writer_gaps(doc: dict) -> list[str]:
                     f"`save-if` this check cannot read ({unreadable})"
                 )
             leg_conditions = f"{inputs.get('save-if', '')} {step.get('if') or ''}"
-            named = [
-                (key, value)
-                for name, value in SAVE_IF_MATRIX.findall(leg_conditions)
-                if (key := matrix_key(name, on_push)) is not None
-            ]
+            named = []
+            for name, value in SAVE_IF_MATRIX.findall(leg_conditions):
+                try:
+                    key = matrix_key(name, on_push)
+                except AmbiguousMatrixKey as ambiguous:
+                    gaps.append(f"{job_id} saves {cache_write(step)} where {ambiguous}")
+                    continue
+                if key is not None:
+                    named.append((key, value))
             axes = sorted({key for key, _ in named})
             if axes:
                 # Fix each named axis at each combination of the values a push runs,
@@ -5947,7 +5964,13 @@ def push_writer_gaps(doc: dict) -> list[str]:
             action = str(step.get("uses") or "").split("@", 1)[0]
             if action == "Swatinem/rust-cache" or KEY_RUNNER.search(key_text):
                 named_axes += KEY_MATRIX_AXIS.findall(str(job.get("runs-on") or ""))
-            key_axes = {matrix_key(name, on_push) for name in named_axes} - {None}
+            key_axes = set()
+            for name in named_axes:
+                try:
+                    key_axes.add(matrix_key(name, on_push))
+                except AmbiguousMatrixKey as ambiguous:
+                    gaps.append(f"{job_id} writes {cache_write(step)} where {ambiguous}")
+            key_axes.discard(None)
             for key in sorted(key_axes):
                 pushed_values = set(map(str, on_push[key]))
                 unwritten = [v for v in elsewhere[key] if str(v) not in pushed_values]
@@ -6887,6 +6910,16 @@ def check_push_writer_mutants(doc: dict) -> None:
                 bool(gaps) is reported,
                 f"{push_writer_gaps(changed)}",
             )
+    # GitHub reads `matrix.leg` and `matrix.LEG` as one name, so a matrix holding
+    # both axes leaves a writing step's `matrix.leg` naming neither for certain.
+    ambiguous = copy.deepcopy(doc)
+    ambiguous["jobs"]["rust-clippy"]["strategy"]["matrix"]["LEG"] = ["workspace"]
+    gaps = push_writer_gaps(ambiguous)
+    check(
+        "a writer matrix holding axes leg and LEG is reported",
+        any(gap.startswith("rust-clippy ") and "differ only in case" in gap for gap in gaps),
+        f"{gaps}",
+    )
     check(
         "the unmutated rust-test matrix is read without a gap",
         not any(gap.startswith("rust-test") for gap in push_writer_gaps(doc)),
