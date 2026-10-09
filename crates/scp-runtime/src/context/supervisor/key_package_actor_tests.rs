@@ -3284,13 +3284,6 @@ impl MlsBackend for FailingBackend {
     ) -> Result<DecryptedContent, MlsError> {
         self.inner.decrypt(group, ciphertext).await
     }
-    async fn process_commit(
-        &self,
-        group: &mut ScpMlsGroup,
-        commit_bytes: &[u8],
-    ) -> Result<(), MlsError> {
-        self.inner.process_commit(group, commit_bytes).await
-    }
     async fn advance_epoch(
         &self,
         group: &mut ScpMlsGroup,

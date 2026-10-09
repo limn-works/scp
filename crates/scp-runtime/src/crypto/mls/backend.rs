@@ -254,36 +254,6 @@ pub trait MlsBackend: Send + Sync {
         ciphertext: &[u8],
     ) -> Result<DecryptedContent, MlsError>;
 
-    /// Processes a TLS-serialized MLS Commit (external; not produced by this
-    /// local group) against `group` and merges the staged commit. This is
-    /// the lower-level alternative to `decrypt` when the caller has already
-    /// decomposed the incoming wire bytes (e.g. federation / restore).
-    ///
-    /// # Errors
-    ///
-    /// On every error raised before the merge the group's epoch is unchanged;
-    /// a storage error from openmls's `merge_staged_commit` can leave the group
-    /// partly merged, so the caller treats the group as unusable.
-    ///
-    /// - [`MlsError::GroupDestroyed`] if the group has been destroyed.
-    /// - [`MlsError::DecryptionFailed`] if the bytes are not an MLS protocol
-    ///   message, or decryption, verification, or sender resolution fails.
-    /// - [`MlsError::CommitProcessingFailed`] if a well-formed message is an
-    ///   application message or a Proposal rather than a Commit (refused
-    ///   before decryption, so it consumes no ratchet generation), or if
-    ///   merging fails.
-    /// - [`MlsError::CannotDecryptOwnMessage`] for the local member's own
-    ///   echoed Commit.
-    /// - [`MlsError::ReceivedKeyPackageLifetimeRangeInvalid`] if an Add
-    ///   proposal's `KeyPackage` `Lifetime` range is empty, inverted, or over
-    ///   the maximum; the check reads no clock (security-model spec §9.7.1, the
-    ///   receiver), and the Commit is not merged.
-    async fn process_commit(
-        &self,
-        group: &mut ScpMlsGroup,
-        commit_bytes: &[u8],
-    ) -> Result<(), MlsError>;
-
     /// Advances the group epoch via a self-update Commit that republishes
     /// the caller's `LeafNode` with `wrapping_pubkey` (§9.16.1). Returns the
     /// TLS-serialized Commit bytes.

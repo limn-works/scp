@@ -50,6 +50,7 @@ use zeroize::Zeroizing;
 use crate::InMemoryMlsProvider;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
+use crate::provider::is_signer_storage_key;
 
 /// The shared secret-bearing core of both snapshot types: the `OpenMLS`
 /// `MemoryStorage` dump plus the MLS signer.
@@ -117,26 +118,20 @@ impl ProviderSignerDump {
     /// Rebuilds a fresh in-memory provider (with the persisted storage entries
     /// re-injected) and deserializes the signer.
     ///
-    /// Drains `mls_storage_entries` into the new provider, whose own `Drop`
-    /// wipes them; the signer bytes are wiped when the consumed dump drops. The
+    /// Drains `mls_storage_entries` into the new provider through
+    /// [`InMemoryMlsProvider::from_storage_entries`], whose own `Drop` wipes
+    /// them; the signer bytes are wiped when the consumed dump drops. The
     /// signer is never written into the provider's storage: every openmls
-    /// operation SCP calls takes it as an argument.
+    /// operation SCP calls takes it as an argument (persistence spec §17.9).
     ///
     /// # Errors
     ///
-    /// Returns [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
-    /// the signer cannot be reconstructed.
+    /// Returns [`MlsError::SignerStorageForbidden`] if a storage entry carries
+    /// openmls's signature-key-pair label (§17.9.1), and [`MlsError::Snapshot`]
+    /// if the provider-storage lock is poisoned or the signer cannot be
+    /// reconstructed.
     fn rebuild(mut self) -> Result<(InMemoryMlsProvider, SignatureKeyPair), MlsError> {
-        let provider = InMemoryMlsProvider::default();
-        {
-            let mut values =
-                provider.storage().values.write().map_err(|e| {
-                    MlsError::Snapshot(format!("provider storage lock poisoned: {e}"))
-                })?;
-            for (k, v) in self.mls_storage_entries.drain(..) {
-                values.insert(k, v);
-            }
-        }
+        let provider = InMemoryMlsProvider::from_storage_entries(&mut self.mls_storage_entries)?;
         let signer: SignatureKeyPair = rmp_serde::from_slice(&self.signer_bytes)
             .map_err(|e| MlsError::Snapshot(format!("signer deserialization: {e}")))?;
         Ok((provider, signer))
@@ -158,8 +153,14 @@ pub type ProviderStorageEntries = Zeroizing<Vec<(Vec<u8>, Vec<u8>)>>;
 /// drops only wiping types (security model spec §9.15 step 2; buffers freed on
 /// the way are covered by §9.15, freed heap memory).
 ///
+/// A storage key that carries openmls's signature-key-pair label fails the
+/// capture with [`MlsError::SignerStorageForbidden`] and no entries, so a
+/// signer that reached provider storage never enters a snapshot (persistence
+/// spec §17.9.1).
+///
 /// # Errors
 ///
+/// [`MlsError::SignerStorageForbidden`] if any storage key is a signer key, and
 /// [`MlsError::Snapshot`] if the signer cannot be encoded or the
 /// provider-storage lock is poisoned.
 pub fn capture_signer_and_storage(
@@ -171,9 +172,12 @@ pub fn capture_signer_and_storage(
         .map_err(|e| MlsError::Snapshot(format!("signer serialization: {e}")))?;
     let values = provider
         .storage()
-        .values
+        .values()
         .read()
         .map_err(|e| MlsError::Snapshot(format!("provider storage lock poisoned: {e}")))?;
+    if values.keys().any(|k| is_signer_storage_key(k)) {
+        return Err(MlsError::SignerStorageForbidden);
+    }
     let mut mls_storage_entries = Zeroizing::new(Vec::with_capacity(values.len()));
     for (k, v) in values.iter() {
         mls_storage_entries.push((k.clone(), v.clone()));
@@ -482,7 +486,7 @@ mod tests {
             generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let (signer_bytes, entries) = capture_signer_and_storage(&provider, &signer).unwrap();
         assert_eq!(*signer_bytes, rmp_serde::to_vec_named(&signer).unwrap());
-        let values = provider.storage().values.read().unwrap();
+        let values = provider.storage().values().read().unwrap();
         assert!(!entries.is_empty());
         assert_eq!(entries.len(), values.len());
         assert!(entries.iter().all(|(k, v)| values.get(k) == Some(v)));
@@ -511,6 +515,61 @@ mod tests {
             rmp_serde::from_slice(&rmp_serde::to_vec_named(&plain).unwrap()).unwrap();
         assert_eq!(*back.signer_bytes, plain.signer_bytes);
         assert_eq!(*back.mls_storage_entries, plain.mls_storage_entries);
+    }
+
+    /// A storage key under openmls's signature-key-pair label, as
+    /// `MemoryStorage::write_signature_key_pair` would build it (label, then the
+    /// JSON key, then the version).
+    fn signer_entry() -> (Vec<u8>, Vec<u8>) {
+        let mut key = crate::provider::SIGNER_STORAGE_LABEL.to_vec();
+        key.extend_from_slice(b"[1,2,3]");
+        key.extend_from_slice(&1u16.to_be_bytes());
+        (key, b"signer private key".to_vec())
+    }
+
+    /// Capture fails with `SignerStorageForbidden` when provider storage holds
+    /// a signer-labelled entry (§17.9.1).
+    #[test]
+    fn capture_refuses_stored_signer_entry() {
+        let (_bundle, signer, provider) =
+            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let (key, value) = signer_entry();
+        provider
+            .storage()
+            .values()
+            .write()
+            .unwrap()
+            .insert(key, value);
+        let result = capture_signer_and_storage(&provider, &signer);
+        assert!(matches!(result, Err(MlsError::SignerStorageForbidden)));
+    }
+
+    /// Restoring a group blob whose storage entries include a signer-labelled
+    /// entry fails with `SignerStorageForbidden` (§17.9.1).
+    #[test]
+    fn deserialize_state_refuses_signer_entry() {
+        let (bundle, bob_signer, bob_provider) =
+            generate_key_package(&credential(BOB), &SystemClock).unwrap();
+        let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
+        let kp_in = KeyPackageIn::tls_deserialize(
+            &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
+        )
+        .unwrap();
+        let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
+        let bob = join_group(&add.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
+        let blob = bob.serialize_state().unwrap();
+
+        // Control: the unmodified blob restores.
+        ScpMlsGroup::deserialize_state(&blob).unwrap();
+
+        let mut snapshot: MlsGroupSnapshot = rmp_serde::from_slice(&blob).unwrap();
+        snapshot
+            .provider_signer
+            .mls_storage_entries
+            .push(signer_entry());
+        let crafted = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let result = ScpMlsGroup::deserialize_state(&crafted);
+        assert!(matches!(result, Err(MlsError::SignerStorageForbidden)));
     }
 
     #[test]

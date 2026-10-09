@@ -162,8 +162,7 @@ pub enum MlsError {
     /// `not_after - not_before` exceeds
     /// [`KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS`](crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS)
     /// (RFC 9420 §7.2). Raised by
-    /// [`decrypt_with_sender_did`](crate::encrypt::decrypt_with_sender_did),
-    /// [`decrypt_commit`](crate::encrypt::decrypt_commit) and
+    /// [`decrypt_with_sender_did`](crate::encrypt::decrypt_with_sender_did) and
     /// [`decrypt_with_membership_changes`](crate::encrypt::decrypt_with_membership_changes),
     /// whose receive-side check reads no clock (security-model spec §9.7.1,
     /// `KeyPackage` `Lifetime` checks, the receiver). The staged Commit is
@@ -211,6 +210,18 @@ pub enum MlsError {
     /// from the restored provider (`MlsGroup::load` returned `None`).
     #[error("MLS state snapshot error: {0}")]
     Snapshot(String),
+
+    /// A provider storage key carries openmls's signature-key-pair label, so
+    /// the entry it names would hold the MLS signer's private key.
+    ///
+    /// The signer never enters provider storage: every openmls operation SCP
+    /// calls takes it as an argument (persistence spec §17.9). Raised by
+    /// [`capture_signer_and_storage`](crate::snapshot::capture_signer_and_storage),
+    /// which then returns no entries, and by
+    /// [`InMemoryMlsProvider::from_storage_entries`](crate::InMemoryMlsProvider::from_storage_entries),
+    /// which then inserts nothing (§17.9.1).
+    #[error("MLS signer must not be stored in provider storage (spec §17.9)")]
+    SignerStorageForbidden,
 
     /// A decrypted-and-verified MLS frame carried **no** convergent-timestamp
     /// AAD (its `FramedContent.authenticated_data` was empty), so the receiver

@@ -1797,11 +1797,11 @@ mod tests {
     fn stores_signature_key_pair(provider: &InMemoryMlsProvider) -> bool {
         provider
             .storage()
-            .values
+            .values()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
-            .any(|k| k.starts_with(b"SignatureKeyPair"))
+            .any(|k| crate::provider::is_signer_storage_key(k))
     }
 
     #[test]
@@ -1816,7 +1816,7 @@ mod tests {
 
         let (_bundle, signer, provider) = generate_key_package(&cred, &SystemClock).unwrap();
         assert!(
-            !provider.storage().values.read().unwrap().is_empty(),
+            !provider.storage().values().read().unwrap().is_empty(),
             "the key package's HPKE private keys are stored, so the scan sees real entries"
         );
         assert!(
@@ -1847,7 +1847,7 @@ mod tests {
             !restored
                 .provider()
                 .storage()
-                .values
+                .values()
                 .read()
                 .unwrap()
                 .is_empty(),
@@ -1858,28 +1858,37 @@ mod tests {
             "deserialize_state must not copy the signer into provider storage"
         );
 
-        // Control: the detector does see a stored signer.
+        // Control for the `SignatureKeyPair::store` entry: the call is
+        // disallowed, and the provider's storage refuses it and stores nothing
+        // (persistence spec §17.9).
         #[expect(
             clippy::disallowed_methods,
-            reason = "control for the detector: stores the signer on purpose"
+            reason = "control for the lint and the refusal: stores the signer on purpose"
         )]
-        signer.store(provider.storage()).unwrap();
-        assert!(stores_signature_key_pair(&provider));
+        let stored = signer.store(provider.storage());
+        assert!(matches!(
+            stored,
+            Err(crate::provider::InMemoryMlsStorageError::SignerStorageForbidden)
+        ));
+        assert!(!stores_signature_key_pair(&provider));
 
         // Control for the trait-method entry: a direct `StorageProvider` call,
-        // which bypasses `SignatureKeyPair::store`, is disallowed too.
+        // which bypasses `SignatureKeyPair::store`, is disallowed and refused too.
         let direct = InMemoryMlsProvider::default();
         #[expect(
             clippy::disallowed_methods,
-            reason = "control for the lint: stores the signer through the trait on purpose"
+            reason = "control for the lint and the refusal: stores the signer through the trait on purpose"
         )]
-        openmls_traits::storage::StorageProvider::write_signature_key_pair(
+        let written = openmls_traits::storage::StorageProvider::write_signature_key_pair(
             direct.storage(),
             &signer.id(),
             &signer,
-        )
-        .unwrap();
-        assert!(stores_signature_key_pair(&direct));
+        );
+        assert!(matches!(
+            written,
+            Err(crate::provider::InMemoryMlsStorageError::SignerStorageForbidden)
+        ));
+        assert!(direct.storage().values().read().unwrap().is_empty());
     }
 
     #[test]

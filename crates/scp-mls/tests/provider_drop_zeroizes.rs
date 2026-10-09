@@ -59,18 +59,18 @@ fn drop_wipes_through_a_poisoned_storage_lock() {
     let buffer = secret.as_ptr() as usize;
     provider
         .storage()
-        .values
+        .values()
         .write()
         .unwrap()
         .insert(b"EpochSecrets-a".to_vec(), secret);
     std::thread::scope(|s| {
         let poisoner = s.spawn(|| {
-            let _guard = provider.storage().values.write().unwrap();
+            let _guard = provider.storage().values().write().unwrap();
             panic!("poison the storage lock");
         });
         assert!(poisoner.join().is_err());
     });
-    assert!(provider.storage().values.is_poisoned());
+    assert!(provider.storage().values().is_poisoned());
 
     WATCHED.store(buffer, Ordering::SeqCst);
     drop(provider);

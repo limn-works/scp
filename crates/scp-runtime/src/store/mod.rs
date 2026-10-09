@@ -241,10 +241,9 @@ impl<S: Storage> ProtocolRepository<S> {
 impl<S: Storage> ProtocolRepository<S> {
     /// Returns a reference to the underlying storage backend.
     ///
-    /// Used by [`MlsStorageBridge`](crate::crypto::mls::storage::MlsStorageBridge)
-    /// to perform raw storage operations for `OpenMLS` state persistence.
-    ///
-    /// See spec section 17.9. See SCP-PERSIST-050.
+    /// For callers that need a raw storage operation the domain methods do
+    /// not provide, such as closing the store or building a storage adapter
+    /// over it.
     #[must_use]
     pub const fn storage(&self) -> &S {
         &self.storage
