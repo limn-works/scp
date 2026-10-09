@@ -102,8 +102,10 @@ impl ProviderSignerDump {
     ///
     /// # Errors
     ///
-    /// Returns [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
-    /// the signer cannot be serialized.
+    /// Returns [`MlsError::SignerStorageForbidden`] if a provider storage key
+    /// carries openmls's signature-key-pair label (§17.9.1), and
+    /// [`MlsError::Snapshot`] if the provider-storage lock is poisoned or the
+    /// signer cannot be serialized.
     fn capture(
         provider: &InMemoryMlsProvider,
         signer: &SignatureKeyPair,
@@ -119,8 +121,8 @@ impl ProviderSignerDump {
     /// re-injected) and deserializes the signer.
     ///
     /// Drains `mls_storage_entries` into the new provider through
-    /// [`InMemoryMlsProvider::from_storage_entries`], whose own `Drop` wipes
-    /// them; the signer bytes are wiped when the consumed dump drops. The
+    /// [`InMemoryMlsProvider::from_storage_entries`], whose storage's `Drop`
+    /// wipes them; the signer bytes are wiped when the consumed dump drops. The
     /// signer is never written into the provider's storage: every openmls
     /// operation SCP calls takes it as an argument (persistence spec §17.9).
     ///
@@ -224,8 +226,10 @@ impl ScpMlsGroup {
     /// # Errors
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group or signer has already
-    /// been destroyed, or [`MlsError::Snapshot`] if the provider-storage lock is
-    /// poisoned or `MessagePack` serialization fails.
+    /// been destroyed, [`MlsError::SignerStorageForbidden`] if a provider
+    /// storage key carries openmls's signature-key-pair label (§17.9.1), or
+    /// [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
+    /// `MessagePack` serialization fails.
     ///
     /// The blob carries the signer and the provider's secrets, so it is
     /// returned in a buffer wiped on drop (security model spec §9.15).
@@ -257,7 +261,9 @@ impl ScpMlsGroup {
     ///
     /// # Errors
     ///
-    /// Returns [`MlsError::Snapshot`] if the blob cannot be deserialized, the
+    /// Returns [`MlsError::SignerStorageForbidden`] if a storage entry in the
+    /// blob carries openmls's signature-key-pair label (§17.9.1), and
+    /// [`MlsError::Snapshot`] if the blob cannot be deserialized, the
     /// provider-storage lock is poisoned, the signer cannot be deserialized, or
     /// the group cannot be reloaded (`MlsGroup::load` errored or returned `None` —
     /// the blob does not contain a group under the recorded id).
@@ -349,7 +355,9 @@ impl std::fmt::Debug for PendingJoinSnapshot {
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
+/// Returns [`MlsError::SignerStorageForbidden`] if a provider storage key
+/// carries openmls's signature-key-pair label (§17.9.1), and
+/// [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
 /// `MessagePack` serialization fails.
 ///
 /// The blob is returned in a buffer wiped on drop, as
@@ -389,7 +397,9 @@ pub fn serialize_pending_join(
 ///
 /// # Errors
 ///
-/// Returns [`MlsError::Snapshot`] if the blob cannot be deserialized, the
+/// Returns [`MlsError::SignerStorageForbidden`] if a storage entry in the blob
+/// carries openmls's signature-key-pair label (§17.9.1), and
+/// [`MlsError::Snapshot`] if the blob cannot be deserialized, the
 /// provider-storage lock is poisoned, or the signer cannot be reconstructed.
 pub fn restore_pending_join(
     blob: &[u8],

@@ -966,7 +966,7 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 
     // The provider's storage holds HPKE key pairs, epoch and message secrets,
     // and key packages. Replacing the provider with a fresh empty one drops the
-    // old one, and `InMemoryMlsProvider`'s `Drop` zeroizes every value present
+    // old one, and its `InMemoryMlsStorage`'s `Drop` zeroizes every value present
     // then, once. Values openmls replaced or deleted during the group's life
     // were freed earlier, and in a shipped artifact the wiping global allocator
     // zeroed each one as it was freed (security model spec §9.15, freed heap

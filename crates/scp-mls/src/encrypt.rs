@@ -1169,9 +1169,55 @@ mod tests {
         );
     }
 
+    /// A one-member group whose wire-format policy sends every handshake
+    /// message as a `PublicMessage`. openmls 0.9.0 reports the echo of the
+    /// member's own pending Commit as `OwnPendingCommit` only when that Commit
+    /// is a `PublicMessage`; a `PrivateMessage` from the member's own leaf
+    /// arrives as `OwnPrivateMessage` before openmls looks at the content.
+    #[allow(clippy::unwrap_used)]
+    fn public_handshake_group() -> ScpMlsGroup {
+        let provider = crate::InMemoryMlsProvider::default();
+        let signer =
+            SignatureKeyPair::new(crate::group::SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        let credential_with_key = CredentialWithKey {
+            credential: BasicCredential::new(test_credential("alice").to_bytes().unwrap()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(crate::group::SCP_CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
+            .max_past_epochs(2)
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .build();
+        let group = MlsGroup::new(&provider, &signer, &config, credential_with_key).unwrap();
+        ScpMlsGroup {
+            group: Some(group),
+            provider,
+            signer: Some(signer),
+            destroyed: false,
+        }
+    }
+
+    /// Stages a self-update Commit on `group` without merging it and returns
+    /// the Commit's wire bytes.
+    #[allow(clippy::unwrap_used)]
+    fn unmerged_self_update_bytes(group: &mut ScpMlsGroup) -> Vec<u8> {
+        let g = group.group.as_mut().unwrap();
+        let signer = group.signer.as_ref().unwrap();
+        g.self_update(&group.provider, signer, LeafNodeParameters::default())
+            .unwrap()
+            .into_commit()
+            .tls_serialize_detached()
+            .unwrap()
+    }
+
     /// A member that processes its own ciphertext (the relay's echo) gets the
     /// typed `CannotDecryptOwnMessage` from every decrypt entry point, not a
     /// wildcard `NotApplicationMessage` or a sender lookup on its own leaf.
+    /// The echo of the member's own unmerged Commit gets the same error and
+    /// leaves the epoch unchanged, whether it arrives as a `PrivateMessage`
+    /// (SCP's wire-format policy, openmls's `OwnPrivateMessage`) or as a
+    /// `PublicMessage` (openmls's `OwnPendingCommit`).
     #[test]
     #[allow(clippy::unwrap_used)]
     fn own_echo_is_rejected_by_all_four_decrypt_functions() {
@@ -1200,6 +1246,30 @@ mod tests {
         }
         // The group stays usable: the next own message still encrypts.
         encrypt(&mut alice_group, b"after echoes").unwrap();
+
+        let mut public_group = public_handshake_group();
+        for (framing, group) in [
+            ("PrivateMessage", &mut alice_group),
+            ("PublicMessage", &mut public_group),
+        ] {
+            let epoch_before = group.epoch().unwrap();
+            // One staged Commit serves all four entry points: a rejected echo
+            // neither merges nor clears the pending Commit.
+            let commit_bytes = unmerged_self_update_bytes(group);
+            for (name, decrypt_fn) in entry_points {
+                let result = decrypt_fn(group, &commit_bytes);
+                assert!(
+                    matches!(result, Err(MlsError::CannotDecryptOwnMessage)),
+                    "{name} must reject the own unmerged Commit as a {framing} with \
+                     CannotDecryptOwnMessage, got {result:?}"
+                );
+                assert_eq!(
+                    group.epoch().unwrap(),
+                    epoch_before,
+                    "{name} must leave the epoch unchanged after the own {framing} Commit"
+                );
+            }
+        }
     }
 
     #[test]

@@ -4,10 +4,12 @@
 //! openmls keeps a group's HPKE private keys, epoch secrets, and message secrets
 //! as serialized bytes in `openmls_memory_storage::MemoryStorage::values`, a
 //! plain `HashMap<Vec<u8>, Vec<u8>>` that frees those bytes without zeroizing
-//! them. [`InMemoryMlsProvider`] owns that storage and zeroizes every value when
-//! it drops, so every owner (an [`crate::ScpMlsGroup`], a `KeyPackage` bundle's
-//! provider, a provider rebuilt from a snapshot, or one dropped on an error path)
-//! releases the storage wiped (security model spec §9.15 step 2).
+//! them. [`InMemoryMlsStorage`] wraps that storage and zeroizes every value when
+//! it drops, so every owner of one (an [`InMemoryMlsProvider`] held by an
+//! [`crate::ScpMlsGroup`], a `KeyPackage` bundle's provider, a provider rebuilt
+//! from a snapshot, a provider dropped on an error path, or a bare
+//! `InMemoryMlsStorage`) releases the storage wiped (security model spec §9.15
+//! step 2).
 //!
 //! [`InMemoryMlsStorage`] wraps that `MemoryStorage` and refuses
 //! `write_signature_key_pair`: it stores nothing and returns
@@ -139,7 +141,8 @@ pub enum InMemoryMlsStorageError {
 /// It is openmls's `MemoryStorage`, except that `write_signature_key_pair`
 /// stores nothing and returns
 /// [`InMemoryMlsStorageError::SignerStorageForbidden`] (persistence spec
-/// §17.9). Every other method delegates to `MemoryStorage`.
+/// §17.9), and that its `Drop` zeroizes every stored value. Every other method
+/// delegates to `MemoryStorage`.
 #[derive(Default)]
 pub struct InMemoryMlsStorage {
     memory: MemoryStorage,
@@ -155,6 +158,28 @@ impl InMemoryMlsStorage {
     #[must_use]
     pub const fn values(&self) -> &RwLock<HashMap<Vec<u8>, Vec<u8>>> {
         &self.memory.values
+    }
+}
+
+impl Drop for InMemoryMlsStorage {
+    /// Zeroizes every stored value in place before `MemoryStorage` frees the
+    /// map, so each value's allocation is freed holding only zeroes
+    /// (`Vec::zeroize` wipes the whole capacity and keeps the allocation).
+    /// [`InMemoryMlsProvider`] has no `Drop` of its own: dropping its `storage`
+    /// field runs this one.
+    ///
+    /// A poisoned lock does not stop the wipe: the map is taken from the poison
+    /// error and wiped anyway, because a panic elsewhere does not make the key
+    /// material less sensitive.
+    fn drop(&mut self) {
+        let mut values = self
+            .memory
+            .values
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for value in values.values_mut() {
+            value.zeroize();
+        }
     }
 }
 
@@ -813,7 +838,8 @@ impl InMemoryMlsProvider {
     /// key, it returns [`MlsError::SignerStorageForbidden`] and leaves
     /// `entries` untouched, so the caller's wiping buffer still holds and
     /// later zeroizes every entry (persistence spec §17.9.1). Otherwise it
-    /// drains `entries` into the new provider, whose `Drop` wipes them.
+    /// drains `entries` into the new provider, whose storage's `Drop` wipes
+    /// them.
     ///
     /// # Errors
     ///
@@ -879,26 +905,6 @@ impl OpenMlsProvider for InMemoryMlsProvider {
 // or a stream position.
 const _: fn(&InMemoryMlsProvider) -> &OsRand = <InMemoryMlsProvider as OpenMlsProvider>::rand;
 const _: () = assert!(std::mem::size_of::<OsRand>() == 0);
-
-impl Drop for InMemoryMlsProvider {
-    /// Zeroizes every storage value in place before `MemoryStorage` frees the
-    /// map, so each value's allocation is freed holding only zeroes
-    /// (`Vec::zeroize` wipes the whole capacity and keeps the allocation).
-    ///
-    /// A poisoned lock does not stop the wipe: the map is taken from the poison
-    /// error and wiped anyway, because a panic elsewhere does not make the key
-    /// material less sensitive.
-    fn drop(&mut self) {
-        let mut values = self
-            .storage
-            .values()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for value in values.values_mut() {
-            value.zeroize();
-        }
-    }
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

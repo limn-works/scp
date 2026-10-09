@@ -378,8 +378,8 @@ fn signer_and_provider_from_wrapper(
     let signer: SignatureKeyPair = rmp_serde::from_slice(&wrapper.signer_bytes)
         .map_err(|e| MlsError::StorageError(format!("signer deserialization: {e}")))?;
 
-    // The entries move into the provider without a copy, and the provider's
-    // own `Drop` wipes them. A signer-labelled entry is refused before any
+    // The entries move into the provider without a copy, and the `Drop` of
+    // the provider's storage wipes them. A signer-labelled entry is refused before any
     // entry moves (persistence spec §17.9.1); the `Zeroizing` vector wipes
     // whatever it still holds when `wrapper` drops.
     let provider = InMemoryMlsProvider::from_storage_entries(&mut wrapper.mls_storage_entries)?;

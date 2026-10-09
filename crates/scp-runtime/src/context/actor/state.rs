@@ -3092,8 +3092,10 @@ impl PerContextState {
     ///
     /// # Errors
     ///
-    /// [`ContextError::CryptoFailed`] if the group is destroyed or
-    /// serialization fails.
+    /// [`ContextError::CryptoFailed`] if the group is destroyed, if
+    /// serialization fails, or, carrying
+    /// [`scp_mls::MlsError::SignerStorageForbidden`], if a provider storage key
+    /// carries openmls's signature-key-pair label (persistence spec §17.9.1).
     pub(crate) fn export_crypto_state(
         &self,
         sender_key_epochs: Vec<(String, u64)>,
