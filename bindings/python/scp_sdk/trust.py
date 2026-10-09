@@ -33,7 +33,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from scp_sdk.errors import ContextError, ScpError, _coded_bridge_error
+from scp_sdk._extension import native_module
+from scp_sdk.errors import ContextError, _coded_bridge_error
 
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
@@ -55,16 +56,7 @@ NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076"
 
 def _bridge() -> Any:
     """Return the ``_scp_core`` extension module, imported lazily."""
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
+    return native_module()
 
 
 # ---------------------------------------------------------------------------

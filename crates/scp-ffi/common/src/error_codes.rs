@@ -1066,17 +1066,21 @@ pub const VALID_7080: &str = "SCP-VALID-7080";
 ///
 /// An SDK's native loader raises it when the native bridge for the platform is
 /// absent; the ts-native SDK throws it when no napi addon package resolves for
-/// the platform (`src/internal/native.ts`). It is the only native-load failure a
-/// test skip guard may treat as absence. The code has one meaning in every SDK
-/// that loads a native bridge, and no FFI bridge mints it.
+/// the platform (`src/internal/native.ts`), and the Python SDK raises it when no
+/// `scp_sdk._scp_core` extension file is present (`scp_sdk/_extension.py`). It
+/// is the only native-load failure a test skip guard may treat as absence. The
+/// code has one meaning in every SDK that loads a native bridge, and no FFI
+/// bridge mints it.
 pub const VALID_7081: &str = "SCP-VALID-7081";
 /// SDK-wrapper local guard: a native bridge is installed and failed to load.
 ///
 /// The native bridge is present, and loading it failed (a `dlopen` error, an ABI
 /// or architecture mismatch, a missing shared library), or it loaded without an
 /// export the SDK calls. The ts-native SDK throws it from `src/internal/native.ts`
-/// and `src/scp.ts`. The code has one meaning in every SDK that loads a native
-/// bridge, and no FFI bridge mints it. A test skip guard must fail on it.
+/// and `src/scp.ts`; the Python SDK raises it from `scp_sdk/__init__.py`,
+/// `scp_sdk/_extension.py`, and `scp_sdk/scp.py`. The code has one meaning in
+/// every SDK that loads a native bridge, and no FFI bridge mints it. A test skip
+/// guard must fail on it.
 pub const VALID_7082: &str = "SCP-VALID-7082";
 /// Discovery announce validation error.
 pub const VALID_7090: &str = "SCP-VALID-7090";

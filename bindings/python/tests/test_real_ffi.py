@@ -22,17 +22,16 @@ import time
 
 import pytest
 
+from tests.conftest import skip_reason_if_extension_absent
+
 # ---------------------------------------------------------------------------
 # Skip entire module if the native extension is not available
 # ---------------------------------------------------------------------------
 
 try:
     from scp_sdk import _scp_core  # installed as scp_sdk._scp_core by maturin
-except (ImportError, AttributeError):
-    pytest.skip(
-        "Native _scp_core extension not available — run maturin develop first",
-        allow_module_level=True,
-    )
+except Exception as _exc:
+    pytest.skip(skip_reason_if_extension_absent(_exc), allow_module_level=True)
 
 from scp_sdk import SCP
 from scp_sdk.errors import ValidationError
@@ -934,8 +933,6 @@ class TestProvenance:
 
     async def test_evaluate_quality(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.
-        import _scp_core  # type: ignore[import-not-found]
-
         result = _scp_core.evaluate_provenance_quality(None, "persistent", "active", None)
         assert isinstance(result, int)
         assert 0 <= result <= 3
@@ -966,8 +963,6 @@ class TestProvenance:
 
     async def test_chain_depth(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.
-        import _scp_core  # type: ignore[import-not-found]
-
         assert _scp_core.provenance_check_chain_depth(3, 5)
         assert not _scp_core.provenance_check_chain_depth(6, 5)
 

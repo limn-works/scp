@@ -60,7 +60,7 @@
       "id": "gate-3",
       "name": "Phase 3: Python SDK + MCP",
       "priority": "P0",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-036",
         "SCP-037",
@@ -2826,7 +2826,7 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "bindings/python/scp_sdk/event_log.py",
         "bindings/python/scp_sdk/transport.py",
@@ -2862,7 +2862,7 @@
       "details": {
         "event_log_api": "class EventLog:\n    async def query(self, filter=None, since=None, actor=None, event_type=None) -> list[Event]: ...\n    async def verify(self, claim: dict) -> Proof: ...\n    async def checkpoint(self) -> Checkpoint: ..."
       },
-      "result": "Implemented in iteration 3"
+      "result": "Seven of eight acceptance criteria met in iteration 3. Unmet: Rust `tracing` output is not forwarded to Python logging, because no crate installs a pyo3 log bridge. The SDK formerly probed for an `init_pyo3_log` export that no crate defines, a no-op that has been removed."
     },
     {
       "id": "SCP-046",
@@ -9161,7 +9161,7 @@
         "`crates/scp-ffi/src/event_log.rs` delegates to real `scp-core` event log query, proof, and checkpoint functions (no `Err(\"not implemented\")`)",
         "All 9 MCP bridge functions (`py_mcp_serve`, `py_mcp_client_connect_stdio`, etc.) are registered in the `#[pymodule]` in `lib.rs`",
         "`crates/scp-ffi/src/mcp.rs` exists and delegates to real `scp-mcp` crate functions",
-        "`python -c \"from _scp_core import py_mcp_serve\"` does not raise `ImportError`",
+        "`python -c \"from scp_sdk._scp_core import SCP; SCP.py_mcp_serve\"` does not raise",
         "Phase 3 integration test (`tests/integration/phase3_integration_test.py`) passes without `MagicMock` for the bridge layer — real bridge calls succeed for all 16 test methods",
         "No `\"not implemented\"` strings remain in any `crates/scp-ffi/src/*.rs` file"
       ],

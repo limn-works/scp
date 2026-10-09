@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from scp_sdk._extension import native_module
 from scp_sdk.errors import ContextError, ValidationError
 from scp_sdk.trust import (
     AttestationSummary,
@@ -42,6 +43,25 @@ from scp_sdk.trust import (
     participation_record,
     verify_participation_requirements,
 )
+from tests.conftest import skip_reason_if_extension_absent
+
+
+def _require_native_extension() -> None:
+    """Skip the calling test only when no native extension is installed.
+
+    The loader decides, through ``skip_reason_if_extension_absent``: an
+    installed extension that fails to load, or lacks a function the test calls,
+    fails the test instead of skipping it. ``pytest.importorskip("_scp_core")``,
+    which this guard replaces, skips on any ``ImportError`` before pytest 9.1,
+    and an installed extension that fails to ``dlopen`` raises ``ImportError``
+    just as an absent one does, so a broken build skipped these tests instead
+    of failing them.
+    """
+    try:
+        native_module()
+    except Exception as exc:
+        pytest.skip(skip_reason_if_extension_absent(exc))
+
 
 # -----------------------------------------------------------------------
 # Structured-result test fake
@@ -1439,7 +1459,7 @@ class TestTrustVerifyTyped:
         """The typed envelope's serialized JSON parses on the REAL Rust
         `Attestation` deserializer: a dummy signature yields a structured
         `valid: False` (verification ran), never a parse error."""
-        pytest.importorskip("_scp_core")
+        _require_native_extension()
         from scp_sdk.trust import trust_verify_attestation
 
         result = trust_verify_attestation(self._envelope())
@@ -1450,7 +1470,7 @@ class TestTrustVerifyTyped:
         """The typed challenge pair's serialized JSON parses on the REAL Rust
         `ChallengeRequest` / `ChallengeResponse` deserializers: dummy
         signatures yield a structured `False`, never a parse error."""
-        pytest.importorskip("_scp_core")
+        _require_native_extension()
         from scp_sdk.trust import trust_verify_response
 
         assert trust_verify_response(self._challenge(), self._response()) is False
@@ -1476,7 +1496,7 @@ class TestTrustCreateChallenge:
     def test_real_bridge_call_through(self) -> None:
         """The REAL bridge issues a signed schema-validation challenge: the
         returned `challenge_json` parses and targets the subject DID."""
-        pytest.importorskip("_scp_core")
+        _require_native_extension()
         from scp_sdk.trust import trust_create_challenge
 
         result = trust_create_challenge("did:dht:zSubject")
