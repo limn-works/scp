@@ -1201,11 +1201,6 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 /// §6.2.4 "Signer authorization": the receipt key MUST be the one authorized
 /// to act for `target_context_id`).
 ///
-/// The creator DID comes from the supervisor rather than from a bridge copy
-/// because this call chooses the authority the receipt signs as, and a context
-/// no actor serves must refuse to sign rather than sign as the creator a bridge
-/// copy recorded.
-///
 /// # Errors
 ///
 /// Returns the [`crate::runtime::live_role_state`] error when the supervisor
@@ -3049,14 +3044,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
-    // `register_context` receives an EMPTY ceiling argument, and a bridge copy
-    // built from that argument held `default_ceiling()` and named the
-    // registering DID as creator — so a narrower supervisor ceiling, a
-    // supervisor-only member, or an absent supervisor role state each split the
-    // two answers apart.
-    // ------------------------------------------------------------------
-
     /// Builds a `PyScp` whose context exists in the supervisor with
     /// `supervisor_ceiling`, and whose FFI state was registered with no ceiling.
     fn live_scp(
@@ -3122,8 +3109,7 @@ mod tests {
     }
 
     /// `outlet_register` refuses the creator when the SUPERVISOR ceiling omits
-    /// `outlet:register`, even though a bridge copy would have carried
-    /// `default_ceiling()` — which grants it.
+    /// `outlet:register`.
     #[test]
     fn outlet_register_refuses_when_the_supervisor_ceiling_omits_outlet_register() {
         let creator = "did:dht:z6MkRegisterCeilingNarrow";
@@ -3311,8 +3297,7 @@ mod tests {
 
     /// `outlet_interface_expose` and `outlet_interface_accept` read the roles
     /// from the supervisor. The supervisor ceiling omits `role:assign`, so the
-    /// creator lacks `RoleAssign` there, while a bridge copy built from
-    /// `default_ceiling()` grants it. Both entry points must refuse.
+    /// creator lacks `RoleAssign` there. Both entry points must refuse.
     #[test]
     fn interface_expose_and_accept_refuse_when_the_supervisor_ceiling_omits_role_assign() {
         let creator = "did:dht:z6MkInterfaceNoRoleAssign";
@@ -3351,8 +3336,7 @@ mod tests {
     /// `outlet_interface_expose` and `outlet_interface_accept` pass the
     /// SUPERVISOR's creator to the admin check. The FFI state is registered
     /// under one DID and the supervisor context is created under another, so
-    /// the registering DID holds no role in the supervisor and the
-    /// supervisor's creator holds none in a bridge copy. Both entry points
+    /// the registering DID holds no role in the supervisor. Both entry points
     /// must admit the supervisor's creator.
     #[test]
     fn interface_expose_and_accept_admit_the_supervisor_creator() {

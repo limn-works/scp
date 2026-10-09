@@ -38,8 +38,6 @@
 //!    registers FFI-specific state via [`register_ffi_state`].
 //! 2. Bridge functions call [`with_ffi_state`] for FFI-specific state and
 //!    [`supervisor`] for the shared `Supervisor`.
-//! 3. `py_context_close` delegates to `ContextManager::close_context`, then
-//!    removes FFI state via [`remove_ffi_state`].
 //!
 //! # Context Discovery (SCP-213)
 //!
@@ -435,12 +433,6 @@ pub struct PyBridgeInstance {
 
     /// Release marks: the ids whose [`FfiBridgeState`] a close released, each
     /// with the instant its mark was last set.
-    ///
-    /// [`register_ffi_state`] refuses to build state for a marked id, and
-    /// [`release_context_unless_readmitted`] removes state only while the id's
-    /// mark stands. [`readmit_context`] clears a mark. Holding
-    /// [`MAX_RELEASED_CONTEXTS`] marks, a new mark first evicts the one set
-    /// earliest.
     pub(crate) released_contexts: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 
     /// MCP server registry (replaces `SERVER_REGISTRY` in `mcp.rs`).
@@ -1537,9 +1529,8 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// `"outlet:call:*"`). This function validates each entry against the
 /// ceiling-entry grammar (spec §5.3.1.1) and then discards the parsed values.
 ///
-/// The function refuses an id that carries a release mark, so state a close
-/// released is never rebuilt for it; [`readmit_context`] clears the mark. The
-/// mark check and the insert run under the registry entry's shard lock.
+/// The function refuses an id that carries a release mark. The mark check and
+/// the insert run under the registry entry's shard lock.
 ///
 /// # Errors
 ///
@@ -1551,6 +1542,44 @@ pub fn register_ffi_state(
     bi: &PyBridgeInstance,
     context_id: &str,
     user_ceiling: &[String],
+) -> Result<(), ScpPyError> {
+    insert_ffi_state(bi, context_id, user_ceiling, MarkedId::Refuse)
+}
+
+/// Registers FFI-specific state for `context_id` and clears its release mark
+/// in one critical section under the registry entry's shard lock.
+///
+/// When the entry is vacant, it clears the mark and inserts a fresh
+/// [`FfiBridgeState`]. When the entry is occupied, it returns an error and
+/// leaves the mark in place.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context ID is already registered
+/// or if a `user_ceiling` entry fails the ceiling-entry grammar.
+pub fn readmit_and_register_ffi_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    user_ceiling: &[String],
+) -> Result<(), ScpPyError> {
+    insert_ffi_state(bi, context_id, user_ceiling, MarkedId::Readmit)
+}
+
+/// What [`insert_ffi_state`] does with a vacant entry whose id carries a
+/// release mark.
+#[derive(Clone, Copy)]
+enum MarkedId {
+    /// Refuse the registration and keep the mark.
+    Refuse,
+    /// Clear the mark and register.
+    Readmit,
+}
+
+fn insert_ffi_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    user_ceiling: &[String],
+    marked: MarkedId,
 ) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
 
@@ -1584,7 +1613,10 @@ pub fn register_ffi_state(
             "context '{context_id}' FFI state is already registered"
         ))),
         Entry::Vacant(vacant) => {
-            if lock_release_marks(bi).contains_key(vacant.key()) {
+            let mut marks = lock_release_marks(bi);
+            if matches!(marked, MarkedId::Readmit) {
+                marks.remove(vacant.key());
+            } else if marks.contains_key(vacant.key()) {
                 // The refusal withholds the lifecycle state: registration
                 // authorizes no one, so its answer must not say whether the
                 // context closed.
@@ -1800,10 +1832,6 @@ pub fn read_live_context_state_on(
 }
 
 /// The most release marks one [`PyBridgeInstance`] holds.
-///
-/// A mark stays until [`readmit_context`] clears it, so without a bound the map
-/// grows by one entry for every context the instance ever closed. Evicting a
-/// mark lets [`register_ffi_state`] build state for that id again.
 pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
 
 /// Locks the bridge's release marks, recovering the map from a poisoned lock.
@@ -1844,46 +1872,65 @@ fn set_release_mark(bi: &PyBridgeInstance, context_id: &str) {
 /// The mark check and all four removals run under the registry entry's shard
 /// lock, and the [`FfiBridgeState`] is removed last.
 fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> bool {
-    use dashmap::mapref::entry::Entry;
-
     let entry = ffi_state_registry(bi).entry(context_id.to_owned());
     if !lock_release_marks(bi).contains_key(context_id) {
         return false;
     }
-    bi.core.remove_known_context(context_id);
-    bi.core.remove_bridge_state(context_id);
-    bi.core.remove_economy_state(context_id);
-    if let Entry::Occupied(occupied) = entry {
-        occupied.remove();
-    }
+    remove_context_entry(bi, context_id, entry);
     true
 }
 
+/// Removes `context_id`'s known-context entry, its connector and economy
+/// state, and then its [`FfiBridgeState`] through `entry`, the registry entry
+/// the caller holds, so all four removals run under that entry's shard lock.
+fn remove_context_entry(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    entry: dashmap::mapref::entry::Entry<'_, String, FfiBridgeState>,
+) {
+    bi.core.remove_known_context(context_id);
+    bi.core.remove_bridge_state(context_id);
+    bi.core.remove_economy_state(context_id);
+    if let dashmap::mapref::entry::Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
+}
+
 /// Registers `known` in the known-contexts registry only while `context_id`'s
-/// [`FfiBridgeState`] is registered, and returns whether it was.
+/// [`FfiBridgeState`] is registered, overwriting any entry for the id.
 ///
 /// The presence check and the registration run under the registry entry's
 /// shard lock.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` with code `SCP-CTX-2023` and the
+/// withheld lifecycle text, registering nothing, when no [`FfiBridgeState`] is
+/// registered for `context_id`.
 pub fn register_known_context_while_registered(
     bi: &PyBridgeInstance,
     context_id: &str,
     known: KnownContext,
-) -> bool {
+) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
 
     match ffi_state_registry(bi).entry(context_id.to_owned()) {
         Entry::Occupied(_held) => {
             bi.core.register_known_context(context_id, known);
-            true
+            Ok(())
         }
-        Entry::Vacant(_) => false,
+        Entry::Vacant(_) => Err(ScpPyError::ContextError {
+            message: format!(
+                "cannot register known context: {}",
+                scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+            ),
+            code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+        }),
     }
 }
 
-/// Clears the release mark a close left for `context_id`.
-///
-/// It clears the mark under the registry entry's shard lock.
-pub fn readmit_context(bi: &PyBridgeInstance, context_id: &str) {
+/// Clears `context_id`'s release mark under the registry entry's shard lock.
+pub(crate) fn readmit_context(bi: &PyBridgeInstance, context_id: &str) {
     let _shard = ffi_state_registry(bi).entry(context_id.to_owned());
     lock_release_marks(bi).remove(context_id);
 }
@@ -1896,9 +1943,8 @@ pub fn readmit_context(bi: &PyBridgeInstance, context_id: &str) {
 /// can return to `Active`, and be readmitted, in between. When the re-read,
 /// taken after the mark went in, reports `Active`, this clears the mark,
 /// removes nothing, and returns `false`. On any other answer, a failed read
-/// included, it removes the state while the mark stands and returns `true`;
-/// the mark stays, so [`register_ffi_state`] refuses to rebuild state for the
-/// id. When a readmit clears the mark between the re-read and the removal, it
+/// included, it removes the state while the mark stands, leaves the mark set,
+/// and returns `true`. When the mark is gone by the time of the removal, it
 /// removes nothing and returns `false`.
 pub fn release_context_unless_readmitted(
     bi: &PyBridgeInstance,
@@ -2166,26 +2212,16 @@ pub fn register_outlet_handler(
 
 /// Removes a context's FFI state from the registry.
 ///
-/// Called when a context is closed. All associated FFI state objects are
-/// dropped. Dropping the `FfiBridgeState` also drops `message_tx`, which
-/// closes the receive channel and causes `__anext__` to raise
-/// `StopAsyncIteration`. Does not error if the context was not found
-/// (idempotent).
+/// All associated FFI state objects are dropped. Dropping the
+/// `FfiBridgeState` also drops `message_tx`, which closes the receive channel
+/// and causes `__anext__` to raise `StopAsyncIteration`. Does not error if the
+/// context was not found (idempotent).
 ///
 /// All four removals run under the registry entry's shard lock, and the
 /// `FfiBridgeState` is removed last.
 pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
-    use dashmap::mapref::entry::Entry;
-
     let entry = ffi_state_registry(bi).entry(context_id.to_owned());
-    // Clean up known-context discovery entry via CoreFields.
-    bi.core.remove_known_context(context_id);
-    // Clean up per-context bridge connector state and economy state via CoreFields.
-    bi.core.remove_bridge_state(context_id);
-    bi.core.remove_economy_state(context_id);
-    if let Entry::Occupied(occupied) = entry {
-        occupied.remove();
-    }
+    remove_context_entry(bi, context_id, entry);
 }
 
 /// Test-only: spawns the per-context supervisor actor whose lifecycle state
@@ -2408,17 +2444,6 @@ pub fn deliver_message_with_handles(
 // `init_context_manager` is called, `register_known_context` panics
 // (callers must initialize identity first, which initializes the bridge).
 // ---------------------------------------------------------------------------
-
-/// Registers a known context in the discovery registry for the supplied
-/// [`PyBridgeInstance`].
-///
-/// Called after `py_context_create` to record the context's routing ID and
-/// relay URL for later discovery via `py_mcp_load_contexts`.
-///
-/// Overwrites any existing entry for the same context ID (idempotent).
-pub fn register_known_context_on(bi: &PyBridgeInstance, context_id: &str, known: KnownContext) {
-    bi.core.register_known_context(context_id, known);
-}
 
 // Phase D (#1695): legacy default-bridge free-fn shims deleted. Callers
 // must use the `*_on(bi, ...)` variants with an explicit PyBridgeInstance.
@@ -2867,8 +2892,7 @@ mod tests {
     ///
     /// `register_context` receives an empty ceiling argument. The supervisor
     /// context carries `supervisor_ceiling`, a non-empty list the caller makes
-    /// narrower than `default_ceiling()`, so a test that asserts an entry absent
-    /// from that list proves the answer came from the supervisor.
+    /// narrower than `default_ceiling()`.
     ///
     /// # Panics
     ///
@@ -3006,7 +3030,7 @@ mod tests {
             last_seen: 0,
         };
 
-        register_known_context_on(bi, &ctx_id, known);
+        bi.core.register_known_context(&ctx_id, known);
         let stats = registry_stats(bi);
 
         assert!(
@@ -3141,8 +3165,8 @@ mod tests {
     }
 
     /// A release leaves the id marked, `register_ffi_state` refuses the marked
-    /// id with `SCP-CTX-2023` and the withheld text, and `readmit_context`
-    /// clears the mark so the next registration succeeds.
+    /// id with `SCP-CTX-2023` and the withheld text, and
+    /// `readmit_and_register_ffi_state` clears the mark and registers the id.
     #[test]
     fn a_release_mark_refuses_registration_until_a_readmit() {
         let (bi, ctx_id) = unserved_context("mark-refuses");
@@ -3169,10 +3193,32 @@ mod tests {
         );
         assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
 
-        readmit_context(&bi, &ctx_id);
+        readmit_and_register_ffi_state(&bi, &ctx_id, &[]).expect("a readmit registers a vacant id");
         assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
-        register_ffi_state(&bi, &ctx_id, &[]).expect("a readmitted id registers");
+        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
         remove_context(&bi, &ctx_id);
+    }
+
+    /// `readmit_and_register_ffi_state` on an occupied entry fails and leaves
+    /// the id's release mark in place.
+    #[test]
+    fn a_readmit_into_an_occupied_entry_fails_and_keeps_the_mark() {
+        let (bi, ctx_id) = unserved_context("readmit-occupied");
+        set_release_mark(&bi, &ctx_id);
+
+        let err = readmit_and_register_ffi_state(&bi, &ctx_id, &[])
+            .expect_err("an occupied entry must refuse the registration")
+            .to_string();
+        assert!(
+            err.contains("already registered"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            lock_release_marks(&bi).contains_key(&ctx_id),
+            "a failed registration must leave the mark in place"
+        );
+        assert!(remove_context_while_released(&bi, &ctx_id));
+        readmit_context(&bi, &ctx_id);
     }
 
     /// A release whose re-read reports `Active` keeps the state and leaves no
@@ -3212,7 +3258,8 @@ mod tests {
                 .iter()
                 .any(|(id, _)| id == &ctx_id)
         };
-        register_known_context_on(&bi, &ctx_id, release_fixture_known());
+        register_known_context_while_registered(&bi, &ctx_id, release_fixture_known())
+            .expect("a registered id registers its known context");
 
         set_release_mark(&bi, &ctx_id);
         readmit_context(&bi, &ctx_id);
@@ -3257,11 +3304,8 @@ mod tests {
                 .any(|(id, _)| id == &ctx_id)
         };
 
-        assert!(register_known_context_while_registered(
-            &bi,
-            &ctx_id,
-            release_fixture_known()
-        ));
+        register_known_context_while_registered(&bi, &ctx_id, release_fixture_known())
+            .expect("a registered id registers its known context");
         assert!(
             is_known(&bi),
             "a registered id gains its known-context entry"
@@ -3269,9 +3313,14 @@ mod tests {
 
         remove_context(&bi, &ctx_id);
         assert!(!is_known(&bi), "removal drops the known-context entry");
+        let refusal =
+            register_known_context_while_registered(&bi, &ctx_id, release_fixture_known())
+                .expect_err("an id with no FFI state must be refused")
+                .to_string();
         assert!(
-            !register_known_context_while_registered(&bi, &ctx_id, release_fixture_known()),
-            "an id with no FFI state must be refused"
+            refusal.contains(scp_ffi_common::error_codes::CTX_2023)
+                && refusal.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD),
+            "the refusal must carry SCP-CTX-2023 and the withheld text: {refusal}"
         );
         assert!(
             !is_known(&bi),
@@ -3984,7 +4033,7 @@ mod tests {
     // `bridge_instance()` internally, so discovery routed through the default
     // bridge even when called from a non-default `PyScp::load_contexts`.
 
-    /// `register_known_context_on(bi_b, ...)` must persist into `bi_b`'s
+    /// A known context registered on `bi_b` must persist into `bi_b`'s
     /// registry and be visible via `known_contexts_for_member_on(bi_b, ...)`.
     #[test]
     fn known_contexts_are_per_instance() {
@@ -4001,7 +4050,7 @@ mod tests {
         };
 
         // Register against bi_b only.
-        register_known_context_on(&bi_b, &ctx_id, known);
+        bi_b.core.register_known_context(&ctx_id, known);
 
         let found_b = known_contexts_for_member_on(&bi_b, member);
         assert!(
@@ -4032,7 +4081,7 @@ mod tests {
             last_seen: 0,
         };
 
-        register_known_context_on(&bi_a, &ctx_id, known);
+        bi_a.core.register_known_context(&ctx_id, known);
 
         let list_a = all_known_contexts_on(&bi_a);
         let list_b = all_known_contexts_on(&bi_b);

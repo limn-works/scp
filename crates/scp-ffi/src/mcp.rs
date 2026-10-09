@@ -781,7 +781,7 @@ impl ContextProvider for FfiBridgeProvider {
         // A dropped bridge instance or an unreadable role state is a failed
         // read, which `tools/list` reports as an error instead of omitting
         // the context's tools. A context the actor does not hold is a
-        // denial. The role state comes from the actor, not the bridge copy.
+        // denial.
         let bi = self.upgrade_bi().map_err(AccessRefusal::Unreadable)?;
         let role_state = Self::gate_role_state(&bi, context_id)?;
         self.outlet_grant(&bi, &role_state, context_id, outlet_name, check)
@@ -4033,7 +4033,7 @@ mod tests {
         };
 
         let bi = __bi();
-        crate::runtime::register_known_context_on(&bi, &ctx_id, known);
+        bi.core.register_known_context(&ctx_id, known);
 
         // Should be discoverable by member DID.
         let found = crate::runtime::known_contexts_for_member_on(&bi, creator);
@@ -5945,9 +5945,7 @@ mod tests {
     ///
     /// `revoked` is the state after an inbound commit removed the agent: the
     /// actor holds the context without the agent. `granted` is the reverse: the
-    /// actor's creator, and so its sole member, is the agent. A gate that
-    /// answered from anything other than the actor's membership fails one of
-    /// the two halves.
+    /// actor's creator, and so its sole member, is the agent.
     #[test]
     fn provider_gates_read_the_actor_role_state_pyo3() {
         use scp_mcp::server::ResourceKind;

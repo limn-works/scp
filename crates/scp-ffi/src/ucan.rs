@@ -1329,12 +1329,6 @@ mod tests {
     // Every UCAN authorization input reaches the supervisor actor
     //
     // `register_context` receives an EMPTY ceiling argument below.
-    // `ucan_mint_reads_the_supervisor_creator_as_issuer`,
-    // `ucan_revoke_authorizes_the_supervisor_creator_not_the_registration_did`,
-    // and the e2e_bridge.rs test
-    // `ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_registration_did`
-    // each fail when their entry point takes the creator from the registration
-    // DID.
     // The absence tests below build a context no supervisor actor serves, so
     // each entry point refuses at `active_ucan_role_state`, the lifecycle gate
     // that runs before the live role-state read; the refusal carries
@@ -1771,8 +1765,7 @@ mod tests {
     }
 
     /// `ucan_evaluate` reads the same two supervisor-owned inputs the enforcing
-    /// `ucan_validate` reads, so the diagnostic refuses on the same condition
-    /// instead of reporting a verdict from a bridge copy.
+    /// `ucan_validate` reads, so the diagnostic refuses on the same condition.
     #[test]
     fn ucan_evaluate_refuses_without_supervisor_role_state() {
         let creator = "did:dht:z6MkUcanEvaluateNoActor";
@@ -1800,8 +1793,7 @@ mod tests {
     /// supervisor, so the DID named in the refusal is the supervisor's creator.
     ///
     /// The fixture registers the bridge state under one DID and creates the
-    /// supervisor context under another. A mint that took its issuer from the
-    /// registration DID names `ffi_creator` and fails the assertion below.
+    /// supervisor context under another.
     #[test]
     fn ucan_mint_reads_the_supervisor_creator_as_issuer() {
         crate::init_runtime().ok();
@@ -1883,14 +1875,12 @@ mod tests {
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
-    /// `ucan_revoke` admits the context creator the SUPERVISOR holds, not the
-    /// DID the bridge state was registered under. The fixture registers the
-    /// bridge state under `ffi_creator` and the supervisor context under
-    /// `supervisor_creator`; neither is the token's issuer. A revoke that took
-    /// the creator from the registration DID refuses `supervisor_creator` and
-    /// admits `ffi_creator`, failing both assertions below.
+    /// `ucan_revoke` admits the context creator the SUPERVISOR holds. The
+    /// fixture registers the bridge state under `ffi_creator` and the
+    /// supervisor context under `supervisor_creator`; neither is the token's
+    /// issuer.
     #[test]
-    fn ucan_revoke_authorizes_the_supervisor_creator_not_the_registration_did() {
+    fn ucan_revoke_authorizes_the_supervisor_creator() {
         crate::init_runtime().ok();
         let ffi_creator = "did:dht:z6MkUcanRevokeFfiCreator";
         let supervisor_creator = "did:dht:z6MkUcanRevokeSupervisorCreator";
@@ -1908,7 +1898,7 @@ mod tests {
 
         let refused = scp
             .ucan_revoke(&ctx_id, REVOKE_TEST_TOKEN, ffi_creator)
-            .expect_err("the registration DID is not the context creator");
+            .expect_err("a revoker the supervisor does not name as creator must be refused");
         assert!(
             refused.to_string().contains(ffi_creator),
             "the refusal must name the revoker it refused: {refused}"

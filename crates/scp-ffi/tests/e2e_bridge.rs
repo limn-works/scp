@@ -3369,11 +3369,10 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
 /// names `owner`, the token's issuer, and the registration names `other`; in
 /// `crossed` the supervisor names `other` and the registration names `owner`.
 /// The token passes the root-issuer check in `anchored` and fails it in
-/// `crossed`. An edit that anchors on the registration DID reverses both
-/// results.
+/// `crossed`.
 #[cfg(feature = "testing")]
 #[test]
-fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_registration_did() {
+fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
     Python::with_gil(|py| {
         setup();
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
@@ -3430,12 +3429,14 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator_not_the_registrat
         );
         assert!(
             !in_crossed.signatures_valid,
-            "evaluate must refuse a root issuer only the registration DID names"
+            "evaluate must refuse a root issuer the supervisor does not name as creator"
         );
 
         let crossed_err = scp
             .ucan_validate(&crossed, &token, &cap, &holder, None)
-            .expect_err("a root issuer only the registration DID names must refuse")
+            .expect_err(
+                "validate must refuse a root issuer the supervisor does not name as creator",
+            )
             .to_string();
         assert!(
             crossed_err.contains(&format!("invalid issuer: expected {other}, got {owner}")),
@@ -3690,10 +3691,6 @@ fn session_invoke_admits_a_supervisor_only_capability_holder() {
 
 /// `outlet_session_invoke` refuses a member the supervisor never granted an
 /// invocation capability, although the invoker's UCAN is valid.
-///
-/// The companion to `session_invoke_admits_a_supervisor_only_capability_holder`:
-/// that test goes red when the gate reads a bridge copy, and this one goes red
-/// when the gate stops refusing, for example a gate that always admits.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
 fn session_invoke_refuses_a_member_the_supervisor_did_not_grant() {

@@ -2647,8 +2647,9 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `TypeError` if params contains invalid types, `ValueError` if
-    /// parameter values are out of range, or `RuntimeError` if context creation
-    /// fails.
+    /// parameter values are out of range, `RuntimeError` if context creation
+    /// fails, or `ContextError` carrying `SCP-CTX-2023` when the context's
+    /// bridge state is no longer registered at the known-context registration.
     #[pyo3(signature = (identity_did, params))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
@@ -2824,7 +2825,7 @@ impl crate::scp::PyScp {
                 member_did: identity_did.to_owned(),
                 last_seen,
             };
-            crate::runtime::register_known_context_on(bi, &context_id, known);
+            crate::runtime::register_known_context_while_registered(bi, &context_id, known)?;
         }
 
         // Transition to "active" -- in the full runtime this happens after MLS
@@ -2851,10 +2852,12 @@ impl crate::scp::PyScp {
     ///
     /// Returns `ContextError` carrying `SCP-CTX-2013` when the supervisor reports
     /// the context in any state but active or no actor serves it,
-    /// `SCP-CTX-2134` when the crash watchdog poisoned it, and `SCP-CTX-2135`
-    /// when its actor crashed or is mid-respawn.
+    /// `SCP-CTX-2134` when the crash watchdog poisoned it, `SCP-CTX-2135`
+    /// when its actor crashed or is mid-respawn, and `SCP-CTX-2023` when the
+    /// context's bridge state is no longer registered at the known-context
+    /// registration.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
-    #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager, syncs FFI state
+    #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager
     pub fn context_join(
         &self,
         handle: &PyContextHandle,
@@ -2990,10 +2993,7 @@ impl crate::scp::PyScp {
             // register post-commit). Reuse the joiner's derived §9.10.4 pseudonym
             // as the routing ID for encrypted contexts; fall back to
             // broadcast_routing_id (plain SHA-256, matching the send path) for
-            // broadcast contexts, which carry no per-member pseudonym. Post-commit
-            // and infallible/idempotent (overwrites), mirroring context_create's
-            // POST-success registration — safe after the committed join, needs no
-            // rollback.
+            // broadcast contexts, which carry no per-member pseudonym.
             {
                 let routing_id = local_pseudonym.unwrap_or_else(|| {
                     if join_is_broadcast {
@@ -3019,7 +3019,7 @@ impl crate::scp::PyScp {
                     member_did,
                     last_seen: scp_clock::SystemClock.now_secs(),
                 };
-                crate::runtime::register_known_context_on(bi, &context_id, known);
+                crate::runtime::register_known_context_while_registered(bi, &context_id, known)?;
             }
         }
 
@@ -3095,10 +3095,9 @@ impl crate::scp::PyScp {
     /// [`context_create`](Self::context_create) does). Without it a Welcome-joined
     /// node can DECRYPT but cannot SEND (no actor-backed handle).
     ///
-    /// The bridge-side FFI state is registered as a REVERSIBLE precheck BEFORE
-    /// the irreversible runtime join and rolled back on failure, mirroring
-    /// `context_create`: there is no path where the runtime join commits but
-    /// bridge state errors, and no leaked FFI/discovery state when the join fails.
+    /// The bridge-side FFI state is registered only after the runtime join
+    /// commits. When that registration or the known-context registration
+    /// fails, the function tears down the actor the join committed.
     ///
     /// Local-identity custody of the JOINER (`owning_did`) is enforced at the
     /// bridge exactly as `context_create` enforces it for the creator: the
@@ -3187,14 +3186,8 @@ impl crate::scp::PyScp {
             serde_json::from_value(serde_json::Value::String(reservation_id))
                 .map_err(|e| PyRuntimeError::new_err(format!("invalid reservation id: {e}")))?;
 
-        // Resolve the tokio runtime + supervisor handle BEFORE any reversible
-        // registration. Neither lookup needs registered bridge state, and both
-        // short-circuit on `?` — resolving them AFTER `register_ffi_state` would
-        // leak the just-registered (reversible) state with no rollback on their
-        // failure, and a later same-id retry would then hard-fail the Occupied
-        // check. Order: custody-derive (above) → runtime/supervisor-resolve →
-        // custody+active-key resolve → register-reversible → spawn →
-        // rollback-on-Err → authenticated ceiling re-sync.
+        // Resolve the tokio runtime + supervisor handle. Neither lookup needs
+        // registered bridge state.
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3210,34 +3203,15 @@ impl crate::scp::PyScp {
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Register the bridge-side FFI state (OutletRegistry / EventLog /
-        // RevocationList / NonceTracker / SessionStore) as a REVERSIBLE precheck
-        // BEFORE the irreversible runtime join. Mirrors `context_create`, which
-        // registers FFI state first and rolls it back via `remove_context` if the
-        // runtime step fails. The FFI state holds no role state and no
-        // membership.
-        //
-        // FLAG-1: the caller supplies no ceiling, and none is stored here. The
-        // Occupied dedup is keyed on `context_id`, so the "detect a duplicate
-        // BEFORE consuming the single-use KeyPackage" crash-safety is preserved.
-        //
-        // Ordering matters for two reasons:
-        //   1. `register_ffi_state` hard-errors on an already-registered context
-        //      (`Entry::Occupied`) — that collision fails the join HERE, BEFORE
-        //      `spawn_actor_from_welcome` consumes the single-use `KeyPackage`,
-        //      and leaves any pre-existing entry untouched (we must NOT roll back
-        //      state we did not create).
-        //   2. If the runtime join later fails, we roll THIS state back, so there
-        //      is no path where the join commits but bridge state errors, and no
-        //      leaked FFI state when the join fails.
-        //
-        // A close of this id on this bridge instance left a release mark, and
-        // `register_ffi_state` refuses a marked id. This join is about to make
-        // the supervisor serve the id again, so it clears the mark first.
-        crate::runtime::readmit_context(bi, &sealed.context_id);
-        crate::runtime::register_ffi_state(bi, &sealed.context_id, &[]).map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to register context state: {e}"))
-        })?;
+        // A pre-existing FFI-state entry for this id fails the join here, before
+        // `spawn_actor_from_welcome` consumes the single-use `KeyPackage`, and
+        // the entry is left untouched.
+        if crate::runtime::ffi_state_registry(bi).contains_key(&sealed.context_id) {
+            return Err(PyRuntimeError::new_err(format!(
+                "failed to register context state: context '{}' FFI state is already registered",
+                sealed.context_id
+            )));
+        }
 
         let owning = scp_did::DID(owning_did.clone());
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
@@ -3250,19 +3224,23 @@ impl crate::scp::PyScp {
         };
         // Irreversible: open + authenticate the sealed bundle, consume the
         // KeyPackage, install the joined MLS group, persist the keyed snapshot,
-        // register the context actor. On failure, roll the reversible FFI state
-        // (and — via `remove_context` → `remove_ffi_state` — any known-context
-        // discovery entry) back so an errored join leaves no orphaned bridge
-        // state beside a runtime that never committed.
-        let joined =
-            match rt.block_on(sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req))
-            {
-                Ok(handle) => handle,
-                Err(e) => {
-                    crate::runtime::remove_context(bi, &sealed.context_id);
-                    return Err(busy_or("context_join_from_welcome", &e));
-                }
-            };
+        // register the context actor. Nothing is registered on this bridge
+        // before the spawn succeeds, so a failed spawn leaves the id's bridge
+        // state and release mark as they were.
+        let joined = rt
+            .block_on(sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req))
+            .map_err(|e| busy_or("context_join_from_welcome", &e))?;
+
+        // The supervisor serves the id now. Clearing the id's release mark and
+        // registering its FFI state run in one critical section; when the entry
+        // is occupied, the mark stays and the just-committed actor is torn down.
+        if let Err(e) = crate::runtime::readmit_and_register_ffi_state(bi, &sealed.context_id, &[])
+        {
+            rt.block_on(sup.discard_joined_context(&sealed.context_id));
+            return Err(PyRuntimeError::new_err(format!(
+                "failed to register context state: {e}"
+            )));
+        }
 
         // Runtime join committed. Register the context in the known-contexts
         // discovery registry so a Welcome-joined context is surfaced by
@@ -3284,25 +3262,20 @@ impl crate::scp::PyScp {
             last_seen: scp_clock::SystemClock.now_secs(),
         };
 
-        // BLACK-2JF-01, post-irreversible-commit compensation: the presence
-        // probe misses only when a concurrent close or leave removed the FFI
-        // state this join registered while the spawn ran or after it returned.
-        // The probe and the known-context registration run under one registry
-        // entry lock. A close or leave does not despawn the actor, so returning
-        // without a teardown would strand a live actor behind a handle with no
-        // FFI state. `discard_joined_context` removes the actor handle, destroys
+        // BLACK-2JF-01, post-irreversible-commit compensation: when the FFI
+        // state this join registered is gone, the join tears down the actor it
+        // committed. `discard_joined_context` removes the actor handle, destroys
         // the resident MLS group, and deletes the durable snapshot the join
-        // persisted; a bare `despawn_actor` would leave the group and the
-        // snapshot behind, so a restart would restore the context and a fresh
-        // re-join would collide with it.
-        if !crate::runtime::register_known_context_while_registered(bi, &sealed.context_id, known) {
+        // persisted.
+        if crate::runtime::register_known_context_while_registered(bi, &sealed.context_id, known)
+            .is_err()
+        {
             rt.block_on(sup.discard_joined_context(&sealed.context_id));
             crate::runtime::remove_context(bi, &sealed.context_id);
             return Err(crate::error::ScpPyError::ContextError {
                 message: format!(
-                    "FFI state for context '{}' vanished between the reversible registration \
-                     and the committed join; the just-committed actor was torn down so no \
-                     context stays live without FFI state",
+                    "FFI state for context '{}' was removed after the committed join; \
+                     the just-committed actor was torn down",
                     sealed.context_id
                 ),
                 code: scp_ffi_common::error_codes::CTX_2040.to_owned(),
@@ -6706,30 +6679,25 @@ mod tests {
         });
     }
 
-    /// ADR-049 Phase 2J (orphaned-success fix): `context_join_from_welcome`
-    /// registers the bridge-side FFI state as a REVERSIBLE precheck BEFORE the
-    /// irreversible runtime join, and ROLLS IT BACK when the runtime join fails —
-    /// so a failed join leaves NO FFI state and NO known-context discovery entry
-    /// behind.
+    /// ADR-049 Phase 2J (orphaned-success fix): when the runtime join fails,
+    /// `context_join_from_welcome` leaves NO FFI state and NO known-context
+    /// discovery entry behind, and a release mark the id carried stays set.
     ///
     /// Drives the REAL entry point with a locally-custodied joiner, so the
     /// custody / pseudonym-derivation gate SUCCEEDS and control reaches the
-    /// register -> spawn seam, but with a bogus reservation + Welcome so
+    /// spawn, but with a bogus reservation + Welcome so
     /// `spawn_actor_from_welcome` fails at the runtime layer (the joiner reserved
     /// nothing, so the fused consume finds no matching reservation). The
     /// assertion is on the observable post-condition: after the error, BOTH the
     /// FFI state registry and the known-contexts registry are empty for the
     /// context.
     ///
-    /// Not false-green: custody SUCCEEDS here (real in-memory identity), so the
-    /// failure is the runtime join itself — exactly the path the rollback guards.
-    /// The explicit "no `SCP-IDENT-1054`" check pins that the register -> spawn
-    /// seam was actually exercised (not short-circuited at the upstream custody
-    /// gate). Were the rollback removed, the freshly-registered `FfiBridgeState`
-    /// would leak beside a runtime that never committed.
+    /// Custody SUCCEEDS here (real in-memory identity), so the failure is the
+    /// runtime join itself. The explicit "no `SCP-IDENT-1054`" check pins that
+    /// the spawn was reached (not short-circuited at the upstream custody gate).
     #[test]
     #[cfg(feature = "testing")]
-    fn join_from_welcome_rolls_back_ffi_state_when_runtime_join_fails() {
+    fn join_from_welcome_leaves_no_ffi_state_and_keeps_the_mark_when_runtime_join_fails() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
         Python::with_gil(|py| {
@@ -6737,15 +6705,16 @@ mod tests {
             let bi = Arc::clone(&scp.inner);
 
             // Locally-custodied joiner so the pseudonym-derivation custody gate
-            // passes and control reaches the register -> spawn seam.
+            // passes and control reaches the spawn.
             let joiner = scp.identity_create(py, "in_memory", None).unwrap();
             let joiner_did = joiner.did().to_owned();
 
             let ctx_id = "a".repeat(64);
+            crate::runtime::lock_release_marks(&bi)
+                .insert(ctx_id.clone(), std::time::Instant::now());
             // A well-formed 32-byte `enc` passes the bridge enc-length check, so
             // the failure is the runtime join itself (bogus reservation +
-            // ciphertext) — exactly the register -> spawn seam the rollback
-            // guards.
+            // ciphertext).
             let sealed = __sealed(
                 &ctx_id,
                 "did:dht:z6MkRollbackCreator",
@@ -6759,12 +6728,16 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 !msg.contains("SCP-IDENT-1054"),
-                "custody must have SUCCEEDED so the register -> spawn seam is exercised; \
+                "custody must have SUCCEEDED so the spawn is reached; \
                  got a derivation error instead: {msg}"
             );
+            assert!(
+                crate::runtime::lock_release_marks(&bi).contains_key(&ctx_id),
+                "a failed join must leave the id's release mark set"
+            );
 
-            // Post-condition: the reversible FFI state was rolled back — no
-            // orphaned bridge state, and no known-context discovery entry.
+            // Post-condition: no bridge state, and no known-context discovery
+            // entry.
             assert!(
                 crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_err(),
                 "FFI state must NOT survive a failed join"
@@ -6782,17 +6755,16 @@ mod tests {
     }
 
     /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
-    /// FFI-state entry fails `context_join_from_welcome` at the
-    /// `register_ffi_state` precheck — which runs BEFORE
-    /// `spawn_actor_from_welcome` consumes the single-use `KeyPackage` — and does
-    /// NOT roll back the pre-existing entry (the bridge must never delete state
-    /// it did not create).
+    /// FFI-state entry fails `context_join_from_welcome` at its occupancy check
+    /// — which runs BEFORE `spawn_actor_from_welcome` consumes the single-use
+    /// `KeyPackage` — and does NOT remove the pre-existing entry (the bridge
+    /// must never delete state it did not create).
     ///
     /// Drives the REAL entry with a locally-custodied joiner (custody gate
     /// passes) against a context whose FFI state is already registered. The
-    /// register-first ordering surfaces the collision as an `already registered`
-    /// error at the precheck, with the `KeyPackage` untouched; the pre-existing
-    /// entry SURVIVES the failed join.
+    /// collision surfaces as an `already registered` error at the occupancy
+    /// check, with the `KeyPackage` untouched; the pre-existing entry SURVIVES
+    /// the failed join.
     #[test]
     #[cfg(feature = "testing")]
     fn join_from_welcome_occupied_ffi_state_fails_before_keypackage_consumption() {
@@ -6811,8 +6783,8 @@ mod tests {
                 .unwrap();
 
             // A well-formed 32-byte `enc` so control passes the bridge
-            // enc-length check and reaches the `register_ffi_state` Occupied
-            // precheck (which runs BEFORE the KeyPackage consume).
+            // enc-length check and reaches the occupancy check (which runs
+            // BEFORE the KeyPackage consume).
             let sealed = __sealed(
                 &ctx_id,
                 "did:dht:z6MkOccupiedCreator",
@@ -6826,14 +6798,14 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains("already registered"),
-                "expected an Occupied-precheck rejection before KeyPackage consumption, got: {msg}"
+                "expected an occupancy-check rejection before KeyPackage consumption, got: {msg}"
             );
 
             // The PRE-EXISTING entry must SURVIVE — the failing join must not roll
             // back state it did not create.
             assert!(
                 crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_ok(),
-                "the pre-existing FFI state must be preserved on an Occupied-precheck failure"
+                "the pre-existing FFI state must be preserved on an occupancy-check failure"
             );
         });
     }
@@ -8238,10 +8210,9 @@ mod tests {
         let (scp, handle) = lifecycle_fixture("a9", creator);
         close_context_behind_the_handle(&scp, &handle, creator);
         scp.finalize_close(&handle).expect("finalize_close");
-        // The fixture close marked the id released on this bridge instance,
-        // and registration refuses a marked id, so clear the mark first.
-        crate::runtime::readmit_context(&scp.inner, handle.context_id());
-        crate::runtime::register_context(&scp.inner, handle.context_id(), creator, &[])
+        // The fixture close left a release mark, so the test readmits the id
+        // and rebuilds its bridge state in one step.
+        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
             .expect("re-register the bridge state the fixture close released");
         assert_eq!(
             crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
@@ -8420,10 +8391,9 @@ mod tests {
         let creator = "did:dht:z6MkFailedDispatchCreator";
         let (scp, handle) = lifecycle_fixture("c1", creator);
         close_context_behind_the_handle(&scp, &handle, creator);
-        // The fixture close marked the id released on this bridge instance,
-        // and registration refuses a marked id, so clear the mark first.
-        crate::runtime::readmit_context(&scp.inner, handle.context_id());
-        crate::runtime::register_context(&scp.inner, handle.context_id(), creator, &[])
+        // The fixture close left a release mark, so the test readmits the id
+        // and rebuilds its bridge state in one step.
+        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
             .expect("re-register the bridge state the fixture close released");
         assert_eq!(
             crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
@@ -8507,10 +8477,9 @@ mod tests {
         assert!(!registry().contains_key(&absent));
 
         close_context_behind_the_handle(&scp, &active, creator);
-        // The fixture close left a release mark, and `register_context` refuses a
-        // marked id, so the test clears it before rebuilding the state.
-        crate::runtime::readmit_context(&scp.inner, active.context_id());
-        crate::runtime::register_context(&scp.inner, active.context_id(), creator, &[])
+        // The fixture close left a release mark, so the test readmits the id
+        // and rebuilds its bridge state in one step.
+        crate::runtime::readmit_and_register_ffi_state(&scp.inner, active.context_id(), &[])
             .expect("re-register the bridge state the fixture close released");
         assert!(
             crate::runtime::release_context_unless_readmitted(
@@ -8582,10 +8551,9 @@ mod tests {
         // and releases the bridge state, so re-register the state: this case
         // asks what a close does to a LIVE entry, not to an absent one.
         close_context_behind_the_handle(&scp, &handle, creator);
-        // The fixture close marked the id released on this bridge instance,
-        // and registration refuses a marked id, so clear the mark first.
-        crate::runtime::readmit_context(&scp.inner, handle.context_id());
-        crate::runtime::register_context(&scp.inner, handle.context_id(), creator, &[])
+        // The fixture close left a release mark, so the test readmits the id
+        // and rebuilds its bridge state in one step.
+        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
             .expect("re-register the bridge state the fixture close released");
         assert_eq!(
             crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
@@ -9152,7 +9120,7 @@ mod tests {
     /// `SCP-VALID-7005`, and creates a context whose
     /// supervisor-held role state carries a non-empty declared ceiling as
     /// written. The accepted case proves the check does not reject every
-    /// create. No bridge copy is read.
+    /// create.
     #[test]
     #[cfg(feature = "testing")]
     fn context_create_rejects_an_absent_none_or_empty_ceiling() {
