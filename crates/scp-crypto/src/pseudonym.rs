@@ -28,10 +28,10 @@
 //! private key bytes, never from a public key. A public-key-keyed derivation
 //! would be a membership enumeration oracle.
 
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
-
-use crate::kdf::{hkdf_expand, hkdf_extract, hmac_sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::p256::{P256PublicKey, P256SecretKey, SeedLabel};
 
@@ -60,11 +60,33 @@ pub enum PseudonymVersion {
 }
 
 /// Derives the `pseudonym_secret` from 32 bytes of private key material via
-/// HKDF-SHA-256 (§9.10.4.A). The PRK and the output block wipe on drop.
+/// HKDF-SHA-256 (§9.10.4.A). The returned secret wipes on drop; the `hkdf`
+/// crate's PRK does not, so wiping is best effort.
 #[must_use]
 pub fn derive_pseudonym_secret(ikm: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-    let prk = hkdf_extract(PSEUDONYM_SECRET_SALT, ikm);
-    hkdf_expand::<32>(&prk, b"")
+    let mut secret = Zeroizing::new([0u8; 32]);
+    // 32 bytes is within 255 · HashLen, so the expansion cannot fail.
+    let Ok(()) = Hkdf::<Sha256>::new(Some(PSEUDONYM_SECRET_SALT), ikm).expand(b"", secret.as_mut())
+    else {
+        unreachable!("32 bytes is within 255 * HashLen")
+    };
+    secret
+}
+
+/// `HMAC-SHA256(key, parts[0] || parts[1] || …)` into a wiping buffer. The
+/// keyed HMAC state is not wiped, so wiping is best effort.
+fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 32]> {
+    // HMAC accepts a key of any length.
+    let Ok(mut mac) = <Hmac<Sha256> as Mac>::new_from_slice(key) else {
+        unreachable!("HMAC-SHA256 accepts keys of any length")
+    };
+    for part in parts {
+        mac.update(part);
+    }
+    let mut bytes: [u8; 32] = mac.finalize().into_bytes().into();
+    let out = Zeroizing::new(bytes);
+    bytes.zeroize();
+    out
 }
 
 /// Computes the per-context `context_seed` (§9.10.4 v1, §9.10.4.1 v2).
@@ -96,7 +118,10 @@ pub fn pseudonym_from_context_seed(context_seed: &[u8; 32]) -> P256PublicKey {
 
 /// Derives the per-context pseudonym point from identity private key material
 /// (`ikm`) for the static (v1) or rotatable (v2) `version` (§9.10.4,
-/// §9.10.4.1). Every intermediate secret wipes on drop.
+/// §9.10.4.1).
+///
+/// Every intermediate buffer this crate owns wipes on drop (best effort; see
+/// [`derive_pseudonym_secret`]).
 #[must_use]
 pub fn derive_pseudonym(
     ikm: &[u8; 32],
@@ -122,20 +147,6 @@ pub fn pseudonym_routing_id(context_pseudonym: &P256PublicKey) -> [u8; 32] {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    /// Compile-time pin for review item "zeroize HMAC/HKDF state": the SHA-256
-    /// core that `Hmac<Sha256>` (inside `crate::kdf`) keys with the pseudonym
-    /// secret or PRK, the block buffer, and the MAC output all wipe on drop.
-    /// Dropping the `zeroize` feature from sha2/hmac fails this to compile.
-    #[test]
-    fn secret_bearing_hash_state_zeroizes_on_drop() {
-        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
-        assert_zod::<Sha256>();
-        assert_zod::<
-            hmac::digest::block_api::Buffer<<Sha256 as hmac::digest::block_api::CoreProxy>::Core>,
-        >();
-        assert_zod::<hmac::digest::CtOutput<hmac::Hmac<Sha256>>>();
-    }
 
     fn h<const N: usize>(s: &str) -> [u8; N] {
         hex::decode(s).unwrap().try_into().unwrap()

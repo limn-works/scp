@@ -261,7 +261,14 @@ impl P256SecretKey {
 /// 32-byte seed, both of which §9.10.4 forbids.
 #[must_use]
 pub fn seed_to_scalar(label: SeedLabel, seed: &[u8; 32]) -> NonZeroScalar {
-    let okm = crate::kdf::hkdf_expand::<48>(seed, label.as_bytes());
+    // A 32-byte PRK is `HashLen`, and 48 ≤ 255 · HashLen, so neither call fails.
+    let Ok(hkdf) = hkdf::Hkdf::<sha2::Sha256>::from_prk(seed) else {
+        unreachable!("a 32-byte PRK is HashLen")
+    };
+    let mut okm = Zeroizing::new([0u8; 48]);
+    let Ok(()) = hkdf.expand(label.as_bytes(), okm.as_mut()) else {
+        unreachable!("48 bytes is within 255 * HashLen")
+    };
 
     let mut wide = U384::from_be_slice(okm.as_ref());
     let mut reduced = wide.rem(&N_MINUS_ONE);

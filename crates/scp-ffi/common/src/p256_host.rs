@@ -154,8 +154,9 @@ pub fn p256_pseudonym_point(context_seed: &[u8]) -> Result<[u8; 33], P256HostErr
 /// From the 32-byte identity key material `ikm`:
 /// `pseudonym_secret = HKDF-SHA256(ikm, "scp-pseudonym-secret-v1")`, the v1
 /// `context_seed` for `context_id` when `epoch` is `None` and the v2 seed at
-/// `epoch` otherwise (§9.10.4.1), then the point. Every intermediate secret,
-/// and this function's copy of `ikm`, is wiped on drop.
+/// `epoch` otherwise (§9.10.4.1), then the point. This function's copy of
+/// `ikm` and every intermediate buffer `scp-crypto` owns are wiped on drop;
+/// the hash crates' internal state is not, so wiping is best effort.
 ///
 /// # Errors
 ///

@@ -11,7 +11,6 @@
 //! - [`signer`]: the curve-neutral [`ScpSigner`] trait.
 
 pub mod custody;
-mod kdf;
 pub mod p256;
 pub mod pseudonym;
 pub mod signer;
