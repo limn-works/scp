@@ -55,12 +55,21 @@ use crate::wrapping_extension::extract_wrapping_key;
 /// `ProcessedMessageContent::OwnPrivateMessage`, an undecrypted body, and an
 /// unverified signature; the typed error lets the receive loop drop it benignly
 /// instead of reading an unauthenticated sender or AAD.
-/// `ProcessedMessageContent::OwnPendingCommit` gets the same error, but a
-/// `PrivateMessage` never reaches it: openmls 0.9.0's `from_inbound_ciphertext`
-/// (`framing/validation.rs`) returns `OwnPrivateMessage` for every
-/// `PrivateMessage` whose sender is the local member, before decryption, so a
-/// member's own Commit sent as a `PrivateMessage` also arrives as
-/// `OwnPrivateMessage`.
+/// `ProcessedMessageContent::OwnPendingCommit` gets the same error.
+///
+/// SCP merges each Commit it creates before publishing it (`add_member` and
+/// `remove_member` in `group.rs`, the two self-updates in `ratchet.rs`), so the
+/// relay's echo of a member's own Commit reaches that member one epoch behind
+/// the member's group. openmls 0.9.0's `decrypt_message` runs
+/// `validate_framing` first, and `validate_framing` refuses a non-application
+/// message from any epoch but the current one, so that echo returns
+/// [`MlsError::DecryptionFailed`] and leaves the epoch unchanged.
+/// [`MlsError::CannotDecryptOwnMessage`] covers a member's own application
+/// message and a member's own Commit that the member has not merged. For a
+/// `PrivateMessage` from the local member, openmls 0.9.0's
+/// `from_inbound_ciphertext` (`framing/validation.rs`) returns
+/// `OwnPrivateMessage` before decryption; openmls returns `OwnPendingCommit`
+/// only for an unmerged own Commit sent as a `PublicMessage`.
 ///
 /// # openmls's receive-side `Lifetime` clock check
 ///
@@ -1211,12 +1220,32 @@ mod tests {
             .unwrap()
     }
 
-    /// A member that processes its own ciphertext (the relay's echo) gets the
-    /// typed `CannotDecryptOwnMessage` from every decrypt entry point, not a
-    /// wildcard `NotApplicationMessage` or a sender lookup on its own leaf.
-    /// The echo of the member's own unmerged Commit gets the same error and
-    /// leaves the epoch unchanged, whether it arrives as a `PrivateMessage`
-    /// (SCP's wire-format policy, openmls's `OwnPrivateMessage`) or as a
+    /// Stages a self-update Commit on `group`, merges it as SCP merges every
+    /// Commit before publishing it, and returns the Commit's wire bytes.
+    #[allow(clippy::unwrap_used)]
+    fn merged_self_update_bytes(group: &mut ScpMlsGroup) -> Vec<u8> {
+        let bytes = unmerged_self_update_bytes(group);
+        group
+            .group
+            .as_mut()
+            .unwrap()
+            .merge_pending_commit(&group.provider)
+            .unwrap();
+        bytes
+    }
+
+    /// A member that processes its own application ciphertext (the relay's
+    /// echo) gets the typed `CannotDecryptOwnMessage` from every decrypt entry
+    /// point, not a wildcard `NotApplicationMessage` or a sender lookup on its
+    /// own leaf.
+    ///
+    /// SCP merges each Commit before publishing it, so the relay's echo of a
+    /// member's own Commit arrives one epoch behind the member, and openmls's
+    /// epoch check in `validate_framing` refuses it with `DecryptionFailed`.
+    /// Every entry point returns that error and leaves the epoch unchanged.
+    /// A member's own Commit that the member has not merged gets
+    /// `CannotDecryptOwnMessage` and leaves the epoch unchanged, whether it
+    /// arrives as a `PrivateMessage` (openmls's `OwnPrivateMessage`) or as a
     /// `PublicMessage` (openmls's `OwnPendingCommit`).
     #[test]
     #[allow(clippy::unwrap_used)]
@@ -1269,6 +1298,32 @@ mod tests {
                     "{name} must leave the epoch unchanged after the own {framing} Commit"
                 );
             }
+        }
+
+        // The production shape: the member merged its own Commit before the
+        // relay echoed it back, so the echo is one epoch behind the member.
+        // openmls 0.9.0 enforces this refusal: `validate_framing`'s epoch check
+        // runs inside `process_message`, before any SCP code reads the message,
+        // and no SCP-side change can make openmls accept a previous-epoch
+        // Commit. This loop pins openmls's refusal and SCP's mapping of it to
+        // `DecryptionFailed`.
+        let (mut merged_group, _bob_group) = setup_alice_bob();
+        let epoch_before_commit = merged_group.epoch().unwrap();
+        let commit_bytes = merged_self_update_bytes(&mut merged_group);
+        let epoch_after_merge = merged_group.epoch().unwrap();
+        assert_eq!(epoch_after_merge, epoch_before_commit + 1);
+        for (name, decrypt_fn) in entry_points {
+            let result = decrypt_fn(&mut merged_group, &commit_bytes);
+            assert!(
+                matches!(result, Err(MlsError::DecryptionFailed(_))),
+                "{name} must refuse the echo of the own merged Commit with \
+                 DecryptionFailed (openmls's epoch check), got {result:?}"
+            );
+            assert_eq!(
+                merged_group.epoch().unwrap(),
+                epoch_after_merge,
+                "{name} must leave the epoch unchanged after the own merged Commit's echo"
+            );
         }
     }
 
