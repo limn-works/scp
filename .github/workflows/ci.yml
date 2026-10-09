@@ -203,7 +203,7 @@ env:
 # workflows, where the two together wrote thirty-six entries before. The
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the
 # comment above job pyo3-module counts them.
-# `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring, fails any
+# `scripts/check-workflow-compile-steps.py`, run by job toolchain-wiring-cases, fails any
 # rust-cache step in any workflow that names no `shared-key` or no `save-if`, and any
 # group with zero or with two writers or with a writer off `main`.
 #
@@ -273,6 +273,9 @@ jobs:
       scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web == 'true' || steps.filter.outputs.toolchain == 'true' }}
       kotlin: ${{ steps.filter.outputs.kotlin == 'true' || steps.filter.outputs.toolchain == 'true' }}
       swift: ${{ steps.filter.outputs.swift == 'true' || steps.filter.outputs.toolchain == 'true' }}
+      # True for every change outside prose; the `code` filter below says which paths
+      # count as prose and which jobs this output guards.
+      code: ${{ steps.filter.outputs.code == 'true' || steps.filter.outputs.toolchain == 'true' }}
       # `fuzz-build` is the one job the stable pin does not decide: it runs `cargo check`
       # with `working-directory: fuzz`, where rustup resolves `fuzz/rust-toolchain.toml`
       # instead, and the `fuzz` filter's `fuzz/**` entry already covers that file.
@@ -352,6 +355,33 @@ jobs:
               # reads it, and the next branch to rebase would find the check red.
               - '.clippy.toml'
               - 'rustfmt.toml'
+              # rust-test runs `crates/scp-testing/tests/integration/ffi_conformance.rs`,
+              # which compiles the first three of these in with `include_str!` and, at
+              # run time, fails an exemption whose reason cites an `ADR-NNN` or `SCP-NNN`
+              # token that no file under `.docs/adrs/` or `.docs/prds/` holds. The outlet
+              # conformance tests compile vectors out of `tests/conformance/`, and
+              # `crates/scp-client-wasm/tests/out048_ts_invoker_fixture_kat.rs` compiles
+              # in the typescript-wasm fixture listed below them. `ffi_conformance.rs` also
+              # reads `scripts/pure-helpers-allowlist.txt` at run time and compiles in the
+              # bridge-symmetry fixtures, and `crates/scp-testing/tests/integration/sdk_wrapper.rs`
+              # compiles in the Python, TypeScript, Swift and Kotlin SDK sources under the
+              # four `bindings/` directories listed last. A pull request that edits only one
+              # of them changes what rust-test asserts. The `prose-route` check of
+              # `scripts/tests/ci-gate/ci_gate_selftest.py` scans `crates/**/*.rs` for every
+              # such read and fails when this filter does not select one.
+              - 'scripts/bridge-aliases.json'
+              - 'scripts/ffi-export-allowlist.json'
+              - '.docs/standards/sdk-capability-matrix.json'
+              - '.docs/adrs/**'
+              - '.docs/prds/**'
+              - 'tests/conformance/**'
+              - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
+              - 'scripts/pure-helpers-allowlist.txt'
+              - 'scripts/tests/bridge-symmetry/fixtures/**'
+              - 'bindings/python/scp_sdk/**'
+              - 'bindings/typescript/src/**'
+              - 'bindings/swift/Sources/SCP/**'
+              - 'bindings/kotlin/scp-kt/src/main/kotlin/**'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`
@@ -468,6 +498,44 @@ jobs:
               # that rewrites that command and changes nothing else would otherwise
               # skip the one job that runs it.
               - '.github/workflows/ci.yml'
+            # Every path a job compiles, executes, or feeds a gate as input, written as
+            # the complement of prose rather than as `'**'` minus exclusions. A pull
+            # request that changes only prose (`.docs/**`, `.claude/**`, a root-level
+            # `*.md`, or `docs/guides/**/*.md`) leaves the `code` output false, and
+            # every job it guards skips: fail-closed-pre-rotation,
+            # shipped-feature-graph, wiping-allocator, protocol-deps, wasm-protocol,
+            # wasm-test and toolchain-wiring-cases. None of those jobs reads a prose
+            # path: each compiles crates, resolves `cargo tree` or `cargo metadata`,
+            # walks `git ls-files '*.rs'`, or runs a fixture suite in a `mktemp -d`
+            # tree. `scripts/tests/ci-gate/ci_gate_selftest.py` lists every tracked
+            # path and fails when one is selected neither by the `code` output nor by
+            # the prose patterns, so a file added outside these entries fails that
+            # check until someone classifies it.
+            code:
+              - 'crates/**'
+              - 'bindings/**'
+              - 'scripts/**'
+              - 'fuzz/**'
+              - 'tests/**'
+              - 'examples/**'
+              - 'scaffolds/**'
+              - 'templates/**'
+              - 'ratchet/**'
+              - 'docs/examples/**'
+              - '.github/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              - 'rustfmt.toml'
+              - '.clippy.toml'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '.gitignore'
+              - '.mise.toml'
+              - 'docker-compose.yml'
+              - 'LICENSE'
+              - 'LICENSE-AGPL'
+              - 'LICENSE-APACHE'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -490,8 +558,8 @@ jobs:
   # standing regression guard: if the fail-closed lowering ever regresses to a
   # silent nullifier fallback, `Ok(_)` trips the assertion.
   fail-closed-pre-rotation:
-    needs: check-draft
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     name: Fail-closed pre-rotation (SCP-IDENT-1059)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -560,8 +628,8 @@ jobs:
   # REJECT `scp-node --features testing`. NEVER add a resolved nullifier feature
   # to the allowlist to make this pass — fix the dependency edge.
   shipped-feature-graph:
-    needs: check-draft
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     name: Shipped-feature-graph (G1 prove-absence)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -585,7 +653,8 @@ jobs:
   # and must pass. It reads `cargo metadata --no-deps` and compiles nothing, so
   # it restores no cache.
   wiping-allocator:
-    needs: check-draft
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Wiping allocator (§9.15)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -727,8 +796,8 @@ jobs:
       - run: python3.12 scripts/check-construction-pattern.py
 
   protocol-deps:
-    needs: check-draft
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     name: Protocol deps check
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -800,10 +869,43 @@ jobs:
         with:
           python-version: "3.12"
       - run: bash scripts/check-toolchain-wiring.sh
+      # `crates/scp-testing/tests/integration/pipeline_wiring.rs` test
+      # `agents_md_enforcement_sections_present` fails when AGENTS.md loses either
+      # heading below, but it runs only in the Rust lane, which a pull request that edits
+      # AGENTS.md alone never selects. This step holds the same two strings on every
+      # pull request, so deleting an enforcement section cannot merge on a prose-only
+      # change and then fail the next pull request that touches `crates/`.
+      - name: AGENTS.md keeps its enforcement sections
+        run: |
+          grep -qF 'Integration checklist (MANDATORY' AGENTS.md || { echo "AGENTS.md lost 'Integration checklist (MANDATORY'"; exit 1; }
+          grep -qF 'NEVER modify enforcement files' AGENTS.md || { echo "AGENTS.md lost 'NEVER modify enforcement files'"; exit 1; }
+
+  # The fixture suites and the workflow-shape check that used to run inside
+  # toolchain-wiring. Every input they read is code: each suite copies a real script
+  # (`scripts/check-toolchain-wiring.sh`, `scripts/check-resolved-rustc.sh`,
+  # `scripts/setup-toolchain.sh`, `scripts/hooks/pre-commit`,
+  # `scripts/pre-commit-clippy-scope.py`) into a `mktemp -d` tree and writes its own
+  # fixture files there, and the compile-steps check reads `.github/workflows/*.yml`.
+  # The `.docs/standards/swift-bindings.md` path one toolchain-wiring case names is a
+  # fixture file it writes under that temporary tree, not the repository's copy. So a
+  # prose-only change cannot alter what this job reports, and the `code` output skips
+  # it; `scripts/check-toolchain-wiring.sh` itself stays in toolchain-wiring, which runs
+  # on every pull request.
+  toolchain-wiring-cases:
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
+    name: enforcement / toolchain wiring cases
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh
-      # scripts/hooks/pre-commit runs the toolchain check above on every commit, and runs
-      # each language's format and lint steps only for files that differ from what the
+      # scripts/hooks/pre-commit runs `scripts/check-resolved-rustc.sh` on every commit,
+      # and runs each language's format and lint steps only for files that differ from what the
       # commit's parent — or, on a merge, each merged-in head — already carries. These
       # cases commit through the real hook in throwaway repositories with `cargo` stubbed.
       - name: Run pre-commit merge cases
@@ -875,7 +977,7 @@ jobs:
       # same reason: a breaking upstream release cannot red a required check
       # without a deliberate bump.
       # PyYAML for check-workflow-compile-steps.py, which parses every workflow
-      # file and which the toolchain-wiring job installs the same pin for.
+      # file and which the toolchain-wiring-cases job installs the same pin for.
       - run: pip install 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift ruff==0.15.4 'pyyaml>=6,<7'
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -1112,8 +1214,8 @@ jobs:
       - run: python3.12 scripts/check-bridge-instance-lifecycle.py
 
   wasm-protocol:
-    needs: check-draft
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     name: WASM / protocol
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1132,8 +1234,8 @@ jobs:
       - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
-    needs: check-draft
-    if: github.event_name != 'push'
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
     name: WASM / test
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -4212,6 +4314,7 @@ jobs:
       - deleted-primitives
       - bridge-instance-lifecycle
       - toolchain-wiring
+      - toolchain-wiring-cases
       - fix-round-check-selftest
       - docker-image
       - docker-image-cache

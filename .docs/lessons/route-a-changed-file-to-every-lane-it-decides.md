@@ -25,6 +25,19 @@ therefore merges with every job that reads it skipped.
   steps.filter.outputs.toolchain == 'true'`. Check 2e of
   `scripts/check-toolchain-wiring.sh` reads the outputs out of the workflow, so a lane added
   later without that clause fails the gate.
+- **A job that reads no prose skips on a prose-only change, through the `code` output.** The
+  `code` filter lists every path a job compiles, executes, or feeds a gate as input, and its
+  output ORs in `toolchain` like every other lane. Jobs that ran on every pull request but read
+  only code (fail-closed-pre-rotation, shipped-feature-graph, wiping-allocator, protocol-deps,
+  wasm-protocol, wasm-test, toolchain-wiring-cases) are guarded by it. A job that reads a prose
+  file needs a filter that selects that file: the `rust` filter lists `.docs/adrs/**`,
+  `.docs/prds/**` and `.docs/standards/sdk-capability-matrix.json`, which rust-test reads. Job
+  `toolchain-wiring` checks on every pull request that `AGENTS.md` keeps the two headings
+  `pipeline_wiring.rs` asserts, because no filter of job `changes` selects `AGENTS.md`.
+- **A positive list needs a coverage check, or a new file falls between it and prose.**
+  `scripts/tests/ci-gate/ci_gate_selftest.py` (`prose-route`) lists every `git ls-files` path
+  and fails on each one that the `code` output does not select and that is not prose: under
+  `.docs/` or `.claude/`, a root-level `*.md`, or a `*.md` under `docs/guides/`.
 - **`on: pull_request: paths:` needs no such routing**, because a required check whose
   workflow never starts stays pending and blocks the merge.
 
@@ -34,3 +47,5 @@ dorny/paths-filter's `predicate-quantifier` defaults to `some`, so `'**'` makes 
 true for every pull request and `!` exclusions subtract only under `some-with-excludes`,
 which changes matching for every filter in the block. It would also run clippy, the test
 lane, both production builds, cargo-deny, and the image build on every `.docs/`-only commit.
+The `code` filter avoids both problems by listing directories and root files, with no `'**'`
+and no `!` entry, and the `prose-route` check covers what such a list can miss.

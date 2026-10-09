@@ -270,6 +270,16 @@ nothing:
                computes each path group's filter outputs from the `changes` job
                and reports every event whose answer differs from
                MACOS_BRIDGE_PATH_CASES.
+  prose-route  A pull request that changes only prose skips every job the
+               `code` output guards. That output is a positive list of paths,
+               so a file added outside it and outside prose would change with
+               those jobs skipped and `ci` green. The check lists every path
+               `git ls-files` reports and fails on each one the `code` output
+               does not select and that is not under `.docs/` or `.claude/`, a
+               root-level `*.md`, or a `*.md` under `docs/guides/`. It also
+               fails on each tracked path rust-test reads, found by scanning
+               `crates/**/*.rs` for include and workspace_root literals, that
+               the `rust` output does not select and no always-on step mirrors.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -286,6 +296,7 @@ import copy
 import functools
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -640,8 +651,22 @@ RUST_ONLY = {
     "kotlin": "false",
     "swift": "false",
     "fuzz": "false",
+    "code": "true",
 }
 DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
+
+# Jobs the `code` output selects: true for every change outside prose, so every
+# scenario below but docs-only runs them. wiping-allocator also runs on a push;
+# the rest are in NOT_ON_PUSH_FILTER_JOBS.
+CODE_JOBS = (
+    "fail-closed-pre-rotation",
+    "protocol-deps",
+    "shipped-feature-graph",
+    "toolchain-wiring-cases",
+    "wasm-protocol",
+    "wasm-test",
+    "wiping-allocator",
+)
 
 # Jobs whose `if:` reads `github.event_name` rather than a `changes` filter
 # output, so a filter scenario decides nothing about them and each scenario
@@ -672,7 +697,6 @@ NOT_ON_PUSH_JOBS = (
     "doc-citations",
     "doc-includes",
     "error-codes",
-    "fail-closed-pre-rotation",
     "fallback-registry",
     "handle-affinity",
     "handler-no-panic",
@@ -682,14 +706,10 @@ NOT_ON_PUSH_JOBS = (
     "no-mutable-globals-ts",
     "no-panic-abort",
     "pyi-generated",
-    "protocol-deps",
     "protocol-sync",
     "saga-gating-granularity",
     "sdk-coverage",
-    "shipped-feature-graph",
     "toolchain-wiring",
-    "wasm-protocol",
-    "wasm-test",
 )
 
 # Jobs a `changes` filter output selects whose `if:` also reads
@@ -700,6 +720,8 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "bridge-parity",
     "bridge-parity-swift",
     "docker-image",
+    "fail-closed-pre-rotation",
+    "protocol-deps",
     "python-lint",
     "python-test",
     "rust-build-pyo3-production",
@@ -709,9 +731,13 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "rust-fmt",
     "rust-test-napi-production",
     "scaffold-typescript-web-check",
+    "shipped-feature-graph",
     "swift-build-test",
     "swift-lint",
+    "toolchain-wiring-cases",
     "typescript-check",
+    "wasm-protocol",
+    "wasm-test",
 )
 
 
@@ -758,7 +784,7 @@ RUST_ONLY_RUNS = {
     "typescript-check": True,
     "typescript-wasm-check": False,
     "xcframework": True,
-}
+} | dict.fromkeys(CODE_JOBS, True)
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
 # A Rust-only pull request skips the four macOS bridge jobs, while a Rust-only
 # merge_group run runs all four and a Rust-only push runs the two producers among
@@ -771,8 +797,8 @@ MACOS_BRIDGE_JOBS = (
     "xcframework",
 )
 RUST_ONLY_PR_RUNS = RUST_ONLY_RUNS | dict.fromkeys(MACOS_BRIDGE_JOBS, False)
-PYTHON_ONLY = DOCS_ONLY | {"python": "true"}
-PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+PYTHON_ONLY = DOCS_ONLY | {"python": "true", "code": "true"}
+PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     (
         "bridge-parity",
         "bridge-parity-kotlin",
@@ -795,9 +821,9 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
 # in its own scenario because scaffold-typescript-web-check ORs it with
 # scaffold-typescript-web.
 SWIFT_TYPESCRIPT = DOCS_ONLY | dict.fromkeys(
-    ("swift", "typescript", "scaffold-typescript-web"), "true"
+    ("swift", "typescript", "scaffold-typescript-web", "code"), "true"
 )
-SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     (
         "bridge-parity",
         "bridge-parity-swift",
@@ -812,8 +838,8 @@ SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
     ),
     True,
 )
-WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true"}
-WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true", "code": "true"}
+WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     ("scaffold-typescript-web-check", "typescript-wasm-check"), True
 )
 
@@ -6420,6 +6446,205 @@ def check_macos_bridge_mutants(doc: dict) -> None:
         check(f"{label} is reported", found, detail)
 
 
+# CRITERION for unrouted_paths: a tracked path is routed when the `code` output
+# of job `changes` selects it or when it is prose. Prose is every path under
+# `.docs/` or `.claude/`, every `*.md` file at the repository root, and every
+# `*.md` file under `docs/guides/`. A pull request that changes only prose skips
+# every job the `code` output guards, so a path that is neither reaches no such
+# job when it alone changes, whatever that job reads.
+def is_prose(path: str) -> bool:
+    """Report whether a tracked path is prose, which no `code`-guarded job reads."""
+    if path.startswith((".docs/", ".claude/")):
+        return True
+    if path.endswith(".md"):
+        return "/" not in path or path.startswith("docs/guides/")
+    return False
+
+
+def unrouted_paths(doc: dict, paths: list[str]) -> list[str]:
+    """Return each path the `code` output does not select and that is not prose.
+
+    The `code` output ORs filter keys together the way every other output does,
+    so a path counts as selected when any filter that output names lists a
+    pattern covering it; pattern_covers reads a pattern shape it does not know as
+    covering nothing, which reports a path rather than passing it.
+    """
+    patterns = output_patterns(doc, "code")
+    if isinstance(patterns, str):
+        return [patterns]
+    return [path for path in paths if not is_prose(path) and not pattern_covers(patterns, path)]
+
+
+def output_patterns(doc: dict, output: str) -> set[str] | str:
+    """Every pattern of every filter the `changes` output `output` reads, or an error."""
+    filters = path_filters(doc["jobs"])
+    expression = (doc["jobs"]["changes"].get("outputs") or {}).get(output)
+    if expression is None:
+        return f"`changes` publishes no `{output}` output"
+    keys = STEP_FILTER_OUTPUT.findall(str(expression))
+    missing = [key for key in keys if key not in filters]
+    if not keys or missing:
+        return f"`changes` output `{output}` reads {keys}, not a filter key"
+    return set().union(*(filters[key] for key in keys))
+
+
+# rust_test_reads lists the files outside `crates/` that a workspace source, and so
+# rust-test (`cargo nextest run --workspace`), can read, by scanning every tracked
+# `crates/**/*.rs` file: the literal of
+# each `include_str!` or `include_bytes!`, resolved against that file's directory, and
+# the literal of each `workspace_root().join(...)`. It also walks the directories
+# below, which ffi_conformance.rs passes to `prefixed_tokens_under` and no literal path
+# names. An entry ends in `/` and stands for every tracked path under it.
+RUST_TEST_RUNTIME_DIRS = (".docs/adrs/", ".docs/prds/")
+# A rust-test input that no filter routes to rust-test, mapped to the name of the
+# always-on step in job `toolchain-wiring` that asserts what rust-test asserts of it.
+RUST_TEST_MIRRORED = {"AGENTS.md": "AGENTS.md keeps its enforcement sections"}
+RUST_INCLUDE_LITERAL = re.compile(r'include_(?:str|bytes)!\(\s*"((?:[^"\\]|\\.)*)"\s*\)', re.DOTALL)
+RUST_WORKSPACE_JOIN_LITERAL = re.compile(r'workspace_root\(\)\s*\.join\(\s*"([^"]+)"\s*\)')
+
+
+def rust_test_reads(sources: dict[str, str]) -> set[str]:
+    """Each path outside `crates/` that a `crates/` source names in an include or a workspace_root join."""
+    reads = set()
+    for source, text in sources.items():
+        for match in RUST_INCLUDE_LITERAL.finditer(text):
+            # A backslash before a newline continues a Rust string literal past it.
+            literal = re.sub(r"\\\n\s*", "", match.group(1))
+            reads.add(posixpath.normpath(posixpath.join(posixpath.dirname(source), literal)))
+        reads.update(posixpath.normpath(m.group(1)) for m in RUST_WORKSPACE_JOIN_LITERAL.finditer(text))
+    return {path for path in reads if not path.startswith("crates/")}
+
+
+def crate_sources(paths: list[str]) -> dict[str, str]:
+    """The text of every tracked `crates/**/*.rs` path."""
+    return {
+        path: (REPO / path).read_text(encoding="utf-8")
+        for path in paths
+        if path.startswith("crates/") and path.endswith(".rs")
+    }
+
+
+def rust_test_inputs_unselected(doc: dict, paths: list[str], reads: set[str]) -> list[str]:
+    """Return each tracked rust-test input the `rust` output does not select and no step mirrors."""
+    patterns = output_patterns(doc, "rust")
+    if isinstance(patterns, str):
+        return [patterns]
+    inputs = [
+        path for path in paths if path in reads or any(path.startswith(entry) for entry in RUST_TEST_RUNTIME_DIRS)
+    ]
+    return [path for path in inputs if path not in RUST_TEST_MIRRORED and not pattern_covers(patterns, path)]
+
+
+def tracked_paths() -> list[str]:
+    """Every path `git ls-files` lists in this checkout."""
+    proc = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-z"],
+        capture_output=True,
+        check=True,
+    )
+    return [path for path in proc.stdout.decode().split("\0") if path]
+
+
+def check_every_path_routed(doc: dict) -> None:
+    paths = tracked_paths()
+    check("git ls-files lists this checkout's own ci.yml", ".github/workflows/ci.yml" in paths)
+    gaps = unrouted_paths(doc, paths)
+    check(
+        "ci.yml: every tracked path is prose or selected by the `code` output",
+        not gaps,
+        f"{len(gaps)} unrouted: {gaps[:20]}",
+    )
+    # Controls: an unclassified root file, a non-Markdown file under docs/guides/,
+    # and a nested Markdown file outside docs/guides/ are each reported; prose is not.
+    planted = ["newtool.cfg", "docs/guides/diagram.svg", "docs/notes/plan.md"]
+    check(
+        "an unrouted path planted beside the tracked ones is reported",
+        unrouted_paths(doc, paths + planted) == gaps + planted,
+        f"{unrouted_paths(doc, paths + planted)}",
+    )
+    check(
+        "prose paths are not reported",
+        not unrouted_paths(doc, ["AGENTS.md", ".docs/specs/x.md", ".claude/a/b.json", "docs/guides/g.md"]),
+    )
+    mutant = copy.deepcopy(doc)
+    step = next(
+        step
+        for step in mutant["jobs"]["changes"]["steps"]
+        if str(step.get("uses") or "").startswith("dorny/paths-filter")
+    )
+    filters = yaml.safe_load(step["with"]["filters"])
+    check("filter code lists 'scripts/**' for the mutant", "scripts/**" in filters["code"])
+    filters["code"] = [entry for entry in filters["code"] if entry != "scripts/**"]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    check(
+        "a `code` filter that drops scripts/** reports scripts/ci-aggregate-result.py",
+        "scripts/ci-aggregate-result.py" in unrouted_paths(mutant, paths),
+    )
+    sources = crate_sources(paths)
+    reads = rust_test_reads(sources)
+    # Controls for the scan: a read on one line, a read whose literal continues past a
+    # backslash-newline, a workspace_root join, and a read of a prose file are each found.
+    for known in (
+        "bindings/python/scp_sdk/identity.py",
+        "scripts/tests/bridge-symmetry/fixtures/bad-alias-in-test-module-only/crates/scp-ffi/napi/src/widgets.rs",
+        "scripts/pure-helpers-allowlist.txt",
+        "AGENTS.md",
+    ):
+        check(f"the include and workspace_root scan finds rust-test input {known}", known in reads)
+    missing = sorted(reads - set(paths))
+    check("every path the scan resolves is tracked", not missing, f"{missing[:10]}")
+    planted = {
+        "crates/a/tests/t.rs": 'include_bytes!(\n    "../../../new/\\\n     x.bin"\n); include_str!("../src/y.rs");',
+        "crates/b/src/lib.rs": 'workspace_root().join("new/z.txt")',
+    }
+    check(
+        "the scan resolves planted reads and drops a read inside crates/",
+        rust_test_reads(planted) == {"new/x.bin", "new/z.txt"},
+        f"{rust_test_reads(planted)}",
+    )
+    conformance = sources.get("crates/scp-testing/tests/integration/ffi_conformance.rs", "")
+    for entry in RUST_TEST_RUNTIME_DIRS:
+        check(f"the checkout tracks rust-test input {entry}", any(p.startswith(entry) for p in paths))
+        check(
+            f"ffi_conformance.rs walks {entry} through prefixed_tokens_under",
+            f'prefixed_tokens_under("{entry.rstrip("/")}"' in conformance,
+        )
+    wiring_runs = {
+        str(step.get("name")): str(step.get("run") or "") for step in doc["jobs"]["toolchain-wiring"].get("steps") or []
+    }
+    for path, step_name in RUST_TEST_MIRRORED.items():
+        check(f"rust-test reads mirrored input {path}", path in reads)
+        check(f"job toolchain-wiring runs step '{step_name}' over {path}", path in wiring_runs.get(step_name, ""))
+    gaps = rust_test_inputs_unselected(doc, paths, reads)
+    check("ci.yml: the `rust` output selects every file rust-test reads", not gaps, f"{gaps[:20]}")
+    check(
+        "a planted rust-test read that no filter selects is reported",
+        rust_test_inputs_unselected(doc, [*paths, "new/x.bin"], reads | {"new/x.bin"}) == [*gaps, "new/x.bin"],
+    )
+    check(
+        "the `rust` output does not select a spec file rust-test never reads",
+        not pattern_covers(output_patterns(doc, "rust"), ".docs/specs/01-thesis.md"),
+    )
+    mutant = copy.deepcopy(doc)
+    step = next(
+        step
+        for step in mutant["jobs"]["changes"]["steps"]
+        if str(step.get("uses") or "").startswith("dorny/paths-filter")
+    )
+    filters = yaml.safe_load(step["with"]["filters"])
+    dropped = (".docs/adrs/**", "bindings/python/scp_sdk/**")
+    check(f"filter rust lists {dropped} for the mutant", all(entry in filters["rust"] for entry in dropped))
+    filters["rust"] = [entry for entry in filters["rust"] if entry not in dropped]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    unselected = rust_test_inputs_unselected(mutant, paths, reads)
+    expected = [p for p in paths if p.startswith(".docs/adrs/") or (p in reads and p.startswith("bindings/python/"))]
+    check(
+        f"a `rust` filter that drops {dropped} reports every ADR file and every Python SDK file rust-test reads",
+        bool(unselected) and unselected == expected,
+        f"{unselected[:5]}",
+    )
+
+
 def check_condition_grammar() -> None:
     """parse_condition reads the grammar ci.yml uses and refuses everything else."""
     outputs = {"rust": "true", "python": "false"}
@@ -6913,6 +7138,9 @@ def main() -> int:
     print("macos-bridges — a pull request runs the macOS bridge jobs only on their paths")
     check_macos_bridges_follow_their_paths(workflow)
     check_macos_bridge_mutants(workflow)
+
+    print("prose-route — every tracked path is prose or reaches the `code` output")
+    check_every_path_routed(workflow)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
