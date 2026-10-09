@@ -2022,7 +2022,7 @@ pub struct Supervisor {
     /// tracker alive until the pump ends.
     outlet_stream_admission:
         Arc<std::sync::RwLock<HashMap<String, Arc<std::sync::RwLock<StreamAdmissionTracker>>>>>,
-    /// Operator-scoped §05-contexts.md:448 per-origin-invoker admission
+    /// Operator-scoped §05-contexts.md:446 per-origin-invoker admission
     /// tracker. A SINGLE instance for the whole supervisor (operator) —
     /// deliberately NOT keyed by `context_id` like
     /// [`Self::outlet_stream_admission`] — so the per-origin-invoker
@@ -2286,7 +2286,7 @@ impl Supervisor {
             // on the first stream open).
             outlet_stream_pump_semaphore,
             outlet_stream_admission: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            // §05-contexts.md:448: a SINGLE operator-scoped origin
+            // §05-contexts.md:446: a SINGLE operator-scoped origin
             // admission tracker, shared across every context this
             // supervisor (operator) hosts. NOT keyed by context — that is
             // the whole point: the per-origin-invoker cap must span all of
@@ -2599,7 +2599,7 @@ impl Supervisor {
             .remove(context_id);
     }
 
-    /// Returns an `Arc` clone of the operator-scoped §05-contexts.md:448
+    /// Returns an `Arc` clone of the operator-scoped §05-contexts.md:446
     /// per-origin-invoker admission tracker.
     ///
     /// Unlike [`Self::outlet_stream_admission_for`], this is NOT keyed by
@@ -14146,7 +14146,7 @@ impl Supervisor {
 
         // Per-context admission tracker (per-invoker + per-outlet) +
         // operator-scoped origin admission tracker (per-origin-invoker,
-        // §05-contexts.md:448) + node-level pump semaphore.
+        // §05-contexts.md:446) + node-level pump semaphore.
         let admission = self.outlet_stream_admission_for(context_id);
         let origin_admission = self.outlet_stream_origin_admission();
         let pump_semaphore = self.outlet_stream_pump_semaphore();
