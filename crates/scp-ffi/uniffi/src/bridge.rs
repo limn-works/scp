@@ -4398,14 +4398,14 @@ pub(crate) struct GatedHandle<'a> {
 }
 
 impl<'a> GatedHandle<'a> {
-    /// Runs the lifecycle gate on `handle.context_id` and pairs the role state
-    /// it returns with `handle`.
+    /// Runs
+    /// [`UniffiBridgeInstance::require_active_context_with_ucan_before_authz`](crate::runtime::UniffiBridgeInstance::require_active_context_with_ucan_before_authz)
+    /// on `handle.context_id` and pairs the role state it returns with
+    /// `handle`.
     ///
     /// # Errors
     ///
-    /// Returns whatever
-    /// [`UniffiBridgeInstance::require_active_context_before_authz`](crate::runtime::UniffiBridgeInstance::require_active_context_before_authz)
-    /// returns.
+    /// Returns whatever that method returns.
     pub(crate) async fn gate<F>(
         bi: &crate::runtime::UniffiBridgeInstance,
         handle: &'a ContextHandle,
@@ -4416,7 +4416,7 @@ impl<'a> GatedHandle<'a> {
         F: FnOnce(String) -> ScpError,
     {
         let role_state = bi
-            .require_active_context_before_authz(&handle.context_id, verb, mk_err)
+            .require_active_context_with_ucan_before_authz(&handle.context_id, verb, mk_err)
             .await?;
         Ok(Self { handle, role_state })
     }
@@ -4431,7 +4431,7 @@ impl<'a> GatedHandle<'a> {
 /// `gated`'s role state, and the chain check anchors on that role state's
 /// `creator_did`. The per-context UCAN state supplies only the revocation list
 /// and the nonce tracker.
-pub(crate) async fn validate_outlet_ucan_uniffi(
+pub(crate) fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     gated: &GatedHandle<'_>,
     outlet_id: &str,
@@ -4460,10 +4460,6 @@ pub(crate) async fn validate_outlet_ucan_uniffi(
     }
     let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
-
-    // Ensure UCAN state is registered for this context on the caller's instance.
-    bi.ensure_ucan_registered_while_active(&handle.context_id)
-        .await?;
 
     bi.with_ucan_state(&handle.context_id, |ucan_state| {
         let production_resolver = bi.did_resolver();
@@ -14177,8 +14173,7 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )
-                .await?;
+                )?;
 
                 // Parse the optional spending UCAN JWT (§19.5
                 // AND-composition). Mirrors `context_send`. An invalid JWT
@@ -14476,8 +14471,7 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )
-                .await?;
+                )?;
 
                 let input_value: serde_json::Value =
                     serde_json::from_str(&input_json).map_err(|e| ScpError::Outlet {
@@ -14970,8 +14964,7 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )
-                .await?;
+                )?;
 
                 let mut store = handle.session_store.lock().await;
 
@@ -16144,7 +16137,7 @@ impl Scp {
                 // withholds every answer about the context from a caller this call
                 // has not yet authorized.
                 let role_state = bi
-                    .require_active_context_before_authz(
+                    .require_active_context_with_ucan_before_authz(
                         &handle.context_id,
                         "validate a UCAN in context",
                         |msg| ScpError::Context {
@@ -16157,10 +16150,6 @@ impl Scp {
                 // capability ceiling, and step 4 anchors the chain on the context
                 // creator. Both come from the supervisor actor.
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
-
-                // Ensure UCAN state is registered for this context on this instance.
-                bi.ensure_ucan_registered_while_active(&handle.context_id)
-                    .await?;
 
                 // Execute the full 11-step validation pipeline via per-context state.
                 let validation_result = bi
@@ -16321,7 +16310,7 @@ impl Scp {
                 // withholds every answer about the context from a caller this call
                 // has not yet authorized.
                 let role_state = bi
-                    .require_active_context_before_authz(
+                    .require_active_context_with_ucan_before_authz(
                         &handle.context_id,
                         "evaluate a UCAN in context",
                         |msg| ScpError::Context {
@@ -16334,10 +16323,6 @@ impl Scp {
                 // capability ceiling, and step 4 anchors the chain on the context
                 // creator. Both come from the supervisor actor.
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
-
-                // Ensure UCAN state is registered for this context on this instance.
-                bi.ensure_ucan_registered_while_active(&handle.context_id)
-                    .await?;
 
                 // evaluate_ucan takes `&ValidationContext` and is read-only — it
                 // probes the nonce tracker via check_replay but never records,
@@ -16463,7 +16448,7 @@ impl Scp {
                 // withholds every answer about the context from a caller this call
                 // has not yet authorized.
                 let role_state = bi
-                    .require_active_context_before_authz(
+                    .require_active_context_with_ucan_before_authz(
                         &handle.context_id,
                         "revoke a UCAN in context",
                         |msg| ScpError::Context {
@@ -16476,10 +16461,6 @@ impl Scp {
                 // the context creator, and that creator comes from the supervisor
                 // actor.
                 let creator_did = role_state.creator_did;
-
-                // Ensure UCAN state is registered for this context on this instance.
-                bi.ensure_ucan_registered_while_active(&handle.context_id)
-                    .await?;
 
                 // Execute the full revocation pipeline within the UCAN state closure.
                 bi.with_ucan_state(&handle.context_id, |ucan_state| {
@@ -21485,6 +21466,63 @@ mod tests {
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
             "a failed state read must build no UCAN state"
+        );
+    }
+
+    /// `require_active_context_with_ucan_before_authz` builds UCAN state for
+    /// an `Active` context with no release mark, builds none while a mark
+    /// stands, and refuses an actor mid-respawn with the caller's code
+    /// (`SCP-CTX-2023`), not the read's `SCP-CTX-2135`, building no state.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn require_active_with_ucan_withholds_a_failed_read_and_builds_only_while_active() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let gate = |id: &str| {
+            rt.block_on(scp.inner.require_active_context_with_ucan_before_authz(
+                id,
+                "validate a UCAN in context",
+                |msg| ScpError::Context {
+                    msg,
+                    code: codes::CTX_2023.to_owned(),
+                },
+            ))
+        };
+
+        scp.inner.remove_ucan_state(&context_id);
+        gate(&context_id).expect("an Active context must pass the gate");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "an Active context with no mark must get UCAN state"
+        );
+
+        scp.inner.release_ucan_state(&context_id);
+        assert!(has_release_mark(&scp.inner, &context_id));
+        gate(&context_id).expect("the supervisor still reports the context Active");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "a release mark must stop the build"
+        );
+        scp.inner.readmit_context(&context_id);
+
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("context_create resolved a supervisor"),
+        );
+        rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
+        let err = gate(&context_id).expect_err("an actor mid-respawn must be refused");
+        assert_eq!(context_code_of(err), codes::CTX_2023);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "a refused gate must build no UCAN state"
         );
     }
 

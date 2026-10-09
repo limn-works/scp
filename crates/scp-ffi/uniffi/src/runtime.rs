@@ -21,7 +21,7 @@
 //!    is mandatory, spec §17.6) constructs a fresh `UniffiBridgeInstance`.
 //! 2. `Scp::method(...)` delegates to methods on
 //!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
-//!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
+//!    `did_resolver`, etc.) — all per-instance,
 //!    no process-wide shared state. `context_manager_expect` returns the
 //!    instance's `Arc<Supervisor>` (ADR-049 actor migration).
 //! 3. The instance is dropped when the last `Arc` reference is released
@@ -1170,6 +1170,30 @@ impl UniffiBridgeInstance {
     {
         let supervisor = self.context_manager_or_error()?;
         active_role_state_on(supervisor, context_id, verb, mk_err).await
+    }
+
+    /// Runs [`Self::require_active_context_before_authz`] and, when it returns
+    /// the role state, builds UCAN validation state for `context_id` from that
+    /// same `Active` read, without reading the supervisor again. No state is
+    /// built while a release mark stands on the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::require_active_context_before_authz`] returns.
+    pub(crate) async fn require_active_context_with_ucan_before_authz<F>(
+        &self,
+        context_id: &str,
+        verb: &str,
+        mk_err: F,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError>
+    where
+        F: FnOnce(String) -> crate::ScpError,
+    {
+        let role_state = self
+            .require_active_context_before_authz(context_id, verb, mk_err)
+            .await?;
+        self.ensure_ucan_registered(context_id);
+        Ok(role_state)
     }
 
     /// Per-instance equivalent of the module-level

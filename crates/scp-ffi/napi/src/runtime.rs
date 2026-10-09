@@ -1629,9 +1629,7 @@ where
 /// Per-context UCAN validation state (NAPI bridge).
 ///
 /// Wraps [`scp_ffi_common::bridge_runtime::UcanContextStateCore`] with
-/// NAPI-specific fields for outlet management. The core fields (revocation
-/// list, nonce tracker, ceiling, creator DID, event log) are shared with the
-/// `UniFFI` bridge (#1447).
+/// NAPI-specific fields for outlet management.
 pub struct UcanContextState {
     /// Core UCAN validation state shared with `UniFFI` bridge.
     pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,

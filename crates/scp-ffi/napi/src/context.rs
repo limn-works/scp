@@ -6405,6 +6405,31 @@ mod tests {
             !crate::runtime::has_release_mark(&bi, &unheld),
             "a release with no live handle must leave no mark"
         );
+
+        let unsettled = format!("napi-release-unsettled-{}", uuid::Uuid::new_v4());
+        let ticket = crate::runtime::mark_released(&bi, &unsettled);
+        crate::runtime::release_context(&bi, &unsettled);
+        assert!(
+            crate::runtime::has_release_mark(&bi, &unsettled),
+            "an unsettled close must keep the mark with no live handle"
+        );
+        assert!(crate::runtime::remove_context_while_released(
+            &bi,
+            ticket,
+            || {}
+        ));
+        crate::runtime::release_context(&bi, &unsettled);
+        assert!(
+            !crate::runtime::has_release_mark(&bi, &unsettled),
+            "a mark with no live handle and no unsettled close must not stay"
+        );
+
+        let closed = format!("napi-release-closed-{}", uuid::Uuid::new_v4());
+        assert!(crate::runtime::release_context_unless_readmitted(&bi, &closed, || {}).await);
+        assert!(
+            !crate::runtime::has_release_mark(&bi, &closed),
+            "a settled close with no live handle must leave no mark"
+        );
     }
 
     /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
