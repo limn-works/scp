@@ -1,9 +1,10 @@
 // NativeLibraryPathTest.kt — the test JVM's `jna.library.path` names the compiled cdylib
 //
-// Every real-FFI suite in this module skips itself through `assumeTrue(nativeAvailable)`
-// when JNA cannot load `libscp_ffi_uniffi`, so a `jna.library.path` that points at the
-// wrong directory turns those suites into silent skips rather than failures. This test
-// fails when the path Gradle hands the test JVM does not name the directory holding it.
+// Every real-FFI suite in this module fails with `UnsatisfiedLinkError` at its first native
+// call when JNA cannot load `libscp_ffi_uniffi`, so a `jna.library.path` that points at
+// the wrong directory fails each of those suites test by test. This test names the cause
+// directly: it fails when the path Gradle hands the test JVM does not name the directory
+// holding the cdylib.
 
 package works.limn.scp
 

@@ -22,8 +22,9 @@
 // → restore` path is exercised at the Rust integration layer
 // (`crates/scp-testing/tests/integration/persistence_sdk.rs`).
 //
-// The suite skips (via JUnit 5 `assumeTrue`) when the UniFFI cdylib
-// is not loadable, matching the pattern in `ScpClassTest`.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 
 package works.limn.scp
 
@@ -32,9 +33,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.ScpException
 import works.limn.scp.bridge.CoroutineBridge
@@ -63,27 +61,6 @@ class PersistenceTest {
          * that no in-memory downgrade happened.
          */
         private const val STORAGE_OPEN_FAILED_CODE = "SCP-STORAGE-8004"
-
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
-            }
-        }
     }
 
     // / Stable 32-byte SQLCipher key. The specific value does not matter;
@@ -99,11 +76,6 @@ class PersistenceTest {
             ioDispatcher = Dispatchers.IO,
             cpuDispatcher = Dispatchers.Default,
         )
-
-    @BeforeEach
-    fun requireNative() {
-        assumeTrue(nativeAvailable, skipReason)
-    }
 
     @AfterEach
     fun tearDown() {

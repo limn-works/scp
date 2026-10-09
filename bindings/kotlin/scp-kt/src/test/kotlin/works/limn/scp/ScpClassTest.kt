@@ -10,8 +10,9 @@
 // suite. After Phase 4 PR 4 (demolition) there is no `SCP.default()` —
 // every caller must construct `SCP()` explicitly.
 //
-// All tests require the compiled UniFFI cdylib; if the native library is not
-// loadable the suite skips via JUnit 5 assumptions, matching PersistenceTest.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 //
 // Provenance: #1549 Phase 4 PR 3 / PR 4 (Kotlin slice). ADR-048.
 
@@ -22,8 +23,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.StorageConfig
@@ -37,30 +36,6 @@ import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ScpClassTest {
-    companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                // Touch a UniFFI helper to force JNA library resolution.
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            } catch (e: UnsatisfiedLinkError) {
-                skipReason = "Native library link error: ${e.message}"
-            } catch (e: ExceptionInInitializerError) {
-                skipReason = "Native library init error: ${e.cause?.message ?: e.message}"
-            } catch (e: NoClassDefFoundError) {
-                skipReason = "Native library class not found: ${e.message}"
-            }
-        }
-    }
-
     private lateinit var scp: SCP
 
     private fun bridge(): CoroutineBridge =
@@ -72,7 +47,6 @@ class ScpClassTest {
 
     @BeforeEach
     fun setUp() {
-        assumeTrue(nativeAvailable, skipReason)
         scp = SCP(StorageConfig.InMemory)
     }
 
@@ -88,7 +62,6 @@ class ScpClassTest {
 
     @Test
     fun `explicit in-memory storage selection constructs a live instance`() {
-        assumeTrue(nativeAvailable, skipReason)
         // Storage selection is mandatory: `StorageConfig.InMemory` is the
         // explicit dev/test selection. There is no zero-argument `SCP()`
         // constructor (the default was removed), so a missing selection is a
