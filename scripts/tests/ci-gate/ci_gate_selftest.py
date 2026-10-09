@@ -268,6 +268,13 @@ nothing:
                computes each path group's filter outputs from the `changes` job
                and reports every event whose answer differs from
                MACOS_BRIDGE_PATH_CASES.
+  prose-route  A pull request that changes only prose skips every job the
+               `code` output guards. That output is a positive list of paths,
+               so a file added outside it and outside prose would change with
+               those jobs skipped and `ci` green. The check lists every path
+               `git ls-files` reports and fails on each one the `code` output
+               does not select and that is not under `.docs/` or `.claude/`, a
+               root-level `*.md`, or a `*.md` under `docs/guides/`.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -638,8 +645,22 @@ RUST_ONLY = {
     "kotlin": "false",
     "swift": "false",
     "fuzz": "false",
+    "code": "true",
 }
 DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
+
+# Jobs the `code` output selects: true for every change outside prose, so every
+# scenario below but docs-only runs them. wiping-allocator also runs on a push;
+# the rest are in NOT_ON_PUSH_FILTER_JOBS.
+CODE_JOBS = (
+    "fail-closed-pre-rotation",
+    "protocol-deps",
+    "shipped-feature-graph",
+    "toolchain-wiring-cases",
+    "wasm-protocol",
+    "wasm-test",
+    "wiping-allocator",
+)
 
 # Jobs whose `if:` reads `github.event_name` rather than a `changes` filter
 # output, so a filter scenario decides nothing about them and each scenario
@@ -670,7 +691,6 @@ NOT_ON_PUSH_JOBS = (
     "doc-citations",
     "doc-includes",
     "error-codes",
-    "fail-closed-pre-rotation",
     "fallback-registry",
     "handle-affinity",
     "handler-no-panic",
@@ -680,14 +700,10 @@ NOT_ON_PUSH_JOBS = (
     "no-mutable-globals-ts",
     "no-panic-abort",
     "pyi-generated",
-    "protocol-deps",
     "protocol-sync",
     "saga-gating-granularity",
     "sdk-coverage",
-    "shipped-feature-graph",
     "toolchain-wiring",
-    "wasm-protocol",
-    "wasm-test",
 )
 
 # Jobs a `changes` filter output selects whose `if:` also reads
@@ -698,6 +714,8 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "bridge-parity",
     "bridge-parity-swift",
     "docker-image",
+    "fail-closed-pre-rotation",
+    "protocol-deps",
     "python-lint",
     "python-test",
     "rust-build-pyo3-production",
@@ -707,9 +725,13 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "rust-fmt",
     "rust-test-napi-production",
     "scaffold-typescript-web-check",
+    "shipped-feature-graph",
     "swift-build-test",
     "swift-lint",
+    "toolchain-wiring-cases",
     "typescript-check",
+    "wasm-protocol",
+    "wasm-test",
 )
 
 
@@ -756,7 +778,7 @@ RUST_ONLY_RUNS = {
     "typescript-check": True,
     "typescript-wasm-check": False,
     "xcframework": True,
-}
+} | dict.fromkeys(CODE_JOBS, True)
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
 # A Rust-only pull request skips the four macOS bridge jobs, while a Rust-only
 # merge_group run runs all four and a Rust-only push runs the two producers among
@@ -769,8 +791,8 @@ MACOS_BRIDGE_JOBS = (
     "xcframework",
 )
 RUST_ONLY_PR_RUNS = RUST_ONLY_RUNS | dict.fromkeys(MACOS_BRIDGE_JOBS, False)
-PYTHON_ONLY = DOCS_ONLY | {"python": "true"}
-PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+PYTHON_ONLY = DOCS_ONLY | {"python": "true", "code": "true"}
+PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     (
         "bridge-parity",
         "bridge-parity-kotlin",
@@ -793,9 +815,9 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
 # in its own scenario because scaffold-typescript-web-check ORs it with
 # scaffold-typescript-web.
 SWIFT_TYPESCRIPT = DOCS_ONLY | dict.fromkeys(
-    ("swift", "typescript", "scaffold-typescript-web"), "true"
+    ("swift", "typescript", "scaffold-typescript-web", "code"), "true"
 )
-SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     (
         "bridge-parity",
         "bridge-parity-swift",
@@ -810,8 +832,8 @@ SWIFT_TYPESCRIPT_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
     ),
     True,
 )
-WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true"}
-WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(
+WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true", "code": "true"}
+WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     ("scaffold-typescript-web-check", "typescript-wasm-check"), True
 )
 
@@ -6416,6 +6438,88 @@ def check_macos_bridge_mutants(doc: dict) -> None:
         check(f"{label} is reported", found, detail)
 
 
+# CRITERION for unrouted_paths: a tracked path is routed when the `code` output
+# of job `changes` selects it or when it is prose. Prose is every path under
+# `.docs/` or `.claude/`, every `*.md` file at the repository root, and every
+# `*.md` file under `docs/guides/`. A pull request that changes only prose skips
+# every job the `code` output guards, so a path that is neither reaches no such
+# job when it alone changes, whatever that job reads.
+def is_prose(path: str) -> bool:
+    """Report whether a tracked path is prose, which no `code`-guarded job reads."""
+    if path.startswith((".docs/", ".claude/")):
+        return True
+    if path.endswith(".md"):
+        return "/" not in path or path.startswith("docs/guides/")
+    return False
+
+
+def unrouted_paths(doc: dict, paths: list[str]) -> list[str]:
+    """Return each path the `code` output does not select and that is not prose.
+
+    The `code` output ORs filter keys together the way every other output does,
+    so a path counts as selected when any filter that output names lists a
+    pattern covering it; pattern_covers reads a pattern shape it does not know as
+    covering nothing, which reports a path rather than passing it.
+    """
+    filters = path_filters(doc["jobs"])
+    expression = (doc["jobs"]["changes"].get("outputs") or {}).get("code")
+    if expression is None:
+        return ["`changes` publishes no `code` output"]
+    keys = STEP_FILTER_OUTPUT.findall(str(expression))
+    missing = [key for key in keys if key not in filters]
+    if not keys or missing:
+        return [f"`changes` output `code` reads {keys}, not a filter key"]
+    patterns = set().union(*(filters[key] for key in keys))
+    return [path for path in paths if not is_prose(path) and not pattern_covers(patterns, path)]
+
+
+def tracked_paths() -> list[str]:
+    """Every path `git ls-files` lists in this checkout."""
+    proc = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-z"],
+        capture_output=True,
+        check=True,
+    )
+    return [path for path in proc.stdout.decode().split("\0") if path]
+
+
+def check_every_path_routed(doc: dict) -> None:
+    paths = tracked_paths()
+    check("git ls-files lists this checkout's own ci.yml", ".github/workflows/ci.yml" in paths)
+    gaps = unrouted_paths(doc, paths)
+    check(
+        "ci.yml: every tracked path is prose or selected by the `code` output",
+        not gaps,
+        f"{len(gaps)} unrouted: {gaps[:20]}",
+    )
+    # Controls: an unclassified root file, a non-Markdown file under docs/guides/,
+    # and a nested Markdown file outside docs/guides/ are each reported; prose is not.
+    planted = ["newtool.cfg", "docs/guides/diagram.svg", "docs/notes/plan.md"]
+    check(
+        "an unrouted path planted beside the tracked ones is reported",
+        unrouted_paths(doc, paths + planted) == gaps + planted,
+        f"{unrouted_paths(doc, paths + planted)}",
+    )
+    check(
+        "prose paths are not reported",
+        not unrouted_paths(doc, ["AGENTS.md", ".docs/specs/x.md", ".claude/a/b.json", "docs/guides/g.md"]),
+    )
+    mutant = copy.deepcopy(doc)
+    step = next(
+        step
+        for step in mutant["jobs"]["changes"]["steps"]
+        if str(step.get("uses") or "").startswith("dorny/paths-filter")
+    )
+    filters = yaml.safe_load(step["with"]["filters"])
+    check("filter code lists 'scripts/**' for the mutant", "scripts/**" in filters["code"])
+    filters["code"] = [entry for entry in filters["code"] if entry != "scripts/**"]
+    step["with"]["filters"] = yaml.safe_dump(filters)
+    check(
+        "a `code` filter that drops scripts/** reports scripts/ci-aggregate-result.py",
+        "scripts/ci-aggregate-result.py" in unrouted_paths(mutant, paths),
+    )
+
+
 def check_condition_grammar() -> None:
     """parse_condition reads the grammar ci.yml uses and refuses everything else."""
     outputs = {"rust": "true", "python": "false"}
@@ -6909,6 +7013,9 @@ def main() -> int:
     print("macos-bridges — a pull request runs the macOS bridge jobs only on their paths")
     check_macos_bridges_follow_their_paths(workflow)
     check_macos_bridge_mutants(workflow)
+
+    print("prose-route — every tracked path is prose or reaches the `code` output")
+    check_every_path_routed(workflow)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}

@@ -519,6 +519,8 @@ Every push to a PR branch. Target: < 3 minutes.
 | doc | ubuntu-latest | The `cargo test --workspace --doc`, then the `cargo doc`, that the CI Commands section above gives. A table cell holds no fenced block, and `scripts/tests/ci-gate/ci_gate_selftest.py` compares a documented `cargo doc` against job `rust-doc` in `.github/workflows/ci.yml` only where a shell block encloses it, so this row names that command rather than repeating its flags. |
 | deny | ubuntu-latest | `cargo deny check` |
 
+A pull request that changes only prose (`.docs/**`, `.claude/**`, a root-level `*.md`, or `docs/guides/**/*.md`) skips every job the `code` output of job `changes` in `.github/workflows/ci.yml` guards: fail-closed-pre-rotation, shipped-feature-graph, wiping-allocator, protocol-deps, wasm-protocol, wasm-test and toolchain-wiring-cases. `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` states the routing rules, and `scripts/tests/ci-gate/ci_gate_selftest.py` fails when a tracked path is neither prose nor selected by that output.
+
 Unit tests and conformance macro suites (`transport_conformance!()`, `storage_conformance!()`, etc.) run as part of `cargo nextest run --workspace` against in-memory implementations.
 
 ### Tier 2 — Merge Gate
