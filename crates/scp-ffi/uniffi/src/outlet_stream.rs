@@ -508,7 +508,8 @@ pub(crate) async fn outlet_stream_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb` — mirrors `outlet_invoke`. `ucan_cid` keys the owned Class-S
@@ -1124,11 +1125,11 @@ fn no_active_saga_err(saga_id: &str) -> ScpError {
 /// (co-resident single-tenant). The key never enters the runtime autonomously
 /// (ADR-006) — it is resolved per-call here and passed to the seal.
 ///
-/// The creator DID comes from the actor rather than from the per-context UCAN
-/// state, because this call chooses the authority a streaming saga signs as:
-/// a context no actor serves refuses to sign rather than signing as the
-/// creator a bridge copy recorded. A failed read reports its own error and is
-/// not withheld.
+/// The creator DID comes from the actor rather than from the handle's
+/// `creator_did`, because this call chooses the authority a streaming saga
+/// signs as: a context no actor serves refuses to sign rather than signing
+/// as the creator the handle recorded. A failed read reports its own error
+/// and is not withheld.
 ///
 /// # Errors
 ///
@@ -1326,7 +1327,8 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb`. `ucan_cid` keys the owned Class-S counters and anchors the

@@ -3353,8 +3353,6 @@ pub struct ContextHandle {
     /// Points into the custody provider. Used by `ucan_mint`.
     #[allow(dead_code)]
     pub(crate) signing_key: Option<KeyHandle>,
-    /// Capability ceiling strings for UCAN mint-time enforcement (#339).
-    pub(crate) ceiling_strings: Vec<String>,
     /// Outlet registry for this context.
     ///
     /// Deliberately a `std::sync::Mutex`, NOT `tokio::sync::Mutex`: every
@@ -3395,7 +3393,6 @@ impl std::fmt::Debug for ContextHandle {
         f.debug_struct("ContextHandle")
             .field("context_id", &self.context_id)
             .field("creator_did", &self.creator_did)
-            .field("ceiling_strings", &self.ceiling_strings)
             .finish_non_exhaustive()
     }
 }
@@ -4434,7 +4431,7 @@ impl<'a> GatedHandle<'a> {
 /// `gated`'s role state, and the chain check anchors on that role state's
 /// `creator_did`. The per-context UCAN state supplies only the revocation list
 /// and the nonce tracker.
-pub(crate) fn validate_outlet_ucan_uniffi(
+pub(crate) async fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     gated: &GatedHandle<'_>,
     outlet_id: &str,
@@ -4465,11 +4462,8 @@ pub(crate) fn validate_outlet_ucan_uniffi(
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
     // Ensure UCAN state is registered for this context on the caller's instance.
-    bi.ensure_ucan_registered(
-        &handle.context_id,
-        &handle.creator_did,
-        &handle.ceiling_strings,
-    );
+    bi.ensure_ucan_registered_while_active(&handle.context_id)
+        .await?;
 
     bi.with_ucan_state(&handle.context_id, |ucan_state| {
         let production_resolver = bi.did_resolver();
@@ -5395,10 +5389,10 @@ impl McpUniFfiBridgeProvider {
         // Read the outlet's registered kind so the UCAN check selects the
         // correct split stem (SCP-OUT-014), then ensure UCAN state is
         // registered for this context. Scope the DashMap Ref so the shard
-        // lock is released before `ensure_ucan_registered` and
+        // lock is released before `ensure_ucan_registered_while_active` and
         // `with_ucan_state` run. A handle removed since the lookup above is a
         // denial for the same reason.
-        let (outlet_kind_for_ucan, creator_did, handle_ceiling) = {
+        let outlet_kind_for_ucan = {
             let handle = context_handle_registry(bi).get(context_id).ok_or_else(|| {
                 AccessRefusal::Denied(format!(
                     "outlet '{outlet_name}' not registered in context '{context_id}'"
@@ -5408,18 +5402,24 @@ impl McpUniFfiBridgeProvider {
                 .outlet_registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let kind = registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
+            registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
                 AccessRefusal::Denied(format!(
                     "outlet '{outlet_name}' not registered in context '{context_id}'"
                 ))
-            })?;
-            (
-                kind,
-                handle.creator_did.clone(),
-                handle.ceiling_strings.clone(),
-            )
+            })?
         };
-        bi.ensure_ucan_registered(context_id, &creator_did, &handle_ceiling);
+        // `validate_capability` reached this call through `gate_role_state`
+        // and `gate_active_lifecycle`, which block on the supervisor the same
+        // way, so `block_in_place` is legal here.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(bi.ensure_ucan_registered_while_active(context_id))
+        })
+        .map_err(|e| {
+            AccessRefusal::Unreadable(format!(
+                "UCAN state of context '{context_id}' could not be registered: {e}"
+            ))
+        })?;
 
         // ADR-016 step 8 compares the token's grants against the ceiling in
         // `role_state`, and the chain check anchors on its `creator_did`. The
@@ -5812,13 +5812,20 @@ impl McpUniFfiBridgeProvider {
 
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
-        // Ensure UCAN state is registered before appending the event. The
-        // handle Ref is dropped before `ensure_ucan_registered` runs.
-        let registered_handle = context_handle_registry(&bi)
-            .get(context_id)
-            .map(|handle| (handle.creator_did.clone(), handle.ceiling_strings.clone()));
-        if let Some((creator_did, handle_ceiling)) = registered_handle {
-            bi.ensure_ucan_registered(context_id, &creator_did, &handle_ceiling);
+        // Ensure UCAN state is registered before appending the event, while
+        // the supervisor reports the context `Active`. `authorize` blocked on
+        // the supervisor the same way, so `block_in_place` is legal here. A
+        // failure leaves the append to the `None` arm below, which logs it.
+        if let Err(e) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(bi.ensure_ucan_registered_while_active(context_id))
+        }) {
+            tracing::warn!(
+                outlet = %outlet_name,
+                context = %context_id,
+                error = %e,
+                "UCAN state could not be registered for the OutletInvokedEvent append"
+            );
         }
 
         let append_result = bi.with_ucan_state(context_id, |ucan_state| {
@@ -6367,12 +6374,8 @@ async fn event_log_checkpoint_impl(
             // Ensure UCAN state (which contains the event log) is registered
             // on this bridge instance while the supervisor reports the context
             // `Active`.
-            bi.ensure_ucan_registered_while_active(
-                &handle.context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            )
-            .await?;
+            bi.ensure_ucan_registered_while_active(&handle.context_id)
+                .await?;
 
             let sender_did = scp_did::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
@@ -6494,12 +6497,8 @@ async fn event_log_checkpoint_by_did_impl(
             // Ensure UCAN state (which contains the event log) is registered
             // on this bridge instance while the supervisor reports the context
             // `Active`.
-            bi.ensure_ucan_registered_while_active(
-                &handle.context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            )
-            .await?;
+            bi.ensure_ucan_registered_while_active(&handle.context_id)
+                .await?;
 
             let sender_did = scp_did::DID(did);
             let context_id = handle.context_id.clone();
@@ -10899,7 +10898,7 @@ impl Scp {
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
-                bi.ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+                bi.ensure_ucan_registered_while_active(&context_id).await?;
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -10924,14 +10923,6 @@ impl Scp {
                     in_memory_custody,
                     callback_custody,
                     signing_key,
-                    ceiling_strings: params
-                        .ceiling
-                        .iter()
-                        .filter_map(|s| {
-                            scp_core::context::roles::Capability::new(s)
-                                .map(|c| c.ucan_capability_name())
-                        })
-                        .collect(),
                     outlet_registry: std::sync::Mutex::new(
                         scp_core::context::outlets::OutletRegistry::new(),
                     ),
@@ -11246,13 +11237,19 @@ impl Scp {
                 // resolved authoritatively by the supervisor's first-writer-wins
                 // spawn lock below.
                 //
-                // FLAG-1: the caller no longer supplies a ceiling, so occupy with the
-                // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on
-                // `context_id`, so the "detect a duplicate BEFORE consuming the
-                // single-use KeyPackage" crash-safety is preserved regardless of the
-                // ceiling. The AUTHENTICATED ceiling is re-synced from the joined
-                // handle's signed params AFTER a successful spawn (below).
-                bi.register_ucan_occupied(&context_id, &creator_did, &[])?;
+                // FLAG-1: the caller supplies no ceiling, and the UCAN state
+                // stores none. The Occupied dedup is keyed on `context_id`, so the
+                // "detect a duplicate BEFORE consuming the single-use KeyPackage"
+                // crash-safety holds. The AUTHENTICATED ceiling reaches the actor
+                // through `spawn_actor_from_welcome` (below).
+                //
+                // This is the one registration that runs before an actor serves
+                // the context, so it cannot go through
+                // `ensure_ucan_registered_while_active`: it fails on an occupied
+                // entry instead of building over it, the join rolls it back when
+                // the spawn fails, and the id's release mark stays until the
+                // spawn commits and the readmit below clears it.
+                bi.register_ucan_occupied(&context_id)?;
 
                 // Irreversible: open + authenticate the sealed bundle, consume the
                 // KeyPackage, install the joined MLS group, persist the keyed
@@ -11285,15 +11282,15 @@ impl Scp {
                 // mark a prior close left on it.
                 bi.readmit_context(&context_id);
 
-                // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-                // signed params, overwriting the DEFAULT ceiling used for the
-                // reversible occupy. The authoritative ceiling lives in the bundle
-                // the creator signed — never in caller input. Runs AFTER the
-                // irreversible commit; the UCAN state was just occupied (and not
-                // removed on this success path), so the sync targets a live entry.
+                // FLAG-1: the AUTHENTICATED ceiling lives in the bundle the
+                // creator signed, and `spawn_actor_from_welcome` stored it in the
+                // spawned actor; the UCAN state holds no ceiling, so nothing is
+                // copied here. Runs AFTER the irreversible commit; the UCAN state
+                // was just occupied and is not removed on this success path, so
+                // the check below finds it unless a racing close removed it.
                 //
                 // BLACK-2JF-01 — post-irreversible-commit compensation: when
-                // the sync finds no UCAN state, returning `Err` here without
+                // the check finds no UCAN state, returning `Err` here without
                 // tearing the actor down would strand a live, orphaned actor
                 // for a join that never fully materialized at the bridge.
                 // Compensate with the COMPLETE teardown (`discard_joined_context`):
@@ -11302,18 +11299,7 @@ impl Scp {
                 // bare `despawn_actor` would leave the crypto group and snapshot
                 // behind, resurrecting the context on restart and blocking a fresh
                 // re-join. Then re-mark the id released and surface the error.
-                let authed_ceiling: std::collections::HashSet<String> = joined
-                    .params()
-                    .ceiling
-                    .iter()
-                    .map(scp_core::context::roles::Capability::ucan_capability_name)
-                    .collect();
-                if bi
-                    .with_ucan_state(&context_id, |st| {
-                        st.ceiling_strings.clone_from(&authed_ceiling);
-                    })
-                    .is_none()
-                {
+                if bi.with_ucan_state(&context_id, |_| ()).is_none() {
                     return Err(tear_down_vanished_join(&bi, sup, &context_id).await);
                 }
 
@@ -11335,10 +11321,6 @@ impl Scp {
                     in_memory_custody,
                     callback_custody,
                     signing_key,
-                    // AUTHENTICATED ceiling from the joined MLS group's signed
-                    // context binding — NOT caller input (there is none). Reuse the
-                    // exact set already synced into the UCAN state above.
-                    ceiling_strings: authed_ceiling.into_iter().collect(),
                     outlet_registry: std::sync::Mutex::new(
                         scp_core::context::outlets::OutletRegistry::new(),
                     ),
@@ -14241,7 +14223,8 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )?;
+                )
+                .await?;
 
                 // Parse the optional spending UCAN JWT (§19.5
                 // AND-composition). Mirrors `context_send`. An invalid JWT
@@ -14539,7 +14522,8 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )?;
+                )
+                .await?;
 
                 let input_value: serde_json::Value =
                     serde_json::from_str(&input_json).map_err(|e| ScpError::Outlet {
@@ -15032,7 +15016,8 @@ impl Scp {
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
-                )?;
+                )
+                .await?;
 
                 let mut store = handle.session_store.lock().await;
 
@@ -15629,12 +15614,8 @@ impl Scp {
             .spawn(async move {
                 // Ensure UCAN state (which contains the event log) is registered
                 // while the supervisor reports the context `Active`.
-                bi.ensure_ucan_registered_while_active(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    &handle.ceiling_strings,
-                )
-                .await?;
+                bi.ensure_ucan_registered_while_active(&handle.context_id)
+                    .await?;
 
                 // Parse optional filter JSON.
                 let filter: Option<serde_json::Value> =
@@ -15914,12 +15895,8 @@ impl Scp {
                 // Ensure UCAN state (which contains the event log) is registered
                 // on this instance while the supervisor reports the context
                 // `Active`.
-                bi.ensure_ucan_registered_while_active(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    &handle.ceiling_strings,
-                )
-                .await?;
+                bi.ensure_ucan_registered_while_active(&handle.context_id)
+                    .await?;
 
                 match claim_type {
                     "inclusion" => {
@@ -16228,11 +16205,8 @@ impl Scp {
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
                 // Ensure UCAN state is registered for this context on this instance.
-                bi.ensure_ucan_registered(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    &handle.ceiling_strings,
-                );
+                bi.ensure_ucan_registered_while_active(&handle.context_id)
+                    .await?;
 
                 // Execute the full 11-step validation pipeline via per-context state.
                 let validation_result = bi
@@ -16408,11 +16382,8 @@ impl Scp {
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
                 // Ensure UCAN state is registered for this context on this instance.
-                bi.ensure_ucan_registered(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    &handle.ceiling_strings,
-                );
+                bi.ensure_ucan_registered_while_active(&handle.context_id)
+                    .await?;
 
                 // evaluate_ucan takes `&ValidationContext` and is read-only — it
                 // probes the nonce tracker via check_replay but never records,
@@ -16553,11 +16524,8 @@ impl Scp {
                 let creator_did = role_state.creator_did;
 
                 // Ensure UCAN state is registered for this context on this instance.
-                bi.ensure_ucan_registered(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    &handle.ceiling_strings,
-                );
+                bi.ensure_ucan_registered_while_active(&handle.context_id)
+                    .await?;
 
                 // Execute the full revocation pipeline within the UCAN state closure.
                 bi.with_ucan_state(&handle.context_id, |ucan_state| {
@@ -20923,8 +20891,7 @@ mod tests {
             has_release_mark(&scp.inner, &context_id),
             "a failed join must not clear the release mark a close left"
         );
-        scp.inner
-            .ensure_ucan_registered(&context_id, &creator_did, &[]);
+        scp.inner.ensure_ucan_registered_for_test(&context_id);
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
             "a released id must not get an empty revocation list rebuilt after a failed join"
@@ -20946,8 +20913,8 @@ mod tests {
             .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
             .expect("context_create should succeed");
         let active = handle.context_id();
-        scp.inner
-            .ensure_ucan_registered(&active, &identity.did(), &[]);
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&active))
+            .expect("the read of an Active context must succeed");
         scp.inner
             .with_ucan_state(&active, |state| {
                 state
@@ -21066,8 +21033,7 @@ mod tests {
             has_release_mark(&scp.inner, &ctx_id),
             "the teardown must re-mark the id the join's readmit cleared"
         );
-        scp.inner
-            .ensure_ucan_registered(&ctx_id, &identity.did(), &[]);
+        scp.inner.ensure_ucan_registered_for_test(&ctx_id);
         assert!(
             scp.inner.with_ucan_state(&ctx_id, |_| ()).is_none(),
             "no UCAN state may be rebuilt for a torn-down join"
@@ -21083,8 +21049,7 @@ mod tests {
     fn close_removal_skips_state_a_readmit_already_claimed() {
         let scp = scp_test();
         let ctx_id = scp_ffi_common::generate_context_id();
-        scp.inner
-            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        scp.inner.ensure_ucan_registered_for_test(&ctx_id);
         scp.inner
             .with_ucan_state(&ctx_id, |state| {
                 state
@@ -21138,8 +21103,7 @@ mod tests {
         let ctx_id = scp_ffi_common::generate_context_id();
         let stale = scp.inner.mark_released(&ctx_id);
         scp.inner.readmit_context(&ctx_id);
-        scp.inner
-            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        scp.inner.ensure_ucan_registered_for_test(&ctx_id);
         let later = scp.inner.mark_released(&ctx_id);
         let in_flight = || {
             scp.inner
@@ -21347,8 +21311,7 @@ mod tests {
     fn close_teardown_holds_the_release_lock_and_no_registry_guard() {
         let scp = scp_test();
         let ctx_id = scp_ffi_common::generate_context_id();
-        scp.inner
-            .ensure_ucan_registered(&ctx_id, "did:dht:test", &[]);
+        scp.inner.ensure_ucan_registered_for_test(&ctx_id);
         let ticket = scp.inner.mark_released(&ctx_id);
 
         let readmitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -21394,7 +21357,7 @@ mod tests {
     fn registry_entry_wait_holds_no_release_lock() {
         let scp = scp_test();
         let held = scp_ffi_common::generate_context_id();
-        scp.inner.ensure_ucan_registered(&held, "did:dht:test", &[]);
+        scp.inner.ensure_ucan_registered_for_test(&held);
         let guard = scp
             .inner
             .ucan_registry
@@ -21407,7 +21370,7 @@ mod tests {
                 let id = held.clone();
                 std::thread::spawn(move || match i {
                     0 => bi.release_ucan_state(&id),
-                    1 => bi.ensure_ucan_registered(&id, "did:dht:test", &[]),
+                    1 => bi.ensure_ucan_registered_for_test(&id),
                     _ => {
                         let ticket = bi.mark_released(&id);
                         bi.remove_ucan_state_while_released(ticket, || {});
@@ -21436,7 +21399,7 @@ mod tests {
         let other_thread = std::thread::spawn(move || {
             let _ticket = bi.mark_released(&other_id);
             bi.readmit_context(&other_id);
-            bi.ensure_ucan_registered(&other_id, "did:dht:test", &[]);
+            bi.ensure_ucan_registered_for_test(&other_id);
             tx.send(()).expect("the test thread is waiting");
         });
         rx.recv_timeout(std::time::Duration::from_secs(5))
@@ -21461,8 +21424,9 @@ mod tests {
     }
 
     /// `ensure_ucan_registered_while_active` builds UCAN state for a context
-    /// the supervisor reports `Active`, and builds none for an id no actor
-    /// serves or for a closed context whose release mark is gone.
+    /// the supervisor reports `Active`, and builds none for an `Active`
+    /// context that carries a release mark, for an id no actor serves, or for
+    /// a closed context whose release mark is gone.
     #[test]
     #[cfg(feature = "testing")]
     fn ensure_while_active_builds_only_for_an_active_context() {
@@ -21476,22 +21440,26 @@ mod tests {
             .expect("context_create should succeed");
         let active = handle.context_id();
         scp.inner.remove_ucan_state(&active);
-        rt.block_on(
-            scp.inner
-                .ensure_ucan_registered_while_active(&active, &identity.did(), &[]),
-        )
-        .expect("the read of an Active context must succeed");
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&active))
+            .expect("the read of an Active context must succeed");
         assert!(
             scp.inner.with_ucan_state(&active, |_| ()).is_some(),
             "an Active context must get UCAN state"
         );
 
+        scp.inner.release_ucan_state(&active);
+        assert!(has_release_mark(&scp.inner, &active));
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&active))
+            .expect("the read of an Active context must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&active, |_| ()).is_none(),
+            "a release mark must stop the build even while the supervisor reports Active"
+        );
+        scp.inner.readmit_context(&active);
+
         let absent = scp_ffi_common::generate_context_id();
-        rt.block_on(
-            scp.inner
-                .ensure_ucan_registered_while_active(&absent, &identity.did(), &[]),
-        )
-        .expect("the read of an id no actor serves must succeed");
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&absent))
+            .expect("the read of an id no actor serves must succeed");
         assert!(
             scp.inner.with_ucan_state(&absent, |_| ()).is_none(),
             "an id no actor serves must not get UCAN state"
@@ -21517,11 +21485,8 @@ mod tests {
         scp.inner.readmit_context(&closed);
         scp.inner.remove_ucan_state(&closed);
         assert!(!has_release_mark(&scp.inner, &closed));
-        rt.block_on(
-            scp.inner
-                .ensure_ucan_registered_while_active(&closed, &identity.did(), &[]),
-        )
-        .expect("the read of a closed context must succeed");
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&closed))
+            .expect("the read of a closed context must succeed");
         assert!(
             scp.inner.with_ucan_state(&closed, |_| ()).is_none(),
             "a closed context whose mark is gone must not get UCAN state"
@@ -21624,8 +21589,7 @@ mod tests {
         rt.block_on(scp.context_close(Arc::clone(&handle), Arc::clone(&creator)))
             .expect("the creator's close should succeed");
         scp.inner.readmit_context(&context_id);
-        scp.inner
-            .ensure_ucan_registered(&context_id, &creator.did(), &[]);
+        scp.inner.ensure_ucan_registered_for_test(&context_id);
         assert_eq!(
             rt.block_on(scp.inner.read_live_context_state(&context_id))
                 .expect("state read"),
@@ -21861,18 +21825,28 @@ mod tests {
             "the validation must refuse at the lifecycle gate and withhold the state: {err:?}"
         );
 
-        scp.inner
-            .ensure_ucan_registered(&context_id, &identity.did(), &[]);
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&context_id))
+            .expect("the read of a closed context must succeed");
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
-            "ensure_ucan_registered must not rebuild a released context's state"
+            "the gated entry must not rebuild a closed context's state"
+        );
+        scp.inner.ensure_ucan_registered_for_test(&context_id);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "the release mark alone must stop the ungated builder"
         );
         scp.inner.readmit_context(&context_id);
-        scp.inner
-            .ensure_ucan_registered(&context_id, &identity.did(), &[]);
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&context_id))
+            .expect("the read of a closed context must succeed");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "with the mark gone, the Closed state alone must stop the gated entry"
+        );
+        scp.inner.ensure_ucan_registered_for_test(&context_id);
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
-            "a readmitted context builds fresh state again"
+            "with the mark gone, the ungated builder builds fresh state again"
         );
     }
 
@@ -21908,8 +21882,8 @@ mod tests {
             !has_release_mark(&scp.inner, &context_id),
             "the import must clear the release mark"
         );
-        scp.inner
-            .ensure_ucan_registered(&context_id, &identity.did(), &[]);
+        rt.block_on(scp.inner.ensure_ucan_registered_while_active(&context_id))
+            .expect("the read of the imported context must succeed");
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
             "the imported context must get UCAN state"
@@ -23428,16 +23402,11 @@ mod tests {
     /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
     /// which only worked against the deleted process-wide default.
     fn test_handle_for(scp: &Arc<crate::scp::Scp>) -> Arc<ContextHandle> {
-        test_handle_with(scp, "did:dht:z6MkTestUser", Vec::new())
+        test_handle_with(scp, "did:dht:z6MkTestUser")
     }
 
-    /// [`test_handle_for`] with `creator_did` as the handle's creator and
-    /// `ceiling_strings` as its UCAN ceiling.
-    fn test_handle_with(
-        scp: &Arc<crate::scp::Scp>,
-        creator_did: &str,
-        ceiling_strings: Vec<String>,
-    ) -> Arc<ContextHandle> {
+    /// [`test_handle_for`] with `creator_did` as the handle's creator.
+    fn test_handle_with(scp: &Arc<crate::scp::Scp>, creator_did: &str) -> Arc<ContextHandle> {
         let instance_id = scp.instance_id();
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
@@ -23447,7 +23416,6 @@ mod tests {
             in_memory_custody: None,
             callback_custody: None,
             signing_key: None,
-            ceiling_strings,
             outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -23574,7 +23542,6 @@ mod tests {
             in_memory_custody: Some(Arc::clone(&opaque)),
             callback_custody: None,
             signing_key: Some(active_handle),
-            ceiling_strings: Vec::new(),
             outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -23736,7 +23703,6 @@ mod tests {
             in_memory_custody: Some(Arc::clone(&opaque_b)),
             callback_custody: None,
             signing_key: Some(active_handle),
-            ceiling_strings: Vec::new(),
             outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -23928,7 +23894,6 @@ mod tests {
             in_memory_custody: None,
             callback_custody: Some(callback_custody),
             signing_key: Some(key_handle),
-            ceiling_strings: Vec::new(),
             outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -23983,7 +23948,7 @@ mod tests {
 
         // Register UCAN state and append a GovernanceActionExecuted leaf to the
         // per-context event log (the fallback path event_log_query reads).
-        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        bi.ensure_ucan_registered_for_test(&handle.context_id);
         let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
             let payload = scp_event_log::payload::encode_payload(
                 &scp_event_log::payload::GovernanceActionExecutedPayload {
@@ -24035,7 +24000,7 @@ mod tests {
 
         // Register UCAN state and append a RoleAssigned leaf to the per-context
         // event log (the fallback path event_log_query reads).
-        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        bi.ensure_ucan_registered_for_test(&handle.context_id);
         let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
             let payload = scp_event_log::payload::encode_payload(
                 &scp_event_log::payload::RoleAssignedPayload {
@@ -25566,7 +25531,9 @@ mod tests {
             .await
             .expect("context creation must succeed");
         // Make the bridge's UCAN-state tree diverge from the actor's log.
-        bi.ensure_ucan_registered("ctx-events-resource", creator, &[]);
+        bi.ensure_ucan_registered_while_active("ctx-events-resource")
+            .await
+            .expect("the read of an Active context must succeed");
         bi.with_ucan_state("ctx-events-resource", |state| {
             state.event_log.push_leaf_raw([0x5A; 32]);
             state.event_log.push_leaf_raw([0xA5; 32]);
@@ -27051,11 +27018,9 @@ mod tests {
     ///
     /// The actor names the token's issuer as the creator, holds the agent as
     /// an admin, and carries `outlet:call:*` in its ceiling, so the role-state
-    /// check and the UCAN step both pass. The handle's own copies name another
-    /// creator and a ceiling without `outlet:call:*`, so a UCAN step that read
-    /// either copy, or
-    /// the per-context UCAN state registered from them, would refuse the first
-    /// call.
+    /// check and the UCAN step both pass. The handle's `creator_did` names
+    /// another creator, so a UCAN step that read the handle would refuse the
+    /// first call.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "testing")]
     async fn uniffi_invoke_outlet_records_the_token_nonce_and_refuses_its_replay() {
@@ -27102,11 +27067,7 @@ mod tests {
             .test_insert_member("ctx-test", scp_did::DID(agent.to_owned()), "admin")
             .await
             .expect("the agent must be recorded as a member of the actor");
-        let handle = test_handle_with(
-            &scp,
-            "did:dht:z6MkStaleHandleCreator",
-            vec!["messages:read".to_owned()],
-        );
+        let handle = test_handle_with(&scp, "did:dht:z6MkStaleHandleCreator");
         register_context_handle(&bi, &handle);
         handle
             .outlet_registry
@@ -27256,11 +27217,7 @@ mod tests {
             .test_insert_member("ctx-test", scp_did::DID(agent.to_owned()), "admin")
             .await
             .expect("the agent must be recorded as a member of the actor");
-        let handle = test_handle_with(
-            &scp,
-            &issuer,
-            vec!["messages:read".to_owned(), "outlet:call:*".to_owned()],
-        );
+        let handle = test_handle_with(&scp, &issuer);
         register_context_handle(&bi, &handle);
         handle
             .outlet_registry
@@ -29610,11 +29567,9 @@ mod tests {
     /// the shape `context_create` produces for a platform-custody identity. The
     /// returned tuple yields the verifying key so signatures can be checked.
     ///
-    /// The supervisor actor holds `supervisor_ceiling`. The handle's own
-    /// `ceiling_strings` copy holds `default_ceiling()`, which is wider, so a
-    /// UCAN entry point that read the handle copy, or the per-context UCAN
-    /// state registered from it, instead of the actor would grant what the
-    /// actor's ceiling withholds.
+    /// The supervisor actor holds `supervisor_ceiling`. Neither the handle nor
+    /// the per-context UCAN state carries a ceiling, so a UCAN entry point
+    /// reads the ceiling from the actor alone.
     async fn callback_context_handle(
         scp: &Arc<crate::scp::Scp>,
         supervisor_ceiling: &[&str],
@@ -29660,10 +29615,6 @@ mod tests {
             in_memory_custody: None,
             callback_custody: Some(callback_custody),
             signing_key: Some(signing_key),
-            ceiling_strings: scp_core::context::roles::default_ceiling()
-                .to_ucan_string_set()
-                .into_iter()
-                .collect(),
             outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -29789,10 +29740,6 @@ mod tests {
             in_memory_custody: None,
             callback_custody: Some(custody),
             signing_key: Some(signing_key),
-            ceiling_strings: scp_core::context::roles::default_ceiling()
-                .to_ucan_string_set()
-                .into_iter()
-                .collect(),
             outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
@@ -30077,7 +30024,7 @@ mod tests {
         // required. Custody comes from `identity`, not the handle.
         let handle = test_handle_for(&scp);
         scp.inner
-            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+            .ensure_ucan_registered_for_test(&handle.context_id);
 
         let checkpoint = event_log_checkpoint_impl(Arc::clone(&scp.inner), handle, identity, 0u64)
             .await
@@ -30115,7 +30062,7 @@ mod tests {
         // required. Custody comes from `identity`, not the handle.
         let handle = test_handle_for(&scp);
         scp.inner
-            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+            .ensure_ucan_registered_for_test(&handle.context_id);
 
         // Pass the identity's own DID so the `did == identity.did` binding
         // (VALID_7000) is satisfied — the production happy path.
@@ -30165,7 +30112,7 @@ mod tests {
             .expect("identity_create");
         let handle = test_handle_for(&scp);
         scp.inner
-            .ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+            .ensure_ucan_registered_for_test(&handle.context_id);
 
         // Mismatch: a different, syntactically valid DID is rejected because it
         // does not match the signing identity's DID.
@@ -30453,18 +30400,13 @@ mod tests {
 
     /// A mint grants no more than the ceiling the supervisor actor holds.
     ///
-    /// The fixture gives the actor `messages:read` and nothing else, while the
-    /// handle's `ceiling_strings` copy holds `default_ceiling()`, which carries
-    /// `messages:write`. A mint of `messages:write` must fail against the
-    /// actor's ceiling; a mint that read the handle copy would succeed.
+    /// The fixture gives the actor `messages:read` and nothing else. A mint of
+    /// `messages:write` must fail against the actor's ceiling, and a mint of
+    /// `messages:read` must succeed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
         let scp = scp_test();
         let (handle, _creator_key) = callback_context_handle(&scp, &["messages:read"]).await;
-        assert!(
-            handle.ceiling_strings.iter().any(|c| c == "messages:write"),
-            "precondition: the handle copy carries messages:write"
-        );
         let actor_ceiling = scp
             .inner
             .live_role_state(&handle.context_id)
@@ -30509,12 +30451,11 @@ mod tests {
     /// a supervisor ceiling that moves after this bridge registered the
     /// context.
     ///
-    /// `context_create` records `messages:write` in three places: the actor,
-    /// the handle's `ceiling_strings`, and (on the first UCAN call) the
-    /// per-context UCAN state. The test then replaces the actor with one whose
-    /// ceiling omits `messages:write`, which leaves both bridge copies as they
-    /// were. Every entry point must now refuse the `messages:write` token or
-    /// grant; an entry point that read either copy would still admit it.
+    /// `context_create` records `messages:write` on the actor, and the first
+    /// UCAN call registers per-context UCAN state, which holds no ceiling. The
+    /// test then replaces the actor with one whose ceiling omits
+    /// `messages:write` and leaves the UCAN state registered. Every entry point
+    /// must now refuse the `messages:write` token or grant.
     #[test]
     #[cfg(feature = "testing")]
     fn ucan_entry_points_follow_a_supervisor_ceiling_moved_after_registration() {
@@ -30559,7 +30500,7 @@ mod tests {
         };
         // `ucan_evaluate` records no nonce, so this probe leaves the token
         // valid for the validation below, and it registers the per-context
-        // UCAN state from the handle copy.
+        // UCAN state.
         assert!(
             evaluate(),
             "the registered ceiling admits messages:write before the move"
@@ -30590,15 +30531,8 @@ mod tests {
         ))
         .expect("the narrowed actor must spawn");
         assert!(
-            handle.ceiling_strings.iter().any(|c| c == "messages:write"),
-            "precondition: the handle copy still carries messages:write"
-        );
-        assert_eq!(
-            scp.inner.with_ucan_state(&context_id, |st| st
-                .ceiling_strings
-                .contains("messages:write")),
-            Some(true),
-            "precondition: the registered UCAN state still carries messages:write"
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "precondition: the UCAN state stays registered across the move"
         );
 
         assert!(
@@ -30657,12 +30591,11 @@ mod tests {
     /// `outlet_invoke` grades the invocation UCAN against a supervisor ceiling
     /// that moved after this bridge registered the context.
     ///
-    /// `context_create` records `outlet:call:*` on the actor, on the handle's
-    /// `ceiling_strings`, and in the per-context UCAN state. The test then
-    /// replaces the actor with one whose ceiling omits `outlet:call:*`, which
-    /// leaves both bridge copies as they were, so the UCAN step must refuse
-    /// the `outlet:call:*` token at ADR-016 step 8. A UCAN step that read
-    /// either copy would pass the token on to the invocation.
+    /// `context_create` records `outlet:call:*` on the actor and registers
+    /// per-context UCAN state, which holds no ceiling. The test then replaces
+    /// the actor with one whose ceiling omits `outlet:call:*` and leaves the
+    /// UCAN state registered, so the UCAN step must refuse the `outlet:call:*`
+    /// token at ADR-016 step 8.
     #[test]
     #[cfg(feature = "testing")]
     fn outlet_invoke_follows_a_supervisor_ceiling_moved_after_registration() {
@@ -30738,12 +30671,9 @@ mod tests {
             None,
         ))
         .expect("the narrowed actor must spawn");
-        assert_eq!(
-            scp.inner.with_ucan_state(&context_id, |st| st
-                .ceiling_strings
-                .contains("outlet_call:*")),
-            Some(true),
-            "precondition: the registered UCAN state still carries outlet_call:*"
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "precondition: the UCAN state stays registered across the move"
         );
 
         let err = rt
@@ -30858,13 +30788,12 @@ mod tests {
 
     /// `ucan_validate` and `ucan_evaluate` anchor the chain on the creator the
     /// supervisor holds (ADR-016 step 4), and `ucan_revoke` admits that
-    /// creator as a revoker, when the handle and the per-context UCAN state
-    /// this bridge registered both name another creator.
+    /// creator as a revoker, when the handle names another creator.
     ///
     /// The owner's token validates under a handle naming `other`, and a
     /// revoke of the holder's delegation by `other` is refused while the same
     /// revoke by the owner succeeds. An edit that read the creator from the
-    /// handle or the UCAN state fails each assertion.
+    /// handle fails each assertion.
     #[test]
     #[cfg(feature = "testing")]
     fn ucan_validate_evaluate_and_revoke_use_the_supervisor_creator() {
@@ -30908,11 +30837,10 @@ mod tests {
             .encoded();
 
         let other = "did:dht:z6MkUniffiHandleCreator";
-        scp.inner
-            .with_ucan_state(&context_id, |state| {
-                other.clone_into(&mut state.creator_did);
-            })
-            .expect("the UCAN state exists after the mint");
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "the UCAN state exists after the delegation"
+        );
         let (custody, signing_key, _key) = rt.block_on(unregistered_callback_custody());
         let handle = handle_carrying_custody(&scp, &context_id, other, custody, signing_key);
 

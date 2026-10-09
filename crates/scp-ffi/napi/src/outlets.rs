@@ -344,9 +344,7 @@ pub(crate) async fn outlet_register_on(
     // receives holds `outlet:register`, and this entry point passes the context
     // creator (`role_state.creator_did`) as that registrant: it receives no
     // caller identity, so the check does not ask whether the caller holds the
-    // capability. The role state is the one the supervisor holds now, not a
-    // bridge copy that a governance action or a membership change could have
-    // left permissive.
+    // capability. The role state is the one the supervisor holds now.
     let creator_did = role_state.creator_did.clone();
 
     // Register the outlet in the context's outlet registry.
@@ -2346,25 +2344,21 @@ mod tests {
             // A 16-byte nonce as 32 lowercase-hex chars.
             let nonce_hex = "0123456789abcdef0123456789abcdef".to_owned();
 
-            // Each side signs as the creator its supervisor reports. The bridge
-            // copies and the handles below name a creator that holds no signing
-            // key, so a saga that took either side's creator from them would
-            // fail to resolve that side's signing key.
+            // Each side signs as the creator its supervisor reports. The
+            // handles below name a creator that holds no signing key, so a saga
+            // that took either side's creator from a handle would fail to
+            // resolve that side's signing key.
             crate::runtime::ensure_registered(&bi, &handle_a)
-                .expect("registering context A's bridge copy must succeed");
-            crate::runtime::narrow_bridge_copy_for_test(&bi, &ctx_a)
-                .expect("the context has a bridge copy to narrow");
-            crate::runtime::narrow_bridge_copy_for_test(&bi, &ctx_b)
-                .expect("the context has a bridge copy to narrow");
+                .expect("registering context A's bridge state must succeed");
             let handle_a = crate::context::NapiContextHandle::test_active_on(
                 &bi,
                 ctx_a.clone(),
-                crate::runtime::NARROWED_COPY_CREATOR.to_owned(),
+                crate::runtime::KEYLESS_HANDLE_CREATOR.to_owned(),
             );
             let handle_b = crate::context::NapiContextHandle::test_active_on(
                 &bi,
                 ctx_b.clone(),
-                crate::runtime::NARROWED_COPY_CREATOR.to_owned(),
+                crate::runtime::KEYLESS_HANDLE_CREATOR.to_owned(),
             );
 
             let result = Box::pin(outlet_invoke_cross_context_saga_on(

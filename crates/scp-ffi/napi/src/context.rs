@@ -1444,8 +1444,7 @@ pub(crate) async fn context_join_from_welcome_on(
     // the ceiling. The bridge state carries no role state and no membership:
     // `spawn_actor_from_welcome` stores the AUTHENTICATED membership and
     // ceiling in the spawned actor.
-    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
-        .map_err(NapiError::from)?;
+    crate::runtime::register_ffi_state(bi, &sealed.context_id, &[]).map_err(NapiError::from)?;
 
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(sealed.creator_did.clone()),
@@ -1813,27 +1812,33 @@ pub(crate) async fn context_close_on(
 
     // Release UCAN state for this context, and mark the id so no later call
     // rebuilds it empty, unless the id returned to `Active` after the
-    // lifecycle read above. That check runs before the handle is written
-    // `Closed` and before its subscription is cancelled, so a close that
-    // reports the context stays open leaves the handle reading "active" with
-    // its subscription running.
-    if !crate::runtime::release_context_unless_readmitted(bi, &handle.context_id).await {
+    // lifecycle read above. The teardown (cancelling the handle's
+    // subscription, writing the handle `Closed`, and dropping the bridge
+    // connector and economy state) runs inside the release, only while the
+    // mark this close set or joined still stands, so a close that reports the
+    // context stays open, or whose mark a readmit cleared, leaves the handle
+    // reading "active" with its subscription running and its state in place.
+    let mut set_closed = Ok(());
+    let released =
+        crate::runtime::release_context_unless_readmitted(bi, &handle.context_id, || {
+            // Stop the background relay listener for this handle.
+            if let Ok(token) = handle.subscription_cancel.lock() {
+                token.cancel();
+            }
+            set_closed = handle.set_closed();
+            // Clean up per-context bridge connector state and economy state via
+            // the same NapiBridgeInstance's core (not the process-global bridge).
+            bi.core.remove_bridge_state(&handle.context_id);
+            bi.core.remove_economy_state(&handle.context_id);
+        })
+        .await;
+    if !released {
         return Err(NapiError::from(ScpNapiError::Context {
             message: "the context returned to Active while this close ran; it stays open and keeps its state on this bridge".to_owned(),
             code: codes::CTX_2017.to_owned(),
         }));
     }
-
-    // Stop the background relay listener for this handle.
-    if let Ok(token) = handle.subscription_cancel.lock() {
-        token.cancel();
-    }
-    handle.set_closed().map_err(NapiError::from)?;
-
-    // Clean up per-context bridge connector state and economy state via the
-    // same NapiBridgeInstance's core (not the process-global bridge).
-    bi.core.remove_bridge_state(&handle.context_id);
-    bi.core.remove_economy_state(&handle.context_id);
+    set_closed.map_err(NapiError::from)?;
 
     Ok(())
 }
@@ -6192,7 +6197,7 @@ mod tests {
             "no known-context discovery entry may leak after a failed join"
         );
         assert!(
-            bi.released_contexts.contains_key(&ctx_id),
+            crate::runtime::has_release_mark(&bi, &ctx_id),
             "a failed join must not clear the release mark a close left"
         );
     }
@@ -6209,7 +6214,7 @@ mod tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &active, creator)
             .await
             .expect("the supervisor creates the context");
-        crate::runtime::register_test_context(&bi, &active, creator);
+        crate::runtime::register_test_context(&bi, &active);
         crate::runtime::with_context(&bi, &active, |rt| {
             rt.core
                 .revocation_list
@@ -6219,10 +6224,10 @@ mod tests {
         .expect("the Active context must have UCAN state");
 
         assert!(
-            !crate::runtime::release_context_unless_readmitted(&bi, &active).await,
+            !crate::runtime::release_context_unless_readmitted(&bi, &active, || {}).await,
             "a release on an Active context must report the readmit"
         );
-        assert!(!bi.released_contexts.contains_key(&active));
+        assert!(!crate::runtime::has_release_mark(&bi, &active));
         assert!(
             crate::runtime::with_context(&bi, &active, |rt| {
                 Ok(rt.core.revocation_list.is_revoked("revoked-before-release"))
@@ -6233,9 +6238,9 @@ mod tests {
 
         let absent = format!("napi-release-absent-{}", uuid::Uuid::new_v4());
         let _absent_handle = active_handle_for(&bi, &absent, creator);
-        assert!(crate::runtime::release_context_unless_readmitted(&bi, &absent).await);
+        assert!(crate::runtime::release_context_unless_readmitted(&bi, &absent, || {}).await);
         assert!(
-            bi.released_contexts.contains_key(&absent),
+            crate::runtime::has_release_mark(&bi, &absent),
             "a release on an id no actor serves must keep the mark"
         );
     }
@@ -6262,7 +6267,7 @@ mod tests {
             "the teardown must surface CTX_2040, got {err:?}"
         );
         assert!(
-            bi.released_contexts.contains_key(&ctx_id),
+            crate::runtime::has_release_mark(&bi, &ctx_id),
             "the teardown must re-mark the id the join's readmit cleared"
         );
         assert!(
@@ -6272,14 +6277,15 @@ mod tests {
     }
 
     /// A readmit that clears the release mark before the close's removal takes
-    /// the registry shard lock leaves the readmitted context's state in place
-    /// and known-context entry in place, and the removal returns `false`;
-    /// while the mark stands, the removal takes both and returns `true`.
+    /// the release-mark lock leaves the readmitted context's state and
+    /// known-context entry in place, runs no teardown, and the removal returns
+    /// `false`; while the mark stands, the removal takes both, runs the
+    /// teardown, and returns `true`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_removal_skips_state_a_readmit_already_claimed() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let ctx_id = format!("napi-release-race-{}", uuid::Uuid::new_v4());
-        crate::runtime::register_test_context(&bi, &ctx_id, "did:key:z6MkNapiReleaseRace");
+        crate::runtime::register_test_context(&bi, &ctx_id);
         crate::runtime::with_context(&bi, &ctx_id, |rt| {
             rt.core
                 .revocation_list
@@ -6297,11 +6303,16 @@ mod tests {
             },
         );
 
-        bi.released_contexts.insert(ctx_id.clone(), ());
+        let ticket = crate::runtime::mark_released(&bi, &ctx_id);
         crate::runtime::readmit_context(&bi, &ctx_id);
+        let mut torn_down = false;
         assert!(
-            !crate::runtime::remove_context_while_released(&bi, &ctx_id),
+            !crate::runtime::remove_context_while_released(&bi, ticket, || torn_down = true),
             "a removal a readmit pre-empted must report that it removed nothing"
+        );
+        assert!(
+            !torn_down,
+            "a removal a readmit pre-empted must run no teardown"
         );
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |rt| {
@@ -6315,10 +6326,14 @@ mod tests {
             "a removal a readmit pre-empted must keep the known-context entry"
         );
 
-        bi.released_contexts.insert(ctx_id.clone(), ());
+        let ticket = crate::runtime::mark_released(&bi, &ctx_id);
         assert!(
-            crate::runtime::remove_context_while_released(&bi, &ctx_id),
+            crate::runtime::remove_context_while_released(&bi, ticket, || torn_down = true),
             "a removal while the mark stands must report that it removed"
+        );
+        assert!(
+            torn_down,
+            "a removal while the mark stands must run the teardown"
         );
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
@@ -6330,6 +6345,113 @@ mod tests {
         );
     }
 
+    /// A close whose mark a readmit cleared and a later release re-set holds
+    /// a ticket for a mark generation that no longer stands, so its removal
+    /// removes nothing and runs no teardown: a close tears down only under the
+    /// mark it set or joined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_close_skips_a_mark_set_after_a_readmit() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("napi-stale-close-{}", uuid::Uuid::new_v4());
+        let _handle = active_handle_for(&bi, &ctx_id, "did:key:z6MkNapiStaleClose");
+        crate::runtime::register_test_context(&bi, &ctx_id);
+
+        let stale = crate::runtime::mark_released(&bi, &ctx_id);
+        crate::runtime::readmit_context(&bi, &ctx_id);
+        let _later = crate::runtime::mark_released(&bi, &ctx_id);
+        let mut torn_down = false;
+        assert!(
+            !crate::runtime::remove_context_while_released(&bi, stale, || torn_down = true),
+            "a close whose mark generation was cleared must remove nothing"
+        );
+        assert!(!torn_down, "a stale close must run no teardown");
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
+            "a stale close must leave the context's state in place"
+        );
+        assert!(crate::runtime::has_release_mark(&bi, &ctx_id));
+    }
+
+    /// Marking a new id at `MAX_RELEASED_CONTEXTS` marks evicts the earliest
+    /// mark with no unsettled close; re-marking an id that already holds a
+    /// mark evicts none, and a mark whose close is unsettled is never evicted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn marking_past_the_cap_evicts_the_earliest_settled_mark() {
+        use crate::runtime::{MAX_RELEASED_CONTEXTS, ReleaseMark};
+
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let now = std::time::Instant::now();
+        let earlier = now
+            .checked_sub(std::time::Duration::from_secs(2))
+            .expect("two seconds before now is representable");
+        let middle = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before now is representable");
+        let mark_count = || crate::runtime::lock_release_marks(&bi).len();
+        {
+            let mut marks = crate::runtime::lock_release_marks(&bi);
+            marks.insert(
+                "earliest-in-flight".to_owned(),
+                ReleaseMark {
+                    at: earlier,
+                    in_flight: 1,
+                    generation: 0,
+                },
+            );
+            marks.insert(
+                "earliest-settled".to_owned(),
+                ReleaseMark {
+                    at: middle,
+                    in_flight: 0,
+                    generation: 0,
+                },
+            );
+            for i in 2..MAX_RELEASED_CONTEXTS {
+                marks.insert(
+                    format!("mark-{i}"),
+                    ReleaseMark {
+                        at: now,
+                        in_flight: 0,
+                        generation: 0,
+                    },
+                );
+            }
+        }
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
+
+        let _ticket = crate::runtime::mark_released(&bi, "mark-2");
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
+        assert!(
+            crate::runtime::has_release_mark(&bi, "earliest-settled"),
+            "re-marking a marked id must evict nothing"
+        );
+
+        // A live handle keeps the new mark past the release's prune.
+        let _newest = active_handle_for(&bi, "newest", "did:key:z6MkNapiMarkCap");
+        crate::runtime::release_context(&bi, "newest");
+        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
+        assert!(crate::runtime::has_release_mark(&bi, "newest"));
+        assert!(
+            crate::runtime::has_release_mark(&bi, "earliest-in-flight"),
+            "a mark whose close is unsettled must not be evicted"
+        );
+        assert!(
+            !crate::runtime::has_release_mark(&bi, "earliest-settled"),
+            "a new mark at the cap must evict the earliest settled mark"
+        );
+
+        for mark in crate::runtime::lock_release_marks(&bi).values_mut() {
+            mark.in_flight = 1;
+        }
+        let _over = active_handle_for(&bi, "over-the-cap", "did:key:z6MkNapiMarkCap");
+        crate::runtime::release_context(&bi, "over-the-cap");
+        assert_eq!(
+            mark_count(),
+            MAX_RELEASED_CONTEXTS + 1,
+            "with every close unsettled, a new mark must evict none"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_mark_lasts_until_the_last_handle_for_the_id_drops() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6337,10 +6459,10 @@ mod tests {
         let creator = "did:key:z6MkNapiReleasePrune";
         let first = active_handle_for(&bi, &ctx_id, creator);
         let second = active_handle_for(&bi, &ctx_id, creator);
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         crate::runtime::release_context(&bi, &ctx_id);
         assert!(
-            bi.released_contexts.contains_key(&ctx_id),
+            crate::runtime::has_release_mark(&bi, &ctx_id),
             "a live handle must keep the mark"
         );
 
@@ -6352,7 +6474,7 @@ mod tests {
 
         drop(second);
         assert!(
-            !bi.released_contexts.contains_key(&ctx_id),
+            !crate::runtime::has_release_mark(&bi, &ctx_id),
             "the last handle's drop must drop the mark"
         );
         assert!(!bi.context_handles.contains_key(&ctx_id));
@@ -6360,7 +6482,7 @@ mod tests {
         let unheld = format!("napi-release-unheld-{}", uuid::Uuid::new_v4());
         crate::runtime::release_context(&bi, &unheld);
         assert!(
-            !bi.released_contexts.contains_key(&unheld),
+            !crate::runtime::has_release_mark(&bi, &unheld),
             "a release with no live handle must leave no mark"
         );
     }
@@ -6383,7 +6505,7 @@ mod tests {
         let ctx_id = "b".repeat(64);
 
         // Pre-occupy the FFI-state slot for this context id.
-        crate::runtime::register_test_context(&bi, &ctx_id, "did:dht:z6MkNapiOccupiedCreator");
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         // A well-formed 32-byte `enc` so control passes the bridge enc-length
         // check and reaches the `register_ffi_state` Occupied precheck (which runs
@@ -6628,7 +6750,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         let handle =
             super::NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator.to_owned());
@@ -6678,7 +6800,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         // Seed a RoleAssigned leaf carrying the affected member's subject_did
         // into the supervisor-owned event log (the manager-path source).
@@ -6814,7 +6936,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         let fabricated = [0xABu8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
@@ -6866,12 +6988,10 @@ mod tests {
         handle
     }
 
-    /// The DID `register_test_context` records as the bridge copy's creator in
-    /// the tests below. No identity and no supervisor context carries it, so a
-    /// call that authorizes against the bridge copy instead of the supervisor
-    /// anchors on the wrong creator.
+    /// A DID that no identity and no supervisor context carries, for the
+    /// tests below that need a caller who is not the context's creator.
     #[cfg(feature = "testing")]
-    const BRIDGE_COPY_CREATOR: &str = "did:dht:z6MkNapiBridgeCopyCreatorOnly";
+    const OUTSIDER_DID: &str = "did:dht:z6MkNapiOutsiderOnly";
 
     /// Calls all five UCAN entry points against `handle` and asserts each one
     /// refuses with the withheld pre-authorization refusal: `SCP-CTX-2023`, the
@@ -6976,10 +7096,7 @@ mod tests {
     /// `messages:write` token from the owner to the holder in that context.
     ///
     /// Returns the bridge instance, the handle, the token, its capability URI,
-    /// the owner DID, and the holder DID. The bridge copy is registered under
-    /// [`BRIDGE_COPY_CREATOR`] with `default_ceiling()`, so it disagrees with
-    /// the supervisor on the creator and, for a narrow `ceiling`, on the
-    /// ceiling.
+    /// the owner DID, and the holder DID.
     #[cfg(feature = "testing")]
     async fn active_context_with_token(
         scp: &crate::scp::Scp,
@@ -7013,7 +7130,7 @@ mod tests {
         )
         .await
         .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &ctx_id, BRIDGE_COPY_CREATOR);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, &owner_did);
         let token = crate::ucan::ucan_mint_on(
             &bi,
@@ -7114,7 +7231,7 @@ mod tests {
                     .await
                     .expect("test supervisor context creation must succeed");
             }
-            crate::runtime::register_test_context(&bi, &ctx_id, &owner_did);
+            crate::runtime::register_test_context(&bi, &ctx_id);
             match fault {
                 "poisoned" => sup.test_poison_context(&ctx_id).await,
                 "mid_respawn" => sup.test_hold_context_mid_respawn(&ctx_id).await,
@@ -7144,7 +7261,7 @@ mod tests {
     }
 
     /// `ucan_mint_on` grants no more than the ceiling the supervisor actor
-    /// holds, even when the handle's ceiling and the bridge copy are wider.
+    /// holds, even when the handle's ceiling is wider.
     ///
     /// The handle carries `default_ceiling()`, and an empty handle ceiling used
     /// to widen to `default_ceiling()` too, so a mint that read the handle
@@ -7170,7 +7287,7 @@ mod tests {
         )
         .await
         .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &ctx_id, &owner_did);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = wide_ceiling_handle_for(&bi, &ctx_id, &owner_did);
         assert!(
             handle.ceiling.iter().any(|c| c == "messages:write"),
@@ -7212,12 +7329,9 @@ mod tests {
     ///
     /// One owner creates two contexts: `wide` holds `messages:write` and
     /// `narrow` omits it. A `messages:write` token minted in `wide` passes each
-    /// call there and fails the ceiling check in `narrow`. Both bridge copies
-    /// carry `default_ceiling()`, which holds `messages:write`, and name
-    /// [`BRIDGE_COPY_CREATOR`]. An edit that hands the core the bridge ceiling,
-    /// the handle's empty ceiling widened to the default, or the other
-    /// context's ceiling fails the `narrow` half; an edit that hands it the
-    /// bridge creator fails the `wide` half at the root-issuer check.
+    /// call there and fails the ceiling check in `narrow`. An edit that hands
+    /// the core the handle's empty ceiling widened to the default, or the other
+    /// context's ceiling, fails the `narrow` half.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() {
@@ -7234,7 +7348,7 @@ mod tests {
         )
         .await
         .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &narrow_id, BRIDGE_COPY_CREATOR);
+        crate::runtime::register_test_context(&bi, &narrow_id);
         let narrow = active_handle_for(&bi, &narrow_id, &owner_did);
 
         for (handle, inside) in [(&wide, true), (&narrow, false)] {
@@ -7334,7 +7448,7 @@ mod tests {
         )
         .await
         .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &ctx_id, &owner_did);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let mut handle = active_handle_for(&bi, &ctx_id, &owner_did);
         handle
             .in_memory_custody
@@ -7375,13 +7489,13 @@ mod tests {
     }
 
     /// `ucan_revoke_on` admits the creator the supervisor holds, and refuses
-    /// the creator the bridge copy recorded.
+    /// a revoker who is neither that creator nor the token's issuer.
     ///
     /// The token's issuer is a third identity, so only the creator clause of
     /// the revocation authorizer can admit either revoker.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ucan_revoke_authorizes_the_supervisor_creator_not_the_bridge_copy() {
+    async fn ucan_revoke_authorizes_the_supervisor_creator_not_an_outsider() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         // The donor context's owner issues the token; the revocation runs in a
         // second context with a different supervisor creator.
@@ -7392,18 +7506,13 @@ mod tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator_did)
             .await
             .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &ctx_id, BRIDGE_COPY_CREATOR);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator_did);
         assert_ne!(issuer_did, creator_did);
 
-        let err = crate::ucan::ucan_revoke_on(
-            &bi,
-            &handle,
-            token.clone(),
-            BRIDGE_COPY_CREATOR.to_owned(),
-        )
-        .await
-        .expect_err("the bridge copy's creator is neither the issuer nor the live creator");
+        let err = crate::ucan::ucan_revoke_on(&bi, &handle, token.clone(), OUTSIDER_DID.to_owned())
+            .await
+            .expect_err("the outsider is neither the issuer nor the live creator");
         assert!(
             err.to_string().contains("neither the token issuer"),
             "the refusal must come from BridgeRevocationAuthorizer, got: {err}"
@@ -7427,7 +7536,7 @@ mod tests {
         crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-no-actor-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiNoActorCreator";
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator);
         assert_eq!(handle.state().expect("state"), "active");
 
@@ -7489,7 +7598,7 @@ mod tests {
                 .expect("context:close parses"),
         );
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator);
 
         let admitted = super::subscribe_admission(&bi, &handle)
@@ -7575,7 +7684,7 @@ mod tests {
             crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
                 .await
                 .expect("test supervisor context creation must succeed");
-            crate::runtime::register_test_context(&bi, &ctx_id, creator);
+            crate::runtime::register_test_context(&bi, &ctx_id);
             let handle = active_handle_for(&bi, &ctx_id, creator);
             match fault {
                 "poisoned" => sup.test_poison_context(&ctx_id).await,
@@ -7877,7 +7986,7 @@ mod tests {
         crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-close-despawned-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCloseDespawned";
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
 
         let handle = active_handle_for(&bi, &ctx_id, creator);
@@ -7929,7 +8038,7 @@ mod tests {
         super::context_close_on(&bi, &handle, identity.inner.did.clone())
             .await
             .expect("the creator's close should succeed");
-        crate::runtime::register_test_context(&bi, &ctx_id, &identity.inner.did);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         assert_eq!(
             crate::runtime::read_live_context_state(&bi, &ctx_id)
                 .await
@@ -7966,7 +8075,7 @@ mod tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
             .await
             .expect("the supervisor creates the context");
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         crate::runtime::supervisor(&bi)
             .expect("supervisor")
@@ -8009,7 +8118,7 @@ mod tests {
             crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
                 .await
                 .expect("the supervisor creates the context");
-            crate::runtime::register_test_context(&bi, &ctx_id, creator);
+            crate::runtime::register_test_context(&bi, &ctx_id);
 
             let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor"));
             if mid_respawn {
@@ -8058,7 +8167,7 @@ mod tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
             .await
             .expect("the supervisor creates the context");
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         assert!(crate::runtime::ucan_registry(&bi).contains_key(&ctx_id));
 
         crate::runtime::supervisor(&bi)
@@ -8108,7 +8217,7 @@ mod tests {
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
 
         assert!(
             !crate::runtime::live_role_state(&bi, &ctx_id)
@@ -9154,7 +9263,7 @@ mod tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &ctx_id, creator)
             .await
             .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator);
 
         let role_state = crate::runtime::live_role_state(&bi, &ctx_id)
@@ -9269,7 +9378,7 @@ mod tests {
         crate::runtime::init_supervisor_for_test_on(&bi);
         let ctx_id = format!("napi-stream-open-no-actor-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiStreamOpenNoActor";
-        crate::runtime::register_test_context(&bi, &ctx_id, creator);
+        crate::runtime::register_test_context(&bi, &ctx_id);
         let handle = active_handle_for(&bi, &ctx_id, creator);
 
         let err = crate::outlet_stream::outlet_stream_open_on(
@@ -9363,10 +9472,8 @@ mod tests {
     }
 
     /// `outlet_register_on` refuses the creator when the supervisor ceiling
-    /// omits `outlet:register`, although the bridge copy's ceiling
-    /// (`default_ceiling()`, written by `register_test_context`) and the
-    /// handle's ceiling both carry it, and admits the creator once the
-    /// supervisor ceiling carries it.
+    /// omits `outlet:register`, although the handle's ceiling carries it, and
+    /// admits the creator once the supervisor ceiling carries it.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outlet_register_follows_the_supervisor_ceiling_not_the_bridge_copy() {
@@ -9382,7 +9489,7 @@ mod tests {
         )
         .await
         .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &narrow, creator);
+        crate::runtime::register_test_context(&bi, &narrow);
         let err = crate::outlets::outlet_register_on(
             &bi,
             &wide_ceiling_handle_for(&bi, &narrow, creator),
@@ -9405,7 +9512,7 @@ mod tests {
         )
         .await
         .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &wide, creator);
+        crate::runtime::register_test_context(&bi, &wide);
         crate::outlets::outlet_register_on(
             &bi,
             &wide_ceiling_handle_for(&bi, &wide, creator),
@@ -9417,13 +9524,8 @@ mod tests {
 
     /// Outlet invocation, cross-context invocation, session invocation,
     /// exposure and acceptance pass with the ceiling, roles and creator the
-    /// supervisor holds, while both contexts' bridge copies are narrowed to
-    /// `messages:read` under another creator
-    /// (`crate::runtime::narrow_bridge_copy_for_test`).
-    ///
-    /// An edit that hands any of these calls the bridge copy's ceiling or
-    /// creator fails it: the copy grants neither `outlet:call` nor
-    /// `role:assign`, and the tokens' root issuer is not the copy's creator.
+    /// supervisor holds. The bridge's UCAN state holds no ceiling and no
+    /// creator for any of them to read instead.
     #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outlet_authorization_follows_the_supervisor_not_the_bridge_copy() {
@@ -9444,7 +9546,7 @@ mod tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &source_id, &owner_did)
             .await
             .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &source_id, BRIDGE_COPY_CREATOR);
+        crate::runtime::register_test_context(&bi, &source_id);
         let source = active_handle_for(&bi, &source_id, &owner_did);
 
         let outlet_id = crate::outlets::outlet_register_on(
@@ -9486,10 +9588,6 @@ mod tests {
         .await
         .expect("session creation must succeed");
 
-        crate::runtime::narrow_bridge_copy_for_test(&bi, &target_id)
-            .expect("the context has a bridge copy to narrow");
-        crate::runtime::narrow_bridge_copy_for_test(&bi, &source_id)
-            .expect("the context has a bridge copy to narrow");
         let input = r#"{"a":"x","b":1}"#;
 
         crate::outlets::outlet_invoke_on(

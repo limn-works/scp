@@ -27,7 +27,7 @@ pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle;
 use scp_ffi_common::credentials::FfiCredentialStore;
 use scp_ffi_common::error_codes as codes;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -193,11 +193,16 @@ pub struct NapiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) ucan_registry: Arc<DashMap<String, UcanContextState>>,
 
-    /// Context ids whose `ucan_registry` entry a release removed.
+    /// Release marks, keyed by the context id whose `ucan_registry` entry a
+    /// release removed.
     ///
-    /// [`ensure_registered`] refuses to rebuild an entry for an id in this
-    /// set.
-    pub(crate) released_contexts: Arc<DashMap<String, ()>>,
+    /// [`ensure_registered`] refuses to rebuild an entry for a marked id.
+    /// Marking a new id at [`MAX_RELEASED_CONTEXTS`] marks first removes the
+    /// earliest mark with no unsettled close.
+    pub(crate) released_contexts: std::sync::Mutex<HashMap<String, ReleaseMark>>,
+
+    /// Generation the next newly created release mark receives.
+    pub(crate) next_release_generation: std::sync::atomic::AtomicU64,
 
     /// The number of live [`NapiContextHandle`]s this instance minted, per
     /// context id.
@@ -398,7 +403,8 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
-            released_contexts: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
@@ -433,7 +439,8 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            released_contexts: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
@@ -566,7 +573,8 @@ impl NapiBridgeInstance {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
-            released_contexts: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
+            next_release_generation: std::sync::atomic::AtomicU64::new(0),
             context_handles: Arc::new(DashMap::new()),
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
@@ -686,7 +694,7 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // the custody provider's `Drop` impl (matching the behavior of the
         // previous `clear_fn` closures).
         self.ucan_registry.clear();
-        self.released_contexts.clear();
+        lock_release_marks(self).clear();
         self.context_handles.clear();
         self.identity_registry.clear();
         // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
@@ -1649,14 +1657,19 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
     bi.ucan_registry.as_ref()
 }
 
-/// Builds a fresh [`UcanContextState`] for a context, validating the caller's
-/// ceiling entries (§5.3.1.1) before normalizing them into the UCAN ceiling
-/// string set.
+/// Builds a fresh [`UcanContextState`] for a context after rejecting a caller
+/// ceiling entry that violates the §5.3.1.1 grammar.
 ///
 /// Shared by [`ensure_registered`] (lazy, idempotent — the UCAN-op path) and
 /// [`register_ffi_state`] (eager, fail-closed — the Welcome-join path) so the
-/// two cannot drift in how they construct per-context FFI state. The state
-/// holds no role state: the context's supervisor actor owns it.
+/// two cannot drift in how they construct per-context FFI state.
+///
+/// `user_ceiling` reaches this function for that grammar check alone. The state
+/// this function builds stores no role state, no ceiling, and no creator DID:
+/// the context's supervisor actor owns them, and every authorization site reads
+/// them through [`live_role_state`] at the moment it decides, because a
+/// `ModifyCeiling` governance action moves the ceiling after this registration
+/// runs.
 ///
 /// # Errors
 ///
@@ -1664,60 +1677,43 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
 /// grammar.
 fn build_ucan_context_state(
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<UcanContextState, ScpNapiError> {
-    let ceiling_strings = if user_ceiling.is_empty() {
-        scp_core::context::roles::default_ceiling()
-            .iter()
-            .map(scp_core::context::roles::Capability::ucan_capability_name)
-            .collect::<HashSet<String>>()
-    } else {
-        // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry
-        // BEFORE it is normalized into the UCAN ceiling string set. Validate the
-        // PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`) — NOT
-        // the raw string — so the validation checks EXACTLY the capability that
-        // gets enforced. `Capability::new` strips a `custom:` prefix: the raw
-        // string `"custom:payments"` has one colon (would pass a raw-string check)
-        // but parses to `Custom("payments")`, whose enforced form
-        // (`ucan_capability_name` → `payments:payments`) corresponds to a no-colon
-        // custom that `validate_as_ceiling_entry` REJECTS. Routing through the
-        // parsed enum keeps the raw-string validation and the enforced parse in
-        // agreement on one canonical form (BLACK-003), and still rejects a
-        // no-colon `payments` that would otherwise be widened to `payments:*`.
-        for entry in user_ceiling {
-            // Fail-closed: a malformed capability string (deleted legacy
-            // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
-            // outlet suffix) parses to `None` and is rejected at the FFI
-            // boundary rather than silently dropped.
-            let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                ScpNapiError::Validation {
-                    message: format!(
-                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                    ),
-                    code: codes::VALID_7000.to_owned(),
-                }
+    // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry.
+    // Validate the PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`)
+    // — NOT the raw string — so the validation checks EXACTLY the capability that
+    // gets enforced. `Capability::new` strips a `custom:` prefix: the raw
+    // string `"custom:payments"` has one colon (would pass a raw-string check)
+    // but parses to `Custom("payments")`, whose enforced form
+    // (`ucan_capability_name` → `payments:payments`) corresponds to a no-colon
+    // custom that `validate_as_ceiling_entry` REJECTS. Routing through the
+    // parsed enum keeps the raw-string validation and the enforced parse in
+    // agreement on one canonical form (BLACK-003), and still rejects a
+    // no-colon `payments` that would otherwise be widened to `payments:*`.
+    for entry in user_ceiling {
+        // Fail-closed: a malformed capability string (deleted legacy
+        // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
+        // outlet suffix) parses to `None` and is rejected at the FFI
+        // boundary rather than silently dropped.
+        let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+            ScpNapiError::Validation {
+                message: format!(
+                    "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            }
+        })?;
+        cap.validate_as_ceiling_entry()
+            .map_err(|e| ScpNapiError::Validation {
+                message: e.to_string(),
+                code: codes::VALID_7000.to_owned(),
             })?;
-            cap.validate_as_ceiling_entry()
-                .map_err(|e| ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
-        }
-        user_ceiling
-            .iter()
-            .filter_map(|s| {
-                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
-            })
-            .collect::<HashSet<String>>()
-    };
+    }
 
     Ok(UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         },
         outlet_registry: OutletRegistry::new(),
@@ -1738,8 +1734,14 @@ fn build_ucan_context_state(
 /// consumed — and leaves the pre-existing entry untouched (the bridge must
 /// never roll back state it did not create).
 ///
-/// The registered state holds no role state and no membership: the
-/// supervisor actor the Welcome join spawns owns both.
+/// The registered state holds no role state, membership, capability ceiling,
+/// or creator DID: the supervisor actor the Welcome join spawns owns them, and
+/// every authorization site reads them through [`live_role_state`].
+///
+/// `user_ceiling` is validated against the ceiling-entry grammar (spec
+/// §5.3.1.1) by [`build_ucan_context_state`] and then discarded; no ceiling is
+/// stored. The Welcome-join path passes an empty slice, because the ceiling
+/// the creator signed reaches the actor through `spawn_actor_from_welcome`.
 ///
 /// # Errors
 ///
@@ -1748,7 +1750,6 @@ fn build_ucan_context_state(
 pub fn register_ffi_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<(), ScpNapiError> {
     use dashmap::mapref::entry::Entry;
@@ -1760,7 +1761,7 @@ pub fn register_ffi_state(
         }),
         Entry::Vacant(vacant) => {
             // This insert leaves the release mark in place.
-            let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
+            let state = build_ucan_context_state(context_id, user_ceiling)?;
             vacant.insert(state);
             Ok(())
         }
@@ -1792,7 +1793,7 @@ pub fn ensure_registered(
 
     let context_id = handle.context_id();
     if let Entry::Vacant(vacant) = ucan_registry(bi).entry(context_id) {
-        if bi.released_contexts.contains_key(vacant.key()) {
+        if lock_release_marks(bi).contains_key(vacant.key()) {
             // The refusal withholds the lifecycle state: this call authorizes
             // no one, so its answer must not say whether the context closed.
             return Err(ScpNapiError::Context {
@@ -1803,73 +1804,208 @@ pub fn ensure_registered(
                 code: codes::CTX_2023.to_owned(),
             });
         }
-        let state =
-            build_ucan_context_state(vacant.key(), &handle.creator_did(), &handle.ceiling())?;
+        let state = build_ucan_context_state(vacant.key(), &handle.ceiling())?;
         vacant.insert(state);
     }
     Ok(())
 }
 
+/// Mark count at which marking a new id first removes the earliest mark that
+/// has no unsettled close.
+pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
+
+/// One release mark: the instant it was last set, the number of closes that
+/// set it and have not yet settled, and the generation it took when it was
+/// created.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReleaseMark {
+    pub(crate) at: std::time::Instant,
+    pub(crate) in_flight: usize,
+    pub(crate) generation: u64,
+}
+
+/// One close's claim on a release mark: the context id and the mark
+/// generation the close set or joined.
+#[derive(Debug)]
+pub(crate) struct ReleaseTicket {
+    context_id: String,
+    generation: u64,
+}
+
+/// Locks `bi`'s release marks.
+pub(crate) fn lock_release_marks(
+    bi: &NapiBridgeInstance,
+) -> std::sync::MutexGuard<'_, HashMap<String, ReleaseMark>> {
+    bi.released_contexts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Sets the release mark on `context_id` to the current instant, adds
+/// `in_flight` to its count of unsettled closes, and returns the mark's
+/// generation. A mark created by this call takes a generation no earlier mark
+/// of this instance took; a mark that already stands keeps its generation.
+/// When `marks` holds [`MAX_RELEASED_CONTEXTS`] marks and `context_id` has
+/// none, first removes the earliest mark whose count of unsettled closes is
+/// zero.
+fn set_release_mark(
+    marks: &mut HashMap<String, ReleaseMark>,
+    next_generation: &std::sync::atomic::AtomicU64,
+    context_id: &str,
+    in_flight: usize,
+) -> u64 {
+    if !marks.contains_key(context_id) && marks.len() >= MAX_RELEASED_CONTEXTS {
+        let oldest = marks
+            .iter()
+            .filter(|(_, mark)| mark.in_flight == 0)
+            .min_by_key(|(_, mark)| mark.at)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            marks.remove(&oldest);
+        }
+    }
+    let now = std::time::Instant::now();
+    let mark = marks
+        .entry(context_id.to_owned())
+        .or_insert_with(|| ReleaseMark {
+            at: now,
+            in_flight: 0,
+            generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        });
+    mark.at = now;
+    mark.in_flight = mark.in_flight.saturating_add(in_flight);
+    mark.generation
+}
+
+/// Returns the mark on `ticket`'s context id when it stands under `ticket`'s
+/// generation.
+fn ticketed_mark<'m>(
+    marks: &'m mut HashMap<String, ReleaseMark>,
+    ticket: &ReleaseTicket,
+) -> Option<&'m mut ReleaseMark> {
+    marks
+        .get_mut(&ticket.context_id)
+        .filter(|mark| mark.generation == ticket.generation)
+}
+
+/// Removes the UCAN state `entry` holds, if any, and releases the registry
+/// shard lock `entry` holds.
+fn remove_registry_entry(entry: dashmap::mapref::entry::Entry<'_, String, UcanContextState>) {
+    if let dashmap::mapref::entry::Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
+}
+
 /// Releases a closed context's [`UcanContextState`] and marks the id so
 /// [`ensure_registered`] does not rebuild it.
 ///
-/// The mark goes in before the entry comes out; [`ensure_registered`] reads the
-/// mark while it holds the entry's shard lock, so no rebuild lands after this
-/// call returns. When no live [`NapiContextHandle`] for the id remains, this
-/// call drops the mark again.
+/// The mark, both removals, and the handle-count check run while this call
+/// holds the registry entry for `context_id` and then the release-mark lock,
+/// the order [`ensure_registered`] takes them in, so no rebuild lands after
+/// this call returns. When no live [`NapiContextHandle`] for the id remains,
+/// this call drops the mark again.
 pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
-    bi.released_contexts.insert(context_id.to_owned(), ());
-    remove_context_while_released(bi, context_id);
-    prune_release_mark(bi, context_id);
+    let entry = ucan_registry(bi).entry(context_id.to_owned());
+    let mut marks = lock_release_marks(bi);
+    set_release_mark(&mut marks, &bi.next_release_generation, context_id, 0);
+    bi.core.remove_known_context(context_id);
+    remove_registry_entry(entry);
+    prune_marked(bi, &mut marks, context_id);
+    drop(marks);
 }
 
-/// Removes `context_id`'s [`UcanContextState`] and its known-context entry,
-/// only while the release mark stands, and returns whether the mark stood.
-///
-/// The mark check and both removals run under the registry entry's shard lock.
-pub(crate) fn remove_context_while_released(bi: &NapiBridgeInstance, context_id: &str) -> bool {
-    use dashmap::mapref::entry::Entry;
+/// Marks `context_id` released with one unsettled close, and returns the
+/// ticket that names the mark generation this close set or joined.
+pub(crate) fn mark_released(bi: &NapiBridgeInstance, context_id: &str) -> ReleaseTicket {
+    let generation = set_release_mark(
+        &mut lock_release_marks(bi),
+        &bi.next_release_generation,
+        context_id,
+        1,
+    );
+    ReleaseTicket {
+        context_id: context_id.to_owned(),
+        generation,
+    }
+}
 
-    let entry = ucan_registry(bi).entry(context_id.to_owned());
-    if !bi.released_contexts.contains_key(context_id) {
+/// Removes `ticket`'s context id's [`UcanContextState`] and known-context
+/// entry and runs `teardown`, only while the release mark stands under
+/// `ticket`'s generation, and returns whether it stood. When it stood, settles
+/// `ticket`'s close on it.
+///
+/// The mark check, both removals, and `teardown` run while this call holds the
+/// release-mark lock, which [`readmit_context`] also takes, so a readmit that
+/// clears the mark first leaves the readmitted context's state in place and
+/// `teardown` unrun, and a readmit that comes second waits for `teardown` to
+/// finish. No registry guard is held while `teardown` runs.
+pub(crate) fn remove_context_while_released(
+    bi: &NapiBridgeInstance,
+    ticket: ReleaseTicket,
+    teardown: impl FnOnce(),
+) -> bool {
+    let entry = ucan_registry(bi).entry(ticket.context_id.clone());
+    let mut marks = lock_release_marks(bi);
+    let Some(mark) = ticketed_mark(&mut marks, &ticket) else {
         return false;
-    }
-    bi.core.remove_known_context(context_id);
-    if let Entry::Occupied(occupied) = entry {
-        occupied.remove();
-    }
+    };
+    mark.in_flight = mark.in_flight.saturating_sub(1);
+    bi.core.remove_known_context(&ticket.context_id);
+    remove_registry_entry(entry);
+    teardown();
+    drop(marks);
     true
 }
 
-/// Clears the release mark [`release_context`] left for `context_id`.
+/// Clears the release mark on `context_id`.
 ///
-/// It clears the mark under the registry entry's shard lock.
+/// It clears the mark while holding the release-mark lock.
 pub fn readmit_context(bi: &NapiBridgeInstance, context_id: &str) {
-    let _shard = ucan_registry(bi).entry(context_id.to_owned());
-    bi.released_contexts.remove(context_id);
+    lock_release_marks(bi).remove(context_id);
+}
+
+/// Settles `ticket`'s close and clears its context id's release mark when no
+/// unsettled close remains on it, if the mark stands under `ticket`'s
+/// generation.
+fn readmit_ticketed(bi: &NapiBridgeInstance, ticket: &ReleaseTicket) {
+    let mut marks = lock_release_marks(bi);
+    if let Some(mark) = ticketed_mark(&mut marks, ticket) {
+        mark.in_flight = mark.in_flight.saturating_sub(1);
+        if mark.in_flight == 0 {
+            marks.remove(&ticket.context_id);
+        }
+    }
 }
 
 /// Marks `context_id` released, re-reads the supervisor, and removes the
-/// context's bridge state only when the re-read does not report `Active`.
+/// context's bridge state and runs `teardown` only when the re-read does not
+/// report `Active`.
 ///
 /// A close decides from a lifecycle read taken before it releases, so the id
 /// can return to `Active`, and be readmitted, in between. When the re-read,
-/// taken after the mark went in, reports `Active`, this clears the mark,
-/// removes nothing, and returns `false`, so the readmitted context keeps its
+/// taken after the mark went in, reports `Active`, this removes nothing, runs
+/// nothing, returns `false`, and settles this call's close, clearing the mark
+/// once no unsettled close remains on it, so the readmitted context keeps its
 /// revocation list, nonce tracker, outlets, and sessions. On any other
-/// answer, a failed read included, it removes the state while the mark stands
-/// and returns `true`. When a readmit clears the mark between the re-read and
-/// the removal, it removes nothing and returns `false`.
-pub async fn release_context_unless_readmitted(bi: &NapiBridgeInstance, context_id: &str) -> bool {
-    bi.released_contexts.insert(context_id.to_owned(), ());
+/// answer, a failed read included, it runs [`remove_context_while_released`]
+/// with `teardown` and returns its result: `true` when the mark stood under
+/// the generation this call set or joined, so the state was removed and
+/// `teardown` ran, and `false` otherwise. A mark this call holds is never
+/// evicted, because its close stays unsettled until the removal.
+pub async fn release_context_unless_readmitted(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    teardown: impl FnOnce(),
+) -> bool {
+    let ticket = mark_released(bi, context_id);
     if matches!(
         read_live_context_state(bi, context_id).await,
         Ok(Some(scp_core::context::ContextState::Active))
     ) {
-        readmit_context(bi, context_id);
+        readmit_ticketed(bi, &ticket);
         return false;
     }
-    if !remove_context_while_released(bi, context_id) {
+    if !remove_context_while_released(bi, ticket, teardown) {
         return false;
     }
     prune_release_mark(bi, context_id);
@@ -1885,12 +2021,13 @@ pub(crate) fn track_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
 }
 
 /// Counts one fewer live [`NapiContextHandle`] for `context_id`, and drops the
-/// id's release mark when the count reaches zero.
+/// id's release mark when the count reaches zero and no close on the id is
+/// unsettled.
 ///
-/// Dropping it keeps `released_contexts` from growing by one entry for every
-/// context this instance ever closed. A count
-/// this instance does not hold (after a shutdown cleared the counts) changes
-/// nothing.
+/// Dropping it keeps `released_contexts` from holding a mark for every closed
+/// context whose handles are gone; [`MAX_RELEASED_CONTEXTS`] bounds the marks
+/// that live handles keep. A count this instance does not hold (after a
+/// shutdown cleared the counts) changes nothing.
 pub(crate) fn untrack_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
     use dashmap::mapref::entry::Entry;
 
@@ -1912,16 +2049,36 @@ pub(crate) fn untrack_context_handle(bi: &NapiBridgeInstance, context_id: &str) 
     }
 }
 
+/// Returns whether `context_id` holds a release mark on `bi`.
+#[cfg(test)]
+pub(crate) fn has_release_mark(bi: &NapiBridgeInstance, context_id: &str) -> bool {
+    lock_release_marks(bi).contains_key(context_id)
+}
+
 /// Drops `context_id`'s release mark when no live [`NapiContextHandle`] for
-/// the id remains.
+/// the id remains and no close on it is unsettled.
 ///
 /// The handle-count check and the removal run under the registry entry's
-/// shard lock, the lock [`ensure_registered`] holds while it reads the mark.
+/// shard lock and then the release-mark lock, the order [`ensure_registered`]
+/// takes them in while it reads the mark.
 fn prune_release_mark(bi: &NapiBridgeInstance, context_id: &str) {
     let _shard = ucan_registry(bi).entry(context_id.to_owned());
-    if !bi.context_handles.contains_key(context_id) {
-        bi.released_contexts.remove(context_id);
+    prune_marked(bi, &mut lock_release_marks(bi), context_id);
+}
+
+/// The body of [`prune_release_mark`], for a caller that already holds the
+/// release-mark lock.
+fn prune_marked(
+    bi: &NapiBridgeInstance,
+    marks: &mut HashMap<String, ReleaseMark>,
+    context_id: &str,
+) {
+    if bi.context_handles.contains_key(context_id)
+        || marks.get(context_id).is_some_and(|mark| mark.in_flight > 0)
+    {
+        return;
     }
+    marks.remove(context_id);
 }
 
 /// Executes a closure with mutable access to a context's UCAN state on the
@@ -2337,21 +2494,14 @@ pub fn query_trust_event_counts(
 
 /// Registers a test context in the UCAN state registry.
 #[cfg(test)]
-pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_did: &str) {
+pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str) {
     let map = ucan_registry(bi);
-
-    let ceiling_strings = scp_core::context::roles::default_ceiling()
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect::<HashSet<String>>();
 
     let state = UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             event_log: EventLog::new(context_id.to_owned()),
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
         },
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
@@ -2396,10 +2546,9 @@ pub(crate) async fn create_supervisor_context_for_test(
 /// [`create_supervisor_context_for_test`] with `ceiling` as the context's
 /// capability ceiling instead of `default_ceiling()`.
 ///
-/// A test that gives the supervisor a ceiling different from the bridge copy
-/// (`register_test_context` writes `default_ceiling()` there, and
-/// `NapiContextHandle::test_active_on` writes an empty `ceiling`) proves an
-/// entry point read the supervisor: the copy would answer differently.
+/// A test that gives the supervisor a ceiling different from the handle's
+/// (`NapiContextHandle::test_active_on` writes an empty `ceiling`) proves an
+/// entry point read the supervisor: the handle would answer differently.
 /// `ceiling` entries take the colon form the TypeScript surface accepts
 /// (`"messages:read"`, `"outlet:call:*"`).
 ///
@@ -2430,37 +2579,12 @@ pub(crate) async fn create_supervisor_context_with_ceiling_for_test(
     create_supervisor_context_with_capabilities(bi, context_id, creator_did, ceiling).await
 }
 
-/// The creator [`narrow_bridge_copy_for_test`] writes into a bridge copy. No
-/// identity and no supervisor context carries it.
+/// A creator DID that no identity and no supervisor context carries. Tests
+/// name it in a [`crate::context::NapiContextHandle`], so an entry point that
+/// took the creator from the handle instead of the supervisor fails to resolve
+/// that creator's signing key.
 #[cfg(all(test, feature = "testing"))]
-pub(crate) const NARROWED_COPY_CREATOR: &str = "did:dht:z6MkNapiNarrowedBridgeCopyCreator";
-
-/// Overwrites the bridge copy of `context_id`'s ceiling and creator
-/// (`core.ceiling_strings` and `core.creator_did`) with a `messages:read`-only
-/// ceiling and [`NARROWED_COPY_CREATOR`] as the creator.
-///
-/// An entry point that still passes after this call took its ceiling and
-/// creator from the supervisor: the copy would refuse it.
-///
-/// # Errors
-///
-/// Returns the registry error when `context_id` has no bridge copy. The
-/// calling test fails on it, because it is a broken fixture rather than a
-/// condition under test.
-#[cfg(all(test, feature = "testing"))]
-pub(crate) fn narrow_bridge_copy_for_test(
-    bi: &NapiBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpNapiError> {
-    let ceiling = scp_core::context::roles::CapabilityCeiling::new([
-        scp_core::context::roles::Capability::MessagesRead,
-    ]);
-    with_context(bi, context_id, |rt| {
-        rt.core.ceiling_strings = ceiling.to_ucan_string_set();
-        NARROWED_COPY_CREATOR.clone_into(&mut rt.core.creator_did);
-        Ok(())
-    })
-}
+pub(crate) const KEYLESS_HANDLE_CREATOR: &str = "did:dht:z6MkNapiKeylessHandleCreator";
 
 /// The shared body of the two supervisor-context test fixtures.
 #[cfg(all(test, feature = "testing"))]
@@ -3237,7 +3361,7 @@ mod tests {
         assert_eq!(role_state.creator_did, creator);
         assert_eq!(
             role_state.ceiling().to_ucan_string_set(),
-            HashSet::from(["messages:read".to_owned()]),
+            std::collections::HashSet::from(["messages:read".to_owned()]),
         );
 
         for (fault, expected) in [
