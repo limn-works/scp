@@ -3093,8 +3093,8 @@ impl crate::scp::PyScp {
     /// node can DECRYPT but cannot SEND (no actor-backed handle).
     ///
     /// The bridge-side FFI state is registered only after the runtime join
-    /// commits. When that registration or the known-context registration
-    /// fails, the function tears down the actor the join committed.
+    /// commits. When that registration fails, the function tears down the
+    /// actor the join committed.
     ///
     /// Local-identity custody of the JOINER (`owning_did`) is enforced at the
     /// bridge exactly as `context_create` enforces it for the creator: the
