@@ -7,10 +7,10 @@
 //! in-browser SCP clients. `scp-runtime` call sites import those items from
 //! `scp_mls` directly (no re-export shim — ADR-057 Amendment).
 //!
-//! This module keeps the **async durable-storage bridge** (`storage`,
-//! `provider`, `backend`, `production_backend`, `storage_adapter`) — the
-//! `block_in_place`/`ScpMlsProvider<S>` parts that are tokio-coupled and
-//! node-only.
+//! This module keeps the tokio-coupled, node-only parts (`provider`,
+//! `backend`, `production_backend`, `storage_adapter`). Every live MLS
+//! provider is `scp_mls::InMemoryMlsProvider`; its state persists as a
+//! snapshot blob (persistence spec §17.9.1).
 //!
 //! # Ciphersuite
 //!
@@ -32,11 +32,10 @@ mod wrapping_extension_runtime_tests;
 // document + honest clock-stamped `resolved_at`.
 pub mod attestation_verification;
 
-// Async durable-storage bridge — stays in scp-runtime (tokio-coupled, node-only).
+// Async MLS backend and provider — stay in scp-runtime (tokio-coupled, node-only).
 pub mod backend;
 pub mod production_backend;
 pub mod provider;
-pub mod storage;
 pub mod storage_adapter;
 
 // Shared two-party joined-pair bootstrap for provider-level unit tests (drives
@@ -46,4 +45,3 @@ pub mod storage_adapter;
 pub(crate) mod two_party_test_support;
 
 pub use provider::NodeMlsFactory;
-pub use storage::{MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider};

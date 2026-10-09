@@ -38,7 +38,6 @@ use super::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
-use super::storage::new_provider;
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
 use scp_mls::InMemoryMlsProvider;
@@ -239,7 +238,7 @@ impl ProductionMlsBackend {
                     "deserializing key package for init-key: {e}"
                 ))
             })?;
-        let provider = new_provider();
+        let provider = InMemoryMlsProvider::default();
         let validated = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| match e {
@@ -379,20 +378,11 @@ fn signer_and_provider_from_wrapper(
     let signer: SignatureKeyPair = rmp_serde::from_slice(&wrapper.signer_bytes)
         .map_err(|e| MlsError::StorageError(format!("signer deserialization: {e}")))?;
 
-    let provider = new_provider();
-    {
-        let mut values = provider
-            .storage()
-            .values
-            .write()
-            .map_err(|e| MlsError::StorageError(format!("provider lock poisoned: {e}")))?;
-        // The entries move into the provider without a copy; the provider's
-        // own `Drop` wipes them, and the drained `Zeroizing` vector wipes its
-        // buffer when `wrapper` drops.
-        for (k, v) in wrapper.mls_storage_entries.drain(..) {
-            values.insert(k, v);
-        }
-    }
+    // The entries move into the provider without a copy, and the `Drop` of
+    // the provider's storage wipes them. A signer-labelled entry is refused before any
+    // entry moves (persistence spec §17.9.1); the `Zeroizing` vector wipes
+    // whatever it still holds when `wrapper` drops.
+    let provider = InMemoryMlsProvider::from_storage_entries(&mut wrapper.mls_storage_entries)?;
 
     // The signer is not written into the provider's storage: every openmls
     // operation that signs takes it as an argument, and openmls never reads a
@@ -498,17 +488,6 @@ impl MlsBackend for ProductionMlsBackend {
         decrypt_with_sender_did(group, ciphertext)
     }
 
-    async fn process_commit(
-        &self,
-        group: &mut ScpMlsGroup,
-        commit_bytes: &[u8],
-    ) -> Result<(), MlsError> {
-        // `decrypt_commit` refuses a non-Commit before decrypting it, so a
-        // refused application message or Proposal consumes no ratchet
-        // generation, then merges a Commit through `decrypt_with_sender_did`.
-        scp_mls::encrypt::decrypt_commit(group, commit_bytes)
-    }
-
     async fn advance_epoch(
         &self,
         group: &mut ScpMlsGroup,
@@ -535,7 +514,7 @@ impl MlsBackend for ProductionMlsBackend {
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
-        let provider = new_provider();
+        let provider = InMemoryMlsProvider::default();
         let validated = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
@@ -855,7 +834,7 @@ mod tests {
         let provider = InMemoryMlsProvider::default();
         provider
             .storage()
-            .values
+            .values()
             .write()
             .unwrap()
             .insert(b"EncryptionKeyPair-a".to_vec(), vec![0xC3_u8; 48]);
@@ -897,6 +876,71 @@ mod tests {
             .unwrap();
         assert_eq!(public.len(), 32);
         assert!(!private.is_empty());
+    }
+
+    /// `SignatureKeyPair::store` and a direct `write_signature_key_pair` are
+    /// disallowed by this crate's `clippy.toml`, and the provider's storage
+    /// refuses both at runtime and stores nothing (persistence spec §17.9).
+    ///
+    /// Each `expect` is the control for one `clippy.toml` entry: it is
+    /// unfulfilled, and the CI clippy run (`-D warnings`) fails, when that
+    /// entry stops disallowing the call.
+    #[test]
+    fn signer_store_is_disallowed_and_refused() {
+        use openmls_traits::storage::StorageProvider as _;
+
+        let provider = InMemoryMlsProvider::default();
+        let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint and the refusal: stores the signer on purpose"
+        )]
+        let stored = signer.store(provider.storage());
+        assert!(matches!(
+            stored,
+            Err(scp_mls::InMemoryMlsStorageError::SignerStorageForbidden)
+        ));
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "control for the lint and the refusal: stores the signer through the trait on purpose"
+        )]
+        let written = provider
+            .storage()
+            .write_signature_key_pair(&signer.id(), &signer);
+        assert!(matches!(
+            written,
+            Err(scp_mls::InMemoryMlsStorageError::SignerStorageForbidden)
+        ));
+
+        assert!(provider.storage().values().read().unwrap().is_empty());
+    }
+
+    /// A signer-state whose storage entries include one under openmls's
+    /// signature-key-pair label fails the signer and provider rebuild with
+    /// `SignerStorageForbidden` (persistence spec §17.9.1); the same
+    /// signer-state without that entry rebuilds.
+    #[tokio::test]
+    async fn signer_from_wrapper_refuses_signer_entry() {
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let generated = backend
+            .generate_key_package(&test_credential("signer-wrapper"), None)
+            .await
+            .unwrap();
+
+        // Control: the unmodified signer-state rebuilds.
+        let wrapper = parse_signer_state(&generated.signer_state).unwrap();
+        signer_and_provider_from_wrapper(wrapper).unwrap();
+
+        let mut wrapper = parse_signer_state(&generated.signer_state).unwrap();
+        let mut signer_key = b"SignatureKeyPair".to_vec();
+        signer_key.extend_from_slice(b"[1,2,3]");
+        wrapper
+            .mls_storage_entries
+            .push((signer_key, b"signer private key".to_vec()));
+        let result = signer_and_provider_from_wrapper(wrapper);
+        assert!(matches!(result, Err(MlsError::SignerStorageForbidden)));
     }
 
     /// A `ProductionMlsBackend` with the durable consumed-init-key store
@@ -1115,17 +1159,16 @@ mod tests {
         );
     }
 
-    /// Security-model spec §9.7.1, the receiver, on
-    /// `MlsBackend::process_commit`: a receiving backend whose injected clock
-    /// stands past an added `KeyPackage`'s `not_after` still merges the add
-    /// Commit, because a receiver checks the received `Lifetime`'s range only
-    /// and reads no clock. The wall clock stays inside Carol's `Lifetime`, so
-    /// openmls's own wall-clock check passes and only an injected-clock check
-    /// on receive could refuse. No production receive path calls
-    /// `process_commit`; the native receive path, `decrypt_and_dispatch`, has
-    /// its own tests among the supervisor tests.
+    /// Security-model spec §9.7.1, the receiver, on `MlsBackend::decrypt`: a
+    /// receiving backend whose injected clock stands past an added
+    /// `KeyPackage`'s `not_after` still merges the add Commit, because a
+    /// receiver checks the received `Lifetime`'s range only and reads no
+    /// clock. The wall clock stays inside Carol's `Lifetime`, so openmls's own
+    /// wall-clock check passes and only an injected-clock check on receive
+    /// could refuse. The native receive path, `decrypt_and_dispatch`, has its
+    /// own tests among the supervisor tests.
     #[tokio::test]
-    async fn process_commit_merges_add_expired_under_receiver_injected_clock() {
+    async fn decrypt_merges_add_expired_under_receiver_injected_clock() {
         use scp_clock::TestClock;
         use scp_mls::lifetime::KEY_PACKAGE_LIFETIME_SECS;
 
@@ -1176,10 +1219,11 @@ mod tests {
         let carol_not_after = real_now + KEY_PACKAGE_LIFETIME_SECS;
         bob_clock.set(carol_not_after + 1);
         assert!(SystemClock.now_secs() < carol_not_after);
-        bob_backend
-            .process_commit(&mut bob, &carol_add.commit)
+        let merged = bob_backend
+            .decrypt(&mut bob, &carol_add.commit)
             .await
             .expect("a receiver merges an Add expired under its own clock");
+        assert!(matches!(merged, DecryptedContent::Commit { .. }));
         assert_eq!(bob.epoch().unwrap(), bob_epoch_before + 1);
         assert_eq!(bob.members().unwrap().len(), 3, "Alice, Bob and Carol");
     }
@@ -1851,7 +1895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_commit_applies_epoch_advance() {
+    async fn decrypt_applies_epoch_advance() {
         let backend = joinable_backend();
 
         // `advance_epoch` always proposes a wrapping-extension update on
@@ -1892,53 +1936,9 @@ mod tests {
             .unwrap();
         assert_eq!(alice_grp.epoch().unwrap(), 2);
 
-        backend
-            .process_commit(&mut bob_grp, &adv_commit)
-            .await
-            .unwrap();
+        let merged = backend.decrypt(&mut bob_grp, &adv_commit).await.unwrap();
+        assert!(matches!(merged, DecryptedContent::Commit { .. }));
         assert_eq!(bob_grp.epoch().unwrap(), 2);
-    }
-
-    /// An application message handed to the backend's `process_commit` is
-    /// refused before decryption, so Bob's epoch is unchanged and the same bytes
-    /// still decrypt through the backend's `decrypt`: the refusal consumed no
-    /// sender ratchet generation and deleted no key.
-    #[tokio::test]
-    async fn process_commit_refuses_application_message_without_consuming_its_key() {
-        let backend = joinable_backend();
-
-        let alice_cred = test_credential("alice-pcapp");
-        let bob_cred = test_credential("bob-pcapp");
-        let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
-        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
-        let added = backend
-            .add_member_raw(&mut alice_grp, &bob_gen.key_package_bytes)
-            .await
-            .unwrap();
-        let mut bob_grp = backend
-            .join_from_welcome(
-                &added.welcome,
-                bob_gen.signer_state.clone(),
-                &bob_gen.key_package_bytes,
-            )
-            .await
-            .unwrap();
-        let epoch_before = bob_grp.epoch().unwrap();
-
-        let ct = backend.encrypt(&mut alice_grp, b"in flight").await.unwrap();
-        let err = backend.process_commit(&mut bob_grp, &ct).await.unwrap_err();
-        assert!(
-            matches!(err, MlsError::CommitProcessingFailed(_)),
-            "expected CommitProcessingFailed, got {err:?}"
-        );
-        assert_eq!(bob_grp.epoch().unwrap(), epoch_before);
-
-        match backend.decrypt(&mut bob_grp, &ct).await.unwrap() {
-            DecryptedContent::Application { plaintext, .. } => {
-                assert_eq!(plaintext, b"in flight");
-            }
-            other => panic!("expected Application, got {other:?}"),
-        }
     }
 
     /// Byte-level equivalence: a backend-produced encryption can be

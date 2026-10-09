@@ -16,7 +16,6 @@ crates/
       crypto/
         mod.rs
         mls/                # ADR-001: MLS wrapper
-          storage.rs        # MlsStorageBridge — OpenMLS StorageProvider impl (§17.9)
         sender_keys/        # ADR-007: Sender-side key layer
           key_protocol.rs   # Pull-based key distribution: SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse
         ucan/               # ADR-009/016: UCAN validation

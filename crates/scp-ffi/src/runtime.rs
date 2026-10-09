@@ -38,8 +38,6 @@
 //!    registers FFI-specific state via [`register_ffi_state`].
 //! 2. Bridge functions call [`with_ffi_state`] for FFI-specific state and
 //!    [`supervisor`] for the shared `Supervisor`.
-//! 3. `py_context_close` delegates to `ContextManager::close_context`, then
-//!    removes FFI state via [`remove_ffi_state`].
 //!
 //! # Context Discovery (SCP-213)
 //!
@@ -54,7 +52,7 @@
 //! errors directly to the Python exception hierarchy without string
 //! roundtripping.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
@@ -64,7 +62,7 @@ use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
 };
-use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::roles::ContextRoleState;
 use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -479,6 +477,10 @@ pub struct PyBridgeInstance {
     /// established for `identity_registry`.
     pub(crate) ffi_bridge_state: Arc<DashMap<String, FfiBridgeState>>,
 
+    /// Release marks: the ids whose [`FfiBridgeState`] a close released, each
+    /// with its [`ReleaseMark`].
+    pub(crate) released_contexts: std::sync::Mutex<HashMap<String, ReleaseMark>>,
+
     /// MCP server registry (replaces `SERVER_REGISTRY` in `mcp.rs`).
     ///
     /// Migrated from a process-global `OnceLock<DashMap<String, McpServerState>>`
@@ -560,6 +562,7 @@ impl PyBridgeInstance {
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
             ffi_bridge_state: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
@@ -605,6 +608,7 @@ impl PyBridgeInstance {
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
             ffi_bridge_state: Arc::new(DashMap::new()),
+            released_contexts: std::sync::Mutex::new(HashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
@@ -697,6 +701,7 @@ impl PyBridgeInstance {
                     identity_registry: Arc::new(DashMap::new()),
                     storage_provider: OnceLock::new(),
                     ffi_bridge_state: Arc::new(DashMap::new()),
+                    released_contexts: std::sync::Mutex::new(HashMap::new()),
                     mcp_server_registry: Arc::new(DashMap::new()),
                     mcp_client_registry: Arc::new(DashMap::new()),
                     connected_relay_url: RwLock::new(None),
@@ -858,6 +863,7 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // `OutletRegistry`, `EventLog`, receive channel senders, and
         // registered outlet handlers drop.
         self.ffi_bridge_state.clear();
+        lock_release_marks(self).clear();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
@@ -1515,21 +1521,10 @@ pub struct FfiBridgeState {
     pub outlet_registry: OutletRegistry,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
-    /// Role state tracking member capabilities.
-    ///
-    /// Also maintained by `ContextManager` for lifecycle operations.
-    /// Both copies are kept in sync: `register_ffi_state` initializes from
-    /// the same parameters, and `py_context_join` updates both.
-    pub role_state: ContextRoleState,
     /// UCAN revocation list for this context.
     pub revocation_list: RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
     pub nonce_tracker: NonceTracker<SystemClock>,
-    /// Capability ceiling as a set of `{resource}:{action}` strings for
-    /// UCAN validation (ADR-016 step 8).
-    pub ceiling_strings: HashSet<String>,
-    /// The DID of the context creator.
-    pub creator_did: String,
     /// Registered outlet handlers keyed by outlet ID.
     ///
     /// Python callers register callable handlers via
@@ -1571,108 +1566,145 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 
 /// Registers FFI-specific state for a new context.
 ///
-/// Creates a [`OutletRegistry`], [`EventLog`], [`ContextRoleState`], and
-/// [`RevocationList`] for the context. The creator DID is assigned admin
-/// capabilities (all capabilities in the ceiling).
+/// Creates an [`OutletRegistry`], an [`EventLog`], a [`RevocationList`], a
+/// [`NonceTracker`], and a session store for the context.
 ///
-/// `user_ceiling` contains user-provided ceiling strings in colon format
-/// (e.g. `"outlet:call:*"`). These are converted to UCAN underscore format
-/// (e.g. `"outlet_call:*"`) via `Capability::new` + `ucan_capability_name`.
-/// Pass an empty slice to use the default ceiling.
+/// `user_ceiling` holds the caller's ceiling entries in colon format (e.g.
+/// `"outlet:call:*"`). This function validates each entry against the
+/// ceiling-entry grammar (spec §5.3.1.1) and then discards the parsed values.
+///
+/// The function refuses an id that carries a release mark. The mark check and
+/// the insert run under the registry entry's shard lock.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
-/// or if role state creation fails.
+/// or if a `user_ceiling` entry fails the ceiling-entry grammar. Returns
+/// `ScpPyError::ContextError` with code `SCP-CTX-2023` when a release mark
+/// stands for the id; the message withholds the lifecycle state.
 pub fn register_ffi_state(
     bi: &PyBridgeInstance,
     context_id: &str,
-    creator_did: &str,
     user_ceiling: &[String],
+) -> Result<(), ScpPyError> {
+    insert_ffi_state(bi, context_id, user_ceiling, MarkedId::Refuse)
+}
+
+/// Registers FFI-specific state for `context_id` and clears its release mark
+/// in one critical section under the registry entry's shard lock.
+///
+/// When the entry is vacant, it clears the id's release mark and inserts a
+/// fresh [`FfiBridgeState`]. When the entry is occupied, it returns an error,
+/// inserts nothing, and leaves the mark in place.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context ID is already registered
+/// or if a `user_ceiling` entry fails the ceiling-entry grammar.
+pub fn readmit_and_register_ffi_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    user_ceiling: &[String],
+) -> Result<(), ScpPyError> {
+    insert_ffi_state(bi, context_id, user_ceiling, MarkedId::Readmit)
+}
+
+/// What [`insert_ffi_state`] does with a vacant entry whose id carries a
+/// release mark.
+#[derive(Clone, Copy)]
+enum MarkedId {
+    /// Refuse the registration and keep the mark.
+    Refuse,
+    /// Clear the mark and register.
+    Readmit,
+}
+
+/// Removes `context_id`'s release mark from `marks` when the mark was set no
+/// later than `admitted_at`, and keeps a mark set after it.
+fn remove_mark_set_by(
+    marks: &mut HashMap<String, ReleaseMark>,
+    context_id: &str,
+    admitted_at: std::time::Instant,
+) {
+    if marks
+        .get(context_id)
+        .is_some_and(|mark| mark.at <= admitted_at)
+    {
+        marks.remove(context_id);
+    }
+}
+
+/// The refusal for a registration whose id already has [`FfiBridgeState`].
+pub(crate) fn ffi_state_already_registered(context_id: &str) -> ScpPyError {
+    ScpPyError::context(format!(
+        "context '{context_id}' FFI state is already registered"
+    ))
+}
+
+fn insert_ffi_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    user_ceiling: &[String],
+    marked: MarkedId,
 ) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
 
-    let map = ffi_state_registry(bi);
+    // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry.
+    // Validate the PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`)
+    // — NOT the raw string — so the validation checks EXACTLY the capability the
+    // supervisor will enforce. `Capability::new` strips a `custom:` prefix: the raw
+    // string `"custom:payments"` has one colon (would pass a raw-string check) but
+    // parses to `Custom("payments")`, whose enforced form (`ucan_capability_name` →
+    // `payments:payments`) corresponds to a no-colon custom that
+    // `validate_as_ceiling_entry` REJECTS. Routing through the parsed enum keeps the
+    // raw-string validation and the enforced parse in agreement on one canonical form
+    // (BLACK-003), and still rejects a no-colon `payments` that would otherwise be
+    // widened to `payments:*`.
+    for entry in user_ceiling {
+        // Fail-closed: a malformed capability string (deleted legacy
+        // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
+        // outlet suffix) parses to `None` and is rejected at the FFI boundary
+        // rather than silently dropped.
+        let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+            ScpPyError::context(format!(
+                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+            ))
+        })?;
+        cap.validate_as_ceiling_entry()
+            .map_err(|e| ScpPyError::context(e.to_string()))?;
+    }
 
-    match map.entry(context_id.to_owned()) {
-        Entry::Occupied(_) => {
-            return Err(ScpPyError::context(format!(
-                "context '{context_id}' FFI state is already registered"
-            )));
-        }
+    match ffi_state_registry(bi).entry(context_id.to_owned()) {
+        Entry::Occupied(_) => Err(ffi_state_already_registered(context_id)),
         Entry::Vacant(vacant) => {
-            let outlet_registry = OutletRegistry::new();
-            let event_log = EventLog::new(context_id.to_owned());
-            let ceiling = default_ceiling();
-            let ceiling_strings = if user_ceiling.is_empty() {
-                ceiling
-                    .iter()
-                    .map(scp_core::context::roles::Capability::ucan_capability_name)
-                    .collect::<HashSet<String>>()
-            } else {
-                // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user
-                // entry BEFORE it is normalized into the UCAN ceiling string set.
-                // Validate the PARSED enum (`Capability::new(entry)
-                // .validate_as_ceiling_entry()`) — NOT the raw string — so the
-                // validation checks EXACTLY the capability that gets enforced.
-                // `Capability::new` strips a `custom:` prefix: the raw string
-                // `"custom:payments"` has one colon (would pass a raw-string check)
-                // but parses to `Custom("payments")`, whose enforced form
-                // (`ucan_capability_name` → `payments:payments`) corresponds to a
-                // no-colon custom that `validate_as_ceiling_entry` REJECTS. Routing
-                // through the parsed enum keeps the raw-string validation and the
-                // enforced parse in agreement on one canonical form (BLACK-003), and
-                // still rejects a no-colon `payments` that would otherwise be widened
-                // to `payments:*`.
-                for entry in user_ceiling {
-                    // Fail-closed: a malformed capability string (deleted
-                    // legacy outlet-invoke / pre-rename outlet-invoke stems,
-                    // invalid §5.4.2.1 outlet suffix) parses to `None` and is
-                    // rejected at the FFI boundary rather than silently dropped.
-                    let cap =
-                        scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                            ScpPyError::context(format!(
-                                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                            ))
-                        })?;
-                    cap.validate_as_ceiling_entry()
-                        .map_err(|e| ScpPyError::context(e.to_string()))?;
-                }
-                user_ceiling
-                    .iter()
-                    .filter_map(|s| {
-                        scp_core::context::roles::Capability::new(s)
-                            .map(|c| c.ucan_capability_name())
-                    })
-                    .collect::<HashSet<String>>()
-            };
-            let role_state =
-                ContextRoleState::new(context_id, creator_did, ceiling, vec![], &SystemClock)
-                    .map_err(|e| {
-                        ScpPyError::context(format!("failed to create role state: {e}"))
-                    })?;
-            let revocation_list = RevocationList::new(context_id.to_owned());
-            let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
-
-            let state = FfiBridgeState {
-                outlet_registry,
-                event_log,
-                role_state,
-                revocation_list,
-                nonce_tracker,
-                ceiling_strings,
-                creator_did: creator_did.to_owned(),
+            let mut marks = lock_release_marks(bi);
+            if matches!(marked, MarkedId::Readmit) {
+                marks.remove(vacant.key());
+            } else if marks.contains_key(vacant.key()) {
+                // The refusal withholds the lifecycle state: registration
+                // authorizes no one, so its answer must not say whether the
+                // context closed.
+                return Err(ScpPyError::ContextError {
+                    message: format!(
+                        "cannot register context state: {}",
+                        scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD
+                    ),
+                    code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+                });
+            }
+            vacant.insert(FfiBridgeState {
+                outlet_registry: OutletRegistry::new(),
+                event_log: EventLog::new(context_id.to_owned()),
+                revocation_list: RevocationList::new(context_id.to_owned()),
+                nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
                 outlet_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
                 session_store: scp_core::context::outlets::SessionStore::new(),
-            };
-
-            vacant.insert(state);
+            });
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
 /// Executes a closure with mutable access to a context's FFI bridge state.
@@ -1863,29 +1895,168 @@ pub fn read_live_context_state_on(
         .map_err(ScpPyError::from)
 }
 
-/// Re-reads `context_id`'s lifecycle state on `sup` and removes this bridge's
-/// state for it unless the read reports `Active`.
+/// The most release marks one [`PyBridgeInstance`] holds once every release
+/// that set one has finished.
+pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
+
+/// One release mark: the instant it was set, and whether the release that set
+/// it is still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReleaseMark {
+    pub(crate) at: std::time::Instant,
+    pub(crate) in_flight: bool,
+}
+
+/// Locks the bridge's release marks, recovering the map from a poisoned lock.
 ///
-/// Returns `false` and removes nothing when the read reports `Active`. On any
-/// other answer, a failed read included, it removes the state and returns
-/// `true`. The read and the removal are two steps, so a readmit that lands
-/// between them loses this bridge's state for the id.
+/// A panic while the lock is held leaves every entry a valid mark, because each
+/// critical section only reads, inserts, or removes whole entries, so the
+/// recovered map is safe to use.
+pub(crate) fn lock_release_marks(
+    bi: &PyBridgeInstance,
+) -> std::sync::MutexGuard<'_, HashMap<String, ReleaseMark>> {
+    bi.released_contexts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Sets `context_id`'s release mark to the current instant, in flight, and
+/// returns that instant.
+///
+/// When `context_id` carries no mark, marks that are not in flight are evicted
+/// first, earliest first, until the map holds fewer than
+/// [`MAX_RELEASED_CONTEXTS`] marks or none of them is out of flight. A mark in
+/// flight is never evicted.
+fn set_release_mark(bi: &PyBridgeInstance, context_id: &str) -> std::time::Instant {
+    let mut marks = lock_release_marks(bi);
+    if !marks.contains_key(context_id) {
+        evict_finished_marks(&mut marks, MAX_RELEASED_CONTEXTS - 1);
+    }
+    let marked_at = std::time::Instant::now();
+    marks.insert(
+        context_id.to_owned(),
+        ReleaseMark {
+            at: marked_at,
+            in_flight: true,
+        },
+    );
+    marked_at
+}
+
+/// Takes `context_id`'s mark out of flight when it is still the mark set at
+/// `marked_at`, then evicts marks that are not in flight, earliest first,
+/// until the map holds at most [`MAX_RELEASED_CONTEXTS`] marks or none of them
+/// is out of flight.
+fn finish_release_mark(bi: &PyBridgeInstance, context_id: &str, marked_at: std::time::Instant) {
+    let mut marks = lock_release_marks(bi);
+    if let Some(mark) = marks.get_mut(context_id)
+        && mark.at == marked_at
+    {
+        mark.in_flight = false;
+    }
+    evict_finished_marks(&mut marks, MAX_RELEASED_CONTEXTS);
+}
+
+/// Evicts marks that are not in flight from `marks`, earliest first, until it
+/// holds at most `limit` marks or none of them is out of flight.
+fn evict_finished_marks(marks: &mut HashMap<String, ReleaseMark>, limit: usize) {
+    while marks.len() > limit {
+        let Some(earliest) = marks
+            .iter()
+            .filter(|(_, mark)| !mark.in_flight)
+            .min_by_key(|(_, mark)| mark.at)
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        marks.remove(&earliest);
+    }
+}
+
+/// Removes `context_id`'s [`FfiBridgeState`], its known-context entry, and its
+/// connector and economy state, only while its release mark stands, and returns
+/// whether the mark stood.
+///
+/// The mark check and all four removals run under the registry entry's shard
+/// lock, and the [`FfiBridgeState`] is removed last.
+fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> bool {
+    let entry = ffi_state_registry(bi).entry(context_id.to_owned());
+    if !lock_release_marks(bi).contains_key(context_id) {
+        return false;
+    }
+    remove_context_entry(bi, context_id, entry);
+    true
+}
+
+/// Removes `context_id`'s known-context entry, its connector and economy
+/// state, and then its [`FfiBridgeState`] through `entry`, the registry entry
+/// the caller holds, so all four removals run under that entry's shard lock.
+fn remove_context_entry(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    entry: dashmap::mapref::entry::Entry<'_, String, FfiBridgeState>,
+) {
+    bi.core.remove_known_context(context_id);
+    bi.core.remove_bridge_state(context_id);
+    bi.core.remove_economy_state(context_id);
+    if let dashmap::mapref::entry::Entry::Occupied(occupied) = entry {
+        occupied.remove();
+    }
+}
+
+/// Registers a known context in the discovery registry for the supplied
+/// [`PyBridgeInstance`].
+///
+/// Overwrites any existing entry for the same context ID (idempotent).
+pub fn register_known_context_on(bi: &PyBridgeInstance, context_id: &str, known: KnownContext) {
+    bi.core.register_known_context(context_id, known);
+}
+
+/// Removes `context_id`'s release mark under the registry entry's shard lock
+/// when the mark was set no later than `admitted_at`, and keeps a mark set
+/// after it.
+pub(crate) fn clear_release_mark_set_by(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    admitted_at: std::time::Instant,
+) {
+    let _shard = ffi_state_registry(bi).entry(context_id.to_owned());
+    remove_mark_set_by(&mut lock_release_marks(bi), context_id, admitted_at);
+}
+
+/// Marks `context_id` released, re-reads its lifecycle state on `sup`, and
+/// removes this bridge's state for it only when the re-read does not report
+/// `Active`.
+///
+/// When the re-read, taken after the mark went in, reports `Active`, this
+/// clears the mark unless a later mark replaced it, removes nothing, and
+/// returns `false`. On any other answer, a failed read included, it removes
+/// the state while the mark stands, leaves the mark set, and returns `true`.
+/// When the mark is gone by the time of the removal, it removes nothing and
+/// returns `false`. The mark stays in flight until this function returns.
 pub fn release_context_unless_readmitted(
     bi: &PyBridgeInstance,
     sup: &Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> bool {
-    match read_live_context_state_on(Arc::clone(sup), context_id) {
-        Ok(Some(scp_core::context::ContextState::Active)) => return false,
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            context_id,
-            error = %e,
-            "lifecycle re-read before a release failed; releasing this bridge's state"
-        ),
-    }
-    remove_context(bi, context_id);
-    true
+    let marked_at = set_release_mark(bi, context_id);
+    let released = match read_live_context_state_on(Arc::clone(sup), context_id) {
+        Ok(Some(scp_core::context::ContextState::Active)) => {
+            clear_release_mark_set_by(bi, context_id, marked_at);
+            false
+        }
+        Ok(_) => remove_context_while_released(bi, context_id),
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "lifecycle re-read before a release failed; releasing this bridge's state"
+            );
+            remove_context_while_released(bi, context_id)
+        }
+    };
+    finish_release_mark(bi, context_id, marked_at);
+    released
 }
 
 /// Reads `context_id`'s role state for an authorization decision after its
@@ -2133,110 +2304,16 @@ pub fn register_outlet_handler(
 
 /// Removes a context's FFI state from the registry.
 ///
-/// Called when a context is closed. All associated FFI state objects are
-/// dropped. Dropping the `FfiBridgeState` also drops `message_tx`, which
-/// closes the receive channel and causes `__anext__` to raise
-/// `StopAsyncIteration`. Does not error if the context was not found
-/// (idempotent).
+/// All associated FFI state objects are dropped. Dropping the
+/// `FfiBridgeState` also drops `message_tx`, which closes the receive channel
+/// and causes `__anext__` to raise `StopAsyncIteration`. Does not error if the
+/// context was not found (idempotent).
+///
+/// All four removals run under the registry entry's shard lock, and the
+/// `FfiBridgeState` is removed last.
 pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
-    ffi_state_registry(bi).remove(context_id);
-    // Clean up known-context discovery entry via CoreFields.
-    bi.core.remove_known_context(context_id);
-    // Clean up per-context bridge connector state and economy state via CoreFields.
-    bi.core.remove_bridge_state(context_id);
-    bi.core.remove_economy_state(context_id);
-}
-
-/// Re-syncs the `FfiBridgeState.role_state` for a context from the
-/// Supervisor.
-///
-/// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `AddMember`, `RemoveMember`, etc.) so that the FFI-side
-/// copy stays current. It does not touch `ceiling_strings`, and a failed
-/// re-read leaves the older role state in place.
-///
-/// The read is `Supervisor::get_role_state_checked`, so a busy or timed-out
-/// actor, a crashed or mid-respawn context and a poisoned context each fail
-/// with their own `ContextError` code instead of reading as a context the
-/// supervisor does not serve.
-///
-/// # Errors
-///
-/// Returns `ScpPyError` if the supervisor is not initialized, the supervisor
-/// serves no context for `context_id`, the supervisor could not answer the
-/// read, the FFI state registry holds no entry for `context_id`, or the tokio
-/// runtime is unavailable.
-pub fn sync_role_state_from_manager(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpPyError> {
-    let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    rt.block_on(sync_role_state_from_manager_async(bi, context_id))
-}
-
-/// Async-native variant of [`sync_role_state_from_manager`].
-///
-/// Callers that are already executing inside `runtime().block_on(...)` (e.g.
-/// the governance propose, approve, reject, withdraw and execute flows in
-/// `context.rs`) MUST use this instead of the sync wrapper: the sync wrapper
-/// performs its own `block_on`, and a nested `block_on` on the multi-threaded
-/// runtime panics with "Cannot start a runtime from within a runtime". This
-/// helper awaits the supervisor role-state query directly so it composes
-/// inside an existing async context.
-///
-/// # Errors
-///
-/// Returns every error [`sync_role_state_from_manager`] documents except the
-/// tokio runtime one.
-pub async fn sync_role_state_from_manager_async(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-) -> Result<(), ScpPyError> {
-    let sup = supervisor(bi)?;
-    let new_role_state = sup
-        .get_role_state_checked(context_id)
-        .await
-        .map_err(ScpPyError::from)?
-        .ok_or_else(|| {
-            ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-        })?;
-    with_ffi_state(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
-}
-
-/// Re-syncs the `FfiBridgeState.ceiling_strings` for a context from the
-/// AUTHENTICATED context params carried by a joined
-/// [`ContextHandle`](scp_core::context::ContextHandle).
-///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the ceiling string set. Used by
-/// `context_join_from_welcome`: the joiner no longer supplies a ceiling, so the
-/// FFI state is registered with the DEFAULT ceiling as a reversible precheck,
-/// then this overwrites it with the ceiling AUTHENTICATED by the joined MLS
-/// group's signed context binding. The ceiling entries are normalized to their
-/// enforced UCAN capability-name form (`{resource}:{action}`), matching the set
-/// [`register_ffi_state`] builds on the create path.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the context's FFI state is not
-/// registered (unreachable on the join success path — the state was just
-/// registered and not removed).
-pub fn sync_ceiling_from_params(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-    ceiling: &[scp_core::context::roles::Capability],
-) -> Result<(), ScpPyError> {
-    let ceiling_strings: HashSet<String> = ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect();
-    with_ffi_state(bi, context_id, |st| {
-        st.ceiling_strings = ceiling_strings;
-        Ok(())
-    })
+    let entry = ffi_state_registry(bi).entry(context_id.to_owned());
+    remove_context_entry(bi, context_id, entry);
 }
 
 /// Test-only: spawns the per-context supervisor actor whose lifecycle state
@@ -2253,8 +2330,7 @@ pub fn sync_ceiling_from_params(
 /// (`"outlet:register"`, `"messages:write"`), as `register_context` takes
 /// them. An empty slice fails the create with
 /// `ContextError::CeilingRequired(CeilingDeclaration::Empty)`, so this helper
-/// panics on it; pass at least one entry. (`register_context` still reads an
-/// empty slice as `default_ceiling()` for the bridge's own ceiling copy.)
+/// panics on it; pass at least one entry.
 ///
 /// # Panics
 ///
@@ -2460,17 +2536,6 @@ pub fn deliver_message_with_handles(
 // `init_context_manager` is called, `register_known_context` panics
 // (callers must initialize identity first, which initializes the bridge).
 // ---------------------------------------------------------------------------
-
-/// Registers a known context in the discovery registry for the supplied
-/// [`PyBridgeInstance`].
-///
-/// Called after `py_context_create` to record the context's routing ID and
-/// relay URL for later discovery via `py_mcp_load_contexts`.
-///
-/// Overwrites any existing entry for the same context ID (idempotent).
-pub fn register_known_context_on(bi: &PyBridgeInstance, context_id: &str, known: KnownContext) {
-    bi.core.register_known_context(context_id, known);
-}
 
 // Phase D (#1695): legacy default-bridge free-fn shims deleted. Callers
 // must use the `*_on(bi, ...)` variants with an explicit PyBridgeInstance.
@@ -2780,12 +2845,17 @@ pub fn register_context(
     // context is valid locally even without relay publication, #501).
     // Passes the creator DID to NodeMlsFactory for real MLS encryption (#1324).
     #[cfg(test)]
-    init_context_manager_for_test(bi);
+    {
+        // The test supervisor is built with a fixed MLS credential identity, so
+        // `creator_did` has no consumer on this branch.
+        let _ = creator_did;
+        init_context_manager_for_test(bi);
+    }
     #[cfg(not(test))]
     init_context_manager(bi, creator_did);
 
-    // Register FFI-specific state.
-    register_ffi_state(bi, context_id, creator_did, user_ceiling)
+    // Register FFI-specific state. `creator_did` reaches the MLS factory above.
+    register_ffi_state(bi, context_id, user_ceiling)
 }
 
 /// Backward-compatible alias for [`with_ffi_state`].
@@ -2938,14 +3008,12 @@ mod tests {
     #[cfg(feature = "testing")]
     use scp_platform::testing::InMemoryKeyCustody;
 
-    /// Test-only: builds a bridge instance whose supervisor role state DIFFERS from
-    /// the bridge copy in `FfiBridgeState`, and returns it with the context id.
+    /// Test-only: builds a bridge instance with registered FFI state and a
+    /// supervisor context, and returns it with the context id.
     ///
-    /// `register_context` receives an EMPTY ceiling argument, so the bridge copy
-    /// `FfiBridgeState.ceiling_strings` carries `default_ceiling()`. The supervisor
+    /// `register_context` receives an empty ceiling argument. The supervisor
     /// context carries `supervisor_ceiling`, a non-empty list the caller makes
-    /// narrower than that default, so a test that asserts the supervisor's answer
-    /// fails the moment a call site goes back to reading the copy.
+    /// narrower than `default_ceiling()`.
     ///
     /// # Panics
     ///
@@ -3083,7 +3151,7 @@ mod tests {
             last_seen: 0,
         };
 
-        register_known_context_on(bi, &ctx_id, known);
+        bi.core.register_known_context(&ctx_id, known);
         let stats = registry_stats(bi);
 
         assert!(
@@ -3098,7 +3166,7 @@ mod tests {
 
         // remove_ffi_state clears both registries (FFI state + known contexts).
         // Register FFI state first so remove_ffi_state has something to remove.
-        let _ = register_ffi_state(bi, &ctx_id, "did:dht:z6MkStatsKnown", &[]);
+        let _ = register_ffi_state(bi, &ctx_id, &[]);
         remove_ffi_state(bi, &ctx_id);
         assert!(
             !bi.core.has_known_context(&ctx_id),
@@ -3187,8 +3255,11 @@ mod tests {
         let creator = "did:dht:z6MkFfiFind";
         register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let creator_did = with_ffi_state(bi, &ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
-        assert_eq!(creator_did, creator);
+        // `FfiBridgeState` carries no creator DID any more, so the lookup asserts
+        // that the registered entry exists by reading a bridge-owned field.
+        let context_id = with_ffi_state(bi, &ctx_id, |st| Ok(st.event_log.context_id().to_owned()))
+            .expect("registered context must be found in the FFI state registry");
+        assert_eq!(context_id, ctx_id);
 
         remove_context(bi, &ctx_id);
     }
@@ -3200,6 +3271,340 @@ mod tests {
         init_context_manager_for_test(bi);
         let result = with_ffi_state(bi, "nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
+    }
+
+    /// Builds a bridge instance with a supervisor attached and FFI state
+    /// registered for a fresh id no supervisor actor serves, and returns both.
+    fn unserved_context(prefix: &str) -> (Arc<PyBridgeInstance>, String) {
+        crate::init_runtime().ok();
+        let bi = Arc::new(PyBridgeInstance::new_py());
+        init_context_manager_for_test(&bi);
+        let ctx_id = unique_ctx_id(prefix);
+        register_context(&bi, &ctx_id, "did:dht:z6MkReleaseMark", &[])
+            .expect("fixture registration");
+        (bi, ctx_id)
+    }
+
+    /// A release leaves the id marked, `register_ffi_state` refuses the marked
+    /// id with `SCP-CTX-2023` and the withheld text, and
+    /// `readmit_and_register_ffi_state` clears the mark and registers the id.
+    #[test]
+    fn a_release_mark_refuses_registration_until_a_readmit() {
+        let (bi, ctx_id) = unserved_context("mark-refuses");
+        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+
+        assert!(
+            release_context_unless_readmitted(&bi, &sup, &ctx_id),
+            "a context no actor serves must be released"
+        );
+        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+        assert!(
+            lock_release_marks(&bi)
+                .get(&ctx_id)
+                .is_some_and(|mark| !mark.in_flight),
+            "the release must leave the id marked, out of flight"
+        );
+
+        let refusal = register_ffi_state(&bi, &ctx_id, &[])
+            .expect_err("a marked id must not regain bridge state")
+            .to_string();
+        assert!(
+            refusal.contains(scp_ffi_common::error_codes::CTX_2023)
+                && refusal.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                && !refusal.contains(&ctx_id),
+            "the refusal must carry SCP-CTX-2023 and the withheld text: {refusal}"
+        );
+        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+
+        readmit_and_register_ffi_state(&bi, &ctx_id, &[]).expect("a readmit registers a vacant id");
+        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// `readmit_and_register_ffi_state` on an occupied entry fails and leaves
+    /// the id's release mark in place.
+    #[test]
+    fn a_readmit_into_an_occupied_entry_fails_and_keeps_the_mark() {
+        let (bi, ctx_id) = unserved_context("readmit-occupied");
+        set_release_mark(&bi, &ctx_id);
+
+        let err = readmit_and_register_ffi_state(&bi, &ctx_id, &[])
+            .expect_err("an occupied entry must refuse the registration")
+            .to_string();
+        assert!(
+            err.contains("already registered"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            lock_release_marks(&bi).contains_key(&ctx_id),
+            "a failed registration must leave the mark in place"
+        );
+        assert!(remove_context_while_released(&bi, &ctx_id));
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
+        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+    }
+
+    /// A readmit clears a mark set at any instant before it, so a close whose
+    /// re-read came before the join's spawn committed finds no mark and leaves
+    /// the registered state in place.
+    #[test]
+    fn a_readmit_clears_a_mark_set_before_it_and_the_close_removes_nothing() {
+        let (bi, ctx_id) = unserved_context("mark-before-readmit");
+        remove_context(&bi, &ctx_id);
+        set_release_mark(&bi, &ctx_id);
+
+        readmit_and_register_ffi_state(&bi, &ctx_id, &[])
+            .expect("a vacant entry registers whatever the mark");
+        assert!(
+            !lock_release_marks(&bi).contains_key(&ctx_id),
+            "a readmit must clear the mark"
+        );
+        assert!(
+            !remove_context_while_released(&bi, &ctx_id),
+            "the close that set the mark must not remove the readmitted state"
+        );
+        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// A close that marks the id after an import's admission instant keeps its
+    /// mark through the import's clear, and the close's removal still runs; a
+    /// clear whose admission instant follows the mark removes it, and a clear
+    /// of an unmarked id leaves it unmarked.
+    #[test]
+    fn clear_release_mark_set_by_keeps_a_later_mark() {
+        let (bi, ctx_id) = unserved_context("clear-mark");
+        let admitted_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let marked_at = set_release_mark(&bi, &ctx_id);
+
+        clear_release_mark_set_by(&bi, &ctx_id, admitted_at);
+        assert_eq!(
+            lock_release_marks(&bi).get(&ctx_id).map(|mark| mark.at),
+            Some(marked_at),
+            "a clear must keep a mark set after its admission"
+        );
+        assert!(
+            remove_context_while_released(&bi, &ctx_id),
+            "the later close's removal must still run"
+        );
+        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
+        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
+        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+    }
+
+    /// The occupied-entry refusal of `readmit_and_register_ffi_state` raises
+    /// `ScpContextError` carrying `SCP-CTX-2001` once passed through
+    /// `PyErr::from`, never `RuntimeError`.
+    #[test]
+    fn an_occupied_readmit_raises_a_typed_context_error() {
+        let (bi, ctx_id) = unserved_context("typed-refusal");
+        let occupied = readmit_and_register_ffi_state(&bi, &ctx_id, &[])
+            .expect_err("an occupied entry must refuse the readmit");
+        remove_context(&bi, &ctx_id);
+
+        pyo3::prepare_freethreaded_python();
+        pyo3::Python::with_gil(|py| {
+            let py_err = pyo3::PyErr::from(occupied);
+            assert!(
+                py_err.is_instance_of::<crate::error::ContextError>(py)
+                    && !py_err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "the refusal must raise ScpContextError: {py_err}"
+            );
+            assert!(
+                py_err
+                    .to_string()
+                    .contains(scp_ffi_common::error_codes::CTX_2001),
+                "{py_err}"
+            );
+        });
+    }
+
+    /// A release whose re-read reports `Active` keeps the state and leaves no
+    /// mark, so the context keeps working on this bridge.
+    #[test]
+    fn an_active_re_read_keeps_the_state_and_clears_the_mark() {
+        let (bi, ctx_id) = unserved_context("mark-active");
+        create_supervisor_context_for_test(
+            &bi,
+            &ctx_id,
+            "did:dht:z6MkReleaseMark",
+            &["messages:read".to_owned()],
+        );
+        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+
+        assert!(
+            !release_context_unless_readmitted(&bi, &sup, &ctx_id),
+            "an Active context must not be released"
+        );
+        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
+        assert!(
+            !lock_release_marks(&bi).contains_key(&ctx_id),
+            "an Active re-read must clear the mark it set"
+        );
+        remove_context(&bi, &ctx_id);
+    }
+
+    /// The removal runs only while the mark stands: once a readmit cleared the
+    /// mark between the re-read and the removal, the removal leaves the state
+    /// in place and reports that it released nothing.
+    #[test]
+    fn a_removal_after_a_readmit_leaves_the_state() {
+        let (bi, ctx_id) = unserved_context("mark-readmitted");
+
+        let is_known = |bi: &PyBridgeInstance| {
+            all_known_contexts_on(bi)
+                .iter()
+                .any(|(id, _)| id == &ctx_id)
+        };
+        register_known_context_on(&bi, &ctx_id, release_fixture_known());
+
+        set_release_mark(&bi, &ctx_id);
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
+        assert!(
+            !remove_context_while_released(&bi, &ctx_id),
+            "a removal must not run once a readmit cleared the mark"
+        );
+        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
+        assert!(
+            is_known(&bi),
+            "a readmitted id keeps its known-context entry"
+        );
+
+        set_release_mark(&bi, &ctx_id);
+        assert!(remove_context_while_released(&bi, &ctx_id));
+        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+        assert!(
+            !is_known(&bi),
+            "a marked removal drops the known-context entry"
+        );
+        clear_release_mark_set_by(&bi, &ctx_id, std::time::Instant::now());
+    }
+
+    fn release_fixture_known() -> KnownContext {
+        KnownContext {
+            routing_id: [0xAB; 32],
+            relay_url: None,
+            member_did: "did:dht:z6MkReleaseMark".to_owned(),
+            last_seen: 0,
+        }
+    }
+
+    /// Sets a release mark on `context_id` and takes it out of flight, as a
+    /// finished release leaves it.
+    fn set_finished_release_mark(bi: &PyBridgeInstance, context_id: &str) {
+        let marked_at = set_release_mark(bi, context_id);
+        finish_release_mark(bi, context_id, marked_at);
+    }
+
+    /// The mark map holds at most `MAX_RELEASED_CONTEXTS` finished marks: a new
+    /// mark on a full map evicts the finished mark set earliest, and re-marking
+    /// an id the map already holds evicts nothing.
+    #[test]
+    fn a_full_mark_map_evicts_the_earliest_mark() {
+        let bi = PyBridgeInstance::new_py();
+        set_finished_release_mark(&bi, "earliest");
+        // The pause keeps every later mark's instant strictly after the first.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for i in 1..MAX_RELEASED_CONTEXTS {
+            set_finished_release_mark(&bi, &format!("mark-{i}"));
+        }
+        assert_eq!(lock_release_marks(&bi).len(), MAX_RELEASED_CONTEXTS);
+
+        set_finished_release_mark(&bi, "mark-1");
+        assert!(
+            lock_release_marks(&bi).contains_key("earliest"),
+            "re-marking a held id must evict nothing"
+        );
+
+        set_release_mark(&bi, "newest");
+        let marks = lock_release_marks(&bi);
+        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+        assert!(
+            !marks.contains_key("earliest") && marks.contains_key("newest"),
+            "a new mark on a full map must evict the earliest mark"
+        );
+    }
+
+    /// Marks in flight can push the map past `MAX_RELEASED_CONTEXTS`; as each
+    /// of those releases finishes, finished marks are evicted until the map
+    /// holds `MAX_RELEASED_CONTEXTS` again, and a new mark keeps it there.
+    #[test]
+    fn an_overshoot_from_marks_in_flight_returns_to_the_bound() {
+        const OVER: usize = 3;
+        let bi = PyBridgeInstance::new_py();
+        for i in 0..MAX_RELEASED_CONTEXTS {
+            set_finished_release_mark(&bi, &format!("finished-{i}"));
+        }
+        let in_flight: Vec<(String, std::time::Instant)> = (0..OVER)
+            .map(|i| {
+                let id = format!("in-flight-{i}");
+                let at = std::time::Instant::now();
+                lock_release_marks(&bi).insert(
+                    id.clone(),
+                    ReleaseMark {
+                        at,
+                        in_flight: true,
+                    },
+                );
+                (id, at)
+            })
+            .collect();
+        assert_eq!(lock_release_marks(&bi).len(), MAX_RELEASED_CONTEXTS + OVER);
+
+        for (id, at) in &in_flight {
+            finish_release_mark(&bi, id, *at);
+        }
+        assert_eq!(
+            lock_release_marks(&bi).len(),
+            MAX_RELEASED_CONTEXTS,
+            "finished releases must bring the map back to the bound"
+        );
+
+        set_finished_release_mark(&bi, "newest");
+        let marks = lock_release_marks(&bi);
+        assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+        assert!(marks.contains_key("newest"));
+    }
+
+    /// A full mark map never evicts a mark in flight: the release that set the
+    /// earliest mark still finds it and removes the state, while the earliest
+    /// finished mark is evicted in its place.
+    #[test]
+    fn a_full_mark_map_keeps_a_mark_in_flight() {
+        let (bi, ctx_id) = unserved_context("mark-in-flight");
+        let marked_at = set_release_mark(&bi, &ctx_id);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        set_finished_release_mark(&bi, "earliest-finished");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for i in 2..MAX_RELEASED_CONTEXTS {
+            set_finished_release_mark(&bi, &format!("mark-{i}"));
+        }
+        assert_eq!(lock_release_marks(&bi).len(), MAX_RELEASED_CONTEXTS);
+
+        set_finished_release_mark(&bi, "newest");
+        {
+            let marks = lock_release_marks(&bi);
+            assert_eq!(marks.len(), MAX_RELEASED_CONTEXTS);
+            assert!(
+                !marks.contains_key("earliest-finished"),
+                "the earliest finished mark must be evicted"
+            );
+            assert_eq!(
+                marks.get(&ctx_id).copied(),
+                Some(ReleaseMark {
+                    at: marked_at,
+                    in_flight: true
+                }),
+                "a mark in flight must survive a full map"
+            );
+        }
+        assert!(remove_context_while_released(&bi, &ctx_id));
+        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
     }
 
     /// The close-teardown fail-closed ordering: once the FFI bridge state
@@ -3261,13 +3666,15 @@ mod tests {
     }
 
     /// User-provided ceiling strings in colon format (e.g. `"outlet:call:*"`)
-    /// must be converted to UCAN underscore format (e.g. `"outlet_call:*"`)
-    /// when stored in `FfiBridgeState.ceiling_strings`. Without this
-    /// conversion, `mint_ucan` ceiling checks fail because the minted
-    /// capability name (underscore format) doesn't match the stored
-    /// raw string.
+    /// must reach UCAN checks in underscore format (e.g. `"outlet_call:*"`).
+    /// Without this conversion, `mint_ucan` ceiling checks fail because the
+    /// minted capability name (underscore format) doesn't match the raw
+    /// string. The test reads the set from the supervisor actor through
+    /// `live_role_state`, so it proves the normalization survives the round
+    /// trip through the supervisor.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
+        crate::init_runtime().ok();
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
@@ -3282,8 +3689,12 @@ mod tests {
         ];
 
         register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
+        create_supervisor_context_for_test(bi, &ctx_id, creator, &user_ceiling);
 
-        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = live_role_state(bi, &ctx_id)
+            .unwrap()
+            .ceiling()
+            .to_ucan_string_set();
 
         // Compound resources must have underscores joining their segments.
         assert!(
@@ -3316,19 +3727,25 @@ mod tests {
         remove_context(bi, &ctx_id);
     }
 
-    /// When no user ceiling is provided (empty slice), the default ceiling
-    /// should be used with proper UCAN underscore format.
+    /// The supervisor reports a context declaring every `default_ceiling()`
+    /// capability in UCAN underscore format.
     #[test]
-    fn empty_user_ceiling_uses_default_in_ucan_format() {
+    fn default_ceiling_reads_in_ucan_format() {
+        crate::init_runtime().ok();
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ceiling-default");
         let creator = "did:dht:z6MkCeilingDefault";
+        let declared = crate::context::default_ceiling_strings();
 
-        register_context(bi, &ctx_id, creator, &[]).unwrap();
+        register_context(bi, &ctx_id, creator, &declared).unwrap();
+        create_supervisor_context_for_test(bi, &ctx_id, creator, &declared);
 
-        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = live_role_state(bi, &ctx_id)
+            .unwrap()
+            .ceiling()
+            .to_ucan_string_set();
 
         // Default ceiling must include outlet_call:* (not outlet:call:*).
         assert!(
@@ -3340,80 +3757,6 @@ mod tests {
             "default ceiling should not contain raw 'outlet:call:*': {ceiling:?}"
         );
 
-        remove_context(bi, &ctx_id);
-    }
-
-    /// Reads the two bridge copies a failed re-sync must leave untouched.
-    fn bridge_copies(
-        bi: &PyBridgeInstance,
-        ctx_id: &str,
-    ) -> (HashSet<String>, scp_core::context::roles::CapabilityCeiling) {
-        with_ffi_state(bi, ctx_id, |st| {
-            Ok((st.ceiling_strings.clone(), st.role_state.ceiling().clone()))
-        })
-        .unwrap()
-    }
-
-    /// A context the supervisor does not serve fails the sync and leaves the
-    /// bridge state as registered.
-    #[test]
-    fn sync_role_state_from_manager_fails_closed_without_a_supervisor_context() {
-        crate::init_runtime().ok();
-        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
-        let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
-        let ctx_id = unique_ctx_id("role-sync-absent");
-        register_context(bi, &ctx_id, "did:dht:z6MkRoleSyncAbsent", &[]).unwrap();
-        let registered = bridge_copies(bi, &ctx_id);
-
-        let err = sync_role_state_from_manager(bi, &ctx_id).unwrap_err();
-        assert!(
-            err.to_string().contains("not found in supervisor"),
-            "got: {err}"
-        );
-        assert_eq!(
-            bridge_copies(bi, &ctx_id),
-            registered,
-            "a failed sync must leave the bridge state as registered"
-        );
-
-        remove_context(bi, &ctx_id);
-    }
-
-    /// A poisoned context fails the sync with `SCP-CTX-2134`, not with the
-    /// "not found in supervisor" answer an absent context gets, and leaves the
-    /// bridge state as it was. The supervisor's ceiling (`messages:read`)
-    /// differs from the registered one, so a sync that wrote the supervisor's
-    /// role state despite the error would change the role-state ceiling.
-    #[cfg(feature = "testing")]
-    #[test]
-    fn sync_role_state_from_manager_reports_a_poisoned_context_as_poisoned() {
-        crate::init_runtime().ok();
-        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
-        let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
-        let ctx_id = format!("51c3{}", "0".repeat(60));
-        let creator = "did:dht:z6MkRoleSyncPoisoned";
-        create_supervisor_context_for_test(bi, &ctx_id, creator, &["messages:read".to_owned()]);
-        register_ffi_state(bi, &ctx_id, creator, &[]).unwrap();
-        let registered = bridge_copies(bi, &ctx_id);
-        let sup = Arc::clone(supervisor(bi).unwrap());
-        crate::runtime()
-            .unwrap()
-            .block_on(sup.test_poison_context(&ctx_id));
-
-        let err = sync_role_state_from_manager(bi, &ctx_id).unwrap_err();
-        let text = err.to_string();
-        assert!(
-            text.contains(scp_ffi_common::error_codes::CTX_2134)
-                && !text.contains("not found in supervisor"),
-            "got: {text}"
-        );
-        assert_eq!(
-            bridge_copies(bi, &ctx_id),
-            registered,
-            "a failed sync must leave the bridge state as registered"
-        );
         remove_context(bi, &ctx_id);
     }
 
@@ -4006,7 +4349,7 @@ mod tests {
     // `bridge_instance()` internally, so discovery routed through the default
     // bridge even when called from a non-default `PyScp::load_contexts`.
 
-    /// `register_known_context_on(bi_b, ...)` must persist into `bi_b`'s
+    /// A known context registered on `bi_b` must persist into `bi_b`'s
     /// registry and be visible via `known_contexts_for_member_on(bi_b, ...)`.
     #[test]
     fn known_contexts_are_per_instance() {
@@ -4023,7 +4366,7 @@ mod tests {
         };
 
         // Register against bi_b only.
-        register_known_context_on(&bi_b, &ctx_id, known);
+        bi_b.core.register_known_context(&ctx_id, known);
 
         let found_b = known_contexts_for_member_on(&bi_b, member);
         assert!(
@@ -4054,7 +4397,7 @@ mod tests {
             last_seen: 0,
         };
 
-        register_known_context_on(&bi_a, &ctx_id, known);
+        bi_a.core.register_known_context(&ctx_id, known);
 
         let list_a = all_known_contexts_on(&bi_a);
         let list_b = all_known_contexts_on(&bi_b);
@@ -4340,15 +4683,14 @@ mod tests {
     }
 
     /// `live_role_state` fails closed when the context has no supervisor actor,
-    /// so no caller receives a permissive default, or the bridge copy, in place
-    /// of a membership record it could not read.
+    /// so no caller receives a permissive default in place of a membership
+    /// record it could not read.
     #[test]
     fn live_role_state_fails_closed_without_a_supervisor_actor() {
         crate::init_runtime().ok();
         let bi = Arc::new(PyBridgeInstance::new_py());
         let ctx_id = unique_ctx_id("live-no-actor");
-        // FFI state, and with it the bridge role-state copy, exists; the
-        // supervisor never created the context.
+        // FFI state exists; the supervisor never created the context.
         register_context(&bi, &ctx_id, "did:dht:z6MkLiveNoActor", &[]).unwrap();
 
         let err = live_role_state(&bi, &ctx_id)
@@ -4390,8 +4732,7 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
-    /// `member_context_role_states` reports a member the supervisor actor records,
-    /// with no write to the bridge copy.
+    /// `member_context_role_states` reports a member the supervisor actor records.
     #[test]
     #[cfg(feature = "testing")]
     fn member_context_role_states_reads_supervisor_membership() {
@@ -4419,34 +4760,18 @@ mod tests {
             role_state.members.contains(member) && role_state.creator_did == creator,
             "the returned role state must be the supervisor's, which lists the member"
         );
-        assert!(
-            !with_ffi_state(&bi, &ctx_id, |st| Ok(st
-                .role_state
-                .members
-                .contains(member)))
-            .unwrap(),
-            "precondition of the assertion above: the bridge copy never lists the member"
-        );
         remove_context(&bi, &ctx_id);
     }
 
     /// `member_context_role_states` refuses when a context is registered but no
-    /// supervisor is attached, instead of answering from the bridge copy.
+    /// supervisor is attached.
     #[test]
     fn member_context_role_states_fails_closed_without_a_supervisor() {
         crate::init_runtime().ok();
         let bi = Arc::new(PyBridgeInstance::new_py());
         let ctx_id = unique_ctx_id("ids-no-supervisor");
         let creator = "did:dht:z6MkIdsNoSupervisor";
-        register_ffi_state(&bi, &ctx_id, creator, &[]).unwrap();
-        assert!(
-            with_ffi_state(&bi, &ctx_id, |st| Ok(st
-                .role_state
-                .members
-                .contains(creator)))
-            .unwrap(),
-            "precondition: the bridge copy lists the creator"
-        );
+        register_ffi_state(&bi, &ctx_id, &[]).unwrap();
 
         member_context_role_states(&bi, creator)
             .expect_err("a registered context with no supervisor must refuse, not answer");
@@ -4484,11 +4809,10 @@ mod tests {
         remove_context(&bi, &ctx_id);
     }
 
-    /// The pre-authorization gate returns the ceiling the SUPERVISOR holds, not
-    /// the `default_ceiling()` the bridge copy carries. The fixture registers FFI
-    /// state with an empty ceiling argument, so the copy holds the default, and
-    /// gives the supervisor a narrower ceiling; a copy-reading implementation
-    /// reports the wider default and fails the exclusion below.
+    /// The pre-authorization gate returns the ceiling the SUPERVISOR holds. The
+    /// fixture gives the supervisor a ceiling narrower than `default_ceiling()`,
+    /// so an implementation that answered with the default fails the exclusion
+    /// below.
     #[test]
     fn pre_authz_gate_returns_the_supervisor_ceiling() {
         let creator = "did:dht:z6MkLiveCeilingCreator";
@@ -4497,12 +4821,6 @@ mod tests {
             creator,
             &["messages:read", "messages:write"],
         );
-        let copy = with_ffi_state(&bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
-        assert!(
-            copy.contains("outlet_call:*"),
-            "precondition: the bridge copy carries the default ceiling: {copy:?}"
-        );
-
         let ceiling = active_role_state_before_authz(
             &bi,
             &ctx_id,
@@ -4518,8 +4836,7 @@ mod tests {
         );
         assert!(
             !ceiling.contains("outlet_call:*"),
-            "an entry the supervisor ceiling omits must be absent; the bridge copy \
-             carries it: {ceiling:?}"
+            "an entry the supervisor ceiling omits must be absent: {ceiling:?}"
         );
         remove_context(&bi, &ctx_id);
     }

@@ -159,7 +159,7 @@ The in-memory `NonceTracker` remains the primary, synchronised replay defense on
 
 ## 17.4 ProtocolRepository
 
-`ProtocolRepository` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolRepository` is the primary interface between protocol logic and persistent storage, with two documented exceptions (see below). The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolRepository` is generic rather than using `Arc<dyn Storage>`.
+`ProtocolRepository` is a concrete generic struct in `scp-core/store/` that wraps a `Storage` implementation and provides typed domain methods. These are NOT trait methods — adapters do not implement them. `ProtocolRepository` is the primary interface between protocol logic and persistent storage, with one documented exception (see below). The type parameter `S` is the concrete storage backend. The `Storage` trait uses RPITIT (return-position `impl Trait` in traits) and is not dyn-compatible, so `ProtocolRepository` is generic rather than using `Arc<dyn Storage>`.
 
 ```rust
 /// scp-core/src/store/mod.rs
@@ -295,11 +295,9 @@ impl<S: Storage> ProtocolRepository<S> {
 
 Every `ProtocolRepository` method translates to one or two `Storage` trait calls using the key convention from section 17.3. There is no query optimizer, no batch API, no transaction boundary beyond what `delete_prefix` provides. If performance profiling reveals hot paths, batch writes can be added to `Storage` as an optional method with a default implementation that loops (Phase 6).
 
-**Exceptions to `ProtocolRepository` as the single interface.** Two subsystems access `Storage` directly rather than through `ProtocolRepository` domain methods:
+**Exception to `ProtocolRepository` as the single interface.** One subsystem accesses `Storage` directly rather than through `ProtocolRepository` domain methods:
 
-1. **MLS bridge (§17.9).** `MlsStorageBridge` accesses raw `Storage` because OpenMLS owns the storage contract and the `StorageProvider` trait dictates serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
-
-2. **Identity bootstrap persistence.** `ApplicationNode` reads/writes the `scp/identity` key via `Storage` directly because identity bootstrap is a pre-DID operation — the identity must be loaded before any DID is known, before contexts exist, and before `ProtocolRepository` domain methods can be used (since they are keyed by DID or context_id). This is infrastructure-level metadata, not protocol state. The value is still wrapped in a `StoredValue` version envelope and serialized with MessagePack, consistent with §17.5.
+1. **Identity bootstrap persistence.** `ApplicationNode` reads/writes the `scp/identity` key via `Storage` directly because identity bootstrap is a pre-DID operation — the identity must be loaded before any DID is known, before contexts exist, and before `ProtocolRepository` domain methods can be used (since they are keyed by DID or context_id). This is infrastructure-level metadata, not protocol state. The value is still wrapped in a `StoredValue` version envelope and serialized with MessagePack, consistent with §17.5.
 
 ### Module Structure
 
@@ -745,49 +743,30 @@ salt       = per-file 16-byte salt   // generated once, persisted with the custo
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
-OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.
+OpenMLS requires a `StorageProvider` implementation for the MLS group state it keeps (tree nodes, key schedules, proposals, HPKE private keys). Every live SCP provider is `scp_mls::InMemoryMlsProvider`, and its `StorageProvider` is `scp_mls::InMemoryMlsStorage`, which holds that state in memory. §17.9.1 persists the state as one snapshot blob.
 
 ```rust
-/// scp-core/src/crypto/mls/storage.rs
+/// scp-mls/src/provider.rs
 
-pub struct MlsStorageBridge<S: Storage> {
-    store: Arc<ProtocolRepository<S>>,
-    context_id: ContextId,
+pub struct InMemoryMlsStorage {
+    memory: openmls_memory_storage::MemoryStorage,
 }
 
-impl<S: Storage> MlsStorageBridge<S> {
-    pub fn new(store: Arc<ProtocolRepository<S>>, context_id: ContextId) -> Self;
-}
-
-impl<S: Storage> openmls_traits::storage::StorageProvider for MlsStorageBridge<S> {
-    // All methods delegate to self.store.storage with key prefix "mls/{context_id}/..."
-    // OpenMLS key types are serialized via MessagePack before storage.
-    // This is a mechanical mapping — no protocol logic.
+impl StorageProvider<CURRENT_VERSION> for InMemoryMlsStorage {
+    type Error = InMemoryMlsStorageError;
+    // Every method except write_signature_key_pair delegates to `memory`.
+    // write_signature_key_pair stores nothing and returns
+    // InMemoryMlsStorageError::SignerStorageForbidden.
 }
 ```
 
-**Key prefix mapping:** OpenMLS storage types map to sub-prefixes under `mls/{context_id}/`:
+**The provider refuses to store the MLS signer.** `InMemoryMlsStorage::write_signature_key_pair` writes nothing and returns `InMemoryMlsStorageError::SignerStorageForbidden`, and `SignatureKeyPair::store` reaches that method, so it fails the same way. Every OpenMLS operation SCP calls takes the signer as an argument, and OpenMLS never reads a stored `SignatureKeyPair` back. A stored copy would therefore only be a second copy of the private key, and §17.9.1 would carry that copy into every snapshot. The `disallowed-methods` lint in `.clippy.toml` and `crates/scp-runtime/clippy.toml` rejects both calls in SCP's crates at compile time. The refusal covers a call the lint does not see, such as one compiled only for wasm32 or one made inside a dependency.
 
-```
-mls/{context_id}/group_state
-mls/{context_id}/tree/{leaf_index}
-mls/{context_id}/key_schedule/{epoch}
-mls/{context_id}/proposal/{hash}
-mls/{context_id}/key_package/{hash}
-mls/{context_id}/encryption_key/{epoch}/{generation}
-```
-
-The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signatures. The bridge is a thin translation layer — it adds no behavior beyond key construction and serialization.
-
-**Why this bypasses `ProtocolRepository` domain methods.** Every other domain area stores data through typed `ProtocolRepository` methods that apply `StoredValue` version envelopes. The MLS bridge is one of two documented exceptions that access raw `Storage` directly (the other is identity bootstrap persistence — see §17.4). This is intentional:
-
-- **OpenMLS owns the storage contract.** The `StorageProvider` trait dictates what gets stored, key structure, and serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
-- **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolRepository wrapper methods would be pure indirection.
-- **Migration is OpenMLS's concern.** MLS state serialization is governed by the OpenMLS version, not SCP's `StoredValue` versioning. Format changes across OpenMLS upgrades follow OpenMLS's own compatibility guarantees.
+`InMemoryMlsProvider` zeroizes every stored value when it drops, and it draws OpenMLS's `rand()` randomness from the operating system on every request (security model spec §9.15).
 
 ### 17.9.1 MLS Crypto State Snapshot
 
-`MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix. A complete MLS crypto context also includes state that lives outside the OpenMLS `StorageProvider` contract:
+`InMemoryMlsProvider` (§17.9) holds the state OpenMLS keeps through its `StorageProvider` trait. A complete MLS crypto context also includes state that lives outside the OpenMLS `StorageProvider` contract:
 
 - **Sender keys and sender key store** — per-member symmetric keys for the sender key layer (ADR-001, §23)
 - **DHKEM(P-256) wrapping keypair** — HPKE encapsulation key for sender key distribution
@@ -805,10 +784,9 @@ Two inherent operations on the encrypted-mode state handle snapshot serializatio
 
 The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On context restoration, the blob is restored before the per-context actor resumes so that its MLS group and sender keys are available for subsequent encrypt/decrypt operations.
 
-**Relationship to `MlsStorageBridge`.** The blob snapshot is the **sole active** persistence mechanism for MLS crypto state in the current implementation. The actor-local OpenMLS provider uses in-memory storage at runtime; `MlsStorageBridge` (§17.9) remains implemented but is **not wired into the runtime crypto provider path**. It exists as infrastructure for future fine-grained persistence if needed.
+**Signer entries are refused at capture and restore.** OpenMLS's in-memory storage files a stored signer under the `SignatureKeyPair` label. Capture (`scp_mls::snapshot::capture_signer_and_storage`) fails with `MlsError::SignerStorageForbidden` when any provider storage key carries that label, and it returns no entries. Restore rebuilds every provider through `InMemoryMlsProvider::from_storage_entries`, which checks every key of the blob before it inserts one. On a signer-labelled key it fails with `MlsError::SignerStorageForbidden`, and it inserts nothing. The refused entries stay in the blob's wiping buffer, which zeroizes them when it drops. A signer entry that reaches a provider through a crafted blob, or through a call the §17.9 refusal does not see, therefore makes capture or restore fail, and it never re-enters a provider.
 
-- **The blob snapshot** (active) captures the complete crypto provider state atomically — both the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, wrapping keys, signer) — as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
-- **`MlsStorageBridge`** (not currently instantiated) provides the OpenMLS `StorageProvider` trait implementation for fine-grained, per-item MLS storage. If activated in a future iteration, it would allow OpenMLS to persist individual items incrementally rather than relying on full-state snapshots.
+**The blob snapshot is the only persistence mechanism for MLS crypto state.** It captures the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, wrapping keys, signer) as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
 
 The snapshot approach ensures atomicity: all crypto state is persisted and restored as a single unit. Without it, a crash between persisting MLS state and persisting sender key state would leave the context in an inconsistent state where MLS decryption succeeds but sender key decryption fails (or vice versa).
 
@@ -941,8 +919,6 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 | `sender_key_roundtrip` | Store sender key, load, verify key matches |
 | `key_state_cache_roundtrip` | Cache key state, load, verify matches |
 | `relay_score_list` | Store scores for 3 relays, list all, verify all returned |
-| `mls_group_state_roundtrip` | Create MLS group, persist via `MlsStorageBridge` (§17.9), reload, verify group state matches |
-| `mls_state_isolated_per_context` | Two contexts with MLS groups via `MlsStorageBridge`, verify state does not leak between contexts |
 
 ## 17.14 Phase Integration
 
@@ -950,7 +926,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 
 - `InMemoryStorage` implements all 6 `Storage` methods including `delete_prefix` and `exists`
 - Skeleton `ProtocolRepository` with context state, membership, and nonce methods
-- `MlsStorageBridge` skeleton (OpenMLS `StorageProvider` implementation)
+- `InMemoryMlsProvider` (OpenMLS `StorageProvider` implementation that refuses to store the MLS signer, §17.9)
 - `storage_conformance!()` macro covers all 6 methods, ordering, and concurrency
 - `InMemoryStorage` passes full conformance suite
 

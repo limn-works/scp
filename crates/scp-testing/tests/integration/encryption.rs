@@ -214,8 +214,8 @@ async fn mls_destroy_group() {
 
 #[tokio::test]
 async fn mls_forward_secrecy() {
-    use scp_core::crypto::mls::epoch_grace::EpochGraceStore;
-    use scp_core::crypto::mls::ratchet::{process_commit, serialize_mls_message};
+    use scp_core::crypto::mls::encrypt::decrypt_with_sender_did;
+    use scp_core::crypto::mls::ratchet::serialize_mls_message;
 
     // Forward secrecy: ciphertext from epoch N must be undecryptable after
     // max_past_epochs+1 epoch advances discard the key material.
@@ -247,7 +247,6 @@ async fn mls_forward_secrecy() {
 
     // Step 3: Advance BOTH groups past max_past_epochs (2) via add_member.
     // Each add_member on Alice produces a Commit; Bob processes it to stay in sync.
-    let mut bob_grace = EpochGraceStore::new();
     for i in 0..3 {
         let temp_cred =
             ScpCredential::new(format!("did:dht:z6MkTempFS{i}"), None, SigningKeyId::Active)
@@ -260,7 +259,7 @@ async fn mls_forward_secrecy() {
 
         // Bob processes Alice's Commit to advance his epoch too.
         let commit_bytes = serialize_mls_message(&result.commit).unwrap();
-        process_commit(&mut bob_group, &commit_bytes, &mut bob_grace).unwrap();
+        decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
     }
 
     // Both groups are now at epoch 4. With max_past_epochs=2, epoch 1 material

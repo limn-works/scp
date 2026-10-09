@@ -3092,8 +3092,10 @@ impl PerContextState {
     ///
     /// # Errors
     ///
-    /// [`ContextError::CryptoFailed`] if the group is destroyed or
-    /// serialization fails.
+    /// [`ContextError::CryptoFailed`] if the group is destroyed, if
+    /// serialization fails, or, carrying
+    /// [`scp_mls::MlsError::SignerStorageForbidden`], if a provider storage key
+    /// carries openmls's signature-key-pair label (persistence spec §17.9.1).
     pub(crate) fn export_crypto_state(
         &self,
         sender_key_epochs: Vec<(String, u64)>,
@@ -4310,18 +4312,20 @@ mod crypto_ops_golden {
     }
 
     /// Apply a public MLS Commit (as produced by `advance_epoch` / `remove_member`)
-    /// to an encrypted actor's group through `scp_mls::ratchet::process_commit`,
-    /// which runs the same `decrypt_with_sender_did` path as the backend's
-    /// `process_commit`.
-    fn process_commit_on_actor(
+    /// to an encrypted actor's group through
+    /// `scp_mls::encrypt::decrypt_with_sender_did`, the path the backend's
+    /// `decrypt` runs, and assert the message was a Commit.
+    fn merge_commit_on_actor(
         state: &mut PerContextState,
         commit_bytes: &[u8],
     ) -> Result<(), scp_mls::error::MlsError> {
-        let mut grace = scp_mls::epoch_grace::EpochGraceStore::default();
         match &mut state.mode {
             ContextModeState::Encrypted(c) => {
                 let group = c.mls_group.as_mut().expect("group present");
-                scp_mls::ratchet::process_commit(group, commit_bytes, &mut grace)
+                match scp_mls::encrypt::decrypt_with_sender_did(group, commit_bytes)? {
+                    scp_mls::DecryptedContent::Commit { .. } => Ok(()),
+                    other => panic!("expected a Commit, got {other:?}"),
+                }
             }
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
         }
@@ -4708,7 +4712,7 @@ mod crypto_ops_golden {
         // The counterparty PROCESSES the commit and reaches the committer's new
         // epoch (the actor is the sole crypto authority; the provider twin is
         // deleted).
-        process_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
+        merge_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
             .expect("Bob processes the actor-produced advance Commit");
         assert_eq!(
             actor_mls_epoch(&bob_from_actor),
@@ -4747,7 +4751,7 @@ mod crypto_ops_golden {
 
         // The counterparty (Bob — the removed member) PROCESSES the remove-Commit
         // and learns of his removal, reaching the committer's new epoch.
-        process_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
+        merge_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
             .expect("Bob processes the actor-produced remove Commit");
         assert_eq!(actor_mls_epoch(&bob_from_actor), epoch_before + 1);
     }

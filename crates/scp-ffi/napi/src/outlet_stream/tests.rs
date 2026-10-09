@@ -305,12 +305,6 @@ async fn live_poll_next_drains_to_terminal() {
     .await
     .expect("ucan_mint should succeed");
 
-    // The open authorizes against the supervisor's ceiling and creator: with
-    // the bridge copy narrowed to `messages:read` under another creator, an
-    // open that read the copy would refuse the token.
-    crate::runtime::narrow_bridge_copy_for_test(&bi, &ctx)
-        .expect("the context has a bridge copy to narrow");
-
     // OPEN — succeeds (member + valid UCAN + zero cost), returning the hex
     // StreamHandleId PROMPTLY (Commit transition, never block-until-terminal).
     let handle_id = outlet_stream_open_on(
@@ -1557,12 +1551,10 @@ mod xctx_streaming_saga_tests {
     /// and creator, and resolves both signing keys from the creators the
     /// supervisor holds.
     ///
-    /// Both bridge copies are narrowed to `messages:read` under
-    /// `crate::runtime::NARROWED_COPY_CREATOR`, and both handles name that
-    /// creator too. No supervisor saga interface exists, so the open fails after
-    /// both reads. An open that read the copy's ceiling or creator fails the
-    /// UCAN check instead; one that took either creator from a copy or a handle
-    /// fails to resolve that creator's identity, and the refusal names it.
+    /// Both handles name `crate::runtime::KEYLESS_HANDLE_CREATOR`. No
+    /// supervisor saga interface exists, so the open fails after both reads.
+    /// An open that took either creator from a handle fails to resolve that
+    /// creator's identity, and the refusal names it.
     #[cfg(feature = "outlet-capability-test-grant")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_saga_open_reads_the_supervisor_not_the_bridge_copy() {
@@ -1624,12 +1616,8 @@ mod xctx_streaming_saga_tests {
         .encoded();
 
         crate::runtime::ensure_registered(&bi, &source)
-            .expect("registering the caller context's bridge copy must succeed");
-        crate::runtime::narrow_bridge_copy_for_test(&bi, &source.context_id())
-            .expect("the context has a bridge copy to narrow");
-        crate::runtime::narrow_bridge_copy_for_test(&bi, &target.context_id())
-            .expect("the context has a bridge copy to narrow");
-        let narrowed = crate::runtime::NARROWED_COPY_CREATOR;
+            .expect("registering the caller context's bridge state must succeed");
+        let narrowed = crate::runtime::KEYLESS_HANDLE_CREATOR;
         let source = NapiContextHandle::test_active_on(&bi, source.context_id(), narrowed.into());
         let target = NapiContextHandle::test_active_on(&bi, target.context_id(), narrowed.into());
 
@@ -1659,14 +1647,12 @@ mod xctx_streaming_saga_tests {
     }
 
     /// Recovery resolves the target's signing key from the creator the
-    /// supervisor holds, never from the bridge copy.
+    /// supervisor holds.
     ///
-    /// In the first context the copy names a creator no identity carries and
-    /// the supervisor names the hosted invoker, so the key resolves and the
-    /// recovery driver refuses a saga the supervisor does not hold. In the
-    /// second the copy names the hosted invoker and the supervisor names a
-    /// creator no identity carries, so the key resolution refuses and names
-    /// that creator.
+    /// In the first context the supervisor names the hosted invoker, so the
+    /// key resolves and the recovery driver refuses a saga the supervisor does
+    /// not hold. In the second the supervisor names a creator no identity
+    /// carries, so the key resolution refuses and names that creator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_saga_recover_signs_as_the_supervisor_creator() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -1683,9 +1669,7 @@ mod xctx_streaming_saga_tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &hosted, &invoker)
             .await
             .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &hosted, &invoker);
-        crate::runtime::narrow_bridge_copy_for_test(&bi, &hosted)
-            .expect("the context has a bridge copy to narrow");
+        crate::runtime::register_test_context(&bi, &hosted);
         scp.insert_test_streaming_saga_entry("saga-napi-recover-hosted", &hosted, &invoker);
         let err = outlet_streaming_saga_recover_truncated_close_on(
             &bi,
@@ -1705,7 +1689,7 @@ mod xctx_streaming_saga_tests {
         crate::runtime::create_supervisor_context_for_test(&bi, &keyless, keyless_creator)
             .await
             .expect("test supervisor context creation must succeed");
-        crate::runtime::register_test_context(&bi, &keyless, &invoker);
+        crate::runtime::register_test_context(&bi, &keyless);
         scp.insert_test_streaming_saga_entry("saga-napi-recover-keyless", &keyless, &invoker);
         let err = outlet_streaming_saga_recover_truncated_close_on(
             &bi,

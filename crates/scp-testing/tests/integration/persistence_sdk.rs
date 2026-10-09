@@ -285,9 +285,9 @@ async fn context_create_persists_membership_to_sqlite() {
 /// 7. Verify membership survived and the context handle is restored.
 ///
 /// The new supervisor uses a NEW `NodeMlsFactory`, so the MLS group
-/// itself does not survive (`OpenMLS` key material lives in the provider
-/// and is not persisted through this path — MLS state persistence is
-/// tracked separately under SCP-PERSIST-050). This test asserts what
+/// itself does not survive (`OpenMLS` key material lives in the provider,
+/// and this test does not exercise the MLS crypto-state snapshot blob that
+/// persists it, persistence spec §17.9.1). This test asserts what
 /// #1491 actually persists: the `ContextSnapshot` (membership, roles,
 /// sender-key metadata, governance state) via `ProtocolRepository`.
 #[cfg(feature = "sqlite")]

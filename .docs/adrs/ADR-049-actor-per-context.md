@@ -468,7 +468,7 @@ Proposed on the grounds that the rest of the supervisor's mutable state lives be
   - The runtime binds the **concrete `NodeMlsFactory`** everywhere, including in tests. Test accommodations are `cfg!(any(test, feature = "testing"))`-gated *inside the concrete provider* (e.g. accepting `did:key`/`did:test` identities and a `None` key-package) rather than swapped in via a mock impl.
   - The fullstack E2E harness was re-wired over the concrete provider plus a shared `KeyExchange` side-channel (commit `12c.9f`) that relays the Welcome/key material between independent nodes' `E2eCryptoProvider`s — there is no in-process mock crypto.
   - The `MlsBackend` injection seam (`with_backends`) exists in the type surface but is **operationally dead**: no production or test path swaps a backend through it; the only coverage is `Arc::ptr_eq` identity asserts proving the seam wires the same instance. It is retained as a future injection point, not an active mock surface. Any future work that needs per-primitive crypto error injection should revive this seam rather than reintroduce a `ContextCryptoProvider`-style omnibus mock.
-- **~13 internal commits.** Large single atomic PR; expected 6–12 full-roster review rounds to double-zero.
+- **~13 internal commits.** Large single atomic PR.
 
 **WASM (historical — superseded by ADR-055).** `scp-runtime` stays native-only per ADR-034. The actor model does not run in the browser with native parity. At the time of this ADR, `scp-ffi/wasm` carried a re-implementation path; per ADR-055 that WASM bridge has since been removed and browser clients are remote thin clients to a server-side `scp-node`, so there is no browser-side actor re-implementation to keep in parity.
 

@@ -1482,12 +1482,16 @@ Relationship stage        Protocol action                Cost
 ──────────────────────────────────────────────────────────────────
 First contact             create_context + invitation    ~200ms (one-time)
 Ongoing communication     send/receive in context        <100ms per message
-Idle period               nothing (context persists)     0 (no keepalive)
+Idle period               periodic MLS Update (§9.7.3)   one Update per PCS Update interval, while online
 Reconnect after offline   transport reconnect            background, automatic
 Relationship ends         close_context                  one-time, keys preserved or destroyed per memory scope
 ```
 
-**Standing contexts have zero idle cost.** No keepalives, no heartbeats, no periodic key rotation (MLS key updates happen on message send, not on a timer). An agent with 500 standing contexts and no active conversations uses zero network bandwidth. The only cost is local storage for persisted MLS state — approximately 2-5KB per bilateral context (two-leaf ratchet tree, sender key material, minimal event log metadata).
+**An idle standing context costs one MLS Update per PCS Update interval.** A standing context sends no keepalives and no heartbeats. A standing context sits in the `Active` lifecycle state (§5.12.5), so the periodic MLS Update of `09-security-model.md` §9.7.3 covers it, and each member's SDK issues an Update in it once per PCS Update interval even when no member sends a message. A standing context is one of SCP's longest-lived groups, so a leaked leaf key stays useful longest there. Only the leaking member's own Update heals the leak, so a member who only receives would never heal it if Updates happened only on send (Alec's ruling, 2026-10-03).
+
+The Update timer runs only while the device is online. The timer never wakes the device. When an Update came due while the device was offline, the SDK sends that Update when the device reconnects, as §9.7.3 recommends. The PCS Update interval is a per-context parameter (§9.7.3), so a standing pair may set an interval longer than the 24-hour default.
+
+An agent with 500 standing contexts, no active conversations, and the 24-hour default interval sends 500 Updates a day and no other traffic. The only other cost is local storage for persisted MLS state — approximately 2-5KB per bilateral context (two-leaf ratchet tree, sender key material, minimal event log metadata).
 
 **Standing contexts vs. ephemeral contexts — when to use which:**
 

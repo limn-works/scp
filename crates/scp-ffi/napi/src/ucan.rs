@@ -431,9 +431,6 @@ pub(crate) async fn ucan_evaluate_on(
 
     let context_id = handle.context_id();
 
-    // The ceiling and the creator come from the supervisor actor for the reason
-    // `ucan_validate_on` reads them there: the bridge copy reports a ceiling a
-    // governance action may already have narrowed.
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
     // evaluate_ucan takes `&ValidationContext` and is read-only — it probes the
@@ -1080,7 +1077,7 @@ mod tests {
         let context_id = format!("ctx-revoke-persist-{}", uuid::Uuid::new_v4());
 
         // Manually register a context in the runtime registry.
-        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id);
 
         // First call: revoke a CID.
         runtime::with_context(&bi, &context_id, |rt| {
@@ -1122,7 +1119,7 @@ mod tests {
 
         let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-nonce-persist-{}", uuid::Uuid::new_v4());
-        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id);
 
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

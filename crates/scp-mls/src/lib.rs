@@ -11,9 +11,9 @@
 //!
 //! `scp-mls` depends only on `scp-clock`, `scp-did`, `scp-protocol`, and the
 //! `openmls` stack. It **must not** depend on `scp-runtime` (tokio/actor
-//! orchestration) or `scp-identity` (tokio-coupled custody/DHT). The async
-//! durable-storage bridge (`ScpMlsProvider<S>`, the `block_in_place` storage
-//! adapters) stays in `scp-runtime`; only the in-memory provider lives here.
+//! orchestration) or `scp-identity` (tokio-coupled custody/DHT). Every live
+//! MLS provider is the in-memory provider here; the runtime persists its state
+//! as a snapshot blob (persistence spec §17.9.1).
 //!
 //! # Ciphersuite
 //!
@@ -27,7 +27,7 @@
 //! - [`convergent_timestamp`] — Authenticated convergent committer timestamp
 //!   carried in the MLS AAD (ADR-057).
 //! - [`encrypt`] — Application-message encrypt/decrypt over the MLS group.
-//! - [`ratchet`] — Commit processing and epoch advance.
+//! - [`ratchet`] — Update proposals and MLS message serialization.
 //! - [`key_package`] — Single-use `KeyPackage` buffer management.
 //! - [`lifetime`] — `KeyPackage` `Lifetime` minting/validation via the injected
 //!   [`scp_clock::Clock`] (ADR-057 Prereq-1).
@@ -39,7 +39,7 @@
 //!   helpers (§5.13.3, finding FFI-02).
 //! - [`epoch_grace`] — Epoch grace-window store (forward-secrecy bound).
 //! - [`provider`] — The in-memory MLS provider, which zeroizes its storage on
-//!   drop.
+//!   drop and refuses to store the MLS signer (persistence spec §17.9).
 //! - [`error`] — MLS-specific error types.
 //!
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
@@ -113,9 +113,10 @@ pub use wrapping_extension::{
     make_wrapping_key_extension, scp_capabilities_with_wrapping_key,
 };
 
-// The in-memory MLS provider holds all key material in process memory and
-// zeroizes its storage values on drop. The native runtime's persistent
-// `ScpMlsProvider<S>` snapshots out to durable storage; an in-browser client
-// snapshots it to `IndexedDB` out-of-band. It lives in `scp-mls` so the sync MLS
-// machine is self-contained (ADR-057).
-pub use provider::InMemoryMlsProvider;
+// The in-memory MLS provider holds all key material in process memory,
+// zeroizes its storage values on drop, and refuses to store the MLS signer
+// (persistence spec §17.9). The native runtime snapshots it to durable storage
+// and an in-browser client snapshots it to `IndexedDB`, both out of band
+// (§17.9.1). It lives in `scp-mls` so the sync MLS machine is self-contained
+// (ADR-057).
+pub use provider::{InMemoryMlsProvider, InMemoryMlsStorage, InMemoryMlsStorageError};

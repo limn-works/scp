@@ -55,12 +55,21 @@ use crate::wrapping_extension::extract_wrapping_key;
 /// `ProcessedMessageContent::OwnPrivateMessage`, an undecrypted body, and an
 /// unverified signature; the typed error lets the receive loop drop it benignly
 /// instead of reading an unauthenticated sender or AAD.
-/// `ProcessedMessageContent::OwnPendingCommit` gets the same error, but a
-/// `PrivateMessage` never reaches it: openmls 0.9.0's `from_inbound_ciphertext`
-/// (`framing/validation.rs`) returns `OwnPrivateMessage` for every
-/// `PrivateMessage` whose sender is the local member, before decryption, so a
-/// member's own Commit sent as a `PrivateMessage` also arrives as
-/// `OwnPrivateMessage`.
+/// `ProcessedMessageContent::OwnPendingCommit` gets the same error.
+///
+/// SCP merges each Commit it creates before publishing it (`add_member` and
+/// `remove_member` in `group.rs`, the two self-updates in `ratchet.rs`), so the
+/// relay's echo of a member's own Commit reaches that member one epoch behind
+/// the member's group. openmls 0.9.0's `decrypt_message` runs
+/// `validate_framing` first, and `validate_framing` refuses a non-application
+/// message from any epoch but the current one, so that echo returns
+/// [`MlsError::DecryptionFailed`] and leaves the epoch unchanged.
+/// [`MlsError::CannotDecryptOwnMessage`] covers a member's own application
+/// message and a member's own Commit that the member has not merged. For a
+/// `PrivateMessage` from the local member, openmls 0.9.0's
+/// `from_inbound_ciphertext` (`framing/validation.rs`) returns
+/// `OwnPrivateMessage` before decryption; openmls returns `OwnPendingCommit`
+/// only for an unmerged own Commit sent as a `PublicMessage`.
 ///
 /// # openmls's receive-side `Lifetime` clock check
 ///
@@ -463,67 +472,6 @@ fn decrypt_protocol_message_with_sender_did(
             Err(MlsError::CannotDecryptOwnMessage)
         }
     }
-}
-
-/// Processes an inbound message that must be a Commit, refusing any other
-/// content type before decrypting it.
-///
-/// The content type is read from the parsed `ProtocolMessage`: a
-/// `PrivateMessage` carries `content_type` in the clear (RFC 9420 §6.3), and a
-/// `PublicMessage` carries it in its `FramedContent` (RFC 9420 §6).
-///
-/// Decrypting a `PrivateMessage` consumes the sender's ratchet generation and
-/// deletes its key (the content type picks the application or handshake
-/// ratchet, RFC 9420 §6.3.1). This function refuses a non-Commit before
-/// decrypting it, so a refused application message or Proposal still decrypts
-/// afterwards through [`decrypt_with_sender_did`]. A relay or other
-/// non-member cannot relabel a message past the check: a `PrivateMessage`'s
-/// `content_type` is bound into its `SenderDataAAD` (RFC 9420 §6.3.2), so a
-/// message it relabels as a Commit fails at sender-data decryption, before
-/// any ratchet generation is spent. A member holds the epoch's
-/// `sender_data_secret`, so it can re-encrypt the sender data under the new
-/// label and spend the claimed sender's handshake-ratchet generation, as it
-/// can through any decrypt path (RFC 9420 §6.3.2). The relabelled message's
-/// application-ratchet key is never spent.
-///
-/// A Commit then gets the checks [`decrypt_with_sender_did`] runs: the
-/// `catch_unwind` guard around openmls's `process_message`, the mapping of the local member's own
-/// echoed message to [`MlsError::CannotDecryptOwnMessage`], and, before the
-/// merge, the clock-free maximum-range check on every Add proposal's
-/// `KeyPackage` `Lifetime`.
-///
-/// Both [`crate::ratchet::process_commit`] and the runtime backend's
-/// `process_commit` call this function.
-///
-/// # Errors
-///
-/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed,
-/// [`MlsError::DecryptionFailed`] if the bytes are not an MLS protocol message,
-/// [`MlsError::CommitProcessingFailed`] if the message is an application
-/// message or a Proposal, and the errors of [`decrypt_with_sender_did`]
-/// otherwise. On every error raised before the merge the group's epoch is
-/// unchanged; a storage error from openmls's `merge_staged_commit` can leave
-/// the group partly merged, so the caller treats the group as unusable.
-pub fn decrypt_commit(group: &mut ScpMlsGroup, commit_bytes: &[u8]) -> Result<(), MlsError> {
-    let protocol_message = parse_protocol_message(group, commit_bytes)?;
-    let content_type = protocol_message.content_type();
-    if content_type != ContentType::Commit {
-        return Err(MlsError::CommitProcessingFailed(format!(
-            "message is not a Commit (content type {content_type:?})"
-        )));
-    }
-
-    // Unreachable after the content-type check above: the AEAD authenticates
-    // the content type for a PrivateMessage, and the signature and membership
-    // tag do for a PublicMessage. Kept as a typed refusal rather than a panic.
-    let DecryptedContent::Commit { .. } =
-        decrypt_protocol_message_with_sender_did(group, protocol_message)?
-    else {
-        return Err(MlsError::CommitProcessingFailed(
-            "message is not a Commit".to_string(),
-        ));
-    };
-    Ok(())
 }
 
 /// The membership changes an existing member observes when it processes an
@@ -1230,9 +1178,75 @@ mod tests {
         );
     }
 
-    /// A member that processes its own ciphertext (the relay's echo) gets the
-    /// typed `CannotDecryptOwnMessage` from every decrypt entry point, not a
-    /// wildcard `NotApplicationMessage` or a sender lookup on its own leaf.
+    /// A one-member group whose wire-format policy sends every handshake
+    /// message as a `PublicMessage`. openmls 0.9.0 reports the echo of the
+    /// member's own pending Commit as `OwnPendingCommit` only when that Commit
+    /// is a `PublicMessage`; a `PrivateMessage` from the member's own leaf
+    /// arrives as `OwnPrivateMessage` before openmls looks at the content.
+    #[allow(clippy::unwrap_used)]
+    fn public_handshake_group() -> ScpMlsGroup {
+        let provider = crate::InMemoryMlsProvider::default();
+        let signer =
+            SignatureKeyPair::new(crate::group::SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        let credential_with_key = CredentialWithKey {
+            credential: BasicCredential::new(test_credential("alice").to_bytes().unwrap()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(crate::group::SCP_CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
+            .max_past_epochs(2)
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .build();
+        let group = MlsGroup::new(&provider, &signer, &config, credential_with_key).unwrap();
+        ScpMlsGroup {
+            group: Some(group),
+            provider,
+            signer: Some(signer),
+            destroyed: false,
+        }
+    }
+
+    /// Stages a self-update Commit on `group` without merging it and returns
+    /// the Commit's wire bytes.
+    #[allow(clippy::unwrap_used)]
+    fn unmerged_self_update_bytes(group: &mut ScpMlsGroup) -> Vec<u8> {
+        let g = group.group.as_mut().unwrap();
+        let signer = group.signer.as_ref().unwrap();
+        g.self_update(&group.provider, signer, LeafNodeParameters::default())
+            .unwrap()
+            .into_commit()
+            .tls_serialize_detached()
+            .unwrap()
+    }
+
+    /// Stages a self-update Commit on `group`, merges it as SCP merges every
+    /// Commit before publishing it, and returns the Commit's wire bytes.
+    #[allow(clippy::unwrap_used)]
+    fn merged_self_update_bytes(group: &mut ScpMlsGroup) -> Vec<u8> {
+        let bytes = unmerged_self_update_bytes(group);
+        group
+            .group
+            .as_mut()
+            .unwrap()
+            .merge_pending_commit(&group.provider)
+            .unwrap();
+        bytes
+    }
+
+    /// A member that processes its own application ciphertext (the relay's
+    /// echo) gets the typed `CannotDecryptOwnMessage` from every decrypt entry
+    /// point, not a wildcard `NotApplicationMessage` or a sender lookup on its
+    /// own leaf.
+    ///
+    /// SCP merges each Commit before publishing it, so the relay's echo of a
+    /// member's own Commit arrives one epoch behind the member, and openmls's
+    /// epoch check in `validate_framing` refuses it with `DecryptionFailed`.
+    /// Every entry point returns that error and leaves the epoch unchanged.
+    /// A member's own Commit that the member has not merged gets
+    /// `CannotDecryptOwnMessage` and leaves the epoch unchanged, whether it
+    /// arrives as a `PrivateMessage` (openmls's `OwnPrivateMessage`) or as a
+    /// `PublicMessage` (openmls's `OwnPendingCommit`).
     #[test]
     #[allow(clippy::unwrap_used)]
     fn own_echo_is_rejected_by_all_four_decrypt_functions() {
@@ -1261,6 +1275,56 @@ mod tests {
         }
         // The group stays usable: the next own message still encrypts.
         encrypt(&mut alice_group, b"after echoes").unwrap();
+
+        let mut public_group = public_handshake_group();
+        for (framing, group) in [
+            ("PrivateMessage", &mut alice_group),
+            ("PublicMessage", &mut public_group),
+        ] {
+            let epoch_before = group.epoch().unwrap();
+            // One staged Commit serves all four entry points: a rejected echo
+            // neither merges nor clears the pending Commit.
+            let commit_bytes = unmerged_self_update_bytes(group);
+            for (name, decrypt_fn) in entry_points {
+                let result = decrypt_fn(group, &commit_bytes);
+                assert!(
+                    matches!(result, Err(MlsError::CannotDecryptOwnMessage)),
+                    "{name} must reject the own unmerged Commit as a {framing} with \
+                     CannotDecryptOwnMessage, got {result:?}"
+                );
+                assert_eq!(
+                    group.epoch().unwrap(),
+                    epoch_before,
+                    "{name} must leave the epoch unchanged after the own {framing} Commit"
+                );
+            }
+        }
+
+        // The production shape: the member merged its own Commit before the
+        // relay echoed it back, so the echo is one epoch behind the member.
+        // openmls 0.9.0 enforces this refusal: `validate_framing`'s epoch check
+        // runs inside `process_message`, before any SCP code reads the message,
+        // and no SCP-side change can make openmls accept a previous-epoch
+        // Commit. This loop pins openmls's refusal and SCP's mapping of it to
+        // `DecryptionFailed`.
+        let (mut merged_group, _bob_group) = setup_alice_bob();
+        let epoch_before_commit = merged_group.epoch().unwrap();
+        let commit_bytes = merged_self_update_bytes(&mut merged_group);
+        let epoch_after_merge = merged_group.epoch().unwrap();
+        assert_eq!(epoch_after_merge, epoch_before_commit + 1);
+        for (name, decrypt_fn) in entry_points {
+            let result = decrypt_fn(&mut merged_group, &commit_bytes);
+            assert!(
+                matches!(result, Err(MlsError::DecryptionFailed(_))),
+                "{name} must refuse the echo of the own merged Commit with \
+                 DecryptionFailed (openmls's epoch check), got {result:?}"
+            );
+            assert_eq!(
+                merged_group.epoch().unwrap(),
+                epoch_after_merge,
+                "{name} must leave the epoch unchanged after the own merged Commit's echo"
+            );
+        }
     }
 
     #[test]

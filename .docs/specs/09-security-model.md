@@ -992,6 +992,8 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 
 **Scope of the PCS bound (in-group only).** PCS bounds the compromise of a leaf's MLS state *within the group where the Update happens* — it does not, on its own, bound reuse of a leaked leaf key plus its **standalone KeyPackage attestation** to join **other** groups. An attacker holding a victim's leaf `signature_key`/`encryption_key` and the attestation over them can present that leaf to a different group until the victim rotates `#active` (§9.12), because verifiers resolve the signer's **current** verification method only (§9.7.1 check 1). The attestation's capped lifetime (`MAX_KEYPACKAGE_ATTESTATION_LIFETIME`, §9.18.7) stops an honest adder from adding the leaf once the attestation has expired. The cap does not stop a member of the target group who commits the Add itself, because a member that receives an Add does not check the attestation against its own clock (§9.7.1 check 13 and the KeyPackage `Lifetime` checks). It is therefore **incorrect** to say such a compromise is bounded by the PCS Update interval; that interval bounds only the in-group message-read window (§9.12 "Time-shifted key compromise"). Rotation is the revocation lever for the cross-group reuse vector at every adder and every receiver; the lifetime cap is a backstop at honest adders only.
 
+**Active contexts.** In this section, an active context is a context in the `Active` lifecycle state that `05-contexts.md` §5.2 names in the `Creating → Active` transition. A context stays in that state across process restarts (`05-contexts.md` §5.12.5) whether or not its members send messages, so an idle standing context (`05-contexts.md` §5.12.6) is an active context. An MLS Update reaches only an encrypted context, because a broadcast context has no MLS group (`05-contexts.md` §5.2).
+
 **SDK requirements:**
 
 - The SDK MUST periodically issue MLS Update proposals. Recommended interval: every 24 hours for active contexts, or immediately after any suspected compromise. Because an Update generates a fresh ephemeral leaf key and ratchets the path, the updated leaf MUST carry a fresh **KeyPackage attestation** binding the new leaf `signature_key` to the DID (§9.7.1).
@@ -1000,7 +1002,7 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 - When a delegated agent identity rotates its own Active Signing Key, that identity runs the bullet above on its own key-event log, because it holds its own keys and the human's log holds none of them (§9.1 invariant 1).
 - When the root key changes by a `RootRecovery` (§9.7.4.2 R3), the SDK MUST issue MLS Updates in every active context with the new credential and a **re-issued KeyPackage attestation** under the operational keys the recovery's key state names. §9.11's key-change rule governs what every peer does on observing it.
 
-**PCS Update interval as context parameter:** High-security contexts may configure shorter PCS Update intervals (e.g., 1 hour). The interval is a context-level parameter set at creation, defaulting to 24 hours.
+**PCS Update interval as context parameter:** High-security contexts may configure shorter PCS Update intervals (e.g., 1 hour). The interval is a context-level parameter set at creation, defaulting to 24 hours. A context may also set an interval longer than 24 hours, within the "hours or days" range RFC 9420 §3.2 gives for Updates, so a standing pair (`05-contexts.md` §5.12.6) whose members rarely exchange messages may set one.
 
 ### 9.7.4 Key Lifecycle
 

@@ -50,7 +50,7 @@ disallowed-types = [
 
 # Clippy reads only the configuration file nearest the crate, so the workspace
 # `.clippy.toml` does not apply here; these entries repeat its ban.
-# `crypto::mls::storage::tests::signer_write_is_refused_and_stores_nothing`
+# `crypto::mls::production_backend::tests::signer_store_is_disallowed_and_refused`
 # carries a control `expect` for each signer-storage entry, and
 # `crypto::mls::production_backend::tests::signature_key_gen_is_disallowed`
 # one for the `signature_key_gen` entry; each fails when its entry is missing.

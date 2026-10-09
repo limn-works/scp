@@ -1001,7 +1001,8 @@ impl NodeMlsFactory {
     /// Returns [`ContextError::CryptoFailed`] if `data` is empty (the owned path
     /// must always yield material — unlike the legacy no-op-on-empty
     /// `restore_crypto_state`), if deserialization
-    /// fails, or if the data is corrupt.
+    /// fails, if the data is corrupt, or if a provider storage entry carries
+    /// openmls's signature-key-pair label (persistence spec §17.9.1).
     pub(crate) fn build_restored_owned(
         &self,
         context_id: &[u8; 32],
@@ -1016,20 +1017,15 @@ impl NodeMlsFactory {
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(data)
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
 
-        // Reconstruct the InMemoryMlsProvider with the persisted storage entries.
-        let provider = scp_mls::InMemoryMlsProvider::default();
-        {
-            let mut values =
-                provider.storage().values.write().map_err(|e| {
-                    ContextError::CryptoFailed(format!("storage lock poisoned: {e}"))
-                })?;
-            // Drain entries so the snapshot no longer holds MLS storage data
-            // (which contains epoch secrets and HPKE private keys); the
-            // drained `Zeroizing` vector wipes its buffer when it drops.
-            for (k, v) in snapshot.mls_storage_entries.drain(..) {
-                values.insert(k, v);
-            }
-        }
+        // Reconstruct the InMemoryMlsProvider with the persisted storage
+        // entries. It drains them, so the snapshot no longer holds MLS storage
+        // data (epoch secrets and HPKE private keys), and it refuses a
+        // signer-labelled entry before draining any (persistence spec
+        // §17.9.1); the `Zeroizing` vector wipes whatever it still holds when
+        // it drops.
+        let provider =
+            scp_mls::InMemoryMlsProvider::from_storage_entries(&mut snapshot.mls_storage_entries)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // Deserialize the signer from the snapshot's raw bytes, which their
         // `Zeroizing` type wipes when the snapshot drops.
@@ -2154,6 +2150,44 @@ mod tests {
         assert!(
             matches!(err, ContextError::CryptoFailed(_)),
             "empty owned-restore must fail with CryptoFailed, got {err:?}"
+        );
+    }
+
+    /// A snapshot whose provider storage entries include one under openmls's
+    /// signature-key-pair label fails the owned restore with `CryptoFailed`
+    /// carrying the signer refusal (persistence spec §17.9.1); the same
+    /// snapshot without that entry restores.
+    #[test]
+    fn build_restored_owned_refuses_signer_entry() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let actor = take_into_actor(&provider, &ctx_id);
+        let (wpub, wsec) = provider.wrapping_keypair();
+        let exported = actor
+            .export_crypto_state(vec![], vec![], wpub, &*wsec)
+            .unwrap();
+
+        // Control: the unmodified snapshot restores.
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let _restored = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
+        let mut signer_key = b"SignatureKeyPair".to_vec();
+        signer_key.extend_from_slice(b"[1,2,3]");
+        snapshot
+            .mls_storage_entries
+            .push((signer_key, b"signer private key".to_vec()));
+        let crafted = rmp_serde::to_vec_named(&snapshot).unwrap();
+
+        let err = provider2
+            .build_restored_owned(&ctx_id, &crafted)
+            .expect_err("a signer entry must be refused on restore");
+        let ContextError::CryptoFailed(message) = err else {
+            panic!("expected CryptoFailed, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            scp_mls::error::MlsError::SignerStorageForbidden.to_string()
         );
     }
 

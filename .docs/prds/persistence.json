@@ -1157,7 +1157,8 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-core"
+        "crate": "scp-core",
+        "superseded_acceptance_criteria": "Every acceptance criterion of this story is superseded. On 2026-10-09 Alec ruled that the MLS paths with no production caller are deleted, and this change deletes `MlsStorageBridge`, `ScpMlsProvider`, `MlsStorageBridgeError`, `new_provider()`, crates/scp-runtime/src/crypto/mls/storage.rs, and the three bridge tests (roundtrip, context isolation, restart) in crates/scp-testing/tests/integration/protocol_repository.rs. No production path ever constructed the bridge: every live OpenMLS provider is `scp_mls::InMemoryMlsProvider`, whose `InMemoryMlsStorage` refuses to store the MLS signer (persistence spec §17.9), and the runtime persists MLS crypto state as one snapshot blob whose capture and restore refuse a signer-labelled entry (§17.9.1). The per-key `mls/{context_id}/...` sub-prefixes and the MessagePack-per-key layout named in the criteria are therefore not built. Read this story against the commit that merged it, not against current HEAD."
       }
     },
     {
