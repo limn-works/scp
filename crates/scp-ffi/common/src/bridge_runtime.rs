@@ -357,25 +357,22 @@ impl ProtocolRepoVariant {
 // Shared UCAN validation state
 // ---------------------------------------------------------------------------
 
-/// Core per-context UCAN validation state shared by all FFI bridges.
+/// Core per-context UCAN validation state.
 ///
 /// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
 /// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
 /// state — the manager does not track UCAN revocation or nonces.
 ///
-/// The NAPI bridge extends this with bridge-specific fields (`role_state`,
-/// `outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
+/// The NAPI bridge extends this with bridge-specific fields
+/// (`outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
 /// uses this as-is (type alias `UcanContextState = UcanContextStateCore`).
+///
+/// This struct holds no capability ceiling and no context creator DID.
 pub struct UcanContextStateCore {
     /// UCAN revocation list for this context.
     pub revocation_list: scp_core::crypto::ucan::revoke::RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
     pub nonce_tracker: scp_core::crypto::ucan::nonce::NonceTracker<scp_clock::SystemClock>,
-    /// Capability ceiling as a set of `{resource}:{action}` strings for
-    /// UCAN validation (ADR-016 step 8).
-    pub ceiling_strings: std::collections::HashSet<String>,
-    /// The DID of the context creator.
-    pub creator_did: String,
     /// Event log (Merkle tree) for this context.
     pub event_log: scp_event_log::EventLog,
 }

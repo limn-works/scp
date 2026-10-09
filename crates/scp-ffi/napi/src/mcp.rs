@@ -582,8 +582,7 @@ fn absent_context_message(bi: &NapiBridgeInstance, context_id: &str) -> String {
 /// Reads `context_id`'s current role state from the context's supervisor
 /// actor, and separates the two outcomes [`live_role_state`] merges:
 /// `Ok(None)` when the actor holds no such context, and `Err` when the read
-/// itself failed. With no supervisor attached it returns `Ok(None)` and reads
-/// no bridge copy.
+/// itself failed. With no supervisor attached it returns `Ok(None)`.
 ///
 /// # Errors
 ///
@@ -2329,7 +2328,7 @@ mod tests {
         scp_mcp::server::McpServer<McpNapiBridgeProvider>,
     ) {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
-        crate::runtime::register_ffi_state(&bi, SUB_CTX, AGENT_DID, &[])
+        crate::runtime::register_ffi_state(&bi, SUB_CTX, &[])
             .expect("registering context FFI state must succeed");
         let provider = McpNapiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2371,7 +2370,7 @@ mod tests {
         ContextEventSender,
     ) {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
-        crate::runtime::register_ffi_state(&bi, SUB_CTX, AGENT_DID, &[])
+        crate::runtime::register_ffi_state(&bi, SUB_CTX, &[])
             .expect("registering context FFI state must succeed");
         register_supervised_context(&bi, SUB_CTX, AGENT_DID);
         let provider = McpNapiBridgeProvider {
@@ -2779,17 +2778,10 @@ mod tests {
         );
     }
 
-    /// Registers `ctx_id` on the bridge with `copy_creator` as the bridge
-    /// state's creator, and creates it on the actor with `actor_creator` as its
-    /// creator and only member, so the bridge state and the actor disagree
-    /// about who created the context.
-    fn setup_diverged_context(
-        bi: &NapiBridgeInstance,
-        ctx_id: &str,
-        copy_creator: &str,
-        actor_creator: &str,
-    ) {
-        crate::runtime::register_ffi_state(bi, ctx_id, copy_creator, &[])
+    /// Registers `ctx_id`'s UCAN state on the bridge, and creates the context
+    /// on the actor with `actor_creator` as its creator and only member.
+    fn setup_actor_context(bi: &NapiBridgeInstance, ctx_id: &str, actor_creator: &str) {
+        crate::runtime::register_ffi_state(bi, ctx_id, &[])
             .expect("registering context FFI state must succeed");
         crate::runtime::init_supervisor_for_test_on(bi);
         let supervisor = Arc::clone(crate::runtime::supervisor(bi).unwrap());
@@ -2813,9 +2805,9 @@ mod tests {
     /// Every MCP gate answers from the actor's role state.
     ///
     /// `revoked` is the state after an inbound commit removed the agent: the
-    /// actor holds the context without the agent while the bridge state still
-    /// names the agent as the context's creator. `granted` is the reverse. A
-    /// gate that let the bridge state decide fails one of the two halves.
+    /// actor holds the context without the agent. In `granted` the agent
+    /// created the context. A gate that answered without the actor's role
+    /// state fails one of the two halves.
     #[test]
     fn provider_gates_read_the_actor_role_state_napi() {
         use scp_mcp::server::{ContextProvider as _, ResourceKind};
@@ -2825,8 +2817,8 @@ mod tests {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
         let revoked = "ctx-napi-live-role-revoked";
         let granted = "ctx-napi-live-role-granted";
-        setup_diverged_context(&bi, revoked, agent, other);
-        setup_diverged_context(&bi, granted, other, agent);
+        setup_actor_context(&bi, revoked, other);
+        setup_actor_context(&bi, granted, agent);
         let provider = |ctx: &str| McpNapiBridgeProvider {
             bi: Arc::downgrade(&bi),
             agent_did: agent.to_owned(),
@@ -2841,7 +2833,7 @@ mod tests {
         ] {
             let denial = provider(revoked)
                 .validate_resource_access(revoked, kind)
-                .expect_err("the copy's grant must not outlive the actor's revocation");
+                .expect_err("the actor's revocation must refuse the agent");
             assert!(
                 matches!(&denial, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains(requirement)),
                 "{kind:?}: {denial}"
@@ -2983,7 +2975,7 @@ mod tests {
         let agent = "did:dht:z6MkNapiEventsResourceAgent";
         let ctx_id = "ctx-napi-events-resource";
         let bi = Arc::new(NapiBridgeInstance::new_napi());
-        setup_diverged_context(&bi, ctx_id, agent, agent);
+        setup_actor_context(&bi, ctx_id, agent);
         // Make the bridge's local tree diverge from the actor's log.
         crate::runtime::with_context(&bi, ctx_id, |rt| {
             rt.core.event_log.push_leaf_raw([0x5A; 32]);
