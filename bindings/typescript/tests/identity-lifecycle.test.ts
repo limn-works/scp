@@ -29,6 +29,7 @@ import type { Bridge, BridgeIdentityHandle } from "../src/internal/bridge";
 import { __setBridgeForTests } from "../src/internal/bridge";
 import { SCP } from "../src/scp";
 import { mountMockScp } from "./mock-bridge";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 const LIFECYCLE_METHODS = [
   "identityRotateKey",
@@ -171,14 +172,13 @@ let skipReason = "";
 try {
   const probe = new SCP({ storage: { type: "in_memory" } });
   if (typeof (probe as unknown as Record<string, unknown>).identityRotateKey !== "function") {
-    skipReason = "SCP missing identityRotateKey — rebuild with the parity changes";
-  } else {
-    await probe.identityCreate("in_memory");
-    napiAvailable = true;
+    throw new Error("SCP missing identityRotateKey — rebuild with the parity changes");
   }
+  await probe.identityCreate("in_memory");
+  napiAvailable = true;
   await probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  skipReason = `Native NAPI bridge not available or not custody-capable: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 if (!napiAvailable) {

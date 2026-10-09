@@ -152,17 +152,20 @@ nothing:
                shows nothing.
   downloaded-module
                Every real-FFI test module under bindings/python/tests skips
-               itself when the extension does not import, and the `scp` fixture
-               skips every test that requests it when `SCP(storage=...)` raises,
-               so a PyO3 consumer whose downloaded module does not load leaves
-               pytest exiting 0 over zero executed assertions. The check requires
+               itself when the extension is absent from
+               bindings/python/scp_sdk, and the `scp` fixture skips every test
+               that requests it in the same case, so a PyO3 consumer whose
+               downloaded module landed anywhere else leaves pytest exiting 0
+               over zero executed assertions. The check requires
                each fragment in PYO3_ASSERTION_FRAGMENTS in the `run:` text of an
                unguarded step before `pytest tests`.
   downloaded-addon
                Every real-NAPI test file under bindings/typescript/tests resolves
-               to `describe.skip` or `test.skip` when the addon load throws, so a
-               NAPI consumer whose downloaded addon does not load leaves
-               `bun test` exiting 0 over zero executed NAPI assertions. The check
+               to `describe.skip` or `test.skip` when `loadNativeAddon()` throws
+               SCP-VALID-7081 (the addon package does not resolve), so a NAPI
+               consumer whose downloaded addon was wired anywhere but the package
+               directory `require()` resolves leaves `bun test` exiting 0 over
+               zero executed NAPI assertions. The check
                requires each fragment in NAPI_ASSERTION_FRAGMENTS in the `run:`
                text of an unguarded step before the first `bun test` or
                `pytest tests` step.
@@ -3970,14 +3973,14 @@ def pyo3_consumers_missing_an_assertion_fragment(
     comes before the first step whose `run:` text matches `\bpytest tests` and that
     carries no `if:` and no `continue-on-error` other than false.
 
-    WHY: every real-FFI test module under bindings/python/tests skips itself when its
-    import of the extension raises ImportError, and the `scp` fixture in
-    bindings/python/tests/conftest.py skips every test that requests it when
-    `scp_sdk` does not import or `SCP(storage=...)` raises anything. A consumer whose
-    downloaded module never reached the import path, failed to load, or was built
-    without a feature a module calls therefore leaves pytest exiting 0 over zero
-    executed assertions in every one of these jobs at once, which is the `zero-test`
-    shape this file names. `crates/scp-ffi/` compiles `fullstack_create_node` only
+    WHY: every real-FFI test module under bindings/python/tests skips itself when the
+    extension is absent from bindings/python/scp_sdk, and the `scp` fixture in
+    bindings/python/tests/conftest.py skips every test that requests it in the same
+    case. A consumer whose downloaded module never reached the import path therefore
+    leaves pytest exiting 0 over zero executed assertions in every one of these jobs
+    at once, which is the `zero-test` shape this file names. The fragments also load
+    the module and read its `testing`- and `server`-gated methods, so a module that
+    fails to load or was built without a feature a module calls fails before pytest. `crates/scp-ffi/` compiles `fullstack_create_node` only
     under `testing` and `relay_start_in_memory` only under `server`.
     """
     gaps: list[str] = []
@@ -4040,12 +4043,14 @@ def napi_consumers_missing_an_assertion_fragment(
     than false.
 
     WHY: every real-NAPI test file under bindings/typescript/tests wraps its addon load
-    and its first construction in one `try`, writes the caught error into a skip reason,
-    and resolves its whole `describe` block to `describe.skip` or to a lone `test.skip`
-    — tests/real-napi.test.ts, tests/e2e-fullstack.test.ts and tests/persistence.test.ts
-    among them. A downloaded addon that does not load therefore leaves `bun test`
-    exiting 0 over zero executed NAPI assertions, which is the same `zero-test` shape
-    the PyO3 criterion above names.
+    and its first construction in one `try`, passes the caught error to
+    `skipReasonIfAddonAbsent` in tests/napi-guard.ts, and resolves its whole `describe`
+    block to `describe.skip` or to a lone `test.skip` when `loadNativeAddon()` throws
+    SCP-VALID-7081 — tests/real-napi.test.ts, tests/e2e-fullstack.test.ts and
+    tests/persistence.test.ts among them. A downloaded addon wired anywhere but the
+    package directory `require()` resolves therefore leaves `bun test` exiting 0 over
+    zero executed NAPI assertions, which is the same `zero-test` shape the PyO3
+    criterion above names.
     """
     gaps: list[str] = []
     for job_id, job in sorted(doc["jobs"].items()):

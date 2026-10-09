@@ -40,10 +40,15 @@
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
-import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
+import { ContextError, mapBridgeError, mapSagaError, ScpError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
-import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import {
+  loadNativeAddon,
+  NATIVE_ADDON_ABSENT_CODE,
+  NATIVE_ADDON_LOAD_FAILED_CODE,
+  type NativeAddon as RawNativeAddon,
+} from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
 import { StreamingSagaHandle } from "./outlets";
@@ -159,11 +164,12 @@ interface NativeScpInstance {
  * Routes through the shared `loadNativeAddon` cache in
  * `internal/native.ts` so this module and the bridge factory share a
  * single frozen addon reference. The shared loader throws
- * `TransportError` (`SCP-TRANS-5001`) on platform-package missing or
- * load failure; this wrapper layers an additional runtime check
- * and a stale-addon (no `SCP` class) check, both surfaced as
- * `ValidationError` (`SCP-VALID-7005`) — the public-API code that
- * SDK consumers see when they call `new SCP(...)`.
+ * `ValidationError` (`SCP-VALID-7081`) when the platform package is
+ * missing, which this wrapper rethrows under the same code with the
+ * reinstall instruction SDK consumers see when they call `new SCP(...)`.
+ * An installed addon that failed to load passes through as the loader's
+ * `ValidationError` (`SCP-VALID-7082`), and an addon that loaded without the `SCP`
+ * class throws the same code, so neither is reported as a missing package.
  */
 function loadAddon(): NativeAddon {
   if (typeof process === "undefined" || !process.versions?.node) {
@@ -179,25 +185,10 @@ function loadAddon(): NativeAddon {
   try {
     addon = loadNativeAddon() as NativeAddon;
   } catch (cause) {
-    const underlying = (cause as Error)?.message ?? String(cause);
-    throw new ValidationError(
-      `Native addon failed to load: ${underlying}. ` +
-        "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
-        "installed, then reinstall with `bun install`.",
-      "SCP-VALID-7005",
-    );
+    throw addonLoadError(cause);
   }
 
-  if (typeof addon.SCP !== "function") {
-    throw new ValidationError(
-      "Native addon loaded but does not export the SCP class — " +
-        "the platform addon was built before the Phase 4 PR 1 multi-instance " +
-        "surface landed. Upgrade the package or rebuild from the current " +
-        "codebase with `cargo build -p scp-ffi-napi`.",
-      "SCP-VALID-7005",
-    );
-  }
-
+  requireAddonExport(addon, "SCP");
   return addon;
 }
 
@@ -218,22 +209,13 @@ function nativeScp(): NativeScpCtor {
  * ADR-048 §1; `SCP` class methods that wrap them route through this
  * accessor instead of `this.#native[name]`.
  *
- * Throws `SCP-VALID-7005` if the addon is unloadable or does not
- * export the named function (e.g., a stale prebuilt addon predating
- * the §1 split).
+ * Throws `SCP-VALID-7081` if no addon is installed. Throws
+ * `SCP-VALID-7082` if the addon is installed and failed to load, and
+ * also if it loaded without the named function (e.g., a stale prebuilt
+ * addon predating the §1 split).
  */
 function nativeFreeFn<T>(name: keyof NativeAddon): T {
-  const addon = loadAddon();
-  const fn = addon[name];
-  if (typeof fn !== "function") {
-    throw new ValidationError(
-      `Native addon does not export the module-level free function "${String(name)}" — ` +
-        "the addon may be stale (predating ADR-048 §1 pure-helper split). " +
-        "Rebuild with `cargo build -p scp-ffi-napi` or upgrade the platform package.",
-      "SCP-VALID-7005",
-    );
-  }
-  return fn as T;
+  return requireAddonExport<T>(loadAddon(), String(name));
 }
 
 // ---------------------------------------------------------------------------
@@ -241,12 +223,72 @@ function nativeFreeFn<T>(name: keyof NativeAddon): T {
 // ---------------------------------------------------------------------------
 
 /**
+ * Maps an error `loadNativeAddon` threw to the error `loadAddon` throws.
+ *
+ * Only the loader's absence error — an `ScpError` carrying
+ * `SCP-VALID-7081`, which the loader throws when the platform package does
+ * not resolve — becomes absence: a `ValidationError` with that code and the
+ * reinstall instruction. Every other `ScpError`, the loader's `SCP-VALID-7082` among
+ * them, is returned unchanged. Any other thrown value is a failure the
+ * loader did not classify, raised while an addon package may well be
+ * installed, so it becomes a `ValidationError` with the load-failure code
+ * `SCP-VALID-7082` and never counts as absence.
+ *
+ * @internal
+ */
+export function addonLoadError(cause: unknown): ScpError {
+  const underlying = (cause as Error)?.message ?? String(cause);
+  if (cause instanceof ScpError && cause.code === NATIVE_ADDON_ABSENT_CODE) {
+    return new ValidationError(
+      `Native addon is not installed: ${underlying}. ` +
+        "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
+        "installed, then reinstall with `bun install`.",
+      NATIVE_ADDON_ABSENT_CODE,
+    );
+  }
+  if (cause instanceof ScpError) {
+    return cause;
+  }
+  const error = new ValidationError(
+    `Native addon failed to load: ${underlying}.`,
+    NATIVE_ADDON_LOAD_FAILED_CODE,
+  );
+  Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+  return error;
+}
+
+/**
+ * Returns `addon[name]` when it is a function.
+ *
+ * An addon that loaded without an export the SDK calls — the `SCP` class or
+ * an ADR-048 §1 module-level free function — is installed and stale or
+ * partially built, not absent. This function throws the loader's
+ * load-failure code `SCP-VALID-7082`, so no caller mistakes the stale
+ * addon for the absence code `SCP-VALID-7081`.
+ *
+ * @throws {ValidationError} `SCP-VALID-7082` when `addon[name]` is not a function.
+ * @internal
+ */
+export function requireAddonExport<T>(addon: NativeAddon, name: string): T {
+  const value = addon[name];
+  if (typeof value !== "function") {
+    throw new ValidationError(
+      `Native addon loaded but does not export "${name}" — the installed ` +
+        "platform addon is stale or partially built. Rebuild it with " +
+        "`cargo build -p scp-ffi-napi` or upgrade the platform package.",
+      NATIVE_ADDON_LOAD_FAILED_CODE,
+    );
+  }
+  return value as T;
+}
+
+/**
  * Clamps a float-seconds timeout into a millisecond count suitable for
  * the NAPI `shutdown(timeoutMillis)` boundary.
  *
  * @internal
  */
-export function __clampShutdownMillisForTests(timeoutSecs: number): number {
+export function clampShutdownMillis(timeoutSecs: number): number {
   const MAX_MILLIS = Number.MAX_SAFE_INTEGER;
   if (timeoutSecs === Number.POSITIVE_INFINITY) {
     return MAX_MILLIS;
@@ -594,7 +636,9 @@ export class SCP {
    * compile error. There is no default backend.
    *
    * @param options Constructor options; `options.storage` is required.
-   * @throws {ValidationError} If no NAPI addon is available — code `SCP-VALID-7005`.
+   * @throws {ValidationError} If no NAPI addon is installed — code `SCP-VALID-7081`.
+   * @throws {ScpError} If the NAPI addon is installed and failed to load, or
+   *   loaded without the `SCP` class — code `SCP-VALID-7082`.
    */
   constructor(options: ScpOptions) {
     // Runtime fail-closed guard (spec §17.6): the TS type makes
@@ -688,7 +732,7 @@ export class SCP {
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
     try {
-      const millis = __clampShutdownMillisForTests(timeoutSecs);
+      const millis = clampShutdownMillis(timeoutSecs);
       await this.#native.shutdown(BigInt(millis));
     } catch (err) {
       throw mapBridgeError(err);
