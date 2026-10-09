@@ -3645,7 +3645,7 @@ Additionally, the original spec did not define how attestations are published, l
 
 The class distinction is not a new attestation type — it is a sub-classification within `IdentityLink`. This is deliberate. `AttestationType` has stable numeric tags (§7.4.1, `attestation_type_tag`). Adding a new variant would require a new tag and break the existing tag stability guarantee. Instead, the class is derived from the verification method, which is already a field in the wire format. Any consumer can determine the class by inspecting `evidence.method`.
 
-The self-attestation model is acceptable for identity links specifically because issuer == subject. The identity's controller is the only party with incentive to create the attestation, and the only party who can perform the OAuth flow. Falsifying a link provides no protocol benefit: shadow claiming (§3.5.5) verifies the external identity independently, and social graph import only surfaces contacts who genuinely control both identities.
+The self-attestation model is acceptable for identity links specifically because issuer == subject. The identity's controller is the only party with incentive to create the attestation, and the only party who can perform the OAuth flow. Falsifying a link provides no protocol benefit: social graph import only surfaces contacts who genuinely control both identities.
 
 ### Rejected Alternatives
 
@@ -3657,7 +3657,7 @@ The self-attestation model is acceptable for identity links specifically because
 
 ### Security Analysis
 
-**Self-attestation attack surface.** A malicious user could create a Class 1 attestation claiming to have performed OAuth verification without actually doing so. The attestation would have a valid signature. Defense: (a) the claim is "I control external account X" — the only use cases (shadow claiming, social graph import) independently verify the external identity, so a false claim has no effect; (b) the `subject_id` in the proof is meaningless without the external platform recognizing it, limiting social engineering; (c) stale attestations (past renewal interval) are degraded, forcing periodic re-verification.
+**Self-attestation attack surface.** A malicious user could create a Class 1 attestation claiming to have performed OAuth verification without actually doing so. The attestation would have a valid signature. Defense: (a) the claim is "I control external account X" — the only use case (social graph import) independently verifies the external identity, so a false claim has no effect; (b) the `subject_id` in the proof is meaningless without the external platform recognizing it, limiting social engineering; (c) stale attestations (past renewal interval) are degraded, forcing periodic re-verification.
 
 **Reference attestation spoofing.** An attacker publishes a Reference attestation pointing to a URL containing another user's identifier. Defense: Reference attestations carry zero trust until the consumer verifies the proof. The consumer checks that the identifier in the external resource matches the attestation's `issuer`. The attacker cannot place the victim's identifier in the victim's profile.
 
