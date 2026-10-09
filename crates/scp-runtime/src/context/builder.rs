@@ -1296,33 +1296,6 @@ mod tests {
         assert!(validate_params(&params).is_ok());
     }
 
-    /// Smoke verifying that ADR-049 §15's
-    /// [`NodeMlsFactory::with_backends`] seam compiles and that
-    /// inherent backend accessors return the injected pointers.
-    /// Functional fail-injection tests (one per orchestration path)
-    /// extend this seam with mock `MlsBackend`/`HpkeBackend` impls
-    /// that return `Err(...)` on a single primitive call; the harness
-    /// for those mocks lives next to the production-backend tests in
-    /// `crate::crypto::mls::production_backend`.
-    #[tokio::test]
-    async fn create_context_fail_paths_use_backend_injection() {
-        use crate::crypto::hpke_backend::ProductionHpkeBackend;
-        use crate::crypto::mls::production_backend::ProductionMlsBackend;
-        use crate::crypto::mls::provider::NodeMlsFactory;
-        use std::sync::Arc;
-
-        let provider = NodeMlsFactory::with_backends(
-            TEST_DID.to_owned(),
-            Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
-                scp_clock::SystemClock,
-            ))),
-            Arc::new(ProductionHpkeBackend::new()),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let _mls = provider.mls_backend();
-        let _hpke = provider.hpke_backend();
-    }
-
     /// ADR-056 (Model A) / §6.2.4:276 conformance: a context whose
     /// id is a real 64-hex string (the shape `generate_context_id` produces:
     /// `hex(32 random bytes)`) keys its creation crypto under the **decoded

@@ -2736,9 +2736,8 @@ impl Supervisor {
     /// (ADR-049 §1 / ADR-049 §15), scoped to `owning_did`.
     ///
     /// Self-sources every collaborator from the `OnceLock`s populated by
-    /// [`Self::with_providers`]: the `MlsBackend` / `HpkeBackend` pair is
-    /// read transitively through `crypto.mls_backend()` /
-    /// `crypto.hpke_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
+    /// [`Self::with_providers`]: the `MlsBackend` is read transitively
+    /// through `crypto.mls_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
     /// owns the only instance — no second supervisor field, so there is
     /// one source of truth per ADR §6). The OpenMLS storage adapter is
     /// the supervisor's `mls_storage` slot. The `KeyPackageStoreHandle`
@@ -2800,7 +2799,6 @@ impl Supervisor {
         // mls/hpke stay transitive — the NodeMlsFactory owns the only
         // backend pair (ADR §6); no Supervisor field mirrors them.
         let mls = Arc::clone(crypto.mls_backend());
-        let hpke = Arc::clone(crypto.hpke_backend());
         let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
         let event_log = Arc::clone(self.event_log_ref().ok_or_else(not_init)?);
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
@@ -2835,7 +2833,6 @@ impl Supervisor {
             supervisor: handle,
             key_package_store,
             mls,
-            hpke,
             mls_storage,
             clock,
             event_tx: self.event_tx_ref().cloned(),
@@ -20898,10 +20895,6 @@ mod tests {
         assert!(
             Arc::ptr_eq(&deps.mls, crypto.mls_backend()),
             "mls must be the crypto provider's single MlsBackend"
-        );
-        assert!(
-            Arc::ptr_eq(&deps.hpke, crypto.hpke_backend()),
-            "hpke must be the crypto provider's single HpkeBackend"
         );
         assert!(
             Arc::ptr_eq(&deps.mls_storage, &mls_storage),

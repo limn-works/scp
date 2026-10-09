@@ -142,7 +142,7 @@ Provider traits (injected, dyn-erased)
   ContextTransportProvider   relay connectivity + message sending
   ContextEventLogProvider    event log init/append/read/export/import
   ContextPersistence         context snapshot persist/load/delete
-  MlsBackend / HpkeBackend   async #[async_trait] MLS + HPKE primitive surfaces
+  MlsBackend                 async #[async_trait] MLS primitive surface
   OpenMlsStorageAdapter      dyn-compatible async KV under the OpenMLS bridge
 
 Convenience

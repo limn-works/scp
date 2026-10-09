@@ -35,23 +35,22 @@ inject test doubles:
 - **`NodeMlsFactory`** (`provider.rs`) — the concrete MLS crypto provider
   (the `ContextCryptoProvider` trait was deleted in ADR-049; the provider is
   now a concrete type held as `Arc<NodeMlsFactory>`). It owns the
-  per-context crypto state — a `DashMap` of per-context MLS state, a `DashMap`
-  of broadcast sender keys, and each identity's DHKEM(P-256) wrapping keypair in an
-  `ArcSwap` for atomic rotation (Decision 12, §9.16.1) — but delegates every
-  raw MLS/HPKE primitive to two injected trait objects:
-  - `mls_backend: Arc<dyn MlsBackend>` (`backend.rs`)
-  - `hpke_backend: Arc<dyn HpkeBackend>` (`../hpke_backend.rs`)
+  per-context crypto state — a `DashMap` of per-context MLS state and a
+  `DashMap` of broadcast sender keys — and delegates every raw MLS primitive to
+  one injected trait object, `mls_backend: Arc<dyn MlsBackend>` (`backend.rs`).
+  HPKE is a direct call to `scp_protocol::crypto::hpke::p256`. Each identity's
+  DHKEM(P-256) wrapping keypair is owned by the supervisor's per-DID map, not
+  by the provider (spec 09 §9.16.1).
   Build the production provider with `NodeMlsFactory::new(local_did, clock)`
   — `clock` is an `Arc<dyn scp_clock::Clock>` (e.g. `Arc::new(scp_clock::SystemClock)`)
-  — which wires `ProductionMlsBackend` + `ProductionHpkeBackend`; tests inject
-  failure-driven mocks via `NodeMlsFactory::with_backends`.
+  — which wires `ProductionMlsBackend`; tests inject failure-driven mocks via
+  `NodeMlsFactory::with_backends`.
 - **`ProductionMlsBackend`** (`production_backend.rs`) — a stateless struct
   that delegates each primitive to the `scp_mls` crate's `group` / `encrypt` /
   `ratchet` free functions (e.g. `scp_mls::group::create_group`).
   It wraps those calls exactly, so the async bridge does not perturb the wire
   bytes the sync state machine produces.
-- **`MlsBackend`** (`backend.rs`) / **`HpkeBackend`** (`../hpke_backend.rs`)
-  are `#[async_trait]`, `Send + Sync`, and dyn-compatible so one `Arc<dyn …>`
+- **`MlsBackend`** (`backend.rs`) is `#[async_trait]`, `Send + Sync`, and dyn-compatible so one `Arc<dyn …>`
   is shared across every context actor. This is a hard requirement: actor
   futures are `tokio::spawn`'d, so the primitives they await must produce
   `Send` futures. See this crate's `AGENTS.md` for the full Send-discipline.

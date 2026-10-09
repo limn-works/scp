@@ -1,8 +1,8 @@
 //! Production `NodeMlsFactory` implementation backed by `OpenMLS`.
 //!
 //! [`NodeMlsFactory`] bridges the historical inherent API to the actor-era
-//! [`MlsBackend`](super::backend::MlsBackend) and
-//! [`HpkeBackend`](crate::crypto::hpke_backend::HpkeBackend) primitives.
+//! [`MlsBackend`](super::backend::MlsBackend) primitives. HPKE calls go
+//! straight to `scp_protocol::crypto::hpke::p256`.
 //!
 //! #2148 (ADR-049 birth-into-actor) — provider per-context-state DISSOLUTION.
 //! The provider holds NO per-context state: the `contexts` / `broadcast_keys`
@@ -44,7 +44,6 @@ use zeroize::Zeroize;
 
 use super::backend::MlsBackend;
 use super::production_backend::ProductionMlsBackend;
-use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
 use scp_mls::credential::ScpCredential;
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use scp_mls::validate_key_package_lifetime;
@@ -447,11 +446,6 @@ pub struct NodeMlsFactory {
     /// methods route every inline `OpenMLS` primitive through this trait —
     /// the factory itself holds no per-context state (post-#2148).
     mls_backend: Arc<dyn MlsBackend>,
-    /// Injected HPKE primitive backend (ADR-049 §15). Same
-    /// injection contract as `mls_backend` — production wires
-    /// [`ProductionHpkeBackend`]; tests can substitute mocks for fail
-    /// injection on the wrapping-key seal/unseal path.
-    hpke_backend: Arc<dyn HpkeBackend>,
     // #2148 (ADR-049 birth-into-actor): the per-context `contexts` /
     // `broadcast_keys` maps and the `taken_context_ids` guard set were DELETED.
     // The provider holds NO per-context state — the actor's `PerContextState`
@@ -467,8 +461,8 @@ pub struct NodeMlsFactory {
 impl NodeMlsFactory {
     /// Creates a new production crypto provider for the given local DID.
     ///
-    /// Constructs the production [`MlsBackend`] / [`HpkeBackend`]
-    /// implementations and injects them into the provider. Call
+    /// Constructs the production [`MlsBackend`] implementation and injects
+    /// it into the provider. Call
     /// [`Self::with_backends`] when test fail-injection is required.
     ///
     /// # Arguments
@@ -482,16 +476,15 @@ impl NodeMlsFactory {
         Self::with_backends(
             local_did,
             Arc::new(ProductionMlsBackend::new(Arc::clone(&clock))),
-            Arc::new(ProductionHpkeBackend::new()),
             clock,
         )
     }
 
-    /// Creates a `NodeMlsFactory` with caller-supplied backends.
+    /// Creates a `NodeMlsFactory` with a caller-supplied MLS backend.
     ///
     /// Test seam introduced by ADR-049 §15. Production code
-    /// uses [`Self::new`]; failure-injection tests instantiate mock
-    /// `MlsBackend` / `HpkeBackend` impls and pass them here. The
+    /// uses [`Self::new`]; failure-injection tests instantiate a mock
+    /// `MlsBackend` and pass it here. The
     /// `local_did` and lock-free state containers behave identically to
     /// [`Self::new`].
     ///
@@ -501,8 +494,6 @@ impl NodeMlsFactory {
     /// * `mls_backend` - The MLS primitive backend (typically
     ///   [`ProductionMlsBackend`] in production; a mock for fail-injection
     ///   in tests).
-    /// * `hpke_backend` - The HPKE primitive backend (typically
-    ///   [`ProductionHpkeBackend`] in production).
     /// * `clock` - The injected hardened [`Clock`] (ADR-057 §Prereq-1) used for
     ///   the provider's direct `scp-mls` `Lifetime` mint/validate calls. Tests
     ///   pass `Arc::new(SystemClock)`; production passes the node's shared clock.
@@ -510,14 +501,12 @@ impl NodeMlsFactory {
     pub fn with_backends(
         local_did: String,
         mls_backend: Arc<dyn MlsBackend>,
-        hpke_backend: Arc<dyn HpkeBackend>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             local_did,
             clock,
             mls_backend,
-            hpke_backend,
         }
     }
 
@@ -529,13 +518,6 @@ impl NodeMlsFactory {
     #[must_use]
     pub fn mls_backend(&self) -> &Arc<dyn MlsBackend> {
         &self.mls_backend
-    }
-
-    /// Borrowed reference to the injected HPKE primitive backend
-    /// (ADR-049 §15). See [`Self::mls_backend`].
-    #[must_use]
-    pub fn hpke_backend(&self) -> &Arc<dyn HpkeBackend> {
-        &self.hpke_backend
     }
 
     /// A clone of the injected hardened [`Clock`] (ADR-057 §Prereq-1) `Arc`.

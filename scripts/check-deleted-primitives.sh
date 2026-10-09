@@ -141,6 +141,9 @@ BAN_ENTRIES=(
     "fn seal_envelope|crates|*.rs|Seal through the context actor (ContextCryptoState::seal); no free-standing envelope seal exists"
     "fn open_envelope|crates|*.rs|Open through the context actor (ContextCryptoState::open + verify_and_unwrap); no free-standing envelope open exists"
     "SenderLayerAad|crates|*.rs|The sender-layer AAD is built inside ContextCryptoState from the MLS-authenticated sender, never from caller input"
+    # HPKE is a direct call to scp_protocol::crypto::hpke::p256. The runtime's
+    # HpkeBackend trait had one implementation and no method callers.
+    "HpkeBackend|crates|*.rs|Call scp_protocol::crypto::hpke::p256 directly; the HPKE backend trait is deleted"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned

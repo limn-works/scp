@@ -99,7 +99,6 @@ use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::handle::SupervisorHandle;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
-use crate::crypto::hpke_backend::HpkeBackend;
 use crate::crypto::mls::backend::MlsBackend;
 use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
@@ -160,8 +159,6 @@ pub struct ActorDeps {
     pub key_package_store: KeyPackageStoreHandle,
     /// MLS primitives backend (stateless).
     pub mls: Arc<dyn MlsBackend>,
-    /// HPKE + wrapping-key primitives backend (stateless).
-    pub hpke: Arc<dyn HpkeBackend>,
     /// OpenMLS `StorageProvider` adapter (shared across actors; each
     /// actor's `OpenMlsBackend` is per-actor but reads/writes the same
     /// underlying KV via this adapter).
@@ -252,7 +249,6 @@ impl ActorDeps {
             supervisor: self.supervisor.clone(),
             key_package_store: self.key_package_store.clone(),
             mls: Arc::clone(&self.mls),
-            hpke: Arc::clone(&self.hpke),
             mls_storage: Arc::clone(&self.mls_storage),
             clock: Arc::clone(&self.clock),
             event_tx: self.event_tx.clone(),
