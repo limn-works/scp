@@ -9,18 +9,15 @@
 // wrapper takes the per-instance route: an SCP-IDENT-1060 here would mean it
 // reverted to that free function.
 //
-// All tests require the compiled UniFFI cdylib. The suite skips via JUnit 5
-// assumptions only when the generated `uniffi.scp` classes are absent; a cdylib
-// that is absent or fails to load throws `UnsatisfiedLinkError` from the first
-// native call and fails the test.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 
 package works.limn.scp
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.ScpException
@@ -32,23 +29,6 @@ import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
 class IdentityVerifyLinkAttestationFfiTest {
-    companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            }
-        }
-    }
-
     private lateinit var scp: SCP
 
     private fun bridge(): CoroutineBridge =
@@ -60,7 +40,6 @@ class IdentityVerifyLinkAttestationFfiTest {
 
     @BeforeEach
     fun setUp() {
-        assumeTrue(nativeAvailable, skipReason)
         scp = SCP(StorageConfig.InMemory)
     }
 

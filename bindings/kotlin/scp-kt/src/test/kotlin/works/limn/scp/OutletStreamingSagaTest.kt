@@ -33,8 +33,6 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
 import kotlin.test.Test
@@ -318,23 +316,6 @@ class StreamingSagaHandleTest {
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class StreamingSagaRecoverTest {
-    companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            }
-        }
-    }
-
     /**
      * The `recoverStreamingSagaTruncatedClose` wrapper forwards `sagaId` +
      * `callerDid` to the real bridge. Without a live truncated saga, an unknown
@@ -344,7 +325,6 @@ class StreamingSagaRecoverTest {
      */
     @Test
     fun `recoverStreamingSagaTruncatedClose reaches the real bridge and surfaces a typed ScpException`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {

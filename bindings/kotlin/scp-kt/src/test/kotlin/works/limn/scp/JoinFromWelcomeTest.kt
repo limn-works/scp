@@ -26,10 +26,9 @@
 // These mirror the Python reference (tests/test_join_from_welcome.py) and the
 // TypeScript SDK (tests/context-join-from-welcome.test.ts).
 //
-// All tests require the compiled UniFFI cdylib. The suite skips via JUnit 5
-// assumptions only when the generated `uniffi.scp` classes are absent; a cdylib
-// that is absent or fails to load throws `UnsatisfiedLinkError` from the first
-// native call and fails the test.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 //
 // Provenance: ADR-049 Phase 2J; FFI-02 Option A. Kotlin SDK slice.
 
@@ -38,8 +37,6 @@ package works.limn.scp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import uniffi.scp.CeilingPolicy
 import uniffi.scp.ContextMode
@@ -60,21 +57,6 @@ import kotlin.time.Duration.Companion.seconds
 @OptIn(ExperimentalCoroutinesApi::class)
 class JoinFromWelcomeTest {
     companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            }
-        }
-
         /** Canonical missing-key-material code (spec §17, ADR-048). */
         private const val MISSING_KEY_MATERIAL_CODE = "SCP-IDENT-1054"
 
@@ -139,7 +121,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `reserveKeyPackage returns a reservation and non-empty public bytes`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -164,7 +145,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `reserveKeyPackage rejects a DID-only non-custodied identity`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -194,7 +174,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `inviteMember seals a real bundle for a reserved invitee KeyPackage`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -276,7 +255,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `inviteMember rejects a non-custodied inviter DID`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {
@@ -317,7 +295,6 @@ class JoinFromWelcomeTest {
 
     @Test
     fun `contextJoinFromWelcome rejects a DID-only joiner before consuming the KeyPackage`() {
-        assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
             try {

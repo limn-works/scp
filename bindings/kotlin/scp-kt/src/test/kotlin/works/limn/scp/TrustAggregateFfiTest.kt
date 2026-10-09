@@ -7,10 +7,9 @@
 // the encoders emit the pinned shapes (TrustAggregateTest.kt covers that
 // without the native lib).
 //
-// All tests require the compiled UniFFI cdylib. The suite skips via JUnit 5
-// assumptions only when the generated `uniffi.scp` classes are absent; a cdylib
-// that is absent or fails to load throws `UnsatisfiedLinkError` from the first
-// native call and fails the test.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 
 package works.limn.scp
 
@@ -21,8 +20,6 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.StorageConfig
@@ -33,23 +30,6 @@ import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
 class TrustAggregateFfiTest {
-    companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            }
-        }
-    }
-
     private lateinit var scp: SCP
 
     private fun bridge(): CoroutineBridge =
@@ -61,7 +41,6 @@ class TrustAggregateFfiTest {
 
     @BeforeEach
     fun setUp() {
-        assumeTrue(nativeAvailable, skipReason)
         scp = SCP(StorageConfig.InMemory)
     }
 

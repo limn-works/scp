@@ -4,10 +4,9 @@
 // The Kotlin wrapper requires `iTrustAllCommands = true` before delegating
 // to the inner UniFFI-generated `Scp` and writes a runtime warning when
 // proceeding. The throw happens at the wrapper layer before any native
-// call — but constructing `SCP()` itself requires the UniFFI library. The
-// suite skips via JUnit 5 assumptions only when the generated `uniffi.scp`
-// classes are absent; a cdylib that is absent or fails to load throws
-// `UnsatisfiedLinkError` from the first native call and fails the test.
+// call — but constructing `SCP()` itself requires the UniFFI library. A
+// cdylib that is absent or fails to load throws `UnsatisfiedLinkError` from
+// the first native call and fails the test.
 //
 // Provenance: ADR-048 §1 multi-instance neutrality.
 
@@ -15,8 +14,6 @@ package works.limn.scp
 
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -27,28 +24,10 @@ import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
 class McpAllowlistTest {
-    companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            }
-        }
-    }
-
     private lateinit var scp: SCP
 
     @BeforeEach
     fun setUp() {
-        assumeTrue(nativeAvailable, skipReason)
         scp = SCP(StorageConfig.InMemory)
     }
 

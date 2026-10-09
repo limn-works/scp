@@ -10,10 +10,9 @@
 // suite. After Phase 4 PR 4 (demolition) there is no `SCP.default()` —
 // every caller must construct `SCP()` explicitly.
 //
-// All tests require the compiled UniFFI cdylib. The suite skips via JUnit 5
-// assumptions only when the generated `uniffi.scp` classes are absent; a cdylib
-// that is absent or fails to load throws `UnsatisfiedLinkError` from the first
-// native call and fails the test.
+// All tests require the compiled UniFFI cdylib. A cdylib that is absent or fails
+// to load throws `UnsatisfiedLinkError` from the first native call and fails the
+// test.
 //
 // Provenance: #1549 Phase 4 PR 3 / PR 4 (Kotlin slice). ADR-048.
 
@@ -24,8 +23,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assumptions.assumeTrue
-import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.StorageConfig
@@ -39,23 +36,6 @@ import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ScpClassTest {
-    companion object {
-        private var nativeAvailable = false
-        private var skipReason = ""
-
-        @JvmStatic
-        @BeforeAll
-        fun probeNativeLibrary() {
-            try {
-                Class.forName("uniffi.scp.ScpKt")
-                Class.forName("uniffi.scp.Scp\$Companion")
-                nativeAvailable = true
-            } catch (e: ClassNotFoundException) {
-                skipReason = "UniFFI bindings not available: ${e.message}"
-            }
-        }
-    }
-
     private lateinit var scp: SCP
 
     private fun bridge(): CoroutineBridge =
@@ -67,7 +47,6 @@ class ScpClassTest {
 
     @BeforeEach
     fun setUp() {
-        assumeTrue(nativeAvailable, skipReason)
         scp = SCP(StorageConfig.InMemory)
     }
 
@@ -83,7 +62,6 @@ class ScpClassTest {
 
     @Test
     fun `explicit in-memory storage selection constructs a live instance`() {
-        assumeTrue(nativeAvailable, skipReason)
         // Storage selection is mandatory: `StorageConfig.InMemory` is the
         // explicit dev/test selection. There is no zero-argument `SCP()`
         // constructor (the default was removed), so a missing selection is a
