@@ -1186,7 +1186,7 @@ impl CancelAckTracker {
 /// The per-origin-invoker ceiling
 /// (`max_concurrent_inbound_streams_per_origin_invoker`, default 16,
 /// keyed by the *outermost* `iss` in the delegation chain) is
-/// deliberately ABSENT from this per-context tracker. §05-contexts.md:446
+/// deliberately ABSENT from this per-context tracker. §5.4.5
 /// mandates it be tracked at operator scope — "shared across every
 /// context the operator hosts" — so a caller cannot fan out across a
 /// cluster of interfaces hosted by the same operator to bypass the
@@ -1212,7 +1212,7 @@ pub struct StreamAdmissionTracker {
 }
 
 /// Operator-scoped concurrent-stream counter for the per-origin-invoker
-/// ceiling (§05-contexts.md:446).
+/// ceiling (§5.4.5).
 ///
 /// Keyed by the *outermost* `iss` in the delegation chain. A single
 /// instance is owned by the supervisor (operator) and shared across
@@ -1324,7 +1324,7 @@ impl StreamAdmissionTracker {
     /// per-outlet ceilings. The per-origin-invoker ceiling is tracked
     /// separately at operator scope in [`OriginAdmissionTracker`] (a
     /// single instance shared across every context the operator hosts),
-    /// per §05-contexts.md:446.
+    /// per §5.4.5.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -1361,7 +1361,7 @@ impl StreamAdmissionTracker {
         // Cap comparisons in §5.4.5 lexical order (per_invoker →
         // per_origin_invoker → per_outlet). NO mutation until all three
         // pass. The middle tier reads the OPERATOR-scoped `origin`
-        // tracker (§05-contexts.md:446), not a per-context map; the
+        // tracker (§5.4.5), not a per-context map; the
         // caller holds both this per-context lock and the operator-scoped
         // `origin` lock across this whole method so the three-tier check
         // and increment remain a single atomic critical section.
@@ -1405,7 +1405,7 @@ impl StreamAdmissionTracker {
                 self.per_invoker.remove(invoker_did);
             }
         }
-        // Decrement the OPERATOR-scoped origin counter (§05-contexts.md:446)
+        // Decrement the OPERATOR-scoped origin counter (§5.4.5)
         // so a closed stream frees the origin's operator-wide capacity —
         // else the origin count leaks and permanently caps the origin.
         origin.decrement(origin_invoker_did);
@@ -2290,7 +2290,7 @@ mod tests {
         assert_eq!(origin.count_per_origin_invoker("did:dht:Origin"), 16);
     }
 
-    /// §05-contexts.md:446 core assertion: the per-origin-invoker cap is
+    /// §5.4.5 core assertion: the per-origin-invoker cap is
     /// OPERATOR-scoped, NOT per-context. One origin DID fanning across N
     /// distinct per-context trackers (each a separate hosted context)
     /// shares ONE operator-scoped `OriginAdmissionTracker`, so it hits
@@ -2320,7 +2320,7 @@ mod tests {
         // per-origin cap (16) can stop these — and it must, at 16 total.
         // If the per-origin dimension were (wrongly) per-context, every
         // context would independently admit all 5 → 20 admits → the
-        // §05-contexts.md:446 fan-out DoS.
+        // §5.4.5 fan-out DoS.
         for (i, ctx) in [&mut ctx_a, &mut ctx_b, &mut ctx_c, &mut ctx_d]
             .into_iter()
             .enumerate()
@@ -2340,7 +2340,7 @@ mod tests {
         assert_eq!(
             admitted, 16,
             "operator-scoped per-origin cap must bound the origin to 16 streams \
-             TOTAL across all contexts (§05-contexts.md:446)"
+             TOTAL across all contexts (§5.4.5)"
         );
         assert_eq!(
             rejected_by_origin, 4,
@@ -2391,7 +2391,7 @@ mod tests {
         assert_eq!(tracker.count_per_outlet("outlet-x"), 0);
     }
 
-    /// §05-contexts.md:446: a closed stream frees the origin's
+    /// §5.4.5: a closed stream frees the origin's
     /// operator-wide capacity. Fill the per-origin cap across two
     /// contexts, close one stream, and confirm the origin can open one
     /// more (the released slot is reusable, in ANY of the operator's
