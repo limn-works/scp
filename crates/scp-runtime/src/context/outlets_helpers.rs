@@ -2963,9 +2963,6 @@ fn check_invocation_error_to_context(
 /// The per-variant `(class, code, slug, detail, retry)` mapping is
 /// single-sourced on [`InvocationError::to_surface`] — never re-derived in the
 /// bridges.
-///
-/// A shutdown refusal is not an outlet error: it keeps `SCP-CTX-2138` as
-/// `ContextError::SupervisorShutDown` (ADR-049 Decision 16 item 2).
 fn invocation_error_to_context(
     err: impl Into<crate::context::outlets::invoke::OutletOpenError>,
 ) -> ContextError {

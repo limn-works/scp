@@ -19,16 +19,11 @@
 //! callback into a task on the Supervisor's task tracker that routes the work
 //! back ONTO the actor mailbox via [`Supervisor::reverse_stream_escrow_via_actor`] /
 //! [`Supervisor::settle_outlet_stream_via_actor`] (the analog of the
-//! reference's `ContextManager` method calls). The captured handle is essential
-//! for the escrow-refund sink: its `refund` may run from a `Drop` on a thread
-//! with no ambient runtime (e.g. the open path's own thread), where
-//! `Handle::current()` would panic.
+//! reference's `ContextManager` method calls).
 //!
-//! # `Weak` back-reference and tracked spawns
+//! # Tracked spawns
 //!
-//! The sinks live inside the streaming pump, a task the Supervisor spawned, so
-//! they hold a `Weak<Supervisor>` (ADR-049 Decision 16) and the pump keeps no
-//! Supervisor alive. Each callback spawns its work on the Supervisor's tracker,
+//! Each callback spawns its work on the Supervisor's tracker,
 //! so `shutdown_all_contexts` waits for an in-flight refund, settlement, or
 //! close-event append before the owner closes storage. These callbacks are
 //! fire-and-forget `()` seams with no caller to return an error to: when the
@@ -90,27 +85,16 @@ fn spawn_supervisor_op<F, Fut>(
 
 /// Concrete [`StreamEscrowRefundSink`] routing an open-time escrow reversal to
 /// the actor-owned budget tracker via the supervisor mailbox.
-///
-/// Held as `Arc<dyn StreamEscrowRefundSink>` inside the streaming pump's
-/// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket);
-/// constructed by the streaming open orchestrator with a `Weak` to the
-/// supervisor.
 pub(crate) struct ActorEscrowRefundSink {
     /// The supervisor whose mailbox owns the target context's budget tracker.
     supervisor: Weak<Supervisor>,
-    /// Runtime handle captured at construction, so the `Drop`-fired `refund`
-    /// can spawn even when it runs off a runtime thread.
+    /// Runtime handle captured at construction, on which `refund` spawns.
     runtime: tokio::runtime::Handle,
 }
 
 impl ActorEscrowRefundSink {
     /// Wrap a `Weak` supervisor reference as the streaming escrow-refund sink, capturing
-    /// the CURRENT runtime handle (the sole construction site — the streaming
-    /// open orchestrator — always runs on the runtime; the captured handle then
-    /// outlives it into the `Drop` that may run off-runtime).
-    ///
-    /// The non-test constructor is the streaming open orchestrator
-    /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
+    /// the current runtime handle.
     pub(crate) fn new(supervisor: Weak<Supervisor>) -> Self {
         Self {
             supervisor,
