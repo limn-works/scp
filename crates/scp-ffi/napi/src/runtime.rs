@@ -2549,7 +2549,10 @@ pub(crate) async fn create_supervisor_context_with_ceiling_for_test(
 /// name it in a [`crate::context::NapiContextHandle`], so an entry point that
 /// took the creator from the handle instead of the supervisor fails to resolve
 /// that creator's signing key.
-#[cfg(all(test, feature = "testing"))]
+#[cfg(all(
+    test,
+    any(feature = "testing", feature = "outlet-capability-test-grant")
+))]
 pub(crate) const KEYLESS_HANDLE_CREATOR: &str = "did:dht:z6MkNapiKeylessHandleCreator";
 
 /// The shared body of the two supervisor-context test fixtures.

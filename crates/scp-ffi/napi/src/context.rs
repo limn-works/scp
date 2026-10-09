@@ -6915,6 +6915,7 @@ mod tests {
     /// Builds the handle [`active_handle_for`] builds, naming
     /// `crate::runtime::KEYLESS_HANDLE_CREATOR` as its creator, a creator no
     /// supervisor context holds.
+    #[cfg(feature = "testing")]
     fn keyless_creator_handle_for(
         bi: &Arc<crate::runtime::NapiBridgeInstance>,
         context_id: &str,
