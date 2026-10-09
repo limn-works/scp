@@ -361,8 +361,14 @@ jobs:
               # token that no file under `.docs/adrs/` or `.docs/prds/` holds. The outlet
               # conformance tests compile vectors out of `tests/conformance/`, and
               # `crates/scp-client-wasm/tests/out048_ts_invoker_fixture_kat.rs` compiles
-              # in the typescript-wasm fixture listed last. A pull request that edits
-              # only one of them changes what rust-test asserts.
+              # in the typescript-wasm fixture listed below them. `ffi_conformance.rs` also
+              # reads `scripts/pure-helpers-allowlist.txt` at run time and compiles in the
+              # bridge-symmetry fixtures, and `crates/scp-testing/tests/integration/sdk_wrapper.rs`
+              # compiles in the Python, TypeScript, Swift and Kotlin SDK sources under the
+              # four `bindings/` directories listed last. A pull request that edits only one
+              # of them changes what rust-test asserts. The `prose-route` check of
+              # `scripts/tests/ci-gate/ci_gate_selftest.py` scans `crates/**/*.rs` for every
+              # such read and fails when this filter does not select one.
               - 'scripts/bridge-aliases.json'
               - 'scripts/ffi-export-allowlist.json'
               - '.docs/standards/sdk-capability-matrix.json'
@@ -370,6 +376,12 @@ jobs:
               - '.docs/prds/**'
               - 'tests/conformance/**'
               - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
+              - 'scripts/pure-helpers-allowlist.txt'
+              - 'scripts/tests/bridge-symmetry/fixtures/**'
+              - 'bindings/python/scp_sdk/**'
+              - 'bindings/typescript/src/**'
+              - 'bindings/swift/Sources/SCP/**'
+              - 'bindings/kotlin/scp-kt/src/main/kotlin/**'
               # `scripts/check-toolchain-wiring.sh` enumerates every root-level file in
               # the git tree, and every cargo configuration file the tree holds at any
               # depth, and fails when one is listed neither here nor in the `toolchain`

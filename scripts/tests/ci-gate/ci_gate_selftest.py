@@ -275,8 +275,9 @@ nothing:
                `git ls-files` reports and fails on each one the `code` output
                does not select and that is not under `.docs/` or `.claude/`, a
                root-level `*.md`, or a `*.md` under `docs/guides/`. It also
-               fails on each tracked path RUST_TEST_INPUTS names that the
-               `rust` output does not select.
+               fails on each tracked path rust-test reads, found by scanning
+               `crates/**/*.rs` for include and workspace_root literals, that
+               the `rust` output does not select and no always-on step mirrors.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -293,6 +294,7 @@ import copy
 import functools
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -6482,33 +6484,51 @@ def output_patterns(doc: dict, output: str) -> set[str] | str:
     return set().union(*(filters[key] for key in keys))
 
 
-# Files outside `crates/` that rust-test reads: the `include_str!` calls in
-# crates/scp-testing/tests/integration/ffi_conformance.rs, in the outlet
-# conformance tests and in crates/scp-client-wasm/tests/out048_ts_invoker_fixture_kat.rs,
-# and the run-time read of `.docs/adrs/` and `.docs/prds/` in ffi_conformance.rs.
-# An entry ending in `/` stands for every tracked path under it.
-RUST_TEST_INPUTS = (
-    "scripts/bridge-aliases.json",
-    "scripts/ffi-export-allowlist.json",
-    ".docs/standards/sdk-capability-matrix.json",
-    ".docs/adrs/",
-    ".docs/prds/",
-    "tests/conformance/",
-    "bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json",
-)
+# rust_test_reads lists the files outside `crates/` that a workspace source, and so
+# rust-test (`cargo nextest run --workspace`), can read, by scanning every tracked
+# `crates/**/*.rs` file: the literal of
+# each `include_str!` or `include_bytes!`, resolved against that file's directory, and
+# the literal of each `workspace_root().join(...)`. It also walks the directories
+# below, which ffi_conformance.rs passes to `prefixed_tokens_under` and no literal path
+# names. An entry ends in `/` and stands for every tracked path under it.
+RUST_TEST_RUNTIME_DIRS = (".docs/adrs/", ".docs/prds/")
+# A rust-test input that no filter routes to rust-test, mapped to the name of the
+# always-on step in job `toolchain-wiring` that asserts what rust-test asserts of it.
+RUST_TEST_MIRRORED = {"AGENTS.md": "AGENTS.md keeps its enforcement sections"}
+RUST_INCLUDE_LITERAL = re.compile(r'include_(?:str|bytes)!\(\s*"((?:[^"\\]|\\.)*)"\s*\)', re.DOTALL)
+RUST_WORKSPACE_JOIN_LITERAL = re.compile(r'workspace_root\(\)\s*\.join\(\s*"([^"]+)"\s*\)')
 
 
-def rust_test_inputs_unselected(doc: dict, paths: list[str]) -> list[str]:
-    """Return each tracked rust-test input the `rust` output does not select."""
+def rust_test_reads(sources: dict[str, str]) -> set[str]:
+    """Each path outside `crates/` that a `crates/` source names in an include or a workspace_root join."""
+    reads = set()
+    for source, text in sources.items():
+        for match in RUST_INCLUDE_LITERAL.finditer(text):
+            # A backslash before a newline continues a Rust string literal past it.
+            literal = re.sub(r"\\\n\s*", "", match.group(1))
+            reads.add(posixpath.normpath(posixpath.join(posixpath.dirname(source), literal)))
+        reads.update(posixpath.normpath(m.group(1)) for m in RUST_WORKSPACE_JOIN_LITERAL.finditer(text))
+    return {path for path in reads if not path.startswith("crates/")}
+
+
+def crate_sources(paths: list[str]) -> dict[str, str]:
+    """The text of every tracked `crates/**/*.rs` path."""
+    return {
+        path: (REPO / path).read_text(encoding="utf-8")
+        for path in paths
+        if path.startswith("crates/") and path.endswith(".rs")
+    }
+
+
+def rust_test_inputs_unselected(doc: dict, paths: list[str], reads: set[str]) -> list[str]:
+    """Return each tracked rust-test input the `rust` output does not select and no step mirrors."""
     patterns = output_patterns(doc, "rust")
     if isinstance(patterns, str):
         return [patterns]
     inputs = [
-        path
-        for path in paths
-        if any(path == entry or (entry.endswith("/") and path.startswith(entry)) for entry in RUST_TEST_INPUTS)
+        path for path in paths if path in reads or any(path.startswith(entry) for entry in RUST_TEST_RUNTIME_DIRS)
     ]
-    return [path for path in inputs if not pattern_covers(patterns, path)]
+    return [path for path in inputs if path not in RUST_TEST_MIRRORED and not pattern_covers(patterns, path)]
 
 
 def tracked_paths() -> list[str]:
@@ -6556,10 +6576,47 @@ def check_every_path_routed(doc: dict) -> None:
         "a `code` filter that drops scripts/** reports scripts/ci-aggregate-result.py",
         "scripts/ci-aggregate-result.py" in unrouted_paths(mutant, paths),
     )
-    for entry in RUST_TEST_INPUTS:
+    sources = crate_sources(paths)
+    reads = rust_test_reads(sources)
+    # Controls for the scan: a read on one line, a read whose literal continues past a
+    # backslash-newline, a workspace_root join, and a read of a prose file are each found.
+    for known in (
+        "bindings/python/scp_sdk/identity.py",
+        "scripts/tests/bridge-symmetry/fixtures/bad-alias-in-test-module-only/crates/scp-ffi/napi/src/widgets.rs",
+        "scripts/pure-helpers-allowlist.txt",
+        "AGENTS.md",
+    ):
+        check(f"the include and workspace_root scan finds rust-test input {known}", known in reads)
+    missing = sorted(reads - set(paths))
+    check("every path the scan resolves is tracked", not missing, f"{missing[:10]}")
+    planted = {
+        "crates/a/tests/t.rs": 'include_bytes!(\n    "../../../new/\\\n     x.bin"\n); include_str!("../src/y.rs");',
+        "crates/b/src/lib.rs": 'workspace_root().join("new/z.txt")',
+    }
+    check(
+        "the scan resolves planted reads and drops a read inside crates/",
+        rust_test_reads(planted) == {"new/x.bin", "new/z.txt"},
+        f"{rust_test_reads(planted)}",
+    )
+    conformance = sources.get("crates/scp-testing/tests/integration/ffi_conformance.rs", "")
+    for entry in RUST_TEST_RUNTIME_DIRS:
         check(f"the checkout tracks rust-test input {entry}", any(p.startswith(entry) for p in paths))
-    gaps = rust_test_inputs_unselected(doc, paths)
+        check(
+            f"ffi_conformance.rs walks {entry} through prefixed_tokens_under",
+            f'prefixed_tokens_under("{entry.rstrip("/")}"' in conformance,
+        )
+    wiring_runs = {
+        str(step.get("name")): str(step.get("run") or "") for step in doc["jobs"]["toolchain-wiring"].get("steps") or []
+    }
+    for path, step_name in RUST_TEST_MIRRORED.items():
+        check(f"rust-test reads mirrored input {path}", path in reads)
+        check(f"job toolchain-wiring runs step '{step_name}' over {path}", path in wiring_runs.get(step_name, ""))
+    gaps = rust_test_inputs_unselected(doc, paths, reads)
     check("ci.yml: the `rust` output selects every file rust-test reads", not gaps, f"{gaps[:20]}")
+    check(
+        "a planted rust-test read that no filter selects is reported",
+        rust_test_inputs_unselected(doc, [*paths, "new/x.bin"], reads | {"new/x.bin"}) == [*gaps, "new/x.bin"],
+    )
     check(
         "the `rust` output does not select a spec file rust-test never reads",
         not pattern_covers(output_patterns(doc, "rust"), ".docs/specs/01-thesis.md"),
@@ -6571,13 +6628,15 @@ def check_every_path_routed(doc: dict) -> None:
         if str(step.get("uses") or "").startswith("dorny/paths-filter")
     )
     filters = yaml.safe_load(step["with"]["filters"])
-    check("filter rust lists '.docs/adrs/**' for the mutant", ".docs/adrs/**" in filters["rust"])
-    filters["rust"] = [entry for entry in filters["rust"] if entry != ".docs/adrs/**"]
+    dropped = (".docs/adrs/**", "bindings/python/scp_sdk/**")
+    check(f"filter rust lists {dropped} for the mutant", all(entry in filters["rust"] for entry in dropped))
+    filters["rust"] = [entry for entry in filters["rust"] if entry not in dropped]
     step["with"]["filters"] = yaml.safe_dump(filters)
-    unselected = rust_test_inputs_unselected(mutant, paths)
+    unselected = rust_test_inputs_unselected(mutant, paths, reads)
+    expected = [p for p in paths if p.startswith(".docs/adrs/") or (p in reads and p.startswith("bindings/python/"))]
     check(
-        "a `rust` filter that drops .docs/adrs/** reports every ADR file and nothing else",
-        bool(unselected) and unselected == [p for p in paths if p.startswith(".docs/adrs/")],
+        f"a `rust` filter that drops {dropped} reports every ADR file and every Python SDK file rust-test reads",
+        bool(unselected) and unselected == expected,
         f"{unselected[:5]}",
     )
 
