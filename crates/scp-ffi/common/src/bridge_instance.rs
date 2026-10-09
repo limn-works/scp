@@ -3334,9 +3334,6 @@ pub trait BridgeInstanceCore: Send + Sync {
         // closes this instance's `SQLCipher` handle, and a node started on
         // that handle must not still be writing when it does.
         self.core().stop_borrowers();
-        // Release stream receivers before the drain: their pumps run on the
-        // Supervisor's tracker and settle only once their receiver drops, so
-        // the drain would otherwise wait on them until the deadline.
         self.release_streams();
         let result = self
             .core()
@@ -3359,9 +3356,7 @@ pub trait BridgeInstanceCore: Send + Sync {
 
     /// Override hook for per-bridge concrete structs to drop their outlet-
     /// stream and streaming-saga registries. [`Self::shutdown`] calls it
-    /// before the Supervisor drain, because each registry entry holds the
-    /// receiver whose drop lets a tracked pump settle. The default
-    /// implementation is a no-op.
+    /// before the Supervisor drain. The default implementation is a no-op.
     fn release_streams(&self) {}
 
     /// Override hook for per-bridge concrete structs to drop their
@@ -3575,7 +3570,8 @@ pub enum ShutdownOutcome {
         panicked_tasks: usize,
     },
     /// The deadline expired before the bridge's own tasks or the
-    /// Supervisor's tracked tasks finished, or the Supervisor drain panicked.
+    /// Supervisor's tracked tasks finished, or the Supervisor drain task
+    /// panicked or was cancelled.
     TimedOut {
         /// Number of the bridge's own `JoinSet` tasks that were aborted
         /// because the shutdown deadline was reached (tasks that had already

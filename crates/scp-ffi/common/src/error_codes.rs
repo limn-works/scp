@@ -587,7 +587,8 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 /// operation refused by shutdown apart from a failure of the operation
 /// itself. Construct a new `SCP` instance to continue.
 ///
-/// Maps from `ContextError::SupervisorShutDown`.
+/// Maps from `ContextError::SupervisorShutDown` and
+/// `SagaError::SupervisorShutDown`.
 pub const CTX_2138: &str = "SCP-CTX-2138";
 /// Stream or streaming saga dropped unregistered by bridge shutdown.
 ///

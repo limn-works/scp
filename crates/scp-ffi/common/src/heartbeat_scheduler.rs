@@ -65,8 +65,8 @@ pub fn heartbeat_interval(profile: TransportProfile) -> Option<std::time::Durati
 ///
 /// Intended to be `tokio::spawn`'d (or enrolled in the bridge's `JoinSet`)
 /// alongside the relay subscribe loop. Holds a `Weak<Supervisor>` (ADR-049
-/// Decision 16), so the scheduler never keeps the Supervisor alive past
-/// shutdown, and an owned key, so it has no borrow ties to the subscribe task.
+/// Decision 16) and an owned key, so it has no borrow ties to the subscribe
+/// task.
 /// Each tick upgrades the `Weak`; a failed upgrade stops the scheduler.
 pub async fn run_heartbeat_scheduler(
     supervisor: std::sync::Weak<Supervisor>,

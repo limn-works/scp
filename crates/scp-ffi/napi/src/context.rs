@@ -4661,9 +4661,10 @@ pub(crate) async fn context_restore_on(
         reply: tx,
     };
     sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
-        NapiError::from(restore_context_failure(
-            "supervisor dispatch_lifecycle_command failed",
-            e,
+        NapiError::from(typed_supervisor_failure(
+            "supervisor dispatch_lifecycle_command",
+            codes::CTX_2064,
+            &e,
         ))
     })?;
     rx.await
@@ -4673,23 +4674,15 @@ pub(crate) async fn context_restore_on(
                 code: codes::CTX_2064.to_owned(),
             })
         })?
-        .map_err(|e| NapiError::from(restore_context_failure("restore_context failed", e)))?;
+        .map_err(|e| {
+            NapiError::from(typed_supervisor_failure(
+                "restore_context",
+                codes::CTX_2064,
+                &e,
+            ))
+        })?;
     crate::runtime::readmit_context(bi, &context_id);
     Ok(())
-}
-
-/// Maps a refused `RestoreContext` to its SDK error: a restore refused because
-/// Supervisor shutdown began keeps SCP-CTX-2138; every other failure carries
-/// SCP-CTX-2064.
-fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> ScpNapiError {
-    if matches!(e, scp_core::context::ContextError::SupervisorShutDown(_)) {
-        ScpNapiError::from(e)
-    } else {
-        ScpNapiError::Context {
-            message: format!("{stage}: {e}"),
-            code: codes::CTX_2064.to_owned(),
-        }
-    }
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_restore_all`](crate::scp::Scp::context_restore_all).
@@ -4704,10 +4697,11 @@ pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Res
     let sup = crate::runtime::supervisor(bi)?;
 
     let restored = sup.restore_on_startup().await.map_err(|e| {
-        NapiError::from(ScpNapiError::Context {
-            message: format!("restore_all_contexts failed: {e}"),
-            code: codes::CTX_2065.to_owned(),
-        })
+        NapiError::from(typed_supervisor_failure(
+            "restore_all_contexts",
+            codes::CTX_2065,
+            &e,
+        ))
     })?;
     for context_id in &restored {
         crate::runtime::readmit_context(bi, context_id);
@@ -7748,29 +7742,37 @@ mod tests {
         }
     }
 
-    /// A restore refused because Supervisor shutdown began keeps
-    /// `SCP-CTX-2138`; any other restore failure reads `SCP-CTX-2064`.
+    /// A single or restore-all restore refused because Supervisor shutdown
+    /// began keeps `SCP-CTX-2138`; any other failure reads the site's own
+    /// code (`SCP-CTX-2064` for one context, `SCP-CTX-2065` for restore-all).
     #[test]
-    fn restore_context_failure_keeps_supervisor_shut_down_typed() {
+    fn restore_failures_keep_supervisor_shut_down_typed() {
         use scp_core::context::ContextError;
         let code_of = |e: crate::error::ScpNapiError| match e {
             crate::error::ScpNapiError::Context { code, .. } => code,
             other => panic!("expected ScpNapiError::Context, got {other:?}"),
         };
-        assert_eq!(
-            code_of(super::restore_context_failure(
-                "restore_context failed",
-                ContextError::SupervisorShutDown("spawn context actor".to_owned()),
-            )),
-            codes::CTX_2138
-        );
-        assert_eq!(
-            code_of(super::restore_context_failure(
-                "restore_context failed",
-                ContextError::MembershipFailed("bad snapshot".to_owned()),
-            )),
-            codes::CTX_2064
-        );
+        for (op, fallback) in [
+            ("restore_context", codes::CTX_2064),
+            ("restore_all_contexts", codes::CTX_2065),
+        ] {
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    op,
+                    fallback,
+                    &ContextError::SupervisorShutDown("spawn context actor".to_owned()),
+                )),
+                codes::CTX_2138
+            );
+            assert_eq!(
+                code_of(super::typed_supervisor_failure(
+                    op,
+                    fallback,
+                    &ContextError::MembershipFailed("bad snapshot".to_owned()),
+                )),
+                fallback
+            );
+        }
     }
 
     /// `context_create` and `context_restore`, called through the bridge
