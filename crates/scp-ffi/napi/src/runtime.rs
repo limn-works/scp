@@ -198,7 +198,7 @@ pub struct NapiBridgeInstance {
     ///
     /// [`ensure_registered`] refuses to rebuild an entry for a marked id.
     /// Marking a new id at [`MAX_RELEASED_CONTEXTS`] marks first removes the
-    /// earliest mark with no unsettled close.
+    /// earliest mark with no unsettled close and no live handle.
     pub(crate) released_contexts: std::sync::Mutex<HashMap<String, ReleaseMark>>,
 
     /// Generation the next newly created release mark receives.
@@ -1665,11 +1665,7 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
 /// two cannot drift in how they construct per-context FFI state.
 ///
 /// `user_ceiling` reaches this function for that grammar check alone. The state
-/// this function builds stores no role state, no ceiling, and no creator DID:
-/// the context's supervisor actor owns them, and every authorization site reads
-/// them through [`live_role_state`] at the moment it decides, because a
-/// `ModifyCeiling` governance action moves the ceiling after this registration
-/// runs.
+/// this function builds stores no role state, no ceiling, and no creator DID.
 ///
 /// # Errors
 ///
@@ -1735,8 +1731,7 @@ fn build_ucan_context_state(
 /// never roll back state it did not create).
 ///
 /// The registered state holds no role state, membership, capability ceiling,
-/// or creator DID: the supervisor actor the Welcome join spawns owns them, and
-/// every authorization site reads them through [`live_role_state`].
+/// or creator DID.
 ///
 /// `user_ceiling` is validated against the ceiling-entry grammar (spec
 /// §5.3.1.1) by [`build_ucan_context_state`] and then discarded; no ceiling is
@@ -1811,7 +1806,7 @@ pub fn ensure_registered(
 }
 
 /// Mark count at which marking a new id first removes the earliest mark that
-/// has no unsettled close.
+/// has no unsettled close and no live handle.
 pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
 
 /// One release mark: the instant it was last set, the number of closes that
@@ -1847,9 +1842,10 @@ pub(crate) fn lock_release_marks(
 /// of this instance took; a mark that already stands keeps its generation.
 /// When `marks` holds [`MAX_RELEASED_CONTEXTS`] marks and `context_id` has
 /// none, first removes the earliest mark whose count of unsettled closes is
-/// zero.
+/// zero and whose id `context_handles` counts no live handle for.
 fn set_release_mark(
     marks: &mut HashMap<String, ReleaseMark>,
+    context_handles: &DashMap<String, usize>,
     next_generation: &std::sync::atomic::AtomicU64,
     context_id: &str,
     in_flight: usize,
@@ -1857,7 +1853,7 @@ fn set_release_mark(
     if !marks.contains_key(context_id) && marks.len() >= MAX_RELEASED_CONTEXTS {
         let oldest = marks
             .iter()
-            .filter(|(_, mark)| mark.in_flight == 0)
+            .filter(|(id, mark)| mark.in_flight == 0 && !context_handles.contains_key(*id))
             .min_by_key(|(_, mark)| mark.at)
             .map(|(id, _)| id.clone());
         if let Some(oldest) = oldest {
@@ -1901,13 +1897,18 @@ fn remove_registry_entry(entry: dashmap::mapref::entry::Entry<'_, String, UcanCo
 ///
 /// The mark, both removals, and the handle-count check run while this call
 /// holds the registry entry for `context_id` and then the release-mark lock,
-/// the order [`ensure_registered`] takes them in, so no rebuild lands after
-/// this call returns. When no live [`NapiContextHandle`] for the id remains,
-/// this call drops the mark again.
+/// the order [`ensure_registered`] takes them in. When no live
+/// [`NapiContextHandle`] for the id remains, this call drops the mark again.
 pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
     let entry = ucan_registry(bi).entry(context_id.to_owned());
     let mut marks = lock_release_marks(bi);
-    set_release_mark(&mut marks, &bi.next_release_generation, context_id, 0);
+    set_release_mark(
+        &mut marks,
+        &bi.context_handles,
+        &bi.next_release_generation,
+        context_id,
+        0,
+    );
     bi.core.remove_known_context(context_id);
     remove_registry_entry(entry);
     prune_marked(bi, &mut marks, context_id);
@@ -1919,6 +1920,7 @@ pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
 pub(crate) fn mark_released(bi: &NapiBridgeInstance, context_id: &str) -> ReleaseTicket {
     let generation = set_release_mark(
         &mut lock_release_marks(bi),
+        &bi.context_handles,
         &bi.next_release_generation,
         context_id,
         1,
@@ -2025,8 +2027,7 @@ pub(crate) fn track_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
 /// unsettled.
 ///
 /// Dropping it keeps `released_contexts` from holding a mark for every closed
-/// context whose handles are gone; [`MAX_RELEASED_CONTEXTS`] bounds the marks
-/// that live handles keep. A count this instance does not hold (after a
+/// context whose handles are gone. A count this instance does not hold (after a
 /// shutdown cleared the counts) changes nothing.
 pub(crate) fn untrack_context_handle(bi: &NapiBridgeInstance, context_id: &str) {
     use dashmap::mapref::entry::Entry;

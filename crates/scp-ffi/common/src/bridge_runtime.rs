@@ -357,8 +357,7 @@ impl ProtocolRepoVariant {
 // Shared UCAN validation state
 // ---------------------------------------------------------------------------
 
-/// Core per-context UCAN validation state shared by the NAPI and `UniFFI`
-/// bridges; the `PyO3` bridge keeps its own `UcanContextState`.
+/// Core per-context UCAN validation state.
 ///
 /// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
 /// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
@@ -368,16 +367,7 @@ impl ProtocolRepoVariant {
 /// (`outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
 /// uses this as-is (type alias `UcanContextState = UcanContextStateCore`).
 ///
-/// This struct holds no capability ceiling and no context creator DID. Both
-/// belong to the per-context supervisor actor, and the two bridges that use
-/// this struct read them from it at the moment they decide an authorization
-/// question: a `ModifyCeiling` governance action moves the ceiling, so a copy
-/// recorded when a bridge registered the context grants what the supervisor
-/// already withdrew, and a copy of either authorizes against a context no
-/// actor serves. NAPI reads `runtime::live_role_state`, and `UniFFI` reads
-/// `UniffiBridgeInstance::live_role_state`. Restoring either field here would
-/// give those reads a bridge-local rival that goes stale on every change the
-/// supervisor applies by another route.
+/// This struct holds no capability ceiling and no context creator DID.
 pub struct UcanContextStateCore {
     /// UCAN revocation list for this context.
     pub revocation_list: scp_core::crypto::ucan::revoke::RevocationList,

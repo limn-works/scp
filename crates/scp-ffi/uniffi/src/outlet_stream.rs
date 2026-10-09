@@ -1060,8 +1060,7 @@ pub(crate) fn outlet_stream_compute_caveats_binding_impl(
 // `bridge.rs`, sharing its `enforce_caller_principal_binding`,
 // `resolve_uniffi_signing_key`, `validate_outlet_ucan_uniffi`, `map_saga_error`,
 // and `decode_asserted_nonce` verbatim, and the SAME `UniffiStreamExecutor` /
-// `resolve_stream_signer` this module already defines. Mirrors the CANONICAL `PyO3` reference bridge's cross-context
-// section.
+// `resolve_stream_signer` this module already defines.
 //
 // Like the `UniFFI` unary cross-context saga (and the 037 same-context open)
 // this is HANDLE-based: the caller/target contexts cross the FFI boundary as

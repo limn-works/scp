@@ -6373,8 +6373,10 @@ mod tests {
     }
 
     /// Marking a new id at `MAX_RELEASED_CONTEXTS` marks evicts the earliest
-    /// mark with no unsettled close; re-marking an id that already holds a
-    /// mark evicts none, and a mark whose close is unsettled is never evicted.
+    /// mark with no unsettled close and no live handle; re-marking an id that
+    /// already holds a mark evicts none, a mark whose close is unsettled is
+    /// never evicted, and a mark whose id a live handle names is never
+    /// evicted, so that handle's `ensure_registered` still refuses.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn marking_past_the_cap_evicts_the_earliest_settled_mark() {
         use crate::runtime::{MAX_RELEASED_CONTEXTS, ReleaseMark};
@@ -6388,8 +6390,17 @@ mod tests {
             .checked_sub(std::time::Duration::from_secs(1))
             .expect("one second before now is representable");
         let mark_count = || crate::runtime::lock_release_marks(&bi).len();
+        let held = active_handle_for(&bi, "earliest-held", "did:key:z6MkNapiMarkCap");
         {
             let mut marks = crate::runtime::lock_release_marks(&bi);
+            marks.insert(
+                "earliest-held".to_owned(),
+                ReleaseMark {
+                    at: earlier,
+                    in_flight: 0,
+                    generation: 0,
+                },
+            );
             marks.insert(
                 "earliest-in-flight".to_owned(),
                 ReleaseMark {
@@ -6406,7 +6417,7 @@ mod tests {
                     generation: 0,
                 },
             );
-            for i in 2..MAX_RELEASED_CONTEXTS {
+            for i in 3..MAX_RELEASED_CONTEXTS {
                 marks.insert(
                     format!("mark-{i}"),
                     ReleaseMark {
@@ -6419,7 +6430,7 @@ mod tests {
         }
         assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
 
-        let _ticket = crate::runtime::mark_released(&bi, "mark-2");
+        let _ticket = crate::runtime::mark_released(&bi, "mark-3");
         assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
         assert!(
             crate::runtime::has_release_mark(&bi, "earliest-settled"),
@@ -6438,6 +6449,20 @@ mod tests {
         assert!(
             !crate::runtime::has_release_mark(&bi, "earliest-settled"),
             "a new mark at the cap must evict the earliest settled mark"
+        );
+        assert!(
+            crate::runtime::has_release_mark(&bi, "earliest-held"),
+            "a mark whose id a live handle names must not be evicted"
+        );
+        match crate::runtime::ensure_registered(&bi, &held) {
+            Err(crate::error::ScpNapiError::Context { code, .. }) => {
+                assert_eq!(code, codes::CTX_2023);
+            }
+            other => panic!("a held handle of a marked id must refuse a rebuild, got {other:?}"),
+        }
+        assert!(
+            crate::runtime::with_context(&bi, "earliest-held", |_| Ok(())).is_err(),
+            "the refusal must build no state"
         );
 
         for mark in crate::runtime::lock_release_marks(&bi).values_mut() {
@@ -7489,7 +7514,8 @@ mod tests {
     }
 
     /// `ucan_revoke_on` admits the creator the supervisor holds, and refuses
-    /// a revoker who is neither that creator nor the token's issuer.
+    /// a revoker who is neither that creator nor the token's issuer, the
+    /// handle's creator included.
     ///
     /// The token's issuer is a third identity, so only the creator clause of
     /// the revocation authorizer can admit either revoker.
@@ -7507,16 +7533,19 @@ mod tests {
             .await
             .expect("test supervisor context creation must succeed");
         crate::runtime::register_test_context(&bi, &ctx_id);
-        let handle = active_handle_for(&bi, &ctx_id, creator_did);
+        let handle = active_handle_for(&bi, &ctx_id, crate::runtime::KEYLESS_HANDLE_CREATOR);
         assert_ne!(issuer_did, creator_did);
+        assert_ne!(issuer_did, crate::runtime::KEYLESS_HANDLE_CREATOR);
 
-        let err = crate::ucan::ucan_revoke_on(&bi, &handle, token.clone(), OUTSIDER_DID.to_owned())
-            .await
-            .expect_err("the outsider is neither the issuer nor the live creator");
-        assert!(
-            err.to_string().contains("neither the token issuer"),
-            "the refusal must come from BridgeRevocationAuthorizer, got: {err}"
-        );
+        for revoker in [OUTSIDER_DID, crate::runtime::KEYLESS_HANDLE_CREATOR] {
+            let err = crate::ucan::ucan_revoke_on(&bi, &handle, token.clone(), revoker.to_owned())
+                .await
+                .expect_err("a revoker that is neither the issuer nor the live creator");
+            assert!(
+                err.to_string().contains("neither the token issuer"),
+                "the refusal of {revoker} must come from BridgeRevocationAuthorizer, got: {err}"
+            );
+        }
 
         crate::ucan::ucan_revoke_on(&bi, &handle, token, creator_did.to_owned())
             .await

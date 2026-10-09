@@ -1236,10 +1236,7 @@ impl UniffiBridgeInstance {
     /// Builds UCAN validation state for `context_id` only when this instance
     /// holds none for it, the supervisor reports the context `Active`, and no
     /// release mark stands on the id. On any other supervisor answer, a failed
-    /// state read included, it registers nothing and returns `Ok(())`: the
-    /// caller's next [`Self::with_ucan_state`] then returns `None`, which the
-    /// caller turns into its own refusal, so this call surfaces no answer
-    /// about the context.
+    /// state read included, it registers nothing and returns `Ok(())`.
     ///
     /// The ungated builder is private, so a direct call does not compile:
     ///
@@ -1266,6 +1263,23 @@ impl UniffiBridgeInstance {
             return Ok(());
         }
         let supervisor = self.context_manager_or_error()?;
+        self.ensure_ucan_registered_while_active_on(supervisor, context_id)
+            .await;
+        Ok(())
+    }
+
+    /// Builds UCAN validation state for `context_id` only when this instance
+    /// holds none for it, `supervisor` reports the context `Active`, and no
+    /// release mark stands on the id. On any other answer, a failed state read
+    /// included, it registers nothing.
+    pub(crate) async fn ensure_ucan_registered_while_active_on(
+        &self,
+        supervisor: &scp_core::context::supervisor::Supervisor,
+        context_id: &str,
+    ) {
+        if self.ucan_registry.contains_key(context_id) {
+            return;
+        }
         match supervisor.read_context_state_checked(context_id).await {
             Ok(Some(scp_core::context::ContextState::Active)) => {
                 self.ensure_ucan_registered(context_id);
@@ -1281,7 +1295,6 @@ impl UniffiBridgeInstance {
                 "UCAN state not registered: the lifecycle state read failed"
             ),
         }
-        Ok(())
     }
 
     /// Builds UCAN validation state for `context_id` without reading the
@@ -1429,12 +1442,8 @@ impl UniffiBridgeInstance {
         true
     }
 
-    /// Clears the release mark on `context_id`, so the next
-    /// [`Self::ensure_ucan_registered_while_active`] builds fresh state for it.
-    ///
-    /// Clears the mark while holding the release-mark lock. The fresh state
-    /// holds an empty revocation list and a fresh nonce tracker, because this
-    /// bridge keeps revocations in process memory.
+    /// Clears the release mark on `context_id` while holding the release-mark
+    /// lock.
     pub fn readmit_context(&self, context_id: &str) {
         self.lock_release_marks().remove(context_id);
     }
@@ -1540,9 +1549,7 @@ impl UniffiBridgeInstance {
                 // `build_ucan_context_state` never touches `ucan_registry`, so
                 // building it while holding this shard's `Entry` write guard
                 // cannot deadlock (mirrors the napi reference's Vacant arm).
-                // The release mark stays until the spawn commits: the caller
-                // readmits the id only then, so a failed join leaves a closed
-                // context's mark in place.
+                // This arm leaves any release mark on the id in place.
                 vacant.insert(Self::build_ucan_context_state(context_id));
                 Ok(())
             }
@@ -1558,11 +1565,6 @@ impl UniffiBridgeInstance {
     /// the caller decides the insert semantics.
     ///
     /// The state carries no capability ceiling and no context creator DID.
-    /// `ucan_validate`, `ucan_evaluate`, `ucan_revoke`, and the outlet entry
-    /// points read both from the per-context supervisor actor through
-    /// [`Self::live_role_state`] at the moment each decides, because a
-    /// `ModifyCeiling` governance action moves the ceiling after this
-    /// registration runs.
     fn build_ucan_context_state(context_id: &str) -> UcanContextState {
         UcanContextState {
             revocation_list: RevocationList::new(context_id.to_owned()),

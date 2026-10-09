@@ -5408,9 +5408,6 @@ impl McpUniFfiBridgeProvider {
                 ))
             })?
         };
-        // `validate_capability` reached this call through `gate_role_state`
-        // and `gate_active_lifecycle`, which block on the supervisor the same
-        // way, so `block_in_place` is legal here.
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(bi.ensure_ucan_registered_while_active(context_id))
@@ -5813,9 +5810,8 @@ impl McpUniFfiBridgeProvider {
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Ensure UCAN state is registered before appending the event, while
-        // the supervisor reports the context `Active`. `authorize` blocked on
-        // the supervisor the same way, so `block_in_place` is legal here. A
-        // failure leaves the append to the `None` arm below, which logs it.
+        // the supervisor reports the context `Active`. A failure leaves the
+        // append to the `None` arm below, which logs it.
         if let Err(e) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(bi.ensure_ucan_registered_while_active(context_id))
@@ -10898,7 +10894,8 @@ impl Scp {
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
-                bi.ensure_ucan_registered_while_active(&context_id).await?;
+                bi.ensure_ucan_registered_while_active_on(sup, &context_id)
+                    .await;
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -11214,8 +11211,7 @@ impl Scp {
                 // FLAG-1: the caller supplies no ceiling, and the UCAN state
                 // stores none. The Occupied dedup is keyed on `context_id`, so the
                 // "detect a duplicate BEFORE consuming the single-use KeyPackage"
-                // crash-safety holds. The AUTHENTICATED ceiling reaches the actor
-                // through `spawn_actor_from_welcome` (below).
+                // crash-safety holds.
                 let owning = scp_did::DID(identity.did.clone());
                 let req = scp_core::context::supervisor::WelcomeJoinRequest {
                     creator_did: scp_did::DID(creator_did.clone()),
@@ -11232,10 +11228,8 @@ impl Scp {
                     )
                     .await?;
 
-                // FLAG-1: the AUTHENTICATED ceiling lives in the bundle the
-                // creator signed, and `spawn_actor_from_welcome` stored it in the
-                // spawned actor; the UCAN state holds no ceiling, so nothing is
-                // copied here. Runs AFTER the irreversible commit; the UCAN state
+                // FLAG-1: the UCAN state holds no ceiling, so nothing is copied
+                // here. Runs AFTER the irreversible commit; the UCAN state
                 // was just occupied and is not removed on this success path, so
                 // the check below finds it unless a racing close removed it.
                 //
@@ -21443,6 +21437,58 @@ mod tests {
         );
     }
 
+    /// `ensure_ucan_registered_while_active_on` builds UCAN state for a
+    /// context the passed supervisor reports `Active`, and builds none for an
+    /// `Active` context that carries a release mark or for an id no actor
+    /// serves.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ensure_while_active_on_builds_only_for_an_active_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let active = handle.context_id();
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("context_create resolved a supervisor"),
+        );
+        scp.inner.remove_ucan_state(&active);
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active_on(&sup, &active),
+        );
+        assert!(
+            scp.inner.with_ucan_state(&active, |_| ()).is_some(),
+            "an Active context must get UCAN state"
+        );
+
+        scp.inner.release_ucan_state(&active);
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active_on(&sup, &active),
+        );
+        assert!(
+            scp.inner.with_ucan_state(&active, |_| ()).is_none(),
+            "a release mark must stop the build even while the supervisor reports Active"
+        );
+
+        let absent = scp_ffi_common::generate_context_id();
+        rt.block_on(
+            scp.inner
+                .ensure_ucan_registered_while_active_on(&sup, &absent),
+        );
+        assert!(
+            scp.inner.with_ucan_state(&absent, |_| ()).is_none(),
+            "an id no actor serves must not get UCAN state"
+        );
+    }
+
     /// A close whose supervisor re-read fails settles its mark's unsettled
     /// close, so the bound may evict that mark later.
     #[test]
@@ -29517,9 +29563,7 @@ mod tests {
     /// the shape `context_create` produces for a platform-custody identity. The
     /// returned tuple yields the verifying key so signatures can be checked.
     ///
-    /// The supervisor actor holds `supervisor_ceiling`. Neither the handle nor
-    /// the per-context UCAN state carries a ceiling, so a UCAN entry point
-    /// reads the ceiling from the actor alone.
+    /// The supervisor actor holds `supervisor_ceiling`.
     async fn callback_context_handle(
         scp: &Arc<crate::scp::Scp>,
         supervisor_ceiling: &[&str],

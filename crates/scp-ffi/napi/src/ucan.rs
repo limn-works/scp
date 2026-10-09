@@ -431,9 +431,6 @@ pub(crate) async fn ucan_evaluate_on(
 
     let context_id = handle.context_id();
 
-    // The ceiling and the creator come from the supervisor actor for the reason
-    // `ucan_validate_on` reads them there: a ceiling recorded earlier may
-    // already have been narrowed by a governance action.
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
     // evaluate_ucan takes `&ValidationContext` and is read-only — it probes the
