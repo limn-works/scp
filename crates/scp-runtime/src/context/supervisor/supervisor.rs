@@ -34547,11 +34547,6 @@ mod open_outlet_stream_tests {
         let mut rx = handle.receiver().expect("receiver");
         let summary_rx = handle.close_summary().expect("close summary");
 
-        // ADR-049 Decision 16 — shutdown begins while the stream runs. The
-        // pump runs on the tracker, so its close-time settlement below is
-        // admitted through the closed gate.
-        supervisor.close_spawn_gate();
-
         // Grant credit via the handle (exercise the control surface).
         let grant = OutletStreamCredit {
             request_id,
@@ -34606,27 +34601,39 @@ mod open_outlet_stream_tests {
             "cancel-ack seq pins to the runtime cursor after 3 emissions"
         );
 
-        // Drain to the terminal chunk (the cancel-ack-timeout forced terminal,
-        // since the blocked executor emits none).
-        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        // ADR-049 Decision 16 — shutdown begins while the stream runs. The
+        // shutdown token closes the pump with `ContextClosedMidStream` before
+        // the cancel-ack timer fires, and the pump runs on the tracker, so its
+        // close-time settlement below is admitted through the closed gate.
+        supervisor.close_spawn_gate();
+
+        // Drain to the terminal chunk.
+        let terminal_code = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match rx.recv().await {
-                    Some(chunk)
-                        if matches!(
-                            chunk.payload,
-                            ChunkPayload::End { .. } | ChunkPayload::Error { terminal: true, .. }
-                        ) =>
-                    {
-                        break true;
-                    }
-                    Some(_) => {}
-                    None => break false,
+                    Some(chunk) => match chunk.payload {
+                        ChunkPayload::Error {
+                            code,
+                            terminal: true,
+                            ..
+                        } => break Some(code),
+                        ChunkPayload::End { .. } => break None,
+                        _ => {}
+                    },
+                    None => break None,
                 }
             }
         })
         .await
         .expect("terminal chunk within 5s");
-        assert!(terminal, "the stream reaches a terminal chunk");
+        assert_eq!(
+            terminal_code.as_deref(),
+            Some(
+                scp_protocol::context::outlets::stream::TerminateReason::ContextClosedMidStream
+                    .code()
+            ),
+            "the shutdown token closes the stream"
+        );
 
         // The pump's close summary carries the economic reconciliation.
         let summary = tokio::time::timeout(Duration::from_secs(5), summary_rx)
