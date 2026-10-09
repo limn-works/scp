@@ -3227,14 +3227,17 @@ impl crate::scp::PyScp {
         // register the context actor. Nothing is registered on this bridge
         // before the spawn succeeds, so a failed spawn leaves the id's bridge
         // state and release mark as they were.
+        let admitted_at = std::time::Instant::now();
         let joined = rt
             .block_on(sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req))
             .map_err(|e| busy_or("context_join_from_welcome", &e))?;
 
-        // The supervisor serves the id now. Clearing the id's release mark and
-        // registering its FFI state run in one critical section; when the entry
-        // is occupied, the mark stays and the just-committed actor is torn down.
-        if let Err(e) = crate::runtime::readmit_and_register_ffi_state(bi, &sealed.context_id, &[])
+        // Clearing the id's release mark and registering its FFI state run in
+        // one critical section. When the entry is occupied, or the mark was set
+        // after `admitted_at`, the mark stays and the just-committed actor is
+        // torn down.
+        if let Err(e) =
+            crate::runtime::readmit_and_register_ffi_state(bi, &sealed.context_id, &[], admitted_at)
         {
             rt.block_on(sup.discard_joined_context(&sealed.context_id));
             return Err(PyRuntimeError::new_err(format!(
@@ -3865,6 +3868,8 @@ impl crate::scp::PyScp {
     ///
     /// - `RuntimeError` if deserialization, validation, or import fails.
     /// - `ValueError` if the data is malformed.
+    /// - `ScpContextError` with code `SCP-CTX-2023` when this bridge set the
+    ///   context's release mark after the call began; the mark stays.
     #[pyo3(signature = (data, importer_did))]
     pub fn context_import(&self, data: &[u8], importer_did: &str) -> PyResult<String> {
         let bi = &*self.inner;
@@ -3946,6 +3951,7 @@ impl crate::scp::PyScp {
         let announce_signing_key = resolve_signing_key(bi, importer_did).ok();
         let context_id_for_announce = context_id.clone();
 
+        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             // Dispatch the import carrying BOTH the creator verifying key
             // (verify-before-init, §23.16.8) and the importer's derived
@@ -3956,9 +3962,10 @@ impl crate::scp::PyScp {
             sup.import_context(export, &verifying_key, Some(local_pseudonym))
                 .await
                 .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
-            // The supervisor serves the id again, so a release mark an earlier
-            // close left on this bridge instance no longer applies.
-            crate::runtime::readmit_context(bi, &context_id_for_announce);
+            // Clears the id's release mark, or refuses when the mark was set
+            // after `admitted_at`.
+            crate::runtime::readmit_context(bi, &context_id_for_announce, admitted_at)
+                .map_err(PyErr::from)?;
 
             // §9.10.4: emit a PseudonymAnnouncement so existing members learn
             // this importer's per-context routing ID. Encrypted contexts only —
@@ -4873,7 +4880,9 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `RuntimeError` (SCP-CTX-2064) if restoration fails.
+    /// Returns `RuntimeError` (SCP-CTX-2064) if restoration fails. Returns
+    /// `ScpContextError` with code `SCP-CTX-2023` when this bridge set the id's
+    /// release mark after the call began; the mark stays.
     #[pyo3(signature = (context_id,))]
     pub fn restore_context(&self, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -4883,6 +4892,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id_owned = context_id.to_owned();
 
+        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             // Route through the ADR-049 commit-9 lifecycle shim. The handler
             // reconstructs an ephemeral ContextHandle and delegates to the
@@ -4915,10 +4925,9 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("SCP-CTX-2064: restore_context failed: {e}"))
                 })
         })?;
-        // The supervisor serves the id again, so a release mark an earlier close
-        // left on this bridge instance no longer applies.
-        crate::runtime::readmit_context(bi, context_id);
-        Ok(())
+        // Clears the id's release mark, or refuses when the mark was set after
+        // `admitted_at`.
+        crate::runtime::readmit_context(bi, context_id, admitted_at).map_err(PyErr::from)
     }
 
     /// Restores all persisted contexts from storage.
@@ -4945,14 +4954,17 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
 
+        let admitted_at = std::time::Instant::now();
         rt.block_on(async move {
             let restored = sup.restore_on_startup().await.map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
             })?;
-            // The supervisor serves each restored id again, so a release mark an
-            // earlier close left on this bridge instance no longer applies.
+            // Clears each restored id's release mark; a mark set after
+            // `admitted_at` stays.
             for context_id in &restored {
-                crate::runtime::readmit_context(bi, context_id);
+                if let Err(e) = crate::runtime::readmit_context(bi, context_id, admitted_at) {
+                    tracing::warn!(context_id, error = %e, "restored id keeps its release mark");
+                }
             }
 
             serde_json::to_string(&restored).map_err(|e| {
@@ -8212,8 +8224,13 @@ mod tests {
         scp.finalize_close(&handle).expect("finalize_close");
         // The fixture close left a release mark, so the test readmits the id
         // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
+        crate::runtime::readmit_and_register_ffi_state(
+            &scp.inner,
+            handle.context_id(),
+            &[],
+            std::time::Instant::now(),
+        )
+        .expect("re-register the bridge state the fixture close released");
         assert_eq!(
             crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
                 .expect("state read"),
@@ -8393,8 +8410,13 @@ mod tests {
         close_context_behind_the_handle(&scp, &handle, creator);
         // The fixture close left a release mark, so the test readmits the id
         // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
+        crate::runtime::readmit_and_register_ffi_state(
+            &scp.inner,
+            handle.context_id(),
+            &[],
+            std::time::Instant::now(),
+        )
+        .expect("re-register the bridge state the fixture close released");
         assert_eq!(
             crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
                 .expect("state read"),
@@ -8479,8 +8501,13 @@ mod tests {
         close_context_behind_the_handle(&scp, &active, creator);
         // The fixture close left a release mark, so the test readmits the id
         // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, active.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
+        crate::runtime::readmit_and_register_ffi_state(
+            &scp.inner,
+            active.context_id(),
+            &[],
+            std::time::Instant::now(),
+        )
+        .expect("re-register the bridge state the fixture close released");
         assert!(
             crate::runtime::release_context_unless_readmitted(
                 &scp.inner,
@@ -8553,8 +8580,13 @@ mod tests {
         close_context_behind_the_handle(&scp, &handle, creator);
         // The fixture close left a release mark, so the test readmits the id
         // and rebuilds its bridge state in one step.
-        crate::runtime::readmit_and_register_ffi_state(&scp.inner, handle.context_id(), &[])
-            .expect("re-register the bridge state the fixture close released");
+        crate::runtime::readmit_and_register_ffi_state(
+            &scp.inner,
+            handle.context_id(),
+            &[],
+            std::time::Instant::now(),
+        )
+        .expect("re-register the bridge state the fixture close released");
         assert_eq!(
             crate::runtime::read_live_context_state(&scp.inner, handle.context_id())
                 .expect("state read"),

@@ -3361,14 +3361,10 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
 }
 
 /// `ucan_validate` and `ucan_evaluate` anchor a token's root issuer on the
-/// context creator the SUPERVISOR holds, not the DID the bridge state was
-/// registered under.
+/// context creator the SUPERVISOR holds.
 ///
-/// Each of the two contexts registers its bridge state under one DID and
-/// creates its supervisor context under the other. In `anchored` the supervisor
-/// names `owner`, the token's issuer, and the registration names `other`; in
-/// `crossed` the supervisor names `other` and the registration names `owner`.
-/// The token passes the root-issuer check in `anchored` and fails it in
+/// In `anchored` the supervisor names `owner`, the token's issuer; in `crossed`
+/// the supervisor names `other`. The token passes the root-issuer check in `anchored` and fails it in
 /// `crossed`.
 #[cfg(feature = "testing")]
 #[test]
@@ -3386,10 +3382,10 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
         let crossed = random_context_id();
         let rt = test_runtime();
         let supervisor = runtime::supervisor(bi).unwrap().clone();
-        for (ctx, bridge_creator, supervisor_creator) in
+        for (ctx, register_arg, supervisor_creator) in
             [(&anchored, &other, &owner), (&crossed, &owner, &other)]
         {
-            runtime::register_context(bi, ctx, bridge_creator, &[]).unwrap();
+            runtime::register_context(bi, ctx, register_arg, &[]).unwrap();
             let params = scp_core::context::ContextParams {
                 ceiling: ["messages:read", "messages:write"]
                     .iter()
@@ -3447,16 +3443,12 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
     });
 }
 
-/// `ucan_mint` enforces the ceiling the SUPERVISOR holds, not one the bridge was
-/// registered with.
+/// `ucan_mint` enforces the ceiling the SUPERVISOR holds.
 ///
 /// The fixture hands `register_context` a WIDE ceiling carrying `outlet:call:*`
 /// and creates the supervisor context with a NARROW one that omits it, then
 /// mints `outlet_call:*`. The supervisor's ceiling forbids that capability, so
-/// the mint must refuse. `register_context` validates the wide argument and
-/// then discards it, and the bridge state holds no ceiling; before that, a
-/// bridge-local ceiling built from the registration argument permitted the
-/// mint, and a mint that read such a copy again would succeed here.
+/// the mint must refuse.
 #[cfg(feature = "testing")]
 #[test]
 fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
@@ -3593,9 +3585,6 @@ fn xctx_unary_saga_rejects_non_active_context() {
 /// when it is false the invoker is an `observer`, which holds no invocation
 /// capability, so a capability gate that reads the supervisor must refuse the
 /// invoker even though the UCAN is valid.
-///
-/// The bridge writes no membership record, so a capability gate that reads a
-/// bridge-local copy sees no member and rejects.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 fn supervisor_only_member_context(
     py: Python<'_>,
@@ -3652,9 +3641,6 @@ fn supervisor_only_member_context(
 
 /// `outlet_session_invoke` admits an invoker whose capability exists ONLY in the
 /// supervisor's role state, so the session capability gate reads the supervisor.
-///
-/// A gate reading a bridge-local copy finds no such member and rejects with
-/// "does not have invocation capability", which this test forbids.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
 fn session_invoke_admits_a_supervisor_only_capability_holder() {
@@ -3778,8 +3764,7 @@ fn cross_context_invoke_refuses_a_source_member_the_supervisor_did_not_grant() {
 /// The cross-context source-capability gate admits an invoker whose capability
 /// exists ONLY in the source context's supervisor role state.
 ///
-/// A gate reading a bridge-local copy finds no such member and rejects with
-/// "does not have invocation capability". Past the gate the call checks chain
+/// Past the gate the call checks chain
 /// depth, validates the input against the target outlet's schema, and answers in
 /// echo mode because the fixture registers no handler. The test asserts that
 /// echo-mode output, so a refusal at the gate or at any earlier check turns it red.
@@ -3832,15 +3817,12 @@ fn cross_context_invoke_admits_a_supervisor_only_capability_holder() {
 }
 
 /// The outlet UCAN validation compares the token's grants against the ceiling
-/// in the role state the lifecycle gate read from the supervisor, not the
-/// ceiling the bridge was registered with.
+/// in the role state the lifecycle gate read from the supervisor.
 ///
-/// The fixture registers the bridge state with a `messages:read`-only ceiling
-/// and creates the supervisor context with a ceiling that carries
+/// The fixture creates the supervisor context with a ceiling that carries
 /// `outlet:call:*`. The supervisor seeds a `member` holding `outlet_call:*`,
 /// the creator mints that member an `outlet_call:*` token, and the member
-/// invokes a session with it. A validation that read the registration ceiling
-/// refuses the token at the ceiling check, which this test forbids.
+/// invokes a session with it.
 #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
 fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {

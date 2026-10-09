@@ -1791,9 +1791,6 @@ mod tests {
 
     /// `ucan_mint` takes its issuer and its mint-time ceiling from the
     /// supervisor, so the DID named in the refusal is the supervisor's creator.
-    ///
-    /// The fixture registers the bridge state under one DID and creates the
-    /// supervisor context under another.
     #[test]
     fn ucan_mint_reads_the_supervisor_creator_as_issuer() {
         crate::init_runtime().ok();
@@ -1875,10 +1872,7 @@ mod tests {
         crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 
-    /// `ucan_revoke` admits the context creator the SUPERVISOR holds. The
-    /// fixture registers the bridge state under `ffi_creator` and the
-    /// supervisor context under `supervisor_creator`; neither is the token's
-    /// issuer.
+    /// `ucan_revoke` admits the context creator the SUPERVISOR holds.
     #[test]
     fn ucan_revoke_authorizes_the_supervisor_creator() {
         crate::init_runtime().ok();

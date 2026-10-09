@@ -600,9 +600,6 @@ impl FfiBridgeProvider {
                 "insufficient permissions to invoke outlet".to_owned(),
             ));
         }
-        // With no FFI state, the context has no outlet registered through
-        // this bridge (see `context_tools`), so the outlet is unregistered:
-        // the denial the state's own registry gives below, not a failed read.
         if !crate::runtime::ffi_state_registry(bi).contains_key(context_id) {
             return Err(AccessRefusal::Denied(format!(
                 "outlet '{outlet_name}' not registered in context '{context_id}'"
@@ -736,9 +733,6 @@ impl ContextProvider for FfiBridgeProvider {
         // A dropped bridge or an unreadable context is an error, never an
         // empty outlet registry.
         let bi = self.upgrade_bi()?;
-        // Outlets register only in this bridge's FFI state, so a context with
-        // no FFI state here has no outlet registered through this bridge: its
-        // registry is empty.
         if !crate::runtime::ffi_state_registry(&bi).contains_key(context_id) {
             return match Self::supervised_role_state(&bi, context_id)? {
                 Some(_) => Ok(Vec::new()),
@@ -6065,18 +6059,18 @@ mod tests {
         check_serve_runtime(RuntimeFlavor::MultiThread).expect("a multi-thread runtime serves");
     }
 
-    /// A context the actor holds while the bridge holds no copy of it has no
-    /// outlet registered through this bridge: `context_tools` reports an empty
+    /// A context the actor holds while this bridge holds no FFI state for it has
+    /// no outlet registered through this bridge: `context_tools` reports an empty
     /// registry, and `validate_capability`, for an agent whose role grants
     /// `outlet:call:*`, passes the role-state check and denies the outlet as
     /// unregistered, instead of failing the read and, through it, `tools/list`
     /// for every served context.
     #[test]
-    fn actor_held_context_without_a_bridge_copy_has_no_outlets_pyo3() {
+    fn actor_held_context_without_ffi_state_has_no_outlets_pyo3() {
         crate::init_runtime().ok();
         let agent = "did:dht:z6MkNoCopyAgent";
         let bi = __bi();
-        let ctx_id = crate::types::generate_random_id("test-mcp-no-copy");
+        let ctx_id = crate::types::generate_random_id("test-mcp-no-ffi-state");
         setup_registered_context_with_ceiling(
             &bi,
             &ctx_id,

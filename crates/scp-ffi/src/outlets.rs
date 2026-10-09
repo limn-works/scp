@@ -3218,7 +3218,7 @@ mod tests {
         );
         assert!(
             !message.contains(ffi_creator),
-            "the resolver must not name the DID the bridge was registered under: {message}"
+            "the resolver must not name `ffi_creator`: {message}"
         );
         crate::runtime::remove_context(bi, &ctx_id);
     }
