@@ -2221,7 +2221,25 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # cargo-deny comes from its upstream release binary, which taiki-e/install-action
+      # checks against the sha256 its manifest records, instead of from
+      # `EmbarkStudios/cargo-deny-action`. That action is a Docker container action, so
+      # every run built its image from `rust:1.85.0-alpine3.20` on Docker Hub, and an
+      # anonymous Docker Hub pull is rate-limited per runner IP: on 2026-10-09 this job
+      # failed on `429 Too Many Requests` before cargo-deny ran. No job in this file
+      # pulls from Docker Hub.
+      #
+      # The command below is the one that action's `entrypoint.sh` ran with its default
+      # inputs (`--log-level warn --manifest-path ./Cargo.toml --all-features check`),
+      # and 0.20.2 is the cargo-deny version its v2 Dockerfile installed, so the job
+      # checks advisories, bans, licenses and sources against `deny.toml` exactly as it
+      # did. The runner's rustup installs the `rust-toolchain.toml` pin on cargo-deny's
+      # first `cargo metadata`, as it does for job rust-fmt. To move the version, change
+      # it here; install-action fails on a version its manifest does not list.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check
 
   # ── Container image ─────────────────────────────────────────────────
   # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that
@@ -2296,7 +2314,18 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
+      # The `docker-container` driver starts buildkit from an image, which
+      # setup-buildx-action pulls from Docker Hub as `moby/buildkit:buildx-stable-1`
+      # unless told otherwise; on 2026-10-09 that pull timed out at auth.docker.io and
+      # failed this job before the build began. `mirror.gcr.io` is Google's public mirror
+      # of Docker Hub and served the same tag at the same index digest when this was
+      # written. The `docker` driver would pull no image, but it cannot export a cache to
+      # a registry, which job `docker-image-cache` needs, and both jobs keep one driver
+      # so the cache one writes is the cache the other reads. The `Dockerfile`'s `FROM`
+      # lines name the same mirror for the same reason.
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
       # `continue-on-error` so a failed login cannot fail the build check.
       - uses: docker/login-action@v3
         continue-on-error: true
@@ -2337,7 +2366,10 @@ jobs:
             df -h /
           fi
       - uses: actions/checkout@v5
+      # Job `docker-image`'s copy of this step says why buildkit comes from the mirror.
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
