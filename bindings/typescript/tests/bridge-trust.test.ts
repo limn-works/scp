@@ -28,6 +28,7 @@ import type { Bridge } from "../src/internal/bridge";
 import { __setBridgeForTests } from "../src/internal/bridge";
 import { SCP } from "../src/scp";
 import { mountMockScp } from "./mock-bridge";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Default-shape unit test (no addon required)
@@ -142,7 +143,7 @@ try {
   napiAvailable = true;
   probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
-  skipReason = `Native NAPI bridge not available: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 if (!napiAvailable) {

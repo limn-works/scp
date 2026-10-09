@@ -2999,15 +2999,18 @@ jobs:
           # Create a minimal package.json so require() resolves
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
       # THE DEFECT THIS CLOSES: every real-NAPI test file under
-      # bindings/typescript/tests wraps its addon load and its first construction in
-      # one `try` and resolves to `describe.skip` or a lone `test.skip` on any error.
-      # An addon wired anywhere but the package directory `require()` resolves, or one
-      # that does not load, would leave `bun test` exiting 0 over zero executed NAPI
-      # assertions, which is the `zero-test` shape
+      # bindings/typescript/tests passes the error its guard caught to
+      # `skipReasonIfAddonAbsent` in tests/napi-guard.ts, which skips the file when,
+      # and only when, `loadNativeAddon()` throws SCP-VALID-7081, meaning the addon
+      # package does not resolve. An addon that resolves and fails to load
+      # (SCP-VALID-7082), and an addon missing a method the file calls, fail the file
+      # instead of skipping it. The absent case still skips: an addon wired anywhere
+      # but the package directory `require()` resolves would leave `bun test` exiting
+      # 0 over zero executed NAPI assertions, which is the `zero-test` shape
       # scripts/tests/ci-gate/ci_gate_selftest.py names. The `[ ! -f ]` check above
       # reads whether target/ci-bridge holds the cdylib and never resolves the package.
-      # This step runs the SDK loader and the native constructor, so such an addon
-      # fails the job here, and it reads the two methods the `server` and
+      # This step runs the SDK loader and the native constructor the guards run, so an
+      # absent addon fails the job here, and it reads the two methods the `server` and
       # `testing` feature lists compile onto the native class, so a build missing
       # either feature fails here, before `bun test`, with the name of
       # the missing method. Every consumer of a NAPI artifact runs this step.

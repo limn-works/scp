@@ -160,9 +160,11 @@ nothing:
                unguarded step before `pytest tests`.
   downloaded-addon
                Every real-NAPI test file under bindings/typescript/tests resolves
-               to `describe.skip` or `test.skip` when the addon load throws, so a
-               NAPI consumer whose downloaded addon does not load leaves
-               `bun test` exiting 0 over zero executed NAPI assertions. The check
+               to `describe.skip` or `test.skip` when `loadNativeAddon()` throws
+               SCP-VALID-7081 (the addon package does not resolve), so a NAPI
+               consumer whose downloaded addon was wired anywhere but the package
+               directory `require()` resolves leaves `bun test` exiting 0 over
+               zero executed NAPI assertions. The check
                requires each fragment in NAPI_ASSERTION_FRAGMENTS in the `run:`
                text of an unguarded step before the first `bun test` or
                `pytest tests` step.
@@ -4040,12 +4042,14 @@ def napi_consumers_missing_an_assertion_fragment(
     than false.
 
     WHY: every real-NAPI test file under bindings/typescript/tests wraps its addon load
-    and its first construction in one `try`, writes the caught error into a skip reason,
-    and resolves its whole `describe` block to `describe.skip` or to a lone `test.skip`
-    — tests/real-napi.test.ts, tests/e2e-fullstack.test.ts and tests/persistence.test.ts
-    among them. A downloaded addon that does not load therefore leaves `bun test`
-    exiting 0 over zero executed NAPI assertions, which is the same `zero-test` shape
-    the PyO3 criterion above names.
+    and its first construction in one `try`, passes the caught error to
+    `skipReasonIfAddonAbsent` in tests/napi-guard.ts, and resolves its whole `describe`
+    block to `describe.skip` or to a lone `test.skip` when `loadNativeAddon()` throws
+    SCP-VALID-7081 — tests/real-napi.test.ts, tests/e2e-fullstack.test.ts and
+    tests/persistence.test.ts among them. A downloaded addon wired anywhere but the
+    package directory `require()` resolves therefore leaves `bun test` exiting 0 over
+    zero executed NAPI assertions, which is the same `zero-test` shape the PyO3
+    criterion above names.
     """
     gaps: list[str] = []
     for job_id, job in sorted(doc["jobs"].items()):

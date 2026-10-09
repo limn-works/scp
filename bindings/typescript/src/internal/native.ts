@@ -6,7 +6,7 @@
  *
  * The native addon is loaded via `createRequire` from the platform-specific
  * optional dependency. If the package is not installed, loading fails with
- * a `TransportError` and an actionable message.
+ * a `ValidationError` (`SCP-VALID-7081`) and an actionable message.
  *
  * Since ADR-048 (Phase 4 PR 4), all calls route through the caller-
  * supplied {@link SCP} instance's class methods rather than module-level
@@ -23,8 +23,8 @@
 import { createRequire } from "node:module";
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { TransportError } from "../errors";
-import { __getNativeScp, type SCP } from "../scp";
+import { TransportError, ValidationError } from "../errors";
+import { __getNativeScp, requireAddonExport, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
   CapabilityValidation,
@@ -53,6 +53,29 @@ import { toCapabilityValidation, wrapBridgeErrors } from "./bridge";
 import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
+// Load-failure codes
+// ---------------------------------------------------------------------------
+
+/**
+ * Code the loader throws when no native addon is installed for this platform:
+ * the platform has no addon package, or the package does not resolve. This is
+ * the only load failure a caller may treat as absence.
+ * `.docs/standards/sdk-common.md` registers it with one meaning for every SDK
+ * that loads a native bridge.
+ */
+export const NATIVE_ADDON_ABSENT_CODE = "SCP-VALID-7081";
+
+/**
+ * Code the loader throws when the addon package resolves but loading it
+ * fails — a `dlopen` error, an ABI or architecture mismatch, a missing
+ * transitive shared library. `.docs/standards/sdk-common.md` registers it with
+ * one meaning for every SDK that loads a native bridge.
+ * A caller must not treat it as absence: a skip guard that did would turn a
+ * broken artifact into a run that executes zero native assertions.
+ */
+export const NATIVE_ADDON_LOAD_FAILED_CODE = "SCP-VALID-7082";
+
+// ---------------------------------------------------------------------------
 // Platform detection
 // ---------------------------------------------------------------------------
 
@@ -78,10 +101,10 @@ function resolveNapiPackage(): string {
   const pkg = platformMap[key];
 
   if (pkg === undefined) {
-    throw new TransportError(
+    throw new ValidationError(
       `No native addon available for platform ${key}. ` +
         "Install the appropriate @limn-works/scp-ts-napi-* package for this platform.",
-      "SCP-TRANS-5001",
+      NATIVE_ADDON_ABSENT_CODE,
     );
   }
 
@@ -110,6 +133,47 @@ export type NativeAddon = Record<string, unknown>;
 let _nativeAddon: NativeAddon | null = null;
 
 /**
+ * Requires `packageName` through `req`, telling an absent package apart from
+ * a present one that failed to load.
+ *
+ * `req.resolve` succeeds exactly when the package and its entry file exist,
+ * so a resolve failure is absence and a failure after a successful resolve is
+ * a load failure.
+ *
+ * @throws {ValidationError} `NATIVE_ADDON_ABSENT_CODE` when `packageName` does
+ *   not resolve.
+ * @throws {ValidationError} `NATIVE_ADDON_LOAD_FAILED_CODE` when `packageName`
+ *   resolves and requiring it throws; the message carries the underlying
+ *   error's message and `cause` carries the error.
+ */
+export function requireNativeAddon(
+  packageName: string,
+  req: ReturnType<typeof createRequire>,
+): NativeAddon {
+  let resolved: string;
+  try {
+    resolved = req.resolve(packageName);
+  } catch {
+    throw new ValidationError(
+      `Native addon ${packageName} is not installed. ` + `Install it with: bun add ${packageName}`,
+      NATIVE_ADDON_ABSENT_CODE,
+    );
+  }
+  try {
+    return req(packageName) as NativeAddon;
+  } catch (cause) {
+    const underlying = cause instanceof Error ? cause.message : String(cause);
+    const error = new ValidationError(
+      `Native addon ${packageName} is installed at ${resolved} but failed to load: ` +
+        `${underlying}. Rebuild or reinstall it for this platform.`,
+      NATIVE_ADDON_LOAD_FAILED_CODE,
+    );
+    Object.defineProperty(error, "cause", { value: cause, enumerable: false });
+    throw error;
+  }
+}
+
+/**
  * Loads (or returns the cached) platform-specific native addon. The
  * returned object is `Object.freeze`d post-load so any code path that
  * later holds a reference cannot mutate the export shape (defence
@@ -119,24 +183,18 @@ let _nativeAddon: NativeAddon | null = null;
  * Both `internal/native.ts` and `scp.ts` route through this single
  * loader — the cache discipline only holds because there is exactly one
  * loader. Adding a second loader anywhere in the SDK is a regression.
+ *
+ * @throws {ValidationError} `NATIVE_ADDON_ABSENT_CODE` when no addon is
+ *   installed for this platform.
+ * @throws {ValidationError} `NATIVE_ADDON_LOAD_FAILED_CODE` when the addon is
+ *   installed and failed to load.
  */
 export function loadNativeAddon(): NativeAddon {
   if (_nativeAddon !== null) {
     return _nativeAddon;
   }
 
-  const packageName = resolveNapiPackage();
-  let addon: NativeAddon;
-  try {
-    const req = createRequire(import.meta.url);
-    addon = req(packageName) as NativeAddon;
-  } catch {
-    throw new TransportError(
-      `Failed to load native addon ${packageName}. ` +
-        `Ensure the package is installed: npm install ${packageName}`,
-      "SCP-TRANS-5001",
-    );
-  }
+  const addon = requireNativeAddon(resolveNapiPackage(), createRequire(import.meta.url));
 
   // Freeze before caching: any later code path holding the addon
   // reference (the `addon` closure local in createNativeBridge, or any
@@ -150,6 +208,24 @@ export function loadNativeAddon(): NativeAddon {
   Object.freeze(addon);
   _nativeAddon = addon;
   return _nativeAddon;
+}
+
+/**
+ * Returns a view of `addon` whose every named read goes through
+ * {@link requireAddonExport}.
+ *
+ * `createNativeBridge` reads module-level free functions as `addon.X`. On a
+ * stale addon that loaded without `X`, a plain read returns `undefined` and
+ * the call throws a bare `TypeError`. Through this view the read throws
+ * `ValidationError` `SCP-VALID-7082`, the load-failure code.
+ *
+ * @internal
+ */
+export function checkedAddon(addon: NativeAddon): NativeAddon {
+  return new Proxy(addon, {
+    get: (target, name) =>
+      typeof name === "string" ? requireAddonExport(target, name) : Reflect.get(target, name),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +248,7 @@ export function loadNativeAddon(): NativeAddon {
  * @internal
  */
 export function createNativeBridge(scp: SCP): Bridge {
-  const addon = loadNativeAddon();
+  const addon = checkedAddon(loadNativeAddon());
   // Type-erased native handle — every NAPI `Scp` class method shares
   // the `async (...args) => unknown` shape after FFI monomorphization,
   // and routing requires dynamic lookup by camelCase method name.
