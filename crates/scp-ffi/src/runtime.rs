@@ -1993,9 +1993,9 @@ pub(crate) fn readmit_context(
 /// A close decides from a lifecycle read taken before it releases, so the id
 /// can return to `Active`, and be readmitted, in between. When the re-read,
 /// taken after the mark went in, reports `Active`, this clears the mark unless
-/// a later mark replaced it, removes nothing, and returns `false`. On any other answer, a failed read
-/// included, it removes the state while the mark stands, leaves the mark set,
-/// and returns `true`. When the mark is gone by the time of the removal, it
+/// a later mark replaced it, removes nothing, and returns `false`. On any
+/// other answer, a failed read included, it removes the state while the mark
+/// stands, leaves the mark set, and returns `true`. When the mark is gone by the time of the removal, it
 /// removes nothing and returns `false`.
 pub fn release_context_unless_readmitted(
     bi: &PyBridgeInstance,
