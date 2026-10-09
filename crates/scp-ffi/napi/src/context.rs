@@ -6372,111 +6372,6 @@ mod tests {
         assert!(crate::runtime::has_release_mark(&bi, &ctx_id));
     }
 
-    /// Marking a new id at `MAX_RELEASED_CONTEXTS` marks evicts the earliest
-    /// mark with no unsettled close and no live handle; re-marking an id that
-    /// already holds a mark evicts none, a mark whose close is unsettled is
-    /// never evicted, and a mark whose id a live handle names is never
-    /// evicted, so that handle's `ensure_registered` still refuses.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn marking_past_the_cap_evicts_the_earliest_settled_mark() {
-        use crate::runtime::{MAX_RELEASED_CONTEXTS, ReleaseMark};
-
-        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        let now = std::time::Instant::now();
-        let earlier = now
-            .checked_sub(std::time::Duration::from_secs(2))
-            .expect("two seconds before now is representable");
-        let middle = now
-            .checked_sub(std::time::Duration::from_secs(1))
-            .expect("one second before now is representable");
-        let mark_count = || crate::runtime::lock_release_marks(&bi).len();
-        let held = active_handle_for(&bi, "earliest-held", "did:key:z6MkNapiMarkCap");
-        {
-            let mut marks = crate::runtime::lock_release_marks(&bi);
-            marks.insert(
-                "earliest-held".to_owned(),
-                ReleaseMark {
-                    at: earlier,
-                    in_flight: 0,
-                    generation: 0,
-                },
-            );
-            marks.insert(
-                "earliest-in-flight".to_owned(),
-                ReleaseMark {
-                    at: earlier,
-                    in_flight: 1,
-                    generation: 0,
-                },
-            );
-            marks.insert(
-                "earliest-settled".to_owned(),
-                ReleaseMark {
-                    at: middle,
-                    in_flight: 0,
-                    generation: 0,
-                },
-            );
-            for i in 3..MAX_RELEASED_CONTEXTS {
-                marks.insert(
-                    format!("mark-{i}"),
-                    ReleaseMark {
-                        at: now,
-                        in_flight: 0,
-                        generation: 0,
-                    },
-                );
-            }
-        }
-        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
-
-        let _ticket = crate::runtime::mark_released(&bi, "mark-3");
-        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
-        assert!(
-            crate::runtime::has_release_mark(&bi, "earliest-settled"),
-            "re-marking a marked id must evict nothing"
-        );
-
-        // A live handle keeps the new mark past the release's prune.
-        let _newest = active_handle_for(&bi, "newest", "did:key:z6MkNapiMarkCap");
-        crate::runtime::release_context(&bi, "newest");
-        assert_eq!(mark_count(), MAX_RELEASED_CONTEXTS);
-        assert!(crate::runtime::has_release_mark(&bi, "newest"));
-        assert!(
-            crate::runtime::has_release_mark(&bi, "earliest-in-flight"),
-            "a mark whose close is unsettled must not be evicted"
-        );
-        assert!(
-            !crate::runtime::has_release_mark(&bi, "earliest-settled"),
-            "a new mark at the cap must evict the earliest settled mark"
-        );
-        assert!(
-            crate::runtime::has_release_mark(&bi, "earliest-held"),
-            "a mark whose id a live handle names must not be evicted"
-        );
-        match crate::runtime::ensure_registered(&bi, &held) {
-            Err(crate::error::ScpNapiError::Context { code, .. }) => {
-                assert_eq!(code, codes::CTX_2023);
-            }
-            other => panic!("a held handle of a marked id must refuse a rebuild, got {other:?}"),
-        }
-        assert!(
-            crate::runtime::with_context(&bi, "earliest-held", |_| Ok(())).is_err(),
-            "the refusal must build no state"
-        );
-
-        for mark in crate::runtime::lock_release_marks(&bi).values_mut() {
-            mark.in_flight = 1;
-        }
-        let _over = active_handle_for(&bi, "over-the-cap", "did:key:z6MkNapiMarkCap");
-        crate::runtime::release_context(&bi, "over-the-cap");
-        assert_eq!(
-            mark_count(),
-            MAX_RELEASED_CONTEXTS + 1,
-            "with every close unsettled, a new mark must evict none"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_mark_lasts_until_the_last_handle_for_the_id_drops() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6992,6 +6887,16 @@ mod tests {
         super::NapiContextHandle::test_active_on(bi, context_id.to_owned(), creator_did.to_owned())
     }
 
+    /// Builds the handle [`active_handle_for`] builds, naming
+    /// `crate::runtime::KEYLESS_HANDLE_CREATOR` as its creator, a creator no
+    /// supervisor context holds.
+    fn keyless_creator_handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+    ) -> super::NapiContextHandle {
+        active_handle_for(bi, context_id, crate::runtime::KEYLESS_HANDLE_CREATOR)
+    }
+
     /// Builds a handle for `context_id` whose `ceiling` is the wide default,
     /// while the supervisor actor for that context holds a narrower ceiling.
     ///
@@ -7120,8 +7025,9 @@ mod tests {
     /// Active supervisor context the owner created with `ceiling`, then mints a
     /// `messages:write` token from the owner to the holder in that context.
     ///
-    /// Returns the bridge instance, the handle, the token, its capability URI,
-    /// the owner DID, and the holder DID.
+    /// Returns the bridge instance, the handle [`keyless_creator_handle_for`]
+    /// builds, the token, its capability URI, the owner DID, and the holder
+    /// DID.
     #[cfg(feature = "testing")]
     async fn active_context_with_token(
         scp: &crate::scp::Scp,
@@ -7156,7 +7062,7 @@ mod tests {
         .await
         .expect("test supervisor context creation must succeed");
         crate::runtime::register_test_context(&bi, &ctx_id);
-        let handle = active_handle_for(&bi, &ctx_id, &owner_did);
+        let handle = keyless_creator_handle_for(&bi, &ctx_id);
         let token = crate::ucan::ucan_mint_on(
             &bi,
             &handle,
@@ -7374,7 +7280,7 @@ mod tests {
         .await
         .expect("test supervisor context creation must succeed");
         crate::runtime::register_test_context(&bi, &narrow_id);
-        let narrow = active_handle_for(&bi, &narrow_id, &owner_did);
+        let narrow = keyless_creator_handle_for(&bi, &narrow_id);
 
         for (handle, inside) in [(&wide, true), (&narrow, false)] {
             let evaluation = crate::ucan::ucan_evaluate_on(
@@ -7533,7 +7439,7 @@ mod tests {
             .await
             .expect("test supervisor context creation must succeed");
         crate::runtime::register_test_context(&bi, &ctx_id);
-        let handle = active_handle_for(&bi, &ctx_id, crate::runtime::KEYLESS_HANDLE_CREATOR);
+        let handle = keyless_creator_handle_for(&bi, &ctx_id);
         assert_ne!(issuer_did, creator_did);
         assert_ne!(issuer_did, crate::runtime::KEYLESS_HANDLE_CREATOR);
 
@@ -9553,8 +9459,9 @@ mod tests {
 
     /// Outlet invocation, cross-context invocation, session invocation,
     /// exposure and acceptance pass with the ceiling, roles and creator the
-    /// supervisor holds. The bridge's UCAN state holds no ceiling and no
-    /// creator for any of them to read instead.
+    /// supervisor holds. Both handles name
+    /// `crate::runtime::KEYLESS_HANDLE_CREATOR`, so a call that took the
+    /// creator from a handle fails.
     #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outlet_authorization_follows_the_supervisor_not_the_bridge_copy() {
@@ -9576,7 +9483,7 @@ mod tests {
             .await
             .expect("test supervisor context creation must succeed");
         crate::runtime::register_test_context(&bi, &source_id);
-        let source = active_handle_for(&bi, &source_id, &owner_did);
+        let source = keyless_creator_handle_for(&bi, &source_id);
 
         let outlet_id = crate::outlets::outlet_register_on(
             &bi,

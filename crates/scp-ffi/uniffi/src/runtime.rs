@@ -1235,8 +1235,9 @@ impl UniffiBridgeInstance {
 
     /// Builds UCAN validation state for `context_id` only when this instance
     /// holds none for it, the supervisor reports the context `Active`, and no
-    /// release mark stands on the id. On any other supervisor answer, a failed
-    /// state read included, it registers nothing and returns `Ok(())`.
+    /// release mark stands on the id. On any other supervisor answer it
+    /// registers nothing and returns `Ok(())`; a failed state read registers
+    /// nothing and returns that read's error.
     ///
     /// The ungated builder is private, so a direct call does not compile:
     ///
@@ -1254,7 +1255,8 @@ impl UniffiBridgeInstance {
     ///
     /// # Errors
     ///
-    /// Returns the error [`Self::context_manager_or_error`] returns, unchanged.
+    /// Returns the error [`Self::context_manager_or_error`] returns, unchanged,
+    /// and the error [`Self::ensure_ucan_registered_while_active_on`] returns.
     pub async fn ensure_ucan_registered_while_active(
         &self,
         context_id: &str,
@@ -1264,37 +1266,41 @@ impl UniffiBridgeInstance {
         }
         let supervisor = self.context_manager_or_error()?;
         self.ensure_ucan_registered_while_active_on(supervisor, context_id)
-            .await;
-        Ok(())
+            .await
     }
 
     /// Builds UCAN validation state for `context_id` only when this instance
     /// holds none for it, `supervisor` reports the context `Active`, and no
-    /// release mark stands on the id. On any other answer, a failed state read
-    /// included, it registers nothing.
+    /// release mark stands on the id. On any other answer it registers
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error `supervisor`'s lifecycle state read returns, as
+    /// [`Self::read_live_context_state`] maps it, and registers nothing.
     pub(crate) async fn ensure_ucan_registered_while_active_on(
         &self,
         supervisor: &scp_core::context::supervisor::Supervisor,
         context_id: &str,
-    ) {
+    ) -> Result<(), crate::ScpError> {
         if self.ucan_registry.contains_key(context_id) {
-            return;
+            return Ok(());
         }
-        match supervisor.read_context_state_checked(context_id).await {
-            Ok(Some(scp_core::context::ContextState::Active)) => {
+        match supervisor
+            .read_context_state_checked(context_id)
+            .await
+            .map_err(crate::ScpError::from)?
+        {
+            Some(scp_core::context::ContextState::Active) => {
                 self.ensure_ucan_registered(context_id);
             }
-            Ok(state) => tracing::debug!(
+            state => tracing::debug!(
                 context = %context_id,
                 ?state,
                 "UCAN state not registered: the supervisor does not report the context Active"
             ),
-            Err(e) => tracing::debug!(
-                context = %context_id,
-                error = %e,
-                "UCAN state not registered: the lifecycle state read failed"
-            ),
         }
+        Ok(())
     }
 
     /// Builds UCAN validation state for `context_id` without reading the

@@ -10894,8 +10894,18 @@ impl Scp {
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
-                bi.ensure_ucan_registered_while_active_on(sup, &context_id)
-                    .await;
+                // The context is already created, so a failed lifecycle read
+                // is logged here and the create still returns its handle.
+                if let Err(e) = bi
+                    .ensure_ucan_registered_while_active_on(sup, &context_id)
+                    .await
+                {
+                    tracing::debug!(
+                        context = %context_id,
+                        error = %e,
+                        "UCAN state not registered: the lifecycle state read failed"
+                    );
+                }
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -21437,6 +21447,47 @@ mod tests {
         );
     }
 
+    /// `ensure_ucan_registered_while_active` and
+    /// `ensure_ucan_registered_while_active_on` return a failed lifecycle read
+    /// as its error (`SCP-CTX-2135` for an actor mid-respawn) and build no
+    /// UCAN state.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ensure_while_active_returns_a_failed_state_read() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("context_create resolved a supervisor"),
+        );
+        scp.inner.remove_ucan_state(&context_id);
+        rt.block_on(sup.test_hold_context_mid_respawn(&context_id));
+
+        let err = rt
+            .block_on(scp.inner.ensure_ucan_registered_while_active(&context_id))
+            .expect_err("a read of an actor mid-respawn must fail");
+        assert_eq!(context_code_of(err), codes::CTX_2135);
+        let err = rt
+            .block_on(
+                scp.inner
+                    .ensure_ucan_registered_while_active_on(&sup, &context_id),
+            )
+            .expect_err("a read of an actor mid-respawn must fail");
+        assert_eq!(context_code_of(err), codes::CTX_2135);
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "a failed state read must build no UCAN state"
+        );
+    }
+
     /// `ensure_ucan_registered_while_active_on` builds UCAN state for a
     /// context the passed supervisor reports `Active`, and builds none for an
     /// `Active` context that carries a release mark or for an id no actor
@@ -21462,7 +21513,8 @@ mod tests {
         rt.block_on(
             scp.inner
                 .ensure_ucan_registered_while_active_on(&sup, &active),
-        );
+        )
+        .expect("the read of an Active context must succeed");
         assert!(
             scp.inner.with_ucan_state(&active, |_| ()).is_some(),
             "an Active context must get UCAN state"
@@ -21472,7 +21524,8 @@ mod tests {
         rt.block_on(
             scp.inner
                 .ensure_ucan_registered_while_active_on(&sup, &active),
-        );
+        )
+        .expect("the read of an Active context must succeed");
         assert!(
             scp.inner.with_ucan_state(&active, |_| ()).is_none(),
             "a release mark must stop the build even while the supervisor reports Active"
@@ -21482,7 +21535,8 @@ mod tests {
         rt.block_on(
             scp.inner
                 .ensure_ucan_registered_while_active_on(&sup, &absent),
-        );
+        )
+        .expect("the read of an id no actor serves must succeed");
         assert!(
             scp.inner.with_ucan_state(&absent, |_| ()).is_none(),
             "an id no actor serves must not get UCAN state"

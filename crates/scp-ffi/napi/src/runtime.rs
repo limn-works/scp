@@ -197,8 +197,6 @@ pub struct NapiBridgeInstance {
     /// release removed.
     ///
     /// [`ensure_registered`] refuses to rebuild an entry for a marked id.
-    /// Marking a new id at [`MAX_RELEASED_CONTEXTS`] marks first removes the
-    /// earliest mark with no unsettled close and no live handle.
     pub(crate) released_contexts: std::sync::Mutex<HashMap<String, ReleaseMark>>,
 
     /// Generation the next newly created release mark receives.
@@ -1805,16 +1803,10 @@ pub fn ensure_registered(
     Ok(())
 }
 
-/// Mark count at which marking a new id first removes the earliest mark that
-/// has no unsettled close and no live handle.
-pub(crate) const MAX_RELEASED_CONTEXTS: usize = 10_000;
-
-/// One release mark: the instant it was last set, the number of closes that
-/// set it and have not yet settled, and the generation it took when it was
-/// created.
+/// One release mark: the number of closes that set it and have not yet
+/// settled, and the generation it took when it was created.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReleaseMark {
-    pub(crate) at: std::time::Instant,
     pub(crate) in_flight: usize,
     pub(crate) generation: u64,
 }
@@ -1836,39 +1828,22 @@ pub(crate) fn lock_release_marks(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Sets the release mark on `context_id` to the current instant, adds
-/// `in_flight` to its count of unsettled closes, and returns the mark's
-/// generation. A mark created by this call takes a generation no earlier mark
-/// of this instance took; a mark that already stands keeps its generation.
-/// When `marks` holds [`MAX_RELEASED_CONTEXTS`] marks and `context_id` has
-/// none, first removes the earliest mark whose count of unsettled closes is
-/// zero and whose id `context_handles` counts no live handle for.
+/// Sets the release mark on `context_id`, adds `in_flight` to its count of
+/// unsettled closes, and returns the mark's generation. A mark created by this
+/// call takes a generation no earlier mark of this instance took; a mark that
+/// already stands keeps its generation.
 fn set_release_mark(
     marks: &mut HashMap<String, ReleaseMark>,
-    context_handles: &DashMap<String, usize>,
     next_generation: &std::sync::atomic::AtomicU64,
     context_id: &str,
     in_flight: usize,
 ) -> u64 {
-    if !marks.contains_key(context_id) && marks.len() >= MAX_RELEASED_CONTEXTS {
-        let oldest = marks
-            .iter()
-            .filter(|(id, mark)| mark.in_flight == 0 && !context_handles.contains_key(*id))
-            .min_by_key(|(_, mark)| mark.at)
-            .map(|(id, _)| id.clone());
-        if let Some(oldest) = oldest {
-            marks.remove(&oldest);
-        }
-    }
-    let now = std::time::Instant::now();
     let mark = marks
         .entry(context_id.to_owned())
         .or_insert_with(|| ReleaseMark {
-            at: now,
             in_flight: 0,
             generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         });
-    mark.at = now;
     mark.in_flight = mark.in_flight.saturating_add(in_flight);
     mark.generation
 }
@@ -1902,13 +1877,7 @@ fn remove_registry_entry(entry: dashmap::mapref::entry::Entry<'_, String, UcanCo
 pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
     let entry = ucan_registry(bi).entry(context_id.to_owned());
     let mut marks = lock_release_marks(bi);
-    set_release_mark(
-        &mut marks,
-        &bi.context_handles,
-        &bi.next_release_generation,
-        context_id,
-        0,
-    );
+    set_release_mark(&mut marks, &bi.next_release_generation, context_id, 0);
     bi.core.remove_known_context(context_id);
     remove_registry_entry(entry);
     prune_marked(bi, &mut marks, context_id);
@@ -1920,7 +1889,6 @@ pub fn release_context(bi: &NapiBridgeInstance, context_id: &str) {
 pub(crate) fn mark_released(bi: &NapiBridgeInstance, context_id: &str) -> ReleaseTicket {
     let generation = set_release_mark(
         &mut lock_release_marks(bi),
-        &bi.context_handles,
         &bi.next_release_generation,
         context_id,
         1,
@@ -1992,8 +1960,7 @@ fn readmit_ticketed(bi: &NapiBridgeInstance, ticket: &ReleaseTicket) {
 /// answer, a failed read included, it runs [`remove_context_while_released`]
 /// with `teardown` and returns its result: `true` when the mark stood under
 /// the generation this call set or joined, so the state was removed and
-/// `teardown` ran, and `false` otherwise. A mark this call holds is never
-/// evicted, because its close stays unsettled until the removal.
+/// `teardown` ran, and `false` otherwise.
 pub async fn release_context_unless_readmitted(
     bi: &NapiBridgeInstance,
     context_id: &str,
