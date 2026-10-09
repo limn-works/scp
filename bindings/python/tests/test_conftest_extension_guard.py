@@ -35,7 +35,7 @@ import ast
 import inspect
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -247,23 +247,55 @@ def test_module_guard_reraises_its_own_error_when_the_extension_loads(
     assert caught.value is guard_error
 
 
-class _SkipSiteCollector(ast.NodeVisitor):
-    """Collect every skip site in one module with the function that encloses it.
+class _SkipSite(NamedTuple):
+    """One skip site: the function that encloses it (``"<module>"`` at module
+    level), its kind, the ``skipif`` condition (``None`` for every other kind),
+    and its reason expression (``None`` when the site has none the scan reads)."""
 
-    A skip site is any spelling that can skip a module or a test: a ``.skip(...)``
-    call (``pytest.skip`` in a module, a fixture or a test body, and the
-    ``pytest.mark.skip(...)`` marker), a ``.skipif(...)`` marker, a
-    ``.importorskip(...)`` call, and a bare ``pytest.mark.skip`` attribute used as
-    a decorator or a ``pytestmark`` value. Each site is recorded as
-    ``(enclosing function name or "<module>", reason expression)``. A site whose
-    reason the scan cannot trace records ``None``: an ``importorskip``, which
-    decides from its own import, and an unconditional bare marker.
+    where: str
+    kind: str
+    condition: ast.expr | None
+    reason: ast.expr | None
+
+
+#: Call names that skip, as an attribute (``pytest.skip``, ``pytest.mark.skipif``,
+#: ``unittest.skipIf``, ``self.skipTest``) or as a bare name imported from
+#: ``pytest`` or ``unittest``, mapped to the site kind each records.
+_SKIP_CALLS = {
+    "skip": "skip",
+    "skipif": "skipif",
+    "importorskip": "importorskip",
+    "skipIf": "unittest",
+    "skipUnless": "unittest",
+    "skipTest": "unittest",
+}
+
+#: Exception classes whose ``raise`` skips a test.
+_SKIP_EXCEPTIONS = {"SkipTest", "Skipped"}
+
+
+class _SkipSiteCollector(ast.NodeVisitor):
+    """Collect the skip sites in one module.
+
+    It records a ``.skip(...)``, ``.skipif(...)``, ``.importorskip(...)``,
+    ``.skipIf(...)``, ``.skipUnless(...)`` or ``.skipTest(...)`` call on any
+    object; the same names called bare after ``from pytest import ...`` or
+    ``from unittest import ...``, under any alias; a bare ``pytest.mark.skip``
+    attribute used as a decorator or a ``pytestmark`` value; and a ``raise`` of
+    ``<x>.skip.Exception``, ``SkipTest`` or ``Skipped``.
     """
 
-    def __init__(self) -> None:
-        self.sites: list[tuple[str, ast.expr | None]] = []
+    def __init__(self, tree: ast.Module) -> None:
+        self.sites: list[_SkipSite] = []
         self._scope: list[str] = []
         self._called: set[int] = set()
+        self._aliases = {
+            alias.asname or alias.name: alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] in {"pytest", "_pytest", "unittest"}
+            for alias in node.names
+        }
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self._scope.append(node.name)
@@ -276,18 +308,36 @@ class _SkipSiteCollector(ast.NodeVisitor):
     def _where(self) -> str:
         return self._scope[-1] if self._scope else "<module>"
 
+    def _callee(self, func: ast.expr) -> str | None:
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        if isinstance(func, ast.Name):
+            return self._aliases.get(func.id)
+        return None
+
     def visit_Call(self, node: ast.Call) -> None:
-        if isinstance(node.func, ast.Attribute):
-            self._called.add(id(node.func))
-            keywords = {kw.arg: kw.value for kw in node.keywords}
-            attr = node.func.attr
-            if attr == "importorskip":
-                self.sites.append((self._where(), None))
-            elif attr == "skipif":
-                self.sites.append((self._where(), keywords.get("reason")))
-            elif attr == "skip":
-                reason = node.args[0] if node.args else keywords.get("reason", keywords.get("msg"))
-                self.sites.append((self._where(), reason))
+        self._called.add(id(node.func))
+        kind = _SKIP_CALLS.get(self._callee(node.func) or "")
+        keywords = {kw.arg: kw.value for kw in node.keywords}
+        if kind == "skipif":
+            condition = node.args[0] if len(node.args) == 1 else None
+            self.sites.append(_SkipSite(self._where(), kind, condition, keywords.get("reason")))
+        elif kind == "skip":
+            reason = node.args[0] if node.args else keywords.get("reason", keywords.get("msg"))
+            self.sites.append(_SkipSite(self._where(), kind, None, reason))
+        elif kind is not None:
+            self.sites.append(_SkipSite(self._where(), kind, None, None))
+        self.generic_visit(node)
+
+    def visit_Raise(self, node: ast.Raise) -> None:
+        exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+        raises_skip = (
+            isinstance(exc, ast.Attribute)
+            and exc.attr == "Exception"
+            and self._callee(exc.value) == "skip"
+        ) or (exc is not None and self._callee(exc) in _SKIP_EXCEPTIONS)
+        if raises_skip:
+            self.sites.append(_SkipSite(self._where(), "raise", None, None))
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -296,24 +346,19 @@ class _SkipSiteCollector(ast.NodeVisitor):
         # ``mark.skip(...)`` is not counted a second time here.
         if (
             node.attr == "skip"
-            and isinstance(node.value, ast.Attribute)
-            and node.value.attr == "mark"
+            and self._callee(node.value) == "mark"
             and id(node) not in self._called
         ):
-            self.sites.append((self._where(), None))
+            self.sites.append(_SkipSite(self._where(), "skip", None, None))
         self.generic_visit(node)
 
 
-def _skip_sites(source: str) -> list[tuple[str, ast.expr | None]]:
-    """Every skip site in ``source`` as ``(enclosing function, reason expression)``."""
-    collector = _SkipSiteCollector()
-    collector.visit(ast.parse(source))
+def _skip_sites(source: str) -> list[_SkipSite]:
+    """Every skip site in ``source``."""
+    tree = ast.parse(source)
+    collector = _SkipSiteCollector(tree)
+    collector.visit(tree)
     return collector.sites
-
-
-def _skip_site_reasons(source: str) -> list[ast.expr | None]:
-    """The reason expression of every skip site in ``source``."""
-    return [reason for _, reason in _skip_sites(source)]
 
 
 def _is_absence_call(expr: ast.expr | None) -> bool:
@@ -324,39 +369,91 @@ def _is_absence_call(expr: ast.expr | None) -> bool:
     )
 
 
-def _is_absence_reason(reason: ast.expr | None, source: str = "") -> bool:
-    """Whether ``reason`` comes from ``skip_reason_if_extension_absent``.
-
-    A direct call qualifies. So does a module variable (optionally written
-    ``name or ""``, the form a ``skipif`` marker needs) when every value
-    ``source`` assigns to it is ``None`` or a direct call and at least one is a
-    call: the ``_NATIVE_SKIP_REASON`` shape in ``test_join_from_welcome.py``.
+def _is_absence_variable(name: str, source: str) -> bool:
+    """Whether every binding of ``name`` in ``source`` assigns ``None`` or a direct
+    ``skip_reason_if_extension_absent(...)`` call to the bare name, and at least
+    one assigns the call: the ``_NATIVE_SKIP_REASON`` shape in
+    ``test_join_from_welcome.py``. A bare annotation binds nothing. Any other
+    binding (an augmented assignment, a walrus, a ``for`` or ``with`` target, a
+    tuple target, an import, a ``def``, a ``del``, a ``global``) rejects the name.
     """
-    if _is_absence_call(reason):
-        return True
-    if isinstance(reason, ast.BoolOp) and isinstance(reason.op, ast.Or):
-        reason = reason.values[0]
-    if not isinstance(reason, ast.Name) or not source:
-        return False
-    values = [
-        node.value
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        and node.value is not None
-        and any(
-            isinstance(t, ast.Name) and t.id == reason.id
-            for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+    tree = ast.parse(source)
+    allowed: set[int] = set()
+    calls = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign) and node.value is None:
+            allowed.add(id(node.target))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if not (
+                _is_absence_call(value) or (isinstance(value, ast.Constant) and value.value is None)
+            ):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    allowed.add(id(target))
+                    calls += target.id == name and _is_absence_call(value)
+    bindings = [
+        node
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id == name
         )
+        or (isinstance(node, ast.alias) and (node.asname or node.name).split(".")[0] == name)
+        or (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == name
+        )
+        or (isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names)
     ]
-    return any(_is_absence_call(v) for v in values) and all(
-        _is_absence_call(v) or (isinstance(v, ast.Constant) and v.value is None) for v in values
-    )
+    return calls > 0 and all(id(b) in allowed for b in bindings)
+
+
+def _site_consults_loader(site: _SkipSite, source: str) -> bool:
+    """Whether ``site`` skips only on the loader's SCP-VALID-7081 answer.
+
+    A ``skip`` qualifies when its reason is a direct
+    ``skip_reason_if_extension_absent(...)`` call, which raises unless the
+    extension is absent. A ``skipif`` qualifies when its condition or its reason
+    is such a call, or when its single condition is exactly ``<name> is not None``
+    and its reason is ``<name>`` or ``<name> or "<text>"`` for one name that
+    ``_is_absence_variable`` accepts. No other kind qualifies.
+    """
+    if site.kind == "skip":
+        return _is_absence_call(site.reason)
+    if site.kind != "skipif":
+        return False
+    if _is_absence_call(site.condition) or _is_absence_call(site.reason):
+        return True
+    condition, reason = site.condition, site.reason
+    if not (
+        isinstance(condition, ast.Compare)
+        and isinstance(condition.left, ast.Name)
+        and len(condition.ops) == 1
+        and isinstance(condition.ops[0], ast.IsNot)
+        and isinstance(condition.comparators[0], ast.Constant)
+        and condition.comparators[0].value is None
+    ):
+        return False
+    name = condition.left.id
+    if (
+        isinstance(reason, ast.BoolOp)
+        and isinstance(reason.op, ast.Or)
+        and len(reason.values) == 2
+        and isinstance(reason.values[1], ast.Constant)
+        and isinstance(reason.values[1].value, str)
+    ):
+        reason = reason.values[0]
+    return isinstance(reason, ast.Name) and reason.id == name and _is_absence_variable(name, source)
 
 
 #: The repository root: ``bindings/python/tests/conftest.py`` sits three levels below it.
 _REPO_ROOT = Path(conftest.__file__).resolve().parents[3]
 
-#: Skip sites whose reason does not come from ``skip_reason_if_extension_absent``,
+#: Skip sites that ``_site_consults_loader`` rejects,
 #: keyed by ``(repository-relative file, enclosing function)``, with the exact
 #: number of such sites in that function. The scan fails when the sites it finds
 #: differ from this table in either direction, so a new site fails and so does an
@@ -385,14 +482,14 @@ def _scanned_test_files() -> list[Path]:
 
 def _non_loader_skip_sites(paths: list[Path], root: Path) -> dict[tuple[str, str], int]:
     """Count, per ``(file relative to root, enclosing function)``, the skip sites
-    in ``paths`` whose reason does not come from ``skip_reason_if_extension_absent``."""
+    in ``paths`` that ``_site_consults_loader`` rejects."""
     counts: dict[tuple[str, str], int] = {}
     for path in paths:
         source = path.read_text()
-        for where, reason in _skip_sites(source):
-            if _is_absence_reason(reason, source):
+        for site in _skip_sites(source):
+            if _site_consults_loader(site, source):
                 continue
-            key = (path.relative_to(root).as_posix(), where)
+            key = (path.relative_to(root).as_posix(), site.where)
             counts[key] = counts.get(key, 0) + 1
     return counts
 
@@ -400,8 +497,8 @@ def _non_loader_skip_sites(paths: list[Path], root: Path) -> dict[tuple[str, str
 def test_every_skip_site_takes_its_reason_from_the_absence_check() -> None:
     """CRITERION: every skip site in a Python test file that imports the SDK —
     under `bindings/python/tests` (including `bridge_parity/`) or the
-    repository-root `tests/` — takes its reason from
-    `skip_reason_if_extension_absent`, so no module or test skips over a present
+    repository-root `tests/` — skips only on `skip_reason_if_extension_absent`'s
+    answer, as `_site_consults_loader` defines it, so no module or test skips over a present
     extension that failed to load (SCP-VALID-7082) or lacks an export it calls.
     The only exceptions are the sites `_NON_LOADER_SKIP_SITES` names; each one is
     conditioned on SCP-VALID-7081 by other means or gates on something other than
@@ -454,11 +551,40 @@ def test_the_skip_scan_reads_the_bridge_parity_package() -> None:
 
 
 def test_the_skip_scan_accepts_the_skipif_shape_that_consults_the_loader() -> None:
-    """The `skipif` guard in test_join_from_welcome.py passes the scan."""
-    source = (Path(conftest.__file__).parent / "test_join_from_welcome.py").read_text()
-    reasons = _skip_site_reasons(source)
-    assert reasons
-    assert all(_is_absence_reason(r, source) for r in reasons)
+    """The `skipif` guards in test_join_from_welcome.py and the Phase 3
+    integration test pass the scan."""
+    for path in (
+        Path(conftest.__file__).parent / "test_join_from_welcome.py",
+        _REPO_ROOT / "tests/integration/phase3_integration_test.py",
+    ):
+        source = path.read_text()
+        sites = _skip_sites(source)
+        assert [site.kind for site in sites] == ["skipif"], path
+        assert _site_consults_loader(sites[0], source), path
+
+
+_ABSENCE_VARIABLE = (
+    "_R: str | None\ntry:\n    import x\n    _R = None\n"
+    "except Exception as e:\n    _R = skip_reason_if_extension_absent(e)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "pytest.skip(skip_reason_if_extension_absent(e), allow_module_level=True)\n",
+        "m = pytest.mark.skipif(skip_reason_if_extension_absent(e), reason='absent')\n",
+        "m = pytest.mark.skipif(True, reason=skip_reason_if_extension_absent(e))\n",
+        _ABSENCE_VARIABLE + "m = pytest.mark.skipif(_R is not None, reason=_R or '')\n",
+        _ABSENCE_VARIABLE + "m = pytest.mark.skipif(_R is not None, reason=_R)\n",
+        "from pytest import skip as s\ns(skip_reason_if_extension_absent(e))\n",
+    ],
+)
+def test_the_skip_scan_accepts_each_shape_that_consults_the_loader(source: str) -> None:
+    """POSITIVE CONTROL: each conforming spelling is one site the scan accepts."""
+    sites = _skip_sites(source)
+    assert len(sites) == 1
+    assert _site_consults_loader(sites[0], source)
 
 
 @pytest.mark.parametrize(
@@ -474,13 +600,36 @@ def test_the_skip_scan_accepts_the_skipif_shape_that_consults_the_loader() -> No
         "def test_x():\n    pytest.skip('native extension missing')\n",
         "@pytest.mark.skip(reason='no native')\ndef test_x():\n    pass\n",
         "pytestmark = pytest.mark.skip\n",
+        # A conforming reason variable over a condition that is not its absence.
+        _ABSENCE_VARIABLE + "m = pytest.mark.skipif(not hasattr(x, 'f'), "
+        "reason=_R or 'rebuild with testing')\n",
+        _ABSENCE_VARIABLE + "m = pytest.mark.skipif(_R is not None or not hasattr(x, 'f'), "
+        "reason=_R or '')\n",
+        _ABSENCE_VARIABLE + "m = pytest.mark.skipif(_R is not None, not hasattr(x, 'f'), "
+        "reason=_R or '')\n",
+        _ABSENCE_VARIABLE + "_O = None\nm = pytest.mark.skipif(_O is not None, reason=_R or '')\n",
+        # A fallback after ``or`` that is not a string literal.
+        _ABSENCE_VARIABLE + "m = pytest.mark.skipif(_R is not None, reason=_R or _R or '')\n",
+        # The variable is rebound by something other than None or the helper call.
+        _ABSENCE_VARIABLE + "_R += ''\nm = pytest.mark.skipif(_R is not None, reason=_R)\n",
+        _ABSENCE_VARIABLE + "for _R in ['x']:\n    pass\n"
+        "m = pytest.mark.skipif(_R is not None, reason=_R)\n",
+        # Spellings that do not call through an attribute.
+        "from pytest import skip\ndef test_x():\n    skip('no native')\n",
+        "from pytest import importorskip as ios\nios('_scp_core')\n",
+        "from pytest import mark\n@mark.skip\ndef test_x():\n    pass\n",
+        "def test_x():\n    raise pytest.skip.Exception('no native')\n",
+        "def test_x():\n    raise unittest.SkipTest('no native')\n",
+        "from unittest import SkipTest\ndef test_x():\n    raise SkipTest\n",
+        "@unittest.skipIf(True, 'no native')\ndef test_x():\n    pass\n",
+        "def test_x(self):\n    self.skipTest('no native')\n",
     ],
 )
 def test_the_skip_scan_rejects_skips_that_do_not_consult_the_loader(source: str) -> None:
-    """NEGATIVE CONTROL: every other skip spelling fails the scan."""
-    reasons = _skip_site_reasons(source)
-    assert len(reasons) == 1
-    assert not _is_absence_reason(reasons[0], source)
+    """NEGATIVE CONTROL: every other skip spelling is one site the scan rejects."""
+    sites = _skip_sites(source)
+    assert len(sites) == 1
+    assert not _site_consults_loader(sites[0], source)
 
 
 def test_the_skip_scan_rejects_a_hand_written_reason() -> None:
@@ -490,6 +639,6 @@ def test_the_skip_scan_rejects_a_hand_written_reason() -> None:
         "except (ImportError, AttributeError):\n"
         '    pytest.skip("not available", allow_module_level=True)\n'
     )
-    reasons = _skip_site_reasons(source)
-    assert len(reasons) == 1
-    assert not _is_absence_reason(reasons[0], source)
+    sites = _skip_sites(source)
+    assert len(sites) == 1
+    assert not _site_consults_loader(sites[0], source)
