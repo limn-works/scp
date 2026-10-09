@@ -63,7 +63,7 @@ Alec introduced the feature in planning session 02 (`.docs/planning-sessions/pla
 
 The bridge files moved from `scp-core` to `crates/scp-protocol/src/bridge/` after the stories closed, and the story text kept the `scp-core` paths. No governance action drove the registration that SCP-085 describes, as the ADR-023 entry states.
 
-**Cut.** The 2026-09-26 ruling, carried out by S1. S1 also removed the Bridge rows from SCP-104, the Phase 5 integration story, which now covers three ADRs and 8 tests where it covered four ADRs and 11 tests. S1 removed the `Bridge.*` cells and `bridgeRegister` items from SCP-302, the ADR-057 structured capability and trust validation story.
+**Cut.** The 2026-09-26 ruling, carried out by S1. S1 also removed the Bridge rows from SCP-104, the Phase 5 integration story, which now covers three ADRs and 8 tests where it covered four ADRs and 11 tests. S1 removed the `Bridge.*` cells and `bridgeRegister` items from SCP-302, the ADR-059 structured capability and trust validation story.
 
 **Code.** `crates/scp-protocol/src/bridge/{mod,registration,shadow,provenance,claiming}.rs`.
 
@@ -92,7 +92,7 @@ The FFI and SDK surface: `crates/scp-ffi/src/bridge_connector.rs` (PyO3), `crate
 
 **Origin.** Pull request #2120, "docs: capability injection & prove-absent dev backends — spec §17.17 + ADR-062 + 15-story PRD", added ADR-062, capability injection, and its PRD on 2026-07-14. Pull request #2136, "docs: correct ADR-062 over-scope", corrected their scope the same day. Pull request #2188, "feat(credentials): durable bridge-credential backend, delete impl Default, demote in-memory to test-only" (2026-08-01), implemented SCP-CAPINJECT-009. Pull request #2308, "fix(relay): relay WRITE-path + structural AC-6 publish seam" (2026-08-28), updated the story's verification text.
 
-**State at archiving.** SCP-CAPINJECT-009 had status `done`, verified by the test `bridge_credential_survives_store_drop_and_reopen`. The `FfiCredentialStore` enum in `crates/scp-ffi/common/src/credentials.rs` selected the store, and the PyO3, NAPI and UniFFI runtimes held it. ADR-062 classified credentials as capability E2 and gave it rollout slice 9; S1 renumbered the remaining slices 10 and 11 and retitled §5 to cover blob (E3) and the relay-publisher default (E4).
+**State at archiving.** SCP-CAPINJECT-009 had status `done`, verified by the test `bridge_credential_survives_store_drop_and_reopen`. The `FfiCredentialStore` enum in `crates/scp-ffi/common/src/credentials.rs` selected the store, and the PyO3, NAPI and UniFFI runtimes held it. ADR-062 classified credentials as capability E2 and gave it rollout slice 9; S1 deleted Slice 9, kept Slices 10 and 11 under their numbers, and retitled §5 to cover blob (E3) and the relay-publisher default (E4).
 
 **Cut.** The 2026-09-26 ruling, carried out by S1. The credentials capability existed only to hold bridge credentials, so it left with them.
 

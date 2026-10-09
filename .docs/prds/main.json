@@ -5795,7 +5795,7 @@
           "Phase 4 (UniFFI)"
         ]
       },
-      "result": "Phase 5 integration test created at crates/scp-core/tests/phase5_integration.rs with 8 tests covering media lifecycle (ADR-024), platform adapters (ADR-025), and cross-ADR integration. All tests pass. Swift SDK tests (ACs 4, 9) deferred to XCFramework build (SCP-103)."
+      "result": "Phase 5 integration test created at crates/scp-core/tests/phase5_integration.rs with 8 tests covering media lifecycle (ADR-024), platform adapters (ADR-025), and cross-ADR integration. All tests pass. Swift SDK tests (ACs 3, 7) deferred to XCFramework build (SCP-103)."
     },
     {
       "id": "SCP-105",
