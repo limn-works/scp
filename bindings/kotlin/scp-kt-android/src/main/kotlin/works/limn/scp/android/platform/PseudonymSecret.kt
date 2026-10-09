@@ -7,14 +7,12 @@ package works.limn.scp.android.platform
 
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.spec.NamedParameterSpec
 import javax.crypto.KeyGenerator
 import javax.crypto.Mac
 import javax.crypto.SecretKey
-import javax.crypto.spec.SecretKeySpec
 
 /**
  * The identity's `pseudonym_secret` (§9.10.4.A) and the context seed it keys:
@@ -23,14 +21,10 @@ import javax.crypto.spec.SecretKeySpec
  *
  * Hardware identity: the secret is a device-local 256-bit HMAC key generated inside
  * Android Keystore at `generateKeypair`, non-exportable, and never derived from a
- * signature; the HMAC runs inside Keystore. Software identity: the secret is
- * `HKDF-SHA256(ikm = Ed25519 private seed, salt = "scp-pseudonym-secret-v1", info = "",
- * len = 32)` (the §9.10.4 native interim), matching `scp-crypto/src/pseudonym.rs`.
+ * signature; the HMAC runs inside Keystore. A software identity's secret and seed are
+ * computed by the Rust helper behind [P256Pseudonym.softwarePoint].
  */
 internal object PseudonymSecret {
-    private const val HMAC = "HmacSHA256"
-    private const val SOFTWARE_SALT = "scp-pseudonym-secret-v1"
-
     /** Keystore alias of an identity's device-local pseudonym secret. */
     fun alias(keyId: String): String = "scp.pseudonym-secret.$keyId"
 
@@ -50,45 +44,6 @@ internal object PseudonymSecret {
             "Pseudonym secret not found in Keystore for identity $keyId",
             "SCP-CRYPTO-4006",
         )
-
-    /** The context seed of a software identity; the secret is wiped after keying the MAC. */
-    fun softwareContextSeed(
-        privateKey: Ed25519PrivateKeyParameters,
-        contextId: ByteArray,
-        suffix: ByteArray,
-    ): ByteArray {
-        val seed = privateKey.encoded
-        val secret = try {
-            hkdfSha256OneBlock(seed, SOFTWARE_SALT.toByteArray(Charsets.UTF_8), ByteArray(0))
-        } finally {
-            seed.fill(0)
-        }
-        val mac = Mac.getInstance(HMAC)
-        try {
-            mac.init(SecretKeySpec(secret, HMAC))
-        } finally {
-            secret.fill(0)
-        }
-        mac.update(contextId)
-        mac.update(suffix)
-        return mac.doFinal()
-    }
-
-    /** RFC 5869 HKDF-SHA256 extract-and-expand to one 32-byte block, `T(1)`. */
-    private fun hkdfSha256OneBlock(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
-        val extract = Mac.getInstance(HMAC)
-        extract.init(SecretKeySpec(salt, HMAC))
-        val prk = extract.doFinal(ikm)
-        val expand = Mac.getInstance(HMAC)
-        try {
-            expand.init(SecretKeySpec(prk, HMAC))
-        } finally {
-            prk.fill(0)
-        }
-        expand.update(info)
-        expand.update(byteArrayOf(0x01))
-        return expand.doFinal()
-    }
 }
 
 /**
