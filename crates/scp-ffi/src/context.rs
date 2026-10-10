@@ -7033,7 +7033,8 @@ mod tests {
     /// A join whose `#active` key custody no longer holds fails at the
     /// runtime's invitation KEM agreement (the first step of the join) with a
     /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
-    /// through `From<ContextError>` and still rolls its reversible state back.
+    /// through `typed_supervisor_failure` and still rolls its reversible state
+    /// back.
     #[test]
     #[cfg(feature = "testing")]
     fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {

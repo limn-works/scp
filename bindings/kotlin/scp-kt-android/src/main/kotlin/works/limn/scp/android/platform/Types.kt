@@ -320,9 +320,10 @@ interface PushProvider {
  *   class, and the Rust trait returns a `PlatformError`. ADR-027 states that a UniFFI callback
  *   that throws any exception other than the generated one panics the Rust caller.
  *
- * [AndroidKeyCustody] converts no exception to [ScpException]. Each method throws [ScpException]
- * only for the codes its `@throws` lines name, and every other failure escapes as the original
- * throwable, so a `catch (e: ScpException)` does not catch it. The Keystore path, which an
+ * [AndroidKeyCustody] converts one exception to [ScpException]: [destroyKey] throws a
+ * `KeyStoreException` from `deleteEntry` as `SCP-CRYPTO-4004`. Otherwise each method throws
+ * [ScpException] only for the codes its `@throws` lines name, and every other failure escapes as
+ * the original throwable, so a `catch (e: ScpException)` does not catch it. The Keystore path, which an
  * Ed25519 [generateKeypair] takes on API 33+ and each other method below takes for a
  * [CustodyType.HARDWARE] handle, can let these escape:
  *
@@ -431,8 +432,9 @@ interface KeyCustodyProvider {
      * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
      * can restore the key when this process dies before the removal reaches disk (see
      * [DestructionAttestation.confirmed]).
-     * A Keystore or EncryptedSharedPreferences failure escapes as the original exception, listed
-     * in the interface KDoc.
+     * A `KeyStoreException` from the Keystore `deleteEntry` is thrown as `SCP-CRYPTO-4004`; every
+     * other Keystore or EncryptedSharedPreferences failure escapes as the original exception,
+     * listed in the interface KDoc.
      *
      * No pseudonym key exists to destroy: once the identity (and, for a Keystore identity, its
      * pseudonym secret) is gone, deriving any of its pseudonyms fails with `SCP-CRYPTO-4006`

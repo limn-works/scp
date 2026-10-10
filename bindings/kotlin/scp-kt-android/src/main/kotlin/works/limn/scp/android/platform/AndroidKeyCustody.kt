@@ -113,7 +113,8 @@ import java.security.SecureRandom
  *
  * ## Errors
  *
- * This class converts no exception to [ScpException]. Each method throws [ScpException] only for
+ * This class converts one exception to [ScpException]: [destroyKey] throws a `KeyStoreException`
+ * from `deleteEntry` as `SCP-CRYPTO-4004`. Otherwise each method throws [ScpException] only for
  * the codes its KDoc names, and every other failure escapes as the original throwable. The
  * KDoc of [KeyCustodyProvider] lists the Keystore and JCA exceptions each method can let escape,
  * and the [dhAgree] KDoc names the Bouncy Castle `IllegalStateException` a low-order peer key
@@ -401,7 +402,7 @@ class AndroidKeyCustody internal constructor(
      *
      * **Software keys (API 26-32, [CustodyType.SOFTWARE]):** `pseudonym_secret =
      * HKDF-SHA256(ikm = Ed25519 private seed, salt = "scp-pseudonym-secret-v1")`, the
-     * §9.10.4.A native interim until S12. The Rust helper behind
+     * §9.10.4.A native interim until the identity key moves to P-256 (SCP-315). The Rust helper behind
      * [P256Pseudonym.softwarePoint] runs all three steps, so software pseudonyms match
      * every other software custody byte for byte (§25.19).
      *
