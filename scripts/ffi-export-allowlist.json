@@ -1106,6 +1106,12 @@
       "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Generates an identity key through the adapter; a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060, as production reports it. Not a protocol operation."
     },
     {
+      "name": "generate_operational_keypair",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Generates an operational key of the given type through the adapter, so a test sees the role the adapter sends the host and the refusal to derive from that key; a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
+    },
+    {
       "name": "derive_pseudonym",
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "test-fixture",
