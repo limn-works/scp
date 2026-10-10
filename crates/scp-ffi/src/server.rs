@@ -172,58 +172,6 @@ fn auto_wire_context_manager(
     });
 }
 
-/// Wires the local `Supervisor` event channel into the node's outbound webhook
-/// dispatcher and supervises the consumer under the bridge instance's lifecycle
-/// (spec §12.10.5).
-///
-/// This is the `PyO3` reference bridge's node-startup wire. The production
-/// `Supervisor` built by `crate::runtime`'s `build_supervisor` always enables
-/// its event channel, so `subscribe_events()` yields a receiver. Delegates the
-/// subscribe → wire → supervise block to the shared
-/// [`RunningNode::wire_and_supervise_context_events`] seam so all three bridges
-/// stay in lockstep. The consumer is aborted on bridge shutdown via the instance
-/// cancellation token, so it never leaks as a detached task.
-///
-/// # Precondition (identical across all three bridges)
-///
-/// One-shot wiring at node startup gates on the shared
-/// [`CoreFields::check_ready`](scp_ffi_common::bridge_instance::CoreFields::check_ready): skip (log, never fail startup) if the instance
-/// is suspended OR shut down, then fetch the supervisor via
-/// [`CoreFields::try_supervisor`](scp_ffi_common::bridge_instance::CoreFields::try_supervisor). All three bridges (`PyO3`, `NAPI`, `UniFFI`)
-/// use this same `check_ready()` + `try_supervisor()` pair so they make the SAME
-/// decision about when to wire — rather than the general-purpose `supervisor(bi)`
-/// accessor, whose warn-on-shutdown-and-proceed semantics suit per-op dispatch
-/// but not startup wiring.
-fn wire_node_webhook_events(
-    bi: &crate::runtime::PyBridgeInstance,
-    py: Python<'_>,
-    rt: &tokio::runtime::Runtime,
-    node: &RunningNode,
-) {
-    py.allow_threads(|| {
-        if let Err(reason) = bi.core.check_ready() {
-            tracing::warn!(
-                %reason,
-                "wire_node_webhook_events: bridge not ready — skipping webhook \
-                 wiring; local context events will not reach the webhook dispatcher"
-            );
-            return;
-        }
-        let Some(supervisor) = bi.core.try_supervisor() else {
-            tracing::warn!(
-                "wire_node_webhook_events: no Supervisor attached — local context \
-                 events will not reach the webhook dispatcher"
-            );
-            return;
-        };
-        let cancel = bi.core.cancel_token();
-        rt.block_on(async {
-            let mut tasks = bi.core.task_handle().await;
-            node.wire_and_supervise_context_events(supervisor, &mut tasks, cancel);
-        });
-    });
-}
-
 // ---------------------------------------------------------------------------
 // PyRelayHandle
 // ---------------------------------------------------------------------------
@@ -709,7 +657,6 @@ impl crate::scp::PyScp {
         // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
         // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
         let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
-        wire_node_webhook_events(bi, py, rt, &inner);
 
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {
@@ -799,8 +746,6 @@ impl crate::scp::PyScp {
         let bridge_token = inner.bridge_token_hex();
         auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
 
-        wire_node_webhook_events(bi, py, rt, &inner);
-
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {
             inner,
@@ -877,9 +822,7 @@ mod tests {
     /// `subscribe_events()` yields a receiver. This is the runtime counterpart
     /// to the `NAPI`/`UniFFI` `node_startup_enables_context_event_channel`
     /// tests. Before this assertion existed, `PyO3`'s "actually wired" guarantee
-    /// rested solely on a `pipeline_wiring.rs` string-match — the same false-green
-    /// that let the original cross-bridge webhook wiring drift go unnoticed
-    /// (only `PyO3` had been wired and no runtime test proved even that).
+    /// rested solely on a `pipeline_wiring.rs` string-match.
     #[test]
     fn node_startup_enables_context_event_channel() {
         // Initialize the process-global tokio runtime the same way `rt()` does;
@@ -905,8 +848,7 @@ mod tests {
                 .expect("Supervisor must be attached after node startup");
             assert!(
                 supervisor.subscribe_events().is_some(),
-                "node startup must enable the Supervisor event channel so the \
-                 webhook dispatcher consumer can subscribe"
+                "node startup must enable the Supervisor event channel"
             );
 
             node.shutdown();
