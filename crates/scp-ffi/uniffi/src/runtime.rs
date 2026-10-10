@@ -278,7 +278,6 @@ impl scp_core::crypto::ucan::validate::RevocationChecker for UniffiStreamRevocat
 /// during PR 1 — they move onto this struct in PR 2.
 ///
 /// Constructed via [`UniffiBridgeInstance::new_uniffi`] /
-/// [`UniffiBridgeInstance::with_persistence_uniffi`] /
 /// [`UniffiBridgeInstance::with_storage_uniffi`]. Every caller-owned
 /// `#[derive(uniffi::Object)] Scp` constructs its own instance —
 /// Phase D (#1695, ADR-048) deleted the process-wide
@@ -481,42 +480,6 @@ impl UniffiBridgeInstance {
                 )),
             );
         let core = CoreFields::with_persistence_arc(persistence);
-        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
-        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
-        Self {
-            core,
-            ucan_registry: Arc::new(DashMap::new()),
-            released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            next_release_generation: std::sync::atomic::AtomicU64::new(0),
-            identity_custody_registry: Arc::new(DashMap::new()),
-            protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
-            identity_link_attestation_registry: Arc::new(DashMap::new()),
-            context_handle_registry: Arc::new(DashMap::new()),
-            mcp_server_registry: Arc::new(DashMap::new()),
-            mcp_client_registry: Arc::new(DashMap::new()),
-            durable_providers: Some(durable_providers),
-            outlet_stream_registry,
-            outlet_streaming_saga_registry,
-        }
-    }
-
-    /// Constructs a new `UniffiBridgeInstance` with an explicit
-    /// [`scp_core::context::persistence::ContextPersistence`] provider.
-    ///
-    /// Used by callers that already have a persistence strategy (typically
-    /// unit tests; production persistence is wired through PR 3's
-    /// [`StorageConfig::InMemory`] path on
-    /// [`UniffiBridgeInstance::with_storage_uniffi`]).
-    #[must_use]
-    pub fn with_persistence_uniffi(
-        persistence: Box<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
-    ) -> Self {
-        let (_event_log, protocol_repository, storage_handle) =
-            scp_ffi_common::bridge_runtime::build_event_log_provider();
-        // Saga journal + `mls_storage` bound into one `DurableProviders` derived
-        // from one handle (§17.6 / §17.16).
-        let durable_providers = durable_providers_from_handle(storage_handle);
-        let core = CoreFields::with_persistence(persistence);
         let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
         let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {

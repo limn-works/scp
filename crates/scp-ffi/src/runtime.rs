@@ -593,31 +593,6 @@ impl PyBridgeInstance {
         instance
     }
 
-    /// Constructs a new `PyBridgeInstance` with a persistence provider.
-    ///
-    /// Mirrors [`CoreFields::with_persistence`] — callers pass the same
-    /// provider they used to build the eventual `ContextManager`.
-    #[must_use]
-    pub fn with_persistence_py(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
-        let core = CoreFields::with_persistence(persistence);
-        let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
-        let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
-        Self {
-            core,
-            identity_registry: Arc::new(DashMap::new()),
-            storage_provider: OnceLock::new(),
-            ffi_bridge_state: Arc::new(DashMap::new()),
-            released_contexts: std::sync::Mutex::new(HashMap::new()),
-            mcp_server_registry: Arc::new(DashMap::new()),
-            mcp_client_registry: Arc::new(DashMap::new()),
-            connected_relay_url: RwLock::new(None),
-            outlet_stream_registry,
-            outlet_streaming_saga_registry,
-            #[cfg(feature = "testing")]
-            network: std::sync::Mutex::new(None),
-        }
-    }
-
     /// Constructs a new `PyBridgeInstance` configured per the given
     /// [`StorageConfig`].
     ///
