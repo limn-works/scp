@@ -8780,7 +8780,7 @@ pub fn sandbox_validate_declaration(
     let decl: CapabilityDeclaration =
         serde_json::from_str(&declaration_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid declaration JSON: {e}"),
-            code: codes::VALID_7070.to_owned(),
+            code: codes::VALID_7000.to_owned(),
         })?;
 
     let ceiling: Vec<Capability> = ceiling_capabilities
@@ -19302,6 +19302,21 @@ mod tests {
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
         crate::scp::Scp::new_in_memory_for_test()
+    }
+
+    /// A declaration that is not valid JSON fails with `SCP-VALID-7000`, the
+    /// code the same function returns for an unparsable capability.
+    #[test]
+    fn sandbox_validate_declaration_rejects_malformed_json_with_valid_7000() {
+        let err = sandbox_validate_declaration("{not json".to_owned(), Vec::new(), Vec::new())
+            .expect_err("malformed declaration JSON must be rejected");
+        match err {
+            ScpError::Validation { code, msg } => {
+                assert_eq!(code, "SCP-VALID-7000");
+                assert!(msg.contains("invalid declaration JSON"), "{msg}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
     }
 
     /// Every runtime error that carries a custody failure reaches the caller

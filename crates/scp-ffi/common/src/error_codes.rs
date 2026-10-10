@@ -604,36 +604,6 @@ pub const CTX_2138: &str = "SCP-CTX-2138";
 /// Distinct from `CTX_2138`, whose refused operation has done nothing, so a
 /// caller does not treat a started operation as one that never ran.
 pub const CTX_2139: &str = "SCP-CTX-2139";
-/// Bridge connector context creation error.
-pub const CTX_2100: &str = "SCP-CTX-2100";
-/// Bridge connector context join error.
-pub const CTX_2101: &str = "SCP-CTX-2101";
-/// Bridge connector context send error.
-pub const CTX_2102: &str = "SCP-CTX-2102";
-/// Bridge connector context leave error.
-pub const CTX_2103: &str = "SCP-CTX-2103";
-/// Bridge connector context close error.
-pub const CTX_2104: &str = "SCP-CTX-2104";
-/// Bridge connector broadcast subscribe error.
-pub const CTX_2105: &str = "SCP-CTX-2105";
-/// Bridge connector broadcast unsubscribe error.
-pub const CTX_2106: &str = "SCP-CTX-2106";
-/// Bridge connector broadcast publish error.
-pub const CTX_2107: &str = "SCP-CTX-2107";
-/// Bridge connector broadcast block error.
-pub const CTX_2108: &str = "SCP-CTX-2108";
-/// Bridge connector broadcast key request error.
-pub const CTX_2109: &str = "SCP-CTX-2109";
-/// Bridge connector broadcast admission error.
-pub const CTX_2110: &str = "SCP-CTX-2110";
-/// Bridge connector governance action error.
-pub const CTX_2111: &str = "SCP-CTX-2111";
-/// Bridge connector TTL expiry error.
-pub const CTX_2112: &str = "SCP-CTX-2112";
-/// Bridge connector TTL extension error.
-pub const CTX_2113: &str = "SCP-CTX-2113";
-/// Bridge connector context import error.
-pub const CTX_2114: &str = "SCP-CTX-2114";
 /// Media context error.
 pub const CTX_2500: &str = "SCP-CTX-2500";
 /// Media context key export error.
@@ -1031,14 +1001,6 @@ pub const VALID_7052: &str = "SCP-VALID-7052";
 pub const VALID_7053: &str = "SCP-VALID-7053";
 /// Key validation error.
 pub const VALID_7054: &str = "SCP-VALID-7054";
-/// Bridge connector broadcast key validation error.
-pub const VALID_7055: &str = "SCP-VALID-7055";
-/// Bridge connector epoch validation error.
-pub const VALID_7056: &str = "SCP-VALID-7056";
-/// Bridge connector governance validation error.
-pub const VALID_7057: &str = "SCP-VALID-7057";
-/// Bridge connector import validation error.
-pub const VALID_7058: &str = "SCP-VALID-7058";
 /// Participation record validation error (§7.3.2).
 pub const VALID_7059: &str = "SCP-VALID-7059";
 /// Discovery validation error.
@@ -1055,12 +1017,6 @@ pub const VALID_7064: &str = "SCP-VALID-7064";
 pub const VALID_7065: &str = "SCP-VALID-7065";
 /// Discovery probe validation error.
 pub const VALID_7066: &str = "SCP-VALID-7066";
-/// Webhook validation error.
-pub const VALID_7070: &str = "SCP-VALID-7070";
-/// Webhook register validation error.
-pub const VALID_7071: &str = "SCP-VALID-7071";
-/// Webhook operation validation error.
-pub const VALID_7072: &str = "SCP-VALID-7072";
 /// `check_capability_requirements`: malformed capability-requirements JSON.
 pub const VALID_7073: &str = "SCP-VALID-7073";
 /// `check_capability_requirements`: malformed agent-capabilities JSON.
