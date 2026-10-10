@@ -960,11 +960,20 @@ impl From<scp_platform::PlatformError> for ScpPyError {
     fn from(e: scp_platform::PlatformError) -> Self {
         // Every variant, the two §17.6 storage conditions included, takes its
         // code from `custody_failure_code`, so a bare and a wrapped
-        // `PlatformError` report the same code.
-        Self::custody_failure(
-            format!("platform key operation failed: {e} — check key custody configuration"),
-            &scp_crypto::CustodyFailure::from(&e),
-        )
+        // `PlatformError` report the same code. A storage call raises the two
+        // §17.6 conditions too, so their message is the error's own text and
+        // never blames key custody.
+        let failure = scp_crypto::CustodyFailure::from(&e);
+        let message = match failure.kind {
+            scp_crypto::CustodyFailureKind::StorageClosed
+            | scp_crypto::CustodyFailureKind::StorageLockHeld => e.to_string(),
+            scp_crypto::CustodyFailureKind::KeyNotFound
+            | scp_crypto::CustodyFailureKind::PseudonymRejected
+            | scp_crypto::CustodyFailureKind::Failed => {
+                format!("platform key operation failed: {e} — check key custody configuration")
+            }
+        };
+        Self::custody_failure(message, &failure)
     }
 }
 
@@ -1405,6 +1414,32 @@ mod tests {
                 variant_and_code(&wrapped_error),
                 "{debug}"
             );
+        }
+
+        // A storage call raises the two §17.6 conditions too, so a bare one
+        // reports the error's own text, never a key-custody diagnosis.
+        for (error, expected_code) in [
+            (
+                scp_platform::PlatformError::StorageClosed,
+                codes::STORAGE_8006,
+            ),
+            (
+                scp_platform::PlatformError::StorageLockHeld {
+                    dir: "/tmp/scp".to_owned(),
+                    lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+                },
+                codes::STORAGE_8005,
+            ),
+        ] {
+            let expected_message = error.to_string();
+            let bare: ScpPyError = error.into();
+            match bare {
+                ScpPyError::ValidationError { message, code } => {
+                    assert_eq!(message, expected_message);
+                    assert_eq!(code, expected_code);
+                }
+                other => panic!("expected a validation error, got {other:?}"),
+            }
         }
     }
 
