@@ -389,10 +389,6 @@ pub const CTX_2006: &str = "SCP-CTX-2006";
 pub const CTX_2007: &str = "SCP-CTX-2007";
 /// Context receive failed.
 pub const CTX_2008: &str = "SCP-CTX-2008";
-/// Context close failed.
-pub const CTX_2009: &str = "SCP-CTX-2009";
-/// Context export/import failed.
-pub const CTX_2010: &str = "SCP-CTX-2010";
 /// Context mode error.
 pub const CTX_2011: &str = "SCP-CTX-2011";
 /// Context manager error.
@@ -1025,15 +1021,15 @@ pub const VALID_7047: &str = "SCP-VALID-7047";
 pub const VALID_7048: &str = "SCP-VALID-7048";
 /// Transport proof validation error.
 pub const VALID_7049: &str = "SCP-VALID-7049";
-/// Bridge connector DID validation error.
+/// DID validation error.
 pub const VALID_7050: &str = "SCP-VALID-7050";
-/// Bridge connector context ID validation error.
+/// Context ID validation error.
 pub const VALID_7051: &str = "SCP-VALID-7051";
-/// Bridge connector payload validation error.
+/// Payload validation error.
 pub const VALID_7052: &str = "SCP-VALID-7052";
-/// Bridge connector admission validation error.
+/// Admission validation error.
 pub const VALID_7053: &str = "SCP-VALID-7053";
-/// Bridge connector key validation error.
+/// Key validation error.
 pub const VALID_7054: &str = "SCP-VALID-7054";
 /// Bridge connector broadcast key validation error.
 pub const VALID_7055: &str = "SCP-VALID-7055";
