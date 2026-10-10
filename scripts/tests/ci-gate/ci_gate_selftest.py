@@ -6094,7 +6094,7 @@ RUST_TEST_SHARDS = (
         "-p scp-dht -p scp-identity -p scp-event-log -p scp-protocol "
         "-p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock "
         "-p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features "
-        "serde_json/unbounded_depth,rustix/net,scp-identity/testing,scp-testing/testing,"
+        "serde_json/unbounded_depth,rustix/net,scp-crypto/testing,scp-identity/testing,scp-testing/testing,"
         "scp-core/outlet-capability-test-grant,scp-mcp/testing,"
         "scp-node/allow_unencrypted_storage,scp-node/testing"
     ),
