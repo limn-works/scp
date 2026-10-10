@@ -654,6 +654,7 @@
         "scripts/check-cross-layer.sh",
         "scripts/check-protocol-deps.sh",
         "scripts/check-protocol-sync.py",
+        "scripts/bridge-aliases.json",
         "fuzz/dicts/ucan_jwt.dict",
         "fuzz/dicts/msgpack_client_message.dict"
       ],
@@ -678,7 +679,7 @@
         "scripts/check-no-fallback-registry.sh continues to exit 0 after the rename (no fallback registry introduced for outlet lookups)",
         "scripts/check-no-default-in-tests.sh continues to exit 0 after the rename",
         "ratchet/once-lock-count.json is verified unchanged (rename adds no new globals; if the rename legitimately removes one, the count is decreased accordingly \u2014 never increased)",
-        "bridge_ratchet_baseline.json is regenerated to reflect the rename of existing exports (identifier-only change; no new exports added here \u2014 new exports land in the streaming gate)",
+        "scripts/bridge-aliases.json renames each existing tool_* canonical operation and its PyO3, UniFFI, and NAPI aliases to the outlet_* spelling (identifier-only change; no new canonical operations added here \u2014 new exports land in the streaming gate); MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs is unchanged; the tests parity_operation_count_never_decreases, aliases_json_is_in_sync_with_parity_operations, and every_exported_ffi_fn_is_registered_or_allowlisted in crates/scp-testing/tests/integration/ffi_conformance.rs pass, and bash scripts/check-bridge-symmetry.sh exits 0",
         "Capability matrix .docs/standards/sdk-capability-matrix.json lists outlets namespace verbs uniformly across all four SDKs",
         "pipeline_wiring.rs asserts register_outlet / invoke_outlet / deregister_outlet / verify_outlet / update_outlet reach the runtime pipeline; no tool_* symbols remain in the assertion table (additive: new outlet_* assertions added alongside retained assertions for identity/messaging/economy)"
       ],
@@ -691,7 +692,7 @@
         "Add outlet_* entries to fuzz dicts",
         "Run the full CI command and confirm zero warnings",
         "Run scripts/check-handle-affinity.sh, check-no-bridge-globals.sh, check-no-fallback-registry.sh, check-no-default-in-tests.sh and confirm all exit 0 after the rename",
-        "Regenerate bridge_ratchet_baseline.json (identifier-only rename; no added exports)",
+        "Rename the tool_* canonical operations and aliases in scripts/bridge-aliases.json to outlet_* (identifier-only rename; no added exports; MIN_PARITY_OPERATIONS unchanged)",
         "Confirm ratchet/once-lock-count.json remains unchanged (or decreased)",
         "Confirm pipeline_wiring.rs outlet_* assertions are additive alongside pre-existing non-outlet assertions (never weakened)"
       ],
@@ -2298,7 +2299,7 @@
         "Integration tests per bridge green",
         "Each bridge exposes a chunk-signature verification surface: `verify_chunk_signature(chunk_bytes, operator_pk, context_id, outlet_id, caveats_binding) -> bool` which verifies the \u00a75.4.5 SCP-OUTLET-CHUNK-SIG-V1 preimage (binds context_id, outlet_id, request_id, sequence, caveats_binding, and SHA-256(canonical_jcs(payload)) \u2014 byte-for-byte matching \u00a75.4.5 per-chunk operator signature block)",
         "Each bridge exposes a caveats-binding recomputation helper matching \u00a75.4.5 caveats_binding preimage block byte-for-byte: `compute_caveats_binding(ucan_cid, request_id, invoker_did, estimated_chunk_count, effective_caveats) -> [u8; 32]` (the helper takes each preimage input as a typed parameter; internally it runs SHA-256 over 'SCP-OUTLET-CAVEAT-BIND-V1:' || len_be32(ucan_cid) || ucan_cid || request_id || len_be32(invoker_did) || invoker_did || estimated_chunk_count_be || len_be32(canonical_jcs(effective_caveats)) || canonical_jcs(effective_caveats))",
-        "The native-bridge streaming exports are covered by the alias-driven parity ratchet (scripts/bridge-aliases.json, additive); no separate bridge_ratchet_baseline.json exists. CI check-bridge-symmetry + ffi_conformance pass.",
+        "The native-bridge streaming exports are covered by the alias-driven parity ratchet: scripts/bridge-aliases.json gains their canonical entries additively, and the MIN_PARITY_OPERATIONS floor in crates/scp-testing/tests/integration/ffi_conformance.rs never decreases. CI check-bridge-symmetry + ffi_conformance pass.",
         "The 7 streaming canonicals (outlet_stream_open, outlet_stream_poll_next, outlet_stream_grant_credit, outlet_stream_cancel, outlet_stream_terminate, verify_chunk_signature, compute_caveats_binding) are present in scripts/bridge-aliases.json for all 3 native bridges; NAPI #[napi] exports resolve in crates/scp-ffi/napi/src/scp.rs; WASM's 2 pure ops are conformance-tested in scp-client-wasm's own vectors (crates/scp-client-wasm/src/lib.rs).",
         "CRITICAL #1 \u2014 every control-plane FFI function (`outlet_stream_grant_credit`, `outlet_stream_cancel`, `outlet_stream_terminate`) takes a `caller_did: &str` parameter and rejects the call with `authorization.denied` (`SCP-PERM-3001`) when `caller_did` does not match the `invoker_did` pinned in the bridge's stream registry at open. Mirrors the runtime's signature-verification gate at the bridge layer.",
         "N/A for WASM per ADR-057 scope fence (no cancel/session in the browser); the native bridges' cancel builds+signs the OutletStreamCancel via custody and self-consistency is enforced at the runtime layer (CRITICAL#2 applies to the node-side signing path).",
@@ -2313,7 +2314,7 @@
         "Add the conformance test",
         "Document semantics on each bridge",
         "Expose verify_chunk_signature and compute_caveats_binding on every bridge",
-        "Regenerate bridge_ratchet_baseline.json (additive \u2014 new exports only; must not reduce any existing ratchet count)",
+        "Add the streaming canonical operations to scripts/bridge-aliases.json and raise MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs (additive \u2014 new exports only; must not reduce any existing ratchet count)",
         "Extend the FFI conformance matrix with the five streaming operations"
       ],
       "blockedBy": [
@@ -2675,9 +2676,10 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt",
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Errors.kt",
         "tests/conformance/vectors/outlet_message_hmac_fixtures.json",
-        "crates/scp-ffi/bridge_ratchet_baseline.json"
+        "scripts/bridge-aliases.json",
+        "crates/scp-testing/tests/integration/ffi_conformance.rs"
       ],
-      "description": "Surface the OUT-041a/b/c runtime functionality through all four FFI bridges (PyO3, NAPI, UniFFI, WASM) and all four language SDKs (Python, TypeScript, Swift, Kotlin). Each bridge exposes outlet_error_new with the options-object signature; each SDK exposes OutletError.new with language-idiomatic options; each SDK integrates the CatalogRotationTooFrequent rejection path. Add a shared conformance fixture (outlet_message_hmac_fixtures.json) that round-trips (outlet_id, catalog_key) pairs across all four bridges producing byte-identical wire_message output. Regenerate bridge_ratchet_baseline.json additively.",
+      "description": "Surface the OUT-041a/b/c runtime functionality through all four FFI bridges (PyO3, NAPI, UniFFI, WASM) and all four language SDKs (Python, TypeScript, Swift, Kotlin). Each bridge exposes outlet_error_new with the options-object signature; each SDK exposes OutletError.new with language-idiomatic options; each SDK integrates the CatalogRotationTooFrequent rejection path. Add a shared conformance fixture (outlet_message_hmac_fixtures.json) that round-trips (outlet_id, catalog_key) pairs across all four bridges producing byte-identical wire_message output. Register the new native-bridge exports additively in the FFI parity ratchet: scripts/bridge-aliases.json and the MIN_PARITY_OPERATIONS floor in crates/scp-testing/tests/integration/ffi_conformance.rs.",
       "acceptanceCriteria": [
         "SDK surface: Python OutletError.new(*, outlet_id=..., catalog_key=..., class_=..., ...) calls FFI outlet_error_new (PyO3) which HMACs at the bridge boundary; the SDK never receives the raw outlet_message_key. grep -c 'outlet_error_new' bindings/python/scp_sdk/ returns >= 1",
         "SDK surface: TypeScript OutletError.new({ outletId, catalogKey, class, ... }) calls outletErrorNew NAPI export; bun test asserts wire_message is a 32-byte opaque value, not the catalog_key string",
@@ -2687,7 +2689,7 @@
         "FFI bridges: all four bridges expose outlet_catalog_rotation_validator (check-only path) that returns CatalogRotationTooFrequent typed error when the dwell-time rule (OUT-041c) fails; SDK wrappers surface this as a typed OutletProtocolError subclass",
         "Per-SDK test: Python/TypeScript/Swift/Kotlin each verify that registering an outlet with catalog C0 at T0, then updating to catalog C1 at T0 + 23.99h (simulated via the test event log) produces CatalogRotationTooFrequent; T0 + 24.01h succeeds",
         "Conformance fixture: tests/conformance/vectors/outlet_message_hmac_fixtures.json \u2014 one fixture per (outlet_id, catalog_key) pair (minimum 10 fixtures covering varied outlet_ids and catalog sizes); every bridge produces byte-identical wire_message for the same (outlet_message_key, catalog_key) input",
-        "bridge_ratchet_baseline.json is regenerated additively (new exports only \u2014 outlet_error_new, outlet_catalog_rotation_validator); CI ratchet passes",
+        "scripts/bridge-aliases.json gains canonical entries outlet_error_new and outlet_catalog_rotation_validator with PyO3, UniFFI, and NAPI aliases (additive \u2014 new exports only); MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs rises by 2; the tests parity_operation_count_never_decreases, aliases_json_is_in_sync_with_parity_operations, and every_exported_ffi_fn_is_registered_or_allowlisted in crates/scp-testing/tests/integration/ffi_conformance.rs pass, and bash scripts/check-bridge-symmetry.sh exits 0",
         "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds",
         "python3.12 -m pytest bindings/python/tests/test_outlet_error_new.py succeeds; bun test bindings/typescript/tests/outlet-error-new.test.ts succeeds; swift test bindings/swift/Tests/SCPTests/OutletErrorTests.swift succeeds; ./gradlew test -Pscp.uniffi.cargoFeatures=testing for OutletErrorTests passes"
       ],
@@ -2696,7 +2698,7 @@
         "Add SDK wrappers in all four language SDKs",
         "Add per-SDK unit tests for OutletError.new options-object form and CatalogRotationTooFrequent rejection",
         "Create tests/conformance/vectors/outlet_message_hmac_fixtures.json with \u2265 10 cross-bridge fixtures",
-        "Regenerate bridge_ratchet_baseline.json (additive only \u2014 new exports)"
+        "Add outlet_error_new and outlet_catalog_rotation_validator to scripts/bridge-aliases.json and raise MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs by 2 (additive only \u2014 new exports)"
       ],
       "blockedBy": [
         "SCP-OUT-041a",
@@ -2713,7 +2715,9 @@
           "section": "### 5.4.1 Outlet Registration Wire Format"
         }
       ],
-      "details": {}
+      "details": {
+        "ratchetScope": "The FFI parity ratchet (scripts/bridge-aliases.json, scripts/check-bridge-symmetry.sh, and MIN_PARITY_OPERATIONS in crates/scp-testing/tests/integration/ffi_conformance.rs) covers the PyO3, UniFFI, and NAPI bridges only. No check in scripts/ or crates/scp-testing/ counts WASM exports, so the WASM outletErrorNew and outlet_catalog_rotation_validator exports have no ratchet criterion; nobody has built that check."
+      }
     },
     {
       "id": "SCP-OUT-042a",
