@@ -729,7 +729,7 @@ Key custody is the `KeyCustody` trait ADR-006 defines, named here for completene
 
 ### FileKeyCustody Argon2id Parameters
 
-`FileKeyCustody`, the software-key backend behind the headless row above, derives an AES-256 wrapping key from a passphrase with Argon2id. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
+`FileKeyCustody`, the software-key backend behind the headless row above, derives from a passphrase, with Argon2id, the root key from which HKDF derives the subkeys below. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
 
 ```
 algorithm  = Argon2id
