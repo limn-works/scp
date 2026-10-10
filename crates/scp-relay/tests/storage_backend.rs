@@ -378,3 +378,38 @@ fn explicit_sqlite_backend_starts() {
         "relay should have logged 'using sqlite blob storage'; output: {output}"
     );
 }
+
+/// A `sqlite` store that cannot open makes the relay exit 1 with the
+/// `StoreOpen` error, and the relay never logs `using sqlite blob storage`
+/// (persistence spec §17.17.1 SCP-CAPSEL-8001: a failed selection is
+/// terminal). A log line naming a backend the relay never opened tells an
+/// operator reading the log that the store is up when it is not.
+///
+/// The path's parent component is a regular file, so the directory and the
+/// database cannot be created.
+#[test]
+fn sqlite_store_that_cannot_open_exits_without_logging_the_backend() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let blocker = tmp.path().join("this-is-a-file");
+    std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+    let db_path = blocker.join("relay.db");
+
+    let output = output_within_deadline(
+        Command::new(relay_bin())
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env("RUST_LOG", "scp_relay=info,scp_transport=info"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("failed to open the sqlite blob store"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("using sqlite blob storage"),
+        "the relay logged a backend it never opened: {stderr}"
+    );
+}

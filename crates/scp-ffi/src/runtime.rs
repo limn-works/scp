@@ -4096,6 +4096,30 @@ mod tests {
         );
     }
 
+    /// Parity with the NAPI and `UniFFI` bridges'
+    /// `test_sqlite_open_failure_fails_closed`: a `SQLite` open whose directory
+    /// cannot be created fails closed with `SqliteOpen` and its registered code
+    /// SCP-STORAGE-8004 (spec §17.17.1 SCP-CAPSEL-8001, §17.6), never an
+    /// instance without durable storage.
+    #[test]
+    fn test_with_storage_py_sqlite_open_failure_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let result = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: blocker.join("scp-data"),
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x22u8; 32])),
+        });
+        let err = result
+            .err()
+            .expect("a SQLite open at an uncreatable directory must fail closed");
+        assert!(
+            matches!(err, StorageInitError::SqliteOpen { .. }),
+            "expected StorageInitError::SqliteOpen, got {err:?}"
+        );
+        assert_eq!(err.code(), scp_ffi_common::error_codes::STORAGE_8004);
+    }
+
     /// Parity with the NAPI bridge `test_sqlite_wrong_passphrase_fails_closed`:
     /// reopening an existing DB with the WRONG passphrase must FAIL CLOSED
     /// (spec §17.6) — never silently open a fresh, empty database.

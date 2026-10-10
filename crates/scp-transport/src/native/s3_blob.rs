@@ -50,6 +50,10 @@
 //!
 //! Set `S3_TEST_ENDPOINT` and `S3_TEST_BUCKET` environment variables.
 //!
+//! The construction failure path needs no endpoint:
+//! `crates/scp-transport/tests/s3_blob_fail_closed.rs` opens the store against
+//! an address nothing listens on and asserts `StorageError::Internal`.
+//!
 //! See SCP-PERSIST-068 for the full story.
 
 use std::collections::HashMap;
@@ -130,8 +134,11 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the `HeadBucket` request every
+    /// construction path issues against `bucket` does not succeed: the
+    /// endpoint refuses or does not answer, the credential chain resolves no
+    /// credentials, the credentials are rejected, no region is configured, or
+    /// the bucket does not exist or the caller may not read it.
     pub async fn open(bucket: &str, prefix: &str) -> Result<Self, StorageError> {
         Self::open_with_clock(bucket, prefix, system_clock()).await
     }
@@ -144,8 +151,11 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the `HeadBucket` request every
+    /// construction path issues against `bucket` does not succeed: the
+    /// endpoint refuses or does not answer, the credential chain resolves no
+    /// credentials, the credentials are rejected, no region is configured, or
+    /// the bucket does not exist or the caller may not read it.
     pub async fn open_with_clock(
         bucket: &str,
         prefix: &str,
@@ -153,12 +163,7 @@ impl S3BlobStore {
     ) -> Result<Self, StorageError> {
         let config = load_ring_backed_aws_config().await;
         let client = Client::new(&config);
-        Ok(Self {
-            client,
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            clock,
-        })
+        Self::from_client(client, bucket, prefix, clock).await
     }
 
     /// Creates an `S3BlobStore` with a custom S3-compatible endpoint URL.
@@ -168,8 +173,11 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the `HeadBucket` request every
+    /// construction path issues against `bucket` does not succeed: the
+    /// endpoint refuses or does not answer, the credential chain resolves no
+    /// credentials, the credentials are rejected, no region is configured, or
+    /// the bucket does not exist or the caller may not read it.
     pub async fn open_with_endpoint(
         bucket: &str,
         prefix: &str,
@@ -182,6 +190,41 @@ impl S3BlobStore {
             .force_path_style(true)
             .build();
         let client = Client::from_conf(s3_config);
+        Self::from_client(client, bucket, prefix, clock).await
+    }
+
+    /// Probes `bucket` with one `HeadBucket` request, then builds the store.
+    ///
+    /// Both constructors go through here, so neither can skip the probe.
+    /// Loading the SDK configuration and building a `Client` perform no I/O,
+    /// so without this request a constructor returned `Ok` for an endpoint
+    /// nothing listens on, a missing bucket, or absent credentials, and the
+    /// relay learned of it on its first `store`. A selected production backend
+    /// that cannot be satisfied is a terminal error at the construction
+    /// boundary (`.docs/specs/17-persistence-and-storage.md` §17.17.1
+    /// SCP-CAPSEL-8001, §17.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Internal`] carrying the SDK's error context when
+    /// the `HeadBucket` request does not succeed.
+    async fn from_client(
+        client: Client,
+        bucket: &str,
+        prefix: &str,
+        clock: ClockFn,
+    ) -> Result<Self, StorageError> {
+        client
+            .head_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::Internal(format!(
+                    "S3 head bucket failed for {bucket}: {}",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                ))
+            })?;
         Ok(Self {
             client,
             bucket: bucket.to_owned(),
