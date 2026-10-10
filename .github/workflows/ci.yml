@@ -25,7 +25,7 @@ env:
   # DWARF sections, so the linker reads and writes less for every test binary and each
   # `target/debug` entry rust-cache saves and restores is smaller. Release
   # builds (`wasm-pack build`'s default `--release`) read `[profile.release]`, and
-  # the `--profile ci-bridge` builds of the four producers other than kotlin-test
+  # the `--profile ci-bridge` builds of the four producers other than uniffi-cdylib-linux
   # read `[profile.ci-bridge]`, which inherits `[profile.release]`; both ignore every
   # `CARGO_PROFILE_DEV_*` variable.
   #
@@ -85,7 +85,7 @@ env:
 #
 #   workspace-debug   `target/debug` under build mode — rust-test (every leg),
 #                     rust-test-napi-production, rust-build-pyo3-production,
-#                     rust-build-uniffi-production, kotlin-test, fail-closed-pre-rotation,
+#                     rust-build-uniffi-production, uniffi-cdylib-linux, fail-closed-pre-rotation,
 #                     shipped-feature-graph, vendored-openssl-scope; and
 #                     rust-doctest (its `cargo test --doc`) in part, as the paragraph
 #                     after this list says.
@@ -111,7 +111,7 @@ env:
 #                     `target/ci-bridge` on Linux — pyo3-module, which runs
 #                     `maturin develop --profile ci-bridge`, and napi-addon, which runs
 #                     `cargo build -p scp-ffi-napi --profile ci-bridge`. The four
-#                     producers other than kotlin-test (pyo3-module, pyo3-module-macos,
+#                     producers other than uniffi-cdylib-linux (pyo3-module, pyo3-module-macos,
 #                     napi-addon and xcframework) build under the `ci-bridge` profile the root
 #                     Cargo.toml defines (scp-ffi, scp-ffi-napi and scp-ffi-uniffi at
 #                     opt-level 0, SCP's other crates at opt-level 1, dependencies at
@@ -133,7 +133,7 @@ env:
 #                     runs cargo and none of them reads a cargo cache.
 #                     bridge-parity-kotlin belonged to `workspace-release` for its `maturin develop
 #                     --release`; it now downloads the PyO3 module from pyo3-module
-#                     and the UniFFI cdylib from kotlin-test, and runs no cargo
+#                     and artifact `uniffi-kotlin-linux`, and runs no cargo
 #                     command. The two members write one
 #                     directory under two feature resolutions and share one entry,
 #                     which pyo3-module writes. `maturin develop` builds package
@@ -282,7 +282,7 @@ jobs:
     runs-on: ubuntu-latest
     # `rust-toolchain.toml` selects the compiler for every lane below, not only the Rust
     # one: `pyo3-module` and `pyo3-module-macos` run `maturin develop`, `napi-addon` runs
-    # `cargo build -p scp-ffi-napi`, the two wasm jobs run `wasm-pack build`, `kotlin-test`
+    # `cargo build -p scp-ffi-napi`, the two wasm jobs run `wasm-pack build`, `uniffi-cdylib-linux`
     # runs `cargo build -p scp-ffi-uniffi`, and `xcframework` runs `build-xcframework.sh`. Every job those outputs guard is written
     # `if: needs.changes.outputs.<lane> == 'true'`, and the `ci` job that aggregates every
     # other job's result counts a skipped job as a pass, so a lane the pin does not reach
@@ -328,7 +328,7 @@ jobs:
               # This file itself. Every job a filter in this workflow guards takes its
               # command, its feature list, its matrix and its cache group from this file:
               # pyo3-module runs `maturin develop`, napi-addon runs
-              # `cargo build -p scp-ffi-napi`, kotlin-test runs
+              # `cargo build -p scp-ffi-napi`, uniffi-cdylib-linux runs
               # `cargo build -p scp-ffi-uniffi`, xcframework runs
               # `bindings/swift/build-xcframework.sh`, and rust-test runs
               # `cargo nextest`, each with the arguments written here. A change to this
@@ -2672,15 +2672,6 @@ jobs:
   # pyo3-module-macos run concurrently instead, and bridge-parity-swift starts when the
   # slower of the two ends.
   #
-  # The UniFFI cdylib is the exception, and the measurement decides it: kotlin-test
-  # builds it and uploads it, and bridge-parity-kotlin waits for the whole of
-  # kotlin-test. In run 37177220484 bridge-parity-kotlin started when pyo3-module ended
-  # (5.0 min), spent 2.6 of its 4.4 min installing a toolchain, restoring the cargo
-  # cache and building that cdylib, and ended at 9.4 min, while kotlin-test ended at
-  # 6.1 min. Waiting for kotlin-test and downloading costs about 1.1 min of start time
-  # and saves the 2.6, and a separate producer job would pay its own checkout, cache
-  # restore and toolchain install for a build kotlin-test still needs before its tests.
-  #
   # WHICH FEATURE SETS ARE THE SAME, read out of the manifests rather than off the
   # command lines, because the four consumers spell one set three ways:
   #
@@ -2744,7 +2735,7 @@ jobs:
   #     every crate any bridge reaches, hashed whole so that no hand-kept crate list
   #     can go stale), bindings/python/pyproject.toml for the two PyO3 jobs,
   #     bindings/swift/build-xcframework.sh for job xcframework, and
-  #     scripts/generate-uniffi-kotlin.sh for job kotlin-test;
+  #     scripts/generate-uniffi-kotlin.sh for job uniffi-cdylib-linux;
   #   * a digest the `artifact-inputs` step computes over the job's own definition in
   #     this file (its build command and feature list), the workflow-level `env:`
   #     block every build inherits, the list of tracked paths under crates/
@@ -2761,7 +2752,7 @@ jobs:
   # that ref alone and would evict entries later runs read. No pull request can
   # place an artifact that `main` or another pull request restores. A push to `main`
   # that misses on all five producers saves five entries; the four artifacts other
-  # than kotlin-test's totalled about 102 MB in run 37154692160.
+  # than `uniffi-kotlin-linux` totalled about 102 MB in run 37154692160.
   # scripts/tests/ci-gate/ci_gate_selftest.py
   # reports a producer whose key drops one of the file inputs above.
   pyo3-module:
@@ -3762,8 +3753,7 @@ jobs:
       # generator — so both shipped without an edge, and the release workflow's
       # publish-maven step would have aborted at `sourcesJar`. This gate reads
       # the edges out of Gradle's task model, so it fails on a missing edge
-      # whatever the caller asked to build. It compiles no Rust, which is why it
-      # belongs in this job rather than in `kotlin-test`.
+      # whatever the caller asked to build.
       - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
       # `kotlin-test` and `bridge-parity-kotlin` pass `scp.uniffi.prebuiltBindings=true`
       # with the bindings present, so neither reaches

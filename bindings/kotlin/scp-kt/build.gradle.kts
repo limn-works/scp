@@ -287,11 +287,9 @@ tasks.register<Exec>("generateUniffiBindings") {
     commandLine(listOf("./scripts/generate-uniffi-kotlin.sh") + uniffiFeatureArgs)
     // `-Pscp.uniffi.prebuiltBindings=true` skips this task and compiles the bindings
     // already in `uniffiBindingsDir`. The `kotlin-test` and `bridge-parity-kotlin` jobs
-    // in `.github/workflows/ci.yml` set it: `kotlin-test` generates the bindings and the
-    // cdylib once, or restores both from its artifact cache, and uploads them, and
-    // `bridge-parity-kotlin` downloads them. Running this task there would rebuild the
-    // crate, which needs a Rust toolchain neither job installs on a cache hit or on
-    // download. Both jobs place the bindings before Gradle starts, so the property
+    // in `.github/workflows/ci.yml` set it: both download the bindings and the cdylib
+    // as artifact `uniffi-kotlin-linux`, and running this task there would rebuild the
+    // crate the download already holds. Both jobs place the bindings before Gradle starts, so the property
     // checks for the generated file while this task is configured and fails the build
     // without it, rather than letting `compileKotlin` run over an empty bindings
     // directory. Any value but `true` or `false` fails too.
