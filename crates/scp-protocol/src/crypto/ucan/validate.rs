@@ -428,9 +428,10 @@ impl ProofResolver for InMemoryProofResolver {
 ///
 /// **Sealed.** The trait has a private supertrait, so no crate outside
 /// `scp-protocol` can implement it, and every `ValidationContext` built outside
-/// this crate carries [`TokenNbCaveatResolver`]:
+/// this crate carries [`TokenNbCaveatResolver`]. An outside impl fails on the
+/// missing `Sealed` bound (E0277):
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use scp_protocol::crypto::ucan::UcanToken;
 /// use scp_protocol::crypto::ucan::validate::CaveatResolver;
 /// use scp_protocol::trust::caveats::InvocationCaveats;
@@ -441,6 +442,33 @@ impl ProofResolver for InMemoryProofResolver {
 ///         None
 ///     }
 /// }
+/// ```
+///
+/// An outside crate cannot name `Sealed` to implement it either (E0603):
+///
+/// ```compile_fail,E0603
+/// struct IgnoresNb;
+/// impl scp_protocol::crypto::ucan::validate::sealed::Sealed for IgnoresNb {}
+/// ```
+///
+/// Positive control: rustdoc checks only that E0277 appears, not that it is
+/// the only error, so this block repeats the first block's `use` lines and
+/// method signature line verbatim and compiles from an outside crate. Keep the
+/// two blocks identical except for the struct, the `impl` line, and the method
+/// body.
+///
+/// ```
+/// use scp_protocol::crypto::ucan::UcanToken;
+/// use scp_protocol::crypto::ucan::validate::CaveatResolver;
+/// use scp_protocol::trust::caveats::InvocationCaveats;
+///
+/// struct Delegates(scp_protocol::crypto::ucan::validate::TokenNbCaveatResolver);
+/// impl Delegates {
+///     fn resolve_caveats(&self, _token: &UcanToken) -> Option<InvocationCaveats> {
+///         CaveatResolver::resolve_caveats(&self.0, _token)
+///     }
+/// }
+/// let _: &dyn CaveatResolver = &scp_protocol::crypto::ucan::validate::TokenNbCaveatResolver;
 /// ```
 ///
 /// Returning `Some(_)` opts the token into Step 7b (attenuation) and Step
