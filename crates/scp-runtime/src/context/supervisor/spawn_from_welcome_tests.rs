@@ -3250,7 +3250,11 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     );
 
     // --- COMPLETE teardown (the FFI compensating path). ---
-    let removed = j.sup.discard_joined_context(&j.ctx_id).await;
+    let removed = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect("the discard stops the actor and deletes the snapshot");
     assert!(
         removed,
         "discard_joined_context reports it removed the live actor handle"
@@ -3300,6 +3304,257 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
         !j.sup.floors.contains_key(&j.ctx_bytes),
         "the registry floor entry is pruned on permanent teardown — no leak"
     );
+}
+
+/// A [`RecordingPersistence`] whose `persist_context`, once armed, signals
+/// `entered` and then waits for a permit from `gate` before it writes, so a
+/// test can hold an actor's write in flight.
+#[derive(Clone)]
+struct GatedPersistence {
+    inner: RecordingPersistence,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<tokio::sync::Semaphore>,
+    entered: Arc<tokio::sync::Notify>,
+}
+
+impl GatedPersistence {
+    fn new() -> Self {
+        Self {
+            inner: RecordingPersistence::default(),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Holds every later `persist_context` at the gate.
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lets every held and later `persist_context` through.
+    fn release(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.gate
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS / 2);
+    }
+
+    async fn has_snapshot(&self, context_id: &str) -> bool {
+        self.inner
+            .load_context(context_id)
+            .await
+            .expect("load never errors")
+            .is_some()
+    }
+
+    /// Waits, in paused test time, for the snapshot of `context_id` to be
+    /// deleted, and fails the test if it is still there after 60 s.
+    async fn await_deleted(&self, context_id: &str) {
+        for _ in 0..600 {
+            if !self.has_snapshot(context_id).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !self.has_snapshot(context_id).await,
+            "a snapshot of the discarded context remains after its actor exited"
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl ContextPersistence for GatedPersistence {
+    async fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &crate::context::state::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.gate.acquire().await?.forget();
+        }
+        self.inner.persist_context(context_id, snapshot).await
+    }
+    async fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<crate::context::state::ContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_context(context_id).await
+    }
+    async fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_context(context_id).await
+    }
+    async fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_persisted_contexts().await
+    }
+}
+
+/// Waits until the actor behind `held` has exited, so its last write has
+/// landed before a test reads the store.
+async fn await_exit(held: &crate::context::actor::handle::ContextActorHandle) {
+    held.stop_and_await_exit_unbounded().await;
+}
+
+/// A clone of the actor handle held outside the registry (a bridge's cached
+/// handle) keeps the actor running past the registry removal, and the actor's
+/// post-loop drain persists its state after it acknowledges `Shutdown`. The
+/// discard must wait for the actor's exit, not for the ack, before it deletes
+/// the snapshot; otherwise the drain writes the snapshot back, a restart
+/// resurrects the context, and Precheck D refuses a fresh re-join.
+///
+/// The drain's write is held at a gate, so the ack has arrived and the write
+/// has not landed: the discard must still be waiting there, and once the write
+/// is let through the snapshot must end up deleted.
+#[tokio::test]
+async fn discard_joined_context_deletes_after_the_actors_last_write() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x6e, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+
+    let sup = Arc::clone(&j.sup);
+    let id = j.ctx_id.clone();
+    let discard = tokio::spawn(async move { sup.discard_joined_context(&id).await });
+    gated.entered.notified().await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !discard.is_finished(),
+        "the discard waits for the actor's exit while its last write is in flight"
+    );
+
+    gated.release();
+    let removed = discard
+        .await
+        .expect("the discard task does not panic")
+        .expect("the discard stops the actor and deletes the snapshot");
+    assert!(removed, "the discard removed the live actor handle");
+    drop(held);
+    assert!(
+        !gated.has_snapshot(&j.ctx_id).await,
+        "no write from the discarded actor may land after the snapshot delete"
+    );
+}
+
+/// An actor that does not exit within the reply bound, because its last write
+/// after the `Shutdown` ack is stuck, makes the discard return a typed error.
+/// The snapshot must stay until the actor exits, and be deleted after its
+/// last write: deleting it at once would let that write leave a `Closed`
+/// snapshot behind, which Precheck D then holds against every re-join. A
+/// second discard of the id meanwhile is refused and deletes nothing.
+#[tokio::test]
+async fn a_timed_out_discard_deletes_the_snapshot_after_the_stuck_last_write() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x6f, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+    tokio::time::pause();
+
+    let error = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("the exit wait times out while the last write is stuck");
+    assert!(
+        matches!(error, crate::context::ContextError::ActorBusy(_)),
+        "the caller gets the typed exit-wait error, got {error:?}"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "the join's snapshot stays while the discarded actor can still write"
+    );
+    let again = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("a second discard is refused while the first one waits for the exit");
+    assert!(
+        matches!(again, crate::context::ContextError::ActorBusy(_)),
+        "the second discard gets the typed pending error, got {again:?}"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "a second discard leaves the snapshot to the first one's teardown"
+    );
+
+    gated.release();
+    await_exit(&held).await;
+    gated.await_deleted(&j.ctx_id).await;
+}
+
+/// A discard whose `Shutdown` finds the mailbox full never queues it, so the
+/// actor runs on and writes its live state once the mailbox drains. The
+/// discard returns a typed error and must still stop the actor and delete the
+/// snapshot after its last write; otherwise the context resurrects `Active`
+/// on restart.
+#[tokio::test]
+async fn a_discard_that_finds_a_full_mailbox_deletes_the_snapshot_after_the_last_write() {
+    let gated = GatedPersistence::new();
+    let (result, j) = join_bob(0x70, Some(Box::new(gated.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+    gated.arm();
+    tokio::time::pause();
+
+    // `Pause` marks the actor dirty, so its coalesce arm persists, and the
+    // gate holds the actor inside that write.
+    held.send_pause()
+        .await
+        .expect("the actor acknowledges Pause");
+    gated.entered.notified().await;
+    let fillers: Vec<_> = (0..super::ACTOR_MAILBOX_CAPACITY)
+        .map(|_| {
+            let filler = held.clone();
+            tokio::spawn(async move {
+                let _reply = filler.send_persist_sync().await;
+            })
+        })
+        .collect();
+    for _ in 0..(4 * super::ACTOR_MAILBOX_CAPACITY) {
+        tokio::task::yield_now().await;
+    }
+
+    let error = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect_err("the Shutdown send times out on the full mailbox");
+    assert!(
+        matches!(error, crate::context::ContextError::ActorBusy(_)),
+        "the caller gets the typed exit-wait error, got {error:?}"
+    );
+    assert!(
+        gated.has_snapshot(&j.ctx_id).await,
+        "the join's snapshot stays while the discarded actor can still write"
+    );
+
+    gated.release();
+    for filler in fillers {
+        filler.await.expect("a filler task does not panic");
+    }
+    await_exit(&held).await;
+    gated.await_deleted(&j.ctx_id).await;
 }
 
 // ---------------------------------------------------------------------------

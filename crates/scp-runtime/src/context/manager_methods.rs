@@ -40,7 +40,7 @@
 //! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders that thread `self.supervisor()` into each helper
 //! through the `Weak<Supervisor>` back-pointer installed by
-//! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
+//! [`Supervisor::with_providers_and_journal`](crate::context::supervisor::Supervisor::with_providers_and_journal)
 //! during bridge construction. The forwarders are deleted alongside the
 //! outer shim in ADR-049 §15.
 //!
@@ -81,7 +81,7 @@ use crate::context::supervisor::Supervisor;
 /// Canonical diagnostic message for the
 /// [`ContextError::NotInitialized`](crate::context::ContextError::NotInitialized) error variant returned when a
 /// helper consults a provider slot that has not been populated by
-/// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers).
+/// [`Supervisor::with_providers_and_journal`](crate::context::supervisor::Supervisor::with_providers_and_journal).
 ///
 /// Phase 1 fix-up of ADR-049 (post-review-round-1): replaces the prior
 /// per-helper `ATTACHED_EXPECT` constants. One canonical string keeps

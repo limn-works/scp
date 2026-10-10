@@ -426,6 +426,52 @@ impl ContextActorHandle {
         })
         .await
     }
+
+    /// Stops the actor and waits until its `run()` has returned, so no write
+    /// the actor makes can land after this resolves.
+    ///
+    /// The `Shutdown` ack does not give that order: the handler replies during
+    /// dispatch, and the run loop's post-loop drain persists any dirty state
+    /// after the reply. The inbox receiver drops only when `run()` returns,
+    /// after that drain, and `Sender::closed` resolves at that drop. An actor
+    /// that has already exited resolves it at once.
+    ///
+    /// # Errors
+    ///
+    /// The `Shutdown` send's error, or [`ContextError::ActorBusy`] when the
+    /// send succeeded, if the actor has not exited within [`REPLY_TIMEOUT`].
+    /// The actor may still write after an error.
+    pub(in crate::context) async fn shutdown_and_await_exit(&self) -> Result<(), ContextError> {
+        // A closed inbox (the actor already exited) fails the send and
+        // resolves `closed` at once, so the exit wait alone decides success.
+        let shutdown = self.send_shutdown().await;
+        match tokio::time::timeout(REPLY_TIMEOUT, self.inbox.closed()).await {
+            Ok(()) => Ok(()),
+            Err(_elapsed) => Err(shutdown.err().unwrap_or_else(|| {
+                ContextError::ActorBusy(format!(
+                    "context actor did not exit within {} seconds of its shutdown ack",
+                    REPLY_TIMEOUT.as_secs()
+                ))
+            })),
+        }
+    }
+
+    /// [`Self::shutdown_and_await_exit`] with no time bound, for a caller that
+    /// must not proceed until the actor has exited however long it takes.
+    ///
+    /// The `Shutdown` send waits for mailbox capacity instead of timing out,
+    /// so a full mailbox delays the stop rather than skipping it. A send that
+    /// fails means the inbox receiver has dropped, which happens only when
+    /// `run()` returns, so the actor has already exited.
+    pub(in crate::context) async fn stop_and_await_exit_unbounded(&self) {
+        let (reply, _ack) = oneshot::channel();
+        let shutdown =
+            ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply });
+        if self.inbox.send(shutdown).await.is_err() {
+            return;
+        }
+        self.inbox.closed().await;
+    }
 }
 
 // ---------------------------------------------------------------------------

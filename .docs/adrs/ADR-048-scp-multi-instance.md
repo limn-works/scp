@@ -389,7 +389,7 @@ Wiring: `with_storage_py` / `with_storage_napi` / `with_storage_uniffi` open a `
 
 PyO3 additionally routes the same `Arc<SqliteStorage>` into the existing `StorageProvider` enum so identity, trust, MCP, and event log reads/writes share that connection instead of opening a second one.
 
-NAPI falls back to the legacy in-memory `NapiBridgePersistence` when no shared provider is configured, preserving behaviour for callers that built their instance via `withStorage({type: "in_memory"})` or the default-instance path.
+The in-memory paths of all three bridges persist snapshots through the same kind of provider: a `ProtocolRepositoryContextBridge` over the encrypted in-memory storage that also backs the event log and `DurableProviders` (spec §17.6). No bridge keeps a separate process-local snapshot store, and an instance with no attached provider attaches no supervisor (spec §17.17).
 
 SDK convenience constructors:
 

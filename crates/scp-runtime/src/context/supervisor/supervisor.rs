@@ -1204,6 +1204,56 @@ impl std::fmt::Display for JoinFailure {
     }
 }
 
+/// Clears a [`Supervisor::discard_joined_context`] pending mark on drop, so a
+/// discarding call that ends or is dropped before it hands the exit wait to a
+/// task never leaves the id refused forever.
+struct PendingDiscardMark<'a> {
+    supervisor: &'a Supervisor,
+    context_id: &'a str,
+}
+
+impl Drop for PendingDiscardMark<'_> {
+    fn drop(&mut self) {
+        self.supervisor.pending_discards.remove(self.context_id);
+    }
+}
+
+/// Finishes a [`Supervisor::discard_joined_context`] whose exit wait timed out,
+/// from the tracked task, after the discarded actor has exited.
+///
+/// Holds a `Weak<Supervisor>` (ADR-049 Decision 16) and the persistence
+/// strongly: once the Supervisor has dropped, its floor and tracker registries
+/// dropped with it, but the snapshot is durable and still has to go. Nobody
+/// awaits this task, so a failure is logged at error level.
+async fn finish_discard_after_exit(
+    supervisor: &std::sync::Weak<Supervisor>,
+    persistence: Option<&Arc<dyn ContextPersistence>>,
+    context_id: &str,
+) {
+    let result = match supervisor.upgrade() {
+        Some(supervisor) => {
+            let finished = supervisor.finish_discard(context_id).await;
+            supervisor.pending_discards.remove(context_id);
+            finished
+        }
+        None => match persistence {
+            Some(persistence) => persistence.delete_context(context_id).await.map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "discard of joined context '{context_id}': snapshot delete failed: {e}"
+                ))
+            }),
+            None => Ok(()),
+        },
+    };
+    if let Err(error) = result {
+        tracing::error!(
+            context_id,
+            %error,
+            "discard of a joined context did not finish after its actor exited"
+        );
+    }
+}
+
 /// Spawn a `KeyPackageStoreActor`'s watchdog task (ADR-049 §10).
 ///
 /// The per-identity twin of [`spawn_actor_watchdog_task`]. A free function for
@@ -1719,10 +1769,9 @@ pub struct Supervisor {
     /// Per-identity X25519 wrapping keys. Wrapped in `ArcSwap` so
     /// rotation is atomic; outer `DashMap` keyed by DID.
     pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>,
-    /// Persistence backend; stored so `spawn_actor` / `crash_recovery`
-    /// can plumb it through to per-actor state.
-    // Operational in Phase 2 of post-review-round-1 plan (actor model wiring).
-    #[allow(dead_code)]
+    /// Persistence backend. [`Self::build_actor_deps`] hands it to every actor
+    /// as `ActorDeps::persistence`. Every shipped constructor fills it with the
+    /// caller's required backend.
     pub(in crate::context::supervisor) persistence: Arc<dyn ContextPersistence>,
     /// Single-producer-multi-read write lock — plan §"Write path".
     #[allow(
@@ -1850,7 +1899,7 @@ pub struct Supervisor {
     // authoritative on Supervisor).
     //
     // Each `OnceLock<Arc<...>>` provider slot is populated directly by
-    // [`Self::with_providers`]. There is no `ContextManager` to attach
+    // [`Self::with_providers_and_journal`]. There is no `ContextManager` to attach
     // — the supervisor IS the source of truth for every provider after
     // ADR-049 §15. Slots are still wrapped in `OnceLock` so the
     // [`Self::for_query_shim`] constructor path (used by tests +
@@ -1864,21 +1913,26 @@ pub struct Supervisor {
     // `standing_contexts`) are eagerly initialized
     // in [`Self::new`] and their accessors do not return `Option`.
     // -----------------------------------------------------------------
-    /// Shared crypto provider. Populated by [`Self::with_providers`].
+    /// Shared crypto provider. Populated by [`Self::with_providers_and_journal`].
     crypto: OnceLock<Arc<crate::crypto::mls::provider::NodeMlsFactory>>,
-    /// Shared transport provider. Populated by [`Self::with_providers`].
+    /// Shared transport provider. Populated by [`Self::with_providers_and_journal`].
     transport: OnceLock<Arc<dyn ContextTransportProvider>>,
-    /// Shared event-log provider. Populated by [`Self::with_providers`].
+    /// Shared event-log provider. Populated by [`Self::with_providers_and_journal`].
     event_log: OnceLock<Arc<dyn ContextEventLogProvider>>,
-    /// Optional helper-side persistence slot — populated by
-    /// [`Self::with_providers`] only when the caller passes
-    /// `Some(persistence)`. Distinct from the supervisor-saga
-    /// [`Self::persistence`] field above (which is always populated;
-    /// defaults to the no-op stub). Helpers branch on
-    /// `persistence_ref().is_some()` to skip best-effort persist
-    /// calls when no real backend is wired.
+    /// Helper-side persistence slot. [`Self::with_providers_and_journal`]
+    /// fills it with the same backend as [`Self::persistence`]. It stays empty
+    /// only on the test-only constructors (`Self::new`, `Self::for_query_shim`,
+    /// and `Self::with_providers` with `persistence: None`); helpers branch on
+    /// `persistence_ref().is_some()` for those harnesses.
     helper_persistence: OnceLock<Arc<dyn ContextPersistence>>,
-    /// Wall-clock source. Populated by [`Self::with_providers`] (or
+    /// Ids whose [`Self::discard_joined_context`] removed the actor and has
+    /// not yet finished its teardown. Marked under `write_lock` together with
+    /// the registry removal, cleared once the teardown has run (or when the
+    /// discarding call is dropped before handing the wait to a task). A
+    /// discard of a marked id is refused, so it cannot delete the snapshot
+    /// while the first discard's actor can still write it.
+    pending_discards: dashmap::DashSet<String>,
+    /// Wall-clock source. Populated by [`Self::with_providers_and_journal`] (or
     /// defaulted to [`scp_clock::SystemClock`] when the caller
     /// passes `None`).
     clock: OnceLock<Arc<dyn Clock>>,
@@ -1888,7 +1942,7 @@ pub struct Supervisor {
     /// clone is a reference-count bump.
     key_resolver: OnceLock<KeyResolver>,
     /// Optional payment adapter. Empty `OnceLock` means "no adapter
-    /// configured"; populated by [`Self::with_providers`] when the
+    /// configured"; populated by [`Self::with_providers_and_journal`] when the
     /// caller passes `Some(adapter)`. There is no post-construction
     /// setter — the deleted prior `set_payment_adapter` opened a
     /// two-paths-to-set seam that no production caller used.
@@ -2121,11 +2175,11 @@ impl DurableProviders {
 
     /// Pairs an `mls_storage` view with the no-op saga journal.
     ///
-    /// `pub(crate)` so only the legacy [`Supervisor::with_providers`] test path
-    /// (which hardcodes [`NoopSagaJournal`] and is reachable from examples
-    /// without the `testing` feature) can build a `DurableProviders` with no
-    /// durable journal. It cannot cause silent crash-recovery loss via backend
-    /// divergence because it carries no durable journal at all.
+    /// Compiled only under `test` or the `testing` feature, for the test-only
+    /// [`Supervisor::with_providers`]. A shipped build has no constructor that
+    /// pairs `mls_storage` with a journal that stores nothing (§17.17
+    /// `SCP-CAPSEL-8000`).
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn with_noop_journal(
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Self {
@@ -2167,6 +2221,26 @@ impl DurableProviders {
     }
 }
 
+/// The providers [`Supervisor::bootstrap`] installs, as named fields.
+///
+/// `persistence` backs the supervisor's own persistence field and every actor's
+/// `ActorDeps::persistence`; `helper_persistence` fills the helper-side slot
+/// that `persistence_ref()` reads. [`Supervisor::with_providers_and_journal`]
+/// sets both to the caller's required persistence. Only the test-only
+/// `Supervisor::with_providers` leaves `helper_persistence` empty.
+struct ProviderBootstrap {
+    crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+    transport: Box<dyn ContextTransportProvider>,
+    event_log: Box<dyn ContextEventLogProvider>,
+    key_resolver: KeyResolver,
+    persistence: Arc<dyn ContextPersistence>,
+    helper_persistence: Option<Arc<dyn ContextPersistence>>,
+    payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+    event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    clock: Option<Arc<dyn Clock>>,
+    durable: DurableProviders,
+}
+
 impl Supervisor {
     /// Per-context lifecycle operation budget (ADR-049 §10). Bounds
     /// `restore_context` on BOTH the `RestoreContext` dispatch arm and the
@@ -2182,9 +2256,9 @@ impl Supervisor {
     /// `scp_ffi_common::bridge_instance` construct one per SCP
     /// instance and drop it on `shutdown`.
     ///
-    /// Visibility is `pub(crate)` in production builds; only
-    /// [`Self::with_providers`] (the FFI-facing factory) calls into
-    /// `new`. Integration tests in `crates/scp-runtime/tests/` reach
+    /// Compiled only under `test` or the `testing` feature; production
+    /// builds construct through [`Self::with_providers_and_journal`], which
+    /// calls `new_inner`. Integration tests in `crates/scp-runtime/tests/` reach
     /// the constructor through the `testing`-feature gate so they can
     /// build supervisors without provider wiring.
     #[must_use]
@@ -2198,7 +2272,7 @@ impl Supervisor {
     }
 
     /// Internal constructor reachable from production builds. The public
-    /// surface goes through [`Self::with_providers`]; the test-only
+    /// surface goes through [`Self::with_providers_and_journal`]; the test-only
     /// `Self::new` alias forwards here so the same body services both
     /// the production factory and the test integration suites.
     #[must_use]
@@ -2245,6 +2319,7 @@ impl Supervisor {
             persistence,
             write_lock,
             bootstrap_spawn_lock,
+            pending_discards: dashmap::DashSet::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
@@ -2319,7 +2394,7 @@ impl Supervisor {
     /// fields are no-op stubs — saga FSM tests assert the coordinator's
     /// observable state transitions, and spawn tests exercise registry
     /// insertion only. Production code paths build supervisors through
-    /// [`Self::with_providers`], which wires real providers; bridge
+    /// [`Self::with_providers_and_journal`], which wires real providers; bridge
     /// instances in `scp_ffi_common::bridge_instance` never call
     /// `for_query_shim`.
     ///
@@ -2334,22 +2409,73 @@ impl Supervisor {
         Self::new_inner(persistence, saga_journal, SupervisorConfig::default())
     }
 
-    /// Construct a supervisor with the providers that previously lived on
-    /// the deleted `ContextManager` (ADR-049 §15).
+    /// Test-only constructor: builds a supervisor over the given providers with
+    /// the no-op saga journal ([`NoopSagaJournal`]), so the saga coordinator
+    /// runs but never durably journals.
     ///
-    /// The supervisor is now the authoritative owner of every provider —
-    /// there is no `ContextManager` to attach. FFI bridges call this
-    /// factory once at construction time; the returned `Arc<Supervisor>`
-    /// is the only handle they hold.
+    /// Compiled only under `test` or the `testing` feature. A shipped build
+    /// constructs through [`Self::with_providers_and_journal`], which takes a
+    /// durable journal and a required context persistence, so no shipped
+    /// constructor installs a no-op persistence or journal (§17.17
+    /// `SCP-CAPSEL-8000`; ADR-049).
     ///
-    /// This test/legacy constructor wires a no-op saga journal
-    /// ([`NoopSagaJournal`]), so the saga coordinator runs but never
-    /// durably journals — durable saga journalling requires
-    /// [`Self::with_providers_and_journal`] (the path every production
-    /// bridge takes). The supervisor's own persistence slot is wired to a
-    /// no-op
+    /// `persistence: None` gives the supervisor's own persistence field and
+    /// every actor it builds a
     /// [`NoopContextPersistence`](crate::context::persistence::NoopContextPersistence)
-    /// when `persistence` is `None`.
+    /// and leaves the helper-side slot empty, so `persistence_ref()` returns
+    /// `None`: helpers skip best-effort persists and `restore_all_contexts`
+    /// returns `PersistenceFailed`.
+    ///
+    /// The other arguments match [`Self::with_providers_and_journal`], except
+    /// that `mls_storage` arrives alone and is paired with the no-op journal.
+    #[must_use]
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(clippy::too_many_arguments)] // mirrors the provider bootstrap of `with_providers_and_journal`
+    pub fn with_providers(
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
+        persistence: Option<Box<dyn ContextPersistence>>,
+        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+        clock: Option<Arc<dyn Clock>>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) -> Arc<Self> {
+        let helper_persistence: Option<Arc<dyn ContextPersistence>> = persistence.map(Arc::from);
+        let persistence: Arc<dyn ContextPersistence> = helper_persistence.as_ref().map_or_else(
+            || Arc::new(crate::context::persistence::NoopContextPersistence) as _,
+            Arc::clone,
+        );
+        Self::bootstrap(ProviderBootstrap {
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            helper_persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            durable: DurableProviders::with_noop_journal(mls_storage),
+        })
+    }
+
+    /// Constructs a supervisor that owns every provider the deleted
+    /// `ContextManager` held (ADR-049 §15). Every production seam (the `PyO3`
+    /// reference bridge, NAPI, `UniFFI`, scp-node) constructs through this
+    /// function; the returned `Arc<Supervisor>` is the only handle it holds.
+    ///
+    /// The saga journal and the `OpenMLS` `mls_storage` view arrive as one
+    /// [`DurableProviders`] built by [`DurableProviders::from_handle`] over the
+    /// caller's single chosen `Storage` backend, so a production caller cannot
+    /// wire the journal to a divergent backend (spec §17.6 / §17.16).
+    ///
+    /// **Visibility (`pub`, intentional).** The bridge-path bootstrap test
+    /// (`scp-testing`, a separate crate) constructs a supervisor with a durable
+    /// saga journal and a populated persistence slot, the two ingredients a real
+    /// [`Self::restore_on_startup`] needs to exercise restore-then-replay through
+    /// the FFI bridge entry.
     ///
     /// # Arguments
     ///
@@ -2364,141 +2490,98 @@ impl Supervisor {
     ///   survive restart.
     /// * `key_resolver` — DID-to-Ed25519-key resolver for governance
     ///   signature verification.
-    /// * `persistence` — optional context persistence; `None` keeps the
-    ///   supervisor in-memory only.
+    /// * `persistence` — **required** context persistence. It backs the
+    ///   supervisor's own persistence field, the helper-side slot, and every
+    ///   actor's `ActorDeps::persistence`. The runtime never substitutes a
+    ///   backend that stores nothing; a caller without persistence cannot
+    ///   construct a supervisor (§17.17 `SCP-CAPSEL-8000`).
     /// * `payment_adapter` — optional payment adapter for the 9-step
     ///   paid-action flow (spec §19.2.2).
     /// * `event_tx` — optional broadcast sender for event fan-out.
     /// * `clock` — optional [`Clock`] override; defaults to
     ///   [`scp_clock::SystemClock`] when `None`.
-    /// * `mls_storage` — **required** OpenMLS storage adapter (the
-    ///   bridge's chosen `Storage`, erased once via
-    ///   [`SpawnBlockingStorageAdapter`](crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter)).
-    ///   The runtime never defaults or manufactures storage — the caller
-    ///   supplies it at the bridge/builder layer, enforced by the type
-    ///   system (non-`Option`). In-memory storage is a bridge-layer dev
-    ///   opt-in, never a runtime default.
+    /// * `durable` — **required** saga journal + `mls_storage` pair over one
+    ///   `Storage` backend. The runtime never defaults storage.
     ///
-    /// # Returns
+    /// A `None` persistence does not compile:
     ///
-    /// `Arc<Supervisor>` — already wrapped because FFI bridges store
-    /// their per-instance supervisor in an `Arc` slot.
+    /// ```compile_fail,E0308
+    /// # use std::sync::Arc;
+    /// # use scp_runtime::context::supervisor::{DurableProviders, Supervisor};
+    /// # fn build(
+    /// #     crypto: Arc<scp_runtime::crypto::mls::provider::NodeMlsFactory>,
+    /// #     transport: Box<dyn scp_runtime::context::builder::ContextTransportProvider>,
+    /// #     event_log: Box<dyn scp_runtime::context::builder::ContextEventLogProvider>,
+    /// #     key_resolver: scp_protocol::context::governance::KeyResolver,
+    /// #     durable: DurableProviders,
+    /// # ) {
+    /// let _ = Supervisor::with_providers_and_journal(
+    ///     crypto, transport, event_log, key_resolver,
+    ///     None, // E0308: expected `Box<dyn ContextPersistence>`
+    ///     None, None, None, durable,
+    /// );
+    /// # }
+    /// ```
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // FFI bridges need to compose providers in one call
-    pub fn with_providers(
-        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
-        transport: Box<dyn ContextTransportProvider>,
-        event_log: Box<dyn ContextEventLogProvider>,
-        key_resolver: KeyResolver,
-        persistence: Option<Box<dyn ContextPersistence>>,
-        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
-        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
-        clock: Option<Arc<dyn Clock>>,
-        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-    ) -> Arc<Self> {
-        // The default provider bootstrap wires the no-op saga journal. This is
-        // the TEST / LEGACY constructor: production bridges no longer call it —
-        // every production seam (PyO3, NAPI, UniFFI, scp-node) constructs via
-        // [`Self::with_providers_and_journal`] with a durable
-        // `ProtocolRepositorySagaJournal` over its single chosen `Storage`
-        // backend. `with_providers` remains for unit/integration tests that do
-        // not exercise the durable saga journal (it hardcodes
-        // [`NoopSagaJournal`]); tests that need a durable journal call
-        // [`Self::with_providers_and_journal`] directly.
-        Self::with_providers_and_journal(
-            crypto,
-            transport,
-            event_log,
-            key_resolver,
-            persistence,
-            payment_adapter,
-            event_tx,
-            clock,
-            DurableProviders::with_noop_journal(mls_storage),
-        )
-    }
-
-    /// Like [`Self::with_providers`] but with a caller-supplied saga journal —
-    /// the seam the saga FSM + crash-recovery tests use to drive the REAL
-    /// journal write-ordering over co-resident actors, AND the constructor every
-    /// production bridge now calls to attach a durable saga journal (ADR-049
-    /// saga work).
-    ///
-    /// Production bridges construct via THIS constructor, supplying the two
-    /// durable providers as one [`DurableProviders`] value built by
-    /// [`DurableProviders::from_handle`] over their single chosen `Storage`
-    /// backend — the PyO3 reference bridge, NAPI, UniFFI, and scp-node. Because
-    /// the constructor accepts ONLY a `DurableProviders` (not separate journal
-    /// and `mls_storage` arguments), and the only non-test constructor of that
-    /// type derives both halves from one handle, a production caller cannot wire
-    /// the journal to a divergent backend. [`Self::with_providers`] — which
-    /// hardcodes [`NoopSagaJournal`] via
-    /// [`DurableProviders::with_noop_journal`] — is the test/legacy constructor
-    /// and is no longer on any production path.
-    ///
-    /// **Visibility (`pub`, intentional).** Kept `pub` so the bridge-path
-    /// bootstrap test (`scp-testing`, a separate crate) can construct a
-    /// supervisor that has BOTH a durable saga journal AND a populated
-    /// helper-persistence slot — the two ingredients a real
-    /// [`Self::restore_on_startup`] needs to exercise restore-then-replay
-    /// end-to-end through the FFI bridge entry. The real precedent for exposing
-    /// this provider-wiring surface as `pub` is the unconditionally-`pub`
-    /// [`Self::with_providers`], which already accepts exactly these providers
-    /// (it merely hardcodes [`NoopSagaJournal`] in place of the caller-supplied
-    /// journal). This constructor only adds the `saga_journal` parameter to that
-    /// already-public surface; it does not widen any other injection point.
-    #[allow(clippy::too_many_arguments)] // provider bootstrap mirrors `with_providers`
+    #[allow(clippy::too_many_arguments)] // FFI bridges compose every provider in one call
     pub fn with_providers_and_journal(
         crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         key_resolver: KeyResolver,
-        persistence: Option<Box<dyn ContextPersistence>>,
+        persistence: Box<dyn ContextPersistence>,
         payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         durable: DurableProviders,
     ) -> Arc<Self> {
-        // The saga journal and the `OpenMLS` `mls_storage` view arrive bound into
-        // ONE [`DurableProviders`] value whose only non-test constructor
-        // ([`DurableProviders::from_handle`]) derives both from a single
-        // `Storage` handle. A production caller therefore cannot pass a journal
-        // wired to a different backend than `mls_storage` — the same-backend
-        // invariant (spec §17.6 / §17.16) is enforced by the type system here,
-        // not by convention. `into_parts` is `pub(crate)`, so this is the single
-        // in-crate site that may decompose the pair.
+        let persistence: Arc<dyn ContextPersistence> = Arc::from(persistence);
+        Self::bootstrap(ProviderBootstrap {
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            helper_persistence: Some(Arc::clone(&persistence)),
+            persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            durable,
+        })
+    }
+
+    /// Builds the supervisor and fills its provider slots. The single body
+    /// behind [`Self::with_providers_and_journal`] and the test-only
+    /// `Self::with_providers`.
+    fn bootstrap(providers: ProviderBootstrap) -> Arc<Self> {
+        let ProviderBootstrap {
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            helper_persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            durable,
+        } = providers;
+        // `into_parts` is `pub(crate)`, so this is the single in-crate site that
+        // decomposes the same-backend journal + `mls_storage` pair.
         let (saga_journal, mls_storage) = durable.into_parts();
-        // The supervisor's own `persistence` field is non-Option (saga
-        // code requires a value); when the caller passes `None`, wire
-        // the no-op stub the `for_query_shim` path uses. The
-        // helper-side `helper_persistence` slot stays empty in that
-        // case so `persistence_ref()` returns `None` and helpers skip
-        // best-effort persist calls.
-        let (supervisor_persistence, helper_persistence_arc) = persistence.map_or_else(
-            || {
-                let stub: Arc<dyn ContextPersistence> =
-                    Arc::new(crate::context::persistence::NoopContextPersistence);
-                (stub, None)
-            },
-            |boxed| {
-                let arc: Arc<dyn ContextPersistence> = Arc::from(boxed);
-                (Arc::clone(&arc), Some(arc))
-            },
-        );
         let supervisor = Arc::new(Self::new_inner(
-            supervisor_persistence,
+            persistence,
             saga_journal,
             SupervisorConfig::default(),
         ));
 
-        // Populate provider OnceLocks. Each `set(...).is_ok()` returns
-        // false if the slot is already populated — impossible on this
-        // freshly-constructed supervisor, but `let _ = ...` keeps clippy
-        // happy with the discarded `Result`.
+        // Populate provider OnceLocks. Each `set(...)` fails only when the slot
+        // is already populated, which is impossible on this freshly-constructed
+        // supervisor; `let _ =` discards the `Result` for clippy.
         let _ = supervisor.crypto.set(crypto);
         let _ = supervisor.transport.set(Arc::from(transport));
         let _ = supervisor.event_log.set(Arc::from(event_log));
-        if let Some(p) = helper_persistence_arc {
+        if let Some(p) = helper_persistence {
             let _ = supervisor.helper_persistence.set(p);
         }
         let _ = supervisor.key_resolver.set(key_resolver);
@@ -2522,10 +2605,8 @@ impl Supervisor {
                 .set_consumed_init_key_store(Arc::clone(&mls_storage));
         }
 
-        // Required, non-Option — the runtime never defaults storage. The
-        // freshly-constructed supervisor's slot is always empty here, so
-        // `set` cannot fail; `let _ =` discards the `Result` for clippy. This
-        // is the last use of `mls_storage`, so it is moved (not cloned) in.
+        // Required, non-Option — the runtime never defaults storage. This is
+        // the last use of `mls_storage`, so it is moved (not cloned) in.
         let _ = supervisor.mls_storage.set(mls_storage);
 
         supervisor
@@ -2620,7 +2701,7 @@ impl Supervisor {
     //
     // Provider accessors (`crypto_ref`, `transport_ref`, etc.) return
     // `Option<&...>` because providers are populated only by
-    // [`Self::with_providers`] — the [`Self::for_query_shim`] path
+    // [`Self::with_providers_and_journal`] — the [`Self::for_query_shim`] path
     // leaves them empty (used by saga + spawn unit tests that don't
     // touch providers).
     //
@@ -2634,7 +2715,7 @@ impl Supervisor {
 
     /// Cheap reference to the supervisor's shared
     /// [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory).
-    /// Returns `None` if [`Self::with_providers`] was not used (e.g. a
+    /// Returns `None` if [`Self::with_providers_and_journal`] was not used (e.g. a
     /// supervisor built via `Self::for_query_shim` / `Self::new`).
     #[must_use]
     pub(crate) fn crypto_ref(&self) -> Option<&Arc<crate::crypto::mls::provider::NodeMlsFactory>> {
@@ -2643,7 +2724,7 @@ impl Supervisor {
 
     /// Cheap reference to the supervisor's shared
     /// [`ContextTransportProvider`]. Returns `None` if
-    /// [`Self::with_providers`] was not used.
+    /// [`Self::with_providers_and_journal`] was not used.
     #[must_use]
     pub(crate) fn transport_ref(&self) -> Option<&Arc<dyn ContextTransportProvider>> {
         self.transport.get()
@@ -2651,16 +2732,17 @@ impl Supervisor {
 
     /// Cheap reference to the supervisor's shared
     /// [`ContextEventLogProvider`]. Returns `None` if
-    /// [`Self::with_providers`] was not used.
+    /// [`Self::with_providers_and_journal`] was not used.
     #[must_use]
     pub(crate) fn event_log_ref(&self) -> Option<&Arc<dyn ContextEventLogProvider>> {
         self.event_log.get()
     }
 
     /// Cheap reference to the helper-side persistence slot. Returns
-    /// `None` if [`Self::with_providers`] was not used or the caller
-    /// passed `None` for `persistence` (helpers branch on this to skip
-    /// best-effort persist calls when no real backend is wired).
+    /// `None` only on a test-only constructor that leaves the slot empty
+    /// (`Self::new`, `Self::for_query_shim`, or `Self::with_providers` with
+    /// `persistence: None`); [`Self::with_providers_and_journal`] always fills
+    /// it.
     #[must_use]
     pub(crate) fn persistence_ref(&self) -> Option<&Arc<dyn ContextPersistence>> {
         self.helper_persistence.get()
@@ -2726,7 +2808,7 @@ impl Supervisor {
     }
 
     /// Cheap reference to the supervisor's wall-clock source. Returns
-    /// `None` if [`Self::with_providers`] was not used.
+    /// `None` if [`Self::with_providers_and_journal`] was not used.
     #[must_use]
     pub(crate) fn clock_ref(&self) -> Option<&Arc<dyn Clock>> {
         self.clock.get()
@@ -2734,7 +2816,7 @@ impl Supervisor {
 
     /// Cheap reference to the supervisor's
     /// [`KeyResolver`](scp_protocol::context::governance::KeyResolver).
-    /// Returns `None` if [`Self::with_providers`] was not used.
+    /// Returns `None` if [`Self::with_providers_and_journal`] was not used.
     #[must_use]
     pub(crate) fn key_resolver_ref(&self) -> Option<&KeyResolver> {
         self.key_resolver.get()
@@ -2794,7 +2876,7 @@ impl Supervisor {
 
     /// Cheap reference to the supervisor's OpenMLS storage adapter
     /// (lock-free read per ADR-049 §Decision 12). Returns `None` if
-    /// [`Self::with_providers`] was not used (e.g. a supervisor built
+    /// [`Self::with_providers_and_journal`] was not used (e.g. a supervisor built
     /// via `Self::for_query_shim` / `Self::new`).
     // Non-test callers land when `dispatch_lifecycle_direct` switches to
     // actor-shape (storage-foundation Step 5); until then this accessor is
@@ -2931,7 +3013,7 @@ impl Supervisor {
 
     /// Clear every per-identity wrapping keypair. Used by the
     /// shutdown helper so a fresh
-    /// [`Self::with_providers`] observes empty per-identity state.
+    /// [`Self::with_providers_and_journal`] observes empty per-identity state.
     /// Wrapping-key secrets zeroize on drop via the
     /// `Zeroizing<[u8;32]>` field on
     /// [`WrappingKeyPair`](crate::context::actor::state::WrappingKeyPair).
@@ -3115,7 +3197,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns [`ContextError::NotInitialized`] if any required provider slot
-    /// is empty (i.e. [`Self::with_providers`] was not used).
+    /// is empty (i.e. [`Self::with_providers_and_journal`] was not used).
     fn build_kp_store_deps(
         &self,
         identity: &DID,
@@ -3153,7 +3235,7 @@ impl Supervisor {
     /// (ADR-049 §1 / ADR-049 §15), scoped to `owning_did`.
     ///
     /// Self-sources every collaborator from the `OnceLock`s populated by
-    /// [`Self::with_providers`]: the `MlsBackend` / `HpkeBackend` pair is
+    /// [`Self::with_providers_and_journal`]: the `MlsBackend` / `HpkeBackend` pair is
     /// read transitively through `crypto.mls_backend()` /
     /// `crypto.hpke_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
     /// owns the only instance — no second supervisor field, so there is
@@ -3187,7 +3269,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns [`ContextError::NotInitialized`] if any required provider
-    /// slot is empty (i.e. [`Self::with_providers`] was not used).
+    /// slot is empty (i.e. [`Self::with_providers_and_journal`] was not used).
     ///
     /// # Method receiver
     ///
@@ -3229,13 +3311,11 @@ impl Supervisor {
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let key_resolver = self.key_resolver_ref().ok_or_else(not_init)?.clone();
         let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
-        let persistence = self.persistence_ref().map_or_else(
-            || {
-                Arc::new(crate::context::persistence::NoopContextPersistence)
-                    as Arc<dyn ContextPersistence>
-            },
-            Arc::clone,
-        );
+        // The supervisor's own non-Option persistence field. Every shipped
+        // constructor (`with_providers_and_journal`) fills it with the caller's
+        // required backend, so no actor receives a backend the caller did not
+        // pass (§17.17 `SCP-CAPSEL-8000`).
+        let persistence = Arc::clone(&self.persistence);
         let key_package_store = self.key_package_store_for(owning_did).await?;
         let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(self);
         // Mint the actor's capability token here, at the supervisor build
@@ -3296,7 +3376,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no providers have been
-    ///   attached — the caller must call [`Self::with_providers`]
+    ///   attached — the caller must call [`Self::with_providers_and_journal`]
     ///   first.
     pub async fn dispatch_query(&self, cmd: QueriesCommand) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A finalization — try the actor mailbox first
@@ -3359,7 +3439,7 @@ impl Supervisor {
     /// - [`ContextError::NotInitialized`] if no
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet — the caller must call
-    ///   [`Self::with_providers`] first.
+    ///   [`Self::with_providers_and_journal`] first.
     /// - [`ContextError::ContextNotRegistered`] if no actor has been
     ///   spawned for `ctx_id`. Every production context creation path
     ///   (create / join / restore / import) spawns an actor before the
@@ -3418,7 +3498,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no providers have been
-    ///   attached — the caller must call [`Self::with_providers`]
+    ///   attached — the caller must call [`Self::with_providers_and_journal`]
     ///   first.
     /// - Any typed error returned by the delegated bootstrap / actor
     ///   handler is surfaced through the variant's oneshot reply; the
@@ -5939,50 +6019,153 @@ impl Supervisor {
     /// consume is irreversible by construction (a KeyPackage is one-shot), and
     /// re-joining draws a fresh reservation anyway.
     ///
-    /// Like the internal rollback arms, the snapshot-delete is best-effort
-    /// (`let _ =`): an idempotent no-op when the join never persisted, and a
-    /// compensating teardown must never itself fail. The handle drop + floor
-    /// reap are synchronous, so the teardown runs under `write_lock` — atomic
-    /// with respect to concurrent register/despawn.
+    /// The floor reap, the stream-admission reap and the snapshot delete run
+    /// only after the actor's `run()` has returned. The actor persists dirty
+    /// state in its post-loop drain, after the last sender drops or `Shutdown`
+    /// dispatches, and a command already queued from another clone of its
+    /// handle can re-create a floor or tracker entry, so anything removed
+    /// while it still runs can come back and the context resurrects on
+    /// restart. Until the delete, the join's snapshot stays in place, so
+    /// Precheck D refuses a re-join of the id in the meantime.
     ///
-    /// Returns `true` if a live actor handle was registered and removed,
-    /// `false` if no entry existed for `context_id`.
-    pub async fn discard_joined_context(&self, context_id: &str) -> bool {
-        let _guard = self.write_lock.lock().await;
-        // 1. Drop the in-memory actor handle. #2148 (ADR-049 birth-into-actor):
+    /// The registry removal runs under `write_lock`, atomic with respect to
+    /// concurrent register/despawn. The exit wait runs outside it, because an
+    /// actor handler can take `write_lock` (a TTL exit's self-despawn).
+    ///
+    /// When the actor has not exited within the reply bound, the wait moves to
+    /// a task on the Supervisor's tracker that stops the actor with no time
+    /// bound and then finishes the teardown, and this call returns the wait's
+    /// error. Once shutdown has begun the tracker takes no task, so the call
+    /// finishes the teardown inline instead and returns only after the actor
+    /// has exited. Either way no write from the actor lands after the delete.
+    /// One gap remains: if the process dies while a wedged actor is still
+    /// running, the join's snapshot is still in place and the next start
+    /// restores the context.
+    ///
+    /// Returns `Ok(true)` if a live actor handle was registered and removed,
+    /// `Ok(false)` if no entry existed for `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// The actor's exit-wait error (the teardown then finishes in the tracked
+    /// task), the error from finishing the teardown
+    /// ([`Self::finish_discard`]), or [`ContextError::ActorBusy`] when an
+    /// earlier discard of the id has not finished its teardown.
+    pub async fn discard_joined_context(
+        self: &Arc<Self>,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
+        // 1. Remove the in-memory actor handle. #2148 (ADR-049 birth-into-actor):
         //    the joiner's MLS crypto is OWNED by the actor's `PerContextState`
-        //    (born owned at the WELCOME seam, never provider-resident), so
-        //    dropping the actor handle closes its mailbox — the actor task ends
-        //    and its state drops: the sender key ZEROIZES (`ZeroizeOnDrop`), the
-        //    group's signer and its provider-storage values zeroize on drop. There is no
-        //    provider map to also destroy (the deleted `destroy_mls_group` arm).
-        let removed = self.actors.remove(context_id).is_some();
-        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
-        // 2. Delete the durable Class-S snapshot the join persisted so a
-        //    restart cannot resurrect the context and Precheck-D does not block
-        //    a fresh re-join (mirrors the `delete_context` rollback arm; the
-        //    helper-persistence slot is the same backend the join persisted to,
-        //    an unset slot means nothing durable was ever written).
-        if let Some(persistence) = self.persistence_ref() {
-            let _ = persistence.delete_context(context_id).await;
+        //    (born owned at the WELCOME seam, never provider-resident), so once
+        //    the actor task ends its state drops: the sender key ZEROIZES
+        //    (`ZeroizeOnDrop`), the group's signer and its provider-storage
+        //    values zeroize on drop. There is no provider map to also destroy
+        //    (the deleted `destroy_mls_group` arm). Another clone of the handle
+        //    (a bridge's cached one) keeps the actor alive, so step 2 stops it
+        //    explicitly.
+        let (handle, mark) = {
+            let guard = self.write_lock.lock().await;
+            if self.pending_discards.contains(context_id) {
+                return Err(ContextError::ActorBusy(format!(
+                    "discard of joined context '{context_id}': an earlier discard is still \
+                     waiting for the actor to exit, and deletes the snapshot once it has"
+                )));
+            }
+            let Some((_, handle)) = self.actors.remove(context_id) else {
+                drop(guard);
+                self.finish_discard(context_id).await?;
+                return Ok(false);
+            };
+            self.pending_discards.insert(context_id.to_owned());
+            (
+                handle,
+                PendingDiscardMark {
+                    supervisor: self,
+                    context_id,
+                },
+            )
+        };
+        // 2. Stop the actor and wait for its run loop to return, so its
+        //    post-loop drain persist lands before step 3.
+        let Err(wait_error) = handle.shutdown_and_await_exit().await else {
+            let finished = self.finish_discard(context_id).await;
+            drop(mark);
+            finished?;
+            return Ok(true);
+        };
+        let supervisor = Arc::downgrade(self);
+        let persistence = self.persistence_ref().cloned();
+        let id = context_id.to_owned();
+        let moved = handle.clone();
+        let spawned = self.spawn_tracked("discard_joined_context exit wait", async move {
+            moved.stop_and_await_exit_unbounded().await;
+            finish_discard_after_exit(&supervisor, persistence.as_ref(), &id).await;
+        });
+        if spawned.is_ok() {
+            // The task now owns the mark and clears it after the teardown.
+            std::mem::forget(mark);
+        } else {
+            // Shutdown has begun and the tracker takes no task: finish inline.
+            handle.stop_and_await_exit_unbounded().await;
+            let finished = self.finish_discard(context_id).await;
+            drop(mark);
+            finished?;
         }
-        // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
-        //    discarded welcome-join is permanently gone (its actor-owned crypto
-        //    freed on the handle drop above — `SenderKey`s, the MLS group's
-        //    signer, and its provider-storage values zeroize on drop, and
-        //    security model spec §9.15 lists the copies no wipe reaches; its
-        //    durable snapshot deleted), so
-        //    the floors are moot and pruning is sound; see
-        //    `Supervisor::remove_context_floors` for the full permanent-vs-
-        //    transient safety argument.
-        self.remove_context_floors(&context_id_bytes);
-        // 4. Drop the per-context stream admission-tracker registry entry on
-        //    the same permanent-teardown sweep (spec §5.4.5) — the streaming
-        //    twin of the floor-registry reap above. An in-flight pump holding
-        //    its own Arc keeps the tracker alive; this only drops the
-        //    registry's reference.
+        Err(wait_error)
+    }
+
+    /// Step 3 of [`Self::discard_joined_context`], run once the discarded
+    /// actor has exited: drops the context's Class-M floor registry entry and
+    /// its stream-admission tracker entry, then deletes the snapshot the join
+    /// persisted.
+    ///
+    /// It holds `bootstrap_spawn_lock` and then `write_lock` (the spawn
+    /// paths' order), so no spawn of the id runs between the registry check
+    /// and the delete.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::InvalidState`] when an actor is registered for the
+    /// id again (a restore spawned it from the snapshot while the discarded
+    /// actor was exiting): the snapshot is that live context's and stays.
+    /// [`ContextError::PersistenceFailed`] when the snapshot delete fails.
+    async fn finish_discard(&self, context_id: &str) -> Result<(), ContextError> {
+        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        let _guard = self.write_lock.lock().await;
+        if self.actors.contains_key(context_id) {
+            return Err(ContextError::InvalidState(format!(
+                "discard of joined context '{context_id}': an actor was registered for the id \
+                 again before the teardown finished; its snapshot is kept"
+            )));
+        }
+        // The floor registry entry (ADR-049): a discarded welcome-join is
+        // permanently gone (its actor-owned crypto freed when the actor task
+        // ended — `SenderKey`s, the MLS group's signer, and its
+        // provider-storage values zeroize on drop, and security model spec
+        // §9.15 lists the copies no wipe reaches; its durable snapshot deleted
+        // below), so the floors are moot and pruning is sound; see
+        // `Supervisor::remove_context_floors` for the full permanent-vs-
+        // transient safety argument.
+        self.remove_context_floors(&crate::context::state::context_id_to_bytes(context_id));
+        // The stream admission-tracker registry entry, on the same
+        // permanent-teardown sweep (spec §5.4.5). An in-flight pump holding its
+        // own Arc keeps the tracker alive; this only drops the registry's
+        // reference.
         self.reap_stream_admission(context_id);
-        removed
+        // The durable Class-S snapshot, so a restart cannot resurrect the
+        // context and Precheck D does not block a fresh re-join (mirrors the
+        // `delete_context` rollback arm; the helper-persistence slot is the
+        // same backend the join persisted to, an unset slot means nothing
+        // durable was ever written).
+        match self.persistence_ref() {
+            Some(persistence) => persistence.delete_context(context_id).await.map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "discard of joined context '{context_id}': snapshot delete failed: {e}"
+                ))
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Reap a context's [`CrashWindow`] entry on a CLEAN, NON-poison despawn
@@ -17218,18 +17401,18 @@ const fn hard_rate_limit_allow(
 }
 
 // ---------------------------------------------------------------------------
-// No-op SagaJournal — plumbed into the FFI [`Self::with_providers`] factory
-// (and the test-only [`Self::for_query_shim`] constructor) when no production
-// saga journal is wired. The `NoopContextPersistence` counterpart lives in
-// [`crate::context::persistence`] (single public definition; the prior local
-// duplicate was deleted in the post-review-round-1 phase 1 fix-up).
+// No-op SagaJournal — test-only. The `NoopContextPersistence` counterpart lives
+// in [`crate::context::persistence`].
 // ---------------------------------------------------------------------------
 
-/// No-op saga journal — every operation is a no-op success. Used by
-/// [`Supervisor::with_providers`] until the production saga path lands; also used
-/// by `Supervisor::for_query_shim` in tests.
+/// No-op saga journal — every operation is a no-op success. Used by the
+/// test-only [`Supervisor::with_providers`] and `Supervisor::for_query_shim`.
+/// Compiled only under `test` or the `testing` feature: a journal that stores
+/// nothing nullifies crash-recovery replay (§17.17 `SCP-CAPSEL-8000`).
+#[cfg(any(test, feature = "testing"))]
 struct NoopSagaJournal;
 
+#[cfg(any(test, feature = "testing"))]
 #[async_trait::async_trait]
 impl SagaJournal for NoopSagaJournal {
     async fn append(
@@ -29103,7 +29286,7 @@ mod tests {
     }
 
     /// Build a `with_providers_and_journal` supervisor over a caller-supplied
-    /// saga `journal` + `mls_storage` view + optional `persistence`,
+    /// saga `journal` + `mls_storage` view + required `persistence`,
     /// with a key_resolver mapping `creator_did → creator_key`
     /// (the target's UCAN re-bind / divergence-signing root). Sibling of
     /// [`xctx_supervisor_with_real_journal_persistence`], but the caller controls
@@ -29114,7 +29297,7 @@ mod tests {
         creator_key: ed25519_dalek::VerifyingKey,
         journal: Arc<dyn SagaJournal>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
-        persistence: Option<Box<dyn ContextPersistence>>,
+        persistence: Box<dyn ContextPersistence>,
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
@@ -29200,7 +29383,7 @@ mod tests {
             creator_key,
             journal,
             mls_storage,
-            Some(Box::new(persistence)),
+            Box::new(persistence),
         );
         let caller_state = xctx_caller_state(caller_did, creator_did);
         let target_state = xctx_target_state(caller_did, creator_did);
@@ -29455,7 +29638,7 @@ mod tests {
             creator_key,
             journal,
             mls_storage,
-            Some(Box::new(persistence.clone())),
+            Box::new(persistence.clone()),
         );
         let caller_did = "did:dht:z6MkXctxOkArmCaller";
         let caller_state = xctx_caller_state(caller_did, &creator_did);
@@ -29605,7 +29788,7 @@ mod tests {
             creator_key,
             Arc::clone(&journal),
             mls_storage,
-            Some(Box::new(persistence.clone())),
+            Box::new(persistence.clone()),
         );
 
         // Restore-then-replay: restores both actors (resident, carrying their
@@ -31352,7 +31535,7 @@ mod tests {
             transport,
             Box::new(TestEventLog),
             key_resolver,
-            Some(persistence),
+            persistence,
             None,
             None,
             None,
@@ -32434,7 +32617,7 @@ mod tests {
             transport,
             Box::new(TestEventLog),
             key_resolver,
-            Some(Box::new(persistence.clone())),
+            Box::new(persistence.clone()),
             None,
             None,
             None,
@@ -32674,7 +32857,7 @@ mod tests {
             transport,
             Box::new(TestEventLog),
             key_resolver,
-            Some(Box::new(persistence.clone())),
+            Box::new(persistence.clone()),
             None,
             None,
             None,
@@ -36034,9 +36217,7 @@ mod streaming_saga_tests {
             transport,
             event_log,
             key_resolver,
-            Some(Box::new(
-                crate::context::persistence::NoopContextPersistence,
-            )),
+            Box::new(crate::context::persistence::NoopContextPersistence),
             Some(payment_adapter),
             None,
             Some(clock),

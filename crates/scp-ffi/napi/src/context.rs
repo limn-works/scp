@@ -1318,14 +1318,19 @@ pub(crate) async fn reserve_key_package_on(
 }
 
 /// Tears down a committed Welcome join whose bridge state a concurrent close
-/// removed, and returns the join's `CTX_2040` error.
+/// removed, and returns the join's `CTX_2040` error, or the teardown's own
+/// error when the discard fails (when the actor did not exit in time, the
+/// Supervisor deletes the snapshot once it has).
 async fn tear_down_vanished_join(
     bi: &crate::runtime::NapiBridgeInstance,
-    sup: &scp_core::context::supervisor::Supervisor,
+    sup: &Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> ScpNapiError {
-    sup.discard_joined_context(context_id).await;
+    let discarded = sup.discard_joined_context(context_id).await;
     crate::runtime::release_context(bi, context_id);
+    if let Err(e) = discarded {
+        return ScpNapiError::from(e);
+    }
     ScpNapiError::Context {
         message: format!(
             "bridge state for context '{context_id}' vanished between the reversible \
@@ -10312,6 +10317,66 @@ mod tests {
         assert!(
             !crate::runtime::ucan_registry(&bi).contains_key(&ctx_id),
             "session close must not build bridge state"
+        );
+    }
+
+    /// A context created on a SQLCipher-backed instance survives a reopen of
+    /// the store: its snapshot lands in the caller's chosen backend (spec
+    /// §17.6, one chosen backend with derived consumers), so a fresh instance
+    /// over the same directory restores it. A process-local snapshot store
+    /// would lose the snapshot with the first instance and restore nothing.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_instance_restores_its_context_after_reopen() {
+        use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+                path: tmp.path().to_path_buf(),
+                key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x5Au8; 32])),
+            })
+            .expect("SQLCipher open must succeed")
+        };
+
+        let scp = crate::scp::Scp {
+            inner: Arc::new(open()),
+        };
+        let bi = Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let did = identity.inner.did.clone();
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+        drop(handle);
+        drop(identity);
+        bi.shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("shutdown must release the store");
+        drop(bi);
+        drop(scp);
+
+        let reopened = open();
+        crate::runtime::init_supervisor(&reopened, &did);
+        let restored_json = super::context_restore_all_on(&reopened)
+            .await
+            .expect("restore_all must succeed on the reopened store");
+        let restored: Vec<String> =
+            serde_json::from_str(&restored_json).expect("restore_all returns a JSON array");
+        assert_eq!(
+            restored,
+            vec![ctx_id],
+            "the reopened SQLCipher instance must restore the context the first instance created"
         );
     }
 }

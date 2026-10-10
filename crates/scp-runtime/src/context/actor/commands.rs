@@ -3821,8 +3821,10 @@ pub enum LifecycleControlCommand {
     /// variant is dispatched before any timer or persistence arm fires
     /// on the same poll.
     Shutdown {
-        /// Oneshot reply channel. The actor sends `Ok(())` after its
-        /// final persist completes.
+        /// Oneshot reply channel. The handler sends `Ok(())` during
+        /// dispatch, before the run loop's post-loop drain persists dirty
+        /// state, so the ack does not mean the final write landed; a caller
+        /// that needs that order uses `ContextActorHandle::shutdown_and_await_exit`.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
     /// Test-only fault-injection seam (ADR-049 §10 watchdog tests). The

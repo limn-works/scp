@@ -222,6 +222,19 @@ async fn build_self_host_node() -> BuiltNode {
     }
 }
 
+/// The loopback supervisor's context persistence over `mls_inner`, the SAME
+/// encrypted `SQLite` handle that backs its `DurableProviders`, mirroring the
+/// production `build_host_site_deployer`.
+fn persistence_over(
+    mls_inner: &Arc<SqliteStorage>,
+) -> Box<dyn scp_core::context::persistence::ContextPersistence> {
+    Box::new(
+        scp_core::store::context::ProtocolRepositoryContextBridge::new(Arc::new(
+            scp_core::store::ProtocolRepository::new(Arc::clone(mls_inner)),
+        )),
+    )
+}
+
 /// Full in-process self-host deploy + HTTP serve, end to end.
 ///
 /// Mirrors the production `--self-host` path: build a no-domain node on real
@@ -286,6 +299,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         key_resolver,
         custody: custody.as_ref(),
         durable,
+        persistence: persistence_over(&mls_inner),
         assets: &assets,
     };
 
@@ -373,7 +387,8 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         SqliteStorage::new(&built.storage_dir.join("mls"), built.storage_key.as_ref())
             .expect("MLS SQLite should open"),
     );
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
     let signing_key_handle = built.node.identity().identity().active_signing_key;
     scp_node::SelfHostDeployer::start(
         &built.node,
@@ -383,6 +398,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         signing_key_handle,
         built.key_resolver(),
         durable,
+        persistence_over(&mls_inner),
     )
     .await
     .expect("deployer setup should succeed")
@@ -978,7 +994,9 @@ async fn deploy_embedded_and_assert_serves<S>(
         SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
             .expect("MLS SQLite should open (distinct subdirectory)"),
     );
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable =
+        scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
+    let persistence = persistence_over(&mls_inner);
 
     let assets = scp_node::embedded_assets(Some(&node_did));
     let expected_count = assets.len();
@@ -994,6 +1012,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             key_resolver,
             custody,
             durable,
+            persistence,
             assets: &assets,
         },
     )
@@ -1596,6 +1615,7 @@ async fn self_host_deployer_shutdown_drains_before_store_close() {
         built.node.identity().identity().active_signing_key,
         built.key_resolver(),
         durable,
+        persistence_over(&mls_inner),
     )
     .await
     .expect("deployer setup should succeed");
