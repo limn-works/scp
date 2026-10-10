@@ -263,6 +263,13 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// `OpenMLS` view share one backend by construction — the journal can never
     /// be wired to a divergent store.
     pub durable: scp_core::context::supervisor::DurableProviders,
+    /// The loopback supervisor's REQUIRED context persistence (spec §17.17
+    /// `SCP-CAPSEL-8000`: the runtime never substitutes a persistence that
+    /// stores nothing). Build it over the SAME `Storage` handle as `durable`,
+    /// e.g. a `ProtocolRepositoryContextBridge` over a `ProtocolRepository`
+    /// on that handle, so snapshots, the saga journal, and the `OpenMLS` view
+    /// share one backend (spec §17.6).
+    pub persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
     /// The static assets to publish, in deploy order.
     pub assets: &'a [Asset],
 }
@@ -404,6 +411,7 @@ where
         key_resolver,
         custody,
         durable,
+        persistence,
         assets,
     } = params;
 
@@ -415,6 +423,7 @@ where
         signing_key_handle,
         key_resolver,
         durable,
+        persistence,
     )
     .await?;
 
@@ -469,7 +478,8 @@ impl SelfHostDeployer {
     /// the caller must then leave the storage behind `durable` open.
     // Provider-bootstrap entry: each argument is a distinct, required provider
     // the loopback supervisor needs (node, identity, hostname, signing key,
-    // governance resolver, durable providers). The durable saga journal and the
+    // governance resolver, durable providers, context persistence). The durable
+    // saga journal and the
     // `mls_storage` view arrive bound into one `DurableProviders` so they cannot
     // be wired to divergent backends — mirroring the FFI
     // `with_providers_and_journal` bootstrap.
@@ -482,6 +492,7 @@ impl SelfHostDeployer {
         signing_key_handle: scp_platform::KeyHandle,
         key_resolver: scp_core::context::governance::KeyResolver,
         durable: scp_core::context::supervisor::DurableProviders,
+        persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
     ) -> Result<Self, SelfHostError>
     where
         S: Storage + 'static,
@@ -494,9 +505,15 @@ impl SelfHostDeployer {
         // and the durable saga journal over the SAME `Storage` backend as
         // `mls_storage` — guaranteed by the `DurableProviders` newtype (§17.16 /
         // ADR-049).
-        let supervisor =
-            connect_loopback_supervisor(node, &node_did, &author_did, key_resolver, durable)
-                .await?;
+        let supervisor = connect_loopback_supervisor(
+            node,
+            &node_did,
+            &author_did,
+            key_resolver,
+            durable,
+            persistence,
+        )
+        .await?;
         // Every setup failure past this point drains the Supervisor before
         // returning, so no tracked task outlives the caller's storage
         // (ADR-049 Decision 16).
@@ -762,7 +779,7 @@ fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolv
 /// `key_resolver` is the REAL document-derived governance resolver (built via
 /// [`colocated_document_vm_key_resolver`] over a [`DualLayerResolver`](scp_identity::DualLayerResolver)
 /// that shares the node's [`DidCache`](scp_identity::DidCache)). It is passed
-/// straight into [`Supervisor::with_providers`](scp_core::context::supervisor::Supervisor::with_providers), so the co-located participant
+/// straight into [`Supervisor::with_providers_and_journal`](scp_core::context::supervisor::Supervisor::with_providers_and_journal), so the co-located participant
 /// verifies governance votes against each voter's published verification method
 /// — never the `|_, _| None` stub the bundled path used to ship (ADR-053 / spec
 /// §10.17).
@@ -772,6 +789,7 @@ async fn connect_loopback_supervisor<S>(
     author_did: &scp_did::DID,
     key_resolver: scp_core::context::governance::KeyResolver,
     durable: scp_core::context::supervisor::DurableProviders,
+    persistence: Box<dyn scp_core::context::persistence::ContextPersistence>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
 where
     S: Storage + 'static,
@@ -817,7 +835,7 @@ where
         transport,
         event_log,
         key_resolver,
-        None,
+        persistence,
         None,
         Some(event_tx),
         Some(clock),
@@ -2638,6 +2656,14 @@ where
     // into one newtype makes that divergence a compile error.
     let durable =
         scp_core::context::supervisor::DurableProviders::from_handle(Arc::clone(&mls_inner));
+    // The loopback supervisor's context persistence over the SAME
+    // `{storage_dir}/mls` SQLCipher store (spec §17.6), so context snapshots
+    // survive a restart alongside the saga journal (§17.17 `SCP-CAPSEL-8000`).
+    let persistence: Box<dyn scp_core::context::persistence::ContextPersistence> = Box::new(
+        scp_core::store::context::ProtocolRepositoryContextBridge::new(Arc::new(
+            scp_core::store::ProtocolRepository::new(Arc::clone(&mls_inner)),
+        )),
+    );
 
     let signing_key_handle = node.identity().identity().active_signing_key;
     let started = SelfHostDeployer::start(
@@ -2648,6 +2674,7 @@ where
         signing_key_handle,
         key_resolver,
         durable,
+        persistence,
     )
     .await;
     match started {

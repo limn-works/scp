@@ -1102,7 +1102,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Constructs an `Arc<Supervisor>` with the given providers (ADR-049
 /// commit 12c.9g.3.6 — bridge layer no longer touches
-/// `ContextManager`). [`scp_core::context::supervisor::Supervisor::with_providers`]
+/// `ContextManager`). [`scp_core::context::supervisor::Supervisor::with_providers_and_journal`]
 /// is the single entry point that constructs the supervisor +
 /// populates the lifted-provider slots.
 ///
@@ -1144,7 +1144,7 @@ fn build_supervisor_arc(
         transport,
         event_log,
         key_resolver,
-        Some(persistence),
+        persistence,
         None,
         Some(event_tx),
         Some(clock),

@@ -251,7 +251,7 @@ const fn _assert_send_sync() {
 /// Mirror of the legacy
 /// `attach_test_supervisor(ContextManager::new(...))` shorthand: the
 /// `ContextManager` type is gone in ADR-049 §15, so callers now build a
-/// supervisor directly via [`supervisor::Supervisor::with_providers`].
+/// supervisor directly via `supervisor::Supervisor::with_providers` (test-only).
 ///
 /// Returns [`Arc<supervisor::Supervisor>`] — the supervisor is the
 /// authoritative owner of every per-context state, provider, and
@@ -266,7 +266,7 @@ const fn _assert_send_sync() {
 /// test-only dev opt-in; production bridges supply a real `Storage`.
 /// Tests that exercise any of those specific surfaces must construct
 /// their own supervisor explicitly via
-/// [`supervisor::Supervisor::with_providers`].
+/// `supervisor::Supervisor::with_providers` (test-only).
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn test_supervisor(

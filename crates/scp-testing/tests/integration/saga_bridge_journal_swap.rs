@@ -172,7 +172,7 @@ fn journal_supervisor(
         Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
         Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
         key_resolver,
-        Some(Box::new(SharedPersistenceArc(persistence))),
+        Box::new(SharedPersistenceArc(persistence)),
         None,
         None,
         None,

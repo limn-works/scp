@@ -884,7 +884,7 @@ fn restore_supervisor(
         Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
         Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
         deterministic_key_resolver(),
-        Some(Box::new(SharedPersistenceArc(persistence))),
+        Box::new(SharedPersistenceArc(persistence)),
         None,
         None,
         Some(clock),

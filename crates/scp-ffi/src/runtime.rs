@@ -927,13 +927,12 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
         crypto,
         Box::new(NotConfiguredTransportProvider),
         build_event_log_provider(bi),
-        persistence,
+        None,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -967,7 +966,6 @@ pub fn init_context_manager_with(
     if bi.core.has_supervisor() {
         return;
     }
-    let persistence = persistence.or_else(|| build_persistence_provider(bi));
     let supervisor_arc = match build_supervisor(bi, crypto, transport, event_log, persistence) {
         Ok(s) => s,
         Err(e) => {
@@ -1021,13 +1019,12 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
         crypto,
         Box::new(scp_core::context::LocalTransportProvider),
         build_event_log_provider(bi),
-        persistence,
+        None,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -1068,13 +1065,12 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
         "did:test:pyo3-bridge-test".to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
         crypto,
         Box::new(scp_core::context::LocalTransportProvider),
         build_event_log_provider(bi),
-        persistence,
+        None,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -1092,8 +1088,9 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
 /// Returns `None` for `PyBridgeInstance` instances built via
 /// [`PyBridgeInstance::new_py`] (no storage attached) — only instances
 /// constructed via [`PyBridgeInstance::with_storage_py`] (driven from Python
-/// by `SCP.with_storage({...})`) carry a provider. The `ContextManager` will
-/// operate without persistence in the no-storage case.
+/// by `SCP.with_storage({...})`) carry a provider. In the no-storage case
+/// `build_supervisor` fails closed with `STORAGE_8000` and attaches no
+/// supervisor.
 ///
 /// Uses `Arc<EncryptingAdapter<InMemoryStorage>>` as the storage backend
 /// for `ProtocolRepository`, sharing the same underlying storage instance as
@@ -1233,9 +1230,14 @@ pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn Context
 /// default shared across all three FFI bridges.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// `Supervisor::with_providers` is the single entry point that constructs the
-/// supervisor + populates the lifted-provider slots. The supervisor is the
-/// only handle returned to the bridge layer.
+/// `Supervisor::with_providers_and_journal` is the single entry point that
+/// constructs the supervisor + populates the lifted-provider slots. The
+/// supervisor is the only handle returned to the bridge layer.
+///
+/// `persistence` is the caller's override; `None` selects the persistence
+/// derived from the bridge instance's chosen storage
+/// (`build_persistence_provider`). The supervisor always receives a real
+/// persistence (spec §17.17 `SCP-CAPSEL-8000`).
 ///
 /// The event broadcast channel is always enabled (capacity
 /// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — the MCP server's
@@ -1254,9 +1256,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 ///
 /// # Errors
 ///
-/// Returns a [`ScpPyError::ContextError`] if the bridge instance has no
-/// storage provider set (storage-before-supervisor precondition). The runtime
-/// never defaults storage; the caller (bridge layer) must supply it first.
+/// Returns a [`ScpPyError::ContextError`] (`STORAGE_8000`) if the bridge
+/// instance has no storage provider set (storage-before-supervisor
+/// precondition), or if no context persistence is supplied or derivable. The
+/// runtime never defaults storage; the caller (bridge layer) must supply it
+/// first.
 fn build_supervisor(
     bi: &PyBridgeInstance,
     crypto: Arc<NodeMlsFactory>,
@@ -1272,6 +1276,19 @@ fn build_supervisor(
     // and the fail-closed `STORAGE_8000` storage-before-supervisor check fires
     // once for both.
     let durable = durable_providers_from_bi(bi)?;
+    // Context persistence is a required supervisor argument (§17.17
+    // `SCP-CAPSEL-8000`): the caller's override, else the persistence derived
+    // from the bridge instance's chosen storage. A storage provider (checked
+    // above) always yields one, so the error below is defense in depth.
+    let persistence = persistence
+        .or_else(|| build_persistence_provider(bi))
+        .ok_or_else(|| ScpPyError::ContextError {
+            message: "storage-before-supervisor precondition failed: no context persistence \
+             derivable from the bridge instance — the runtime never substitutes a \
+             persistence that stores nothing (spec §17.17)."
+                .to_owned(),
+            code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+        })?;
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the MCP server's resource notifications. The unused receiver
     // is dropped immediately; the retained sender keeps the channel open so

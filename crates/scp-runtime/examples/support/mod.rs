@@ -13,6 +13,7 @@ use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::{ContextError, ContextParams};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime::context::supervisor::DurableProviders;
 use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 /// Derives a deterministic signing key from a DID string for example use.
@@ -34,17 +35,25 @@ pub fn example_crypto(did: &str) -> std::sync::Arc<NodeMlsFactory> {
     ))
 }
 
-/// Convenience constructor: an in-memory `OpenMLS` storage adapter for the
-/// required `mls_storage` provider. Examples are dev affordances, so the
-/// in-memory backend (a bridge-layer dev opt-in) is the correct choice —
-/// production wires a real `Storage` (`SQLCipher`).
-pub fn example_mls_storage()
--> std::sync::Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
-    std::sync::Arc::new(
-        scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-            std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
-        ),
-    )
+/// The supervisor's storage-derived providers, all over ONE explicitly
+/// selected in-memory `Storage` backend: the saga journal and the `OpenMLS`
+/// view (bound into one [`DurableProviders`]) and the context persistence.
+///
+/// `InMemoryStorage` is a durability-only backend (spec §17.17
+/// `SCP-CAPSEL-8010`): it loses state when the process exits but stores every
+/// write while it runs. Examples select it explicitly; production selects a
+/// durable `Storage` (`SQLCipher`).
+pub fn example_storage_providers() -> (
+    DurableProviders,
+    Box<dyn scp_runtime::context::persistence::ContextPersistence>,
+) {
+    let storage = std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new());
+    let durable = DurableProviders::from_handle(std::sync::Arc::clone(&storage));
+    let persistence =
+        scp_runtime::store::context::ProtocolRepositoryContextBridge::new(std::sync::Arc::new(
+            scp_runtime::store::ProtocolRepository::new_for_testing(storage),
+        ));
+    (durable, Box::new(persistence))
 }
 
 /// Mock transport provider — reports connected, all sends succeed silently.

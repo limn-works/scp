@@ -2,7 +2,7 @@
 //!
 //! Hoisted to its own module in ADR-049 §15 ahead of the
 //! `manager/` directory deletion. This module is the canonical home of
-//! the trait and its no-op stub.
+//! the trait and its test-only no-op stub.
 
 use super::state::ContextSnapshot;
 use async_trait::async_trait;
@@ -101,11 +101,15 @@ pub trait ContextPersistence: Send + Sync {
 
 /// No-op persistence — every operation is a no-op success.
 ///
-/// Used by the supervisor's `Supervisor::for_query_shim`
-/// constructor and as the default when [`crate::context::supervisor::Supervisor::with_providers`]
-/// is called with `persistence: None`.
+/// Used by the test-only `Supervisor::for_query_shim` constructor and by the
+/// test-only `Supervisor::with_providers` when called with `persistence: None`.
+/// Compiled only under `test` or the `testing` feature: a persistence that
+/// reports every write as durable and stores nothing nullifies restart
+/// recovery (§17.17 `SCP-CAPSEL-8000`), so no shipped build may reach it.
+#[cfg(any(test, feature = "testing"))]
 pub struct NoopContextPersistence;
 
+#[cfg(any(test, feature = "testing"))]
 #[async_trait]
 impl ContextPersistence for NoopContextPersistence {
     async fn persist_context(
