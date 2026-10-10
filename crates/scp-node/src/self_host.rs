@@ -992,7 +992,7 @@ pub(crate) const SELF_HOST_HOSTNAME: &str = "selfhost.scp.local";
 type OptionalPortMapper = Option<Arc<dyn scp_transport::nat::PortMapper>>;
 
 /// Reports the live site details to the caller once the site is deployed and
-/// the public listener is about to open.
+/// the bound public listener is about to start serving.
 ///
 /// The binary uses this to print its operator-facing "live URL" banner without
 /// the library having to print anything itself.
@@ -1003,7 +1003,8 @@ pub struct HostSiteReady {
     pub context_id: String,
     /// The node's DID string.
     pub node_did: String,
-    /// The port the public listener binds (`0.0.0.0:<port>`).
+    /// The port the public listener bound (`0.0.0.0:<port>`). When
+    /// [`HostSiteConfig::port`] is 0 this is the port the OS assigned.
     pub port: u16,
     /// The number of static assets deployed.
     pub asset_count: usize,
@@ -1108,7 +1109,10 @@ pub struct HostSiteConfig {
     /// is served verbatim.
     pub site_dir: Option<PathBuf>,
     /// Port the public listener binds on `0.0.0.0`. Defaults to the port of
-    /// [`crate::DEFAULT_HTTP_BIND_ADDR`] (8443).
+    /// [`crate::DEFAULT_HTTP_BIND_ADDR`] (8443). 0 asks the OS for a free port;
+    /// the listener is bound before the node is built, so the node's
+    /// configuration, the NAT mapping, and [`HostSiteReady::port`] all carry
+    /// the port it bound.
     pub port: u16,
     /// `SQLite` storage directory. `None` resolves to the XDG default
     /// (`$XDG_DATA_HOME/scp/node`, falling back to `$HOME/.local/share/scp/node`).
@@ -1460,7 +1464,18 @@ where
     //    downstream (the match below). --
     let (plaintext, skip_nat) = lower_host_site_reach_tls(&reach, &tls)?;
 
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // -- Bind the public listener first, so a `port` of 0 resolves to the port
+    //    the OS assigned before anything (node config, NAT mapping, the ready
+    //    signal) records it, and a port already in use fails before any state
+    //    is opened. The listener serves only after the initial deploy. --
+    let requested = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(requested)
+        .await
+        .map_err(|e| HostSiteError::Serve(format!("failed to bind {requested}: {e}")))?;
+    let http_addr = listener
+        .local_addr()
+        .map_err(|e| HostSiteError::Serve(format!("failed to read the bound address: {e}")))?;
+    let port = http_addr.port();
 
     // -- Storage path + key (Result-returning; never exits) --
     let storage_dir = resolve_storage_path(storage_path.as_ref())?;
@@ -1497,6 +1512,7 @@ where
         Arc::new(StorageSequenceStore::new(Arc::clone(&node_storage_arc)));
 
     let common = ServeHostedSite {
+        listener,
         http_addr,
         port,
         plaintext,
@@ -1646,7 +1662,12 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
 /// Bundled into a struct so the two DHT-mode call sites stay terse and the
 /// generic function avoids a long positional argument list.
 struct ServeHostedSite {
+    /// The public listener, bound by [`host_site_until`] and served only after
+    /// the initial deploy.
+    listener: tokio::net::TcpListener,
+    /// The listener's bound address.
     http_addr: SocketAddr,
+    /// `http_addr.port()`.
     port: u16,
     plaintext: bool,
     skip_nat: bool,
@@ -1686,6 +1707,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let ServeHostedSite {
+        listener,
         http_addr,
         port,
         plaintext,
@@ -1763,7 +1785,7 @@ where
     };
     let (deployer, mls_store) = deployer;
 
-    // -- Initial deploy BEFORE the public port opens. --
+    // -- Initial deploy BEFORE the bound public listener serves. --
     if let Err(e) = deployer
         .deploy(node.as_ref(), &mint_deploy_id(), custody.as_ref(), &assets)
         .await
@@ -1797,6 +1819,7 @@ where
     //    best-effort before returning. --
     if let Err(e) = open_self_host_public_surface(
         node.as_ref(),
+        listener,
         http_addr,
         plaintext,
         port,
@@ -1897,6 +1920,7 @@ fn teardown_outcome(teardown: Result<(), HostSiteError>, cause: HostSiteError) -
 /// for the renewal loop on success) before the error is returned.
 async fn open_self_host_public_surface<S>(
     node: &ApplicationNode<S>,
+    listener: tokio::net::TcpListener,
     http_addr: SocketAddr,
     plaintext: bool,
     port: u16,
@@ -1916,7 +1940,7 @@ where
     };
 
     if let Err(e) = node
-        .serve_background_with_surface_tls(Some(http_addr), PublicSurface::SelfHost, tls_config)
+        .serve_background_on_listener(listener, PublicSurface::SelfHost, tls_config)
         .await
     {
         release_self_host_mappings(upnp_mapper.clone(), natpmp_mapper.clone(), port).await;

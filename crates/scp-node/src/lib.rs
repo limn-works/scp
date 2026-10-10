@@ -54,7 +54,7 @@ pub(crate) use published_state::{
 #[cfg(test)]
 pub(crate) use published_state::{DidPublisher, PublishAuthorization};
 
-pub use http::BroadcastContext;
+pub use http::{BoundApplicationNode, BroadcastContext};
 pub use projection::{
     DeployManifest, DeployManifestEntry, PathEntry, ProjectedContext, SiteConfig,
 };
@@ -841,6 +841,60 @@ impl<S: Storage> ApplicationNode<S> {
         surface: PublicSurface,
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<SocketAddr, NodeError> {
+        self.claim_background_serve()?;
+
+        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+
+        // Security: warn when binding a *plaintext* listener to a non-loopback
+        // address. When a TLS config is present (self-host self-signed cert),
+        // traffic is encrypted, so the "unencrypted" warning would be wrong.
+        if !addr.ip().is_loopback() && tls_config.is_none() {
+            tracing::warn!(
+                bind_addr = %addr,
+                "serve_background binding to non-loopback address — \
+                 HTTP traffic is unencrypted (no TLS) and will be \
+                 accessible from the network"
+            );
+        }
+
+        // Bind the TCP listener before spawning so we can report errors
+        // and the bound address synchronously.
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            // Reset serving flag on bind failure.
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!(
+                "failed to bind background HTTP server on {addr}: {e}"
+            ))
+        })?;
+        self.spawn_background_server(listener, surface, tls_config)
+            .await
+    }
+
+    /// Serves the public surface in the background on a listener the caller
+    /// already bound, returning the listener's local address.
+    ///
+    /// [`crate::self_host::host_site_until`] binds its public listener before it
+    /// builds the node, so a `port` of 0 resolves to the OS-assigned port that
+    /// the node's configuration, NAT mapping, and ready signal all report.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::serve_background_with_surface_tls`], except that no
+    /// bind happens here.
+    pub(crate) async fn serve_background_on_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
+        self.claim_background_serve()?;
+        self.spawn_background_server(listener, surface, tls_config)
+            .await
+    }
+
+    /// Rejects a background serve on a shut-down node and claims the
+    /// single-serve flag. The caller resets the flag on a later failure.
+    fn claim_background_serve(&self) -> Result<(), NodeError> {
         // Reject if the node has already been shut down — the cancellation
         // token is already cancelled so the server would exit immediately.
         if self.state.shutdown_token.is_cancelled() {
@@ -860,34 +914,22 @@ impl<S: Storage> ApplicationNode<S> {
             ));
         }
 
-        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+        Ok(())
+    }
 
-        // Security: warn when binding a *plaintext* listener to a non-loopback
-        // address. When a TLS config is present (self-host self-signed cert),
-        // traffic is encrypted, so the "unencrypted" warning would be wrong.
-        if !addr.ip().is_loopback() && tls_config.is_none() {
-            tracing::warn!(
-                bind_addr = %addr,
-                "serve_background binding to non-loopback address — \
-                 HTTP traffic is unencrypted (no TLS) and will be \
-                 accessible from the network"
-            );
-        }
-
+    /// Spawns the background server on a bound listener. The caller holds the
+    /// single-serve flag; it is reset if the local address cannot be read.
+    async fn spawn_background_server(
+        &self,
+        listener: tokio::net::TcpListener,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
         let shutdown_token = self.state.shutdown_token.clone();
 
         // Build the merged router for the requested public surface.
         let merged = self.build_scp_router_with_surface(axum::Router::new(), surface);
 
-        // Bind the TCP listener before spawning so we can report errors
-        // and the bound address synchronously.
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-            // Reset serving flag on bind failure.
-            self.serving.store(false, Ordering::SeqCst);
-            NodeError::Serve(format!(
-                "failed to bind background HTTP server on {addr}: {e}"
-            ))
-        })?;
         let local_addr = listener.local_addr().map_err(|e| {
             self.serving.store(false, Ordering::SeqCst);
             NodeError::Serve(format!("failed to get local address: {e}"))
@@ -4365,18 +4407,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_listening_before_did_publish() {
+    async fn relay_binds_before_did_publish() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Create a DID method that verifies the relay is listening when
-        // publish() is called.
-        struct RelayCheckDidMethod {
+        // A DID method that records whether `publish()` was called.
+        struct PublishRecorder {
             inner: TestDidDht,
-            relay_was_listening_at_publish: Arc<AtomicBool>,
-            bind_addr: SocketAddr,
+            published: Arc<AtomicBool>,
         }
 
-        impl DidMethod for RelayCheckDidMethod {
+        impl DidMethod for PublishRecorder {
             /// These doubles observe what the builders publish; none of them
             /// keeps a record alive, so the keep-alive client is the fail-closed
             /// `DisabledDhtClient` rather than one that would report a false
@@ -4411,17 +4451,8 @@ mod tests {
             ) -> impl std::future::Future<
                 Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
             > + Send {
-                // Probe the relay bind address to see if it's listening.
-                let addr = self.bind_addr;
-                let flag = Arc::clone(&self.relay_was_listening_at_publish);
-                let inner = &self.inner;
-                async move {
-                    // Attempt a TCP connection to the relay's bound port.
-                    if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    inner.publish(identity, document).await
-                }
+                self.published.store(true, Ordering::SeqCst);
+                self.inner.publish(identity, document)
             }
 
             fn resolve(
@@ -4443,47 +4474,63 @@ mod tests {
             }
         }
 
-        // We need to know the bind address ahead of time so the DID method
-        // can probe it.  Bind to port 0 and let the OS pick a port — but the
-        // relay picks the port, so we pre-bind a listener, record its address,
-        // then drop it and hand the same address to the config.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind_addr = listener.local_addr().unwrap();
-        drop(listener); // free the port for the relay
-
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let relay_was_listening = Arc::new(AtomicBool::new(false));
-
-        let check_method = Arc::new(RelayCheckDidMethod {
-            inner: make_test_dht(&custody),
-            relay_was_listening_at_publish: Arc::clone(&relay_was_listening),
-            bind_addr,
-        });
-
-        let _node = Node::start_for_testing(NodeConfig {
-            bind_addr: Some(bind_addr),
-            dht: DhtMode::Production,
-            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
-                domain: "relay-order.example.com".to_owned(),
-            })),
-            ..NodeConfig::defaults(
-                Reach::Domain {
+        // Starts a domain node whose relay binds `bind_addr`, publishing through
+        // a recorder. Returns the start result and whether `publish()` ran.
+        async fn start_recording(bind_addr: SocketAddr) -> (Result<(), NodeError>, bool) {
+            let custody = Arc::new(InMemoryKeyCustody::new());
+            let published = Arc::new(AtomicBool::new(false));
+            let recorder = Arc::new(PublishRecorder {
+                inner: make_test_dht(&custody),
+                published: Arc::clone(&published),
+            });
+            let result = Node::start_for_testing(NodeConfig {
+                bind_addr: Some(bind_addr),
+                dht: DhtMode::Production,
+                tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                     domain: "relay-order.example.com".to_owned(),
-                },
-                IdentitySource::Generate {
-                    custody,
-                    did_method: check_method,
-                },
-                InMemoryStorage::new(),
-                BlobStorageBackend::in_memory(),
-            )
-        })
-        .await
-        .unwrap();
+                })),
+                ..NodeConfig::defaults(
+                    Reach::Domain {
+                        domain: "relay-order.example.com".to_owned(),
+                    },
+                    IdentitySource::Generate {
+                        custody,
+                        did_method: recorder,
+                    },
+                    InMemoryStorage::new(),
+                    BlobStorageBackend::in_memory(),
+                )
+            })
+            .await
+            .map(drop);
+            (result, published.load(Ordering::SeqCst))
+        }
 
+        // The ordering proof: hold the relay's address for the whole start, so
+        // the relay bind fails. If the start published before binding the
+        // relay, `publish()` would already have run when the bind failed.
+        // Holding the listener (never dropping it before the start) leaves no
+        // window for another socket to take the port.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held_addr = held.local_addr().unwrap();
+        let (result, published) = start_recording(held_addr).await;
         assert!(
-            relay_was_listening.load(Ordering::SeqCst),
-            "relay must be listening BEFORE DID document is published"
+            result.is_err(),
+            "a relay whose address is held must fail the start"
+        );
+        assert!(
+            !published,
+            "the relay must bind BEFORE the DID document is published"
+        );
+        drop(held);
+
+        // Control: with a free relay address the same start publishes, so the
+        // recorder observes `publish()` and the assertion above is not vacuous.
+        let (result, published) = start_recording(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+        result.expect("a node whose relay can bind must start");
+        assert!(
+            published,
+            "a started domain node must publish its DID document"
         );
     }
 
