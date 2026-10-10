@@ -14,168 +14,13 @@
 #![cfg(all(feature = "quic", feature = "allow_unencrypted_storage"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+mod quic_support;
 
-use quinn::{ClientConfig, Endpoint};
 use scp_relay_client::{ClientMessage, RelayMessage};
-use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::quic::listener::SCP_ALPN;
 
-use scp_clock::SystemClock;
-use scp_dht::InMemoryDhtClient;
-use scp_identity::DidCache;
-use scp_identity::dht::DidDht;
-use scp_node::{ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, Reach};
-use scp_platform::in_memory::InMemoryStorage;
-use scp_platform::testing::InMemoryKeyCustody;
-
-type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
-
-/// A rustls server-certificate verifier that accepts any certificate.
-///
-/// Test-only: the node generates its self-signed certificate internally, so the
-/// QUIC client has no way to pin it. Skipping verification is acceptable here
-/// because the test only exercises transport plumbing, not TLS trust.
-#[derive(Debug)]
-struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Installs the process-wide rustls crypto provider exactly once.
-///
-/// Both the node's TLS stack and the QUIC client config builder require a
-/// default [`CryptoProvider`]; installing it is idempotent (a second call
-/// returns `Err`, which we ignore).
-fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-/// Builds a QUIC client config that trusts any server certificate and
-/// negotiates the SCP ALPN.
-fn insecure_client_config() -> ClientConfig {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification(Arc::clone(&provider))))
-        .with_no_client_auth();
-    tls_config.alpn_protocols = vec![SCP_ALPN.to_vec()];
-
-    let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).unwrap();
-    ClientConfig::new(Arc::new(quic_client_config))
-}
-
-/// Reserves a free TCP port by binding to port 0 and immediately releasing it.
-///
-/// The returned port is then used as a fixed `http_bind_addr` so the test can
-/// connect a QUIC client to the known UDP port (`serve()` does not surface the
-/// bound address).
-async fn reserve_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-/// Builds a domain-mode node with a self-signed certificate (so a QUIC server
-/// config is provisioned) bound to the given public HTTP/TLS port.
-async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
-    let custody = Arc::new(InMemoryKeyCustody::new());
-    let dht_client = Arc::new(InMemoryDhtClient::new());
-    let cache = Arc::new(DidCache::new());
-    let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(TestDidDht::with_client_and_signer(
-        dht_client, cache, sign_fn,
-    ));
-
-    // Default `TlsMode::SelfSigned` reproduces the dropped explicit
-    // `SelfSignedTlsProvider::new("localhost")` (so a QUIC server config is
-    // provisioned). The node opts into `DhtMode::Production` (M2 accepts
-    // `Disabled` for every `Reach`, `Domain` included), which makes the start
-    // publish through `did_method` and fail if that publish fails.
-    Node::start_for_testing(NodeConfig {
-        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], http_port))),
-        dht: DhtMode::Production,
-        ..NodeConfig::defaults(
-            Reach::Domain {
-                domain: "localhost".to_owned(),
-            },
-            IdentitySource::Generate {
-                custody,
-                did_method,
-            },
-            InMemoryStorage::new(),
-            BlobStorageBackend::in_memory(),
-        )
-    })
-    .await
-    .expect("node build should succeed")
-}
-
-/// Connects a QUIC client to `addr`, retrying until the listener is accepting
-/// or the timeout elapses.
-async fn connect_quic(addr: SocketAddr) -> quinn::Connection {
-    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    endpoint.set_default_client_config(insecure_client_config());
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match endpoint.connect(addr, "localhost").unwrap().await {
-            Ok(conn) => return conn,
-            Err(e) => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "QUIC connection to {addr} never succeeded: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
+use quic_support::{
+    CONNECT_DEADLINE, build_tls_node, connect_quic, install_crypto_provider, serve_in_background,
+};
 
 /// Sends a single client message on a fresh bidi stream and reads all responses.
 async fn send_and_recv(conn: &quinn::Connection, msg: &ClientMessage) -> Vec<RelayMessage> {
@@ -210,27 +55,14 @@ async fn send_and_recv(conn: &quinn::Connection, msg: &ClientMessage) -> Vec<Rel
 #[tokio::test]
 async fn quic_listener_accepts_connection_on_serve() {
     install_crypto_provider();
-    let port = reserve_port().await;
-    let node = build_tls_node(port).await;
+    let mut serving = serve_in_background(build_tls_node().await).await;
 
-    // Run serve() in the background; it consumes the node and runs until the
-    // shutdown future resolves.
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let serve_handle = tokio::spawn(async move {
-        node.serve(axum::Router::new(), async move {
-            let _ = rx.await;
-        })
-        .await
-        .ok();
-    });
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let conn = connect_quic(addr).await;
-    assert_eq!(conn.remote_address(), addr);
+    let conn = connect_quic(&mut serving).await;
+    assert_eq!(conn.remote_address(), serving.quic_addr);
+    assert_eq!(conn.remote_address().port(), serving.http_addr.port());
 
     conn.close(0u32.into(), b"done");
-    let _ = tx.send(());
-    let _ = serve_handle.await;
+    serving.stop().await;
 }
 
 /// Asserts a PUBLISH over QUIC is stored and visible to a subsequent QUERY over
@@ -238,20 +70,9 @@ async fn quic_listener_accepts_connection_on_serve() {
 #[tokio::test]
 async fn quic_publish_then_query_roundtrips() {
     install_crypto_provider();
-    let port = reserve_port().await;
-    let node = build_tls_node(port).await;
+    let mut serving = serve_in_background(build_tls_node().await).await;
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let serve_handle = tokio::spawn(async move {
-        node.serve(axum::Router::new(), async move {
-            let _ = rx.await;
-        })
-        .await
-        .ok();
-    });
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let conn = connect_quic(addr).await;
+    let conn = connect_quic(&mut serving).await;
 
     let routing_id = [7u8; 32];
     let blob = vec![123u8; 64];
@@ -294,8 +115,7 @@ async fn quic_publish_then_query_roundtrips() {
     );
 
     conn.close(0u32.into(), b"done");
-    let _ = tx.send(());
-    let _ = serve_handle.await;
+    serving.stop().await;
 }
 
 /// Asserts `.well-known/scp` advertises `"quic"` when (and only when) a QUIC
@@ -304,43 +124,31 @@ async fn quic_publish_then_query_roundtrips() {
 #[tokio::test]
 async fn well_known_advertises_quic_when_listener_running() {
     install_crypto_provider();
-    let port = reserve_port().await;
-    let node = build_tls_node(port).await;
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let serve_handle = tokio::spawn(async move {
-        node.serve(axum::Router::new(), async move {
-            let _ = rx.await;
-        })
-        .await
-        .ok();
-    });
+    let mut serving = serve_in_background(build_tls_node().await).await;
 
     // Confirm the QUIC listener is up before asserting the advertisement, so the
     // advertisement reflects a genuinely running listener.
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let conn = connect_quic(addr).await;
+    let conn = connect_quic(&mut serving).await;
     conn.close(0u32.into(), b"probe");
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .timeout(CONNECT_DEADLINE)
         .build()
         .unwrap();
 
-    let url = format!("https://127.0.0.1:{port}/.well-known/scp");
-    // The TCP listener may need a moment after bind; retry briefly.
-    let mut doc: Option<serde_json::Value> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).send().await
-            && let Ok(json) = resp.json::<serde_json::Value>().await
-        {
-            doc = Some(json);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let doc = doc.expect("well-known document should be reachable over HTTPS");
+    // `bind()` returned before the serve task started, so the TCP listener
+    // already holds the connection in its backlog: one bounded request
+    // suffices, and its error is the failure message.
+    let url = format!("https://{}/.well-known/scp", serving.http_addr);
+    let doc: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"))
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} returned no JSON document: {e}"));
 
     let transports = doc
         .get("relay_config")
@@ -358,6 +166,8 @@ async fn well_known_advertises_quic_when_listener_running() {
         "quic must be advertised while the QUIC listener is running, got {transport_names:?}"
     );
 
-    let _ = tx.send(());
-    let _ = serve_handle.await;
+    // Close the client's pooled keep-alive connection first: the TLS server's
+    // shutdown waits for open connections to finish, up to 30 s.
+    drop(client);
+    serving.stop().await;
 }

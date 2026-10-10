@@ -610,13 +610,11 @@ mod tests {
             "got: {err}"
         );
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
-        let Err(err) =
-            SseClientTransport::connect(&format!("http://127.0.0.1:{port}/sse"), Some("tok"))
-        else {
-            panic!("nothing listens on the port");
+        // No socket can listen on port 0, so a connection to it always fails
+        // (refused on Linux, address unavailable on macOS); a port learned
+        // from a dropped listener could be taken by another process.
+        let Err(err) = SseClientTransport::connect("http://127.0.0.1:0/sse", Some("tok")) else {
+            panic!("nothing listens on port 0");
         };
         assert!(
             err.starts_with("failed to connect"),

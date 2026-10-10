@@ -19,132 +19,20 @@
 #![cfg(all(feature = "quic", feature = "allow_unencrypted_storage"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod quic_support;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use quinn::{ClientConfig, Endpoint};
 use scp_relay_client::{ClientMessage, RelayMessage};
-use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::quic::listener::SCP_ALPN;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use scp_clock::SystemClock;
-use scp_dht::InMemoryDhtClient;
-use scp_identity::DidCache;
-use scp_identity::dht::DidDht;
-use scp_node::{ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, Reach};
-use scp_platform::in_memory::InMemoryStorage;
-use scp_platform::testing::InMemoryKeyCustody;
-
-type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
-
-// ---------------------------------------------------------------------------
-// Shared TLS certificate verifier (test-only)
-// ---------------------------------------------------------------------------
-
-/// A rustls server-certificate verifier that accepts any certificate.
-///
-/// Test-only: the node generates its self-signed certificate internally, so the
-/// QUIC and WebSocket clients have no way to pin it. Skipping verification is
-/// acceptable here because the test only exercises transport plumbing, not TLS
-/// trust.
-#[derive(Debug)]
-struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Installs the process-wide rustls crypto provider exactly once.
-///
-/// Both the node's TLS stack and the client config builders require a default
-/// [`CryptoProvider`]; installing it is idempotent (a second call returns
-/// `Err`, which we ignore).
-fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-// ---------------------------------------------------------------------------
-// QUIC client helpers
-// ---------------------------------------------------------------------------
-
-/// Builds a QUIC client config that trusts any server certificate and
-/// negotiates the SCP ALPN.
-fn insecure_quic_client_config() -> ClientConfig {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification(Arc::clone(&provider))))
-        .with_no_client_auth();
-    tls_config.alpn_protocols = vec![SCP_ALPN.to_vec()];
-
-    let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).unwrap();
-    ClientConfig::new(Arc::new(quic_client_config))
-}
-
-/// Connects a QUIC client to `addr`, retrying until the listener is accepting
-/// or the timeout elapses.
-async fn connect_quic(addr: SocketAddr) -> quinn::Connection {
-    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    endpoint.set_default_client_config(insecure_quic_client_config());
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match endpoint.connect(addr, "localhost").unwrap().await {
-            Ok(conn) => return conn,
-            Err(e) => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "QUIC connection to {addr} never succeeded: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
+use quic_support::{
+    CONNECT_DEADLINE, build_tls_node, connect_quic, insecure_rustls_client_config,
+    install_crypto_provider, serve_in_background,
+};
 
 /// Sends a single client message on a fresh QUIC bidi stream and returns the
 /// length-prefixed frames as `RelayMessage`s, reading until the stream is
@@ -251,46 +139,35 @@ async fn quic_recv_blob(recv: &mut quinn::RecvStream) -> Vec<u8> {
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
-/// Connects a WebSocket client to `wss://127.0.0.1:{port}/scp/v1`, terminating
-/// TLS with a no-verify rustls config.
+/// Connects a WebSocket client to `wss://{addr}/scp/v1`, terminating TLS with
+/// a no-verify rustls config.
 ///
 /// The node's TLS listener advertises ALPN `["h2", "http/1.1"]`; WebSocket
 /// upgrades require HTTP/1.1, so the client offers only `http/1.1` to force the
-/// HTTP/1.1 path. Retries the TCP connect + handshake until the listener is up
-/// or the timeout elapses.
-async fn connect_ws(port: u16) -> WsStream {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification(Arc::clone(&provider))))
-        .with_no_client_auth();
-    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+/// HTTP/1.1 path. `bind()` returned before the serve task started, so the TCP
+/// listener already holds the connection in its backlog: one attempt bounded
+/// by [`CONNECT_DEADLINE`] suffices, and its error is the failure message.
+async fn connect_ws(addr: SocketAddr) -> WsStream {
+    let tls_config = insecure_rustls_client_config(vec![b"http/1.1".to_vec()]);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let url = format!("wss://localhost:{}/scp/v1", addr.port());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let url = format!("wss://localhost:{port}/scp/v1");
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let attempt = async {
-            let tcp = tokio::net::TcpStream::connect(addr).await?;
-            let tls = connector.connect(server_name.clone(), tcp).await?;
-            let (ws, _resp) = tokio_tungstenite::client_async(&url, tls)
-                .await
-                .map_err(std::io::Error::other)?;
-            Ok::<WsStream, std::io::Error>(ws)
-        };
-
-        match attempt.await {
-            Ok(ws) => return ws,
-            Err(e) => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "WebSocket connection to {url} never succeeded: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+    let attempt = async {
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let tls = connector.connect(server_name, tcp).await?;
+        let (ws, _resp) = tokio_tungstenite::client_async(&url, tls)
+            .await
+            .map_err(std::io::Error::other)?;
+        Ok::<WsStream, std::io::Error>(ws)
+    };
+    match tokio::time::timeout(CONNECT_DEADLINE, attempt).await {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => panic!("WebSocket connection to {url} failed: {e}"),
+        Err(elapsed) => {
+            panic!(
+                "WebSocket connection to {url} did not complete within {CONNECT_DEADLINE:?}: {elapsed}"
+            )
         }
     }
 }
@@ -377,59 +254,6 @@ async fn ws_recv_blob(ws: &mut WsStream) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Node setup
-// ---------------------------------------------------------------------------
-
-/// Reserves a free TCP port by binding to port 0 and immediately releasing it.
-///
-/// The returned port is then used as a fixed `http_bind_addr` so the test can
-/// connect both a QUIC client (UDP) and a WebSocket client (TCP) to the same
-/// known port (`serve()` does not surface the bound address).
-async fn reserve_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-/// Builds a domain-mode node with a self-signed certificate (so a QUIC server
-/// config is provisioned) bound to the given public HTTP/TLS port. The same
-/// node serves the WebSocket relay over TCP and the QUIC listener over UDP on
-/// this port, sharing one subscription registry and blob storage backend.
-async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
-    let custody = Arc::new(InMemoryKeyCustody::new());
-    let dht_client = Arc::new(InMemoryDhtClient::new());
-    let cache = Arc::new(DidCache::new());
-    let sign_fn = TestDidDht::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(TestDidDht::with_client_and_signer(
-        dht_client, cache, sign_fn,
-    ));
-
-    // Default `TlsMode::SelfSigned` reproduces the dropped explicit
-    // `SelfSignedTlsProvider::new("localhost")` (so a QUIC server config is
-    // provisioned). The node opts into `DhtMode::Production` (M2 accepts
-    // `Disabled` for every `Reach`, `Domain` included), which makes the start
-    // publish through `did_method` and fail if that publish fails.
-    Node::start_for_testing(NodeConfig {
-        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], http_port))),
-        dht: DhtMode::Production,
-        ..NodeConfig::defaults(
-            Reach::Domain {
-                domain: "localhost".to_owned(),
-            },
-            IdentitySource::Generate {
-                custody,
-                did_method,
-            },
-            InMemoryStorage::new(),
-            BlobStorageBackend::in_memory(),
-        )
-    })
-    .await
-    .expect("node build should succeed")
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -442,29 +266,18 @@ async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
 #[tokio::test]
 async fn quic_subscriber_receives_websocket_publish() {
     install_crypto_provider();
-    let port = reserve_port().await;
-    let node = build_tls_node(port).await;
+    let mut serving = serve_in_background(build_tls_node().await).await;
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let serve_handle = tokio::spawn(async move {
-        node.serve(axum::Router::new(), async move {
-            let _ = rx.await;
-        })
-        .await
-        .ok();
-    });
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let routing_id = [0x5Au8; 32];
     let payload = vec![0xA1u8; 96];
 
     // Subscribe over QUIC first so the subscription is registered before the
     // WebSocket publish fans out.
-    let quic_conn = connect_quic(addr).await;
+    let quic_conn = connect_quic(&mut serving).await;
     let (_quic_send, mut quic_recv) = quic_subscribe(&quic_conn, routing_id).await;
 
     // Publish over WebSocket to the same routing ID.
-    let mut ws = connect_ws(port).await;
+    let mut ws = connect_ws(serving.http_addr).await;
     ws_publish(&mut ws, routing_id, payload.clone()).await;
 
     // The QUIC subscriber must receive the exact payload published over WS.
@@ -476,8 +289,7 @@ async fn quic_subscriber_receives_websocket_publish() {
 
     let _ = ws.close(None).await;
     quic_conn.close(0u32.into(), b"done");
-    let _ = tx.send(());
-    let _ = serve_handle.await;
+    serving.stop().await;
 }
 
 /// Cross-transport delivery, WebSocket subscriber <- QUIC publisher (reverse).
@@ -488,29 +300,18 @@ async fn quic_subscriber_receives_websocket_publish() {
 #[tokio::test]
 async fn websocket_subscriber_receives_quic_publish() {
     install_crypto_provider();
-    let port = reserve_port().await;
-    let node = build_tls_node(port).await;
+    let mut serving = serve_in_background(build_tls_node().await).await;
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let serve_handle = tokio::spawn(async move {
-        node.serve(axum::Router::new(), async move {
-            let _ = rx.await;
-        })
-        .await
-        .ok();
-    });
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let routing_id = [0xC3u8; 32];
     let payload = vec![0x7Eu8; 128];
 
     // Subscribe over WebSocket first so the subscription is registered before
     // the QUIC publish fans out.
-    let mut ws = connect_ws(port).await;
+    let mut ws = connect_ws(serving.http_addr).await;
     ws_subscribe(&mut ws, routing_id).await;
 
     // Publish over QUIC to the same routing ID.
-    let quic_conn = connect_quic(addr).await;
+    let quic_conn = connect_quic(&mut serving).await;
     let publish = ClientMessage::Publish {
         ref_id: Some("quic-pub".to_owned()),
         routing_id,
@@ -541,6 +342,5 @@ async fn websocket_subscriber_receives_quic_publish() {
 
     let _ = ws.close(None).await;
     quic_conn.close(0u32.into(), b"done");
-    let _ = tx.send(());
-    let _ = serve_handle.await;
+    serving.stop().await;
 }
