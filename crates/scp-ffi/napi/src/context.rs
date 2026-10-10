@@ -1318,14 +1318,18 @@ pub(crate) async fn reserve_key_package_on(
 }
 
 /// Tears down a committed Welcome join whose bridge state a concurrent close
-/// removed, and returns the join's `CTX_2040` error.
+/// removed, and returns the join's `CTX_2040` error, or the teardown's own
+/// error when the discard fails (the actor may then still write its snapshot).
 async fn tear_down_vanished_join(
     bi: &crate::runtime::NapiBridgeInstance,
     sup: &scp_core::context::supervisor::Supervisor,
     context_id: &str,
 ) -> ScpNapiError {
-    sup.discard_joined_context(context_id).await;
+    let discarded = sup.discard_joined_context(context_id).await;
     crate::runtime::release_context(bi, context_id);
+    if let Err(e) = discarded {
+        return ScpNapiError::from(e);
+    }
     ScpNapiError::Context {
         message: format!(
             "bridge state for context '{context_id}' vanished between the reversible \

@@ -3250,7 +3250,11 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     );
 
     // --- COMPLETE teardown (the FFI compensating path). ---
-    let removed = j.sup.discard_joined_context(&j.ctx_id).await;
+    let removed = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect("the discard stops the actor and deletes the snapshot");
     assert!(
         removed,
         "discard_joined_context reports it removed the live actor handle"
@@ -3299,6 +3303,46 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     assert!(
         !j.sup.floors.contains_key(&j.ctx_bytes),
         "the registry floor entry is pruned on permanent teardown — no leak"
+    );
+}
+
+/// A clone of the actor handle held outside the registry (a bridge's cached
+/// handle) keeps the actor running past the registry removal, and the actor's
+/// post-loop drain persists its state when it finally exits. The discard must
+/// wait for that exit before it deletes the snapshot; otherwise the drain
+/// writes the snapshot back, a restart resurrects the context, and Precheck D
+/// refuses a fresh re-join.
+///
+/// The test drives the held clone's actor to exit after the discard returns.
+/// When the discard has already stopped the actor, that exit is a no-op and
+/// the snapshot stays deleted; when the discard left the actor running, its
+/// drain persists the snapshot again.
+#[tokio::test]
+async fn discard_joined_context_deletes_after_the_actors_last_write() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = join_bob(0x6e, Some(Box::new(rec.clone()))).await;
+    result.expect("the happy-path join succeeds");
+    let held = j
+        .sup
+        .lookup(&j.ctx_id)
+        .expect("a live context actor is registered for the joiner");
+
+    let removed = j
+        .sup
+        .discard_joined_context(&j.ctx_id)
+        .await
+        .expect("the discard stops the actor and deletes the snapshot");
+    assert!(removed, "the discard removed the live actor handle");
+
+    held.shutdown_and_await_exit()
+        .await
+        .expect("the held clone's actor has exited");
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .await
+            .expect("load never errors")
+            .is_none(),
+        "no write from the discarded actor may land after the snapshot delete"
     );
 }
 

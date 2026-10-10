@@ -299,14 +299,18 @@ fn no_pre_rotation_backend() -> ScpError {
 }
 
 /// Tears down a committed Welcome join, re-marks the id released, and returns
-/// the join's `CTX_2040` error.
+/// the join's `CTX_2040` error, or the teardown's own error when the discard
+/// fails (the actor may then still write its snapshot).
 async fn tear_down_vanished_join(
     bi: &crate::runtime::UniffiBridgeInstance,
     sup: &scp_core::context::supervisor::Supervisor,
     context_id: &str,
 ) -> ScpError {
-    sup.discard_joined_context(context_id).await;
+    let discarded = sup.discard_joined_context(context_id).await;
     bi.release_ucan_state(context_id);
+    if let Err(e) = discarded {
+        return ScpError::from(e);
+    }
     ScpError::Context {
         msg: format!(
             "UCAN state for context '{context_id}' vanished after the join committed; the \
@@ -21831,7 +21835,8 @@ mod tests {
                 .context_manager_or_error()
                 .expect("test supervisor must be attached"),
         );
-        rt.block_on(sup.discard_joined_context(&context_id));
+        rt.block_on(sup.discard_joined_context(&context_id))
+            .expect("the discard stops the creator's actor and deletes its snapshot");
         deregister_context_handle(&scp.inner, &context_id);
         scp.inner.release_ucan_state(&context_id);
 
