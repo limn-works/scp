@@ -94,7 +94,7 @@ lists the values and what an unset value does.
 
 ```bash
 # Full node (a shipped binary logs "no production pre-rotation custody backend available" and exits 1; see section 6)
-SCP_NODE_DOMAIN=relay.example.com scp-node
+SCP_NODE_DOMAIN=relay.example.com SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db scp-node
 
 # Relay-only mode (names its storage backend and path, which have no default; see section 4)
 SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
@@ -270,9 +270,11 @@ The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (d
 ### Production deployment
 
 ```bash
-# Required: domain and storage path
+# Required: domain, storage path, and blob backend and path (section 4)
 SCP_NODE_DOMAIN=relay.example.com \
 SCP_STORAGE_PATH=/var/lib/scp/node \
+SCP_RELAY_STORAGE_BACKEND=sqlite \
+SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db \
 scp-node
 ```
 

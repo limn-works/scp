@@ -493,13 +493,28 @@ fn required_value(
     }
 }
 
+/// Reads `raw`, the value of `SCP_RELAY_S3_PREFIX`. Unset is `blobs/`; a set
+/// but blank value is [`StartupError::InvalidValue`] rather than an empty
+/// prefix.
+#[cfg(feature = "s3-blob")]
+fn s3_prefix(raw: Option<OsString>) -> Result<String, StartupError> {
+    const PREFIX_VAR: &str = "SCP_RELAY_S3_PREFIX";
+    match raw {
+        None => Ok("blobs/".to_owned()),
+        Some(raw) if is_blank(&raw) => Err(StartupError::InvalidValue {
+            var: PREFIX_VAR,
+            reason: "the value is set but empty; unset it to use blobs/".to_owned(),
+        }),
+        Some(raw) => utf8(PREFIX_VAR, raw),
+    }
+}
+
 /// Constructs the blob storage backend `choice` names, reading that
 /// backend's configuration from the environment.
 ///
 /// `choice` comes from [`backend_choice_from_env`]. This function applies no
 /// default to any variable it reads, except `SCP_RELAY_S3_PREFIX`, whose
-/// default `blobs/` is the key prefix the S3 key layout in persistence spec
-/// §17.7 names. The doc comment of [`backend_choice_from_env`] lists each
+/// default is `blobs/` when it is unset. The doc comment of [`backend_choice_from_env`] lists each
 /// backend's config variables.
 ///
 /// # Backend availability
@@ -518,7 +533,8 @@ fn required_value(
 ///   (`SCP_RELAY_STORAGE_PATH`, `SCP_RELAY_DATABASE_URL`, or
 ///   `SCP_RELAY_S3_BUCKET`) is unset or blank.
 /// - [`StartupError::RelativePath`] when `SCP_RELAY_STORAGE_PATH` is relative.
-/// - [`StartupError::InvalidValue`] when a variable it reads is not UTF-8.
+/// - [`StartupError::InvalidValue`] when a variable it reads is not UTF-8, or
+///   when `SCP_RELAY_S3_PREFIX` is set but blank.
 /// - [`StartupError::StoreOpen`] when the store fails to open.
 #[cfg_attr(
     not(any(feature = "postgres-blob", feature = "s3-blob")),
@@ -563,12 +579,8 @@ pub async fn storage_from_env(choice: BackendChoice) -> Result<BlobStorageBacken
         #[cfg(feature = "s3-blob")]
         BackendChoice::S3 => {
             const BUCKET_VAR: &str = "SCP_RELAY_S3_BUCKET";
-            const PREFIX_VAR: &str = "SCP_RELAY_S3_PREFIX";
             let bucket = required_value("s3", BUCKET_VAR, env::var_os(BUCKET_VAR))?;
-            let prefix = match env::var_os(PREFIX_VAR) {
-                None => "blobs/".to_owned(),
-                Some(raw) => utf8(PREFIX_VAR, raw)?,
-            };
+            let prefix = s3_prefix(env::var_os("SCP_RELAY_S3_PREFIX"))?;
             tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
             let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
                 .await
@@ -1065,6 +1077,33 @@ mod tests {
         assert_eq!(
             required_value("s3", "SCP_RELAY_S3_BUCKET", Some(OsString::from("b"))).ok(),
             Some("b".to_owned())
+        );
+    }
+
+    /// An unset S3 prefix is `blobs/`; a set but blank prefix is refused
+    /// rather than becoming an empty key prefix; a set prefix is kept.
+    #[cfg(feature = "s3-blob")]
+    #[test]
+    fn a_set_s3_prefix_must_not_be_blank() {
+        use super::s3_prefix;
+
+        assert_eq!(s3_prefix(None).ok(), Some("blobs/".to_owned()));
+        for raw in ["", " "] {
+            let result = s3_prefix(Some(OsString::from(raw)));
+            assert!(
+                matches!(
+                    result,
+                    Err(StartupError::InvalidValue {
+                        var: "SCP_RELAY_S3_PREFIX",
+                        ..
+                    })
+                ),
+                "{raw:?}: {result:?}"
+            );
+        }
+        assert_eq!(
+            s3_prefix(Some(OsString::from("tenant-a"))).ok(),
+            Some("tenant-a".to_owned())
         );
     }
 }
