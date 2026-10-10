@@ -9,7 +9,7 @@
 //! `blob_storage_fail_closed.rs`; this file carries the S3 arm's.
 //!
 //! Both public constructors go through one private path that issues a
-//! `HeadBucket` request, so this test reaches the probe `S3BlobStore::open`
+//! `ListObjectsV2` probe, so this test reaches the probe `S3BlobStore::open`
 //! reaches. Without that probe the constructor returned `Ok` for every input,
 //! because loading the SDK configuration and building a client perform no I/O,
 //! and the relay learned of an unreachable store on its first `store` call.
@@ -68,7 +68,7 @@ async fn s3_blob_open_against_unusable_endpoint_fails_closed_with_internal() {
     match result {
         Err(StorageError::Internal(message)) => {
             assert!(
-                message.contains("S3 head bucket failed for scp-relay-blobs"),
+                message.contains("S3 list probe failed for scp-relay-blobs"),
                 "the error must name the bucket probe that failed: {message}"
             );
         }
