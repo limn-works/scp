@@ -1115,8 +1115,8 @@ where
 ///
 /// An HPKE P-256 key requires a valid 65-byte uncompressed peer point, an
 /// X25519 key a 32-byte peer, both checked before the host call. A signing
-/// key is [`PlatformError::WrongKeyType`] without a host call. The host must return exactly 32 bytes, which are zeroized once
-/// copied.
+/// key is [`PlatformError::WrongKeyType`] without a host call. The host must
+/// return exactly 32 bytes, which are zeroized once copied.
 ///
 /// # Errors
 ///
@@ -3011,14 +3011,15 @@ mod tests {
         });
         assert!(poisoner.is_err());
         registry.abandon_destroy(identity, token);
-        let slots = registry
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(matches!(slots.map.get(&1), Some(Slot::Abandoned { .. })));
-        assert!(matches!(slots.map.get(&7), Some(Slot::Live(_))));
-        drop(slots);
-        assert!(registry.is_live(&KeyHandle::new(7)));
+        let (identity_slot, key_slot) = {
+            let slots = registry
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (slots.map.get(&1).cloned(), slots.map.get(&7).cloned())
+        };
+        assert!(matches!(identity_slot, Some(Slot::Abandoned { .. })));
+        assert!(matches!(key_slot, Some(Slot::Live(_))));
     }
 
     /// A sweep whose host destroy fails keeps the orphan queued and

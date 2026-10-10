@@ -335,16 +335,26 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
     const secret = Uint8Array.from({ length: 32 }, (_, i) => 0xa0 + i);
     const peer = Buffer.alloc(32, 0x5c);
     const seen: unknown[][] = [];
+    // An X25519 key the host holds: the adapter resolves it through
+    // `getPublicKey`, since `dhAgree` refuses a signing key.
+    const spki = crypto
+      .generateKeyPairSync("x25519")
+      .publicKey.export({ format: "der", type: "spki" });
+    const keyId = "9";
     const custody = adapterWith({
+      getPublicKey: () => ({
+        keyType: "x25519",
+        publicKey: new Uint8Array(spki.subarray(spki.length - 32)),
+        role: "operational",
+      }),
       dhAgree: (...args: unknown[]) => {
         seen.push(args);
         return secret;
       },
     });
-    const identity = await custody.generateKeypair();
-    const shared = await custody.dhAgree(identity, peer);
+    const shared = await custody.dhAgree(keyId, peer);
     expect(Buffer.from(shared).toString("hex")).toBe(Buffer.from(secret).toString("hex"));
-    expect(seen).toEqual([[identity, new Uint8Array(peer)]]);
+    expect(seen).toEqual([[keyId, new Uint8Array(peer)]]);
     // The host's own buffer is the host's to wipe.
     expect(secret.every((b, i) => b === 0xa0 + i)).toBe(true);
   });

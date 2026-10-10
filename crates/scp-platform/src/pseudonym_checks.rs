@@ -1,7 +1,7 @@
 //! The pseudonym check every software custody's tests run.
 
 use crate::error::PlatformError;
-use crate::traits::{KeyCustody, KeyType};
+use crate::traits::KeyCustody;
 
 /// Checks that a destroyed identity derives no pseudonym (§9.10.4.A): after
 /// identity `u` is destroyed, its v1 and v2 derivations fail with
@@ -10,8 +10,8 @@ use crate::traits::{KeyCustody, KeyType};
 pub async fn check_destroyed_identity_derives_no_pseudonym<C: KeyCustody>(
     custody: &C,
 ) -> Result<(), PlatformError> {
-    let u = custody.generate_keypair(KeyType::Ed25519).await?;
-    let v = custody.generate_keypair(KeyType::Ed25519).await?;
+    let u = custody.generate_identity_keypair().await?;
+    let v = custody.generate_identity_keypair().await?;
     let v_static = custody.derive_pseudonym(&v, b"ctx").await?;
     let v_rotatable = custody.derive_rotatable_pseudonym(&v, b"ctx", 7).await?;
     custody.derive_pseudonym(&u, b"ctx").await?;

@@ -1454,9 +1454,9 @@ mod tests {
     async fn callback_pseudonym_routing_id_is_spec_25_19_vector_30() {
         let custody = FfiKeyCustody::Callback(fake_py_custody(Some("vector30")));
         let handle = custody
-            .generate_keypair(KeyType::Ed25519)
+            .generate_identity_keypair()
             .await
-            .expect("key");
+            .expect("identity key");
         let pseudo = custody
             .derive_pseudonym(&handle, b"context-alpha")
             .await
