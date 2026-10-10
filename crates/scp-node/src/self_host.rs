@@ -2074,13 +2074,24 @@ where
 /// an empty or relative `XDG_DATA_HOME`; this resolver refuses it instead, so
 /// an operator who set it learns the value was not used.)
 ///
+/// An explicit path is used as given, and may be relative (the deployment
+/// guide's recipes pass `./data`). An empty explicit path, such as a set but
+/// empty `SCP_STORAGE_PATH`, is refused: it names no directory, and the
+/// filesystem calls downstream would resolve it to the working directory.
+///
 /// # Errors
 ///
-/// Returns [`HostSiteError::StorageLocation`] when no explicit path is given
-/// and the environment yields no absolute base, carrying the
-/// [`StorageLocationError`] that names the variable at fault.
+/// Returns [`HostSiteError::StorageLocation`] carrying
+/// [`StorageLocationError::ExplicitPathEmpty`] for an empty explicit path, or,
+/// when no explicit path is given and the environment yields no absolute base,
+/// the [`StorageLocationError`] that names the variable at fault.
 pub fn resolve_storage_path(cli_path: Option<&PathBuf>) -> Result<PathBuf, HostSiteError> {
     if let Some(path) = cli_path {
+        if path.as_os_str().is_empty() {
+            return Err(HostSiteError::StorageLocation(
+                StorageLocationError::ExplicitPathEmpty,
+            ));
+        }
         return Ok(path.clone());
     }
     default_storage_path(
@@ -2090,9 +2101,17 @@ pub fn resolve_storage_path(cli_path: Option<&PathBuf>) -> Result<PathBuf, HostS
     .map_err(HostSiteError::StorageLocation)
 }
 
-/// Why the environment yields no default storage location.
+/// Why no storage location could be resolved: an empty explicit path, or an
+/// environment that yields no absolute default.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StorageLocationError {
+    /// The explicit storage path (`--storage-path`, `SCP_STORAGE_PATH`, or
+    /// `HostSiteConfig::storage_path`) is empty.
+    #[error(
+        "the explicit storage path is empty (is SCP_STORAGE_PATH set to an empty \
+         value?); pass a directory, or unset SCP_STORAGE_PATH to use the default"
+    )]
+    ExplicitPathEmpty,
     /// `XDG_DATA_HOME` is set to an empty value.
     #[error(
         "XDG_DATA_HOME is set but empty; set it to an absolute directory, unset it, \
@@ -3002,14 +3021,26 @@ mod tests {
         );
     }
 
-    /// An explicit path bypasses the environment entirely.
+    /// An explicit path bypasses the environment entirely, and a relative
+    /// explicit path is kept as given (the deployment guide passes `./data`).
     #[test]
     fn resolve_storage_path_prefers_an_explicit_path() {
-        let explicit = PathBuf::from("/srv/scp");
-        assert_eq!(
-            resolve_storage_path(Some(&explicit)).expect("explicit path"),
-            explicit
-        );
+        for explicit in [PathBuf::from("/srv/scp"), PathBuf::from("./data")] {
+            assert_eq!(
+                resolve_storage_path(Some(&explicit)).expect("explicit path"),
+                explicit
+            );
+        }
+    }
+
+    /// An empty explicit path (a set but empty `SCP_STORAGE_PATH`, or
+    /// `--storage-path ""`) is refused instead of naming the working directory.
+    #[test]
+    fn resolve_storage_path_refuses_an_empty_explicit_path() {
+        match resolve_storage_path(Some(&PathBuf::new())) {
+            Err(HostSiteError::StorageLocation(StorageLocationError::ExplicitPathEmpty)) => {}
+            other => panic!("an empty explicit storage path must be refused, got {other:?}"),
+        }
     }
 
     /// The self-host drain failure line names a panic as a panic and a
