@@ -6921,7 +6921,8 @@ mod tests {
         use scp_platform::traits::{KeyCustody, KeyType};
         use scp_protocol::crypto::ucan::validate::{
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-            InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver, ValidationContext,
+            InMemoryProofResolver, InMemoryRevocationChecker, TokenNbCaveatResolver,
+            ValidationContext,
         };
 
         // Set up issuer identity.
@@ -6966,7 +6967,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let caveat_resolver = NoCaveatResolver;
+        let caveat_resolver = TokenNbCaveatResolver;
         let mut ctx = ValidationContext {
             did_resolver: &resolver,
             nonce_tracker: &mut nonce_tracker,
@@ -7015,7 +7016,8 @@ mod tests {
         use scp_platform::traits::{KeyCustody, KeyType};
         use scp_protocol::crypto::ucan::validate::{
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-            InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver, ValidationContext,
+            InMemoryProofResolver, InMemoryRevocationChecker, TokenNbCaveatResolver,
+            ValidationContext,
         };
 
         let custody = InMemoryKeyCustody::new();
@@ -7083,7 +7085,7 @@ mod tests {
                 let mut nonce_tracker = InMemoryNonceTracker::new();
                 let revocation_checker = InMemoryRevocationChecker::new();
                 let proof_resolver = InMemoryProofResolver::new();
-                let caveat_resolver = NoCaveatResolver;
+                let caveat_resolver = TokenNbCaveatResolver;
                 let mut ctx = ValidationContext {
                     did_resolver: &resolver,
                     nonce_tracker: &mut nonce_tracker,

@@ -422,10 +422,7 @@ pub(crate) fn validate_outlet_ucan(
             // effective caveats from each token's `nb` field so §7.3.8 Step 7b
             // (per-edge narrow) and Step 11b (time-box) run over the proof
             // chain's VALIDATED-NARROWED caveat set, not an unverified leaf
-            // assertion. `NoCaveatResolver` returns `None` for every token, so
-            // narrowing would commit to nothing. The generic `py_ucan_validate`
-            // site (ucan.rs) and the broadcast paths stay on `NoCaveatResolver`
-            // — they are not outlet-invocation sites.
+            // assertion.
             caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 

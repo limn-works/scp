@@ -1068,15 +1068,16 @@ where
     // issuer is then bound to the actor — sub-delegation cannot smuggle
     // in a different root.
     // Spending UCANs carry `scp:spending:{id}` capability URIs, never outlet
-    // stems, so §7.3.8 invocation caveats never apply on this path. Pass the
-    // no-op `NoCaveatResolver` — the per-edge caveat narrow is inert (every
-    // token resolves to `None`, and no attestation is an outlet edge).
+    // stems, and mint with `nb = None` (§7.3.8 outlet scoping), so the
+    // per-edge caveat narrow admits a faithful chain unchanged. The resolver
+    // reads each token's own signed `nb`, so a chain whose `nb` does not
+    // narrow is rejected rather than having its caveats ignored.
     let root_issuer = super::validate::verify_delegation_chain(
         token,
         did_resolver,
         proof_resolver,
         revocation_checker,
-        &super::validate::NoCaveatResolver,
+        &super::validate::TokenNbCaveatResolver,
         clock_skew_tolerance_secs,
         clock,
     )?;

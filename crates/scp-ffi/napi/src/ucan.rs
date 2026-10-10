@@ -334,10 +334,11 @@ pub(crate) async fn ucan_validate_on(
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            // Generic validate site: not an outlet-invocation path, so caveat
-            // resolution is a constant `None` (`NoCaveatResolver`). Only
-            // outlet-invocation sites use `TokenNbCaveatResolver`.
-            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+            // §7.3.8: resolve caveats from the token's own signed `nb`, so
+            // Step 7b narrows every outlet edge and Step 11b enforces the
+            // presenting token's time-box. A non-outlet token carries
+            // `nb = None`, so both caveat steps are no-ops for it.
+            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
         // Execute the full 11-step validation pipeline.
@@ -457,10 +458,11 @@ pub(crate) async fn ucan_evaluate_on(
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            // Generic evaluate site: not an outlet-invocation path, so caveat
-            // resolution is a constant `None` (`NoCaveatResolver`). Only
-            // outlet-invocation sites use `TokenNbCaveatResolver`.
-            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+            // §7.3.8: resolve caveats from the token's own signed `nb`, so
+            // Step 7b narrows every outlet edge and Step 11b enforces the
+            // presenting token's time-box. A non-outlet token carries
+            // `nb = None`, so both caveat steps are no-ops for it.
+            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
         Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))

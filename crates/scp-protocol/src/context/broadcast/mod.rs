@@ -2393,7 +2393,7 @@ mod tests {
     };
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-        InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
+        InMemoryProofResolver, InMemoryRevocationChecker, TokenNbCaveatResolver,
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
     use scp_clock::Clock;
@@ -2722,7 +2722,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx
@@ -2767,7 +2767,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
-                caveat_resolver: &NoCaveatResolver,
+                caveat_resolver: &TokenNbCaveatResolver,
             };
             ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
                 .unwrap();
@@ -2789,7 +2789,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
-                caveat_resolver: &NoCaveatResolver,
+                caveat_resolver: &TokenNbCaveatResolver,
             };
             let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
             assert!(
@@ -2820,7 +2820,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
-                caveat_resolver: &NoCaveatResolver,
+                caveat_resolver: &TokenNbCaveatResolver,
             };
             let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
             assert!(
@@ -2850,7 +2850,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
-                caveat_resolver: &NoCaveatResolver,
+                caveat_resolver: &TokenNbCaveatResolver,
             };
             ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
                 .unwrap();
@@ -2880,7 +2880,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
         let result = restored.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
         assert!(
@@ -2926,7 +2926,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
-                caveat_resolver: &NoCaveatResolver,
+                caveat_resolver: &TokenNbCaveatResolver,
             };
             ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
                 .unwrap();
@@ -2956,7 +2956,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
         let result = ctx
             .subscribe("did:example:bob", Some(&ucan2), 1000, Some(&mut val_ctx))
@@ -2983,7 +2983,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3050,7 +3050,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3075,7 +3075,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3533,7 +3533,7 @@ mod tests {
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
         ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
             .unwrap();
@@ -3631,7 +3631,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         // With full validation, a properly signed wildcard UCAN from the
@@ -3704,7 +3704,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -4077,7 +4077,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx
@@ -4756,7 +4756,7 @@ mod tests {
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         // Subscribe with UCAN.
@@ -5907,7 +5907,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -5956,7 +5956,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -6008,7 +6008,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -6056,7 +6056,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -6103,7 +6103,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -6192,7 +6192,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -6234,7 +6234,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
-            caveat_resolver: &NoCaveatResolver,
+            caveat_resolver: &TokenNbCaveatResolver,
         };
 
         let result = validate_ucan(&ucan, &required_cap, &mut val_ctx);

@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, NoCaveatResolver, ValidationContext,
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, TokenNbCaveatResolver,
+    ValidationContext,
 };
 use tokio::sync::oneshot;
 
@@ -232,7 +233,11 @@ async fn handle_subscribe_broadcast(
         presenting_agent_did: p.subscriber_did.as_ref(),
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: deps.clock.as_ref(),
-        caveat_resolver: &NoCaveatResolver,
+        // §7.3.8: Step 11b reads the presented token's own signed `nb`. A
+        // `messages:read` grant is non-outlet and mints with `nb = None`, so
+        // the caveat steps admit it unchanged; a token that does carry an `nb`
+        // has its time-box enforced rather than ignored.
+        caveat_resolver: &TokenNbCaveatResolver,
     };
 
     let subscribe_fut = async {
