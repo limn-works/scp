@@ -58,7 +58,7 @@ from typing import (
 from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
 from scp_sdk.errors import ScpError, ValidationError, _coded_bridge_error
 from scp_sdk.governance import GovernanceActionResult, check_proposal_response
-from scp_sdk.types import CustodyType
+from scp_sdk.types import CustodyType, CustomRole, MemberRole
 
 if TYPE_CHECKING:
     from scp_sdk.outlets import OutletDefinition, SagaResult, StreamingSagaHandle
@@ -1460,9 +1460,17 @@ class SCP:
         """Delegate to ``_scp_core.SCP.context_member_dids``."""
         return await asyncio.to_thread(self._native.context_member_dids, handle)
 
-    async def context_member_role(self, handle: Any, did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.context_member_role``."""
-        return await asyncio.to_thread(self._native.context_member_role, handle, did)
+    async def context_member_role(self, handle: Any, did: str) -> MemberRole | CustomRole | None:
+        """Return the role ``did`` holds in the context, or ``None`` for a non-member.
+
+        Raises:
+            UnknownGovernanceOutcomeError: the bridge reported a role name
+                :meth:`MemberRole.from_bridge` cannot parse (code ``SCP-GOV-11040``).
+        """
+        raw = await asyncio.to_thread(self._native.context_member_role, handle, did)
+        if raw is None:
+            return None
+        return MemberRole.from_bridge(raw)
 
     async def context_propose_ttl_extension(
         self, handle: Any, member_did: str, proposed_seconds: int

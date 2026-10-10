@@ -1220,3 +1220,48 @@ class TestMemberRoleFromBridge:
             MemberRole.from_bridge(raw)
         assert excinfo.value.code == "SCP-GOV-11040"
         assert excinfo.value.raw_outcome == raw
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("author", "AUTHOR"),
+            ("subscriber", "SUBSCRIBER"),
+            ("night-shift-reviewer", None),
+        ],
+    )
+    async def test_scp_context_member_role_returns_the_parsed_role(
+        self, raw: str, expected: str | None
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.scp import SCP
+        from scp_sdk.types import CustomRole, MemberRole
+
+        scp = MagicMock()
+        scp._native.context_member_role = MagicMock(return_value=raw)
+        got = await SCP.context_member_role(scp, "ctx", "did:dht:zA")
+        if expected is None:
+            assert got == CustomRole(name=raw)
+        else:
+            assert got is MemberRole[expected]
+
+    async def test_scp_context_member_role_returns_none_for_a_non_member(self) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.context_member_role = MagicMock(return_value=None)
+        assert await SCP.context_member_role(scp, "ctx", "did:dht:zA") is None
+
+    async def test_scp_context_member_role_raises_gov_11040_for_a_malformed_name(self) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.context_member_role = MagicMock(return_value="Admin")
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            await SCP.context_member_role(scp, "ctx", "did:dht:zA")
+        assert excinfo.value.code == "SCP-GOV-11040"

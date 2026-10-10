@@ -69,6 +69,7 @@ import type {
   EventLogEntry,
   GovernanceActionResult,
   InviteMemberOutcome,
+  MemberRole,
   OutletDefinition,
   ParticipationProfile,
   RequireParticipation,
@@ -93,6 +94,7 @@ import {
   encodeRequireParticipation,
   encodeThresholdRequirements,
   governanceActionResultFromBridge,
+  memberRoleFromBridge,
 } from "./types";
 
 /**
@@ -1843,14 +1845,23 @@ export class SCP {
     }
   }
 
-  async contextMemberRole(handle: unknown, did: string): Promise<string | null> {
+  /**
+   * Returns the role `did` holds in the context, or `null` for a non-member.
+   *
+   * @throws {UnknownGovernanceOutcomeError} `SCP-GOV-11040` when the bridge
+   *   reports a role name {@link memberRoleFromBridge} cannot parse.
+   */
+  async contextMemberRole(handle: unknown, did: string): Promise<MemberRole | null> {
+    let raw: string | null;
     try {
-      return await (
+      raw = await (
         this.#native.contextMemberRole as (h: unknown, d: string) => Promise<string | null>
       )(handle, did);
     } catch (err) {
       throw mapBridgeError(err);
     }
+    if (raw === null) return null;
+    return memberRoleFromBridge(raw);
   }
 
   async contextDrainEvents(handle: unknown): Promise<readonly string[]> {

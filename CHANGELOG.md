@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 `member_role` on the `PyO3` and `UniFFI` bridges reports
 `RoleAssignment.role_name`, which for a built-in role is one of the six names
 `crates/scp-protocol/src/context/roles.rs` reserves. Python's `MemberRole`,
-Swift's `MemberRole`, and TypeScript's `MemberRole` carried five of those six, so
+Swift's `MemberRole`, and TypeScript's `MemberRole` carried four of those six, so
 a member holding `author` or `subscriber` resolved to `Custom`, the answer each
 SDK documents as "a role a context's governance defined", which
 `RESERVED_ROLE_NAMES` forbids either name from being. **All three now carry

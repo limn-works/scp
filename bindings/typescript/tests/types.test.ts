@@ -890,3 +890,29 @@ describe("memberRoleFromBridge", () => {
     }
   });
 });
+
+describe("SCP.contextMemberRole", () => {
+  const scpReturning = (raw: string | null): SCP =>
+    __constructScpWithNativeForTests({ contextMemberRole: async () => raw });
+
+  it("returns the parsed role", async () => {
+    expect(await scpReturning("author").contextMemberRole({}, "did:dht:zA")).toBe("Author");
+    expect(await scpReturning("subscriber").contextMemberRole({}, "did:dht:zA")).toBe("Subscriber");
+    expect(await scpReturning("night-shift-reviewer").contextMemberRole({}, "did:dht:zA")).toEqual({
+      kind: "Custom",
+      name: "night-shift-reviewer",
+    });
+  });
+
+  it("returns null for a non-member", async () => {
+    expect(await scpReturning(null).contextMemberRole({}, "did:dht:zA")).toBeNull();
+  });
+
+  it("throws SCP-GOV-11040 for a malformed role name", async () => {
+    const err = await scpReturning("Admin")
+      .contextMemberRole({}, "did:dht:zA")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UnknownGovernanceOutcomeError);
+    expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
+  });
+});
