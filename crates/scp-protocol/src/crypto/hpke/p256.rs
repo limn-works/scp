@@ -26,7 +26,7 @@
 //!
 //! Each [`seal`] draws a fresh ephemeral key as `DeriveKeyPair(random(Nsk))`,
 //! which RFC 9180 §4 names as an implementation of `GenerateKeyPair`, so the one
-//! [`derive_key_pair`] routine serves both the RFC 9180 A.3 known-answer tests
+//! `derive_key_pair` routine serves both the RFC 9180 A.3 known-answer tests
 //! and production. The HPKE context performs exactly one `Seal` at sequence
 //! number 0; nothing here exports secrets or supplies an external nonce.
 
@@ -89,7 +89,7 @@ const HPKE_SUITE_ID: [u8; 10] = hpke_suite_id_for(KEM_ID, KDF_ID, AEAD_ID);
 /// when all 256 candidates fall outside `[1, n − 1]` (probability about
 /// 2^-8192). RFC 9180 §7.1.3 says `ikm` SHOULD be at least `Nsk` bytes; SCP
 /// rejects a shorter one.
-pub fn derive_key_pair(ikm: &[u8]) -> Result<P256SecretKey, HpkeError> {
+pub(crate) fn derive_key_pair(ikm: &[u8]) -> Result<P256SecretKey, HpkeError> {
     if ikm.len() < PRIVATE_KEY_LEN {
         return Err(HpkeError::InvalidKey(format!(
             "DeriveKeyPair ikm must be at least {PRIVATE_KEY_LEN} bytes, got {}",
@@ -924,6 +924,40 @@ mod tests {
             derive_key_pair(&[0u8; 31]),
             Err(HpkeError::InvalidKey(_))
         ));
+        Ok(())
+    }
+
+    /// Our `DeriveKeyPair(random ikm)` against the `hpke-rs` reference
+    /// `DeriveKeyPair` on the same `ikm`. `hpke-rs` is a dev-dependency gated
+    /// off wasm32, as in `tests/hpke_oracle.rs`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn derive_key_pair_matches_reference() -> TestResult {
+        use hpke_rs::hpke_types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
+        use hpke_rs::{Hpke, Mode};
+        use hpke_rs_rust_crypto::HpkeRustCrypto;
+
+        let mut ikm = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut ikm);
+        let ours = derive_key_pair(&ikm)?;
+        let pk = ours.public_key().to_uncompressed();
+
+        // `HpkePrivateKey` exposes its bytes only under hpke-rs's `hazmat`
+        // feature. `d ↦ d·G` is injective on [1, n − 1], so equal public keys
+        // prove equal scalars.
+        let reference = Hpke::<HpkeRustCrypto>::new(
+            Mode::Base,
+            KemAlgorithm::DhKemP256,
+            KdfAlgorithm::HkdfSha256,
+            AeadAlgorithm::Aes128Gcm,
+        )
+        .derive_key_pair(&ikm)
+        .map_err(|e| format!("reference derive_key_pair: {e:?}"))?;
+        assert_eq!(
+            reference.public_key().as_slice(),
+            pk.as_slice(),
+            "DeriveKeyPair pkR"
+        );
         Ok(())
     }
 }

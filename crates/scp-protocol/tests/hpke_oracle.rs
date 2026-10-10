@@ -156,27 +156,19 @@ fn ref_hpke_p256() -> Hpke<HpkeRustCrypto> {
     )
 }
 
-/// A fresh recipient from our `DeriveKeyPair(random ikm)`, checked against
-/// the reference `DeriveKeyPair` on the same `ikm`.
+/// A fresh recipient: a uniformly random scalar in [1, n − 1]. The
+/// `DeriveKeyPair` comparison against the reference lives in the
+/// `hpke::p256` test module, since `derive_key_pair` is crate-private.
 fn fresh_p256_recipient() -> Result<([u8; 32], [u8; 65]), Box<dyn std::error::Error>> {
-    let mut ikm = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut OsRng, &mut ikm);
-    let ours = hpke::p256::derive_key_pair(&ikm)?;
-    let sk = *ours.to_scalar_bytes();
-    let pk = ours.public_key().to_uncompressed();
-
-    // `HpkePrivateKey` exposes its bytes only under hpke-rs's `hazmat`
-    // feature. `d ↦ d·G` is injective on [1, n − 1], so equal public keys
-    // prove equal scalars.
-    let reference = ref_hpke_p256()
-        .derive_key_pair(&ikm)
-        .map_err(|e| format!("reference derive_key_pair: {e:?}"))?;
-    assert_eq!(
-        reference.public_key().as_slice(),
-        pk.as_slice(),
-        "DeriveKeyPair pkR"
-    );
-    Ok((sk, pk))
+    loop {
+        let mut candidate = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut candidate);
+        // A candidate of zero or at least n is rejected; the chance is
+        // below 2^-32, so the loop almost always ends on its first pass.
+        if let Ok(sk) = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&candidate) {
+            return Ok((*sk.to_scalar_bytes(), sk.public_key().to_uncompressed()));
+        }
+    }
 }
 
 /// Our P-256 `seal` opens under the reference, and the reference's P-256
