@@ -37,6 +37,44 @@
 # `assert_allowlist_has_no_nullifier` fixture rejects any edit that puts them
 # back.
 #
+# A SECOND DIMENSION: THE LOCAL CRATES EACH ARTIFACT REACHES
+# ----------------------------------------------------------
+# For every ARTIFACTS entry, the set of crates its non-dev graph resolves from a
+# LOCAL PATH source is also a SUBSET of a closed list, PERMITTED_CRATES. A local
+# crate the list does not name FAILS this gate until a human adds it.
+#
+# Why the feature dimension alone cannot see such a crate: it compares FEATURE
+# rows, and a crate contributes no row when no feature of it is enabled. A crate
+# that declares no `[features]` table never contributes one, and neither does a
+# crate whose table holds only off-by-default features, which is `scp-relay` on
+# this tree (its table holds only `cloud-blobs`). Cargo also renders no edge for a
+# tree's own root. So a new local crate carrying an always-succeeds verifier and
+# declaring no feature would ship under a green feature dimension.
+#
+# CRITERION: provenance. A crate counts when the WHOLE `cargo tree` node line
+# carries a local-path source token, ` (/…)`. Cargo prints a path proc-macro as
+# `name v1.0 (proc-macro) (/path)`, marker first, so the line is searched for the
+# token rather than the token being anchored after the version. This covers a
+# workspace member, a `vendor/` crate that declares its own `[workspace]` table
+# (repo-authored, NOT a workspace member), and a path dependency outside the
+# repository. A registry crate, a vendored registry crate (cargo prints a crate
+# served through a `directory` source replacement exactly as it prints a
+# crates.io crate, with no source token; measured with cargo 1.97.1), and a git
+# crate carry no local-path token and are not this dimension's subject;
+# `cargo deny` and the reviewed `Cargo.lock` govern them.
+# INDICATOR, NOT CRITERION: the `scp-` name prefix. It appears only in this
+# gate's messages, as a label on each offender, and decides nothing.
+#
+# The dimension reads BOTH renderings the feature dimension reads (the
+# `-e features,no-dev` tree and the `-e no-dev --format '{f}|{p}'` tree, each
+# with `--target all`) and checks their union, for the same reason: a cargo
+# release that changes one rendering must not empty the check. The default-members
+# resolution gets no crate dimension, because a bare `cargo build` compiles each
+# member into its own artifact; the per-artifact graph is what links into a
+# shipped binary, and cross-member unification is a FEATURE effect the feature
+# dimension already checks. That resolution reaches test-only members
+# (`scp-relay-mock`, `scp-ffi-napi-test-stubs`) that no ARTIFACTS graph reaches.
+#
 # WHY A CLOSED ⊆-WHITELIST, NOT A DENYLIST
 # ----------------------------------------
 # A denylist ("fail if `scp-platform/testing` appears") is FAIL-OPEN: a fourth
@@ -246,6 +284,48 @@ scp-transport/default
 scp-transport/redb-blob
 scp-transport/sqlite-blob
 scp-transport/startup
+EOF
+)"
+
+# ---------------------------------------------------------------------------
+# Permitted-production CRATE list (EXPLICIT, closed): the whitelist for the
+# crate dimension the header describes.
+#
+# Every crate an ARTIFACTS graph resolves from a local path source must appear
+# here. `cargo tree` DERIVES each artifact's reached set; this list is the
+# hand-maintained set of what is PERMITTED. Like PERMITTED_ALLOWLIST it is one
+# SUPERSET list covering every ARTIFACTS entry, and run_gate fails on an entry no
+# artifact reaches, so the list cannot drift into naming crates that do not ship.
+# NULLIFIER_CONTROL_FEATURES's bare crate entry (`scp-testing`) may never appear
+# here; assert_permitted_crates_have_no_nullifier_crate enforces that.
+#
+# ADDING AN ENTRY IS THE REVIEWABLE ACT. A crate reaches a shipped binary only by
+# being named here, so read what it implements before adding it.
+# ---------------------------------------------------------------------------
+PERMITTED_CRATES="$(cat <<'EOF'
+scp-alloc
+scp-clock
+scp-core
+scp-crypto
+scp-dht
+scp-did
+scp-event-log
+scp-ffi
+scp-ffi-common
+scp-ffi-napi
+scp-ffi-uniffi
+scp-identity
+scp-mcp
+scp-media
+scp-mls
+scp-node
+scp-platform
+scp-protocol
+scp-relay
+scp-relay-client
+scp-runtime
+scp-sqlite-pools
+scp-transport
 EOF
 )"
 
@@ -711,6 +791,167 @@ tree_names_scp_testing_crate() {
 }
 
 # ---------------------------------------------------------------------------
+# local_crate_names <node-lines>
+#   Pure. Emit, sorted-unique, the name of every crate node in <node-lines> whose
+#   WHOLE line carries a local-path source token ` (/`. A node line begins at
+#   column 0 with `<name> v<digit>`, which `--prefix none` guarantees.
+#
+#   STEP 1 selects node lines. cargo's own status output ("Blocking waiting for
+#   file lock on package cache", "Locking 2 packages", "Adding foo v0.1.0
+#   (/path)") is INDENTED, and an error line begins `error:`, so the column-0
+#   `<name> v<digit>` anchor admits no line cargo writes to stderr. The resolver
+#   also keeps stderr out of the parsed text; either measure alone suffices.
+#   STEP 2 tests the whole selected line for the source token, never its
+#   position, because cargo prints `name v1.0 (proc-macro) (/path)` with the
+#   marker FIRST, and a draft that anchored the source right after the version
+#   dropped every repo-authored proc-macro crate.
+#
+#   A bash loop reads to end of input, so this adds no command to the set
+#   assert_every_pipeline_reader_consumes_its_input enumerates.
+# ---------------------------------------------------------------------------
+local_crate_names() {
+  local line
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Za-z0-9_-]+)\ v[0-9] ]] || continue
+    [[ "$line" == *" (/"* ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+  done <<<"$1" | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# package_tree_node_lines <per-package-tree>
+#   Pure. Strip the `<features>|` field from each line of a
+#   `--format '{f}|{p}'` tree, leaving the `{p}` node text local_crate_names
+#   reads. The split is at the FIRST `|`, which is correct by construction
+#   because a feature name never contains `|` while a path may. A line carrying
+#   no `|` is not a node of this rendering and is dropped. The edge rendering
+#   needs no such step, and must not get one, because its node lines carry no
+#   feature field and a path holding `|` would lose its name.
+# ---------------------------------------------------------------------------
+package_tree_node_lines() {
+  local line
+  while IFS= read -r line; do
+    [[ "$line" == *"|"* ]] && printf '%s\n' "${line#*|}"
+  done <<<"$1"
+}
+
+# ---------------------------------------------------------------------------
+# merge_resolved_crate_sets <edge-tree> <per-package-tree>
+#   Pure. Emit the UNION of the local crates both renderings name. Returns 1
+#   when EITHER yields an empty set: every artifact reaches at least itself from
+#   a local path, so an empty half means cargo resolved nothing or a rendering
+#   changed shape, and the caller fails loud instead of accepting half a union.
+# ---------------------------------------------------------------------------
+merge_resolved_crate_sets() {
+  local edge_crates pkg_crates
+  edge_crates="$(local_crate_names "$1")"
+  pkg_crates="$(local_crate_names "$(package_tree_node_lines "$2")")"
+  if [[ -z "$edge_crates" ]]; then
+    echo "no local-path crate node appears in the feature-edge rendering this gate resolved" >&2
+    return 1
+  fi
+  if [[ -z "$pkg_crates" ]]; then
+    echo "no local-path crate node appears in the per-package rendering this gate resolved" >&2
+    return 1
+  fi
+  printf '%s\n%s\n' "$edge_crates" "$pkg_crates" | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# resolve_crate_set <cargo-tree-args...>
+#   Run both renderings of one non-dev, every-triple resolution and emit the
+#   union of the local crates they name. stderr goes to a file this function
+#   prints only when cargo FAILED: cargo writes progress to stderr on a
+#   successful run, and folding it into the parsed text once produced a crate
+#   named `Blocking`. A cargo failure returns non-zero with cargo's message, so
+#   it can never read as "no local crate reached".
+# ---------------------------------------------------------------------------
+resolve_crate_set() {
+  local edge_tree package_tree rc err
+  err="$(mktemp)"
+  edge_tree="$(cargo tree -e features,no-dev --target all --prefix none "$@" 2>"$err")"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (crate nodes, feature-edge rendering) failed for: cargo tree -e features,no-dev --target all --prefix none $*"
+      cat "$err"; } >&2
+    rm -f "$err"
+    return 1
+  fi
+  package_tree="$(cargo tree -e no-dev --target all --prefix none --format '{f}|{p}' "$@" 2>"$err")"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (crate nodes, per-package rendering) failed for: cargo tree -e no-dev --target all --prefix none --format '{f}|{p}' $*"
+      cat "$err"; } >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  merge_resolved_crate_sets "$edge_tree" "$package_tree"
+}
+
+# ---------------------------------------------------------------------------
+# assert_crates_permitted <reached-crates> <permitted-list>
+#   Pure. The crate dimension's verdict for one artifact: require the local
+#   crates its graph reaches ⊆ <permitted-list>. Prints one OK or FAIL verdict;
+#   returns 0 on OK, 1 on FAIL. An empty <reached-crates> FAILS, because every
+#   artifact reaches at least itself from a local path. Both inputs are
+#   parameters so the fixture harness drives this exact function with the real
+#   workspace's resolution and a list that must reject it.
+#
+#   Each offender's `scp-` prefix, or its absence, is printed as a labelled
+#   INDICATOR. The prefix decided nothing: the offender failed because cargo
+#   resolved it from a local path and the list does not name it.
+# ---------------------------------------------------------------------------
+assert_crates_permitted() {
+  local reached="$1" permitted="$2" offenders name
+  if ! resolution_is_nonempty "$reached"; then
+    echo "   FAIL — the local crate set this artifact reaches is EMPTY. Every"
+    echo "          artifact reaches at least itself from a local path; refusing"
+    echo "          to treat that as 'empty ⊆ PERMITTED_CRATES'."
+    return 1
+  fi
+  if offenders="$(check_subset "$reached" "$permitted")"; then
+    echo "   OK — local crates reached ⊆ PERMITTED_CRATES ($(printf '%s\n' "$reached" | grep -c .) crates)"
+    return 0
+  fi
+  echo "   FAIL — local-path crates in the shipped graph that PERMITTED_CRATES does not name:"
+  while IFS= read -r name; do
+    if [[ "$name" == scp-* ]]; then
+      echo "       ✗ $name   (indicator: carries the scp- prefix; the prefix decided nothing)"
+    else
+      echo "       ✗ $name   (indicator: no scp- prefix; the prefix decided nothing)"
+    fi
+  done <<<"$offenders"
+  echo "   Each crate above was resolved from a local path source. Sever the edge"
+  echo "   that pulls it in, or read what it implements and then add it to"
+  echo "   PERMITTED_CRATES; a crate enabling no feature is invisible to the"
+  echo "   feature check below."
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# assert_every_permitted_crate_is_reached <reached-union> <permitted-list>
+#   Pure. Require <permitted-list> ⊆ <reached-union>, the union of every
+#   artifact's reached set. An entry no artifact reaches is a permission nothing
+#   uses, and a later edge to that crate would ship without anyone reading it.
+#   An EMPTY union FAILS: every artifact's resolution failed, which run_gate has
+#   already counted, and this check must not then report the list as tidy.
+# ---------------------------------------------------------------------------
+assert_every_permitted_crate_is_reached() {
+  local union="$1" permitted="$2" unreached
+  if ! resolution_is_nonempty "$(printf '%s' "$union" | sed '/^$/d')"; then
+    echo "   FAIL — no artifact's local crate set resolved, so no PERMITTED_CRATES"
+    echo "          entry can be shown to ship."
+    return 1
+  fi
+  if unreached="$(check_subset "$permitted" "$(printf '%s' "$union" | sed '/^$/d')")"; then
+    echo "   OK — every PERMITTED_CRATES entry is reached by an ARTIFACTS graph"
+    return 0
+  fi
+  echo "   FAIL — PERMITTED_CRATES names crates no ARTIFACTS graph reaches:"
+  printf '%s\n' "$unreached" | sed 's/^/       ✗ /'
+  echo "   Remove each entry above, or add the artifact that ships it to ARTIFACTS."
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # check_subset <resolved-lines> <allowlist-lines>
 #   Pure ⊆ check: prints every resolved entry NOT on the allowlist. Returns 0 if
 #   resolved ⊆ allowlist (no output), 1 otherwise. This function is the sole
@@ -914,9 +1155,23 @@ run_gate() {
   # lines ahead of its own failure.
   assert_resolver_sees_own_feature_table_activation || failures=$((failures + 1))
   echo
+  local reached_union=""
   for spec in "${ARTIFACTS[@]}"; do
     local crate="${spec%%|*}" features="${spec#*|}"
     echo ">> $crate  ($features)"
+
+    # Crate dimension FIRST, so a feature-dimension `continue` below cannot skip
+    # it. A resolution failure FAILS LOUD and contributes nothing to the union.
+    local reached
+    # shellcheck disable=SC2086
+    if reached="$(resolve_crate_set -p "$crate" $features)"; then
+      assert_crates_permitted "$reached" "$PERMITTED_CRATES" || failures=$((failures + 1))
+      reached_union="$(printf '%s\n%s' "$reached_union" "$reached")"
+    else
+      echo "   FAIL — the local crate set this artifact reaches did not resolve"
+      echo "          (cargo failed or a rendering yielded no local crate node)."
+      failures=$((failures + 1))
+    fi
 
     local resolved offenders
     # resolve_scp_features returns non-zero (and surfaces cargo's stderr) if
@@ -966,6 +1221,10 @@ run_gate() {
     fi
   done
 
+  echo ">> PERMITTED_CRATES hygiene  (every entry reached by at least one artifact)"
+  assert_every_permitted_crate_is_reached "$reached_union" "$PERMITTED_CRATES" \
+    || failures=$((failures + 1))
+
   # A bare workspace build — one `.github/workflows/build-matrix.yml` runs
   # and uploads bridge cdylibs from. Resolver 2 unifies normal-dependency
   # features across every default member, so this union can carry a nullifier no
@@ -1013,6 +1272,9 @@ run_gate() {
 fixture_failures=0
 same_string() { # <actual> <expected> — exit 0 iff equal, so a caller reads a command status
   [[ "$1" == "$2" ]]
+}
+contains_text() { # <text> <fragment> — exit 0 iff <text> contains <fragment>, read as a command status
+  [[ "$1" == *"$2"* ]]
 }
 expect() { # <label> <expected: PASS|FAIL> <actual-rc>
   local label="$1" expected="$2" rc="$3" actual
@@ -1770,6 +2032,147 @@ assert_allowlist_has_no_nullifier() {
   echo "   ok   — no custody/attestation/DHT/did:key/test-harness/encryption-at-rest-unseal nullifier control-feature appears on this allowlist"
 }
 
+# assert_permitted_crates_have_no_nullifier_crate <permitted-crate-list>
+#   Every NULLIFIER_CONTROL_FEATURES entry without a `/` names a whole crate
+#   (`scp-testing`), and none may appear on <permitted-crate-list>. Increments
+#   fixture_failures per crate found; the harness also drives it with a planted
+#   list that must fail.
+assert_permitted_crates_have_no_nullifier_crate() {
+  local permitted="$1" nf found=0
+  for nf in "${NULLIFIER_CONTROL_FEATURES[@]}"; do
+    [[ "$nf" == */* ]] && continue
+    # `grep -xF … >/dev/null`, not `grep -q`, for the SIGPIPE reason above.
+    if printf '%s\n' "$permitted" | grep -xF "$nf" >/dev/null; then
+      echo "   FAIL — nullifier crate '$nf' is on PERMITTED_CRATES (forbidden exception)"
+      fixture_failures=$((fixture_failures + 1))
+      found=1
+    fi
+  done
+  [[ "$found" -eq 0 ]] && echo "   ok   — no NULLIFIER_CONTROL_FEATURES crate entry appears on PERMITTED_CRATES"
+}
+
+# run_crate_dimension_fixtures
+#   Behavioral proofs for the crate dimension: the provenance extractor, both
+#   renderings' merge, the closed ⊆ verdict against this workspace's real
+#   resolution, the hygiene check, and the nullifier-crate exclusion.
+run_crate_dimension_fixtures() {
+  local rc out names
+
+  # (crate-provenance) local_crate_names keeps a crate exactly when its node line
+  #     carries a local-path source token. The input mixes every shape the
+  #     extractor must classify: cargo's indented stderr status lines and an
+  #     `error:` line, a vendor/ path crate, a path proc-macro whose marker
+  #     precedes its source, a workspace member, a registry crate (`axum`), a
+  #     registry proc-macro, a crate served through a `directory` source
+  #     replacement (`vfoo`, printed exactly like a registry crate; measured with
+  #     cargo 1.97.1), a registry crate whose name carries the scp- prefix, and a
+  #     feature-edge row.
+  local mixed
+  mixed="$(printf '%s\n' \
+    '    Blocking waiting for file lock on package cache' \
+    '    Updating crates.io index' \
+    '      Adding limn-attest v0.1.0 (/repo/vendor/limn-attest)' \
+    '      Adding stderr-only-crate v0.1.0 (/repo/vendor/stderr-only-crate)' \
+    'error: failed to select a version' \
+    'limn-attest v0.1.0 (/repo/vendor/limn-attest)' \
+    'limn-attest-derive v0.1.0-beta.2+build.1 (proc-macro) (/repo/vendor/limn-attest-derive) (*)' \
+    'scp-core v0.1.0-beta.2 (/repo/crates/scp-core) (*)' \
+    'scp-core feature "default"' \
+    'scp-published-elsewhere v9.9.9' \
+    'axum v0.8.8' \
+    'tracing-attributes v0.1.31 (proc-macro)' \
+    'vfoo v0.1.0')"
+  names="$(local_crate_names "$mixed")"
+  same_string "$names" "$(printf '%s\n' limn-attest limn-attest-derive scp-core)"; rc=$?
+  expect "(crate-provenance) exactly the local-path nodes are kept: a vendor/ crate, a path proc-macro, a member" "PASS" "$rc"
+  printf '%s\n' "$names" | grep -xF 'limn-attest-derive' >/dev/null; rc=$?
+  expect "(crate-provenance) a path proc-macro, source token after its (proc-macro) marker, COUNTS as local" "PASS" "$rc"
+  # Where a fixture expects grep to find NOTHING, a grep error (rc 2) is mapped
+  # to rc 0, so a broken grep fails that fixture instead of meeting it.
+  printf '%s\n' "$names" | grep -xF 'vfoo' >/dev/null; rc=$?; [[ "$rc" -gt 1 ]] && rc=0
+  expect "(crate-provenance) a vendored registry crate (directory source, no source token) does NOT count" "FAIL" "$rc"
+  printf '%s\n' "$names" | grep -xF 'scp-published-elsewhere' >/dev/null; rc=$?; [[ "$rc" -gt 1 ]] && rc=0
+  expect "(crate-provenance) a registry crate carrying the scp- prefix does NOT count: the prefix decides nothing" "FAIL" "$rc"
+  printf '%s\n' "$names" | grep -xE 'Blocking|Updating|Adding|error:?|stderr-only-crate' >/dev/null; rc=$?; [[ "$rc" -gt 1 ]] && rc=0
+  expect "(crate-provenance) cargo's stderr status and error lines contribute no crate" "FAIL" "$rc"
+
+  # (crate-provenance, per-package) the `{f}|{p}` rendering: a feature list, a
+  #     root with no feature (empty field), and a path proc-macro.
+  local pkg_tree
+  pkg_tree="$(printf '%s\n' \
+    'default,std|scp-core v0.1.0-beta.2 (/repo/crates/scp-core)' \
+    '|scp-relay v0.1.0-beta.2 (/repo/crates/scp-relay)' \
+    '|limn-attest-derive v0.1.0 (proc-macro) (/repo/vendor/limn-attest-derive) (*)' \
+    'default|axum v0.8.8' \
+    '|vfoo v0.1.0')"
+  same_string "$(local_crate_names "$(package_tree_node_lines "$pkg_tree")")" \
+              "$(printf '%s\n' limn-attest-derive scp-core scp-relay)"; rc=$?
+  expect "(crate-provenance, per-package) the {f}|{p} rendering yields the same classification" "PASS" "$rc"
+
+  # (crate-merge) each rendering must contribute; an empty half FAILS.
+  merge_resolved_crate_sets "$mixed" "" >/dev/null 2>&1; rc=$?
+  expect "(crate-merge) an empty per-package half is REJECTED" "FAIL" "$rc"
+  merge_resolved_crate_sets "axum v0.8.8" "$pkg_tree" >/dev/null 2>&1; rc=$?
+  expect "(crate-merge) an edge half with no local-path node is REJECTED" "FAIL" "$rc"
+  out="$(merge_resolved_crate_sets "$mixed" "$pkg_tree")"; rc=$?
+  expect "(crate-merge) two non-empty halves merge" "PASS" "$rc"
+  same_string "$out" "$(printf '%s\n' limn-attest limn-attest-derive scp-core scp-relay)"; rc=$?
+  expect "(crate-merge) the merge is the union of both halves" "PASS" "$rc"
+
+  # (crate-closed) the ⊆ verdict, synthetic.
+  assert_crates_permitted "" "$PERMITTED_CRATES" >/dev/null; rc=$?
+  expect "(crate-closed) an EMPTY reached set is REJECTED, never 'empty ⊆ list'" "FAIL" "$rc"
+  out="$(assert_crates_permitted "$(printf '%s\n' scp-core limn-attest)" "scp-core")"; rc=$?
+  expect "(crate-closed) a novel local crate WITHOUT the scp- prefix is REJECTED" "FAIL" "$rc"
+  contains_text "$out" "✗ limn-attest   (indicator: no scp- prefix"; rc=$?
+  expect "(crate-closed) the offender is named and its prefix shown only as an indicator" "PASS" "$rc"
+
+  # (crate-closed, real tree) this workspace's own resolution of scp-relay.
+  #     scp-relay enables none of its features in this build, so the feature
+  #     dimension resolves no scp-relay/ row for it: the blind spot this
+  #     dimension closes. The crate dimension must see scp-relay, accept the
+  #     resolution against PERMITTED_CRATES, and REJECT it against a list derived
+  #     from the resolution minus scp-relay.
+  local relay_crates relay_features trimmed
+  if ! relay_crates="$(resolve_crate_set -p scp-relay 2>&1)"; then
+    echo "   FAIL — (crate-closed, real tree) resolve_crate_set -p scp-relay failed:"
+    printf '%s\n' "$relay_crates" | sed 's/^/       /'
+    fixture_failures=$((fixture_failures + 1))
+  else
+    printf '%s\n' "$relay_crates" | grep -xF 'scp-relay' >/dev/null; rc=$?
+    expect "(crate-closed, real tree) the crate dimension sees scp-relay in its own graph" "PASS" "$rc"
+    if relay_features="$(resolve_scp_features scp-relay "" 2>/dev/null)"; then
+      printf '%s\n' "$relay_features" | grep '^scp-relay/' >/dev/null; rc=$?
+      [[ "$rc" -gt 1 ]] && rc=0
+      expect "(crate-closed, real tree) the feature dimension resolves no scp-relay/ row for that same graph" "FAIL" "$rc"
+    else
+      echo "   FAIL — (crate-closed, real tree) resolve_scp_features scp-relay failed"
+      fixture_failures=$((fixture_failures + 1))
+    fi
+    assert_crates_permitted "$relay_crates" "$PERMITTED_CRATES" >/dev/null; rc=$?
+    expect "(crate-closed, real tree) scp-relay's reached crates ⊆ PERMITTED_CRATES" "PASS" "$rc"
+    trimmed="$(printf '%s\n' "$relay_crates" | grep -vxF 'scp-relay')"
+    out="$(assert_crates_permitted "$relay_crates" "$trimmed")"; rc=$?
+    expect "(crate-closed, real tree) a list omitting a reached local crate is REJECTED" "FAIL" "$rc"
+    contains_text "$out" "✗ scp-relay "; rc=$?
+    expect "(crate-closed, real tree) that rejection names scp-relay" "PASS" "$rc"
+  fi
+
+  # (crate-hygiene) every PERMITTED_CRATES entry must be reached.
+  assert_every_permitted_crate_is_reached "$(printf '%s\n' scp-a scp-b)" "$(printf '%s\n' scp-a scp-b scp-c)" >/dev/null; rc=$?
+  expect "(crate-hygiene) a permitted crate no artifact reaches is REJECTED" "FAIL" "$rc"
+  assert_every_permitted_crate_is_reached "$(printf '\n\n')" "scp-a" >/dev/null; rc=$?
+  expect "(crate-hygiene) an empty reached union is REJECTED" "FAIL" "$rc"
+  assert_every_permitted_crate_is_reached "$(printf '%s\n' scp-a scp-b scp-c)" "$(printf '%s\n' scp-a scp-b)" >/dev/null; rc=$?
+  expect "(crate-hygiene) a list every entry of which is reached is ACCEPTED" "PASS" "$rc"
+
+  # (crate-nullifier) the exclusion check must fire on a planted list.
+  ( fixture_failures=0
+    assert_permitted_crates_have_no_nullifier_crate "$(printf '%s\nscp-testing' "$PERMITTED_CRATES")" >/dev/null
+    exit "$fixture_failures" ); rc=$?
+  expect "(crate-nullifier) a PERMITTED_CRATES carrying scp-testing is REJECTED" "FAIL" "$rc"
+}
+
 run_fixtures() {
   echo "G1 fixture harness — behavioral proof the ⊆-whitelist is closed & load-bearing"
   echo "-------------------------------------------------------------------------------"
@@ -2272,6 +2675,10 @@ TREE
 
   assert_allowlist_has_no_nullifier
 
+  echo ">> fixture: the crate dimension (local-path provenance, closed PERMITTED_CRATES)"
+  run_crate_dimension_fixtures
+  assert_permitted_crates_have_no_nullifier_crate "$PERMITTED_CRATES"
+
   assert_shipping_invocations_are_gated
 
   assert_wheel_feature_selection_is_gated "${MATURIN_PROJECT_FILES[@]}"
@@ -2334,11 +2741,14 @@ main() {
   if run_gate; then
     echo
     echo "G1 PASSED: every shipped artifact's SCP-crate feature set ⊆ this permitted-production allowlist (durability-only + real-backend, zero nullifier exceptions)."
+    echo "G1 PASSED: every shipped artifact's local-path crate set ⊆ PERMITTED_CRATES, and every entry there is reached."
     exit 0
   fi
   echo
   echo "G1 FAILED: a shipped artifact resolves a non-allowlisted (nullifier/test-harness)"
   echo "feature. Fix the dependency edge — do NOT add the feature to the allowlist."
+  echo "Or a shipped artifact reaches a local-path crate PERMITTED_CRATES does not name,"
+  echo "or that list names a crate no artifact reaches; the FAIL lines above say which."
   exit 1
 }
 
