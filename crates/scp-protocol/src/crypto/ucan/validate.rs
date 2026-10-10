@@ -422,10 +422,12 @@ impl ProofResolver for InMemoryProofResolver {
 ///
 /// Each implementation chooses how it associates caveats with tokens — the
 /// canonical wire location is the UCAN `nb` field (§7.3.8), but validation
-/// only requires a deterministic look-up keyed by `&UcanToken`. The default
-/// implementation [`NoCaveatResolver`] returns `None` for every token,
-/// preserving backward-compatible behaviour for callers that have not yet
-/// minted caveat-bearing delegations.
+/// only requires a deterministic look-up keyed by `&UcanToken`. Every
+/// production validation site uses [`TokenNbCaveatResolver`], which reads the
+/// token's own signed `nb`. No resolver that ignores `nb` exists: one would
+/// skip the Step 11b time-box on a root outlet token (admitting it past
+/// `nb.valid_until`) and reject every delegated outlet token at its first edge
+/// with `OriginKindUnspecified`.
 ///
 /// Returning `Some(_)` opts the token into Step 7b (attenuation) and Step
 /// 11b (time-box) caveat enforcement. Returning `None` means the token
@@ -453,26 +455,11 @@ pub trait CaveatResolver: Send + Sync {
     ) -> Option<crate::trust::caveats::InvocationCaveats>;
 }
 
-/// A [`CaveatResolver`] that returns `None` for every token. The default
-/// resolver — preserves pre-SCP-OUT-021 behaviour where every token is
-/// treated as caveat-free at the protocol layer.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoCaveatResolver;
-
-impl CaveatResolver for NoCaveatResolver {
-    fn resolve_caveats(
-        &self,
-        _token: &UcanToken,
-    ) -> Option<crate::trust::caveats::InvocationCaveats> {
-        None
-    }
-}
-
 /// A [`CaveatResolver`] that reads each token's caveats directly from its
 /// own `nb` field — the canonical wire location for §7.3.8 invocation
 /// caveats.
 ///
-/// This is the production resolver for outlet-stream open: it feeds the
+/// This is the production resolver for every UCAN validation site: it feeds the
 /// leaf token's signed `nb` and every parent proof's `nb` into the
 /// per-edge `narrow()` loop (the test-only `verify_attenuation` wrapper over `verify_edge_attenuation`, Step 7b) and into the
 /// leaf time-box gate ([`verify_caveat_time_box`] Step 11b), so the set
@@ -491,13 +478,6 @@ impl CaveatResolver for NoCaveatResolver {
 /// into every non-root token's `nb`, so a `None` here on a child whose
 /// direct parent resolved `Some` is rejected at the edge (Step 7b) — a
 /// non-root token cannot drop a bound its parent carried.
-///
-/// Call-site note: switching the runtime / bridge validation call sites
-/// from [`NoCaveatResolver`] to this resolver is a separate wiring step.
-/// The shared cross-target validation helper MUST NOT hardcode this
-/// resolver — the generic UCAN-validation entry point funnels through the
-/// same helper, so the resolver is threaded as a parameter at each call
-/// site that opts into caveat enforcement.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokenNbCaveatResolver;
 
@@ -701,9 +681,7 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
     /// resolvers, and adding a fifth generic for the caveat resolver would
     /// be a wide breaking change for every test rig that constructs a
     /// `ValidationContext`. Type erasure here is local to the validation
-    /// pipeline and incurs no runtime cost on the `None` path because
-    /// `NoCaveatResolver`'s `resolve_caveats` is a constant `None` return
-    /// the optimizer inlines.
+    /// pipeline.
     pub caveat_resolver: &'a dyn CaveatResolver,
 }
 
@@ -2120,7 +2098,7 @@ mod tests {
         }
     }
 
-    /// Sanity: verify_attenuation with NoCaveatResolver still applies the
+    /// Sanity: verify_attenuation with TokenNbCaveatResolver still applies the
     /// pre-existing capability-subset check (no regression for genuinely
     /// caveat-free tokens). Uses a NON-outlet capability (`messages:write`):
     /// the `(None, None)` arm is admissible for a non-outlet child (invocation
@@ -2136,8 +2114,8 @@ mod tests {
         proof_resolver.proofs.insert("PARENT".to_owned(), parent);
 
         // No caveats anywhere — capability-only path on a non-outlet capability.
-        verify_attenuation(&child, &proof_resolver, &NoCaveatResolver)
-            .expect("matching non-outlet capabilities pass under NoCaveatResolver");
+        verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect("matching non-outlet capabilities pass with nb = None");
     }
 
     // -----------------------------------------------------------------------

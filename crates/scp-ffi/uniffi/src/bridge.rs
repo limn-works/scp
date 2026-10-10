@@ -4577,8 +4577,7 @@ pub(crate) fn validate_outlet_ucan_uniffi(
             // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
             // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
             // and Step 11b (time-box) run over the proof chain's VALIDATED-
-            // NARROWED caveat set. Generic validate/evaluate sites stay on
-            // `NoCaveatResolver`.
+            // NARROWED caveat set.
             caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
@@ -5511,8 +5510,7 @@ impl McpUniFfiBridgeProvider {
                 // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
                 // caveats from each token's `nb` field so §7.3.8 Step 7b
                 // (per-edge narrow) and Step 11b (time-box) run over the
-                // proof chain's VALIDATED-NARROWED caveat set. Generic
-                // validate/evaluate sites stay on `NoCaveatResolver`.
+                // proof chain's VALIDATED-NARROWED caveat set.
                 caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
             };
 
@@ -15579,11 +15577,13 @@ impl Scp {
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
-                            // Generic validate site: not an outlet-invocation
-                            // path, so caveat resolution is a constant `None`
-                            // (`NoCaveatResolver`). Only outlet-invocation sites
-                            // use `TokenNbCaveatResolver`.
-                            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                            // §7.3.8: resolve caveats from the token's own
+                            // signed `nb`, so Step 7b narrows every outlet edge
+                            // and Step 11b enforces the presenting token's
+                            // time-box. A non-outlet token carries `nb = None`,
+                            // so both caveat steps are no-ops for it.
+                            caveat_resolver:
+                                &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                         };
 
                         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
@@ -15754,11 +15754,13 @@ impl Scp {
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
-                            // Generic evaluate site: not an outlet-invocation
-                            // path, so caveat resolution is a constant `None`
-                            // (`NoCaveatResolver`). Only outlet-invocation sites
-                            // use `TokenNbCaveatResolver`.
-                            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                            // §7.3.8: resolve caveats from the token's own
+                            // signed `nb`, so Step 7b narrows every outlet edge
+                            // and Step 11b enforces the presenting token's
+                            // time-box. A non-outlet token carries `nb = None`,
+                            // so both caveat steps are no-ops for it.
+                            caveat_resolver:
+                                &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                         };
 
                         evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)
@@ -21233,6 +21235,197 @@ mod tests {
             matches!(*rt.block_on(handle.state.lock()), ContextState::Active),
             "a refused close must not write the handle's cached state"
         );
+    }
+
+    /// Re-signs `encoded` as `signer` with its `nb` replaced by `nb` and a
+    /// fresh nonce, so a test can present a root token whose signed §7.3.8
+    /// caveats the bridge mint does not originate.
+    #[cfg(feature = "testing")]
+    fn resign_with_nb(
+        scp: &crate::scp::Scp,
+        signer: &str,
+        encoded: &str,
+        nb: scp_core::trust::caveats::InvocationCaveats,
+    ) -> String {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_platform::traits::KeyCustody as _;
+
+        let mut token = scp_core::crypto::ucan::validate::parse_ucan(encoded).unwrap();
+        token.payload.nb = Some(nb);
+        token.payload.nnc = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
+        let header_b64 = encoded.split('.').next().unwrap();
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token.payload).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let (custody, key) = {
+            let entry = identity_custody_registry(&scp.inner).get(signer).unwrap();
+            let (custody, key) = entry.value();
+            (Arc::clone(custody), *key)
+        };
+        let sig = runtime()
+            .block_on(custody.sign(&key, signing_input.as_bytes()))
+            .unwrap();
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_bytes()))
+    }
+
+    /// A context whose ceiling holds `outlet_call:*` and `messages:write`, plus
+    /// a root `outlet_call:*` token minted to `holder` and its capability.
+    #[cfg(feature = "testing")]
+    struct NbFixture {
+        scp: Arc<crate::scp::Scp>,
+        creator: String,
+        holder: String,
+        handle: Arc<ContextHandle>,
+        root: String,
+        cap: String,
+    }
+
+    #[cfg(feature = "testing")]
+    fn nb_fixture() -> NbFixture {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let holder = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed")
+            .did();
+        let mut params = closable_test_params();
+        params.ceiling.push("outlet_call:*".to_owned());
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), params))
+            .expect("context_create should succeed");
+        let root = rt
+            .block_on(scp.ucan_mint(
+                Arc::clone(&handle),
+                holder.clone(),
+                vec!["outlet_call:*".to_owned()],
+                None,
+            ))
+            .expect("outlet mint");
+        NbFixture {
+            creator: creator.did(),
+            holder,
+            handle,
+            root: root.encoded.clone(),
+            cap: root.data.capabilities[0].clone(),
+            scp,
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn valid_until(offset: i64) -> scp_core::trust::caveats::InvocationCaveats {
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        scp_core::trust::caveats::InvocationCaveats {
+            valid_until: Some(now.saturating_add_signed(offset)),
+            ..scp_core::trust::caveats::InvocationCaveats::empty()
+        }
+    }
+
+    /// §7.3.8 Step 11b: `ucan_validate` and `ucan_evaluate` refuse a root
+    /// `outlet_call:*` token whose signed `nb.valid_until` has passed although
+    /// its `exp` has not.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
+        let rt = runtime();
+        let f = nb_fixture();
+        let lapsed = resign_with_nb(&f.scp, &f.creator, &f.root, valid_until(-60));
+        let evaluation = rt
+            .block_on(f.scp.ucan_evaluate(
+                Arc::clone(&f.handle),
+                lapsed.clone(),
+                Some(f.cap.clone()),
+                f.holder.clone(),
+                None,
+            ))
+            .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && !evaluation.time_bounds_valid,
+            "evaluate must report only the time-box failure"
+        );
+        let err = rt
+            .block_on(
+                f.scp
+                    .ucan_validate(Arc::clone(&f.handle), lapsed, f.cap, f.holder, None),
+            )
+            .expect_err("a root outlet token past nb.valid_until must not validate");
+        assert!(
+            matches!(&err, ScpError::Permission { code, msg }
+                if code == codes::PERM_3002
+                    && msg.contains("caveat time-box violation: valid_until")),
+            "the refusal must be the Step 11b time-box: {err:?}"
+        );
+    }
+
+    /// §7.3.8 Step 7b: a delegated outlet token whose `nb` carries the
+    /// materialized `origin_kind` and an unexpired `valid_until` validates.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
+        let rt = runtime();
+        let f = nb_fixture();
+        let delegatee = "did:dht:z6MkUniffiNbTimeBoxDelegatee".to_owned();
+        let live = resign_with_nb(&f.scp, &f.creator, &f.root, valid_until(1800));
+        let child = rt
+            .block_on(f.scp.ucan_delegate(
+                Arc::clone(&f.handle),
+                f.holder.clone(),
+                delegatee.clone(),
+                live.clone(),
+                vec![f.cap.clone()],
+            ))
+            .expect("delegate")
+            .encoded
+            .clone();
+        let evaluation = rt
+            .block_on(f.scp.ucan_evaluate(
+                Arc::clone(&f.handle),
+                child.clone(),
+                Some(f.cap.clone()),
+                delegatee.clone(),
+                Some(vec![live.clone()]),
+            ))
+            .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && evaluation.time_bounds_valid,
+            "evaluate must admit the delegated outlet token"
+        );
+        rt.block_on(f.scp.ucan_validate(
+            Arc::clone(&f.handle),
+            child,
+            f.cap,
+            delegatee,
+            Some(vec![live]),
+        ))
+        .expect("a delegated outlet token inside its time-box must validate");
+    }
+
+    /// A `messages:write` token carries no `nb`, so the caveat steps leave it
+    /// unaffected.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_validate_leaves_a_non_outlet_token_unaffected() {
+        let rt = runtime();
+        let f = nb_fixture();
+        let plain = rt
+            .block_on(f.scp.ucan_mint(
+                Arc::clone(&f.handle),
+                f.holder.clone(),
+                vec!["messages:write".to_owned()],
+                None,
+            ))
+            .expect("messages mint");
+        let plain_cap = plain.data.capabilities[0].clone();
+        rt.block_on(f.scp.ucan_validate(
+            f.handle,
+            plain.encoded.clone(),
+            plain_cap,
+            f.holder,
+            None,
+        ))
+        .expect("a messages:write token must validate");
     }
 
     /// A token revoked before a close stays refused after the close released

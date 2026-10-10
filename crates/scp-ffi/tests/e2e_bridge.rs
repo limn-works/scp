@@ -3414,6 +3414,187 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
     });
 }
 
+/// Re-signs `encoded` as `signer` with its `nb` replaced by `nb` and a fresh
+/// nonce, so a test can present a root token whose signed §7.3.8 caveats the
+/// bridge mint does not originate.
+#[cfg(feature = "testing")]
+fn resign_with_nb(
+    bi: &PyBridgeInstance,
+    signer: &str,
+    encoded: &str,
+    nb: scp_core::trust::caveats::InvocationCaveats,
+) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use scp_platform::traits::KeyCustody as _;
+
+    let mut token = scp_core::crypto::ucan::validate::parse_ucan(encoded).unwrap();
+    token.payload.nb = Some(nb);
+    token.payload.nnc = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
+    let header_b64 = encoded.split('.').next().unwrap();
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token.payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let (custody, key) = runtime::with_identity(bi, signer, |entry| {
+        Ok((
+            Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })
+    .unwrap();
+    let sig = test_runtime()
+        .block_on(custody.sign(&key, signing_input.as_bytes()))
+        .unwrap();
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_bytes()))
+}
+
+/// A context whose ceiling holds `outlet_call:*` and `messages:write`, plus a
+/// root `outlet_call:*` token minted to `holder` and its capability string.
+#[cfg(feature = "testing")]
+struct NbFixture {
+    scp: _scp_core::scp::PyScp,
+    creator: String,
+    holder: String,
+    ctx: String,
+    root: String,
+    cap: String,
+}
+
+#[cfg(feature = "testing")]
+fn nb_fixture(py: Python<'_>) -> NbFixture {
+    setup();
+    let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+    let creator = published_identity_did(py, &scp);
+    let holder = published_identity_did(py, &scp);
+    runtime::init_context_manager_for_test(scp.bridge_instance());
+    let ctx = {
+        let params = PyDict::new(py);
+        let ceiling: Vec<String> = scp_core::context::roles::default_ceiling()
+            .iter()
+            .map(|cap| cap.name().into_owned())
+            .collect();
+        params.set_item("ceiling", ceiling).unwrap();
+        let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+        handle_context_id(py, &handle)
+    };
+    let root = scp
+        .ucan_mint(&ctx, &holder, vec!["outlet_call:*".to_owned()], None)
+        .unwrap();
+    let cap = root.capabilities[0].clone();
+    NbFixture {
+        scp,
+        creator,
+        holder,
+        ctx,
+        root: root.encoded,
+        cap,
+    }
+}
+
+#[cfg(feature = "testing")]
+fn valid_until(offset: i64) -> scp_core::trust::caveats::InvocationCaveats {
+    let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+    scp_core::trust::caveats::InvocationCaveats {
+        valid_until: Some(now.saturating_add_signed(offset)),
+        ..scp_core::trust::caveats::InvocationCaveats::empty()
+    }
+}
+
+/// §7.3.8 Step 11b: `ucan_validate` and `ucan_evaluate` refuse a root
+/// `outlet_call:*` token whose signed `nb.valid_until` has passed although its
+/// `exp` has not.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
+    Python::with_gil(|py| {
+        let f = nb_fixture(py);
+        let lapsed = resign_with_nb(
+            f.scp.bridge_instance(),
+            &f.creator,
+            &f.root,
+            valid_until(-60),
+        );
+        let evaluation = f
+            .scp
+            .ucan_evaluate(&f.ctx, &lapsed, Some(f.cap.as_str()), &f.holder, None)
+            .unwrap();
+        assert!(
+            evaluation.signatures_valid && !evaluation.time_bounds_valid,
+            "evaluate must report only the time-box failure"
+        );
+        let err = f
+            .scp
+            .ucan_validate(&f.ctx, &lapsed, &f.cap, &f.holder, None)
+            .expect_err("a root outlet token past nb.valid_until must not validate")
+            .to_string();
+        assert!(
+            err.contains("caveat time-box violation: valid_until"),
+            "the refusal must be the Step 11b time-box: {err}"
+        );
+    });
+}
+
+/// §7.3.8 Step 7b: a delegated outlet token whose `nb` carries the
+/// materialized `origin_kind` and an unexpired `valid_until` validates.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
+    Python::with_gil(|py| {
+        let f = nb_fixture(py);
+        let delegatee = published_identity_did(py, &f.scp);
+        let live = resign_with_nb(
+            f.scp.bridge_instance(),
+            &f.creator,
+            &f.root,
+            valid_until(1800),
+        );
+        let child = f
+            .scp
+            .ucan_delegate(&f.ctx, &f.holder, &delegatee, &live, vec![f.cap.clone()])
+            .unwrap()
+            .encoded;
+        let evaluation = f
+            .scp
+            .ucan_evaluate(
+                &f.ctx,
+                &child,
+                Some(f.cap.as_str()),
+                &delegatee,
+                Some(vec![live.clone()]),
+            )
+            .unwrap();
+        assert!(
+            evaluation.signatures_valid && evaluation.time_bounds_valid,
+            "evaluate must admit the delegated outlet token"
+        );
+        f.scp
+            .ucan_validate(&f.ctx, &child, &f.cap, &delegatee, Some(vec![live]))
+            .expect("a delegated outlet token inside its time-box must validate");
+    });
+}
+
+/// A `messages:write` token carries no `nb`, so the caveat steps leave it
+/// unaffected.
+#[cfg(feature = "testing")]
+#[test]
+fn ucan_validate_leaves_a_non_outlet_token_unaffected() {
+    Python::with_gil(|py| {
+        let f = nb_fixture(py);
+        let plain = f
+            .scp
+            .ucan_mint(&f.ctx, &f.holder, vec!["messages:write".to_owned()], None)
+            .unwrap();
+        f.scp
+            .ucan_validate(
+                &f.ctx,
+                &plain.encoded,
+                &plain.capabilities[0],
+                &f.holder,
+                None,
+            )
+            .expect("a messages:write token must validate");
+    });
+}
+
 /// `ucan_mint` enforces the ceiling the SUPERVISOR holds.
 ///
 /// The fixture hands `register_context` a WIDE ceiling carrying `outlet:call:*`

@@ -20,8 +20,8 @@ use scp_core::crypto::ucan::capability::{
 };
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
 use scp_core::crypto::ucan::validate::{
-    InMemoryDidResolver, InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
-    NonceTracker, ValidationContext,
+    InMemoryDidResolver, InMemoryProofResolver, InMemoryRevocationChecker, NonceTracker,
+    TokenNbCaveatResolver, ValidationContext,
 };
 use scp_core::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload};
 use scp_did::SigningKeyId;
@@ -171,7 +171,7 @@ async fn mint_validate_roundtrip() {
         presenting_agent_did: &audience_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
-        caveat_resolver: &NoCaveatResolver,
+        caveat_resolver: &TokenNbCaveatResolver,
     };
 
     let result = validate_ucan(&token, &required, &mut ctx);
@@ -503,7 +503,7 @@ async fn delegation_chain() {
         presenting_agent_did: &leaf_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
-        caveat_resolver: &NoCaveatResolver,
+        caveat_resolver: &TokenNbCaveatResolver,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);
@@ -611,7 +611,7 @@ async fn broken_delegation_chain() {
         presenting_agent_did: &mid_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
-        caveat_resolver: &NoCaveatResolver,
+        caveat_resolver: &TokenNbCaveatResolver,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);

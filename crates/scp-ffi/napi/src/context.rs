@@ -7454,6 +7454,173 @@ mod tests {
         }
     }
 
+    /// Re-signs `encoded` as `signer` with its `nb` replaced by `nb` and a
+    /// fresh nonce, so a test can present a root token whose signed §7.3.8
+    /// caveats the bridge mint does not originate.
+    #[cfg(feature = "testing")]
+    async fn resign_with_nb(
+        bi: &crate::runtime::NapiBridgeInstance,
+        signer: &str,
+        encoded: &str,
+        nb: scp_core::trust::caveats::InvocationCaveats,
+    ) -> String {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_platform::traits::KeyCustody as _;
+
+        let mut token = scp_core::crypto::ucan::validate::parse_ucan(encoded).unwrap();
+        token.payload.nb = Some(nb);
+        token.payload.nnc = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
+        let header_b64 = encoded.split('.').next().unwrap();
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&token.payload).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let (custody, key) = crate::runtime::with_identity(bi, signer, |entry| {
+            Ok((
+                Arc::clone(&entry.custody),
+                entry.identity.active_signing_key,
+            ))
+        })
+        .unwrap();
+        let sig = custody.sign(&key, signing_input.as_bytes()).await.unwrap();
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_bytes()))
+    }
+
+    /// A context whose ceiling holds `outlet_call:*` and `messages:write`, a
+    /// `messages:write` token and its capability, and a root `outlet_call:*`
+    /// token minted to the holder with its capability.
+    #[cfg(feature = "testing")]
+    struct NbFixture {
+        bi: Arc<crate::runtime::NapiBridgeInstance>,
+        handle: super::NapiContextHandle,
+        plain: String,
+        plain_cap: String,
+        owner_did: String,
+        holder_did: String,
+        root: String,
+        cap: String,
+    }
+
+    #[cfg(feature = "testing")]
+    async fn nb_fixture(scp: &crate::scp::Scp) -> NbFixture {
+        let (bi, handle, plain, plain_cap, owner_did, holder_did) =
+            active_context_with_token(scp, &["messages:read", "messages:write", "outlet_call:*"])
+                .await;
+        let root = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            holder_did.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("outlet mint");
+        let cap = root.capabilities()[0].clone();
+        NbFixture {
+            bi,
+            handle,
+            plain,
+            plain_cap,
+            owner_did,
+            holder_did,
+            root: root.encoded(),
+            cap,
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn valid_until(offset: i64) -> scp_core::trust::caveats::InvocationCaveats {
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        scp_core::trust::caveats::InvocationCaveats {
+            valid_until: Some(now.saturating_add_signed(offset)),
+            ..scp_core::trust::caveats::InvocationCaveats::empty()
+        }
+    }
+
+    /// §7.3.8 Step 11b: `ucan_validate_on` and `ucan_evaluate_on` refuse a
+    /// root `outlet_call:*` token whose signed `nb.valid_until` has passed
+    /// although its `exp` has not.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let f = nb_fixture(&scp).await;
+        let lapsed = resign_with_nb(&f.bi, &f.owner_did, &f.root, valid_until(-60)).await;
+        let evaluation = crate::ucan::ucan_evaluate_on(
+            &f.bi,
+            &f.handle,
+            lapsed.clone(),
+            Some(f.cap.clone()),
+            f.holder_did.clone(),
+            None,
+        )
+        .await
+        .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && !evaluation.time_bounds_valid,
+            "evaluate must report only the time-box failure"
+        );
+        let err =
+            crate::ucan::ucan_validate_on(&f.bi, &f.handle, lapsed, f.cap, f.holder_did, None)
+                .await
+                .expect_err("a root outlet token past nb.valid_until must not validate")
+                .to_string();
+        assert!(
+            err.contains("caveat time-box violation: valid_until"),
+            "the refusal must be the Step 11b time-box: {err}"
+        );
+    }
+
+    /// §7.3.8 Step 7b: a delegated outlet token whose `nb` carries the
+    /// materialized `origin_kind` and an unexpired `valid_until` validates.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let f = nb_fixture(&scp).await;
+        let delegatee = "did:dht:z6MkNapiNbTimeBoxDelegatee".to_owned();
+        let live = resign_with_nb(&f.bi, &f.owner_did, &f.root, valid_until(1800)).await;
+        let child = crate::ucan::ucan_delegate_on(
+            &f.bi,
+            &f.handle,
+            f.holder_did.clone(),
+            delegatee.clone(),
+            live.clone(),
+            vec![f.cap.clone()],
+        )
+        .await
+        .expect("delegate")
+        .encoded();
+        let evaluation = crate::ucan::ucan_evaluate_on(
+            &f.bi,
+            &f.handle,
+            child.clone(),
+            Some(f.cap.clone()),
+            delegatee.clone(),
+            Some(vec![live.clone()]),
+        )
+        .await
+        .expect("evaluate");
+        assert!(
+            evaluation.signatures_valid && evaluation.time_bounds_valid,
+            "evaluate must admit the delegated outlet token"
+        );
+        crate::ucan::ucan_validate_on(&f.bi, &f.handle, child, f.cap, delegatee, Some(vec![live]))
+            .await
+            .expect("a delegated outlet token inside its time-box must validate");
+    }
+
+    /// A `messages:write` token carries no `nb`, so the caveat steps leave it
+    /// unaffected.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_leaves_a_non_outlet_token_unaffected() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let f = nb_fixture(&scp).await;
+        crate::ucan::ucan_validate_on(&f.bi, &f.handle, f.plain, f.plain_cap, f.holder_did, None)
+            .await
+            .expect("a messages:write token must validate");
+    }
+
     /// `ucan_mint_on` signs with the custody this bridge holds for the
     /// supervisor's creator, not with the custody the handle carries.
     ///
