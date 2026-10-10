@@ -15,7 +15,6 @@ use std::time::Duration;
 use scp_did::DID;
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::BridgeMode;
 use crate::economy::EconomicPolicy;
 use crate::provenance::CounterpartyPolicy;
 use crate::trust::{CapabilityRequirement, RequireParticipation};
@@ -372,98 +371,6 @@ pub struct ProjectionPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// BridgeDirectionality (§5.7)
-// ---------------------------------------------------------------------------
-
-/// Directionality of a bridge connector (spec §5.7).
-///
-/// Determines whether the bridge relays content in both directions or
-/// one. Visible in context metadata before opt-in so prospective members
-/// can evaluate trust implications of bridge presence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BridgeDirectionality {
-    /// Platform-to-SCP and SCP-to-platform.
-    Full,
-    /// Platform-to-SCP only (external content enters SCP,
-    /// but SCP messages are not forwarded to the platform).
-    ReadOnly,
-    /// SCP-to-platform only (SCP messages are forwarded to the
-    /// platform, but no external content enters SCP).
-    WriteOnly,
-}
-
-// ---------------------------------------------------------------------------
-// BridgeCapability (§5.7)
-// ---------------------------------------------------------------------------
-
-/// Capabilities a bridge connector can exercise in a context (spec §5.7).
-///
-/// These are the four protocol-defined bridge capabilities. A bridge's
-/// `capabilities` field declares which of these it exercises, providing
-/// legibility to prospective members before they join.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BridgeCapability {
-    /// Relay messages between SCP and the external platform.
-    RelayMessages,
-    /// Create shadow participants for external users.
-    CreateShadows,
-    /// Attest external user identities.
-    AttestIdentities,
-    /// Forward presence/typing indicators.
-    ForwardPresence,
-}
-
-// ---------------------------------------------------------------------------
-// BridgeMetadata (§5.7)
-// ---------------------------------------------------------------------------
-
-/// Metadata for an active bridge connector as defined in spec §5.7.
-///
-/// This is the spec-aligned bridge metadata type that provides
-/// directionality and capabilities information to prospective members.
-/// Complements [`BridgeInfo`] which carries the implementation-level
-/// bridge mode (Relay/Puppet/Api/Cooperative). `BridgeMetadata` is
-/// the pre-join legibility surface; `BridgeInfo` is the runtime
-/// structural data.
-///
-/// Structural field — always visible before joining (legibility tenet).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BridgeMetadata {
-    /// External platform name (e.g., `"discord"`, `"slack"`, `"x"`).
-    pub platform: String,
-    /// DID of the bridge operator — the human accountable for bridge
-    /// behavior (spec §12.2).
-    pub bridge_did: DID,
-    /// Capabilities the bridge exercises in this context.
-    pub capabilities: Vec<BridgeCapability>,
-    /// Directionality of the bridge.
-    pub mode: BridgeDirectionality,
-}
-
-// ---------------------------------------------------------------------------
-// BridgeInfo
-// ---------------------------------------------------------------------------
-
-/// Summary of an active bridge connector visible in context metadata.
-///
-/// Bridge presence, operator identity, connected platform, and operating mode
-/// are visible to all context members and in context metadata before opt-in
-/// (spec §12.2, §12.6.1). This is a structural field -- always visible
-/// regardless of `MetadataVisibilityPolicy`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BridgeInfo {
-    /// Unique identifier for this bridge instance.
-    pub bridge_id: String,
-    /// DID of the human operator accountable for this bridge.
-    pub operator_did: DID,
-    /// Name of the external platform (e.g., `"discord"`, `"slack"`).
-    pub platform: String,
-    /// Operating mode of the bridge (Relay, Puppet, Api, Cooperative).
-    pub mode: BridgeMode,
-}
-
-// ---------------------------------------------------------------------------
 // MigrationSource (§5.11A.2)
 // ---------------------------------------------------------------------------
 
@@ -525,30 +432,6 @@ pub struct PublicMetadata {
     #[serde(default)]
     pub min_protocol_version: Option<(u8, u8)>,
 
-    /// Active bridge connectors registered in this context (spec §12.2, §12.6.1).
-    ///
-    /// Bridge presence is always visible in context metadata before opt-in
-    /// (legibility tenet). This is a structural field -- not governed by
-    /// `MetadataVisibilityPolicy`.
-    #[serde(default)]
-    pub bridges: Vec<BridgeInfo>,
-
-    // --- Structural fields (runtime, always visible) ---
-    /// DIDs of active bridge operators registered in this context.
-    ///
-    /// Always visible (never filtered by `MetadataVisibilityPolicy`) because
-    /// bridge presence is a trust signal required for informed consent before
-    /// joining (spec §12.6.1: "Context metadata (§5.7) MUST include
-    /// `bridge_operator_did` when a bridge is registered").
-    ///
-    /// Empty when no bridges are registered. Multiple entries when multiple
-    /// bridges from different operators are active. Deduplicated — the same
-    /// operator DID appears only once even if they operate multiple bridges.
-    /// On bridge revocation, the operator's DID is removed if they have no
-    /// remaining active bridges.
-    #[serde(default)]
-    pub bridge_operator_dids: Vec<DID>,
-
     // --- Operational fields (governed by MetadataVisibilityPolicy) ---
     /// Current member count. `None` when hidden by `MemberOnly` or unavailable.
     pub member_count: Option<u64>,
@@ -587,18 +470,6 @@ pub struct RuntimeMetadata {
     pub outlet_interface_count: Option<u32>,
     /// Child context summary information (e.g., parent context IDs, summaries).
     pub child_context_info: Option<Vec<String>>,
-    /// Active bridge connectors registered in this context (spec §12.2, §12.6.1).
-    ///
-    /// Bridges are a structural metadata field -- always visible before opt-in.
-    /// Defaults to empty when no bridges are registered.
-    pub bridges: Vec<BridgeInfo>,
-    /// DIDs of active bridge operators registered in this context (spec §12.6.1).
-    ///
-    /// Populated from `BridgeRegistry::bridge_operator_dids()`. Empty vec means
-    /// no active bridges. This is always visible in `PublicMetadata` (structural,
-    /// not filtered by `MetadataVisibilityPolicy`).
-    #[allow(clippy::struct_field_names)]
-    pub bridge_operator_dids: Vec<DID>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,8 +967,6 @@ impl ContextParams {
             memory_scope: self.memory_scope,
             metadata_visibility: self.metadata_visibility.clone(),
             min_protocol_version: self.min_protocol_version,
-            bridges: runtime.bridges.clone(),
-            bridge_operator_dids: runtime.bridge_operator_dids.clone(),
 
             // Operational fields — filtered by visibility policy.
             member_count: filter_field(vis.member_count, runtime.member_count),
@@ -1604,8 +1473,6 @@ mod tests {
             description: Some("A test context".to_owned()),
             outlet_interface_count: Some(3),
             child_context_info: Some(vec!["child-1".to_owned(), "child-2".to_owned()]),
-            bridges: Vec::new(),
-            bridge_operator_dids: Vec::new(),
         }
     }
 
@@ -1898,90 +1765,45 @@ mod tests {
         assert_eq!(meta, deserialized);
     }
 
-    // -----------------------------------------------------------------------
-    // bridge_operator_dids in PublicMetadata (SCP-BCH-013, §12.6.1)
-    // -----------------------------------------------------------------------
-
+    /// `PublicMetadata` carries no `deny_unknown_fields`, so serde ignores the
+    /// `bridges` and `bridge_operator_dids` keys that a pre-cut peer wrote
+    /// (the bridge-connector fields deleted from spec §5.7): the value
+    /// deserializes to the same metadata, and re-serializing it emits neither key.
     #[test]
-    fn public_metadata_bridge_operator_dids_empty_by_default() {
-        let params = ContextParams::default();
-        let runtime = RuntimeMetadata::default();
-        let meta = params.public_metadata(&runtime);
-        assert!(
-            meta.bridge_operator_dids.is_empty(),
-            "bridge_operator_dids should be empty when no bridges registered"
-        );
-    }
-
-    #[test]
-    fn public_metadata_bridge_operator_dids_populated_from_runtime() {
-        let params = ContextParams::default();
-        let runtime = RuntimeMetadata {
-            bridge_operator_dids: vec![
-                DID::from("did:dht:z6MkOperator1"),
-                DID::from("did:dht:z6MkOperator2"),
-            ],
-            ..RuntimeMetadata::default()
-        };
-        let meta = params.public_metadata(&runtime);
-        assert_eq!(meta.bridge_operator_dids.len(), 2);
-        assert!(
-            meta.bridge_operator_dids
-                .contains(&DID::from("did:dht:z6MkOperator1"))
-        );
-        assert!(
-            meta.bridge_operator_dids
-                .contains(&DID::from("did:dht:z6MkOperator2"))
-        );
-    }
-
-    #[test]
-    fn public_metadata_bridge_operator_dids_always_visible() {
-        // bridge_operator_dids is a structural field — always visible
-        // regardless of MetadataVisibilityPolicy. Verify it's present even
-        // when all operational fields are MemberOnly.
+    fn public_metadata_ignores_pre_cut_bridge_fields() {
         let params = ContextParams {
-            metadata_visibility: MetadataVisibilityPolicy {
-                member_count: FieldVisibility::MemberOnly,
-                context_age: FieldVisibility::MemberOnly,
-                creator_identity: FieldVisibility::MemberOnly,
-                name: FieldVisibility::MemberOnly,
-                description: FieldVisibility::MemberOnly,
-                economic_policy: FieldVisibility::MemberOnly,
-                outlet_interface_count: FieldVisibility::MemberOnly,
-                child_context_info: FieldVisibility::MemberOnly,
-            },
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             ..ContextParams::default()
         };
-        let runtime = RuntimeMetadata {
-            bridge_operator_dids: vec![DID::from("did:dht:z6MkBridgeOp")],
-            member_count: Some(10),
-            ..RuntimeMetadata::default()
-        };
-        let meta = params.public_metadata(&runtime);
+        let meta = params.public_metadata(&full_runtime());
 
-        // Operational fields hidden.
-        assert!(meta.member_count.is_none());
-        // Bridge operator DIDs always visible.
-        assert_eq!(meta.bridge_operator_dids.len(), 1);
-        assert_eq!(
-            meta.bridge_operator_dids[0],
-            DID::from("did:dht:z6MkBridgeOp")
+        let mut value = serde_json::to_value(&meta).unwrap();
+        let object = value
+            .as_object_mut()
+            .expect("PublicMetadata serializes as a map");
+        object.insert(
+            "bridges".to_owned(),
+            serde_json::json!([{
+                "bridge_id": "bridge-001",
+                "operator_did": "did:dht:z6MkOperator",
+                "platform": "discord",
+                "mode": "Relay"
+            }]),
         );
-    }
+        object.insert(
+            "bridge_operator_dids".to_owned(),
+            serde_json::json!(["did:dht:z6MkOperator"]),
+        );
 
-    #[test]
-    fn public_metadata_bridge_operator_dids_serialization_roundtrip() {
-        let params = ContextParams::default();
-        let runtime = RuntimeMetadata {
-            bridge_operator_dids: vec![DID::from("did:dht:z6MkOp1"), DID::from("did:dht:z6MkOp2")],
-            ..RuntimeMetadata::default()
-        };
-        let meta = params.public_metadata(&runtime);
+        let decoded: PublicMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, meta);
 
-        let json = serde_json::to_string(&meta).unwrap();
-        let deserialized: PublicMetadata = serde_json::from_str(&json).unwrap();
-        assert_eq!(meta.bridge_operator_dids, deserialized.bridge_operator_dids);
+        let reencoded = serde_json::to_value(&decoded).unwrap();
+        let reencoded = reencoded
+            .as_object()
+            .expect("PublicMetadata serializes as a map");
+        assert!(!reencoded.contains_key("bridges"));
+        assert!(!reencoded.contains_key("bridge_operator_dids"));
     }
 
     // -----------------------------------------------------------------------
