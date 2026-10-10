@@ -78,7 +78,7 @@ env:
 # name a group. rust-cache already appends the OS and architecture to every key, so a
 # group name never spells one out:
 #
-#   workspace-debug   `target/debug` under build mode — rust-test (all four shards),
+#   workspace-debug   `target/debug` under build mode — rust-test (every leg),
 #                     rust-test-napi-production, rust-build-pyo3-production,
 #                     rust-build-uniffi-production, kotlin-test, fail-closed-pre-rotation,
 #                     shipped-feature-graph, vendored-openssl-scope; and
@@ -219,10 +219,10 @@ env:
 # the upload and every later job with the same key is told the entry exists, so leaving
 # `save-if` at its default would let the shortest job in a group decide the entry's
 # contents — shipped-feature-graph resolves a feature graph and compiles almost nothing,
-# and it finishes eleven minutes before rust-test. The producers are rust-test
-# (workspace-debug), rust-clippy's `workspace`, `examples` and `packages` legs
-# (workspace-check, clippy-examples and clippy-packages, one each, the `packages`
-# leg running on push alone), rust-test-optional-features (each of its three
+# and it finishes eleven minutes before rust-test. The producers are rust-test's
+# push-only `all` leg (workspace-debug), rust-clippy's `workspace`, `examples` and
+# `packages` legs (workspace-check, clippy-examples and clippy-packages, one each,
+# the `packages` leg running on push alone), rust-test-optional-features (each of its three
 # transport-optional groups, one writer per group because each matrix leg's step
 # expands the key to its own group), rust-test-macos's push-only `all` leg
 # (apple-transport-platform),
@@ -354,6 +354,9 @@ jobs:
               # its cases, so a change to either must trigger the job that runs it.
               - 'scripts/check-examples-compile.sh'
               - 'scripts/tests/examples-compile/**'
+              # The rust-test job runs scripts/check-test-shard-features.py over
+              # its own shard commands, so a change to that script must trigger it.
+              - 'scripts/check-test-shard-features.py'
               # The `docker-image` job builds from these two and is guarded by this
               # filter, so a change to either has to reach it.
               - 'Dockerfile'
@@ -1508,7 +1511,7 @@ jobs:
         if: matrix.leg == 'examples'
         run: bash scripts/tests/examples-compile/run-tests.sh
 
-  # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
+  # This job runs the workspace's nextest suite, so a merge gate rests on it.
   # It gates on `rust` at job level, never at step level. It carried seven
   # step-level `if: needs.changes.outputs.rust == 'true'` conditions instead,
   # under a comment claiming each matrix leg had to expand and report a status
@@ -1521,43 +1524,59 @@ jobs:
   # job-level conditions, so neither could see it. That self-test now rejects
   # any `needs.changes.outputs.*` reference outside a job-level `if:`.
   #
-  # ── Why this job runs on Linux in four shards ───────────────────────────────
+  # ── Why this job runs on Linux in four package shards ──────────────────────
   #
   # Linux only. Job rust-test-macos tests scp-transport and scp-platform on
   # macOS.
   #
-  # Measured on run 34721754678, whose log line
-  # `Restored from cache key "v0-rust-rust-test-Linux-x64-…" full match: true.`
-  # makes it the one warm sample in that week's runs: the ubuntu leg spent
-  # 4 min 16 s compiling (26 `Compiling` lines — rust-cache restores the 890
-  # dependency crates and every workspace crate rebuilds, because a checkout
-  # writes each source file with the checkout's own mtime) and 6 min 43 s running
-  # 11314 tests. Execution was the larger half and it divides; compilation does
-  # not, since nextest builds every test binary before it runs any subset.
+  # The job used to run `cargo nextest run --workspace --partition count:k/4`.
+  # Nextest partitions the run and not the build, so each of the four legs
+  # compiled all 160 test binaries before running a quarter of the 11998 tests:
+  # on merge-queue run 38006292987 the legs spent 2 min 37 s to 3 min 55 s in
+  # `Finished` and 34 s to 58 s running tests. The workspace test build is
+  # CPU-bound (compile-timings run 34791768528 measured a mean parallelism of
+  # 3.81 on 4 cores), so a leg finishes sooner only when it compiles less.
   #
-  # `--partition count:k/4` splits the run and not the build, so four shards cost
-  # four compiles and turn 6 min 43 s of execution into 1 min 41 s. Each shard is
-  # therefore about 0.9 + 4.3 + 1.7 minutes rather than 16.8, and the union of
-  # the four shards is the same 11314 tests: nextest assigns each test to exactly
-  # one partition.
+  # Each leg now selects a set of packages with `-p`, so it compiles only the
+  # graph those packages need, and still runs every test of each package it
+  # selects. scp-testing depends on no bridge crate, so the `testing` leg never
+  # compiles scp-ffi, scp-ffi-napi or scp-ffi-uniffi, the largest test units.
+  # scp-platform runs on the `testing` leg because its passphrase-KDF tests take
+  # 126 s of summed test time in a debug build; on the `rest` leg they made
+  # that leg the slowest of the four.
   #
-  # Only shard 1 writes the `workspace-debug` cache. All four legs compile the
-  # same target directory, so any of them could, and naming one keeps the
-  # entry's contents decided rather than raced.
+  # `TEST_FEATURES` is the feature list the old `--workspace` command passed.
+  # It is the canonical resolution each leg reproduces, and no leg passes it
+  # whole: cargo accepts `--features pkg/feature` only for a selected package
+  # or a dependency of one. scripts/check-test-shard-features.py, which the
+  # `testing` and `all` legs run, fails when a workspace member is in no leg or in
+  # two, when a leg command carries any argument besides `-p` and
+  # `--features` that could drop tests, when a selected package resolves to
+  # features different from its `--workspace --features $TEST_FEATURES`
+  # resolution, and when any package in a leg's graph gets a feature that
+  # resolution never gives it. Each leg's `--features` list is the output of
+  # that script's `--suggest` mode: it adds every `package/feature` cargo
+  # accepts that moves the leg's resolution toward the canonical one, so the
+  # leg tests the same code and restores the same dependency artifacts the
+  # canonical resolution built. scripts/read-workspace-test-features.py reads
+  # `TEST_FEATURES` for .github/workflows/compile-timings.yml.
   #
-  # A push to `main` runs shard 1 alone, to write that cache. The
-  # merge queue already ran all four shards on the same commit, and shards 2-4
-  # write nothing a later run restores.
+  # A push to `main` runs one `all` leg, which runs every leg's step in turn
+  # and is the only writer of the `workspace-debug` cache, so the entry holds
+  # each leg's dependency builds. Pull requests and the merge queue run the
+  # four package legs, which restore that entry and write nothing.
   rust-test:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / test (shard ${{ matrix.shard }}/4)
+    name: Rust / test (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      TEST_FEATURES: scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(github.event_name == 'push' && '[1]' || '[1, 2, 3, 4]') }}
+        leg: ${{ fromJSON(github.event_name == 'push' && '["all"]' || '["bridges", "runtime", "testing", "rest"]') }}
     steps:
       - name: Free disk space when the runner is short of it
         run: |
@@ -1592,22 +1611,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-debug
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}
       - uses: taiki-e/install-action@nextest
-      - name: Run tests
+      # One leg runs the check: it reads ci.yml and the lockfile, which every leg
+      # shares, so a second run would only repeat its five `cargo tree` calls.
+      - name: Check the shards cover every member once under canonical features
+        if: matrix.leg == 'all' || matrix.leg == 'testing'
+        run: |
+          python3 -m pip install --quiet 'pyyaml>=6,<7'
+          python3 scripts/check-test-shard-features.py --self-test
+          python3 scripts/check-test-shard-features.py
+      - name: Put libpython on the loader path
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
-          export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          # Enable testing for scp-ffi-uniffi so that
-          # in-memory custody tests run. Mobile production builds (iOS
-          # XCFramework, Android .aar) MUST NOT enable this feature.
-          # See GitHub issue #88.
-          #
-          # `--no-tests=fail` because `--partition` narrows the selection: a
-          # filter that selects nothing must fail this shard rather than report
-          # success over zero assertions, which is the zero-test defect
-          # scripts/tests/ci-gate/ci_gate_selftest.py records.
-          cargo nextest run --workspace --no-tests=fail --partition count:${{ matrix.shard }}/4 --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
+          echo "LD_LIBRARY_PATH=${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+      # `--no-tests=fail` on each leg: a leg whose package list selects no test
+      # must fail rather than report success over zero assertions, which is the
+      # zero-test defect scripts/tests/ci-gate/ci_gate_selftest.py records.
+      - name: Run the bridge crates' tests
+        if: matrix.leg == 'all' || matrix.leg == 'bridges'
+        run: |
+          # Enable testing for scp-ffi-uniffi so that in-memory custody tests
+          # run. Mobile production builds (iOS XCFramework, Android .aar) MUST
+          # NOT enable this feature. See GitHub issue #88.
+          cargo nextest run --no-tests=fail -p scp-ffi -p scp-ffi-common -p scp-ffi-napi -p scp-ffi-napi-test-stubs -p scp-ffi-uniffi --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,scp-platform/filesystem,scp-testing/testing
+      - name: Run scp-runtime and scp-core tests
+        if: matrix.leg == 'all' || matrix.leg == 'runtime'
+        run: |
+          cargo nextest run --no-tests=fail -p scp-runtime -p scp-core --features scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,serde_json/raw_value,serde_json/unbounded_depth,tracing/log,scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,tokio-util/io,scp-testing/testing
+      - name: Run scp-testing and scp-platform tests
+        if: matrix.leg == 'all' || matrix.leg == 'testing'
+        run: |
+          cargo nextest run --no-tests=fail -p scp-testing -p scp-platform --features openmls_basic_credential/test-utils,serde_json/unbounded_depth,scp-core/outlet-capability-test-grant,tokio/test-util,scp-runtime/outlet-capability-test-grant,scp-runtime/saga-witness-test-mint,scp-platform/filesystem,scp-ffi-common/custody,scp-ffi-common/server,scp-ffi-common/testing
+      - name: Run every other member's tests
+        if: matrix.leg == 'all' || matrix.leg == 'rest'
+        run: |
+          cargo nextest run --no-tests=fail -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did -p scp-dht -p scp-identity -p scp-event-log -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock -p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features serde_json/unbounded_depth,rustix/net,scp-identity/testing,scp-testing/testing,scp-core/outlet-capability-test-grant,scp-mcp/testing,scp-node/allow_unencrypted_storage,scp-node/testing
 
   # ── Optional-feature test lanes ─────────────────────────────────────────────
   #

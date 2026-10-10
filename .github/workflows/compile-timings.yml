@@ -99,11 +99,11 @@ jobs:
       # does not own, so a change there would leave this job measuring a different graph
       # while still reading as correct.
       # `.docs/lessons/route-a-changed-file-to-every-lane-it-decides.md` names that failure.
-      # The script parses ci.yml, reads the `run:` blocks of its `rust-test` job, and takes
-      # the token after `--features` on the one line that invokes nextest over the whole
-      # workspace, so a reordered or added flag does not hide the invocation and prose
-      # describing it does not count as it. Its `--self-test` runs first and covers both
-      # shapes; it exits non-zero when the job holds no such line or more than one.
+      # The script parses ci.yml and prints the `rust-test` job's `env.TEST_FEATURES`: the
+      # canonical workspace feature list each of that job's package shards is checked
+      # against, so prose describing it does not count as it. Its `--self-test` runs first;
+      # it exits non-zero when the job sets no such value or the value is not one
+      # comma-separated list of `package/feature` items.
       - name: Read the feature list out of ci.yml
         run: |
           set -euo pipefail
