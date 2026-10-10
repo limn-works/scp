@@ -3356,7 +3356,10 @@ impl GatedPersistence {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        panic!("a snapshot of the discarded context remains after its actor exited");
+        assert!(
+            !self.has_snapshot(context_id).await,
+            "a snapshot of the discarded context remains after its actor exited"
+        );
     }
 }
 
