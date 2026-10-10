@@ -84,9 +84,6 @@ members = [
 # removes that unification path, and
 # `scripts/check-shipped-feature-graph.sh` asserts a default-members build
 # resolves nothing outside its permitted-production allowlist.
-#
-# A test run still covers `scp-testing`: CI passes `--workspace` explicitly,
-# which overrides this list.
 default-members = [
     "crates/scp-clock",
     "crates/scp-crypto",

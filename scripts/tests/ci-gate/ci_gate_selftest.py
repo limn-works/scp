@@ -1466,6 +1466,33 @@ def workspace_member_directories(root: Path | None = None) -> set[str]:
     return members
 
 
+def workspace_member_names(root: Path | None = None) -> set[str]:
+    """Return the `[package] name` of every directory workspace_member_directories lists."""
+    root = (REPO if root is None else root).resolve()
+    return {
+        tomllib.loads((root / directory / "Cargo.toml").read_text())["package"]["name"]
+        for directory in workspace_member_directories(root)
+    }
+
+
+def selected_packages(job: dict) -> set[str]:
+    """Return every package a `-p <package>` in a job's cargo commands selects."""
+    names: set[str] = set()
+    for step in job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for line in logical_lines(step.get("run") or ""):
+            tokens = line.split()
+            if tokens[:1] != ["cargo"]:
+                continue
+            names |= {
+                tokens[index + 1]
+                for index, token in enumerate(tokens[:-1])
+                if token in ("-p", "--package")
+            }
+    return names
+
+
 def directory_covered(patterns: set[str], directory: str) -> bool:
     """Report whether a dorny/paths-filter pattern set selects every file below one directory.
 
@@ -1515,23 +1542,26 @@ def uncovered_members(patterns: set[str], members: set[str]) -> list[str]:
 
 
 def workspace_scoped_jobs(doc: dict):
-    """Yield each job running a `--workspace` cargo command under a path filter.
+    """Yield each job compiling every workspace member under a path filter.
 
-    Yields `(job_id, keys, patterns)`, where `keys` names the paths-filter keys
-    that decide whether the job runs and `patterns` holds their path entries. A
-    job carrying no filter-gated `if:` runs on every event, so it needs no
-    filter and this skips it.
+    A job compiles every member when one of its commands carries `--workspace`,
+    or when its cargo commands' `-p` selections together name every member, as
+    rust-test's package shards do. Yields `(job_id, keys, patterns)`, where
+    `keys` names the paths-filter keys that decide whether the job runs and
+    `patterns` holds their path entries. A job carrying no filter-gated `if:`
+    runs on every event, so it needs no filter and this skips it.
     """
     steps = paths_filter_steps(doc)
     if not steps:
         return
+    members = workspace_member_names()
     for job_id, job in sorted((doc.get("jobs") or {}).items()):
         workspace_wide = any(
             WORKSPACE_SCOPE_FLAG in line.split()
             for step in (job.get("steps") or [])
             if isinstance(step, dict)
             for line in logical_lines(step.get("run") or "")
-        )
+        ) or members <= selected_packages(job)
         if not workspace_wide:
             continue
         keys = gating_filter_keys(doc, job)
@@ -1851,6 +1881,23 @@ def check_workspace_and_rustdoc_readers(documents: list[tuple[Path, dict]]) -> N
         f"discovered {sorted(scoped)}, want {sorted(WORKSPACE_SCOPED_JOBS)} — a job "
         f"this check no longer reads is a job whose filter nothing checks",
     )
+    # rust-test selects every member through `-p` across its shards. A shard
+    # that drops a member leaves the job compiling part of the workspace, and
+    # the discovery stops reading it, which the comparison above turns into a
+    # failure.
+    ci = next((doc for path, doc in documents if path.name == "ci.yml"), None)
+    if ci is not None and "rust-test" in ci["jobs"]:
+        dropped = copy.deepcopy(ci)
+        for step in dropped["jobs"]["rust-test"]["steps"]:
+            if isinstance(step, dict) and " -p scp-relay " in str(step.get("run") or ""):
+                step["run"] = str(step["run"]).replace(" -p scp-relay ", " ")
+        check(
+            "a rust-test shard set missing a member is not read as workspace-wide",
+            "rust-test"
+            not in {job_id for job_id, _k, _p in workspace_scoped_jobs(dropped)}
+            and "rust-test" in {job_id for job_id, _k, _p in workspace_scoped_jobs(ci)},
+            "the discovery reads rust-test whatever its shards select",
+        )
     rustdoc = {
         (path.name, job_id)
         for path, doc in documents
@@ -6016,7 +6063,44 @@ CLIPPY_WORKSPACE_FEATURES = (
     "scp-ffi-uniffi/outlet-capability-test-grant"
 )
 NEXTEST = "cargo nextest run --no-tests=fail"
+# rust-test's four package shards. scripts/check-test-shard-features.py holds each
+# shard's packages and features to the workspace resolution; this table pins the
+# commands so a leg cannot drop or repeat one.
+RUST_TEST_SHARDS = (
+    (
+        f"{NEXTEST} -p scp-ffi -p scp-ffi-common -p scp-ffi-napi -p scp-ffi-napi-test-stubs "
+        "-p scp-ffi-uniffi --features scp-ffi-uniffi/testing,scp-ffi/testing,"
+        "scp-ffi-napi/testing,scp-ffi/outlet-capability-test-grant,"
+        "scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant,"
+        "scp-platform/filesystem,scp-testing/testing"
+    ),
+    (
+        f"{NEXTEST} -p scp-runtime -p scp-core --features scp-core/testing,scp-runtime/testing,"
+        "scp-runtime/saga-witness-test-mint,scp-core/outlet-capability-test-grant,"
+        "serde_json/raw_value,serde_json/unbounded_depth,tracing/log,"
+        "scp-runtime/outlet-capability-test-grant,scp-dht/production-dht,"
+        "scp-identity/production-dht,scp-platform/file,scp-platform/sqlite,tokio-util/codec,"
+        "tokio-util/io,scp-testing/testing"
+    ),
+    (
+        f"{NEXTEST} -p scp-testing -p scp-platform --features openmls_basic_credential/test-utils,"
+        "serde_json/unbounded_depth,scp-core/outlet-capability-test-grant,tokio/test-util,"
+        "scp-runtime/outlet-capability-test-grant,scp-runtime/saga-witness-test-mint,"
+        "scp-platform/filesystem,scp-ffi-common/custody,scp-ffi-common/server,"
+        "scp-ffi-common/testing"
+    ),
+    (
+        f"{NEXTEST} -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did "
+        "-p scp-dht -p scp-identity -p scp-event-log -p scp-protocol "
+        "-p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock "
+        "-p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features "
+        "serde_json/unbounded_depth,rustix/net,scp-identity/testing,scp-testing/testing,"
+        "scp-core/outlet-capability-test-grant,scp-mcp/testing,"
+        "scp-node/allow_unencrypted_storage,scp-node/testing"
+    ),
+)
 LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    (("rust-test",), ("push", "pull_request"), RUST_TEST_SHARDS),
     (
         ("rust-test-macos",),
         ("push", "pull_request"),
@@ -6466,12 +6550,13 @@ def check_push_writer_mutants(doc: dict) -> None:
     )
 
     shard = copy.deepcopy(doc)
-    shard["jobs"]["rust-test"]["strategy"]["matrix"]["shard"] = (
-        "${{ fromJSON(github.event_name == 'push' && '[2]' || '[1, 2, 3, 4]') }}"
+    shard["jobs"]["rust-test"]["strategy"]["matrix"]["leg"] = (
+        "${{ fromJSON(github.event_name == 'push' && '[\"bridges\"]' "
+        "|| '[\"bridges\", \"runtime\", \"testing\", \"rest\"]') }}"
     )
     gaps = push_writer_gaps(shard)
     check(
-        "a push matrix without the writing shard is reported",
+        "a push matrix without the writing leg is reported",
         any("rust-test saves" in gap for gap in gaps),
         f"{gaps}",
     )
@@ -6641,7 +6726,7 @@ def check_push_writer_mutants(doc: dict) -> None:
             "rust-test",
             test_cache,
             "save-if",
-            "${{ github.event_name == 'merge_group' && matrix.shard == 1 }}",
+            "${{ github.event_name == 'merge_group' && matrix.leg == 'all' }}",
             "no push to `main` meets",
         ),
         (
@@ -6677,11 +6762,11 @@ def check_push_writer_mutants(doc: dict) -> None:
             None,
         ),
         (
-            "a rust-cache `save-if` naming a number and the main ref",
+            "a rust-cache `save-if` naming a leg and the main ref",
             "rust-test",
             test_cache,
             "save-if",
-            "${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}",
+            "${{ github.ref == 'refs/heads/main' && matrix.leg == 'all' }}",
             None,
         ),
     ):
@@ -6701,7 +6786,10 @@ def check_push_writer_mutants(doc: dict) -> None:
                 f"{gaps}",
             )
 
-    push_shards = "${{ fromJSON(github.event_name == 'push' && '[1, 5]' || '[1, 2, 3, 4]') }}"
+    push_shards = (
+        "${{ fromJSON(github.event_name == 'push' && '[\"all\", \"extra\"]' "
+        "|| '[\"bridges\", \"runtime\", \"testing\", \"rest\"]') }}"
+    )
     for label, key, value, reported in (
         (
             "a writer matrix that is one expression",
@@ -6711,15 +6799,15 @@ def check_push_writer_mutants(doc: dict) -> None:
         ),
         (
             "a writer matrix key no pattern reads",
-            "shard",
-            "${{ fromJSON(inputs.shards) }}",
-            "matrix `shard` is an expression this check cannot read",
+            "leg",
+            "${{ fromJSON(inputs.legs) }}",
+            "matrix `leg` is an expression this check cannot read",
         ),
         (
             "a push matrix leg outside every other event's legs",
-            "shard",
+            "leg",
             push_shards,
-            "rust-test's matrix `shard` runs [1, 5] on push",
+            "rust-test's matrix `leg` runs ['all', 'extra'] on push",
         ),
     ):
         changed = copy.deepcopy(doc)
@@ -7315,7 +7403,7 @@ def output_patterns(doc: dict, output: str) -> set[str] | str:
 
 
 # rust_test_reads lists the files outside `crates/` that a workspace source, and so
-# rust-test (`cargo nextest run --workspace`), can read, by scanning every tracked
+# rust-test, can read, by scanning every tracked
 # `crates/**/*.rs` file: the literal of
 # each `include_str!` or `include_bytes!`, resolved against that file's directory, and
 # the literal of each `workspace_root().join(...)`. It also walks the directories

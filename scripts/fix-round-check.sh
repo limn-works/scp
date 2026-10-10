@@ -237,11 +237,11 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# `timeout` bounds the `cargo metadata` call below and each of the 30 gates, so 31 call
+# `timeout` bounds the `cargo metadata` call below and each of the 33 gates, so 34 call
 # sites depend on it. macOS ships neither `timeout` nor `gtimeout`, Homebrew's coreutils
 # supplies both names, and `.mise.toml` provisions neither, so a checkout that installed
 # only the prerequisites README.md lists has no such program. Without this guard every gate
-# would exit 127, and the run would print 30 blocks reading "timeout: command not found"
+# would exit 127, and the run would print 33 blocks reading "timeout: command not found"
 # and report 30 enforcement violations that do not exist.
 TIMEOUT=timeout
 command -v "$TIMEOUT" >/dev/null 2>&1 || TIMEOUT=gtimeout
@@ -519,7 +519,7 @@ UNRUN_LANES=(
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
     ".github/|scripts/tests/ci-gate/run-tests.sh, whose docs group the ci-workflow-selftest-docs job and whose rest group the ci-workflow-selftest job of .github/workflows/ci.yml run and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, and scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red. Those two are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest and toolchain-wiring-cases jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
-    "scripts/|the suites that .github/workflows/ci.yml runs over this directory: scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py, scripts/tests/call-invariants/ and scripts/tests/summarize-cargo-timings/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh, scripts/tests/pre-commit-clippy-scope/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring-cases job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, scripts/tests/ci-gate/run-tests.sh in the ci-workflow-selftest-docs and ci-workflow-selftest jobs, and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in a job of .github/workflows/ci.yml and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the kotlin-test job starts to generate the Kotlin bindings it tests and uploads to bridge-parity-kotlin, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
+    "scripts/|the suites that .github/workflows/ci.yml runs over this directory: scripts/check-test-shard-features.py and its --self-test in the rust-test job, scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py, scripts/tests/call-invariants/ and scripts/tests/summarize-cargo-timings/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh, scripts/tests/pre-commit-clippy-scope/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring-cases job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, scripts/tests/ci-gate/run-tests.sh in the ci-workflow-selftest-docs and ci-workflow-selftest jobs, and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in a job of .github/workflows/ci.yml and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the kotlin-test job starts to generate the Kotlin bindings it tests and uploads to bridge-parity-kotlin, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
 if [[ $changed_rc -eq 0 ]]; then
@@ -889,6 +889,8 @@ run_step format cargo fmt --all -- --check
 # 2026-09-13 run measured the first two at 12.9 seconds and 391 ms while another worktree
 # held that lock. `scripts/check-wiping-allocator.sh` runs one `cargo metadata
 # --no-deps`, which resolves no dependency and compiles nothing.
+# `scripts/check-test-shard-features.py` runs one `cargo metadata --no-deps` and five
+# `cargo tree` resolutions, one canonical and one per rust-test shard.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
 # list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the
@@ -929,6 +931,7 @@ GATES=(
     scripts/check-saga-gating-granularity.sh
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
+    scripts/check-test-shard-features.py
     scripts/check-toolchain-wiring.sh
     scripts/check-vendored-openssl-scope.sh
     scripts/check-wiping-allocator.sh
