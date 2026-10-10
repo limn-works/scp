@@ -526,12 +526,12 @@ mod tests {
     #[test]
     fn parse_capability_endpoint_system_only() {
         let caps = parse_capability_endpoint(
-            "scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation",
+            "scp:capabilities:scp:system:relay-operation,scp:system:key-rotation",
         )
         .unwrap();
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[0], cap("scp:system:relay-operation"));
-        assert_eq!(caps[1], cap("scp:system:bridge-operation"));
+        assert_eq!(caps[1], cap("scp:system:key-rotation"));
         assert!(
             caps.iter()
                 .all(scp_protocol::trust::capability_uri::CapabilityUri::is_system)
@@ -541,15 +541,14 @@ mod tests {
     #[test]
     fn parse_capability_endpoint_all_system_capabilities() {
         let caps = parse_capability_endpoint(
-            "scp:capabilities:scp:system:mls-group-management,scp:system:key-rotation,scp:system:governance-participation,scp:system:relay-operation,scp:system:bridge-operation",
+            "scp:capabilities:scp:system:mls-group-management,scp:system:key-rotation,scp:system:governance-participation,scp:system:relay-operation",
         )
         .unwrap();
-        assert_eq!(caps.len(), 5);
+        assert_eq!(caps.len(), 4);
         assert_eq!(caps[0], cap("scp:system:mls-group-management"));
         assert_eq!(caps[1], cap("scp:system:key-rotation"));
         assert_eq!(caps[2], cap("scp:system:governance-participation"));
         assert_eq!(caps[3], cap("scp:system:relay-operation"));
-        assert_eq!(caps[4], cap("scp:system:bridge-operation"));
     }
 
     #[test]
@@ -568,7 +567,8 @@ mod tests {
         doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-2"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
-            service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation".to_owned(),
+            service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:system:key-rotation"
+                .to_owned(),
         });
 
         let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
@@ -579,7 +579,7 @@ mod tests {
             entry.capabilities[1],
             cap("scp:capability:schema-validation/v1")
         );
-        assert_eq!(entry.capabilities[2], cap("scp:system:bridge-operation"));
+        assert_eq!(entry.capabilities[2], cap("scp:system:key-rotation"));
     }
 
     #[test]
