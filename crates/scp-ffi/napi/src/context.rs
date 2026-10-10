@@ -1319,10 +1319,11 @@ pub(crate) async fn reserve_key_package_on(
 
 /// Tears down a committed Welcome join whose bridge state a concurrent close
 /// removed, and returns the join's `CTX_2040` error, or the teardown's own
-/// error when the discard fails (the actor may then still write its snapshot).
+/// error when the discard fails (when the actor did not exit in time, the
+/// Supervisor deletes the snapshot once it has).
 async fn tear_down_vanished_join(
     bi: &crate::runtime::NapiBridgeInstance,
-    sup: &scp_core::context::supervisor::Supervisor,
+    sup: &Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> ScpNapiError {
     let discarded = sup.discard_joined_context(context_id).await;

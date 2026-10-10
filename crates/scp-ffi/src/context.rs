@@ -3142,8 +3142,8 @@ impl crate::scp::PyScp {
         // the just-committed actor is torn down.
         if let Err(e) = crate::runtime::readmit_and_register_ffi_state(bi, &sealed.context_id, &[])
         {
-            // A failed discard outranks the registration error: the actor may
-            // still write the snapshot the teardown meant to delete.
+            // A failed discard outranks the registration error: the teardown
+            // did not finish, and the caller has to see that.
             rt.block_on(sup.discard_joined_context(&sealed.context_id))
                 .map_err(|discard| PyErr::from(crate::error::ScpPyError::from(discard)))?;
             return Err(PyErr::from(e));

@@ -1204,6 +1204,56 @@ impl std::fmt::Display for JoinFailure {
     }
 }
 
+/// Clears a [`Supervisor::discard_joined_context`] pending mark on drop, so a
+/// discarding call that ends or is dropped before it hands the exit wait to a
+/// task never leaves the id refused forever.
+struct PendingDiscardMark<'a> {
+    supervisor: &'a Supervisor,
+    context_id: &'a str,
+}
+
+impl Drop for PendingDiscardMark<'_> {
+    fn drop(&mut self) {
+        self.supervisor.pending_discards.remove(self.context_id);
+    }
+}
+
+/// Finishes a [`Supervisor::discard_joined_context`] whose exit wait timed out,
+/// from the tracked task, after the discarded actor has exited.
+///
+/// Holds a `Weak<Supervisor>` (ADR-049 Decision 16) and the persistence
+/// strongly: once the Supervisor has dropped, its floor and tracker registries
+/// dropped with it, but the snapshot is durable and still has to go. Nobody
+/// awaits this task, so a failure is logged at error level.
+async fn finish_discard_after_exit(
+    supervisor: &std::sync::Weak<Supervisor>,
+    persistence: Option<&Arc<dyn ContextPersistence>>,
+    context_id: &str,
+) {
+    let result = match supervisor.upgrade() {
+        Some(supervisor) => {
+            let finished = supervisor.finish_discard(context_id).await;
+            supervisor.pending_discards.remove(context_id);
+            finished
+        }
+        None => match persistence {
+            Some(persistence) => persistence.delete_context(context_id).await.map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "discard of joined context '{context_id}': snapshot delete failed: {e}"
+                ))
+            }),
+            None => Ok(()),
+        },
+    };
+    if let Err(error) = result {
+        tracing::error!(
+            context_id,
+            %error,
+            "discard of a joined context did not finish after its actor exited"
+        );
+    }
+}
+
 /// Spawn a `KeyPackageStoreActor`'s watchdog task (ADR-049 §10).
 ///
 /// The per-identity twin of [`spawn_actor_watchdog_task`]. A free function for
@@ -1875,6 +1925,13 @@ pub struct Supervisor {
     /// and `Self::with_providers` with `persistence: None`); helpers branch on
     /// `persistence_ref().is_some()` for those harnesses.
     helper_persistence: OnceLock<Arc<dyn ContextPersistence>>,
+    /// Ids whose [`Self::discard_joined_context`] removed the actor and has
+    /// not yet finished its teardown. Marked under `write_lock` together with
+    /// the registry removal, cleared once the teardown has run (or when the
+    /// discarding call is dropped before handing the wait to a task). A
+    /// discard of a marked id is refused, so it cannot delete the snapshot
+    /// while the first discard's actor can still write it.
+    pending_discards: dashmap::DashSet<String>,
     /// Wall-clock source. Populated by [`Self::with_providers_and_journal`] (or
     /// defaulted to [`scp_clock::SystemClock`] when the caller
     /// passes `None`).
@@ -2262,6 +2319,7 @@ impl Supervisor {
             persistence,
             write_lock,
             bootstrap_spawn_lock,
+            pending_discards: dashmap::DashSet::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
@@ -5961,28 +6019,42 @@ impl Supervisor {
     /// consume is irreversible by construction (a KeyPackage is one-shot), and
     /// re-joining draws a fresh reservation anyway.
     ///
-    /// The snapshot delete runs only after the actor's `run()` has returned.
-    /// The actor persists dirty state in its post-loop drain, after the last
-    /// sender drops or `Shutdown` dispatches, so a delete issued while it still
-    /// runs is overwritten and the context resurrects on restart. A delete of
-    /// an id the join never persisted is an idempotent no-op. The registry
-    /// removal and floor reap run under `write_lock`, atomic with respect to
-    /// concurrent register/despawn; the exit wait and the delete run after it
-    /// is released, because an actor handler can take `write_lock` (a TTL
-    /// exit's self-despawn) and would deadlock against a wait under it.
+    /// The floor reap, the stream-admission reap and the snapshot delete run
+    /// only after the actor's `run()` has returned. The actor persists dirty
+    /// state in its post-loop drain, after the last sender drops or `Shutdown`
+    /// dispatches, and a command already queued from another clone of its
+    /// handle can re-create a floor or tracker entry, so anything removed
+    /// while it still runs can come back and the context resurrects on
+    /// restart. Until the delete, the join's snapshot stays in place, so
+    /// Precheck D refuses a re-join of the id in the meantime.
+    ///
+    /// The registry removal runs under `write_lock`, atomic with respect to
+    /// concurrent register/despawn. The exit wait runs outside it, because an
+    /// actor handler can take `write_lock` (a TTL exit's self-despawn).
+    ///
+    /// When the actor has not exited within the reply bound, the wait moves to
+    /// a task on the Supervisor's tracker that stops the actor with no time
+    /// bound and then finishes the teardown, and this call returns the wait's
+    /// error. Once shutdown has begun the tracker takes no task, so the call
+    /// finishes the teardown inline instead and returns only after the actor
+    /// has exited. Either way no write from the actor lands after the delete.
+    /// One gap remains: if the process dies while a wedged actor is still
+    /// running, the join's snapshot is still in place and the next start
+    /// restores the context.
     ///
     /// Returns `Ok(true)` if a live actor handle was registered and removed,
     /// `Ok(false)` if no entry existed for `context_id`.
     ///
     /// # Errors
     ///
-    /// The actor's exit-wait error (it did not exit within the reply bound
-    /// and may still write the snapshot), or
-    /// [`ContextError::PersistenceFailed`] when the snapshot delete fails.
-    /// The delete is attempted after an exit-wait error too, and the
-    /// exit-wait error wins.
-    pub async fn discard_joined_context(&self, context_id: &str) -> Result<bool, ContextError> {
-        let guard = self.write_lock.lock().await;
+    /// The actor's exit-wait error (the teardown then finishes in the tracked
+    /// task), the error from finishing the teardown
+    /// ([`Self::finish_discard`]), or [`ContextError::ActorBusy`] when an
+    /// earlier discard of the id has not finished its teardown.
+    pub async fn discard_joined_context(
+        self: &Arc<Self>,
+        context_id: &str,
+    ) -> Result<bool, ContextError> {
         // 1. Remove the in-memory actor handle. #2148 (ADR-049 birth-into-actor):
         //    the joiner's MLS crypto is OWNED by the actor's `PerContextState`
         //    (born owned at the WELCOME seam, never provider-resident), so once
@@ -5990,49 +6062,110 @@ impl Supervisor {
         //    (`ZeroizeOnDrop`), the group's signer and its provider-storage
         //    values zeroize on drop. There is no provider map to also destroy
         //    (the deleted `destroy_mls_group` arm). Another clone of the handle
-        //    (a bridge's cached one) keeps the actor alive, so step 4 stops it
+        //    (a bridge's cached one) keeps the actor alive, so step 2 stops it
         //    explicitly.
-        let removed = self.actors.remove(context_id).map(|(_, handle)| handle);
-        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
-        // 2. Drop the authoritative Class-M floor registry entry (ADR-049). A
-        //    discarded welcome-join is permanently gone (its actor-owned crypto
-        //    freed on the handle drop above — `SenderKey`s, the MLS group's
-        //    signer, and its provider-storage values zeroize on drop, and
-        //    security model spec §9.15 lists the copies no wipe reaches; its
-        //    durable snapshot deleted), so
-        //    the floors are moot and pruning is sound; see
-        //    `Supervisor::remove_context_floors` for the full permanent-vs-
-        //    transient safety argument.
-        self.remove_context_floors(&context_id_bytes);
-        // 3. Drop the per-context stream admission-tracker registry entry on
-        //    the same permanent-teardown sweep (spec §5.4.5) — the streaming
-        //    twin of the floor-registry reap above. An in-flight pump holding
-        //    its own Arc keeps the tracker alive; this only drops the
-        //    registry's reference.
-        self.reap_stream_admission(context_id);
-        drop(guard);
-        // 4. Stop the actor and wait for its run loop to return, so its
-        //    post-loop drain persist lands before the delete below.
-        let exit = match &removed {
-            Some(handle) => handle.shutdown_and_await_exit().await,
-            None => Ok(()),
+        let (handle, mark) = {
+            let guard = self.write_lock.lock().await;
+            if self.pending_discards.contains(context_id) {
+                return Err(ContextError::ActorBusy(format!(
+                    "discard of joined context '{context_id}': an earlier discard is still \
+                     waiting for the actor to exit, and deletes the snapshot once it has"
+                )));
+            }
+            let Some((_, handle)) = self.actors.remove(context_id) else {
+                drop(guard);
+                self.finish_discard(context_id).await?;
+                return Ok(false);
+            };
+            self.pending_discards.insert(context_id.to_owned());
+            (
+                handle,
+                PendingDiscardMark {
+                    supervisor: self,
+                    context_id,
+                },
+            )
         };
-        // 5. Delete the durable Class-S snapshot the join persisted so a
-        //    restart cannot resurrect the context and Precheck-D does not block
-        //    a fresh re-join (mirrors the `delete_context` rollback arm; the
-        //    helper-persistence slot is the same backend the join persisted to,
-        //    an unset slot means nothing durable was ever written).
-        let deleted = match self.persistence_ref() {
+        // 2. Stop the actor and wait for its run loop to return, so its
+        //    post-loop drain persist lands before step 3.
+        let Err(wait_error) = handle.shutdown_and_await_exit().await else {
+            let finished = self.finish_discard(context_id).await;
+            drop(mark);
+            finished?;
+            return Ok(true);
+        };
+        let supervisor = Arc::downgrade(self);
+        let persistence = self.persistence_ref().cloned();
+        let id = context_id.to_owned();
+        let moved = handle.clone();
+        let spawned = self.spawn_tracked("discard_joined_context exit wait", async move {
+            moved.stop_and_await_exit_unbounded().await;
+            finish_discard_after_exit(&supervisor, persistence.as_ref(), &id).await;
+        });
+        if spawned.is_ok() {
+            // The task now owns the mark and clears it after the teardown.
+            std::mem::forget(mark);
+        } else {
+            // Shutdown has begun and the tracker takes no task: finish inline.
+            handle.stop_and_await_exit_unbounded().await;
+            let finished = self.finish_discard(context_id).await;
+            drop(mark);
+            finished?;
+        }
+        Err(wait_error)
+    }
+
+    /// Step 3 of [`Self::discard_joined_context`], run once the discarded
+    /// actor has exited: drops the context's Class-M floor registry entry and
+    /// its stream-admission tracker entry, then deletes the snapshot the join
+    /// persisted.
+    ///
+    /// It holds `bootstrap_spawn_lock` and then `write_lock` (the spawn
+    /// paths' order), so no spawn of the id runs between the registry check
+    /// and the delete.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::InvalidState`] when an actor is registered for the
+    /// id again (a restore spawned it from the snapshot while the discarded
+    /// actor was exiting): the snapshot is that live context's and stays.
+    /// [`ContextError::PersistenceFailed`] when the snapshot delete fails.
+    async fn finish_discard(&self, context_id: &str) -> Result<(), ContextError> {
+        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        let _guard = self.write_lock.lock().await;
+        if self.actors.contains_key(context_id) {
+            return Err(ContextError::InvalidState(format!(
+                "discard of joined context '{context_id}': an actor was registered for the id \
+                 again before the teardown finished; its snapshot is kept"
+            )));
+        }
+        // The floor registry entry (ADR-049): a discarded welcome-join is
+        // permanently gone (its actor-owned crypto freed when the actor task
+        // ended — `SenderKey`s, the MLS group's signer, and its
+        // provider-storage values zeroize on drop, and security model spec
+        // §9.15 lists the copies no wipe reaches; its durable snapshot deleted
+        // below), so the floors are moot and pruning is sound; see
+        // `Supervisor::remove_context_floors` for the full permanent-vs-
+        // transient safety argument.
+        self.remove_context_floors(&crate::context::state::context_id_to_bytes(context_id));
+        // The stream admission-tracker registry entry, on the same
+        // permanent-teardown sweep (spec §5.4.5). An in-flight pump holding its
+        // own Arc keeps the tracker alive; this only drops the registry's
+        // reference.
+        self.reap_stream_admission(context_id);
+        // The durable Class-S snapshot, so a restart cannot resurrect the
+        // context and Precheck D does not block a fresh re-join (mirrors the
+        // `delete_context` rollback arm; the helper-persistence slot is the
+        // same backend the join persisted to, an unset slot means nothing
+        // durable was ever written).
+        match self.persistence_ref() {
             Some(persistence) => persistence.delete_context(context_id).await.map_err(|e| {
                 ContextError::PersistenceFailed(format!(
                     "discard of joined context '{context_id}': snapshot delete failed: {e}"
                 ))
             }),
             None => Ok(()),
-        };
-        exit?;
-        deleted?;
-        Ok(removed.is_some())
+        }
     }
 
     /// Reap a context's [`CrashWindow`] entry on a CLEAN, NON-poison despawn

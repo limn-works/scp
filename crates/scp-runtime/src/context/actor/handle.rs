@@ -455,6 +455,23 @@ impl ContextActorHandle {
             })),
         }
     }
+
+    /// [`Self::shutdown_and_await_exit`] with no time bound, for a caller that
+    /// must not proceed until the actor has exited however long it takes.
+    ///
+    /// The `Shutdown` send waits for mailbox capacity instead of timing out,
+    /// so a full mailbox delays the stop rather than skipping it. A send that
+    /// fails means the inbox receiver has dropped, which happens only when
+    /// `run()` returns, so the actor has already exited.
+    pub(in crate::context) async fn stop_and_await_exit_unbounded(&self) {
+        let (reply, _ack) = oneshot::channel();
+        let shutdown =
+            ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply });
+        if self.inbox.send(shutdown).await.is_err() {
+            return;
+        }
+        self.inbox.closed().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
