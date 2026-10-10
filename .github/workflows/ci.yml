@@ -277,8 +277,18 @@ jobs:
 
   # Detect which language areas changed. Jobs skip when their paths
   # haven't been touched, but still report "success" to branch protection.
+  #
+  # This job carries check-draft's `if:` instead of `needs: check-draft`, so it starts
+  # when the run is created rather than after check-draft finishes. On a draft pull
+  # request it skips, and every job that needs it skips with it, exactly as when it
+  # needed check-draft. scripts/tests/ci-gate/ci_gate_selftest.py fails when this
+  # `if:` differs from check-draft's, and scripts/ci-aggregate-result.py fails a run
+  # in which one of the two skipped and the other did not.
   changes:
-    needs: check-draft
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'merge_group' ||
+      github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     # `rust-toolchain.toml` selects the compiler for every lane below, not only the Rust
     # one: `pyo3-module` and `pyo3-module-macos` run `maturin develop`, `napi-addon` runs
