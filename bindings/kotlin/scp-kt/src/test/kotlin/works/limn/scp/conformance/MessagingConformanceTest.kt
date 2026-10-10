@@ -82,13 +82,13 @@ class MessagingConformanceTest {
         fun `context_send propagates error for closed context`() =
             runTest(testDispatcher) {
                 stubBindings.contextSendError =
-                    BridgeException("Context closed", "SCP-CTX-2010")
+                    BridgeException("Context closed", "SCP-CTX-2007")
                 val result =
                     dispatcher.dispatch(
                         "context_send",
                         mapOf("context_handle" to "10", "identity_handle" to "1", "payload" to "hello"),
                     )
-                assertEquals("SCP-CTX-2010", result["error"])
+                assertEquals("SCP-CTX-2007", result["error"])
             }
     }
 

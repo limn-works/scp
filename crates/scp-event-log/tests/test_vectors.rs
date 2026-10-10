@@ -266,120 +266,115 @@ fn different_event_order_produces_different_root() {
 }
 
 // ---------------------------------------------------------------------------
-// §25.8 Typed-leaf + checkpoint KAT (ADR-011 typed-event unification)
+// §25.8 Vectors 32 and 33: typed event-log leaves and the checkpoint root
 //
 // The vectors above pin the abstract RFC 6962 tree construction. These pin the
-// *typed* leaf preimage: each leaf is SHA-256(0x00 || rmp_serde(Event)) over a
-// canonical `scp_event_log::Event` whose `event_type` is one of the closed
-// EventType taxonomy, and the checkpoint `merkle_root` equals `tree::root`.
+// typed leaf preimage: each leaf is SHA-256(0x00 || rmp_serde(Event)) over a
+// signed `scp_event_log::Event`, and the checkpoint `merkle_root` equals
+// `tree::root`. Every value is printed in `.docs/specs/25-test-vectors.md` and
+// produced by `scripts/gen-test-vectors-p256.py`.
 //
-// Determinism: a fixed 32-byte Ed25519 seed yields a fixed signing key; Ed25519
-// signatures are deterministic (RFC 8032), so the full-Event rmp_serde bytes —
-// and hence the leaf hash — are reproducible across runs and implementations.
-// The DID is `did:dht:z<z-base-32(pubkey)>`, which `extract_public_key_from_did`
-// accepts without the `testing` feature.
+// Each event is signed with the §25.2 reference key 1 (P-256, RFC 6979) over
+// the production `compute_event_canonical_hash`, through the scp-crypto
+// primitives. Production event signing and `tree::append`'s signature check
+// are still Ed25519 (rule B of the identity plan); slice S12 moves them to
+// P-256 and asserts these leaves through the signed append path. Until then
+// the log is built with `tree::append_unsigned_event`, which runs the
+// production sequence, hash-chain, leaf-hash, and incremental-root code
+// without the Ed25519 signature check.
 // ---------------------------------------------------------------------------
 
-use ed25519_dalek::{Signer, SigningKey, Verifier};
+use scp_crypto::p256::{P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict};
+use scp_crypto::{CustodyFailure, CustodyFailureKind};
 use scp_event_log::tree::{self, compute_event_canonical_hash};
 use scp_event_log::{
     Event, EventLog, EventLogSigner, EventPayload, EventType, checkpoint, payload,
 };
 
-/// Fixed 32-byte Ed25519 seed for KAT reproducibility. Not a real key.
-const KAT_SEED: [u8; 32] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-];
+/// The §25.2 seed-to-scalar label.
+const TEST_VECTOR_KEY_LABEL: &[u8] = b"SCP-TEST-VECTOR-KEY-V1";
 
-/// Genesis sentinel `prev_hash` for the first event (mirrors `tree::GENESIS_PREV_HASH`).
+/// §25.2 reference seed 1.
+const REFERENCE_SEED_1: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+
+/// Genesis sentinel `prev_hash` for the first event.
 const KAT_GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
 
-fn kat_signing_key() -> SigningKey {
-    SigningKey::from_bytes(&KAT_SEED)
+/// §25.1 fixture identifiers, each `SHA-256("SCP test vector identifier <role>")`
+/// in the `scp:` text form.
+const ID_EVENT_LOG_ACTOR: &str = "scp:gweyicxangesw4cafjfvafnt2cusxvt7nxked4z6356q4fzkmqoa";
+const ID_APP: &str = "scp:n5hzj47neu6axurs4j5c2raqo3bvyxmuhir75dypf5enuktwmzga";
+const ID_AGENT: &str = "scp:gugakbvop4hkbtpmivkcnpm6z75kvk5nrk35wnfiwkxn2tv5cegq";
+const ID_A: &str = "scp:i3cbnrsij6l54zihsollo6mzasshwszcz5uoi6j5a3hv7x4s24ca";
+const ID_B: &str = "scp:ihyapxk7wahtonmyfkolh4c2sq5vd52u3f477ik3xc5fontsqima";
+const ID_M: &str = "scp:ni4vblzmv5aysoj57nmwlnrzkznatwiks2txqtva66hma3sgqneq";
+const ID_CAROL: &str = "scp:mu3leerpopwlqi4da5g65wgpv5cp4lmvxfpebotmnyugveds37qa";
+const ID_DAVE: &str = "scp:xwseckbpifculwol66dbthmywocvxzfskyzedf2wg6qqr3pywu2q";
+
+/// §25.8 Vector 32 leaves, in append order.
+const EXPECTED_LEAVES: [&str; 9] = [
+    "5f0b7494633bf4e50df0734a73431985184a88ac0d31700f25cf32923b232ba9",
+    "69ac3c845a002b16f0ef612b73419f8cc56ecb061c062328a5c4efbca97c5e79",
+    "4312aeeb911f88a1ba67ed94aa796f4a5660e1c701fa41945dc0f94cf3245465",
+    "65857aebf0d00dc53adf6cb23911b12aeee9b1e57a416c947fe82f2b2c7716b1",
+    "f03d157ae6a4b86f88fdd93140b9e7a57d362d285e80d3f8e9d1a99a0124270b",
+    "e0a65df7a50bb297bf0b06d197dbe21479615b229b81a7c90fb9ff5cbc3e8f42",
+    "74348229437898c2ab6a19e86ced221d41146301c51aaee2c67ef1ff061a6a69",
+    "08a3d79d1f54dec672c3194a60ef6c391c3465a92af01304c603395098ea3649",
+    "2cd931312eea90d2e786f34b1c1891717a803acdbe3a2237416b9139ac4b8b29",
+];
+
+/// §25.8 Vector 32 root, which Vector 33 reuses as the checkpoint root.
+const EXPECTED_ROOT: &str = "d161de08f68888a0b13e7fb03e8bbc25758701ab247beb7b6bc2232c87971500";
+
+fn reference_key() -> P256SecretKey {
+    assert_eq!(SeedLabel::TestVectorKey.as_bytes(), TEST_VECTOR_KEY_LABEL);
+    let seed: [u8; 32] = hex::decode(REFERENCE_SEED_1).unwrap().try_into().unwrap();
+    P256SecretKey::from_seed(SeedLabel::TestVectorKey, &seed)
 }
 
-/// Builds the `did:dht:z<z-base-32(pubkey)>` DID for the fixed KAT key.
-fn kat_did() -> String {
-    let vk = kat_signing_key().verifying_key();
-    format!("did:dht:z{}", zbase32::encode(vk.as_bytes()))
+fn prehash(digest: &[u8]) -> [u8; 32] {
+    digest.try_into().expect("32-byte canonical hash")
 }
 
-/// A deterministic, fixed-key [`EventLogSigner`] for checkpoint KAT signing.
-struct KatSigner(SigningKey);
+/// Signs checkpoints with the §25.2 reference key over the 32-byte canonical
+/// hash `generate_checkpoint` passes it. Slice S12 replaces this with the
+/// production P-256 signer.
+struct ReferenceKeySigner(P256SecretKey);
 
 #[async_trait::async_trait]
-impl EventLogSigner for KatSigner {
-    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, scp_crypto::CustodyFailure> {
-        Ok(self.0.sign(message).to_bytes().to_vec())
+impl EventLogSigner for ReferenceKeySigner {
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CustodyFailure> {
+        let digest: [u8; 32] = message.try_into().map_err(|_| CustodyFailure {
+            kind: CustodyFailureKind::Failed,
+            detail: format!("expected a 32-byte digest, got {} bytes", message.len()),
+        })?;
+        sign_prehash_rfc6979(&self.0, &digest)
+            .map(|signature| signature.to_vec())
+            .map_err(|e| CustodyFailure {
+                kind: CustodyFailureKind::Failed,
+                detail: e.to_string(),
+            })
     }
 }
 
-/// Signs an event with the fixed KAT key (canonical hash over all fields except
-/// the signature).
-fn kat_sign_event(
-    event_type: EventType,
-    actor_did: &str,
-    timestamp: u64,
-    sequence: u64,
-    payload_bytes: Vec<u8>,
-    prev_hash: [u8; 32],
-) -> Event {
-    let mut event = Event {
-        event_type,
-        actor_did: actor_did.to_owned().into(),
-        timestamp,
-        sequence,
-        payload: EventPayload {
-            data: payload_bytes,
-        },
-        prev_hash,
-        signature: Vec::new(),
-    };
-    let canonical_hash = compute_event_canonical_hash(&event);
-    event.signature = kat_signing_key().sign(&canonical_hash).to_bytes().to_vec();
-    event
-}
-
-/// Computes the RFC 6962 leaf hash over the full signed event:
-/// `SHA-256(0x00 || rmp_serde(Event))`.
-fn typed_leaf_hash(event: &Event) -> [u8; 32] {
-    let serialized = rmp_serde::to_vec(event).expect("event serialization");
-    leaf_hash(&serialized)
-}
-
-/// Builds the representative spread of typed events for the KAT.
-///
-/// Spread (ADR-011 Amendment coverage): `AppBound`, `SpendApproved`,
-/// `TtlExtended`, `RecoveryEpochAdvanced`, `ContextTombstoned`,
-/// `ConsequenceTriggered`, `CommitBroadcastSucceeded`, `RoleAssigned`,
-/// `MemberJoined`. Payloads use the shared `payload` encoder where a structured
-/// struct is defined; the remaining variants carry their documented opaque
-/// payloads. The trailing `RoleAssigned`/`MemberJoined` leaves pin the
-/// subject-bearing payloads added by the ADR-011 amendment.
-/// Encodes a structured payload via the shared `payload` encoder.
+/// Encodes a structured payload through the shared `payload` encoder.
 fn enc<T: serde::Serialize>(value: &T) -> Vec<u8> {
     payload::encode_payload(value)
         .expect("shared payload encode")
         .data
 }
 
+/// Builds the nine signed Vector 32 events, chaining each `prev_hash` to the
+/// previous production leaf hash.
 fn kat_events() -> Vec<Event> {
-    let did = kat_did();
-    let mut events: Vec<Event> = Vec::new();
-    let mut prev = KAT_GENESIS_PREV_HASH;
-
-    // (event_type, timestamp, payload-bytes) in append order. Structured
-    // payloads use the shared `payload` encoder; opaque ones carry their
-    // documented bytes. Spread covers AppBound, SpendApproved, TtlExtended,
-    // RecoveryEpochAdvanced, ContextTombstoned, ConsequenceTriggered,
-    // CommitBroadcastSucceeded, RoleAssigned, MemberJoined.
+    let key = reference_key();
     let spec: Vec<(EventType, u64, Vec<u8>)> = vec![
         (
             EventType::AppBound,
             1_700_000_000,
             enc(&payload::AppBoundPayload {
-                app_did: "did:key:app".to_owned(),
+                app_did: ID_APP.to_owned(),
                 app_name: "Scheduler".to_owned(),
                 app_version: "1.0.0".to_owned(),
                 capabilities: vec!["outlet:call:*".to_owned()],
@@ -389,7 +384,7 @@ fn kat_events() -> Vec<Event> {
             EventType::SpendApproved,
             1_700_000_001,
             enc(&payload::SpendApprovedPayload {
-                spender: "did:key:agent".to_owned(),
+                spender: ID_AGENT.to_owned(),
                 amount: 5_000,
                 purpose: "inference".to_owned(),
             }),
@@ -401,7 +396,7 @@ fn kat_events() -> Vec<Event> {
                 old_deadline_unix: 1_700_000_000,
                 new_deadline_unix: 1_800_000_000,
                 proposal_id: [0xABu8; 32],
-                consenting_members: vec!["did:key:a".to_owned(), "did:key:b".to_owned()],
+                consenting_members: vec![ID_A.to_owned(), ID_B.to_owned()],
             }),
         ),
         (
@@ -423,7 +418,8 @@ fn kat_events() -> Vec<Event> {
         (
             EventType::ConsequenceTriggered,
             1_700_000_005,
-            b"member_did=did:key:m;rule_index=2;trigger_kind=absence;action_type=suspend".to_vec(),
+            format!("member_did={ID_M};rule_index=2;trigger_kind=absence;action_type=suspend")
+                .into_bytes(),
         ),
         (
             EventType::CommitBroadcastSucceeded,
@@ -434,7 +430,7 @@ fn kat_events() -> Vec<Event> {
             EventType::RoleAssigned,
             1_700_000_007,
             enc(&payload::RoleAssignedPayload {
-                subject_did: "did:key:carol".to_owned(),
+                subject_did: ID_CAROL.to_owned(),
                 role: "admin".to_owned(),
             }),
         ),
@@ -442,108 +438,100 @@ fn kat_events() -> Vec<Event> {
             EventType::MemberJoined,
             1_700_000_008,
             enc(&payload::MembershipChangePayload {
-                subject_did: "did:key:dave".to_owned(),
+                subject_did: ID_DAVE.to_owned(),
                 role_name: "member".to_owned(),
             }),
         ),
     ];
 
-    for (seq, (et, ts, data)) in spec.into_iter().enumerate() {
-        let ev = kat_sign_event(et, &did, ts, seq as u64, data, prev);
-        prev = typed_leaf_hash(&ev);
-        events.push(ev);
+    let mut events = Vec::with_capacity(spec.len());
+    let mut prev_hash = KAT_GENESIS_PREV_HASH;
+    for (sequence, (event_type, timestamp, data)) in (0u64..).zip(spec) {
+        let mut event = Event {
+            event_type,
+            actor_did: ID_EVENT_LOG_ACTOR.to_owned().into(),
+            timestamp,
+            sequence,
+            payload: EventPayload { data },
+            prev_hash,
+            signature: Vec::new(),
+        };
+        let digest = prehash(&compute_event_canonical_hash(&event));
+        let signature = sign_prehash_rfc6979(&key, &digest).unwrap();
+        verify_prehash_strict(&key.public_key(), &digest, &signature)
+            .expect("reference-key event signature must verify");
+        event.signature = signature.to_vec();
+        prev_hash = tree::leaf_hash(&event).expect("leaf hash");
+        events.push(event);
     }
-
     events
 }
 
-#[test]
-fn vector_32_typed_leaf_and_checkpoint_kat() {
-    println!("=== Vector 32: Typed-leaf + checkpoint KAT ===");
-    println!("  KAT DID: {}", kat_did());
-
-    let events = kat_events();
-    assert_eq!(events.len(), 9, "KAT spread must be 9 events");
-
-    // Build the log via the production append path (verifies signatures, builds
-    // the RFC 6962 tree incrementally).
+/// Appends the Vector 32 events through the production hash-chain and tree
+/// code (see the section comment for why the append is unsigned until S12).
+fn kat_log() -> EventLog {
     let mut log = EventLog::new("ctx-kat".to_owned());
-    let mut leaves = Vec::new();
-    for ev in &events {
-        tree::append(&mut log, ev).expect("append KAT event");
-        leaves.push(typed_leaf_hash(ev));
+    for event in kat_events() {
+        tree::append_unsigned_event(&mut log, &event).expect("append KAT event");
+    }
+    log
+}
+
+#[test]
+fn vector_32_typed_leaves_and_root() {
+    let events = kat_events();
+    assert_eq!(events.len(), EXPECTED_LEAVES.len());
+    for (i, event) in events.iter().enumerate() {
+        let leaf = tree::leaf_hash(event).unwrap();
+        assert_eq!(
+            hex(&leaf),
+            EXPECTED_LEAVES[i],
+            "leaf {i} ({:?})",
+            event.event_type
+        );
+        // The production leaf is RFC 6962 SHA-256(0x00 || rmp_serde(Event)).
+        assert_eq!(leaf, leaf_hash(&rmp_serde::to_vec(event).unwrap()));
     }
 
-    // Print + pin each typed leaf.
-    for (i, leaf) in leaves.iter().enumerate() {
-        print_vec(&format!("Leaf {i} ({:?})", events[i].event_type), leaf);
-    }
-    let root = tree::root(&log);
-    print_vec("tree::root", &root);
+    let log = kat_log();
+    assert_eq!(hex(&tree::root(&log)), EXPECTED_ROOT, "tree::root");
 
-    // --- Pinned typed-leaf vectors (generated by this test, then pinned) ---
-    let expected_leaves = [
-        // 0: AppBound
-        "e5fcd986946d86cb30ebfa10b74b44807675e9c0ea42d73a186c7efded8e0da1",
-        // 1: SpendApproved
-        "73c4f74f59164252ae462651155f9e3af8df1b71a77b35d7760a8c87544c17aa",
-        // 2: TtlExtended
-        "ce9abaa841fd68d031418737c23ca9870af3ae047532a4f777844f703049983d",
-        // 3: RecoveryEpochAdvanced
-        "e8c3d8846d800f2b89a0d832a56c8ec3a9ab2153a6b467c3069a8053e029d51c",
-        // 4: ContextTombstoned
-        "e3de3be1a57f82d1113741b32e08d94415b829397ffc5dc1436054fc6cebdba9",
-        // 5: ConsequenceTriggered
-        "7d3c5297947d292a3d01a1b6690ef8579d866d17147a62eb9479f69506e2eb00",
-        // 6: CommitBroadcastSucceeded
-        "2103da782402619216105fe5c2104dc8863f69b9d0583b60cfd760c0b1f58cb7",
-        // 7: RoleAssigned (RoleAssignedPayload)
-        "262e1ff73e6767eee3a20b3532333a17f789aad278467c0b0caefb255c40994c",
-        // 8: MemberJoined (MembershipChangePayload)
-        "08947e7b6e695a1f9066471d7ee1eab95ae536a7f7a390a8dd2c6b5b0d26bed0",
-    ];
-    for (i, leaf) in leaves.iter().enumerate() {
-        assert_eq!(hex(leaf), expected_leaves[i], "typed leaf {i} mismatch");
-    }
-    assert_eq!(
-        hex(&root),
-        "2618d3c542c263eaf0febbc0ea5cdceeee1a2b7a44fe406fc56dd36a63c1a2ad",
-        "tree::root mismatch"
-    );
+    // The root is the RFC 6962 tree over the nine leaves: an unbalanced split
+    // of eight and one.
+    let leaves: Vec<[u8; 32]> = EXPECTED_LEAVES
+        .iter()
+        .map(|l| hex::decode(l).unwrap().try_into().unwrap())
+        .collect();
+    let level = |nodes: &[[u8; 32]]| -> Vec<[u8; 32]> {
+        nodes
+            .chunks(2)
+            .map(|p| interior_hash(&p[0], &p[1]))
+            .collect()
+    };
+    let eight = level(&level(&level(&leaves[..8])));
+    assert_eq!(hex(&interior_hash(&eight[0], &leaves[8])), EXPECTED_ROOT);
 }
 
 #[tokio::test]
-async fn vector_33_checkpoint_root_equals_tree_root_kat() {
-    println!("=== Vector 33: Checkpoint merkle_root == tree::root KAT ===");
-
-    let events = kat_events();
-    let mut log = EventLog::new("ctx-kat".to_owned());
-    for ev in &events {
-        tree::append(&mut log, ev).expect("append KAT event");
-    }
-
-    let tree_root = tree::root(&log);
-    let did: scp_did::DID = kat_did().into();
-    let signer = KatSigner(kat_signing_key());
-
-    // generate_checkpoint computes merkle_root = tree::root(log) and signs the
-    // §23.16.1 canonical-hash layout (SCP-CHECKPOINT-V1: || len(ctx) || ctx ||
-    // len(did) || did || event_count_BE || merkle_root || epoch || ts_BE).
-    let cp = checkpoint::generate_checkpoint(&log, &did, 5, &signer)
+async fn vector_33_checkpoint_root_equals_tree_root() {
+    let log = kat_log();
+    let did: scp_did::DID = ID_EVENT_LOG_ACTOR.into();
+    let key = reference_key();
+    let public = key.public_key();
+    let cp = checkpoint::generate_checkpoint(&log, &did, 5, &ReferenceKeySigner(key))
         .await
         .expect("generate checkpoint");
 
-    print_vec("checkpoint.merkle_root", &cp.merkle_root);
-    print_vec("tree::root", &tree_root);
-
     assert_eq!(
-        cp.merkle_root, tree_root,
-        "checkpoint merkle_root must equal RFC 6962 tree::root"
+        hex(&cp.merkle_root),
+        EXPECTED_ROOT,
+        "checkpoint merkle_root"
     );
+    assert_eq!(cp.merkle_root, tree::root(&log));
     assert_eq!(cp.event_count, 9, "checkpoint must cover all 9 events");
 
-    // Recompute the §23.16.1 canonical checkpoint hash and assert the signature
-    // verifies against the KAT key — pins the canonical-hash layout.
+    // The checkpoint signature covers the §23.16.1 canonical hash. Slice S12
+    // asserts it through the production P-256 checkpoint verifier.
     let canonical = checkpoint::compute_checkpoint_canonical_hash(
         "ctx-kat",
         &did,
@@ -552,17 +540,6 @@ async fn vector_33_checkpoint_root_equals_tree_root_kat() {
         Some(5),
         cp.timestamp,
     );
-    print_vec("checkpoint canonical hash (§23.16.1)", &canonical);
-
-    let vk = kat_signing_key().verifying_key();
-    let sig = ed25519_dalek::Signature::from_slice(&cp.signature).expect("sig bytes");
-    vk.verify(&canonical, &sig)
-        .expect("checkpoint signature must verify over §23.16.1 canonical hash");
-
-    // --- Pinned checkpoint root (generated by this test, then pinned) ---
-    assert_eq!(
-        hex(&tree_root),
-        "2618d3c542c263eaf0febbc0ea5cdceeee1a2b7a44fe406fc56dd36a63c1a2ad",
-        "checkpoint tree::root mismatch"
-    );
+    verify_prehash_strict(&public, &prehash(&canonical), &cp.signature)
+        .expect("checkpoint signature must verify over the §23.16.1 canonical hash");
 }

@@ -15,7 +15,6 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
-pub mod bridge_state;
 pub mod error_codes;
 pub mod outlet_id;
 pub mod p256_host;
@@ -53,9 +52,6 @@ pub const fn context_state_str(state: &scp_protocol::context::ContextState) -> &
         S::Poisoned => "poisoned",
     }
 }
-
-mod bridge_id;
-pub use bridge_id::generate_bridge_id;
 
 // Canonical §18.4.1 context-ID generator — shared across all FFI
 // bridges so `Scp::context_create` cannot regress to non-hex shapes
@@ -144,13 +140,6 @@ pub use bridge_instance::{
 // Requires scp-core + scp-platform (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod bridge_runtime;
-
-// Bridge credential-store selection seam shared by all three FFI bridges
-// (ADR-062 §Decision 5, SCP-CAPINJECT-009). The `FfiCredentialStore` enum
-// dispatches between the real durable backend and a testing-only in-memory
-// double. Requires scp-core (behind `resolvers` feature).
-#[cfg(feature = "resolvers")]
-pub mod credentials;
 
 // Crash-safe per-stream `monotonic_seq` grant counter (SCP-OUT-034 AC31) shared
 // by all three bridges. Persists the cursor to durable `Storage` so an SDK

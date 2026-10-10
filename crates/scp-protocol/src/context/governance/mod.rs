@@ -3770,4 +3770,30 @@ mod tests {
     fn eve() -> DID {
         DID::from("did:dht:z6MkEve")
     }
+
+    /// §25.5 Vector 7: the vote canonical hash, computed by the production
+    /// `compute_vote_hash` over the spec inputs. The voter is the §25.1
+    /// fixture identifier voter. The integration test
+    /// `vector_7_vote_signature` in `scp-runtime/tests/test_vectors.rs`
+    /// asserts the P-256 signature over this hash.
+    #[test]
+    fn spec_25_vector_7_vote_canonical_hash() {
+        let proposal_id: ProposalId =
+            hex::decode("0102030405060708091011121314151617181920212223242526272829303132")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let hash = compute_vote_hash(
+            &proposal_id,
+            "scp:bbxkpyevxkco6odwvddqgluf3ug2a3qj3lacn4olgxtpshuk4a6a",
+            &VoteType::Approve,
+            1_700_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(hash),
+            "3a0c35742f6ddd8c3a935f924ede5ca85ad905c1312ca99e18eb618223769c67",
+            "§25.5 Vector 7 canonical hash drift"
+        );
+    }
 }

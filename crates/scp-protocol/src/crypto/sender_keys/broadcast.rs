@@ -2091,10 +2091,10 @@ mod tests {
     /// populated `DataProvenance` value. This is the same hash the FFI
     /// event-log provenance sites record for `ProvenanceAttached` /
     /// `ProvenanceReceived`, so a byte change here signals a cross-layer
-    /// provenance-hash divergence.
-    ///
-    /// Regenerate with:
-    /// `cargo test -p scp-protocol vector_35_data_provenance_hash_kat -- --nocapture`
+    /// provenance-hash divergence. The counterparties are the §25.1 fixture
+    /// identifiers alice and bob. `scripts/gen-test-vectors-p256.py` encodes
+    /// the same value with its own `MessagePack` writer and self-gates on the
+    /// hash asserted here.
     #[test]
     fn vector_35_data_provenance_hash_kat() {
         use crate::economy::types::Amount;
@@ -2103,7 +2103,10 @@ mod tests {
         let provenance = DataProvenance {
             source_context: "ctx-kat-provenance".to_string(),
             source_type: SourceType::Persistent,
-            counterparties: vec!["did:key:alice".into(), "did:key:bob".into()],
+            counterparties: vec![
+                "scp:nog6fhpyfhhmerfnq7ggtjk4m7hme7rkfovqrce2jnecf7tdu54q".into(),
+                "scp:gnv52mckv7p7qq5zgbetmtpnglpjrtr5nurq66dxczjzqs3f2k2a".into(),
+            ],
             purpose: Some("kat".to_string()),
             discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
             age: std::time::Duration::from_mins(5),
@@ -2119,7 +2122,7 @@ mod tests {
         let hash = compute_provenance_hash(Some(&provenance)).unwrap();
         let hex = hex::encode(hash);
         assert_eq!(
-            hex, "12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68",
+            hex, "fa9cbfad74121473e2df010ac3b39f74bc30912d9168bc2efc77a25077ad1c01",
             "provenance_hash KAT drift — see §25 Vector 35 / §24.3.3"
         );
 

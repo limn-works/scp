@@ -886,7 +886,7 @@ pub fn expect_fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[
 ///
 /// Same contract as [`expect_fixed_bytes`], but the returned array is
 /// wrapped in `zeroize::Zeroizing` so it is overwritten when dropped.
-/// Use for private-key material (sender keys, bridge credential keys,
+/// Use for private-key material (sender keys,
 /// any 32-byte Ed25519/X25519 seed): the common shape is `raw Vec<u8>
 /// → narrow → Zeroizing<[u8; 32]>` and this helper eliminates the
 /// repeated `Zeroizing::new(expect_fixed_bytes::<32>(...))` dance.

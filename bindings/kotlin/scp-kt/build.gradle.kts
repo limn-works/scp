@@ -81,10 +81,7 @@ val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
 // A set `CARGO_TARGET_DIR` is read directly instead. Cargo resolves a relative
 // value of that variable against the directory it runs in, which for the
 // `cargo metadata` call below is the repository root, so the answer is the one
-// cargo would give. The `kotlin-test` job in `.github/workflows/ci.yml` sets it
-// because on an artifact-cache hit that job installs no Rust toolchain, and a
-// `cargo metadata` there would make rustup install the pinned channel with every
-// target `rust-toolchain.toml` lists.
+// cargo would give.
 val workspaceRoot: File = rootProject.projectDir.parentFile.parentFile
 val cargoTargetDir: Provider<String> =
     providers
@@ -290,11 +287,9 @@ tasks.register<Exec>("generateUniffiBindings") {
     commandLine(listOf("./scripts/generate-uniffi-kotlin.sh") + uniffiFeatureArgs)
     // `-Pscp.uniffi.prebuiltBindings=true` skips this task and compiles the bindings
     // already in `uniffiBindingsDir`. The `kotlin-test` and `bridge-parity-kotlin` jobs
-    // in `.github/workflows/ci.yml` set it: `kotlin-test` generates the bindings and the
-    // cdylib once, or restores both from its artifact cache, and uploads them, and
-    // `bridge-parity-kotlin` downloads them. Running this task there would rebuild the
-    // crate, which needs a Rust toolchain neither job installs on a cache hit or on
-    // download. Both jobs place the bindings before Gradle starts, so the property
+    // in `.github/workflows/ci.yml` set it: both download the bindings and the cdylib
+    // as artifact `uniffi-kotlin-linux`, and running this task there would rebuild the
+    // crate the download already holds. Both jobs place the bindings before Gradle starts, so the property
     // checks for the generated file while this task is configured and fails the build
     // without it, rather than letting `compileKotlin` run over an empty bindings
     // directory. Any value but `true` or `false` fails too.

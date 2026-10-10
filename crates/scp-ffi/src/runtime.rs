@@ -909,7 +909,7 @@ impl Drop for PyBridgeInstance {
 /// See issue #329.
 ///
 /// The `local_did` is consumed only by `NodeMlsFactory::new` — the
-/// `BridgeInstance` itself carries no DID (spec §12.2.3).
+/// `BridgeInstance` itself carries no DID.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 /// If the manager is already initialized with a different DID, a warning is logged.
@@ -963,7 +963,7 @@ pub fn init_context_manager_with(
 ) {
     // `_local_did` is retained in the signature for API stability: callers
     // construct `crypto` with the DID before calling into this function
-    // (it is the `NodeMlsFactory` that carries the DID; see spec §12.2.3).
+    // (it is the `NodeMlsFactory` that carries the DID).
     if bi.core.has_supervisor() {
         return;
     }
@@ -1227,9 +1227,8 @@ pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn Context
 /// Bounded capacity of the supervisor's `ContextEvent` broadcast channel.
 ///
 /// Every production supervisor built here enables this channel so that local
-/// context events can be consumed by external sinks — notably the node's
-/// outbound webhook dispatcher (spec §12.10.5), wired in
-/// [`PyScp::node_start_in_memory`](crate::scp::PyScp::node_start_in_memory)/`node_start_local`. Lagging consumers
+/// context events can be consumed by external sinks — the MCP server's
+/// resource notifications (`mcp_server_bundle` in `crate::mcp`). Lagging consumers
 /// drop the oldest events (logged, never panics); `1024` is the documented
 /// default shared across all three FFI bridges.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -1239,8 +1238,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// only handle returned to the bridge layer.
 ///
 /// The event broadcast channel is always enabled (capacity
-/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — e.g. the node webhook
-/// dispatcher — can subscribe via
+/// [`EVENT_CHANNEL_CAPACITY`]) so downstream consumers — the MCP server's
+/// resource notifications — can subscribe via
 /// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
 /// When no consumer subscribes, emitting into the channel is a cheap no-op: the
 /// retained sender has no receivers, so `send` returns `Err` and the event is
@@ -1274,9 +1273,9 @@ fn build_supervisor(
     // once for both.
     let durable = durable_providers_from_bi(bi)?;
     // Enable the event broadcast channel so `subscribe_events()` yields a
-    // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
+    // receiver for the MCP server's resource notifications. The unused receiver
     // is dropped immediately; the retained sender keeps the channel open so
-    // later subscribers (wired at node startup) observe subsequent events.
+    // later subscribers observe subsequent events.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // Wire the production VM-aware governance key resolver when a DID resolver
     // is configured; otherwise fail closed with the always-`None` resolver so
@@ -1940,10 +1939,10 @@ fn evict_finished_marks(marks: &mut HashMap<String, ReleaseMark>, limit: usize) 
 }
 
 /// Removes `context_id`'s [`FfiBridgeState`], its known-context entry, and its
-/// connector and economy state, only while its release mark stands, and returns
-/// whether the mark stood.
+/// economy state, only while its release mark stands, and returns whether the
+/// mark stood.
 ///
-/// The mark check and all four removals run under the registry entry's shard
+/// The mark check and all three removals run under the registry entry's shard
 /// lock, and the [`FfiBridgeState`] is removed last.
 fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> bool {
     let entry = ffi_state_registry(bi).entry(context_id.to_owned());
@@ -1954,16 +1953,15 @@ fn remove_context_while_released(bi: &PyBridgeInstance, context_id: &str) -> boo
     true
 }
 
-/// Removes `context_id`'s known-context entry, its connector and economy
-/// state, and then its [`FfiBridgeState`] through `entry`, the registry entry
-/// the caller holds, so all four removals run under that entry's shard lock.
+/// Removes `context_id`'s known-context entry, its economy state, and then its
+/// [`FfiBridgeState`] through `entry`, the registry entry the caller holds, so
+/// all three removals run under that entry's shard lock.
 fn remove_context_entry(
     bi: &PyBridgeInstance,
     context_id: &str,
     entry: dashmap::mapref::entry::Entry<'_, String, FfiBridgeState>,
 ) {
     bi.core.remove_known_context(context_id);
-    bi.core.remove_bridge_state(context_id);
     bi.core.remove_economy_state(context_id);
     if let dashmap::mapref::entry::Entry::Occupied(occupied) = entry {
         occupied.remove();

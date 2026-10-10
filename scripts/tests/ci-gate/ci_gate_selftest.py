@@ -178,8 +178,8 @@ nothing:
                three paths, one of them the tracked ScpBindings.swift, so the
                checkout always supplied a match and the option could not fail
                the producer when build-xcframework.sh wrote nothing. The
-               kotlin-test upload lists the UniFFI cdylib and the Kotlin
-               bindings, and a build that wrote one of them satisfies the
+               uniffi-cdylib-linux upload lists the UniFFI cdylib and the
+               Kotlin bindings, and a build that wrote one of them satisfies the
                option the same way.
   lint-scope   One crate declared the lint the two rustdoc jobs exist to fire:
                crates/scp-runtime/src/lib.rs carried
@@ -825,6 +825,7 @@ RUST_ONLY_RUNS = {
     "swift-lint": False,
     "typescript-check": True,
     "typescript-wasm-check": False,
+    "uniffi-cdylib-linux": True,
     "xcframework": True,
 } | dict.fromkeys(CODE_JOBS, True)
 DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
@@ -845,7 +846,8 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromke
         "bridge-parity",
         "bridge-parity-kotlin",
         "bridge-parity-swift",
-        # Producer of the UniFFI cdylib bridge-parity-kotlin downloads.
+        # Its `python` clause predates the producer split and is kept so the Kotlin
+        # suite runs on every change it ran on before.
         "kotlin-test",
         "napi-addon",
         "pyo3-module",
@@ -854,6 +856,9 @@ PYTHON_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromke
         "python-test",
         "python-wheel-build",
         "rust-build-pyo3-production",
+        # Producer of the UniFFI cdylib and Kotlin bindings kotlin-test and
+        # bridge-parity-kotlin download.
+        "uniffi-cdylib-linux",
         "xcframework",
     ),
     True,
@@ -3764,8 +3769,8 @@ def selects(expression: str, outputs: dict[str, str], event_name: str) -> bool:
             return event_name
         if token == "github.event.pull_request.draft":
             # Held at false, so the enumeration covers the runs in which check-draft
-            # runs. On a draft pull request check-draft skips, every job that needs it
-            # skips with it, and scripts/ci-aggregate-result.py returns 0 on exactly
+            # and `changes` run. On a draft pull request both skip, every job that
+            # needs either skips with it, and scripts/ci-aggregate-result.py returns 0 on exactly
             # that state, because GitHub blocks merging a draft and a merge queue
             # re-runs this workflow on a merge_group event where the gate applies. A
             # draft run therefore has no job whose skip a merge could ride, which is
@@ -3898,6 +3903,64 @@ def check_dependency_conditions(doc: dict) -> None:
     )
 
 
+def draft_condition_gaps(doc: dict) -> list[str]:
+    """Return each way job `changes` fails to carry job check-draft's `if:`.
+
+    CRITERION: job `changes` carries an `if:` whose whitespace-normalised text equals
+    check-draft's, and that text reads `github.event.pull_request.draft`.
+
+    WHY: `changes` does not need check-draft, so that it starts when the run is
+    created. Every path-filtered job reaches the draft gate only through `changes`,
+    so `changes` without the draft `if:` runs on a draft pull request and every job
+    that needs it runs with it. scripts/ci-aggregate-result.py returns 0 for a
+    draft once it sees check-draft skipped, and fails a run in which check-draft
+    skipped and `changes` did not, so a divergence would also turn every draft run
+    red; this check reports it on the pull request that introduces it.
+    """
+    jobs = doc["jobs"]
+    gate = jobs.get("check-draft", {}).get("if")
+    if gate is None or "github.event.pull_request.draft" not in str(gate):
+        return [f"check-draft carries no draft `if:` (it carries {gate!r})"]
+    condition = jobs.get("changes", {}).get("if")
+    if condition is None:
+        return ["changes carries no `if:`, so it runs on a draft pull request"]
+    if " ".join(str(condition).split()) != " ".join(str(gate).split()):
+        return [f"changes carries `if: {condition}`, not check-draft's `if: {gate}`"]
+    return []
+
+
+def check_draft_condition(doc: dict) -> None:
+    gaps = draft_condition_gaps(doc)
+    check("ci.yml: job changes carries check-draft's `if:`", not gaps, "; ".join(gaps))
+    # Controls: `changes` without the `if:`, `changes` with a narrower one, and a
+    # check-draft whose `if:` changed while `changes` kept the old text each report.
+    absent = copy.deepcopy(doc)
+    del absent["jobs"]["changes"]["if"]
+    gaps = draft_condition_gaps(absent)
+    check(
+        "a changes job without the draft `if:` is reported",
+        any("changes carries no `if:`" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    narrowed = copy.deepcopy(doc)
+    narrowed["jobs"]["changes"]["if"] = "github.event_name == 'push'"
+    gaps = draft_condition_gaps(narrowed)
+    check(
+        "a changes job whose `if:` differs from check-draft's is reported",
+        any("not check-draft's" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    moved = copy.deepcopy(doc)
+    gate = moved["jobs"]["check-draft"]
+    gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
+    gaps = draft_condition_gaps(moved)
+    check(
+        "a check-draft `if:` that changes alone no longer carries is reported",
+        any("not check-draft's" in gap for gap in gaps),
+        f"{gaps}",
+    )
+
+
 def narrow_condition(expression: str, clause_fragment: str) -> str:
     """Drop every `||` clause of one `if:` expression that names a fragment.
 
@@ -3926,12 +3989,13 @@ def check_dependency_conditions_detect_a_narrowed_producer(doc: dict) -> None:
     """Narrowing one producer's condition by one clause is caught above.
 
     Each (producer, clause) pair below is a producer whose `if:` carries that clause
-    for bridge-parity-kotlin alone: kotlin-test's own tests need `kotlin || rust`, so
-    its `python` clause is the one an edit scoped to the Kotlin lane would drop.
+    for bridge-parity-kotlin alone: uniffi-cdylib-linux's other consumer, kotlin-test,
+    needs only `kotlin || rust` for its own tests, so the `python` clause is the one an
+    edit scoped to the Kotlin lane would drop.
     """
     for producer_id, clause in (
         ("pyo3-module", "outputs.kotlin"),
-        ("kotlin-test", "outputs.python"),
+        ("uniffi-cdylib-linux", "outputs.python"),
     ):
         narrowed = copy.deepcopy(doc)
         producer = narrowed["jobs"][producer_id]
@@ -4733,7 +4797,7 @@ ARTIFACT_KEY_JOB_FILE_INPUTS = {
     "xcframework": (
         ("bindings/swift/build-xcframework.sh", "the script that runs the build"),
     ),
-    "kotlin-test": (
+    "uniffi-cdylib-linux": (
         (
             "scripts/generate-uniffi-kotlin.sh",
             "the script that generates the Kotlin bindings",
@@ -4903,7 +4967,13 @@ def check_artifact_cache_keys(doc: dict) -> None:
     producers = bridge_producers(doc)
     check(
         "ci.yml: the artifact cache check reads all five bridge producers",
-        {"kotlin-test", "napi-addon", "pyo3-module", "pyo3-module-macos", "xcframework"}
+        {
+            "napi-addon",
+            "pyo3-module",
+            "pyo3-module-macos",
+            "uniffi-cdylib-linux",
+            "xcframework",
+        }
         <= set(producers),
         f"found {producers}",
     )
@@ -5211,8 +5281,8 @@ def check_artifact_input_digests_fail_closed(doc: dict) -> None:
 # marker file the job touches before its build under RUNNER_TEMP, the uploaded paths the
 # checkout tracks (a cache hit that leaves a tracked path out cannot be detected,
 # because the checkout supplies it), and whether its verify step rejects a
-# zero-byte output (kotlin-test's two paths are files; the xcframework's include
-# directories).
+# zero-byte output (uniffi-cdylib-linux's two paths are files; the xcframework's
+# include directories).
 MULTI_PATH_PRODUCERS = (
     (
         "xcframework",
@@ -5221,7 +5291,7 @@ MULTI_PATH_PRODUCERS = (
         ("bindings/swift/Sources/SCP/Internal/ScpBindings.swift",),
         False,
     ),
-    ("kotlin-test", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", (), True),
+    ("uniffi-cdylib-linux", "uniffi-kotlin-linux", "uniffi-kotlin-build-start", (), True),
 )
 # Uploaded paths that name a file rather than a directory.
 UPLOADED_FILE_SUFFIXES = (".swift", ".so", ".kt")
@@ -5269,17 +5339,17 @@ def check_multi_path_producers_are_listed(doc: dict) -> None:
         f"got {gaps}",
     )
     mutated = copy.deepcopy(doc)
-    for step in mutated["jobs"]["kotlin-test"]["steps"]:
+    for step in mutated["jobs"]["uniffi-cdylib-linux"]["steps"]:
         if (step.get("with") or {}).get("name") == "uniffi-kotlin-linux":
             step["with"]["path"] = step["with"]["path"].split()[0]
     gaps = multi_path_producer_gaps(mutated)
     check(
-        "kotlin-test uploading one path is reported as extra in the tuple",
+        "uniffi-cdylib-linux uploading one path is reported as extra in the tuple",
         gaps
         == [
             (
-                "kotlin-test is in MULTI_PATH_PRODUCERS and has no upload listing "
-                "several paths"
+                "uniffi-cdylib-linux is in MULTI_PATH_PRODUCERS and has no upload "
+                "listing several paths"
             )
         ],
         f"got {gaps}",
@@ -5306,8 +5376,9 @@ def check_multi_path_outputs_are_verified(
 
     WHY: `if-no-files-found: error` fires only when all listed paths together match
     nothing. The xcframework upload lists the tracked ScpBindings.swift, so the
-    checkout always supplies a match, and a build that writes one of kotlin-test's
-    two paths satisfies the option, so the option alone cannot fail either producer.
+    checkout always supplies a match, and a build that writes one of
+    uniffi-cdylib-linux's two paths satisfies the option, so the option alone cannot
+    fail either producer.
     """
     steps = doc["jobs"][job_id]["steps"]
     upload = next(
@@ -6504,6 +6575,7 @@ def check_push_runs_every_cache_writer(doc: dict) -> None:
         "rust-test-macos",
         "rust-test-optional-features",
         "typescript-wasm-check",
+        "uniffi-cdylib-linux",
         "xcframework",
     ):
         check(f"{job_id} is read as a cache writer", job_id in writers, f"{writers}")
@@ -7070,13 +7142,26 @@ def check_push_writer_mutants(doc: dict) -> None:
         f"{gaps}",
     )
 
+    # Every writer reaches the draft gate through `changes`, which carries
+    # check-draft's `if:` instead of needing check-draft. A push skip on `changes`
+    # is reported as a dependency gap; a push skip on check-draft alone is reported
+    # as a divergence between the two draft conditions.
     draft = copy.deepcopy(doc)
-    gate = draft["jobs"]["check-draft"]
+    gate = draft["jobs"]["changes"]
     gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
     gaps = dependency_condition_gaps(draft)
     check(
-        "a push skip on check-draft, which every writer needs, is reported",
-        any("changes runs and check-draft skips on event push" in gap for gap in gaps),
+        "a push skip on changes, which every writer needs, is reported",
+        any("and changes skips on event push" in gap for gap in gaps),
+        f"{gaps}",
+    )
+    draft = copy.deepcopy(doc)
+    gate = draft["jobs"]["check-draft"]
+    gate["if"] = f"github.event_name != 'push' && ({gate['if']})"
+    gaps = dependency_condition_gaps(draft) + draft_condition_gaps(draft)
+    check(
+        "a push skip on check-draft is reported",
+        any("not check-draft's" in gap for gap in gaps),
         f"{gaps}",
     )
 
@@ -7655,7 +7740,10 @@ def run_one_job_aggregate(expression: str, event: str) -> tuple[int, str]:
     workflow = {
         "jobs": {
             "check-draft": {"runs-on": "ubuntu-latest"},
-            "changes": {"needs": "check-draft", "outputs": {"rust": "x", "python": "x"}},
+            "changes": {
+                "if": "github.event.pull_request.draft == false",
+                "outputs": {"rust": "x", "python": "x"},
+            },
             "probe": {"needs": "changes", "if": expression},
             "ci": {"if": "always()", "needs": ["check-draft", "changes", "probe"]},
         }
@@ -8165,6 +8253,7 @@ def run_needs_condition(inputs: Inputs) -> None:
     workflow = inputs.workflow
     print("needs-condition — a job's dependencies run wherever the job does")
     check_dependency_conditions(workflow)
+    check_draft_condition(workflow)
     check_dependency_conditions_detect_a_narrowed_producer(workflow)
     check_dependency_conditions_detect_a_conditionless_consumer(workflow)
     check_dependency_conditions_read_a_status_guarded_consumer(workflow)
@@ -8548,6 +8637,28 @@ def run_push_skips(inputs: Inputs) -> None:
     needs["changes"]["outputs"] = dict(docs_pr.filters)
     code, out = run_aggregate(needs, docs_pr.event)
     check("draft pull request, every job skipped -> exit 0", code == 0, out)
+
+    # `changes` carries check-draft's `if:` rather than needing it, so the two skip
+    # together. Either one skipping alone means their conditions diverged.
+    needs = build_needs(jobs, docs_pr)
+    for entry in needs.values():
+        entry["result"] = "skipped"
+    needs["changes"] = {"result": "success", "outputs": dict(docs_pr.filters)}
+    code, out = run_aggregate(needs, docs_pr.event)
+    check(
+        "check-draft skipped while changes ran -> exit 1",
+        code == 1 and "conditions diverged" in out,
+        f"exit {code}: {out}",
+    )
+
+    needs = build_needs(jobs, docs_pr)
+    needs["changes"] = {"result": "skipped", "outputs": {}}
+    code, out = run_aggregate(needs, docs_pr.event)
+    check(
+        "check-draft ran while changes skipped -> exit 1",
+        code == 1 and "changes: skipped" in out,
+        f"exit {code}: {out}",
+    )
 
     needs = build_needs(jobs, docs_pr)
     needs.pop("wasm-test")

@@ -119,6 +119,9 @@ scp-mcp = { path = "../scp-mcp", features = ["testing"] }
 pyo3 = { version = "0.24.1", features = ["auto-initialize", "multiple-pymethods"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing", "custody"] }
+# The test build needs `scp-core/testing`, which turns on `scp-runtime/testing`.
+# Name it here instead of relying on another crate's feature list.
+scp-core = { path = "../scp-core", features = ["testing"] }
 # Tests need InMemoryKeyCustody.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 # Tests construct `InMemoryDhtClient` directly (the §17.17.3 DHT nullifier) via

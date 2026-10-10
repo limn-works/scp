@@ -11,8 +11,6 @@
 
 #![forbid(unsafe_code)]
 
-pub mod bridge_auth;
-pub mod bridge_handlers;
 pub mod config;
 pub mod dev_api;
 pub mod dns_provider;
@@ -23,7 +21,6 @@ mod published_state;
 mod republish;
 pub mod self_host;
 pub mod tls;
-pub mod webhook;
 mod well_known;
 
 use std::collections::HashMap;
@@ -54,7 +51,7 @@ pub(crate) use published_state::{
 #[cfg(test)]
 pub(crate) use published_state::{DidPublisher, PublishAuthorization};
 
-pub use http::BroadcastContext;
+pub use http::{BoundApplicationNode, BroadcastContext};
 pub use projection::{
     DeployManifest, DeployManifestEntry, PathEntry, ProjectedContext, SiteConfig,
 };
@@ -131,20 +128,20 @@ pub const DEFAULT_PROJECTION_RATE_LIMIT: u32 = 60;
 /// [`Full`](PublicSurface::Full) protocol surface. The `--self-host`
 /// website-hosting mode serves the restricted [`SelfHost`](PublicSurface::SelfHost)
 /// surface so the public bind exposes only the read-only website projection
-/// and never the relay upgrade or bridge routes (§10.12.8).
+/// and never the relay upgrade (§10.12.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicSurface {
     /// Full protocol surface: `.well-known/scp`, the `/scp/v1` relay
-    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), the
-    /// bridge routes (`/v1/scp/bridge/*`), ACME challenges, and the
-    /// virtual-host fallback. Used by every run mode except `--self-host`.
+    /// WebSocket upgrade, broadcast projection (`/scp/broadcast/*`), ACME
+    /// challenges, and the virtual-host fallback. Used by every run mode
+    /// except `--self-host`.
     Full,
     /// Restricted website surface for `--self-host`: `.well-known/scp`, the
     /// broadcast projection endpoints (`/scp/broadcast/*`, including
     /// `/feed`, `/messages`, and `/site`), and the virtual-host fallback —
-    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) and the bridge
-    /// routes (`/v1/scp/bridge/*`) are NOT mounted, so an anonymous internet
-    /// client cannot reach the node's relay or bridge through the public bind.
+    /// and nothing else. The relay upgrade/bridge (`/scp/v1`) is NOT mounted,
+    /// so an anonymous internet client cannot reach the node's relay or bridge
+    /// through the public bind.
     SelfHost,
 }
 
@@ -436,55 +433,6 @@ impl<S: Storage> ApplicationNode<S> {
         self.state.live_state.get().relay_url
     }
 
-    /// Returns a clonable handle to this node's outbound webhook dispatcher.
-    ///
-    /// The dispatcher fans context events out to registered bridge webhook
-    /// endpoints (spec §12.2.1, §12.10.5). It is fed by two producers:
-    ///
-    /// 1. The inbound HTTP relay endpoint (`POST /v1/scp/bridge/webhook`),
-    ///    which reconciles platform-originated events.
-    /// 2. The local `Supervisor` event channel, wired via
-    ///    [`wire_context_events`](Self::wire_context_events).
-    #[must_use]
-    pub fn webhook_dispatcher(&self) -> Arc<crate::webhook::WebhookDispatcher> {
-        self.state.bridge_state.webhook_dispatcher()
-    }
-
-    /// Spawns a background task that forwards local `Supervisor` events to
-    /// this node's [`WebhookDispatcher`](crate::webhook::WebhookDispatcher).
-    ///
-    /// This is the production wire for SCP-to-platform webhook delivery
-    /// (§12.10.5): when a context the node hosts emits an event (message
-    /// received/sent, member joined/left, governance action), the event is
-    /// translated and dispatched to every registered webhook target matching
-    /// that context.
-    ///
-    /// The caller supplies a fresh broadcast receiver obtained from
-    /// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events).
-    /// The returned [`JoinHandle`](tokio::task::JoinHandle) owns the consumer
-    /// task; the caller MUST retain or supervise it so the task is aborted on
-    /// shutdown (otherwise it runs until the `Supervisor` — and therefore the
-    /// broadcast sender — is dropped, which closes the channel and stops the
-    /// consumer cleanly).
-    ///
-    /// # Fail-safe
-    ///
-    /// Webhook delivery is best-effort. A slow or unreachable webhook endpoint
-    /// cannot block or crash context operations: the broadcast channel drops
-    /// the oldest events for lagging consumers (logged, never panics), and the
-    /// dispatcher performs HTTP I/O on its own spawned tasks with bounded
-    /// retries.
-    #[must_use]
-    pub fn wire_context_events(
-        &self,
-        events: tokio::sync::broadcast::Receiver<(
-            String,
-            scp_core::context::membership::ContextEvent,
-        )>,
-    ) -> tokio::task::JoinHandle<()> {
-        crate::webhook::spawn_event_consumer(events, self.webhook_dispatcher())
-    }
-
     /// Returns the TLS certificate resolver for ACME hot-reload.
     ///
     /// Returns `Some` in domain mode when TLS is active, `None` in
@@ -639,13 +587,13 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// [`PublicSurface::Full`] exposes the complete protocol surface:
     /// `.well-known/scp`, the `/scp/v1` relay WebSocket upgrade, the broadcast
-    /// projection endpoints (`/scp/broadcast/*`), the bridge routes
-    /// (`/v1/scp/bridge/*`), ACME challenges, and the virtual-host fallback.
+    /// projection endpoints (`/scp/broadcast/*`), ACME challenges, and the
+    /// virtual-host fallback.
     ///
     /// [`PublicSurface::SelfHost`] exposes ONLY the read-only website surface:
     /// `.well-known/scp`, the broadcast projection endpoints, and the
-    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) and the
-    /// bridge routes (`/v1/scp/bridge/*`) are deliberately NOT mounted — in
+    /// virtual-host fallback. The relay upgrade/bridge (`/scp/v1`) is
+    /// deliberately NOT mounted — in
     /// self-host mode the node's loopback relay is reached in-process over
     /// `127.0.0.1` and must never be exposed to anonymous internet clients on
     /// the public bind (§10.12.8; exposing `/scp/v1` would let an anonymous
@@ -666,19 +614,7 @@ impl<S: Storage> ApplicationNode<S> {
         match surface {
             PublicSurface::Full => {
                 let relay_rt = http::relay_router(Arc::clone(&self.state));
-                let (bridge, bridge_webhook) = http::build_bridge_routers(
-                    &self.state.bridge_state,
-                    self.state.bridge_lookup.as_ref(),
-                );
-                http::build_merged_router(
-                    app_router,
-                    well_known,
-                    relay_rt,
-                    projection,
-                    bridge,
-                    bridge_webhook,
-                    &self.state,
-                )
+                http::build_merged_router(app_router, well_known, relay_rt, projection, &self.state)
             }
             PublicSurface::SelfHost => {
                 http::build_self_host_router(app_router, well_known, projection, &self.state)
@@ -794,8 +730,8 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// [`PublicSurface::SelfHost`] mounts ONLY the read-only website
     /// projection surface (`.well-known/scp`, `/scp/broadcast/*`, and the
-    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) and bridge
-    /// routes (`/v1/scp/bridge/*`) are not exposed on the background listener
+    /// virtual-host fallback) — the relay upgrade (`/scp/v1`) is not exposed
+    /// on the background listener
     /// (§10.12.8). All other behavior (no TLS, no dev API, double-serve
     /// prevention, shutdown via the node's cancellation token) is identical to
     /// [`serve_background`](Self::serve_background).
@@ -841,6 +777,60 @@ impl<S: Storage> ApplicationNode<S> {
         surface: PublicSurface,
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<SocketAddr, NodeError> {
+        self.claim_background_serve()?;
+
+        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+
+        // Security: warn when binding a *plaintext* listener to a non-loopback
+        // address. When a TLS config is present (self-host self-signed cert),
+        // traffic is encrypted, so the "unencrypted" warning would be wrong.
+        if !addr.ip().is_loopback() && tls_config.is_none() {
+            tracing::warn!(
+                bind_addr = %addr,
+                "serve_background binding to non-loopback address — \
+                 HTTP traffic is unencrypted (no TLS) and will be \
+                 accessible from the network"
+            );
+        }
+
+        // Bind the TCP listener before spawning so we can report errors
+        // and the bound address synchronously.
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            // Reset serving flag on bind failure.
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!(
+                "failed to bind background HTTP server on {addr}: {e}"
+            ))
+        })?;
+        self.spawn_background_server(listener, surface, tls_config)
+            .await
+    }
+
+    /// Serves the public surface in the background on a listener the caller
+    /// already bound, returning the listener's local address.
+    ///
+    /// [`crate::self_host::host_site_until`] binds its public listener before it
+    /// builds the node, so a `port` of 0 resolves to the OS-assigned port that
+    /// the node's configuration, NAT mapping, and ready signal all report.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::serve_background_with_surface_tls`], except that no
+    /// bind happens here.
+    pub(crate) async fn serve_background_on_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
+        self.claim_background_serve()?;
+        self.spawn_background_server(listener, surface, tls_config)
+            .await
+    }
+
+    /// Rejects a background serve on a shut-down node and claims the
+    /// single-serve flag. The caller resets the flag on a later failure.
+    fn claim_background_serve(&self) -> Result<(), NodeError> {
         // Reject if the node has already been shut down — the cancellation
         // token is already cancelled so the server would exit immediately.
         if self.state.shutdown_token.is_cancelled() {
@@ -860,34 +850,22 @@ impl<S: Storage> ApplicationNode<S> {
             ));
         }
 
-        let addr = bind_addr.unwrap_or(DEFAULT_BACKGROUND_HTTP_BIND_ADDR);
+        Ok(())
+    }
 
-        // Security: warn when binding a *plaintext* listener to a non-loopback
-        // address. When a TLS config is present (self-host self-signed cert),
-        // traffic is encrypted, so the "unencrypted" warning would be wrong.
-        if !addr.ip().is_loopback() && tls_config.is_none() {
-            tracing::warn!(
-                bind_addr = %addr,
-                "serve_background binding to non-loopback address — \
-                 HTTP traffic is unencrypted (no TLS) and will be \
-                 accessible from the network"
-            );
-        }
-
+    /// Spawns the background server on a bound listener. The caller holds the
+    /// single-serve flag; it is reset if the local address cannot be read.
+    async fn spawn_background_server(
+        &self,
+        listener: tokio::net::TcpListener,
+        surface: PublicSurface,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+    ) -> Result<SocketAddr, NodeError> {
         let shutdown_token = self.state.shutdown_token.clone();
 
         // Build the merged router for the requested public surface.
         let merged = self.build_scp_router_with_surface(axum::Router::new(), surface);
 
-        // Bind the TCP listener before spawning so we can report errors
-        // and the bound address synchronously.
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-            // Reset serving flag on bind failure.
-            self.serving.store(false, Ordering::SeqCst);
-            NodeError::Serve(format!(
-                "failed to bind background HTTP server on {addr}: {e}"
-            ))
-        })?;
         let local_addr = listener.local_addr().map_err(|e| {
             self.serving.store(false, Ordering::SeqCst);
             NodeError::Serve(format!("failed to get local address: {e}"))
@@ -3310,16 +3288,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         "application node started (domain mode, TLS active)"
     );
 
-    // Build the production bridge auth lookup, hydrating from storage.
-    // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        format!("https://{domain}"),
-    ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
-
     // Start this node's self-DID republish cycle (ADR-003 §2). Below every
     // fallible step in this builder, so no `?` leaves arms to tear down.
     let republish = start_node_republish_cycle(&did_method, &live_state).await;
@@ -3350,8 +3318,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         acme_challenges,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         default_site_routing_id: std::sync::RwLock::new(None),
-        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-        bridge_lookup: Some(bridge_lookup),
         #[cfg(feature = "quic")]
         publish_rate_limiter,
         #[cfg(feature = "quic")]
@@ -3675,23 +3641,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         ))
     };
 
-    // Bridge auth lookup — audience is the relay URL in no-domain mode (spec
-    // 12.10.2). Deliberately a SNAPSHOT, not a clone of the slot: the audience is
-    // this node's stable JWT-validation identity, not its reachability address.
-    // `load_from_storage` persists it once (`bridge/config/audience`) and never
-    // overwrites it, so it is already pinned across restarts — and making it
-    // follow a NAT tier change would silently invalidate every bridge credential
-    // an operator had already minted against the old value. The domain builder
-    // makes the same distinction visible: there the audience is
-    // `https://<domain>`, which is not the relay URL at all.
-    let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
-        Arc::clone(&storage),
-        live_state.get().relay_url,
-    ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
-
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         live_state: live_state.clone(),
@@ -3718,8 +3667,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         acme_challenges: None,
         hostname_index: tokio::sync::RwLock::new(HashMap::new()),
         default_site_routing_id: std::sync::RwLock::new(None),
-        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
-        bridge_lookup: Some(bridge_lookup),
         // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
         #[cfg(feature = "quic")]
         publish_rate_limiter,
@@ -4375,18 +4322,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_listening_before_did_publish() {
+    async fn relay_binds_before_did_publish() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Create a DID method that verifies the relay is listening when
-        // publish() is called.
-        struct RelayCheckDidMethod {
+        // A DID method that records whether `publish()` was called.
+        struct PublishRecorder {
             inner: TestDidDht,
-            relay_was_listening_at_publish: Arc<AtomicBool>,
-            bind_addr: SocketAddr,
+            published: Arc<AtomicBool>,
         }
 
-        impl DidMethod for RelayCheckDidMethod {
+        impl DidMethod for PublishRecorder {
             /// These doubles observe what the builders publish; none of them
             /// keeps a record alive, so the keep-alive client is the fail-closed
             /// `DisabledDhtClient` rather than one that would report a false
@@ -4421,17 +4366,8 @@ mod tests {
             ) -> impl std::future::Future<
                 Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
             > + Send {
-                // Probe the relay bind address to see if it's listening.
-                let addr = self.bind_addr;
-                let flag = Arc::clone(&self.relay_was_listening_at_publish);
-                let inner = &self.inner;
-                async move {
-                    // Attempt a TCP connection to the relay's bound port.
-                    if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    inner.publish(identity, document).await
-                }
+                self.published.store(true, Ordering::SeqCst);
+                self.inner.publish(identity, document)
             }
 
             fn resolve(
@@ -4453,47 +4389,63 @@ mod tests {
             }
         }
 
-        // We need to know the bind address ahead of time so the DID method
-        // can probe it.  Bind to port 0 and let the OS pick a port — but the
-        // relay picks the port, so we pre-bind a listener, record its address,
-        // then drop it and hand the same address to the config.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind_addr = listener.local_addr().unwrap();
-        drop(listener); // free the port for the relay
-
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let relay_was_listening = Arc::new(AtomicBool::new(false));
-
-        let check_method = Arc::new(RelayCheckDidMethod {
-            inner: make_test_dht(&custody),
-            relay_was_listening_at_publish: Arc::clone(&relay_was_listening),
-            bind_addr,
-        });
-
-        let _node = Node::start_for_testing(NodeConfig {
-            bind_addr: Some(bind_addr),
-            dht: DhtMode::Production,
-            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
-                domain: "relay-order.example.com".to_owned(),
-            })),
-            ..NodeConfig::defaults(
-                Reach::Domain {
+        // Starts a domain node whose relay binds `bind_addr`, publishing through
+        // a recorder. Returns the start result and whether `publish()` ran.
+        async fn start_recording(bind_addr: SocketAddr) -> (Result<(), NodeError>, bool) {
+            let custody = Arc::new(InMemoryKeyCustody::new());
+            let published = Arc::new(AtomicBool::new(false));
+            let recorder = Arc::new(PublishRecorder {
+                inner: make_test_dht(&custody),
+                published: Arc::clone(&published),
+            });
+            let result = Node::start_for_testing(NodeConfig {
+                bind_addr: Some(bind_addr),
+                dht: DhtMode::Production,
+                tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
                     domain: "relay-order.example.com".to_owned(),
-                },
-                IdentitySource::Generate {
-                    custody,
-                    did_method: check_method,
-                },
-                InMemoryStorage::new(),
-                BlobStorageBackend::in_memory(),
-            )
-        })
-        .await
-        .unwrap();
+                })),
+                ..NodeConfig::defaults(
+                    Reach::Domain {
+                        domain: "relay-order.example.com".to_owned(),
+                    },
+                    IdentitySource::Generate {
+                        custody,
+                        did_method: recorder,
+                    },
+                    InMemoryStorage::new(),
+                    BlobStorageBackend::in_memory(),
+                )
+            })
+            .await
+            .map(drop);
+            (result, published.load(Ordering::SeqCst))
+        }
 
+        // The ordering proof: hold the relay's address for the whole start, so
+        // the relay bind fails. If the start published before binding the
+        // relay, `publish()` would already have run when the bind failed.
+        // Holding the listener (never dropping it before the start) leaves no
+        // window for another socket to take the port.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held_addr = held.local_addr().unwrap();
+        let (result, published) = start_recording(held_addr).await;
         assert!(
-            relay_was_listening.load(Ordering::SeqCst),
-            "relay must be listening BEFORE DID document is published"
+            result.is_err(),
+            "a relay whose address is held must fail the start"
+        );
+        assert!(
+            !published,
+            "the relay must bind BEFORE the DID document is published"
+        );
+        drop(held);
+
+        // Control: with a free relay address the same start publishes, so the
+        // recorder observes `publish()` and the assertion above is not vacuous.
+        let (result, published) = start_recording(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+        result.expect("a node whose relay can bind must start");
+        assert!(
+            published,
+            "a started domain node must publish its DID document"
         );
     }
 

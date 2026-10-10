@@ -121,7 +121,8 @@ const EVICTION_WAIT: Duration = Duration::from_secs(5);
 /// log line that carried it would let any reader of the log claim the session.
 #[derive(Clone)]
 pub struct SseConfig {
-    /// The address to bind the HTTP server to (e.g., `127.0.0.1:3000`).
+    /// The address to bind the HTTP server to (e.g., `127.0.0.1:3000`). Port 0
+    /// asks the OS for a free port; [`bind_sse`] reports the port it bound.
     pub bind_addr: SocketAddr,
 
     /// Capacity of the broadcast channel for SSE messages.
@@ -543,6 +544,10 @@ async fn bearer_auth_middleware(
 /// handshake and subscriptions before it admits the new stream, so the new
 /// client starts with neither.
 ///
+/// `run_sse` is [`bind_sse`] followed by [`BoundSse::serve`]; a caller that
+/// needs the bound address (for example after requesting port 0) calls the
+/// two steps itself.
+///
 /// # Errors
 ///
 /// Returns [`SseError::Io`] if the server cannot bind or encounters an I/O
@@ -551,6 +556,86 @@ pub async fn run_sse<P: ContextProvider + 'static>(
     server: McpServerForTransport<P>,
     config: SseConfig,
     shutdown: ShutdownHandle,
+) -> Result<(), SseError> {
+    bind_sse(server, config, shutdown).await?.serve().await
+}
+
+/// Binds the SSE transport's listener on [`SseConfig::bind_addr`] without
+/// serving yet, and returns a [`BoundSse`] that reports the address the
+/// operating system assigned.
+///
+/// A caller that requests port 0 learns the real port from
+/// [`BoundSse::local_addr`] and serves on the listener already bound, so no
+/// window exists between learning the port and binding it. Nothing else
+/// starts until [`BoundSse::serve`]: the event pump and the session
+/// machinery start there, and dropping an unserved `BoundSse` closes the
+/// listener and starts nothing.
+///
+/// # Errors
+///
+/// Returns [`SseError::Io`] if the listener cannot bind or its bound address
+/// cannot be read.
+pub async fn bind_sse<P: ContextProvider + 'static>(
+    server: McpServerForTransport<P>,
+    config: SseConfig,
+    shutdown: ShutdownHandle,
+) -> Result<BoundSse<P>, SseError> {
+    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+    let local_addr = listener.local_addr()?;
+    Ok(BoundSse {
+        server,
+        config,
+        shutdown,
+        listener,
+        local_addr,
+    })
+}
+
+/// An SSE transport whose listener is bound but not yet served.
+///
+/// Returned by [`bind_sse`]; [`serve`](Self::serve) runs the server exactly as
+/// [`run_sse`] does after its bind step.
+#[must_use = "a bound SSE transport serves nothing until `serve` is awaited"]
+pub struct BoundSse<P: ContextProvider + 'static> {
+    server: McpServerForTransport<P>,
+    config: SseConfig,
+    shutdown: ShutdownHandle,
+    listener: tokio::net::TcpListener,
+    local_addr: SocketAddr,
+}
+
+impl<P: ContextProvider + 'static> BoundSse<P> {
+    /// The address the listener is bound to.
+    #[must_use]
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Serves on the bound listener until the [`ShutdownHandle`] is triggered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SseError::Io`] if the server encounters an I/O error.
+    pub async fn serve(self) -> Result<(), SseError> {
+        let Self {
+            server,
+            config,
+            shutdown,
+            listener,
+            local_addr,
+        } = self;
+        serve_sse(server, &config, shutdown, listener, local_addr).await
+    }
+}
+
+/// The serve half of [`run_sse`]: builds the router and pump, then serves on
+/// `listener` until shutdown.
+async fn serve_sse<P: ContextProvider + 'static>(
+    server: McpServerForTransport<P>,
+    config: &SseConfig,
+    shutdown: ShutdownHandle,
+    listener: tokio::net::TcpListener,
+    local_addr: SocketAddr,
 ) -> Result<(), SseError> {
     // `Some(pump)` exactly when the server is wired — the bundle guarantees it,
     // so no pairing check is needed here.
@@ -565,15 +650,14 @@ pub async fn run_sse<P: ContextProvider + 'static>(
     // no pump left to serve them.
     let server_token = shutdown.token.child_token();
     let _sessions_guard = server_token.clone().drop_guard();
-    let (router, pump) = router_with_pump(server, &config, pump, server_token);
+    let (router, pump) = router_with_pump(server, config, pump, server_token);
     // Hold the pump under a guard that aborts it on every exit from this future,
     // for the same reason: a bare `JoinHandle` dropped without `abort()` only
     // detaches the task, which — holding an `Arc<AppState>` — would outlive the
     // server.
     let _pump_guard = pump.map(crate::stdio::AbortOnDrop);
 
-    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
-    tracing::info!("MCP SSE server listening on {}", config.bind_addr);
+    tracing::info!("MCP SSE server listening on {local_addr}");
 
     let token = shutdown.token.clone();
     axum::serve(listener, router)
@@ -1593,16 +1677,7 @@ mod tests {
         let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
-        // Reserve a free port, then hand it to `run_sse`, which binds its own
-        // listener and does not report the port it bound.
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let mut config = SseConfig::new(addr);
-        config.auth_token = "shutdown-secret".to_owned();
-        let handle = ShutdownHandle::new();
-        let task = tokio::spawn(run_sse(bundle, config, handle.clone()));
+        let (addr, task, handle) = serve_on_port_zero(bundle, "shutdown-secret").await;
 
         // Attach a session over a real connection; its endpoint event proves
         // the response stream is open.
@@ -2750,14 +2825,7 @@ mod tests {
         let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let mut config = SseConfig::new(addr);
-        config.auth_token = "abort-secret".to_owned();
-
-        let task = tokio::spawn(run_sse(bundle, config, ShutdownHandle::new()));
+        let (addr, task, _handle) = serve_on_port_zero(bundle, "abort-secret").await;
         // The client's own `GET`, so this also checks that the connection
         // closes once the stream ends.
         let mut conn = attach_session(addr, "abort-secret").await;
@@ -2803,14 +2871,7 @@ mod tests {
         let (_event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
         let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let bundle = McpServerForTransport(TransportBundle::Wired(server, pump));
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let mut config = SseConfig::new(addr);
-        config.auth_token = "evict-secret".to_owned();
-        let handle = ShutdownHandle::new();
-        let task = tokio::spawn(run_sse(bundle, config, handle.clone()));
+        let (addr, task, handle) = serve_on_port_zero(bundle, "evict-secret").await;
 
         let mut first = attach_session(addr, "evict-secret").await;
         let second = attach_session(addr, "evict-secret").await;
@@ -2824,6 +2885,33 @@ mod tests {
 
         drop(second);
         handle.shutdown();
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("run_sse must return after shutdown")
+            .expect("the serve task must not panic")
+            .expect("serve must shut down without error");
+    }
+
+    /// Binds an SSE transport on `127.0.0.1:0` with `token`, then serves it on
+    /// a spawned task. Returns the bound address (the listener the server
+    /// already holds, so no other socket can take the port), the serve task,
+    /// and the shutdown handle.
+    async fn serve_on_port_zero(
+        bundle: McpServerForTransport<MockProvider>,
+        token: &str,
+    ) -> (
+        SocketAddr,
+        tokio::task::JoinHandle<Result<(), SseError>>,
+        ShutdownHandle,
+    ) {
+        let mut config = SseConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        token.clone_into(&mut config.auth_token);
+        let handle = ShutdownHandle::new();
+        let bound = bind_sse(bundle, config, handle.clone())
+            .await
+            .expect("bind_sse must bind 127.0.0.1:0");
+        let addr = bound.local_addr();
+        assert_ne!(addr.port(), 0, "local_addr must report the bound port");
+        (addr, tokio::spawn(bound.serve()), handle)
     }
 }

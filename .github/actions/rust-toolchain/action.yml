@@ -1,0 +1,33 @@
+name: Install the pinned Rust toolchain
+description: >-
+  Reads the channel out of a toolchain file, installs it under the minimal profile with
+  only the components and targets the job names, retrying a failed download with backoff,
+  sets it as the override of that file's directory, and asserts that `rustc -V` there
+  reports it. install.sh beside this file states why and every failure it reports.
+inputs:
+  toolchain-file:
+    description: The toolchain file whose channel to install, relative to the workspace.
+    required: false
+    default: rust-toolchain.toml
+  components:
+    description: >-
+      Components beyond the minimal profile's rustc, cargo and rust-std, comma-separated
+      (for example `clippy` or `rustfmt`). Empty installs none.
+    required: false
+    default: ""
+  targets:
+    description: >-
+      Targets beyond the host, comma-separated (for example `wasm32-unknown-unknown`).
+      Empty installs the host's standard library alone.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install the pinned Rust toolchain
+      shell: bash
+      env:
+        TOOLCHAIN_FILE: ${{ inputs.toolchain-file }}
+        COMPONENTS: ${{ inputs.components }}
+        TARGETS: ${{ inputs.targets }}
+      run: bash "$GITHUB_ACTION_PATH/install.sh" "$TOOLCHAIN_FILE" "$COMPONENTS" "$TARGETS"
