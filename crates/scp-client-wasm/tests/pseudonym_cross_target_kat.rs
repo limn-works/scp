@@ -47,10 +47,13 @@ use wasm_bindgen_test::wasm_bindgen_test;
 // Fixed inputs (identical on every target and every run)
 // ---------------------------------------------------------------------------
 
-/// The announcer DID pinned into the golden wire blob and the classifier matrix.
-const KAT_MEMBER_DID: &str = "did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA";
-/// A second DID for the sender-mismatch / cross-DID-collision matrix rows.
-const KAT_OTHER_DID: &str = "did:dht:z6MkPseudonymKatFixtureOtherBBBBBBBBBBBBBBB";
+/// The announcer identifier pinned into the golden wire blob and the
+/// classifier matrix: §25.19 Vector 36's `SHA-256("SCP test vector identifier
+/// announcing member")` in the `scp:` text form.
+const KAT_MEMBER_DID: &str = "scp:z5glr2inbuzd33xrfkdgpjejz4x7z4r2jxcsfvdxbwtgoi73xx2q";
+/// A second identifier for the sender-mismatch / cross-DID-collision matrix
+/// rows: §25.19 Vector 36's "other member" fixture identifier.
+const KAT_OTHER_DID: &str = "scp:ur5v4nca7x4lfagd2fojmjydguxwjwvfz2tur63s3x3k5vvqmppa";
 /// The context id the classifier derives reserved routing IDs against.
 const KAT_CONTEXT_ID: &str = "ctx-adr057-pseudonym-kat";
 /// A fixed, honest (non-reserved) 32-byte routing ID.
@@ -66,7 +69,7 @@ const KAT_PSEUDONYM: [u8; 32] = [0x42u8; 32];
 /// `serde_bytes` binary field — deterministic and target-independent. If this
 /// moves, the wire format changed (a spec-observable event, §25.19), not a
 /// refactor.
-const GOLDEN_PSEUDONYM_ANNOUNCEMENT_HEX: &str = "83a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7631aa6d656d6265725f646964d9336469643a6468743a7a364d6b50736575646f6e796d4b6174466978747572654d656d6265724141414141414141414141414141a970736575646f6e796dc4204242424242424242424242424242424242424242424242424242424242424242";
+const GOLDEN_PSEUDONYM_ANNOUNCEMENT_HEX: &str = "83a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7631aa6d656d6265725f646964d9387363703a7a35676c7232696e62757a6433337872666b6467706a656a7a3478377a3472326a78637366766478627774676f69373378783271a970736575646f6e796dc4204242424242424242424242424242424242424242424242424242424242424242";
 
 // ---------------------------------------------------------------------------
 // Helpers
