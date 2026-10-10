@@ -746,6 +746,8 @@ jobs:
       - run: python3.12 scripts/check-call-invariants.py
       - name: cfg-walker unit tests (regression guard for MAJOR-1/MINOR-1/MINOR-2)
         run: python3.12 -m pytest scripts/tests/call-invariants/ -v
+      - name: summarize-cargo-timings unit tests
+        run: python3.12 -m pytest scripts/tests/summarize-cargo-timings/ -v
 
   # ── Protocol enforcement ─────────────────────────────────────────────
   protocol-sync:
@@ -3162,9 +3164,10 @@ jobs:
           PYTHONPATH=. pytest tests/ -v -m "not parity"
       # `cd bindings/python` above resolves `tests/` to `bindings/python/tests/`,
       # so this step runs no pytest suite that lives elsewhere in this
-      # repository. Four such suites exist. Two of them, under `scripts/`, run in
-      # their own steps (`scripts/test_check_sdk_coverage.py` and
-      # `scripts/tests/call-invariants/`). The other two run in no CI job, and
+      # repository. Five such suites exist. Three of them, under `scripts/`, run
+      # in their own steps (`scripts/test_check_sdk_coverage.py`,
+      # `scripts/tests/call-invariants/` and
+      # `scripts/tests/summarize-cargo-timings/`). The other two run in no CI job, and
       # each comment below says why its suite gets no step.
       #
       # `examples/reference-agent/test_agent.py` gets no step. Two of its 23
