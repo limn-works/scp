@@ -59,8 +59,8 @@ custody = ["dep:scp-platform"]
 # shipped build instead of running a nullifier-backed node. No test-harness
 # platform edge is present, transitively or otherwise — G1 proves it.
 # `resolvers` is listed because `server.rs` names `scp_core::context::supervisor::Supervisor`
-# (in `wire_and_supervise_context_events`) and `crate::bridge_instance::CoreFields`
-# (in `register_node`), and both live behind `resolvers`. That edge held before
+# and `crate::bridge_instance::CoreFields` (in `register_node`), and both live
+# behind `resolvers`. That edge held before
 # this line existed only because `resolvers` is a default feature; declaring it
 # makes `--no-default-features --features server` compile rather than fail on a
 # missing `scp-core` dep. It resolves no new feature anywhere, because every
