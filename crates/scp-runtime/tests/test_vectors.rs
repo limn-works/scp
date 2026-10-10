@@ -80,7 +80,6 @@ const ID_NEW_MEMBER: &str = "scp:ykcz3x3dycntc6lkxzbe3nixvd7w5c37riaowlh26lczdnc
 const ID_HPKE_SENDER: &str = "scp:jx35aojrkpxu2pjy7k6v6blpsotz5iakm7yui2t3rc6lmthfcbpa";
 const ID_ISSUER: &str = "scp:mhe6nmpij74wrgb46ngrakeetnlycmnfmcgppkfqqufyl7kkl3ia";
 const ID_SUBJECT: &str = "scp:ktarg6aqtsju6mh2ws3hk7t5kmsvmckq7d5eqwsmaw5di3e3p4ta";
-const ID_CLAIMANT: &str = "scp:nof3f4ikizgjnnxysigd42wgfx4srjkvbirtaicvnw7qfulrpmeq";
 const ID_LEAF_ATTESTER: &str = "scp:gomjxlxjt4kesb5fghb6tpykrvhsxdduwwlo3uwgmvh2jhoqvjyq";
 
 /// The P-256 group order `n`.
@@ -626,38 +625,6 @@ fn vectors_20_38_key_continuity_fingerprint() {
     assert_eq!(
         hex::encode(sha256(&reversed)),
         "c6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// §25.10 Claim Validation Vectors
-// ---------------------------------------------------------------------------
-
-/// Vector 22 over the spec's field set with the canonical-encoding
-/// primitives. Production `compute_claim_canonical_hash` hashes a different
-/// field set, and the platform-bridge cut removes the claim path and this
-/// vector together, so no production builder computes this preimage.
-#[test]
-fn vector_22_shadow_claim_hash() {
-    let bytes = canonical_hash_bytes(
-        b"SCP-CLAIM-V1:",
-        &[
-            CanonicalField::VarBytes(b"shadow-alice-x-12345"),
-            CanonicalField::VarBytes(ID_CLAIMANT.as_bytes()),
-            CanonicalField::VarBytes(b"bridge-test-context"),
-            CanonicalField::U64(1_700_000_000),
-        ],
-    )
-    .unwrap();
-    // 13 (domain) + (4+20) + (4+56) + (4+19) + 8 = 128
-    assert_eq!(
-        hex::encode(&bytes),
-        "5343502d434c41494d2d56313a00000014736861646f772d616c6963652d782d3132333435000000387363703a6e6f66336634696b697a676a6e6e7879736967643432776766783473726a6b7662697274616963766e77377166756c72706d6571000000136272696467652d746573742d636f6e74657874000000006553f100"
-    );
-    assert_eq!(bytes.len(), 128);
-    assert_eq!(
-        hex::encode(sha256(&bytes)),
-        "08d9bd5de3ff51a2ff7d8c750ec2361c70b4f0106cd7c98f5d331abbf0f67fcd"
     );
 }
 
