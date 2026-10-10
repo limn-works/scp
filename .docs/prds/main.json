@@ -10653,7 +10653,6 @@
         "crates/scp-platform/src/error.rs",
         "crates/scp-platform/src/file.rs",
         "crates/scp-platform/src/lib.rs",
-        "crates/scp-platform/src/pseudonym_checks.rs",
         "crates/scp-platform/src/sqlite/key_custody.rs",
         "crates/scp-platform/src/testing/key_custody.rs",
         "crates/scp-platform/src/traits.rs",

@@ -73,17 +73,6 @@ pub mod testing;
 pub mod kdf;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-// The pseudonym check every software custody's tests run (`file`, `testing`,
-// `sqlite` with `software_platform`).
-#[cfg(all(
-    test,
-    any(
-        feature = "file",
-        feature = "testing",
-        all(feature = "sqlite", feature = "software_platform")
-    )
-))]
-mod pseudonym_checks;
 // Versioned storage envelope + spec §17.3 key conventions. The single source of
 // the `StoredValue` format and `identity/{did}/document` key convention shared
 // by `scp-runtime`'s `ProtocolRepository` and `scp-identity`'s `Identity::create`
@@ -101,7 +90,8 @@ pub use store_value::{
     identity_document_key, sanitize_key_component, to_stored_value_bytes,
 };
 pub use traits::{
-    CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyType,
-    PreRotationCustody, PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle,
-    Pseudonym, PublicKey, Push, PushToken, SharedSecret, Signature, Storage, WakeSignal,
+    CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyRole,
+    KeyType, PreRotationCustody, PreRotationCustodyError, PreRotationCustodyKind,
+    PreRotationKeyHandle, Pseudonym, PublicKey, Push, PushToken, SharedSecret, Signature, Storage,
+    WakeSignal, require_derive_source,
 };

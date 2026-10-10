@@ -1,13 +1,13 @@
 //! Key custody conformance test macro.
 //!
-//! The `key_custody_conformance` macro generates 10 test cases that validate
+//! The `key_custody_conformance` macro generates 13 test cases that validate
 //! any `KeyCustody` implementation against the
 //! protocol specification (ADR-006):
 //!
 //! 1. `generate_sign_verify_roundtrip` — generate Ed25519 keypair, sign data, verify signature
-//! 2. `destroy_prevents_sign` — generate, destroy, attempt sign -> error
+//! 2. `destroy_prevents_sign` — generate, destroy, attempt sign -> `KeyNotFound`
 //! 3. `distinct_handles` — generate two keypairs, handles are different
-//! 4. `sign_with_invalid_handle_errors` — sign with non-existent handle -> error
+//! 4. `sign_with_invalid_handle_errors` — sign with non-existent handle -> `KeyNotFound`
 //! 5. `p256_generate_sign_verify` — P-256 signing key: 33-byte public key;
 //!    signatures over 64 distinct 32-byte digests all verify strictly
 //!    (low-`s`); data that is not 32 bytes is refused with `CustodyError`
@@ -21,11 +21,19 @@
 //!    under a `0x05` or `0x02` prefix, and the 33-byte compressed point, are
 //!    refused with `CustodyError` (RFC 9180 §7.1.1)
 //! 10. `p256_destroy_prevents_use` — destroyed P-256 keys of both types can
-//!     no longer sign, agree, or report a public key
+//!     no longer sign, agree, or report a public key: each is `KeyNotFound`
+//! 11. `identity_keys_derive` — an identity key, generated or imported,
+//!     derives the same v1 and v2 pseudonyms on every call
+//! 12. `derive_from_operational_key_is_not_identity_key` — an operational
+//!     key of every type is refused as a derivation source with
+//!     `NotIdentityKey`, and the operational Ed25519 key still signs
+//! 13. `destroyed_identity_derives_key_not_found` — after an identity is
+//!     destroyed, its v1 and v2 derivations fail with `KeyNotFound`, and a
+//!     bystander identity still derives the same points (§9.10.4.A)
 //!
 //! See ADR-006 in `.docs/adrs/phase-1.md` for the platform adapter design.
 
-/// Generates 10 conformance tests for a `KeyCustody` implementation.
+/// Generates 13 conformance tests for a `KeyCustody` implementation.
 ///
 /// # Arguments
 ///
@@ -54,7 +62,8 @@ macro_rules! key_custody_conformance {
         mod key_custody_conformance {
             use super::*;
 
-            use scp_platform::{KeyCustody, KeyHandle, KeyType};
+            use scp_platform::{KeyCustody, KeyHandle, KeyType, PlatformError};
+            use $crate::conformance::key_custody::test_helpers::assert_key_not_found;
 
             #[tokio::test]
             async fn generate_sign_verify_roundtrip() {
@@ -97,11 +106,9 @@ macro_rules! key_custody_conformance {
                     .await
                     .expect("destroy_key should succeed");
 
-                // Attempt to sign with the destroyed key should fail.
-                let result = custody.sign(&handle, b"data").await;
-                assert!(
-                    result.is_err(),
-                    "sign with destroyed key should return an error"
+                assert_key_not_found(
+                    custody.sign(&handle, b"data").await.map(|_| ()),
+                    "sign with a destroyed key",
                 );
             }
 
@@ -144,10 +151,9 @@ macro_rules! key_custody_conformance {
                 // Use an extremely high handle ID that was never generated.
                 let invalid_handle = KeyHandle::new(u64::MAX);
 
-                let result = custody.sign(&invalid_handle, b"data").await;
-                assert!(
-                    result.is_err(),
-                    "sign with non-existent handle should return an error"
+                assert_key_not_found(
+                    custody.sign(&invalid_handle, b"data").await.map(|_| ()),
+                    "sign with a handle never generated",
                 );
             }
 
@@ -315,21 +321,157 @@ macro_rules! key_custody_conformance {
                     .await
                     .expect("destroy_key(HpkeP256) should succeed");
 
-                assert!(
-                    custody.sign(&signing, &[0u8; 32]).await.is_err(),
-                    "a destroyed P-256 signing key must not sign"
+                assert_key_not_found(
+                    custody.sign(&signing, &[0u8; 32]).await.map(|_| ()),
+                    "sign with a destroyed P-256 signing key",
                 );
-                assert!(
-                    custody.public_key(&signing).await.is_err(),
-                    "a destroyed P-256 signing key has no public key"
+                assert_key_not_found(
+                    custody.public_key(&signing).await.map(|_| ()),
+                    "public_key of a destroyed P-256 signing key",
                 );
-                assert!(
-                    custody.dh_agree(&hpke, &peer).await.is_err(),
-                    "a destroyed HPKE P-256 key must not agree"
+                assert_key_not_found(
+                    custody.dh_agree(&hpke, &peer).await.map(|_| ()),
+                    "dh_agree with a destroyed HPKE P-256 key",
                 );
-                assert!(
-                    custody.public_key(&hpke).await.is_err(),
-                    "a destroyed HPKE P-256 key has no public key"
+                assert_key_not_found(
+                    custody.public_key(&hpke).await.map(|_| ()),
+                    "public_key of a destroyed HPKE P-256 key",
+                );
+            }
+
+            #[tokio::test]
+            async fn identity_keys_derive() {
+                let custody = $factory;
+                let generated = custody
+                    .generate_identity_keypair()
+                    .await
+                    .expect("generate_identity_keypair should succeed");
+                let imported = custody
+                    .import_ed25519_signing_key(
+                        &$crate::conformance::key_custody::test_helpers::import_seed(),
+                    )
+                    .await
+                    .expect("import_ed25519_signing_key should succeed");
+                for identity in [generated, imported] {
+                    let v1 = custody
+                        .derive_pseudonym(&identity, b"ctx")
+                        .await
+                        .expect("an identity key derives a v1 pseudonym");
+                    assert_eq!(
+                        custody
+                            .derive_pseudonym(&identity, b"ctx")
+                            .await
+                            .expect("an identity key derives a v1 pseudonym"),
+                        v1
+                    );
+                    let v2 = custody
+                        .derive_rotatable_pseudonym(&identity, b"ctx", 3)
+                        .await
+                        .expect("an identity key derives a v2 pseudonym");
+                    assert_eq!(
+                        custody
+                            .derive_rotatable_pseudonym(&identity, b"ctx", 3)
+                            .await
+                            .expect("an identity key derives a v2 pseudonym"),
+                        v2
+                    );
+                    assert_ne!(v1, v2, "v1 and v2 use different domain separators");
+                }
+            }
+
+            #[tokio::test]
+            async fn derive_from_operational_key_is_not_identity_key() {
+                let custody = $factory;
+                for key_type in [
+                    KeyType::Ed25519,
+                    KeyType::X25519,
+                    KeyType::P256Signing,
+                    KeyType::HpkeP256,
+                ] {
+                    let operational = custody
+                        .generate_keypair(key_type)
+                        .await
+                        .expect("generate_keypair should succeed");
+                    let v1 = custody.derive_pseudonym(&operational, b"ctx").await;
+                    assert!(
+                        matches!(v1, Err(PlatformError::NotIdentityKey)),
+                        "v1 derivation from an operational {key_type:?} key must be \
+                         NotIdentityKey, got {v1:?}"
+                    );
+                    let v2 = custody
+                        .derive_rotatable_pseudonym(&operational, b"ctx", 1)
+                        .await;
+                    assert!(
+                        matches!(v2, Err(PlatformError::NotIdentityKey)),
+                        "v2 derivation from an operational {key_type:?} key must be \
+                         NotIdentityKey, got {v2:?}"
+                    );
+                }
+                // The refusal is the role: the same operational Ed25519 key
+                // still signs.
+                let operational = custody
+                    .generate_keypair(KeyType::Ed25519)
+                    .await
+                    .expect("generate_keypair should succeed");
+                custody
+                    .sign(&operational, b"data")
+                    .await
+                    .expect("an operational Ed25519 key signs");
+            }
+
+            #[tokio::test]
+            async fn destroyed_identity_derives_key_not_found() {
+                let custody = $factory;
+                let u = custody
+                    .generate_identity_keypair()
+                    .await
+                    .expect("generate_identity_keypair should succeed");
+                let v = custody
+                    .generate_identity_keypair()
+                    .await
+                    .expect("generate_identity_keypair should succeed");
+                let v_static = custody
+                    .derive_pseudonym(&v, b"ctx")
+                    .await
+                    .expect("v derives");
+                let v_rotatable = custody
+                    .derive_rotatable_pseudonym(&v, b"ctx", 7)
+                    .await
+                    .expect("v derives");
+                custody
+                    .derive_pseudonym(&u, b"ctx")
+                    .await
+                    .expect("u derives before the destroy");
+
+                custody
+                    .destroy_key(&u)
+                    .await
+                    .expect("destroy_key should succeed");
+
+                assert_key_not_found(
+                    custody.derive_pseudonym(&u, b"ctx").await.map(|_| ()),
+                    "v1 derivation from a destroyed identity",
+                );
+                assert_key_not_found(
+                    custody
+                        .derive_rotatable_pseudonym(&u, b"ctx", 7)
+                        .await
+                        .map(|_| ()),
+                    "v2 derivation from a destroyed identity",
+                );
+                assert_eq!(
+                    custody
+                        .derive_pseudonym(&v, b"ctx")
+                        .await
+                        .expect("the bystander still derives"),
+                    v_static
+                );
+                assert_eq!(
+                    custody
+                        .derive_rotatable_pseudonym(&v, b"ctx", 7)
+                        .await
+                        .expect("the bystander still derives"),
+                    v_rotatable
                 );
             }
 
@@ -383,6 +525,29 @@ macro_rules! key_custody_conformance {
 /// These are public so the macro-generated tests can reference them, but
 /// they are implementation details of the conformance suite.
 pub mod test_helpers {
+    /// Asserts that `result` is exactly [`PlatformError::KeyNotFound`], the
+    /// failure a bridge reports as `SCP-CRYPTO-4006`.
+    ///
+    /// # Panics
+    ///
+    /// Panics naming `what` when `result` is `Ok` or any other error.
+    ///
+    /// [`PlatformError::KeyNotFound`]: scp_platform::PlatformError::KeyNotFound
+    #[allow(clippy::panic)]
+    pub fn assert_key_not_found(result: Result<(), scp_platform::PlatformError>, what: &str) {
+        match result {
+            Err(scp_platform::PlatformError::KeyNotFound) => {}
+            Err(other) => panic!("{what}: expected KeyNotFound, got {other:?}"),
+            Ok(()) => panic!("{what}: expected KeyNotFound, got Ok"),
+        }
+    }
+
+    /// A fixed Ed25519 seed for the identity-import case.
+    #[must_use]
+    pub fn import_seed() -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new([0x5Au8; 32])
+    }
+
     /// Verifies an Ed25519 signature against a public key and message.
     ///
     /// # Panics

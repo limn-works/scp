@@ -74,7 +74,7 @@
 //!
 //! See ADR-006.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -89,20 +89,19 @@ use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
+    Signature,
 };
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Current file format version.
+/// Current file format version (`17-persistence-and-storage.md` §17.8).
 ///
-/// Version 0x04 adds each entry's role byte (bound in its associated data),
-/// version 0x03 authenticates the whole file with a trailing HMAC-SHA256
-/// tag, and version 0x02 introduced the per-entry associated data (type
-/// byte and index). Older versions are refused (SCP has no deployed key
-/// files to migrate).
+/// A version-0x04 file carries a role byte in each entry, binds each entry's
+/// version, type byte, role byte and index as associated data, and ends with
+/// a whole-file HMAC-SHA256 tag. Every other version byte is refused.
 const FORMAT_VERSION: u8 = 0x04;
 
 /// Length of the trailing whole-file HMAC-SHA256 tag.
@@ -149,22 +148,6 @@ const KEY_TYPE_P256_SIGNING: u8 = 0x03;
 /// Key type byte for a P-256 HPKE key ([`KeyType::HpkeP256`]).
 const KEY_TYPE_P256_HPKE: u8 = 0x04;
 
-/// Role byte for an operational key ([`KeyCustody::generate_keypair`]).
-const ROLE_OPERATIONAL: u8 = 0x00;
-
-/// Role byte for an identity key ([`KeyCustody::generate_identity_keypair`],
-/// [`KeyCustody::import_ed25519_signing_key`]), the only derivation source.
-const ROLE_IDENTITY: u8 = 0x01;
-
-/// The role byte of an identity (`true`) or operational key.
-const fn role_byte(identity: bool) -> u8 {
-    if identity {
-        ROLE_IDENTITY
-    } else {
-        ROLE_OPERATIONAL
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -210,19 +193,24 @@ impl StoredKeyType {
     }
 }
 
-/// Maps handle IDs to their key type and position in the file's entry list.
+/// One handle's entry: its key type, its role, and its position in the
+/// file's entry list.
+#[derive(Debug, Clone, Copy)]
+struct MappedEntry {
+    key_type: StoredKeyType,
+    role: KeyRole,
+    index: usize,
+}
+
+/// Maps handle IDs to their entries.
 struct HandleMap {
-    /// Maps `handle_id` to (`key_type`, `entry_index`).
-    entries: HashMap<u64, (StoredKeyType, usize)>,
-    /// Handles whose entry is in the identity role.
-    identities: HashSet<u64>,
+    entries: HashMap<u64, MappedEntry>,
 }
 
 impl HandleMap {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            identities: HashSet::new(),
         }
     }
 }
@@ -517,22 +505,23 @@ impl FileKeyCustody {
             let offset = HEADER_SIZE + i * ENTRY_SIZE;
             let key_type_byte = data[offset];
             let key_type = StoredKeyType::from_byte(key_type_byte)?;
-            let identity = match data[offset + 1] {
-                ROLE_OPERATIONAL => false,
-                ROLE_IDENTITY => true,
-                b => {
-                    return Err(PlatformError::CustodyError(format!(
-                        "unknown key role byte {b:#04x} in entry {i}"
-                    )));
-                }
-            };
+            let role_byte = data[offset + 1];
+            let role = KeyRole::from_byte(role_byte).ok_or_else(|| {
+                PlatformError::CustodyError(format!(
+                    "unknown key role byte {role_byte:#04x} in entry {i}"
+                ))
+            })?;
 
             let handle_id = next_id;
             next_id += 1;
-            handle_map.entries.insert(handle_id, (key_type, i));
-            if identity {
-                handle_map.identities.insert(handle_id);
-            }
+            handle_map.entries.insert(
+                handle_id,
+                MappedEntry {
+                    key_type,
+                    role,
+                    index: i,
+                },
+            );
         }
 
         Ok(Self {
@@ -626,33 +615,21 @@ impl FileKeyCustody {
         Ok((nonce_bytes, ciphertext))
     }
 
-    /// Decrypts a key entry from the file at the given entry index. The
-    /// entry's type byte and `entry_index` are authenticated as associated
-    /// data, so a flipped type byte or a moved entry fails here.
+    /// Decrypts the key entry stored at `entry_index`. The entry's type byte,
+    /// role byte and `entry_index` are authenticated as associated data, so a
+    /// flipped type or role byte or a moved entry fails here.
     fn decrypt_entry(
         &self,
         data: &[u8],
         entry_index: usize,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
-        self.decrypt_entry_as(data, entry_index, entry_index)
-    }
-
-    /// Decrypts the entry stored at `position` whose associated data names
-    /// `aad_index` (they differ only while `destroy_key` re-encrypts shifted
-    /// entries).
-    fn decrypt_entry_as(
-        &self,
-        data: &[u8],
-        position: usize,
-        aad_index: usize,
-    ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
-        let offset = HEADER_SIZE + position * ENTRY_SIZE;
+        let offset = HEADER_SIZE + entry_index * ENTRY_SIZE;
         if data.len() < offset + ENTRY_SIZE {
             return Err(PlatformError::CustodyError(format!(
-                "key file truncated at entry {position}"
+                "key file truncated at entry {entry_index}"
             )));
         }
-        let aad = Self::entry_aad(data[offset], data[offset + 1], aad_index)?;
+        let aad = Self::entry_aad(data[offset], data[offset + 1], entry_index)?;
         let nonce_start = offset + 2;
         let ct_start = nonce_start + NONCE_LEN;
         let ct_end = ct_start + KEY_LEN + TAG_LEN;
@@ -710,7 +687,7 @@ impl FileKeyCustody {
     fn append_entry(
         &self,
         key_type: StoredKeyType,
-        identity: bool,
+        role: KeyRole,
         private_key: &[u8; KEY_LEN],
     ) -> Result<usize, PlatformError> {
         let _lock = self
@@ -730,12 +707,8 @@ impl FileKeyCustody {
         let new_index = current_count as usize;
 
         // Encrypt the key, binding its type byte and index.
-        let entry = self.encrypt_entry(
-            key_type.to_byte(),
-            role_byte(identity),
-            new_index,
-            private_key,
-        )?;
+        let entry =
+            self.encrypt_entry(key_type.to_byte(), role.to_byte(), new_index, private_key)?;
         data.extend_from_slice(&entry);
 
         // Update entry count.
@@ -802,8 +775,13 @@ impl FileKeyCustody {
         map: &HandleMap,
         key_id: u64,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
+        let role = map
+            .entries
+            .get(&key_id)
+            .ok_or(PlatformError::KeyNotFound)?
+            .role;
         let loaded = self.load_key_locked(map, key_id)?;
-        crate::traits::require_derive_source(map.identities.contains(&key_id), loaded.key_type())?;
+        crate::traits::require_derive_source(role, loaded.key_type())?;
         match loaded {
             LoadedKey::Ed25519(seed) => Ok(seed),
             other => Err(wrong_type(other.key_type(), KeyType::Ed25519)),
@@ -822,13 +800,15 @@ impl FileKeyCustody {
     /// Decrypts the file entry for `key_id` under a `handle_map` lock the
     /// caller holds.
     fn load_key_locked(&self, map: &HandleMap, key_id: u64) -> Result<LoadedKey, PlatformError> {
-        let (key_type, entry_index) = map
+        let MappedEntry {
+            key_type, index, ..
+        } = map
             .entries
             .get(&key_id)
             .copied()
             .ok_or(PlatformError::KeyNotFound)?;
         let data = self.read_file()?;
-        let key_bytes = self.decrypt_entry(&data, entry_index)?;
+        let key_bytes = self.decrypt_entry(&data, index)?;
         Ok(match key_type {
             StoredKeyType::Ed25519 => LoadedKey::Ed25519(key_bytes),
             StoredKeyType::X25519 => LoadedKey::X25519(key_bytes),
@@ -843,13 +823,8 @@ impl FileKeyCustody {
         })
     }
 
-    /// Mints and persists a key of `key_type`, in the identity role when
-    /// `identity`.
-    async fn generate(
-        &self,
-        key_type: KeyType,
-        identity: bool,
-    ) -> Result<KeyHandle, PlatformError> {
+    /// Mints and persists a key of `key_type` in `role`.
+    async fn generate(&self, key_type: KeyType, role: KeyRole) -> Result<KeyHandle, PlatformError> {
         let key_bytes = match key_type {
             KeyType::Ed25519 | KeyType::X25519 => {
                 let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
@@ -870,12 +845,16 @@ impl FileKeyCustody {
         // lock-ordering inversion. Mirrors the pattern in
         // `import_ed25519_signing_key`.
         let mut map = self.handle_map.lock().await;
-        let entry_index = self.append_entry(stored_type, identity, &key_bytes)?;
+        let index = self.append_entry(stored_type, role, &key_bytes)?;
         let handle = self.next_handle();
-        map.entries.insert(handle.id(), (stored_type, entry_index));
-        if identity {
-            map.identities.insert(handle.id());
-        }
+        map.entries.insert(
+            handle.id(),
+            MappedEntry {
+                key_type: stored_type,
+                role,
+                index,
+            },
+        );
         drop(map);
 
         Ok(handle)
@@ -936,13 +915,13 @@ impl KeyCustody for FileKeyCustody {
         &self,
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(key_type, false)
+        self.generate(key_type, KeyRole::Operational)
     }
 
     fn generate_identity_keypair(
         &self,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(KeyType::Ed25519, true)
+        self.generate(KeyType::Ed25519, KeyRole::Identity)
     }
 
     fn sign(
@@ -1007,7 +986,11 @@ impl KeyCustody for FileKeyCustody {
             // failed `read_file` or `atomic_write` cannot orphan
             // encrypted material on disk (the in-memory map would
             // otherwise have lost the only handle pointing at it).
-            let Some(&(_, removed_index)) = map.entries.get(&key_id) else {
+            let Some(&MappedEntry {
+                index: removed_index,
+                ..
+            }) = map.entries.get(&key_id)
+            else {
                 return Err(PlatformError::KeyNotFound);
             };
 
@@ -1066,7 +1049,7 @@ impl KeyCustody for FileKeyCustody {
                 if i < removed_index {
                     new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
                 } else {
-                    let key_bytes = self.decrypt_entry_as(&data, i, i)?;
+                    let key_bytes = self.decrypt_entry(&data, i)?;
                     let entry = self.encrypt_entry(
                         data[entry_offset],
                         data[entry_offset + 1],
@@ -1086,10 +1069,9 @@ impl KeyCustody for FileKeyCustody {
             // map: drop the destroyed entry and shift indices for
             // entries that lived after it.
             map.entries.remove(&key_id);
-            map.identities.remove(&key_id);
-            for (_key_type, entry_index) in map.entries.values_mut() {
-                if *entry_index > removed_index {
-                    *entry_index -= 1;
+            for entry in map.entries.values_mut() {
+                if entry.index > removed_index {
+                    entry.index -= 1;
                 }
             }
             drop(map);
@@ -1220,10 +1202,11 @@ impl KeyCustody for FileKeyCustody {
             let data = self.read_file()?;
             // Only identity entries count: the imported key is the migrated
             // identity's new `#0`, and an operational entry never derives.
-            for (id, (kt, idx)) in &map.entries {
-                if *kt != StoredKeyType::Ed25519 || !map.identities.contains(id) {
+            for (id, entry) in &map.entries {
+                if entry.key_type != StoredKeyType::Ed25519 || entry.role != KeyRole::Identity {
                     continue;
                 }
+                let idx = entry.index;
                 // Surface decrypt failure rather than silently skipping
                 // the entry. A failed decrypt at this point indicates
                 // file corruption (mismatched MAC, truncated ciphertext,
@@ -1231,7 +1214,7 @@ impl KeyCustody for FileKeyCustody {
                 // doesn't match"; treating it as the latter would
                 // permit a corrupted file to silently re-grow with
                 // duplicate entries on every retry.
-                let existing_bytes = self.decrypt_entry(&data, *idx).map_err(|e| {
+                let existing_bytes = self.decrypt_entry(&data, idx).map_err(|e| {
                     PlatformError::CustodyError(format!(
                         "import dedup scan: failed to decrypt entry {idx} \
                          (handle {id}) — file may be corrupted: {e}"
@@ -1250,12 +1233,17 @@ impl KeyCustody for FileKeyCustody {
             // `append_entry` takes only `file_write_lock` — safe to call
             // while holding `handle_map`.
             let key_bytes = Zeroizing::new(**seed);
-            let entry_index = self.append_entry(StoredKeyType::Ed25519, true, &key_bytes)?;
+            let index = self.append_entry(StoredKeyType::Ed25519, KeyRole::Identity, &key_bytes)?;
 
             let handle = self.next_handle();
-            map.entries
-                .insert(handle.id(), (StoredKeyType::Ed25519, entry_index));
-            map.identities.insert(handle.id());
+            map.entries.insert(
+                handle.id(),
+                MappedEntry {
+                    key_type: StoredKeyType::Ed25519,
+                    role: KeyRole::Identity,
+                    index,
+                },
+            );
             drop(map);
 
             Ok(handle)
@@ -1440,8 +1428,14 @@ mod tests {
         let desync_id = custody.next_handle().id();
         {
             let mut map = custody.handle_map.lock().await;
-            map.entries
-                .insert(desync_id, (StoredKeyType::Ed25519, 9_999));
+            map.entries.insert(
+                desync_id,
+                MappedEntry {
+                    key_type: StoredKeyType::Ed25519,
+                    role: KeyRole::Operational,
+                    index: 9_999,
+                },
+            );
         }
         let desync_handle = KeyHandle::new(desync_id);
 
@@ -1889,9 +1883,10 @@ mod tests {
         let count_offset = 1 + SALT_LEN;
         let count =
             u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap()) as usize;
-        for (id, (_kt, idx)) in &map.entries {
+        for (id, entry) in &map.entries {
+            let idx = entry.index;
             assert!(
-                *idx < count,
+                idx < count,
                 "handle {id} has stale entry_index {idx} ≥ on-disk count {count}"
             );
         }
@@ -2058,24 +2053,30 @@ mod tests {
         }
     }
 
-    /// Older versions (0x01 without associated data, 0x02 without the file
-    /// tag) are refused.
+    /// Every version byte other than 0x04 is refused (§17.8). Each case is a
+    /// real version-0x04 file holding a key, with only its version byte
+    /// rewritten and its file tag recomputed, so the tag and the entries
+    /// still verify and only the version check can refuse it.
     #[tokio::test]
     async fn older_key_file_versions_are_refused() {
-        for version in [0x01u8, 0x02] {
+        for version in [0x01u8, 0x02, 0x03, 0x05] {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("keys.scp");
-            let mut data = vec![version];
-            data.extend_from_slice(&[0u8; SALT_LEN]);
-            data.extend_from_slice(&0u32.to_le_bytes());
-            data.extend_from_slice(&[0u8; FILE_TAG_LEN]);
-            std::fs::write(&path, &data).unwrap();
+            let custody = FileKeyCustody::new(&path, "pass").unwrap();
+            custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+            drop(custody);
+            tamper_and_retag(&path, "pass", |data| {
+                assert_eq!(data[0], FORMAT_VERSION);
+                data[0] = version;
+            });
             match FileKeyCustody::new(&path, "pass") {
-                Err(PlatformError::CustodyError(_)) => {}
-                other => panic!(
-                    "version {version:#04x} must be refused, got {:?}",
-                    other.err()
-                ),
+                Err(PlatformError::CustodyError(m)) => {
+                    assert!(m.contains("unsupported key file version"), "{m}");
+                }
+                Err(other) => {
+                    panic!("version {version:#04x}: expected CustodyError, got {other:?}")
+                }
+                Ok(_) => panic!("version {version:#04x} must be refused"),
             }
         }
     }
@@ -2127,13 +2128,7 @@ mod tests {
                 .await,
         ] {
             assert!(
-                matches!(
-                    result,
-                    Err(PlatformError::WrongKeyType {
-                        expected: KeyType::Ed25519,
-                        ..
-                    })
-                ),
+                matches!(result, Err(PlatformError::NotIdentityKey)),
                 "{result:?}"
             );
         }
@@ -2143,8 +2138,8 @@ mod tests {
 
         tamper_and_retag(&path, "pass", |data| {
             let role = HEADER_SIZE + ENTRY_SIZE + 1;
-            assert_eq!(data[role], ROLE_OPERATIONAL);
-            data[role] = ROLE_IDENTITY;
+            assert_eq!(data[role], KeyRole::Operational.to_byte());
+            data[role] = KeyRole::Identity.to_byte();
         });
         let custody = FileKeyCustody::new(&path, "pass").unwrap();
         assert!(matches!(
@@ -2248,7 +2243,9 @@ mod tests {
                 let dir = TempDir::new().unwrap();
                 let path = dir.path().join("keys.scp");
                 let custody = FileKeyCustody::new(&path, "pass").unwrap();
-                custody.append_entry(stored_type, false, &scalar).unwrap();
+                custody
+                    .append_entry(stored_type, KeyRole::Operational, &scalar)
+                    .unwrap();
                 drop(custody);
 
                 let custody = FileKeyCustody::new(&path, "pass").unwrap();
@@ -2267,16 +2264,5 @@ mod tests {
                 ));
             }
         }
-    }
-
-    #[tokio::test]
-    async fn destroyed_identity_derives_no_pseudonym() {
-        let dir = TempDir::new().unwrap();
-        crate::pseudonym_checks::check_destroyed_identity_derives_no_pseudonym(&make_custody(
-            &dir,
-            "passphrase",
-        ))
-        .await
-        .unwrap();
     }
 }

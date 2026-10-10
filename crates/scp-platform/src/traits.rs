@@ -42,6 +42,71 @@ pub enum KeyType {
     HpkeP256,
 }
 
+/// What a custody key is for, fixed when custody first holds the key
+/// (ADR-006, amended 2026-10-10).
+///
+/// [`KeyCustody::generate_identity_keypair`] and
+/// [`KeyCustody::import_ed25519_signing_key`] hold their key in the
+/// [`Identity`](Self::Identity) role, and [`KeyCustody::generate_keypair`]
+/// holds every other key in the [`Operational`](Self::Operational) role. Only
+/// an identity key may be a pseudonym-derivation source
+/// (`09-security-model.md` §9.10.4.A); see [`require_derive_source`].
+///
+/// This is a custody record, distinct from the key-state role of
+/// `09-security-model.md` §9.7.4.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KeyRole {
+    /// The identity key (`#0`) of an identity: the only pseudonym-derivation
+    /// source.
+    Identity,
+    /// Every key that is not an identity key.
+    Operational,
+}
+
+impl KeyRole {
+    /// The role's name in a host custody contract: `"identity"` or
+    /// `"operational"` (ADR-021, amended 2026-10-10).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Operational => "operational",
+        }
+    }
+
+    /// Parses a name that [`as_str`](Self::as_str) produces; any other string
+    /// is `None`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "identity" => Some(Self::Identity),
+            "operational" => Some(Self::Operational),
+            _ => None,
+        }
+    }
+
+    /// The role byte of a persisted key entry: `0x00` operational, `0x01`
+    /// identity (`17-persistence-and-storage.md` §17.8).
+    #[must_use]
+    pub const fn to_byte(self) -> u8 {
+        match self {
+            Self::Operational => 0x00,
+            Self::Identity => 0x01,
+        }
+    }
+
+    /// Parses a role byte that [`to_byte`](Self::to_byte) produces; any other
+    /// byte is `None`.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(Self::Operational),
+            0x01 => Some(Self::Identity),
+            _ => None,
+        }
+    }
+}
+
 /// Opaque handle to a cryptographic key managed by a [`KeyCustody`] implementation.
 ///
 /// The handle is an integer identifier. Implementations map this to actual key
@@ -556,11 +621,11 @@ pub trait KeyCustody: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] (with `expected`
-    /// [`KeyType::Ed25519`]) if the handle is not an identity key
-    /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
-    /// operational key of any type, Ed25519 included, and every non-Ed25519
-    /// key. The identity key is Ed25519 (§9.10.4.A).
+    /// Returns [`PlatformError::NotIdentityKey`] if the handle is not an
+    /// identity key ([`KeyRole::Identity`]): an operational key of any type,
+    /// Ed25519 included. Returns [`PlatformError::WrongKeyType`] (with
+    /// `expected` [`KeyType::Ed25519`]) for an identity key that is not
+    /// Ed25519. The identity key is Ed25519 (§9.10.4.A).
     fn derive_pseudonym(
         &self,
         key: &KeyHandle,
@@ -594,11 +659,11 @@ pub trait KeyCustody: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] (with `expected`
-    /// [`KeyType::Ed25519`]) if the handle is not an identity key
-    /// ([`generate_identity_keypair`](Self::generate_identity_keypair)): an
-    /// operational key of any type, Ed25519 included, and every non-Ed25519
-    /// key. The identity key is Ed25519 (§9.10.4.A).
+    /// Returns [`PlatformError::NotIdentityKey`] if the handle is not an
+    /// identity key ([`KeyRole::Identity`]): an operational key of any type,
+    /// Ed25519 included. Returns [`PlatformError::WrongKeyType`] (with
+    /// `expected` [`KeyType::Ed25519`]) for an identity key that is not
+    /// Ed25519. The identity key is Ed25519 (§9.10.4.A).
     fn derive_rotatable_pseudonym(
         &self,
         key: &KeyHandle,
@@ -1310,29 +1375,21 @@ pub(crate) fn generate_p256_os_rng() -> Result<scp_crypto::p256::P256SecretKey, 
     ))
 }
 
-/// The pseudonym-derivation source check shared by the software backends:
-/// the source must be an identity key
-/// ([`KeyCustody::generate_identity_keypair`]), and an Ed25519 one
+/// Requires a pseudonym-derivation source to be an Ed25519 identity key
 /// (§9.10.4.A).
+///
+/// Every custody that records roles shares this check, the software backends
+/// and the callback adapter alike. The role is checked first, so an operational key of any type fails as
+/// [`PlatformError::NotIdentityKey`].
 ///
 /// # Errors
 ///
+/// [`PlatformError::NotIdentityKey`] for a source in the operational role.
 /// [`PlatformError::WrongKeyType`] with `expected` [`KeyType::Ed25519`] for
-/// a source that is not an identity key (its role, whatever its type), or
-/// that is not Ed25519.
-#[cfg(all(
-    feature = "software_platform",
-    any(feature = "file", feature = "sqlite", feature = "testing")
-))]
-pub(crate) const fn require_derive_source(
-    is_identity: bool,
-    key_type: KeyType,
-) -> Result<(), PlatformError> {
-    if !is_identity {
-        return Err(PlatformError::WrongKeyType {
-            expected: KeyType::Ed25519,
-            actual: key_type,
-        });
+/// an identity source that is not Ed25519.
+pub const fn require_derive_source(role: KeyRole, key_type: KeyType) -> Result<(), PlatformError> {
+    if !matches!(role, KeyRole::Identity) {
+        return Err(PlatformError::NotIdentityKey);
     }
     // §9.10.4.A: the identity key is Ed25519.
     if !matches!(key_type, KeyType::Ed25519) {

@@ -150,6 +150,7 @@ mod tests {
                 },
                 codes::CRYPTO_4060,
             ),
+            (PlatformError::NotIdentityKey, codes::CRYPTO_4060),
             (
                 PlatformError::StorageError("x".to_owned()),
                 codes::CRYPTO_4060,

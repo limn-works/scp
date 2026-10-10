@@ -4,7 +4,7 @@
 //! integer handles. Supports optional seeded RNG for deterministic key generation.
 //! See ADR-006 in `.docs/adrs/phase-1.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -15,7 +15,8 @@ use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
+    Signature,
 };
 
 /// The error for using a key of type `actual` where `expected` is required.
@@ -23,16 +24,21 @@ const fn wrong_type(actual: KeyType, expected: KeyType) -> PlatformError {
     PlatformError::WrongKeyType { expected, actual }
 }
 
+/// A handle's key type, which says which operations it permits, and its role.
+#[derive(Debug, Clone, Copy)]
+struct KeyRecord {
+    key_type: KeyType,
+    role: KeyRole,
+}
+
 /// Internal key storage. P-256 signing and HPKE keys share `p256_keys`; the
-/// handle's entry in `key_types` says which operations it permits.
+/// handle's entry in `records` says which operations it permits and whether
+/// it may derive.
 struct KeyStore {
     ed25519_keys: HashMap<u64, SigningKey>,
     x25519_keys: HashMap<u64, StaticSecret>,
     p256_keys: HashMap<u64, P256SecretKey>,
-    key_types: HashMap<u64, KeyType>,
-    /// Handles in the identity role, the only pseudonym-derivation sources
-    /// ([`KeyCustody::generate_identity_keypair`]).
-    identity_keys: HashSet<u64>,
+    records: HashMap<u64, KeyRecord>,
 }
 
 impl KeyStore {
@@ -41,24 +47,34 @@ impl KeyStore {
             ed25519_keys: HashMap::new(),
             x25519_keys: HashMap::new(),
             p256_keys: HashMap::new(),
-            key_types: HashMap::new(),
-            identity_keys: HashSet::new(),
+            records: HashMap::new(),
         }
     }
 
-    /// Returns the stored key type for a handle, or an error if not found.
-    fn lookup_type(&self, handle: KeyHandle) -> Result<KeyType, PlatformError> {
-        self.key_types
+    /// Returns the stored record for a handle, or an error if not found.
+    fn lookup(&self, handle: KeyHandle) -> Result<KeyRecord, PlatformError> {
+        self.records
             .get(&handle.id())
             .copied()
             .ok_or(PlatformError::KeyNotFound)
     }
 
+    /// Returns the stored key type for a handle, or an error if not found.
+    fn lookup_type(&self, handle: KeyHandle) -> Result<KeyType, PlatformError> {
+        self.lookup(handle).map(|record| record.key_type)
+    }
+
+    /// Records `key_type` and `role` for `handle`.
+    fn record(&mut self, handle: KeyHandle, key_type: KeyType, role: KeyRole) {
+        self.records
+            .insert(handle.id(), KeyRecord { key_type, role });
+    }
+
     /// The Ed25519 seed of a pseudonym-derivation source, after the role and
     /// (until SCP-315) curve check.
     fn derive_source(&self, key_id: u64) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        let key_type = self.lookup_type(KeyHandle::new(key_id))?;
-        crate::traits::require_derive_source(self.identity_keys.contains(&key_id), key_type)?;
+        let KeyRecord { key_type, role } = self.lookup(KeyHandle::new(key_id))?;
+        crate::traits::require_derive_source(role, key_type)?;
         let signing_key = self
             .ed25519_keys
             .get(&key_id)
@@ -200,17 +216,13 @@ impl InMemoryKeyCustody {
         let signing_key = SigningKey::from_bytes(private_key_bytes);
         let mut store = self.store.lock().await;
         store.ed25519_keys.insert(handle.id(), signing_key);
-        store.key_types.insert(handle.id(), KeyType::Ed25519);
+        store.record(handle, KeyType::Ed25519, KeyRole::Operational);
         handle
     }
 
-    /// Mints a key of `key_type`, in the identity role when `identity`.
-    /// Consumes exactly 32 RNG bytes either way (ADR-046).
-    async fn generate(
-        &self,
-        key_type: KeyType,
-        identity: bool,
-    ) -> Result<KeyHandle, PlatformError> {
+    /// Mints a key of `key_type` in `role`. Consumes exactly 32 RNG bytes
+    /// in either role (ADR-046).
+    async fn generate(&self, key_type: KeyType, role: KeyRole) -> Result<KeyHandle, PlatformError> {
         let handle = self.next_handle();
         let mut key_bytes = Zeroizing::new([0u8; 32]);
         self.rng.lock().await.fill_bytes(key_bytes.as_mut());
@@ -220,12 +232,10 @@ impl InMemoryKeyCustody {
             KeyType::Ed25519 => {
                 let signing_key = SigningKey::from_bytes(&key_bytes);
                 store.ed25519_keys.insert(handle.id(), signing_key);
-                store.key_types.insert(handle.id(), KeyType::Ed25519);
             }
             KeyType::X25519 => {
                 let secret = StaticSecret::from(*key_bytes);
                 store.x25519_keys.insert(handle.id(), secret);
-                store.key_types.insert(handle.id(), KeyType::X25519);
             }
             KeyType::P256Signing | KeyType::HpkeP256 => {
                 let key = P256SecretKey::from_scalar_bytes(&key_bytes).map_err(|e| {
@@ -234,12 +244,9 @@ impl InMemoryKeyCustody {
                     ))
                 })?;
                 store.p256_keys.insert(handle.id(), key);
-                store.key_types.insert(handle.id(), key_type);
             }
         }
-        if identity {
-            store.identity_keys.insert(handle.id());
-        }
+        store.record(handle, key_type, role);
         drop(store);
 
         Ok(handle)
@@ -290,13 +297,13 @@ impl KeyCustody for InMemoryKeyCustody {
         &self,
         key_type: KeyType,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(key_type, false)
+        self.generate(key_type, KeyRole::Operational)
     }
 
     fn generate_identity_keypair(
         &self,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        self.generate(KeyType::Ed25519, true)
+        self.generate(KeyType::Ed25519, KeyRole::Identity)
     }
 
     fn sign(
@@ -394,8 +401,7 @@ impl KeyCustody for InMemoryKeyCustody {
                     store.p256_keys.remove(&key_id);
                 }
             }
-            store.key_types.remove(&key_id);
-            store.identity_keys.remove(&key_id);
+            store.records.remove(&key_id);
             drop(store);
 
             Ok(())
@@ -517,9 +523,8 @@ impl KeyCustody for InMemoryKeyCustody {
 
             let mut store = self.store.lock().await;
             store.ed25519_keys.insert(handle.id(), signing_key);
-            store.key_types.insert(handle.id(), KeyType::Ed25519);
             // The imported key is the migrated identity's new `#0`.
-            store.identity_keys.insert(handle.id());
+            store.record(handle, KeyType::Ed25519, KeyRole::Identity);
             drop(store);
 
             // `seed_copy: Zeroizing<[u8; 32]>` drops here → bytes wiped.
@@ -565,55 +570,20 @@ mod tests {
     use scp_crypto::pseudonym::{derive_pseudonym_secret, pseudonym_from_context_seed};
     use sha2::Sha256;
 
-    /// Only an identity key derives. An operational Ed25519 key, and an
-    /// operational P-256 key, are refused with `WrongKeyType` and change no
-    /// state; the operational key still signs, so the refusal is its role.
     /// The identity key draws the same 32 RNG bytes as an Ed25519
-    /// `generate_keypair` (ADR-046), and an import is an identity.
+    /// `generate_keypair` (ADR-046), so a seeded custody mints the same key
+    /// whichever role it asks for. Role refusal is in the shared
+    /// `key_custody_conformance!` suite.
     #[tokio::test]
-    async fn only_identity_keys_derive() {
+    async fn identity_generation_draws_the_ed25519_rng_bytes() {
         let custody = InMemoryKeyCustody::from_seed_bytes([7u8; 32]);
         let identity = custody.generate_identity_keypair().await.unwrap();
-        let operational = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let p256 = custody
-            .generate_keypair(KeyType::P256Signing)
-            .await
-            .unwrap();
-        custody.derive_pseudonym(&identity, b"ctx").await.unwrap();
-        let before = custody.store.lock().await.key_types.len();
-        for (handle, actual) in [
-            (operational, KeyType::Ed25519),
-            (p256, KeyType::P256Signing),
-        ] {
-            for result in [
-                custody.derive_pseudonym(&handle, b"ctx").await,
-                custody.derive_rotatable_pseudonym(&handle, b"ctx", 2).await,
-            ] {
-                assert!(
-                    matches!(
-                        result,
-                        Err(PlatformError::WrongKeyType { expected: KeyType::Ed25519, actual: a })
-                            if a == actual
-                    ),
-                    "{result:?}"
-                );
-            }
-        }
-        assert_eq!(custody.store.lock().await.key_types.len(), before);
-        custody.sign(&operational, b"data").await.unwrap();
-
         let parity = InMemoryKeyCustody::from_seed_bytes([7u8; 32]);
         let minted = parity.generate_keypair(KeyType::Ed25519).await.unwrap();
         assert_eq!(
             custody.public_key(&identity).await.unwrap().as_bytes(),
             parity.public_key(&minted).await.unwrap().as_bytes()
         );
-        let imported = parity
-            .import_ed25519_signing_key(&Zeroizing::new([3u8; 32]))
-            .await
-            .unwrap();
-        parity.derive_pseudonym(&imported, b"ctx").await.unwrap();
-        assert!(parity.derive_pseudonym(&minted, b"ctx").await.is_err());
     }
 
     #[tokio::test]
@@ -765,14 +735,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let handle = custody.generate_keypair(KeyType::X25519).await.unwrap();
         let result = custody.derive_pseudonym(&handle, b"ctx").await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            PlatformError::WrongKeyType { expected, actual } => {
-                assert_eq!(expected, KeyType::Ed25519);
-                assert_eq!(actual, KeyType::X25519);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(result, Err(PlatformError::NotIdentityKey)),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -949,14 +915,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let handle = custody.generate_keypair(KeyType::X25519).await.unwrap();
         let result = custody.derive_rotatable_pseudonym(&handle, b"ctx", 0).await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            PlatformError::WrongKeyType { expected, actual } => {
-                assert_eq!(expected, KeyType::Ed25519);
-                assert_eq!(actual, KeyType::X25519);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(
+            matches!(result, Err(PlatformError::NotIdentityKey)),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1224,14 +1186,5 @@ mod tests {
                 Err(PlatformError::CustodyError(_))
             ));
         }
-    }
-
-    #[tokio::test]
-    async fn destroyed_identity_derives_no_pseudonym() {
-        crate::pseudonym_checks::check_destroyed_identity_derives_no_pseudonym(
-            &InMemoryKeyCustody::new(),
-        )
-        .await
-        .unwrap();
     }
 }
