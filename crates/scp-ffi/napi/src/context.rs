@@ -2672,55 +2672,6 @@ pub(crate) async fn context_member_role_on(
 // Bridge functions — events (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Formats a [`ContextEvent`](scp_core::context::membership::ContextEvent) as a human-readable string.
-///
-/// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
-/// formatted with structured key=value pairs for observability. All other
-/// events use their `Debug` representation.
-fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
-    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
-    match event {
-        ConsequenceTriggered {
-            context_id,
-            member_did,
-            rule_index,
-            trigger_type,
-            action_type,
-        } => format!(
-            "consequence_triggered:member={member_did},\
-             rule={rule_index},trigger={trigger_type},\
-             action={action_type},context={context_id}"
-        ),
-        ConsequenceEnforced {
-            context_id,
-            member_did,
-            action_type,
-            success,
-        } => format!(
-            "consequence_enforced:member={member_did},\
-             action={action_type},success={success},\
-             context={context_id}"
-        ),
-        // Relay equivocation detected (§9.9.3, §23.7). Security event — MUST NOT
-        // be silently discarded (§9.9.4); surface as a structured, non-lossy,
-        // HTML-escaped record rather than a Debug blob.
-        scp_core::context::membership::ContextEvent::EquivocationDetected {
-            context_id,
-            remote_sender_did,
-            event_count,
-            local_merkle_root,
-            remote_merkle_root,
-        } => scp_ffi_common::html_escape_event_string(&format!(
-            "equivocation_detected:context={context_id},\
-             remote_sender={remote_sender_did},event_count={event_count},\
-             local_merkle_root={},remote_merkle_root={}",
-            hex::encode(local_merkle_root),
-            hex::encode(remote_merkle_root),
-        )),
-        other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
-    }
-}
-
 /// Per-bridge-instance implementation of [`Scp::context_drain_events`](crate::scp::Scp::context_drain_events).
 ///
 /// Routed through the ADR-049 messaging dispatch surface
@@ -2748,7 +2699,10 @@ pub(crate) async fn context_drain_events_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("drain_events shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(format!("drain_events failed: {e}")))?;
-    Ok(events.iter().map(format_context_event).collect())
+    Ok(events
+        .iter()
+        .map(scp_ffi_common::context_event::context_event_wire_string)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2924,7 +2878,9 @@ pub(crate) async fn context_broadcast_admission_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-    Ok(admission.map(|a| format!("{a:?}")))
+    Ok(admission
+        .map(scp_ffi_common::broadcast::broadcast_admission_name)
+        .map(str::to_owned))
 }
 
 // ---------------------------------------------------------------------------
@@ -3622,7 +3578,7 @@ pub(crate) async fn context_execute_governance_action_on(
         _ => {}
     }
 
-    Ok(format!("{result:?}"))
+    Ok(scp_ffi_common::governance_result::governance_action_result_name(&result).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -4105,14 +4061,13 @@ pub(crate) async fn context_governance_propose_on(
             })
         })?;
 
-    let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-    let response = serde_json::json!({
-        "proposal_id": hex::encode(outcome.proposal.proposal_id),
-        "status": format!("{:?}", outcome.status),
-        "execution_result": result_str,
-    });
-    Ok(response.to_string())
+    Ok(
+        scp_ffi_common::governance_result::governance_propose_response(
+            &outcome.proposal.proposal_id,
+            &outcome.status,
+            outcome.execution_result.as_ref(),
+        ),
+    )
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_approve`](crate::scp::Scp::context_governance_approve).
@@ -4167,7 +4122,9 @@ pub(crate) async fn context_governance_approve_on(
             })
         })?;
 
-    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    Ok(scp_ffi_common::governance_result::proposal_status_response(
+        &status,
+    ))
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_reject`](crate::scp::Scp::context_governance_reject).
@@ -4221,7 +4178,9 @@ pub(crate) async fn context_governance_reject_on(
             })
         })?;
 
-    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    Ok(scp_ffi_common::governance_result::proposal_status_response(
+        &status,
+    ))
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_withdraw`](crate::scp::Scp::context_governance_withdraw).
@@ -4270,7 +4229,9 @@ pub(crate) async fn context_governance_withdraw_on(
             })
         })?;
 
-    Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+    Ok(scp_ffi_common::governance_result::proposal_status_response(
+        &status,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4627,11 +4588,13 @@ pub(crate) async fn context_add_checkpoint_cosignature_on(
             })
         })?;
 
-    let response = serde_json::json!({
-        "attestation_status": format!("{status:?}"),
-        "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
-    });
-    Ok(response.to_string())
+    scp_ffi_common::governance_result::checkpoint_cosignature_response(&updated_checkpoint, &status)
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("add_checkpoint_cosignature failed to encode checkpoint: {e}"),
+                code: codes::CTX_2063.to_owned(),
+            })
+        })
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_restore`](crate::scp::Scp::context_restore).
@@ -8430,74 +8393,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Consequence event format tests (#1531, #1593, #1594)
+    // Consequence rule parameter tests
     // -------------------------------------------------------------------
-
-    #[test]
-    fn format_consequence_triggered_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceTriggered {
-            context_id: "ctx-napi-123".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
-            rule_index: 1,
-            trigger_type: "velocity".to_owned(),
-            action_type: "mute".to_owned(),
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_triggered:"),
-            "must contain consequence_triggered prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkBob"),
-            "must contain member DID"
-        );
-        assert!(formatted.contains("rule=1"), "must contain rule index");
-        assert!(
-            formatted.contains("trigger=velocity"),
-            "must contain trigger type"
-        );
-        assert!(
-            formatted.contains("action=mute"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("context=ctx-napi-123"),
-            "must contain context ID"
-        );
-    }
-
-    #[test]
-    fn format_consequence_enforced_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceEnforced {
-            context_id: "ctx-napi-456".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkAlice".to_owned()),
-            action_type: "restrict_write".to_owned(),
-            success: false,
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_enforced:"),
-            "must contain consequence_enforced prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkAlice"),
-            "must contain member DID"
-        );
-        assert!(
-            formatted.contains("action=restrict_write"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("success=false"),
-            "must contain success=false"
-        );
-    }
 
     /// Verifies that `ContextParams` accepts `consequence_rules` and they
     /// serialize/deserialize correctly for FFI bridge consumption.

@@ -7204,55 +7204,6 @@ pub struct BatchPublishResult {
 // Free functions — events (#387)
 // ---------------------------------------------------------------------------
 
-/// Formats a [`ContextEvent`](scp_core::context::membership::ContextEvent) as a human-readable string.
-///
-/// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
-/// formatted with structured key=value pairs for observability. All other
-/// events use their `Debug` representation.
-fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
-    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
-    match event {
-        ConsequenceTriggered {
-            context_id,
-            member_did,
-            rule_index,
-            trigger_type,
-            action_type,
-        } => format!(
-            "consequence_triggered:member={member_did},\
-             rule={rule_index},trigger={trigger_type},\
-             action={action_type},context={context_id}"
-        ),
-        ConsequenceEnforced {
-            context_id,
-            member_did,
-            action_type,
-            success,
-        } => format!(
-            "consequence_enforced:member={member_did},\
-             action={action_type},success={success},\
-             context={context_id}"
-        ),
-        // Relay equivocation detected (§9.9.3, §23.7). Security event — MUST NOT
-        // be silently discarded (§9.9.4); surface as a structured, non-lossy,
-        // HTML-escaped record rather than a Debug blob.
-        scp_core::context::membership::ContextEvent::EquivocationDetected {
-            context_id,
-            remote_sender_did,
-            event_count,
-            local_merkle_root,
-            remote_merkle_root,
-        } => scp_ffi_common::html_escape_event_string(&format!(
-            "equivocation_detected:context={context_id},\
-             remote_sender={remote_sender_did},event_count={event_count},\
-             local_merkle_root={},remote_merkle_root={}",
-            hex::encode(local_merkle_root),
-            hex::encode(remote_merkle_root),
-        )),
-        other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Free functions — access key lifecycle (#1529)
 // ---------------------------------------------------------------------------
@@ -8378,7 +8329,7 @@ pub fn media_send_signaling(signaling_json: String) -> Result<String, ScpError> 
     use base64::Engine;
     serde_json::to_string(&serde_json::json!({
         "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
-        "message_type": format!("{message_type:?}"),
+        "message_type": scp_ffi_common::wire_name::message_type_name(message_type),
     }))
     .map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize result: {e}"),
@@ -11549,40 +11500,8 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
                 // Serialize the result variant name for the caller.
-                use scp_core::context::state::GovernanceActionResult;
-                let result_str = match result {
-                    GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
-                    GovernanceActionResult::MemberRemoved => "MemberRemoved",
-                    GovernanceActionResult::RoleChanged => "RoleChanged",
-                    GovernanceActionResult::OutletRegistered => "OutletRegistered",
-                    GovernanceActionResult::OutletRemoved => "OutletRemoved",
-                    GovernanceActionResult::CeilingModified => "CeilingModified",
-                    GovernanceActionResult::ContextClosed => "ContextClosed",
-                    GovernanceActionResult::TtlExtended => "TtlExtended",
-                    GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-                    GovernanceActionResult::AdminTransferred => "AdminTransferred",
-                    GovernanceActionResult::SignerAdded => "SignerAdded",
-                    GovernanceActionResult::SignerRemoved => "SignerRemoved",
-                    GovernanceActionResult::ThresholdModified => "ThresholdModified",
-                    GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                    GovernanceActionResult::OutletInterfaceEstablished => {
-                        "OutletInterfaceEstablished"
-                    }
-                    GovernanceActionResult::MemberReset => "MemberReset",
-                    GovernanceActionResult::ConflictResolved => "ConflictResolved",
-                    GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                    GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-                    GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-                    GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-                    GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-                    GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                    GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-                    GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-                    GovernanceActionResult::Executed => "Executed",
-                    GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-                    GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-                    GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-                };
+                let result_str =
+                    scp_ffi_common::governance_result::governance_action_result_name(&result);
                 Ok::<_, ScpError>(result_str.to_owned())
             })
             .await
@@ -11645,14 +11564,13 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
-                let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
-
-                let response = serde_json::json!({
-                    "proposal_id": hex::encode(outcome.proposal.proposal_id),
-                    "status": format!("{:?}", outcome.status),
-                    "execution_result": result_str,
-                });
-                Ok::<_, ScpError>(response.to_string())
+                Ok::<_, ScpError>(
+                    scp_ffi_common::governance_result::governance_propose_response(
+                        &outcome.proposal.proposal_id,
+                        &outcome.status,
+                        outcome.execution_result.as_ref(),
+                    ),
+                )
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11711,7 +11629,9 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
 
-                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+                Ok(scp_ffi_common::governance_result::proposal_status_response(
+                    &status,
+                ))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11768,7 +11688,9 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
 
-                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+                Ok(scp_ffi_common::governance_result::proposal_status_response(
+                    &status,
+                ))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -11804,7 +11726,9 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
-                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+                Ok(scp_ffi_common::governance_result::proposal_status_response(
+                    &status,
+                ))
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -12132,11 +12056,14 @@ impl Scp {
                         .map_err(ScpError::from)?
                 };
 
-                let response = serde_json::json!({
-                    "attestation_status": format!("{status:?}"),
-                    "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
-                });
-                Ok(response.to_string())
+                scp_ffi_common::governance_result::checkpoint_cosignature_response(
+                    &updated_checkpoint,
+                    &status,
+                )
+                .map_err(|e| ScpError::Context {
+                    msg: format!("add_checkpoint_cosignature failed to encode checkpoint: {e}"),
+                    code: codes::CTX_2063.to_owned(),
+                })
             })
             .await
             .map_err(|e| ScpError::Context {
@@ -13222,7 +13149,9 @@ impl Scp {
             return None;
         }
         match rx.await {
-            Ok(Ok(admission)) => admission.map(|a| format!("{a:?}")),
+            Ok(Ok(admission)) => {
+                admission.map(|a| scp_ffi_common::broadcast::broadcast_admission_name(a).to_owned())
+            }
             _ => None,
         }
     }
@@ -13354,7 +13283,7 @@ impl Scp {
         manager
             .member_role(&handle.context_id, &did)
             .await
-            .map(|r| format!("{r:?}"))
+            .map(|r| r.role_name)
     }
 
     /// Per-instance equivalent of the free-function `context_drain_events`.
@@ -13372,7 +13301,7 @@ impl Scp {
             .drain_events(&handle.context_id)
             .await
             .iter()
-            .map(format_context_event)
+            .map(scp_ffi_common::context_event::context_event_wire_string)
             .collect()
     }
 
@@ -15139,7 +15068,8 @@ impl Scp {
                             manager_events.push(Event {
                                 event_type: scp_ffi_common::event_log::event_type_label(
                                     &entry.event_type,
-                                ),
+                                )
+                                .to_owned(),
                                 actor_did: entry.actor_did.0.clone(),
                                 timestamp: entry.timestamp,
                                 payload_json: payload_value.to_string(),
@@ -15188,7 +15118,8 @@ impl Scp {
                                 }
                                 // Apply event type filter.
                                 if let Some(ref et) = filter_event_type
-                                    && format!("{:?}", evt.event_type) != *et
+                                    && scp_ffi_common::event_log::event_type_label(&evt.event_type)
+                                        != et.as_str()
                                 {
                                     continue;
                                 }
@@ -15226,7 +15157,10 @@ impl Scp {
                                 let payload_json = payload_value.to_string();
 
                                 results.push(Event {
-                                    event_type: format!("{:?}", evt.event_type),
+                                    event_type: scp_ffi_common::event_log::event_type_label(
+                                        &evt.event_type,
+                                    )
+                                    .to_owned(),
                                     actor_did: evt.actor_did.0.clone(),
                                     timestamp: evt.timestamp,
                                     payload_json,
@@ -17942,11 +17876,11 @@ impl Scp {
 
         let result = serde_json::json!({
             "source_context": prov.source_context,
-            "source_type": format!("{:?}", prov.source_type),
+            "source_type": scp_ffi_common::wire_name::source_type_name(prov.source_type),
             "chain_depth": prov.chain_depth,
             "counterparties": prov.counterparties.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "age_secs": prov.age.as_secs(),
-            "memory_scope": format!("{:?}", prov.memory_scope),
+            "memory_scope": scp_ffi_common::wire_name::memory_scope_name(prov.memory_scope),
             "chain_path": prov.chain_path,
             "purpose": prov.purpose,
         });
@@ -26467,74 +26401,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Consequence event format tests (#1531, #1593, #1594)
+    // Consequence rule parameter tests
     // -------------------------------------------------------------------
-
-    #[test]
-    fn format_consequence_triggered_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceTriggered {
-            context_id: "ctx-uniffi-123".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
-            rule_index: 3,
-            trigger_type: "outlet_rate".to_owned(),
-            action_type: "capability_suspension".to_owned(),
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_triggered:"),
-            "must contain consequence_triggered prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkBob"),
-            "must contain member DID"
-        );
-        assert!(formatted.contains("rule=3"), "must contain rule index");
-        assert!(
-            formatted.contains("trigger=outlet_rate"),
-            "must contain trigger type"
-        );
-        assert!(
-            formatted.contains("action=capability_suspension"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("context=ctx-uniffi-123"),
-            "must contain context ID"
-        );
-    }
-
-    #[test]
-    fn format_consequence_enforced_event() {
-        use scp_core::context::membership::ContextEvent;
-
-        let event = ContextEvent::ConsequenceEnforced {
-            context_id: "ctx-uniffi-456".to_owned(),
-            member_did: scp_did::DID("did:dht:z6MkAlice".to_owned()),
-            action_type: "access_revocation".to_owned(),
-            success: true,
-        };
-
-        let formatted = super::format_context_event(&event);
-        assert!(
-            formatted.contains("consequence_enforced:"),
-            "must contain consequence_enforced prefix"
-        );
-        assert!(
-            formatted.contains("member=did:dht:z6MkAlice"),
-            "must contain member DID"
-        );
-        assert!(
-            formatted.contains("action=access_revocation"),
-            "must contain action type"
-        );
-        assert!(
-            formatted.contains("success=true"),
-            "must contain success=true"
-        );
-    }
 
     /// Verifies that `ContextParams` correctly accepts `consequence_rules`
     /// when parsed from JSON (mirrors the `UniFFI` bridge param flow).

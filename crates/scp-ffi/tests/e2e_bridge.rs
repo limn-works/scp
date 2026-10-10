@@ -306,6 +306,89 @@ fn context_member_role_creator_is_admin() {
     );
 }
 
+/// Builds a `PyScp` whose owner identity a single-admin governance engine can
+/// resolve, plus a context whose ceiling lets that owner propose a
+/// `SuspendCapability`.
+///
+/// `identity_create` publishes an owner's DID document into this instance's
+/// resolver, which single-admin vote verification reads to resolve a
+/// proposer's public key. It precedes `init_context_manager_for_test`,
+/// because a supervisor snapshots its resolver when it is built.
+fn single_admin_owner_and_context(
+    py: Python<'_>,
+) -> (_scp_core::scp::PyScp, String, PyContextHandle) {
+    setup();
+    let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+    let owner = scp
+        .identity_create(py, "in_memory", None)
+        .unwrap()
+        .into_pyobject(py)
+        .unwrap()
+        .getattr("did")
+        .unwrap()
+        .extract::<String>()
+        .unwrap();
+    runtime::init_context_manager_for_test(scp.bridge_instance());
+    let params = PyDict::new(py);
+    let ceiling = PyList::new(
+        py,
+        [
+            "governance:propose",
+            "member:ban",
+            "messages:read",
+            "messages:write",
+        ],
+    )
+    .unwrap();
+    params.set_item("ceiling", ceiling).unwrap();
+    let handle = scp.context_create(&owner, &params.as_borrowed()).unwrap();
+    (scp, owner, handle)
+}
+
+/// A `single_admin` context auto-approves and auto-executes a proposal, so
+/// `governance_propose`'s `execution_result` field names which action ran.
+/// `SuspendCapability` yields `GovernanceActionResult::MemberSuspended`, whose
+/// `SuspendMemberResult` payload made `format!("{r:?}")` send
+/// `MemberSuspended(SuspendMemberResult { .. })`; `execution_result` must
+/// equal `governance_action_result_name`'s bare name.
+#[test]
+fn governance_propose_execution_result_is_a_wire_name() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let action_json = serde_json::json!({
+            "SuspendCapability": { "did": owner, "capabilities": ["MessagesWrite"] }
+        })
+        .to_string();
+        let response = scp
+            .governance_propose(&handle, &owner, &action_json)
+            .expect("SuspendCapability must auto-execute under single_admin");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("governance_propose must return JSON");
+        assert_eq!(
+            parsed["status"].as_str(),
+            Some("Approved"),
+            "got {response}"
+        );
+        assert_eq!(
+            parsed["execution_result"].as_str(),
+            Some("MemberSuspended"),
+            "execution_result must be a bare outcome name; got {response}"
+        );
+    });
+}
+
+/// `context_member_role` returns `RoleAssignment.role_name`, which every
+/// SDK's `MemberRole` parser reads. A `Debug` dump of `RoleAssignment` also
+/// contains "admin", so only equality proves a bare name crossed.
+#[test]
+fn context_member_role_bridge_returns_role_name() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let role = scp.context_member_role(&handle, &owner).unwrap();
+        assert_eq!(role.as_deref(), Some("admin"));
+    });
+}
+
 #[test]
 fn context_drain_events_is_idempotent() {
     let bi = __bi();

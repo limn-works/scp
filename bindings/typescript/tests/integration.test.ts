@@ -1793,10 +1793,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 
       // ADR-011 amendment (phase-2.md:907-934): MessageSent is per-author,
       // non-convergent application activity surfaced only as a local
-      // `ContextEvent::MessageSent` on the in-process buffer (drained here as a
-      // Debug-formatted string) — never a durable Merkle leaf.
+      // `ContextEvent::MessageSent` on the in-process buffer — never a durable
+      // Merkle leaf.
       const drained = await scp.contextDrainEvents(ctx._rawHandle);
-      expect(drained.some((e) => e.includes("MessageSent"))).toBe(true);
+      expect(drained.some((e) => e.startsWith("message_sent:"))).toBe(true);
 
       // The durable event log (read by eventLogQuery) deliberately excludes
       // MessageSent so two honest members derive the same merkle_root (§9.9.3).

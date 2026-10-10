@@ -1308,9 +1308,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // ADR-011 amendment (phase-2.md:907-934): MessageSent is per-author,
       // non-convergent application activity. It is NOT a durable Merkle leaf —
       // it is surfaced only as a local `ContextEvent::MessageSent` on the
-      // in-process buffer (drained here as a Debug-formatted string).
+      // in-process buffer.
       const drained = await napi.contextDrainEvents(ctx);
-      expect(drained.some((e) => e.includes("MessageSent"))).toBe(true);
+      expect(drained.some((e) => e.startsWith("message_sent:"))).toBe(true);
 
       // The durable event log (read by eventLogQuery) deliberately excludes
       // MessageSent so two honest members derive the same merkle_root (§9.9.3),

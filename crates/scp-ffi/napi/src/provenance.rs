@@ -185,11 +185,11 @@ pub(crate) fn provenance_attach_on(
 
     let result = serde_json::json!({
         "source_context": prov.source_context,
-        "source_type": format!("{:?}", prov.source_type),
+        "source_type": scp_ffi_common::wire_name::source_type_name(prov.source_type),
         "chain_depth": prov.chain_depth,
         "counterparties": prov.counterparties.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "age_secs": prov.age.as_secs(),
-        "memory_scope": format!("{:?}", prov.memory_scope),
+        "memory_scope": scp_ffi_common::wire_name::memory_scope_name(prov.memory_scope),
         "chain_path": prov.chain_path,
         "purpose": prov.purpose,
         "discovery_method": discovery_method_str,
