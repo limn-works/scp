@@ -9,12 +9,12 @@ both out of it:
   UNIT_DATA         one entry per compiled unit, carrying its start second, its duration,
                     and the seconds the unit spent producing rmeta before its dependents
                     could start.
-  CONCURRENCY_DATA  one sample per 100 ms, carrying how many units were running, how many
-                    were ready but waiting for a core, and how many were blocked on a
-                    dependency.
+  CONCURRENCY_DATA  samples at uneven times, each carrying its second `t`, how many units
+                    were running, how many were ready but waiting for a core, and how many
+                    were blocked on a dependency.
 
 From those two arrays this script reports the wall time, the summed unit time and the
-floor that a four-core runner imposes on it, the twenty slowest units, how much of the
+floor that the runner's core count imposes on it, the twenty slowest units, how much of the
 wall time ran fewer units than the machine has cores, and the longest chain of units that
 the schedule actually realised. It reads the reports and writes text; it
 compiles nothing and it fails no build.
@@ -48,6 +48,19 @@ def extract_array(html: str, name: str) -> list[dict]:
     return json.loads(match.group(1))
 
 
+def weighted_samples(concurrency: list[dict], wall: float) -> list[tuple[dict, float]]:
+    """Pair each concurrency sample, in time order, with the seconds of the build it covers.
+
+    Cargo does not sample on a fixed clock, so each sample holds from its own `t` until
+    the next sample's `t`, and the last one holds until `wall`. The first sample also
+    covers the build's start, and every `t` is clamped into [0, wall], so the durations
+    are never negative and always sum to `wall`: no share computed from them exceeds 100%.
+    """
+    ordered = sorted(concurrency, key=lambda s: s["t"])
+    bounds = [0.0] + [min(max(s["t"], 0.0), wall) for s in ordered[1:]] + [wall]
+    return [(s, bounds[i + 1] - bounds[i]) for i, s in enumerate(ordered)]
+
+
 def summarize(report: Path, cores: int) -> None:
     html = report.read_text(encoding="utf-8")
     print(f"=== {report.parent.name} ===")
@@ -73,11 +86,11 @@ def summarize(report: Path, cores: int) -> None:
     )
 
     if concurrency:
-        span = concurrency[-1]["t"] / max(len(concurrency) - 1, 1)
-        starved = sum(span for s in concurrency if s["active"] < cores)
-        single = sum(span for s in concurrency if s["active"] <= 1)
+        weighted = weighted_samples(concurrency, wall)
+        starved = sum(dt for s, dt in weighted if s["active"] < cores)
+        single = sum(dt for s, dt in weighted if s["active"] <= 1)
         blocked = sum(
-            span for s in concurrency if s["active"] < cores and s["waiting"] == 0
+            dt for s, dt in weighted if s["active"] < cores and s["waiting"] == 0
         )
         print(
             f"wall time under {cores} active:   {starved:.1f} s "
