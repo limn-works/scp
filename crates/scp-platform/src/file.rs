@@ -8,7 +8,7 @@
 //! # Key File Format
 //!
 //! `17-persistence-and-storage.md` §17.8 (`FileKeyCustody` Argon2id Parameters)
-//! defines this format: the Argon2id parameters, the v4 HKDF info labels, the
+//! defines this format: the Argon2id parameters, the HKDF info labels, the
 //! header, entry and associated-data layouts, and the file tag. This summary
 //! restates it; where the two differ, §17.8 governs.
 //!
@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────┐
-//! │ version: u8          (1 byte, currently 0x04)  │
+//! │ version: u8          (1 byte, 0x01)            │
 //! │ argon2id_salt: [u8]  (16 bytes)                │
 //! ├────────────────────────────────────────────────┤
 //! │ entry_count: u32 LE  (4 bytes)                 │
@@ -97,21 +97,21 @@ use crate::traits::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Current file format version (`17-persistence-and-storage.md` §17.8).
+/// File format version (`17-persistence-and-storage.md` §17.8).
 ///
-/// A version-0x04 file carries a role byte in each entry, binds each entry's
-/// version, type byte, role byte and index as associated data, and ends with
-/// a whole-file HMAC-SHA256 tag. Every other version byte is refused.
-const FORMAT_VERSION: u8 = 0x04;
+/// The file carries a role byte in each entry, binds each entry's version,
+/// type byte, role byte and index as associated data, and ends with a
+/// whole-file HMAC-SHA256 tag. Every other version byte is refused.
+const FORMAT_VERSION: u8 = 0x01;
 
 /// Length of the trailing whole-file HMAC-SHA256 tag.
 const FILE_TAG_LEN: usize = 32;
 
 /// HKDF-SHA256 info label for the AES-256-GCM entry-encryption subkey.
-const ENTRY_KEY_INFO: &[u8] = b"scp/file-key-custody/v4/entry-aead";
+const ENTRY_KEY_INFO: &[u8] = b"scp/file-key-custody/v1/entry-aead";
 
 /// HKDF-SHA256 info label for the whole-file HMAC-SHA256 subkey.
-const FILE_MAC_INFO: &[u8] = b"scp/file-key-custody/v4/file-mac";
+const FILE_MAC_INFO: &[u8] = b"scp/file-key-custody/v1/file-mac";
 
 /// The entry-encryption key and the file-MAC key, in that order, that
 /// [`FileKeyCustody::derive_keys`] derives from a passphrase.
@@ -2053,13 +2053,13 @@ mod tests {
         }
     }
 
-    /// Every version byte other than 0x04 is refused (§17.8). Each case is a
-    /// real version-0x04 file holding a key, with only its version byte
-    /// rewritten and its file tag recomputed, so the tag and the entries
-    /// still verify and only the version check can refuse it.
+    /// Every version byte other than `FORMAT_VERSION` is refused (§17.8).
+    /// Each case is a real file holding a key, with only its version byte
+    /// rewritten and its file tag recomputed, so the file's length and tag
+    /// still verify and the version check is what refuses it.
     #[tokio::test]
-    async fn older_key_file_versions_are_refused() {
-        for version in [0x01u8, 0x02, 0x03, 0x05] {
+    async fn a_key_file_with_another_version_byte_is_refused() {
+        for version in [0x00u8, 0x02, 0xFF] {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("keys.scp");
             let custody = FileKeyCustody::new(&path, "pass").unwrap();
