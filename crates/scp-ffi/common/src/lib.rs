@@ -111,6 +111,12 @@ pub fn html_escape_event_string(s: &str) -> String {
 #[cfg(feature = "custody")]
 pub mod custody_parse;
 
+// Shared key-type registry and P-256 host-return validation for the three
+// callback-custody adapters (behind the `custody` feature, like
+// `custody_parse`). See ADR-006.
+#[cfg(feature = "custody")]
+pub mod callback_custody;
+
 // Shared attestation construction pipeline for all FFI bridges.
 // Requires scp-core + scp-identity (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]

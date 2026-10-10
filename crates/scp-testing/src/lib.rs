@@ -35,7 +35,7 @@
 //! - [`payment_adapter_conformance!`] — 8 tests for `PaymentAdapter`
 //!   (spec section 19.2.6).
 //! - [`transport_conformance!`] — 6 tests for `TransportAdapter` (ADR-005).
-//! - [`key_custody_conformance!`] — 4 tests for `KeyCustody` (ADR-006).
+//! - [`key_custody_conformance!`] — 13 tests for `KeyCustody` (ADR-006).
 //! - [`attestation_conformance!`] — 2 tests for `DeviceAttestation` (ADR-006).
 //! - [`push_conformance!`] — 2 tests for `Push` (ADR-006).
 //!

@@ -10,6 +10,12 @@ readme = "README.md"
 keywords = ["protocol", "cryptography", "ed25519", "p256"]
 categories = ["cryptography"]
 
+[features]
+# Test support only: `p256::sign_prehash_rfc6979_unnormalized`, the raw RFC 6979
+# signature before low-s normalisation, for tests that pin a high-s input.
+# Enabled only from dev-dependencies, so no shipped build resolves it.
+testing = []
+
 [dependencies]
 ed25519-dalek = { workspace = true }
 # Pseudonym derivation (§9.10.4.A): HKDF-SHA-256 pseudonym secret + HMAC-SHA-256

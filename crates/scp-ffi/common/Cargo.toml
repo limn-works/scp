@@ -30,10 +30,11 @@ testing = [
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
 # Pseudonym, PublicKey, PlatformError); scp-crypto, for the P-256 host
-# helpers and the custody failure kind. Deliberately NOT folded into
+# helpers and the custody failure kind; and ed25519-dalek for strict
+# signature checks on host returns. Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
 # stack.
-custody = ["dep:scp-platform"]
+custody = ["dep:scp-platform", "dep:ed25519-dalek"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. `start_node_local` opens no protocol store: it receives a caller's

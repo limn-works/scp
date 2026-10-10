@@ -729,7 +729,7 @@ Key custody is the `KeyCustody` trait ADR-006 defines, named here for completene
 
 ### FileKeyCustody Argon2id Parameters
 
-`FileKeyCustody`, the software-key backend behind the headless row above, derives an AES-256 wrapping key from a passphrase with Argon2id. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
+`FileKeyCustody`, the software-key backend behind the headless row above, derives from a passphrase, with Argon2id, the root key from which HKDF derives the subkeys below. **A single Argon2id parameterization is REQUIRED across the codebase**, and an implementation MUST NOT define a second, divergent parameter set: two parameterizations derive two keys from one passphrase, so one of them cannot decrypt what the other wrote. The SQLCipher passphrase key-derivation mode of §17.6 draws from the same parameter source.
 
 ```
 algorithm  = Argon2id
@@ -740,6 +740,39 @@ p_cost     = 1                       // parallelism = 1
 output_len = 32                      // 32-byte derived key
 salt       = per-file 16-byte salt   // generated once, persisted with the custody file
 ```
+
+The Argon2id output is not used as a key itself. HKDF-SHA256 over it, with no salt, derives two 32-byte subkeys (L = 32) under distinct info labels: `scp/file-key-custody/v1/entry-aead` is the AES-256-GCM key for each entry, and `scp/file-key-custody/v1/file-mac` is an HMAC-SHA256 key. The file ends with an HMAC-SHA256 tag over every byte before it. An implementation MUST refuse a file whose length is not exactly the header, plus `entry_count` entries, plus the 32-byte tag, and MUST refuse a file whose tag does not verify, on open and on every later read. The tag stops an entry from being removed, appended or replayed, and stops the entry count from being changed. It does not stop the whole file being rolled back to an earlier copy of itself.
+
+**The key file is a header, `entry_count` entries, and a tag, at these fixed widths.** The format version is `0x01`; an implementation MUST refuse a file with any other version byte. Integers are unsigned.
+
+| Field | Offset | Width (bytes) | Encoding |
+|-------|--------|---------------|----------|
+| `version` | 0 | 1 | `0x01` |
+| `argon2id_salt` | 1 | 16 | the per-file salt above |
+| `entry_count` | 17 | 4 | little-endian |
+| entries | 21 | `entry_count` × 62 | the entry layout below, in index order from 0 |
+| `file_tag` | 21 + 62 × `entry_count` | 32 | HMAC-SHA256 under the `v1/file-mac` subkey over every byte before it |
+
+Each entry is 62 bytes:
+
+| Field | Offset in entry | Width (bytes) | Encoding |
+|-------|-----------------|---------------|----------|
+| `key_type` | 0 | 1 | `0x01` Ed25519, `0x02` X25519, `0x03` P-256 signing, `0x04` P-256 HPKE |
+| `role` | 1 | 1 | `0x00` operational, `0x01` identity |
+| `nonce` | 2 | 12 | AES-256-GCM nonce, unique per entry write |
+| `ciphertext` | 14 | 32 | the 32-byte private key under the `v1/entry-aead` subkey; a P-256 key is its big-endian scalar |
+| `aead_tag` | 46 | 16 | the AES-256-GCM tag |
+
+Each entry's AES-256-GCM associated data is 7 bytes:
+
+| Field | Offset | Width (bytes) | Encoding |
+|-------|--------|---------------|----------|
+| `version` | 0 | 1 | `0x01` |
+| `key_type` | 1 | 1 | the entry's `key_type` byte |
+| `role` | 2 | 1 | the entry's `role` byte |
+| `entry_index` | 3 | 4 | the entry's zero-based position, big-endian |
+
+Because the associated data binds the type, the role and the position, an implementation that flips an entry's type or role byte, or moves an entry to another index, fails decryption instead of reinterpreting the key. Only an entry whose role byte is `0x01` may be a pseudonym-derivation source (`09-security-model.md` §9.10.4.A). An implementation MUST refuse a decrypted P-256 scalar that is zero or not below the group order `n`. Removing an entry re-encrypts every entry whose index shifts.
 
 ## 17.9 OpenMLS StorageProvider Bridge
 

@@ -90,7 +90,7 @@ sqlite = ["dep:rusqlite", "dep:scp-sqlite-pools", "dep:hex", "dep:argon2", "dep:
 vendored-openssl = ["libsqlite3-sys?/bundled-sqlcipher-vendored-openssl"]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
 # Universal fallback for non-HSM platforms. See GitHub issue #391.
-file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
+file = ["software_platform", "dep:aes-gcm", "dep:argon2", "dep:hkdf"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
 # EncryptingAdapter — wraps any Storage backend with AES-256-GCM per-value
@@ -121,6 +121,7 @@ rmp-serde = { workspace = true }
 # file dependencies, gated behind the `file` feature flag.
 aes-gcm = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }
@@ -152,6 +153,10 @@ fs2 = { version = "0.4", optional = true }
 libsqlite3-sys = { version = "0.30.1", optional = true }
 
 [dev-dependencies]
+# Test-only: raw (un-normalised) RFC 6979 ECDSA, to pin a digest whose raw `s`
+# is high so the low-s normalisation test cannot pass by luck. P-256 arithmetic
+# stays in scp-crypto; `deny.toml` bans a direct `p256` dependency here.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", features = ["testing"] }
 scp-testing = { path = "../scp-testing" }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

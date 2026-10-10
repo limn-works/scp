@@ -76,6 +76,11 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
+    fn generate_identity_keypair(
+        &self,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async { Err(PlatformError::CustodyError("not supported".into())) }
+    }
 
     fn sign(
         &self,
@@ -112,7 +117,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
     fn dh_agree(
         &self,
         _key: &KeyHandle,
-        _peer_public: &[u8; 32],
+        _peer_public: &[u8],
     ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }

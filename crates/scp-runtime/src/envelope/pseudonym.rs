@@ -108,7 +108,6 @@ pub async fn derive_rotatable_pseudonym(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
-    use scp_platform::traits::KeyType;
 
     use super::*;
 
@@ -121,7 +120,7 @@ mod tests {
     #[tokio::test]
     async fn derive_pseudonym_with_a_destroyed_key_is_custody_key_not_found() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
         custody.destroy_key(&key_handle).await.unwrap();
         let err = derive_pseudonym(&custody, &key_handle, b"test-context-1")
             .await
@@ -135,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn derive_pseudonym_is_deterministic() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
         let context_id = b"test-context-1";
 
         let p1 = derive_pseudonym(&custody, &key_handle, context_id)
@@ -154,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn different_context_produces_different_pseudonym() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
 
         let p1 = derive_pseudonym(&custody, &key_handle, b"context-a")
             .await
@@ -172,8 +171,8 @@ mod tests {
     #[tokio::test]
     async fn different_identity_key_produces_different_pseudonym() {
         let custody = InMemoryKeyCustody::new();
-        let key1 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let key2 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key1 = custody.generate_identity_keypair().await.unwrap();
+        let key2 = custody.generate_identity_keypair().await.unwrap();
         let context_id = b"same-context";
 
         let p1 = derive_pseudonym(&custody, &key1, context_id).await.unwrap();
@@ -194,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn derive_rotatable_pseudonym_with_a_destroyed_key_is_custody_key_not_found() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
         custody.destroy_key(&key_handle).await.unwrap();
         let err = derive_rotatable_pseudonym(&custody, &key_handle, b"test-context-1", 3)
             .await
@@ -208,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn rotatable_pseudonym_is_deterministic() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
         let context_id = b"test-context-1";
 
         let p1 = derive_rotatable_pseudonym(&custody, &key_handle, context_id, 5)
@@ -228,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn different_epoch_produces_different_pseudonym() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
         let context_id = b"test-context-1";
 
         let p1 = derive_rotatable_pseudonym(&custody, &key_handle, context_id, 0)
@@ -248,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn rotatable_pseudonym_differs_from_v1() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
         let context_id = b"test-context-1";
 
         let v1 = derive_pseudonym(&custody, &key_handle, context_id)
@@ -268,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn rotatable_pseudonym_different_context_different_key() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
 
         let p1 = derive_rotatable_pseudonym(&custody, &key_handle, b"context-a", 0)
             .await
@@ -287,8 +286,8 @@ mod tests {
     #[tokio::test]
     async fn rotatable_pseudonym_different_identity_different_key() {
         let custody = InMemoryKeyCustody::new();
-        let key1 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let key2 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key1 = custody.generate_identity_keypair().await.unwrap();
+        let key2 = custody.generate_identity_keypair().await.unwrap();
         let context_id = b"same-context";
 
         let p1 = derive_rotatable_pseudonym(&custody, &key1, context_id, 0)
@@ -308,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn rotatable_pseudonym_public_key_is_33_byte_p256_point() {
         let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let key_handle = custody.generate_identity_keypair().await.unwrap();
 
         let p = derive_rotatable_pseudonym(&custody, &key_handle, b"ctx", 42)
             .await

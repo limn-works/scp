@@ -504,7 +504,27 @@ impl TestingCallbackCustody {
     pub async fn generate_keypair(&self) -> napi::Result<String> {
         use scp_platform::KeyCustody;
         self.inner
-            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .generate_identity_keypair()
+            .await
+            .map(|h| h.id().to_string())
+            .map_err(custody_err)
+    }
+
+    /// Generates an operational key of `key_type` through the provider, as
+    /// `KeyCustody::generate_keypair` does in production.
+    ///
+    /// # Errors
+    ///
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi(js_name = "generateOperationalKeypair")]
+    pub async fn generate_operational_keypair(
+        &self,
+        key_type: crate::custody::NapiCustodyKeyType,
+    ) -> napi::Result<String> {
+        use scp_platform::KeyCustody;
+        self.inner
+            .generate_keypair(key_type.into())
             .await
             .map(|h| h.id().to_string())
             .map_err(custody_err)
