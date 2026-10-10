@@ -89,21 +89,18 @@ class CryptoError(ScpError):
     _default_code: str = "SCP-CRYPTO-4000"
 
 
-# The custody-provider protocol's typed not-found. A ``KeyCustodyProvider``
-# raises ``KeyNotFoundError`` when it holds no key for the key id it was given;
-# the native bridge recognises the class and reports ``KeyNotFound``
-# (``SCP-CRYPTO-4006``), as it does any exception whose ``code`` is
-# ``SCP-CRYPTO-4006``, while any other exception a provider raises is a custody
-# error. The class is the bridge's own, so the match is by type, never by
-# message text.
-try:
-    from scp_sdk._scp_core import KeyNotFoundError
-except ImportError:  # pure-Python / mocked tests: no bridge to hand it to
+class KeyNotFoundError(CryptoError):
+    """A ``KeyCustodyProvider`` has no key for the given key id.
 
-    class KeyNotFoundError(CryptoError):  # type: ignore[no-redef]
-        """A ``KeyCustodyProvider`` has no key for the given key id."""
+    The custody-provider protocol's typed not-found: a provider raises it when
+    it holds no key for the key id it was given. The native bridge reads the
+    exception's ``code``, ``SCP-CRYPTO-4006``, and reports ``KeyNotFound``, as
+    it does for any exception carrying that code; any other exception a
+    provider raises is a custody error. The match is by code, never by message
+    text.
+    """
 
-        _default_code: str = "SCP-CRYPTO-4006"
+    _default_code: str = "SCP-CRYPTO-4006"
 
 
 class TransportError(ScpError):

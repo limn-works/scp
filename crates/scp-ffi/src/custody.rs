@@ -392,16 +392,11 @@ impl PyKeyCustodyProvider {
         })
     }
 
-    /// Maps a provider exception: the typed host not-found
-    /// ([`KeyNotFoundError`](crate::error::KeyNotFoundError), exported as
-    /// `scp_sdk.KeyNotFoundError`) is [`PlatformError::KeyNotFound`]; any
-    /// other exception goes through the shared host-failure mapping, where a
-    /// `code` attribute of `SCP-CRYPTO-4006` is key-not-found and anything
-    /// else is a custody error carrying its code and text.
+    /// Maps a provider exception through the shared host-failure mapping: a
+    /// `code` attribute of `SCP-CRYPTO-4006` (the code of
+    /// `scp_sdk.KeyNotFoundError`) is [`PlatformError::KeyNotFound`], and
+    /// anything else is a custody error carrying its code and text.
     fn call_err(py: Python<'_>, method_name: &str, e: &PyErr) -> PlatformError {
-        if e.is_instance_of::<crate::error::KeyNotFoundError>(py) {
-            return PlatformError::KeyNotFound;
-        }
         scp_ffi_common::custody_parse::host_failure(
             method_name,
             Self::exc_code(py, e).as_deref(),
@@ -842,7 +837,8 @@ pub(crate) mod test_fakes {
     /// P-256 point, since the bridge validates it, so the fake runs the
     /// §9.10.4 seed-to-scalar step over its context seed and multiplies with
     /// a compact affine P-256; it stores nothing for it. An unknown key id
-    /// raises `KeyNotFoundError` (injected by [`fake_py_custody_of`]).
+    /// raises `KeyNotFoundError`, an exception whose `code` is
+    /// `SCP-CRYPTO-4006`, as `scp_sdk.KeyNotFoundError` is.
     /// `fault` makes one path misbehave in one named way: a 32-byte legacy
     /// pseudonym (`legacy32`), the retired `(point, key_id)` tuple (`tuple`),
     /// the §25.19 Vector 30 v1 point for every v1 derive (`vector30`), a
@@ -851,6 +847,9 @@ pub(crate) mod test_fakes {
     /// `ConnectionError` (`transport`) or a coded host error (`sign_4001`).
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
 import hashlib, hmac
+
+class KeyNotFoundError(Exception):
+    code = 'SCP-CRYPTO-4006'
 
 P = 2**256 - 2**224 + 2**192 + 2**96 - 1
 N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
@@ -1162,12 +1161,6 @@ class WrongLengthCustody(P256Custody):
             let module =
                 PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
                     .expect("fake provider module compiles");
-            module
-                .setattr(
-                    "KeyNotFoundError",
-                    py.get_type::<crate::error::KeyNotFoundError>(),
-                )
-                .expect("inject KeyNotFoundError");
             let cls = module
                 .getattr(class.to_str().expect("utf-8 class name"))
                 .expect("fake provider class");

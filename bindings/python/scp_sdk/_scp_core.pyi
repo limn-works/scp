@@ -44,7 +44,6 @@ if TYPE_CHECKING:
 #       +-- IdentityError
 #       +-- ContextError
 #       +-- CryptoError
-#       |   +-- KeyNotFoundError
 #       +-- TransportError
 #       +-- UcanError
 #       +-- ValidationError
@@ -71,11 +70,6 @@ class ContextError(ScpError):
 
 class CryptoError(ScpError):
     """A cryptographic operation failed (MLS, sender keys, encryption, decryption)."""
-
-    ...
-
-class KeyNotFoundError(CryptoError):
-    """A KeyCustodyProvider has no key for the given key id."""
 
     ...
 
