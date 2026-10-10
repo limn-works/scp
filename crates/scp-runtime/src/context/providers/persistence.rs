@@ -7,7 +7,7 @@
 //! methods directly (ADR-049 Decision 7).
 //!
 //! This module re-exports the canonical implementation for convenience. Under
-//! `test` or the `testing` feature it also provides [`InMemoryPersistence`],
+//! `test` or the `testing` feature it also provides `InMemoryPersistence`,
 //! which keeps snapshots only in memory and so compiles into no shipped build
 //! (root `AGENTS.md`, "No dev/test-only stand-ins in production").
 //!

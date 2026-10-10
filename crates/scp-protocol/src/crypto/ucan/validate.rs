@@ -513,8 +513,7 @@ impl CaveatResolver for TokenNbCaveatResolver {
 /// In-memory [`CaveatResolver`] keyed by encoded JWT string.
 ///
 /// Restricted to test builds. Tests use it to attach caveats to a token
-/// without re-signing its `nb` field; production paths read the signed `nb`
-/// through [`TokenNbCaveatResolver`].
+/// without re-signing its `nb` field.
 ///
 /// Map values are owned [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats) records — the resolver
 /// returns clones so the validation pipeline can take an owned snapshot

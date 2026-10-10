@@ -11,9 +11,8 @@
 //! the types in [`GATED_DOUBLES`]: it parses every Rust source file under
 //! `crates/` with `syn` and fails when an item that declares, implements, or
 //! re-exports one of them carries no cfg predicate that implies
-//! `test || feature = "testing"`. A file under a crate's own `tests/` directory
-//! counts as gated, because Cargo compiles it only into an integration-test
-//! target.
+//! `test || feature = "testing"`. A `use` item in a file under a crate's own
+//! `tests/` directory is exempt; a declaration or impl there is not.
 
 use std::path::{Path, PathBuf};
 
@@ -168,13 +167,28 @@ fn mentions_in_source(src: &str) -> Vec<Mention> {
     out
 }
 
+/// Mentions in the file at `path` that the cfg check accepts or rejects.
+///
+/// A `use` item in a file under a crate's `tests/` directory counts as gated:
+/// it names a declaration that this check holds to the cfg gate, so a shipped
+/// build that reached the file through `#[path]`, `include!`, or a manifest
+/// target path would fail to resolve the name. A struct, enum, or impl there
+/// gets no exemption, because no cfg on it means the shipped build compiles it.
+fn checked_mentions(path: &Path, src: &str) -> Vec<Mention> {
+    let in_tests = in_integration_test_target(path);
+    let Ok(file) = syn::parse_file(src) else {
+        panic!("{} does not parse", path.display());
+    };
+    let mut found = Vec::new();
+    collect(&file.items, attrs_gated(&file.attrs), &mut found);
+    for m in &mut found {
+        m.gated |= in_tests && m.kind == "use";
+    }
+    found
+}
+
 /// True when `path` sits under the `tests/` directory of the crate that owns
 /// it, the nearest ancestor directory holding a `Cargo.toml`.
-///
-/// Cargo compiles a file there only into an integration-test target, so no
-/// shipped artifact contains it whatever cfg its items carry. Every manifest
-/// under `crates/` that sets a target `path` into `tests/` declares that
-/// target as `[[test]]`.
 fn in_integration_test_target(path: &Path) -> bool {
     let mut dir = path.parent();
     while let Some(d) = dir {
@@ -224,16 +238,7 @@ fn named_test_doubles_compile_only_under_test_or_testing() {
         if !GATED_DOUBLES.iter().any(|n| src.contains(n)) {
             continue;
         }
-        let Ok(file) = syn::parse_file(&src) else {
-            panic!("{} does not parse", path.display());
-        };
-        let mut found = Vec::new();
-        collect(
-            &file.items,
-            in_integration_test_target(path) || attrs_gated(&file.attrs),
-            &mut found,
-        );
-        for m in found {
+        for m in checked_mentions(path, &src) {
             if m.kind == "struct" || m.kind == "enum" {
                 declarations.push(m.name);
             }
@@ -306,9 +311,38 @@ fn checker_rejects_each_weakened_gate() {
     }
 }
 
-/// The integration-test exemption covers files under a crate's own `tests/`
+/// The integration-test exemption accepts only a `use` item, and only in a
+/// file under a crate's own `tests/` directory: an ungated declaration or impl
+/// there is rejected, and an ungated `use` in `src/` is rejected.
+#[test]
+fn integration_test_exemption_accepts_only_use_items() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let in_tests = crate_dir.join("tests/integration/fixture.rs");
+    let in_src = crate_dir.join("src/fixture.rs");
+
+    let import = "use scp_core::crypto::ucan::validate::InMemoryCaveatResolver;";
+    let found = checked_mentions(&in_tests, import);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].gated, "{found:?}");
+    let found = checked_mentions(&in_src, import);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(!found[0].gated, "{found:?}");
+
+    for src in [
+        "pub struct InMemoryPersistence;",
+        "pub enum InMemoryPersistence {}",
+        "impl RevocationChecker for InMemoryRevocationChecker {}",
+        "impl InMemoryCaveatResolver { fn new() -> Self { todo!() } }",
+    ] {
+        let found = checked_mentions(&in_tests, src);
+        assert_eq!(found.len(), 1, "{src}: {found:?}");
+        assert!(!found[0].gated, "exemption accepted a declaration: {src}");
+    }
+}
+
+/// `in_integration_test_target` holds for files under a crate's own `tests/`
 /// directory and nothing else: a `tests` directory inside `src/`, or a
-/// `tests.rs` module file, stays subject to the cfg check.
+/// `tests.rs` module file, does not count.
 #[test]
 fn integration_test_exemption_covers_only_the_crate_tests_dir() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
