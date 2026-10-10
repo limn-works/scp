@@ -2186,7 +2186,6 @@ mod tests {
             "scp:system:key-rotation",
             "scp:system:governance-participation",
             "scp:system:relay-operation",
-            "scp:system:bridge-operation",
         ] {
             let cap_uri: CapabilityUri = system_uri.parse().unwrap();
             let result = issue_challenge(

@@ -44,7 +44,7 @@
 //! Run via `cargo test -p scp-testing`. Suites cover identity, agent binding,
 //! context lifecycle, broadcast, governance, capabilities, encryption,
 //! transport, node, economics, trust, discovery, content access, compromise
-//! recovery, bridge cooperative, and attack scenarios.
+//! recovery, and attack scenarios.
 //!
 //! # Running tests
 //!

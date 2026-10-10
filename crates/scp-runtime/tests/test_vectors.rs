@@ -947,7 +947,6 @@ fn domain_separators_are_all_unique() {
         "SCP-VOTE-V1:",
         "SCP-RESET-REQUEST-V1:",
         "SCP-KEY-CONTINUITY-V1:",
-        "SCP-CLAIM-V1:",
         "SCP-PROPOSAL-V1:",
         "SCP-ATTESTATION-V1:",
         "SCP-PSEUDONYM-V1:",

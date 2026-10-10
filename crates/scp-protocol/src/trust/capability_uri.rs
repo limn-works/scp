@@ -749,13 +749,12 @@ mod tests {
 
     #[test]
     fn display_roundtrip_all_system_capabilities() {
-        // All 5 system capabilities from §7.3.4.3
+        // All 4 system capabilities from §7.3.4.3
         let uris = [
             "scp:system:mls-group-management",
             "scp:system:key-rotation",
             "scp:system:governance-participation",
             "scp:system:relay-operation",
-            "scp:system:bridge-operation",
         ];
         for original in uris {
             let uri: CapabilityUri = original.parse().unwrap();
