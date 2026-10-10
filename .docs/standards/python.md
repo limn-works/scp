@@ -199,8 +199,8 @@ ruff check bindings/python/
 # Type check
 mypy bindings/python/scp_sdk/ --strict
 
-# Build extension (dev mode)
-maturin develop --release
+# Build extension (dev mode), from the directory whose pyproject.toml holds [tool.maturin]
+(cd bindings/python && maturin develop --release)
 
 # Run tests
 pytest bindings/python/tests/ -v
@@ -208,18 +208,19 @@ pytest bindings/python/tests/ -v
 # Run async tests
 pytest bindings/python/tests/ -v --asyncio-mode=auto
 
-# Build wheel
-maturin build --release
+# Build wheel, from the same directory
+(cd bindings/python && maturin build --release)
 
 # Build wheels for all platforms (CI: the python-wheels job in
-# .github/workflows/build-matrix.yml, one wheel per CPython minor per target).
+# .github/workflows/build-matrix.yml, from bindings/python, one wheel per CPython
+# minor per target).
 # The flags and variable below give each wheel the tag the Platform Wheels table
 # names: CI builds the Linux wheels inside the manylinux_2_28 container, and
 # MACOSX_DEPLOYMENT_TARGET sets the macOS floor in the universal2 tag.
-maturin build --release --target x86_64-unknown-linux-gnu --compatibility manylinux_2_28 -i python3.10 python3.11 python3.12 python3.13
-maturin build --release --target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 -i python3.10 python3.11 python3.12 python3.13
-MACOSX_DEPLOYMENT_TARGET=11.0 maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13
-maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13
+(cd bindings/python && maturin build --release --target x86_64-unknown-linux-gnu --compatibility manylinux_2_28 -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target aarch64-unknown-linux-gnu --compatibility manylinux_2_28 -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && MACOSX_DEPLOYMENT_TARGET=11.0 maturin build --release --target universal2-apple-darwin -i python3.10 python3.11 python3.12 python3.13)
+(cd bindings/python && maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11 python3.12 python3.13)
 ```
 
 ## CI Matrix
@@ -231,13 +232,14 @@ maturin build --release --target x86_64-pc-windows-msvc -i python3.10 python3.11
 | pip-audit | ubuntu-latest | 3.12 | Every PR |
 | test | ubuntu-latest, macos-latest | 3.12, 3.13 | Every PR |
 | rust-build-pyo3-production (`scp-ffi` library with the wheel's `[tool.maturin] features`, vendored OpenSSL) | ubuntu-latest | 3.12 | Every PR that changes Rust or `bindings/python/` |
+| python-wheel-build (`ci.yml`: a debug wheel with the wheel's `[tool.maturin] features`, installed; every `scp_sdk` module imported; readelf shows no dynamic libcrypto or libssl) | ubuntu-latest | 3.10, 3.12 | Every PR that changes Rust or `bindings/python/` |
 | python-wheels (`build-matrix.yml`) | ubuntu-latest (x86_64, aarch64), macos-latest (universal2), windows-latest | 3.10, 3.11, 3.12, 3.13 | Tagged release |
 | conformance | ubuntu-latest | 3.12 | Every PR |
 | publish (PyPI) | ubuntu-latest | 3.12 | Tagged release |
 
 ## Platform Wheels
 
-maturin builds binary wheels with the Rust extension embedded. Users install with `pip install scp-python` — no Rust toolchain required.
+maturin builds binary wheels with the Rust extension embedded, one per CPython minor 3.10-3.13 for each platform in the table below. A user whose platform and CPython minor a wheel covers installs with `pip install scp-python` and needs no Rust toolchain.
 
 | Platform | Architecture | Wheel tag |
 |----------|-------------|-----------|

@@ -39,7 +39,6 @@ released or the deadline elapses.
 | Module | Domain |
 |--------|--------|
 | `scp.rs` | The `SCP` `#[napi]` class -- caller-owned handle; `SCP.withStorage(config)` factory |
-| `bridge_connector.rs` | Bridge connector operations (register, trust evaluation, shadow identities) |
 | `context.rs` | Context lifecycle, membership, governance, broadcast, TTL, export/import |
 | `custody.rs` | `KeyCustody` enum dispatch for the napi bridge |
 | `discovery.rs` | Context discovery |

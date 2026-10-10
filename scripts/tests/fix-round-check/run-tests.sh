@@ -217,9 +217,11 @@
 # grammars nine Python gates parse with, the PyYAML
 # `scripts/check-workflow-compile-steps.py` reads every workflow file with, the ruff
 # `scripts/check-pyi-generated.sh` runs,
-# the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the twelve
-# `cargo tree` resolutions two gates run, and the base ref `scripts/check-cross-layer.sh`
-# diffs against. A developer runs the same command by hand.
+# the jq `scripts/check-bridge-symmetry.sh` requires, a Rust toolchain for the
+# `cargo tree` resolutions of `scripts/check-shipped-feature-graph.sh`,
+# `scripts/check-protocol-deps.sh` and `scripts/check-vendored-openssl-scope.sh`, and the
+# base ref `scripts/check-cross-layer.sh` diffs against. A developer runs the same command
+# by hand.
 #
 # The cases run concurrently; the driver after the last case says how, and prints each
 # case's output in case order once every case has finished.
@@ -285,11 +287,11 @@ trap 'rm -rf "$WORK"' EXIT
 # metadata answer that lists no package; an earlier revision of this stub answered every
 # `metadata` call with an object holding no package list, which turned case 3 red.
 #
-# `cargo tree` stays delegated, so the twelve resolutions inside
-# `scripts/check-shipped-feature-graph.sh` and `scripts/check-protocol-deps.sh` read this
-# repository and case 3 fails when either gate rejects the tree. `cargo tree` takes no build
-# lock: measured at 12.9 seconds and 391 ms for those two gates while another worktree held
-# it.
+# `cargo tree` stays delegated, so the resolutions inside
+# `scripts/check-shipped-feature-graph.sh`, `scripts/check-protocol-deps.sh` and
+# `scripts/check-vendored-openssl-scope.sh` read this repository and case 3 fails when any
+# of them rejects the tree. `cargo tree` takes no build lock: measured at 12.9 seconds and
+# 391 ms for the first two gates while another worktree held it.
 #
 # WHAT THE STUBBED STEPS STILL PROVE. These cases test what the script does with a step's
 # exit code, not whether cargo formats correctly. `.github/workflows/ci.yml` runs the real

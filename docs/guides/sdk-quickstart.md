@@ -38,12 +38,12 @@ cargo --version
 
 ### Python
 
-- Python >= 3.12 (use `python3.12`, not system `python3` which may be Xcode 3.9)
-- Rust toolchain (required for building the native extension via `maturin`)
-- Pre-built wheels are available for Linux, macOS, and Windows
+- CPython 3.10 or later, the `requires-python` floor in `bindings/python/pyproject.toml` (in this repository use `python3.12`, which mise installs, not system `python3`, which may be Xcode 3.9)
+- Pre-built wheels cover CPython 3.10-3.13 on Linux x86_64 and aarch64 with glibc 2.28 or newer (manylinux_2_28), macOS 11 or newer (universal2), and Windows x86_64; installing one needs no Rust toolchain
+- A build from source, both when pip falls back to the source distribution because no wheel matches and when you run `maturin develop` in `bindings/python`, needs a Rust toolchain, a C compiler, and, on Linux and Windows, a full perl (plus make on Linux) for the OpenSSL the build compiles; `bindings/python/README.md` §Requirements has the details
 
 ```bash
-python3.12 --version  # >= 3.12
+python3.12 --version
 ```
 
 ### TypeScript

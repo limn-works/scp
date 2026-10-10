@@ -691,6 +691,7 @@ CODE_JOBS = (
     "protocol-deps",
     "shipped-feature-graph",
     "toolchain-wiring-cases",
+    "vendored-openssl-scope",
     "wasm-protocol",
     "wasm-test",
     "wiping-allocator",
@@ -772,6 +773,7 @@ NOT_ON_PUSH_FILTER_JOBS = (
     "swift-lint",
     "toolchain-wiring-cases",
     "typescript-check",
+    "vendored-openssl-scope",
     "wasm-protocol",
     "wasm-test",
 )

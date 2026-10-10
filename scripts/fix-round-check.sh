@@ -874,22 +874,21 @@ run_step format cargo fmt --all -- --check
 #
 # THE CRITERION for this list: running the script compiles nothing, links nothing, runs no
 # program cargo produced, and takes no lock on the shared target directory, so its whole
-# cost is reading repository files and, for one gate, resolving a dependency graph. Every
-# gate that compiles or links belongs to CI, which runs it on the pushed head.
+# cost is reading repository files and, for the gates named below, resolving dependency
+# graphs. Every gate that compiles or links belongs to CI, which runs it on the pushed head.
 #
-# WHAT THIS LIST HOLDS, against the repository: `scripts/` holds 33 files named
-# `check-*`. This list names 31 of them, and GATES_NOT_RUN below names the other two with
-# the reason each is absent. Neither count is load-bearing: the loop below globs
+# WHAT THIS LIST HOLDS, against the repository: every `scripts/check-*` file but the ones
+# GATES_NOT_RUN below names, each with the reason it is absent. The loop below globs
 # `scripts/check-*` off the disk and fails the run on any file neither array names, so a
 # gate this repository gains and this list does not reports itself instead of going
 # unnoticed.
 #
-# THREE GATES STAY IN THE LIST ALTHOUGH THEY START CARGO. `scripts/check-shipped-feature-
-# graph.sh` runs eleven `cargo tree` resolutions and `scripts/check-protocol-deps.sh` runs
-# one, and `cargo tree` compiles nothing and takes no build lock: a 2026-09-13 run
-# measured them at 12.9 seconds and 391 ms while another worktree held that lock.
-# `scripts/check-wiping-allocator.sh` runs one `cargo metadata --no-deps`, which resolves
-# no dependency and compiles nothing.
+# GATES THAT START CARGO STAY IN THE LIST. `scripts/check-shipped-feature-graph.sh`,
+# `scripts/check-protocol-deps.sh` and `scripts/check-vendored-openssl-scope.sh` run
+# `cargo tree` resolutions, and `cargo tree` compiles nothing and takes no build lock: a
+# 2026-09-13 run measured the first two at 12.9 seconds and 391 ms while another worktree
+# held that lock. `scripts/check-wiping-allocator.sh` runs one `cargo metadata
+# --no-deps`, which resolves no dependency and compiles nothing.
 #
 # Measured on 2026-09-13, one run each, in the order below: 47 seconds for the 28 this
 # list held that day. `scripts/check-workflow-compile-steps.py` joined it afterwards: the
@@ -899,6 +898,8 @@ run_step format cargo fmt --all -- --check
 # job once, for a `Swatinem/rust-cache` step that named no cache group.
 # `scripts/check-doc-includes.py` joined after that: the `doc-includes` job of
 # `.github/workflows/ci.yml` runs it, and it reads only `.docs/` with the standard library.
+# `scripts/check-vendored-openssl-scope.sh` joined with the `vendored-openssl-scope` job,
+# under the cargo exception above.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
@@ -929,6 +930,7 @@ GATES=(
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
     scripts/check-toolchain-wiring.sh
+    scripts/check-vendored-openssl-scope.sh
     scripts/check-wiping-allocator.sh
     scripts/check-workflow-compile-steps.py
 )
@@ -984,10 +986,12 @@ if ! "$PYTHON" -c 'import yaml' >/dev/null 2>&1; then
     printf 'fix-round-check: %s cannot import yaml, which scripts/check-workflow-compile-steps.py parses every workflow file with, so that gate fails below for the missing library. Install it with: pip install '"'"'pyyaml>=6,<7'"'"'\n' "$PYTHON" >&2
 fi
 # `scripts/check-shipped-feature-graph.sh` runs python3.12 itself, whatever $PYTHON
-# resolved to, and imports `tomllib` under it. This line names that cause when the
-# interpreter is absent or lacks the module, for the same reason as the line above.
+# resolved to, and imports `tomllib` under it; `scripts/check-vendored-openssl-scope.sh`
+# reads its wheel entry from that gate's `--print-wheel-entries`. This line names that
+# cause when the interpreter is absent or lacks the module, for the same reason as the
+# line above.
 if ! python3.12 -P -c 'import tomllib' >/dev/null 2>&1; then
-    printf 'fix-round-check: python3.12 is not on PATH or cannot import tomllib, which scripts/check-shipped-feature-graph.sh reads the [tool.maturin] table of each pyproject.toml with, so that gate fails below for the missing interpreter. Install Python 3.12 (.mise.toml names it).\n' >&2
+    printf 'fix-round-check: python3.12 is not on PATH or cannot import tomllib, which scripts/check-shipped-feature-graph.sh reads the [tool.maturin] table of each pyproject.toml with and scripts/check-vendored-openssl-scope.sh reads the wheel entry through, so both gates fail below for the missing interpreter. Install Python 3.12 (.mise.toml names it).\n' >&2
 fi
 
 gates_t0=$(date +%s)
@@ -1021,11 +1025,11 @@ for g in "${GATES[@]}"; do
         *) runner=(bash "$g") ;;
     esac
     # Each gate carries a 300-second bound for the same reason the metadata call above
-    # carries a 60-second one: two of these gates start `cargo tree`, neither passes
-    # `--offline`, and a cargo command on this machine can sit in a queue for half an hour.
-    # A gate that does not finish proved nothing, so the run reports that rather than
-    # waiting. The bound is 300 seconds rather than 60 because the slowest gate measured on
-    # 2026-09-13 took 12.9 seconds and the whole set took 47.
+    # carries a 60-second one: the gates that start `cargo tree` pass no `--offline`, and
+    # a cargo command on this machine can sit in a queue for half an hour. A gate that
+    # does not finish proved nothing, so the run reports that rather than waiting. The
+    # bound is 300 seconds rather than 60 because the slowest gate measured on 2026-09-13
+    # took 12.9 seconds and the whole set took 47.
     out=$("$TIMEOUT" 300 "${runner[@]}" 2>&1)
     gate_rc=$?
     if [[ $gate_rc -eq 0 ]]; then

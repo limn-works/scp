@@ -506,17 +506,16 @@ collect_fn_names_from_file() {
                 # tolerates the messy multi-line attribute patterns rustfmt
                 # produces — e.g.
                 #
-                #     #[pyfunction]
-                #     #[pyo3(name = "bridge_register")]
+                #     #[pyo3(name = "outlet_invoke_cross_context_saga")]
                 #     #[pyo3(signature = (
-                #         context_id,
-                #         operator_did,
+                #         caller_context_id,
+                #         target_context_id,
                 #         ...
                 #     ))]
                 #     #[allow(clippy::too_many_arguments)]
-                #     pub fn py_bridge_register(...)
+                #     pub fn outlet_invoke_cross_context_saga(...)
                 #
-                # without clearing pending on the `    context_id,` or
+                # without clearing pending on the `    caller_context_id,` or
                 # `    ))]` continuation lines (which the simpler
                 # "starts with #[" check would mishandle). Doc-comment
                 # continuation lines have already been stripped to blank

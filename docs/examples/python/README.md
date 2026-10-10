@@ -5,28 +5,32 @@ context lifecycle, messaging, and tool invocation.
 
 ## Prerequisites
 
-1. **Rust toolchain** (for building the native extension):
+1. **Rust toolchain, a C compiler, and, on Linux and Windows, a full perl (plus
+   make on Linux)**: step 3 compiles the native extension and, on Linux and
+   Windows, the OpenSSL its SQLCipher uses (see `bindings/python/README.md`
+   §Requirements):
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 
-2. **Python 3.12+** (via mise):
+2. **CPython 3.10 or later**, the `requires-python` floor in
+   `bindings/python/pyproject.toml`; the repository's mise config installs 3.12:
    ```bash
    mise install python@3.12
    ```
 
-3. **Build the native extension**:
+3. **Build the native extension**, from the repository root:
    ```bash
-   cd bindings/python
-   pip install maturin
-   maturin develop --release
+   (cd bindings/python && pip install maturin && maturin develop --release)
    ```
 
 ## Running the Examples
 
-Each example is a standalone async script:
+Each example is a standalone async script. From the repository root:
 
 ```bash
+cd docs/examples/python
+
 # Identity creation and DID document inspection
 python identity.py
 

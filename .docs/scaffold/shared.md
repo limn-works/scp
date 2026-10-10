@@ -211,7 +211,7 @@ Binary artifact build, sign, and distribute workflow. Conformance gate (100% pas
 
 | Platform | Architectures | Artifact types |
 |----------|--------------|----------------|
-| Linux | x86_64, aarch64 | manylinux2014 wheels (Python), .so (native) |
+| Linux | x86_64, aarch64 | manylinux_2_28 wheels (Python), .so (native) |
 | macOS | universal2 (x86_64 + arm64) | wheels (Python), .dylib (native), .xcframework (Swift) |
 | Windows | x86_64 | wheels (Python), .dll (native) |
 

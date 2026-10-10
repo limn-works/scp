@@ -892,30 +892,6 @@ impl From<scp_core::discovery::DiscoveryError> for ScpPyError {
     }
 }
 
-// Bridge errors → ScpPyError::ContextError
-
-impl From<scp_core::bridge::registration::BridgeRegistrationError> for ScpPyError {
-    fn from(e: scp_core::bridge::registration::BridgeRegistrationError) -> Self {
-        Self::ContextError {
-            message: format!(
-                "bridge registration failed: {e} — verify bridge configuration and permissions"
-            ),
-            code: codes::CTX_2009.to_owned(),
-        }
-    }
-}
-
-impl From<scp_core::bridge::shadow::ShadowError> for ScpPyError {
-    fn from(e: scp_core::bridge::shadow::ShadowError) -> Self {
-        Self::ContextError {
-            message: format!(
-                "shadow context operation failed: {e} — check bridge state and context permissions"
-            ),
-            code: codes::CTX_2010.to_owned(),
-        }
-    }
-}
-
 // Transport errors → ScpPyError::TransportError
 
 impl From<scp_transport::TransportError> for ScpPyError {

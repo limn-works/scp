@@ -115,13 +115,15 @@ The `build-matrix.yml` workflow builds release artifacts for all SDK targets:
 | Job | What it builds | Platforms |
 |-----|---------------|-----------|
 | `rust` | `libscp_core`, `libscp_ffi` | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
-| `python-wheels` | maturin-built wheels | Linux (x86_64, aarch64), macOS universal2, Windows (x86_64) |
+| `python-wheels` | maturin-built wheels, one per CPython minor 3.10-3.13 | Linux manylinux_2_28 (x86_64, aarch64), macOS universal2 (one wheel for x86_64 and aarch64), Windows (x86_64) |
 | `python-sdist` | Source distribution | Platform-independent |
 | `typescript-napi` | napi-rs native addon | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
 | `swift-xcframework` | XCFramework + DocC docs | macOS universal2, iOS arm64, iOS Simulator |
 | `kotlin-aar` | AAR with bundled `.so` | Android (arm64, armv7, x86_64, x86) |
 | `cbindgen` | C ABI shared library | Linux, macOS, Windows (same as Rust) |
 | `aggregate` | Combined release bundle | All of the above |
+
+On a pull request that changes Rust or `bindings/python/`, `ci.yml` job `python-wheel-build` builds a debug wheel for CPython 3.10 and 3.12 on Linux x86_64 from the same `[tool.maturin]` table, installs it, imports every `scp_sdk` module, and fails when the extension links libcrypto or libssl dynamically.
 
 ## Release Pipeline
 

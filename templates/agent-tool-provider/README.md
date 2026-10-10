@@ -5,6 +5,7 @@ A Python agent that registers tools in an SCP context, handles invocations with 
 ## Prerequisites
 
 - Python 3.12+
+- For the source install: a Rust toolchain, a C compiler, and, on Linux and Windows, a full perl (plus make on Linux) for the OpenSSL the build compiles; `bindings/python/README.md` §Requirements has the details
 - SCP Python SDK (`pip install scp-python`, or from source: `pip install -e ../../bindings/python`)
 
 ## Build and Run

@@ -161,7 +161,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
     - `maturin develop` builds the extension in-place for development.
     - `maturin build --release` produces optimized wheels.
     - `maturin publish` uploads to PyPI.
-    - CI builds wheels for Linux (manylinux2014 x86_64 + aarch64), macOS (universal2), Windows (x86_64).
+    - CI builds wheels for Linux (manylinux_2_28 x86_64 + aarch64, so glibc 2.28 or newer: the manylinux2014 image, CentOS 7, can build neither `ring` nor the OpenSSL the Linux wheels compile in), macOS (universal2), Windows (x86_64).
     - Users on a platform and CPython minor a wheel covers (the release wheels cover CPython 3.10-3.13; 3.10 is the supported floor) install with `pip install scp-python` — no Rust toolchain required.
 
 ### Scope

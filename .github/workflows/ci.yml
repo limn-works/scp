@@ -81,7 +81,7 @@ env:
 #   workspace-debug   `target/debug` under build mode — rust-test (all four shards),
 #                     rust-test-napi-production, rust-build-pyo3-production,
 #                     rust-build-uniffi-production, kotlin-test, fail-closed-pre-rotation,
-#                     shipped-feature-graph; and
+#                     shipped-feature-graph, vendored-openssl-scope; and
 #                     rust-doctest (its `cargo test --doc`) in part, as the paragraph
 #                     after this list says.
 #   workspace-check   `target/debug` under check mode and the workspace feature
@@ -654,6 +654,35 @@ jobs:
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
+  # ── Vendored-OpenSSL scope ──
+  # scripts/check-vendored-openssl-scope.sh: `openssl-src` reaches the PyPI
+  # wheel's configuration with libsqlite3-sys's
+  # `bundled-sqlcipher-vendored-openssl` feature on, and no other configuration
+  # scripts/check-shipped-feature-graph.sh --print-artifacts lists and no package
+  # of the root workspace, each resolved under `cargo tree --target all`. Its
+  # fixture harness runs first and must pass. It compiles nothing, so it reads the
+  # `workspace-debug` group for its registry alone.
+  vendored-openssl-scope:
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true'
+    name: Vendored-OpenSSL scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-debug
+          save-if: false
+      # The wheel entry comes from scripts/check-shipped-feature-graph.sh
+      # --print-wheel-entries, which reads `[tool.maturin]` with `tomllib` under
+      # python3.12 and fails when that interpreter is absent or cannot import it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: openssl-src reaches the PyPI wheel's configuration and no other shipped configuration
+        run: bash scripts/check-vendored-openssl-scope.sh
+
   # ── Wiping allocator (09-security-model.md §9.15, freed heap memory) ──
   # Every shipped binary and cdylib links scp-alloc's one `#[global_allocator]`
   # through `use scp_alloc as _;` at its crate root, over an unconditional
@@ -959,9 +988,10 @@ jobs:
   # file with, the Python 3.12 whose tomllib check-shipped-feature-graph.sh
   # reads each pyproject.toml's [tool.maturin] table with, the ruff
   # check-pyi-generated.sh runs, the jq
-  # check-bridge-symmetry.sh requires, a Rust toolchain for the twelve `cargo
-  # tree` resolutions check-shipped-feature-graph.sh and check-protocol-deps.sh
-  # run, and the base ref check-cross-layer.sh diffs against. No step here
+  # check-bridge-symmetry.sh requires, a Rust toolchain for the `cargo tree`
+  # resolutions check-shipped-feature-graph.sh, check-protocol-deps.sh and
+  # check-vendored-openssl-scope.sh run, and the base ref check-cross-layer.sh
+  # diffs against. No step here
   # compiles a crate: the suite replaces `cargo check` and `cargo fmt` with
   # stubs, because what it tests is what the runner does with their exit codes.
   #
@@ -979,9 +1009,10 @@ jobs:
   # because it runs the runner's gates over this checkout, but only through a
   # gate whose own job runs on every pull request (doc-citations, doc-includes,
   # agent-verdict-criterion, error-codes, sdk-coverage and toolchain-wiring among
-  # them). The five gates in that list whose jobs the `code` output guards
-  # (protocol-deps, no-shim-reexports, shipped-feature-graph, wiping-allocator,
-  # workflow-compile-steps) open no prose file, so a prose change still reaches
+  # them). The gates in that list whose jobs the `code` output guards
+  # (protocol-deps, no-shim-reexports, shipped-feature-graph,
+  # vendored-openssl-scope, wiping-allocator, workflow-compile-steps) open no
+  # prose file, so a prose change still reaches
   # every gate that reads it.
   fix-round-check-selftest:
     needs: changes
@@ -1009,7 +1040,7 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       # This job reads the `workspace-debug` cache group for its registry alone,
-      # the way job shipped-feature-graph does: the twelve `cargo tree`
+      # the way job shipped-feature-graph does: the `cargo tree`
       # resolutions the suite drives download the index and the `.crate` files,
       # and no step here compiles a crate into `target/debug`. `save-if: false`
       # keeps job rust-test the group's one writer, which is the shape the
@@ -4561,6 +4592,7 @@ jobs:
       - changes
       - error-codes
       - shipped-feature-graph
+      - vendored-openssl-scope
       - wiping-allocator
       - fail-closed-pre-rotation
       - cross-layer

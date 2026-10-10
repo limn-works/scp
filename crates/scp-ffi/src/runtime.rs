@@ -70,7 +70,6 @@ use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 use scp_ffi_common::bridge_instance::StreamRegistry;
-use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
@@ -775,39 +774,6 @@ impl PyBridgeInstance {
         &self,
     ) -> &Arc<DashMap<String, crate::mcp::McpClientState>> {
         &self.mcp_client_registry
-    }
-
-    /// Selects this instance's **durable** bridge credential store from the
-    /// chosen storage backend, or `None` if storage has not yet been selected.
-    ///
-    /// The credential store is derived on demand from the SAME per-instance
-    /// [`StorageProvider`] the supervisor's `mls_storage` / saga journal derive
-    /// from (spec §17.6) — so a `Sqlite` selection persists bridge tokens across
-    /// restart and an encrypted-in-memory selection keeps them encrypted at
-    /// rest. Because `StorageProvider` is not itself `EncryptedStorage` (the
-    /// sealed marker lives in `scp-platform`), the concrete inner
-    /// `EncryptedStorage` handle is dispatched per variant, exactly as
-    /// `build_persistence_provider` does for `ProtocolRepository`.
-    ///
-    /// Returns `None` only in the storage-before-selection window; production
-    /// `PyScp` construction always goes through
-    /// [`PyBridgeInstance::with_storage_py`], which selects storage first. The
-    /// caller ([`crate::bridge_connector`]) maps `None` to a fail-closed error
-    /// emitted as `SCP-CTX-2105` (`codes::CTX_2105`) — never a silent in-memory
-    /// fallback. This satisfies requirement SCP-CAPSEL-8001 (spec §17.17.1,
-    /// "selection fails closed"); note SCP-CAPSEL-8001 is a classification
-    /// requirement, not the emitted error code. There is no in-memory arm on
-    /// this shipped path (ADR-062 §Decision 5, SCP-CAPINJECT-009).
-    #[must_use]
-    pub fn credential_store(&self) -> Option<FfiCredentialStore> {
-        match self.storage_provider()? {
-            StorageProvider::InMemoryEncrypted(handle) => {
-                Some(FfiCredentialStore::durable_from_handle(Arc::clone(handle)))
-            }
-            StorageProvider::Sqlite(handle) => {
-                Some(FfiCredentialStore::durable_from_handle(Arc::clone(handle)))
-            }
-        }
     }
 
     /// Returns a reference to the connected-relay URL slot.
