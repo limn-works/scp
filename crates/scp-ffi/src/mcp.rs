@@ -41,7 +41,7 @@
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full MCP adapter design.
 
 use scp_ffi_common::error_codes as codes;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -200,18 +200,8 @@ impl McpTransport for StdioClientTransport {
         // Serialize and write the request as a single line.
         let json = serde_json::to_string(request)
             .map_err(|e| format!("failed to serialize request: {e}"))?;
-        inner
-            .writer
-            .write_all(json.as_bytes())
+        scp_mcp::stdio::write_message(&self.child, &mut inner.writer, &json)
             .map_err(|e| format!("failed to write to subprocess stdin: {e}"))?;
-        inner
-            .writer
-            .write_all(b"\n")
-            .map_err(|e| format!("failed to write newline: {e}"))?;
-        inner
-            .writer
-            .flush()
-            .map_err(|e| format!("failed to flush subprocess stdin: {e}"))?;
 
         // Read until this request's response: the server interleaves
         // notifications on the same stream.
@@ -229,21 +219,10 @@ impl McpTransport for StdioClientTransport {
 
         let json = serde_json::to_string(notification)
             .map_err(|e| format!("failed to serialize notification: {e}"))?;
-        inner
-            .writer
-            .write_all(json.as_bytes())
-            .map_err(|e| format!("failed to write notification: {e}"))?;
-        inner
-            .writer
-            .write_all(b"\n")
-            .map_err(|e| format!("failed to write newline: {e}"))?;
-        inner
-            .writer
-            .flush()
-            .map_err(|e| format!("failed to flush notification: {e}"))?;
+        let written = scp_mcp::stdio::write_message(&self.child, &mut inner.writer, &json)
+            .map_err(|e| format!("failed to write notification: {e}"));
         drop(inner);
-
-        Ok(())
+        written
     }
 }
 
@@ -2699,6 +2678,8 @@ pub const fn register_mcp(_m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     /// Test helper: constructs a fresh bridge instance.
@@ -4590,6 +4571,52 @@ mod tests {
         );
         stop_stdio_server(&slot);
         assert!(slot.lock().expect("slot lock").is_none());
+    }
+
+    /// A stop empties the server's slot and reaps the group leader, but a
+    /// group member it killed (a command `sh` forked, or the real server
+    /// under a launcher) can hold the server's stdin open until the kernel
+    /// finishes its exit, so a write in that window lands in the buffer and
+    /// succeeds. The test forces that window: it takes the server out of its
+    /// slot as the stop does, without killing it, so the stdin still accepts
+    /// bytes, and a notification and a request must both fail as sent to a
+    /// stopped server.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_after_a_stop_fails_while_the_server_stdin_is_open() {
+        use scp_mcp::client::McpTransport as _;
+        let mut allowlist = scp_mcp::allowlist::StdioAllowlist::new_with_defaults();
+        allowlist.configure(&["sh"]).expect("allow sh");
+        let allowlist = std::sync::Mutex::new(allowlist);
+        let transport = StdioClientTransport::spawn(
+            &allowlist,
+            &["sh".to_owned(), "-c".to_owned(), "sleep 600".to_owned()],
+        )
+        .expect("spawn a silent server");
+        let child = transport
+            .server_process()
+            .lock()
+            .expect("server lock")
+            .take()
+            .expect("the server is in its slot");
+        let notification = JsonRpcNotification::new("notifications/initialized", None);
+        let notified = transport.send_notification(&notification);
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            method: "tools/list".to_owned(),
+            params: None,
+            id: scp_mcp::protocol::RequestId::Number(1),
+        };
+        // A request that reached the live stub would wait 600 s for a reply;
+        // it runs only once the notification has failed.
+        let requested = notified.is_err().then(|| transport.send_request(&request));
+        scp_mcp::stdio::stop_server_process(child);
+        let error = notified.expect_err("a notification to a stopped server must fail");
+        assert!(error.contains("stopped"), "unexpected error: {error}");
+        let error = requested
+            .expect("the request ran")
+            .expect_err("a request to a stopped server must fail");
+        assert!(error.contains("stopped"), "unexpected error: {error}");
     }
 
     /// A `tools/list` and a `tools/call` that checked the handle out before a

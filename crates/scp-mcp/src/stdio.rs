@@ -216,6 +216,48 @@ pub fn stop_server_process(mut child: std::process::Child) {
     let _ = child.wait();
 }
 
+/// Writes one JSON-RPC message as a line to a stdio MCP server's stdin and
+/// flushes it, refusing a server that has been stopped.
+///
+/// `server` is the bridge's slot for the server's [`std::process::Child`],
+/// which the one stop that kills the server empties under the slot's lock.
+/// An empty slot fails the write before any byte is written. A write error
+/// cannot stand in for that check: the stop reaps only the group leader, so
+/// a group member it killed (the real server under a launcher, or a command
+/// `sh` forked) can still hold the server's stdin open after the stop
+/// returns, and a write then lands in the kernel buffer and succeeds,
+/// telling the caller a message reached a server the transport already
+/// stopped. The slot's lock is released before the write, which can block
+/// on a server that does not read, so a disconnect is never held behind it;
+/// a stop that lands between the check and the write is a stop that came
+/// after the send.
+///
+/// # Errors
+///
+/// Returns an error when the server has been stopped, and when the write or
+/// the flush fails, as it does with `EPIPE` once every holder of the
+/// server's stdin is gone.
+pub fn write_message<W: std::io::Write>(
+    server: &std::sync::Mutex<Option<std::process::Child>>,
+    stdin: &mut W,
+    json: &str,
+) -> Result<(), String> {
+    let stopped = server
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_none();
+    if stopped {
+        return Err("the stdio server was stopped".to_owned());
+    }
+    stdin
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("write error: {e}"))?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|e| format!("write newline error: {e}"))?;
+    stdin.flush().map_err(|e| format!("flush error: {e}"))
+}
+
 /// Reads lines from a stdio MCP server's stdout until the response to the
 /// request with `id` arrives, each line bounded by [`read_line_bounded`].
 ///
@@ -1001,6 +1043,36 @@ mod tests {
         let mut reader = std::io::Cursor::new("h\u{e9}\nrest".as_bytes().to_vec());
         assert_eq!(read_line_bounded(&mut reader, &mut buf), Ok(4));
         assert_eq!(buf, "h\u{e9}\n");
+    }
+
+    /// A write to a server whose slot a stop has emptied fails before any
+    /// byte is written, though the stdin it would write to still accepts
+    /// bytes, as it does while a killed group member holds it; a write to a
+    /// server in its slot goes out as one line.
+    #[cfg(unix)]
+    #[test]
+    fn write_message_refuses_a_stopped_server_whose_stdin_still_accepts_bytes() {
+        let mut stdin = Vec::new();
+        let stopped = std::sync::Mutex::new(None);
+        let err = write_message(&stopped, &mut stdin, "{}").expect_err("a stopped server");
+        assert!(err.contains("stopped"), "got: {err}");
+        assert!(
+            stdin.is_empty(),
+            "nothing may be written to a stopped server"
+        );
+
+        let mut command = std::process::Command::new("sleep");
+        command.arg("600").stdin(std::process::Stdio::null());
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let live = std::sync::Mutex::new(Some(command.spawn().expect("spawn server stand-in")));
+        assert_eq!(write_message(&live, &mut stdin, "{}"), Ok(()));
+        assert_eq!(stdin, b"{}\n");
+        let child = live
+            .lock()
+            .expect("slot lock")
+            .take()
+            .expect("server in slot");
+        stop_server_process(child);
     }
 
     /// The server writes notifications to stdout between responses, and a
