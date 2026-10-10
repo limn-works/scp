@@ -935,5 +935,7 @@ private fun checkExecutionResult(body: JsonObject) {
     GovernanceActionResult.fromBridge(name)
 }
 
-private fun JsonObject.stringField(key: String): String? =
-    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+private fun JsonObject.stringField(key: String): String? {
+    val primitive = this[key] as? JsonPrimitive
+    return primitive?.takeIf { it.isString }?.content
+}
