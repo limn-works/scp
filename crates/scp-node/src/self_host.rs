@@ -1240,7 +1240,12 @@ pub enum HostSiteError {
     /// every reach.
     #[error("invalid host-site config: {0}")]
     InvalidConfig(String),
-    /// The storage directory could not be resolved, created, or written.
+    /// No explicit storage path was given and the environment names no
+    /// absolute default location. Carries the typed
+    /// [`StorageLocationError`], so a caller matches which variable to set.
+    #[error("storage location error: {0}")]
+    StorageLocation(StorageLocationError),
+    /// The storage directory could not be created or written.
     #[error("storage path error: {0}")]
     StoragePath(String),
     /// The `SQLCipher` encryption key could not be resolved or generated.
@@ -2060,27 +2065,98 @@ where
 /// Priority: `cli_path` > `$XDG_DATA_HOME/scp/node` > `$HOME/.local/share/scp/node`.
 /// (The `SCP_STORAGE_PATH` env var is resolved by the binary into `cli_path`.)
 ///
+/// An unset `XDG_DATA_HOME` falls through to `HOME`. A set but empty or
+/// relative `XDG_DATA_HOME`, and an unset, empty or relative `HOME` that the
+/// lookup reaches, are each an error rather than a default: an empty or
+/// relative base resolves against the working directory, so a node started
+/// from two working directories would open two storage directories and two
+/// identities. (The XDG Base Directory Specification tells a reader to ignore
+/// an empty or relative `XDG_DATA_HOME`; this resolver refuses it instead, so
+/// an operator who set it learns the value was not used.)
+///
 /// # Errors
 ///
-/// Returns [`HostSiteError::StoragePath`] when no explicit path is given and
-/// neither `XDG_DATA_HOME` nor `HOME` is set.
+/// Returns [`HostSiteError::StorageLocation`] when no explicit path is given
+/// and the environment yields no absolute base, carrying the
+/// [`StorageLocationError`] that names the variable at fault.
 pub fn resolve_storage_path(cli_path: Option<&PathBuf>) -> Result<PathBuf, HostSiteError> {
     if let Some(path) = cli_path {
         return Ok(path.clone());
     }
+    default_storage_path(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .map_err(HostSiteError::StorageLocation)
+}
+
+/// Why the environment yields no default storage location.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StorageLocationError {
+    /// `XDG_DATA_HOME` is set to an empty value.
+    #[error(
+        "XDG_DATA_HOME is set but empty; set it to an absolute directory, unset it, \
+         or pass an explicit storage path"
+    )]
+    XdgDataHomeEmpty,
+    /// `XDG_DATA_HOME` names a relative path.
+    #[error(
+        "XDG_DATA_HOME is {:?}, a relative path that resolves against the working \
+         directory; set it to an absolute directory, unset it, or pass an explicit \
+         storage path", .value.display().to_string()
+    )]
+    XdgDataHomeNotAbsolute {
+        /// The value `XDG_DATA_HOME` carried.
+        value: PathBuf,
+    },
+    /// `XDG_DATA_HOME` is unset and `HOME` is unset or empty.
+    #[error(
+        "HOME is unset or empty and XDG_DATA_HOME is unset; set HOME or XDG_DATA_HOME \
+         to an absolute directory, or pass an explicit storage path"
+    )]
+    HomeUnset,
+    /// `XDG_DATA_HOME` is unset and `HOME` names a relative path.
+    #[error(
+        "HOME is {:?}, a relative path that resolves against the working directory, \
+         and XDG_DATA_HOME is unset; set HOME or XDG_DATA_HOME to an absolute \
+         directory, or pass an explicit storage path", .value.display().to_string()
+    )]
+    HomeNotAbsolute {
+        /// The value `HOME` carried.
+        value: PathBuf,
+    },
+}
+
+/// [`resolve_storage_path`] without an explicit path, over explicit
+/// `XDG_DATA_HOME` and `HOME` values, so a test covers every case without
+/// mutating the process environment.
+fn default_storage_path(
+    xdg_data_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, StorageLocationError> {
     // XDG Base Directory Specification: $XDG_DATA_HOME or $HOME/.local/share.
-    let data_home = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg)
+    let data_home = if let Some(xdg) = xdg_data_home {
+        if xdg.is_empty() {
+            return Err(StorageLocationError::XdgDataHomeEmpty);
+        }
+        let xdg = Path::new(xdg);
+        if !xdg.is_absolute() {
+            return Err(StorageLocationError::XdgDataHomeNotAbsolute {
+                value: xdg.to_path_buf(),
+            });
+        }
+        xdg.to_path_buf()
     } else {
-        let home = std::env::var("HOME").map_err(|_| {
-            HostSiteError::StoragePath(
-                "HOME environment variable is not set and no storage path or \
-                 XDG_DATA_HOME was provided; set HOME, XDG_DATA_HOME, or pass an \
-                 explicit storage path"
-                    .to_owned(),
-            )
-        })?;
-        PathBuf::from(home).join(".local").join("share")
+        let home = home
+            .filter(|home| !home.is_empty())
+            .map(Path::new)
+            .ok_or(StorageLocationError::HomeUnset)?;
+        if !home.is_absolute() {
+            return Err(StorageLocationError::HomeNotAbsolute {
+                value: home.to_path_buf(),
+            });
+        }
+        home.join(".local").join("share")
     };
     Ok(data_home.join("scp").join("node"))
 }
@@ -2876,6 +2952,65 @@ pub fn external_ip_from_relay_url(relay_url: &str) -> Option<std::net::IpAddr> {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// An unset, empty or relative `HOME` that the lookup reaches is refused
+    /// with a variant naming it; `PathBuf::from("").join(".local")` is the
+    /// relative `.local`, which lands under the working directory.
+    #[test]
+    fn default_storage_path_refuses_an_unset_empty_or_relative_home() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            default_storage_path(None, None),
+            Err(StorageLocationError::HomeUnset)
+        );
+        assert_eq!(
+            default_storage_path(None, Some(OsStr::new(""))),
+            Err(StorageLocationError::HomeUnset)
+        );
+        assert_eq!(
+            default_storage_path(None, Some(OsStr::new("data"))),
+            Err(StorageLocationError::HomeNotAbsolute {
+                value: PathBuf::from("data")
+            })
+        );
+        assert_eq!(
+            default_storage_path(None, Some(OsStr::new("/home/op"))),
+            Ok(PathBuf::from("/home/op/.local/share/scp/node"))
+        );
+    }
+
+    /// A set but empty or relative `XDG_DATA_HOME` is refused, even when an
+    /// absolute `HOME` would serve, so an operator who set it learns it was
+    /// not used; an absolute one wins over `HOME`.
+    #[test]
+    fn default_storage_path_refuses_an_empty_or_relative_xdg_data_home() {
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("/home/op"));
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("")), home),
+            Err(StorageLocationError::XdgDataHomeEmpty)
+        );
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("share")), home),
+            Err(StorageLocationError::XdgDataHomeNotAbsolute {
+                value: PathBuf::from("share")
+            })
+        );
+        assert_eq!(
+            default_storage_path(Some(OsStr::new("/data")), None),
+            Ok(PathBuf::from("/data/scp/node"))
+        );
+    }
+
+    /// An explicit path bypasses the environment entirely.
+    #[test]
+    fn resolve_storage_path_prefers_an_explicit_path() {
+        let explicit = PathBuf::from("/srv/scp");
+        assert_eq!(
+            resolve_storage_path(Some(&explicit)).expect("explicit path"),
+            explicit
+        );
+    }
 
     /// The self-host drain failure line names a panic as a panic and a
     /// cancellation as a cancellation.

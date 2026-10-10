@@ -32,8 +32,15 @@ testing = [
 # Pseudonym, PublicKey, PlatformError); scp-crypto, for the P-256 host
 # helpers and the custody failure kind. Deliberately NOT folded into
 # `resolvers`: these are pure byte/string ops far lighter than the resolver
-# stack.
-custody = ["dep:scp-platform"]
+# stack. The feature also compiles the custody_file module, which resolves and
+# opens the `"file"` custody key file through `FileKeyCustody` (spec §17.8), a
+# production backend that `scp-platform/file` compiles.
+#
+# `scp-platform?/file` uses the `?` form because the plain `scp-platform/file`
+# form makes Cargo mint an implicit feature named `scp-platform`, which the
+# shipped-feature-graph gate rejects as a feature its allowlist does not name.
+# `dep:scp-platform` on the same line already enables the dependency.
+custody = ["dep:scp-platform", "scp-platform?/file"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. `start_node_local` opens no protocol store: it receives a caller's

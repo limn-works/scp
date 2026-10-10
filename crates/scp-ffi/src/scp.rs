@@ -599,12 +599,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// AC5: on a shipped build the production `identity_create` path fails closed
-    /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) — it reaches
-    /// the pre-rotation commitment step (after real File custody + real Pkarr DHT
-    /// construction) and returns the typed error rather than minting the
-    /// `InMemoryPreRotationCustody` nullifier. File custody is used because
-    /// `in_memory` custody is itself severed on shipped builds; a temp `HOME` +
-    /// `SCP_KEY_PASSPHRASE` give the File backend a real, isolated key file.
+    /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) rather than
+    /// minting the `InMemoryPreRotationCustody` nullifier. File custody is used
+    /// because `in_memory` custody is itself severed on shipped builds; a temp
+    /// `HOME` + `SCP_KEY_PASSPHRASE` resolve the File backend's inputs. The
+    /// refusal runs after those inputs resolve and before the key directory or
+    /// key file is created, so a failed call leaves no `$HOME/.scp`.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn identity_create_fails_closed_without_pre_rotation_backend() {
@@ -634,6 +634,12 @@ mod tests {
                 "shipped identity_create must fail closed with SCP-IDENT-1059, got: {msg}"
             );
         });
+        let key_dir = tmp.path().join(".scp");
+        assert!(
+            !key_dir.exists(),
+            "a refused identity_create must not create {}",
+            key_dir.display()
+        );
     }
 
     /// AC3: on a shipped build the device-attestation *verify* op fails closed

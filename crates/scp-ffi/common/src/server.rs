@@ -96,7 +96,8 @@ pub enum ServerError {
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 
-    /// No passphrase was provided when one is required for persistent node identity.
+    /// No passphrase, or an empty one, was provided when one is required for
+    /// persistent node identity.
     #[error("passphrase required for persistent node identity")]
     MissingPassphrase,
 
@@ -576,7 +577,9 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 /// - A data directory cannot be created ([`ServerError::Io`])
 /// - A redb blob database cannot be opened ([`ServerError::Storage`])
 /// - A key custody file cannot be opened ([`ServerError::Platform`])
-/// - No passphrase arrived when `identity` is `None` ([`ServerError::MissingPassphrase`])
+/// - No passphrase, or an empty one, arrived when `identity` is `None`
+///   ([`ServerError::MissingPassphrase`]); this check runs before the data
+///   directory or any file in it is created
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local<S>(
     data_dir: &Path,
@@ -588,6 +591,19 @@ where
     S: EncryptedStorage + 'static,
 {
     use scp_identity::DidCache;
+
+    // A persisted identity needs a passphrase, and an empty one counts as
+    // absent: Argon2id over "" seals the key file under a key anyone who reads
+    // the salt can derive (spec §17.8). Checked before the data directory or
+    // the blob database is created, so a refused call leaves nothing on disk.
+    let passphrase = match identity {
+        Some(_) => None,
+        None => Some(
+            passphrase
+                .filter(|passphrase| !passphrase.is_empty())
+                .ok_or(ServerError::MissingPassphrase)?,
+        ),
+    };
 
     // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
@@ -645,13 +661,22 @@ where
         })
         .await?
     } else {
-        // Persistent key custody — keys survive process restarts.
+        // Persistent key custody — keys survive process restarts. The
+        // passphrase was validated at entry, before any file was created.
         let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
         let key_path = data_dir.join("identity.key");
-        let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
-            &key_path,
-            &passphrase,
-        )?);
+        // `FileKeyCustody::new` runs an Argon2id derivation (64 MiB, three
+        // passes) and can wait up to 10 s on a file another process is
+        // creating (spec §17.8), so it runs on the blocking pool rather than
+        // on this future's worker thread. A panicked or cancelled task
+        // surfaces as `ServerError::Io`.
+        let key_custody = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                scp_platform::file::FileKeyCustody::new(&key_path, &passphrase)
+            })
+            .await
+            .map_err(std::io::Error::from)??,
+        );
 
         // Build the node's DHT client for its DID method. A shipped build uses
         // the real Mainline Pkarr client, fail-closed (never an in-memory
@@ -1858,5 +1883,90 @@ mod tests {
 
         // Cleanup (data_dir may not have been fully created).
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An empty passphrase is refused with `MissingPassphrase` before the data
+    /// directory exists, so no `identity.key` sealed under "" and no blob
+    /// database is left behind.
+    #[tokio::test]
+    async fn node_local_rejects_an_empty_passphrase_before_touching_disk() {
+        let tmp = temp_dir_for("node-empty-pass");
+        let result = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            None,
+            Some(zeroize::Zeroizing::new(String::new())),
+        )
+        .await;
+        let created = tmp.exists();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let err = result.err().expect("an empty passphrase must be refused");
+        assert!(
+            matches!(err, ServerError::MissingPassphrase),
+            "expected ServerError::MissingPassphrase, got: {err:?}"
+        );
+        assert!(
+            !created,
+            "a refused start must not create the data directory {}",
+            tmp.display()
+        );
+    }
+
+    /// `FileKeyCustody::new` runs its Argon2id derivation on the blocking
+    /// pool. With one worker thread, a derivation run inline would stall a
+    /// sibling task for the whole derivation; the sibling's longest stall must
+    /// stay under half of one derivation measured on this machine and build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn node_local_opens_key_custody_on_the_blocking_pool() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let probe = temp_dir_for("custody-cost");
+        std::fs::create_dir_all(&probe).expect("probe dir");
+        let started = Instant::now();
+        let probe_custody = FileKeyCustody::new(&probe.join("identity.key"), "probe-passphrase");
+        let derivation = started.elapsed();
+        drop(probe_custody.expect("probe custody opens"));
+        let _ = std::fs::remove_dir_all(&probe);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker_stop = Arc::clone(&stop);
+        let ticker = tokio::spawn(async move {
+            let mut last = Instant::now();
+            let mut longest = Duration::ZERO;
+            while !ticker_stop.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let now = Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+            }
+            longest
+        });
+
+        let tmp = temp_dir_for("node-blocking-pool");
+        let data_dir = tmp.clone();
+        let started = tokio::spawn(async move {
+            start_node_local(
+                &data_dir,
+                instance_in_memory_storage(),
+                None,
+                Some(zeroize::Zeroizing::new("blocking-pool-pass".to_owned())),
+            )
+            .await
+        })
+        .await
+        .expect("start task joins");
+        stop.store(true, Ordering::Release);
+        let longest = ticker.await.expect("ticker joins");
+        let node = started.expect("node starts");
+        node.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            longest < derivation / 2,
+            "a sibling task stalled {longest:?}, against {derivation:?} for one derivation; \
+             FileKeyCustody::new ran on the worker thread"
+        );
     }
 }
