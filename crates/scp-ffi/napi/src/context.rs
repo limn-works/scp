@@ -1823,8 +1823,8 @@ pub(crate) async fn context_close_on(
     // Release UCAN state for this context, and mark the id so no later call
     // rebuilds it empty, unless the id returned to `Active` after the
     // lifecycle read above. The teardown (cancelling the handle's
-    // subscription, writing the handle `Closed`, and dropping the bridge
-    // connector and economy state) runs inside the release, only while the
+    // subscription, writing the handle `Closed`, and dropping the economy
+    // state) runs inside the release, only while the
     // mark this close set or joined still stands, so a close that reports the
     // context stays open, or whose mark a readmit cleared, leaves the handle
     // reading "active" with its subscription running and its state in place.
@@ -1836,9 +1836,8 @@ pub(crate) async fn context_close_on(
                 token.cancel();
             }
             set_closed = handle.set_closed();
-            // Clean up per-context bridge connector state and economy state via
-            // the same NapiBridgeInstance's core (not the process-global bridge).
-            bi.core.remove_bridge_state(&handle.context_id);
+            // Clean up per-context economy state via the same
+            // NapiBridgeInstance's core (not the process-global bridge).
             bi.core.remove_economy_state(&handle.context_id);
         })
         .await;
