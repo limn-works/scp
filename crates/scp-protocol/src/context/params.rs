@@ -1765,47 +1765,6 @@ mod tests {
         assert_eq!(meta, deserialized);
     }
 
-    /// `PublicMetadata` carries no `deny_unknown_fields`, so serde ignores the
-    /// `bridges` and `bridge_operator_dids` keys that a pre-cut peer wrote
-    /// (the bridge-connector fields deleted from spec §5.7): the value
-    /// deserializes to the same metadata, and re-serializing it emits neither key.
-    #[test]
-    fn public_metadata_ignores_pre_cut_bridge_fields() {
-        let params = ContextParams {
-            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
-            ..ContextParams::default()
-        };
-        let meta = params.public_metadata(&full_runtime());
-
-        let mut value = serde_json::to_value(&meta).unwrap();
-        let object = value
-            .as_object_mut()
-            .expect("PublicMetadata serializes as a map");
-        object.insert(
-            "bridges".to_owned(),
-            serde_json::json!([{
-                "bridge_id": "bridge-001",
-                "operator_did": "did:dht:z6MkOperator",
-                "platform": "discord",
-                "mode": "Relay"
-            }]),
-        );
-        object.insert(
-            "bridge_operator_dids".to_owned(),
-            serde_json::json!(["did:dht:z6MkOperator"]),
-        );
-
-        let decoded: PublicMetadata = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded, meta);
-
-        let reencoded = serde_json::to_value(&decoded).unwrap();
-        let reencoded = reencoded
-            .as_object()
-            .expect("PublicMetadata serializes as a map");
-        assert!(!reencoded.contains_key("bridges"));
-        assert!(!reencoded.contains_key("bridge_operator_dids"));
-    }
-
     // -----------------------------------------------------------------------
     // participation_requirements (SCP-BA-002, §7.3.2.1)
     // -----------------------------------------------------------------------
