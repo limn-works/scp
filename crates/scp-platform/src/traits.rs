@@ -722,8 +722,8 @@ pub trait KeyCustody: Send + Sync {
     /// This is a synchronous query against local state — no I/O is required.
     fn custody_type(&self, key: &KeyHandle) -> CustodyType;
 
-    /// Import an existing Ed25519 private key (raw 32-byte seed) into
-    /// operational custody, returning a fresh [`KeyHandle`].
+    /// Import an existing Ed25519 private key (raw 32-byte seed) as a key in
+    /// the [`KeyRole::Identity`] role, returning a fresh [`KeyHandle`].
     ///
     /// This is used by `migrate_identity` (ADR-003 §4b) to install the
     /// pre-rotation key revealed from cold custody as the NEW identity
@@ -1033,8 +1033,9 @@ pub trait PreRotationCustody: Send + Sync {
 
     /// Destroy the pre-rotation key after a successful migration, returning
     /// the raw private key bytes (zeroized wrapper) so the caller can
-    /// re-import them into operational custody as the new identity key
-    /// (the canonical use of the pre-rotation key per ADR-003 §4b).
+    /// re-import them into [`KeyCustody`] as the new identity key, in the
+    /// [`KeyRole::Identity`] role (the canonical use of the pre-rotation key
+    /// per ADR-003 §4b).
     ///
     /// After this returns, subsequent calls with the same handle MUST
     /// return [`PreRotationCustodyError::HandleNotFound`].

@@ -965,7 +965,7 @@ impl KeyCustody for CallbackKeyCustody {
     ) -> Result<KeyHandle, PlatformError> {
         // Migrating an identity via callback custody requires the SDK
         // consumer to install the pre-rotation private bytes (revealed
-        // at migration time) as the NEW operational `#0` key. The
+        // at migration time) as the NEW identity `#0` key. The
         // `KeyCustodyProvider` callback interface today has no method
         // for "import a known seed and return a handle" — only
         // `generate_keypair`, which mints a fresh random key.

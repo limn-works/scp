@@ -798,7 +798,7 @@ impl KeyCustody for PyCallbackKeyCustody {
         seed: &zeroize::Zeroizing<[u8; 32]>,
     ) -> Result<KeyHandle, PlatformError> {
         // Migration installs the revealed pre-rotation private bytes as the
-        // NEW operational `#0` key. The `KeyCustodyProvider` callback protocol
+        // NEW identity `#0` key, in the identity role. The `KeyCustodyProvider` callback protocol
         // has no "import a known seed → handle" method (only
         // `generate_keypair`, which mints a fresh random key), so this MUST
         // surface a clear error rather than failing deeper in the migration

@@ -897,7 +897,7 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         seed: &zeroize::Zeroizing<[u8; 32]>,
     ) -> Result<KeyHandle, PlatformError> {
         // Migration installs the revealed pre-rotation private bytes as the
-        // NEW operational `#0` key. The callback protocol has no "import a
+        // NEW identity `#0` key, in the identity role. The callback protocol has no "import a
         // known seed → handle" method (only `generateKeypair`, which mints a
         // fresh random key), so this surfaces a clear error. Identity CREATION
         // via callback custody is unaffected. Mirrors the UniFFI/PyO3 contract.

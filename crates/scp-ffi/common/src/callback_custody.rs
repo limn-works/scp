@@ -16,8 +16,12 @@
 //!   exists: a handle the cache lacks (a host key from an earlier session, or
 //!   one destroyed in this session) is resolved through `get_public_key` the
 //!   same way in every entry point, and a host that no longer holds the key
-//!   answers key-not-found. A destroy drops the cache entry only after the
-//!   host confirms it.
+//!   answers key-not-found. A destroy drops the cache entry when the host
+//!   confirms it or reports the key absent. A resolution that awaits the
+//!   host while a destroy of the same id completes caches the destroyed key;
+//!   no operation succeeds from that entry alone, because each one either
+//!   calls the host, which answers key-not-found, or fails a type or role
+//!   check first.
 //! - Every host signature is verified: an Ed25519 signature strictly over the
 //!   data under the cached verifying key, a P-256 signature through
 //!   [`p256_host_signature`]. An exported Ed25519 seed must produce the cached
@@ -157,8 +161,13 @@ pub struct RegisteredEntry {
 ///
 /// The cache is not the authority on whether a key exists; the host is. A
 /// handle the cache lacks is resolved through the host, and a destroy removes
-/// the entry only once the host confirms the key is gone. The map holds at
-/// most one entry per key the caller minted or used.
+/// the entry when the host confirms the key is gone. An entry can outlive
+/// its key: a [`resolve`] that awaits the host's `get_public_key` while a
+/// [`destroy_key`] of the same id completes binds the destroyed key
+/// afterwards. Every operation on that entry still calls the host (which
+/// answers key-not-found) or fails a type or role check, and a later
+/// [`destroy_key`] drops it. The map holds at most one entry per key the
+/// caller minted or used.
 #[derive(Debug, Default)]
 pub struct CallbackKeyRegistry {
     entries: Mutex<HashMap<u64, RegisteredEntry>>,
@@ -746,9 +755,13 @@ where
 
 /// `KeyCustody::destroy_key` over a host provider.
 ///
-/// The host destroys the key; the cache entry is dropped only when the host
+/// The host destroys the key; the cache entry is dropped when the host
 /// confirms the key is gone, by success or by key-not-found. A host failure
 /// leaves the entry, so the handle still names the key the host still holds.
+/// A [`resolve`] of the same id that was awaiting the host when this call
+/// dropped the entry binds the destroyed key again; the host stays the
+/// authority, so every later operation on the handle reaches it and fails
+/// key-not-found (or fails a type or role check first).
 ///
 /// # Errors
 ///
