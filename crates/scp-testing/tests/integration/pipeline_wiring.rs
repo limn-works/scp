@@ -1211,11 +1211,11 @@ fn import_context_is_actor_native_not_dashmap_dual_write() {
 #[test]
 fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
     // G1 — the receive seam GATES fail-closed on the registry, never
-    // log-and-drops. `decrypt_and_dispatch` must call the registry recv gate and
-    // install remote keys via the unchecked wrapper (gate-before-install), with
-    // no "non-fatal" mirror-forward drop.
-    // The recv floor gates in `deliver_incoming` AFTER `verify_and_unwrap`, so a
-    // frame whose signature fails never advances the replay floor.
+    // log-and-drops. The recv floor gates in `deliver_incoming` AFTER
+    // `verify_and_unwrap`, so a frame whose signature fails never advances the
+    // replay floor, and `decrypt_and_dispatch` must not call the recv gate.
+    // `decrypt_and_dispatch` gates the remote sender epoch and then installs
+    // remote keys via the unchecked wrapper (gate-before-install).
     {
         let body = extract_fn_body(MANAGER_SRC, "deliver_incoming")
             .expect("deliver_incoming body must be extractable");
