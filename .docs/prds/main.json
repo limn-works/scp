@@ -936,8 +936,8 @@
         "Generation replay prevention is delegated to the MLS and sender-key layers",
         "No open_envelope, seal_envelope, or SenderLayerAad exists in any crate",
         "Integration test: a message sealed by one production node opens on another and yields the original content",
-        "Test: the production receive path rejects a tampered encrypted_blob",
-        "Test: the production receive path rejects a mismatched payload_hash",
+        "Test (deliver_incoming_rejects_a_payload_altered_after_signing): deliver_incoming rejects an inner envelope whose payload was replaced after signing with the content integrity failure, and the receive floor does not move",
+        "Test (deliver_incoming_rejects_a_signed_payload_hash_that_does_not_match_the_payload): deliver_incoming rejects a validly signed payload_hash that does not match the payload with the content integrity failure, and the receive floor does not move",
         "Test: an inner envelope claiming a sender other than the MLS sender is rejected without a key lookup",
         "Test: an envelope with a bad signature leaves the receive floor unchanged, and a valid envelope at the same (epoch, sequence) is then accepted",
         "No unwrap() or expect() in library code"
@@ -948,7 +948,7 @@
         "In messaging_helpers::verify_and_unwrap, bind the MLS sender to inner.sender_did and resolve the key for (inner.sender_did, signing_key_id)",
         "Wire the payload_hash integrity check: SHA256(stripped_payload) == inner_envelope.payload_hash",
         "Advance the receive floor in deliver_incoming only after verify_and_unwrap succeeds",
-        "Write the production-path roundtrip, tamper, payload-hash, sender-binding, and receive-floor tests",
+        "Write the production-path roundtrip, altered-payload, mismatched-payload-hash, sender-binding, and receive-floor tests, each through deliver_incoming",
         "Delete seal_envelope, open_envelope, and SenderLayerAad and ban them in scripts/check-deleted-primitives.sh"
       ],
       "blockedBy": [

@@ -122,7 +122,7 @@ pub const DEFAULT_BLOB_TTL_SECS: u32 =
 /// inner-envelope construction and the sealed wire stays byte-identical across
 /// the flip (the 16 golden byte-identity tests continue to hold).
 #[allow(clippy::too_many_arguments)]
-fn build_inner_wire(
+pub fn build_inner_wire(
     clock: &Arc<dyn Clock>,
     context_id: &str,
     sender_did: &DID,

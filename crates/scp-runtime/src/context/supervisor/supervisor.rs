@@ -23236,6 +23236,76 @@ mod tests {
             .expect("alice seals the application message")
         }
 
+        /// Alice's correctly signed inner envelope for `payload` at sender
+        /// sequence `aad_sequence`, before sealing.
+        fn alice_inner(
+            &self,
+            ctx_str: &str,
+            aad_sequence: u64,
+            payload: &[u8],
+        ) -> (crate::envelope::inner::InnerEnvelope, [u8; 32]) {
+            let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
+            let recipients = std::collections::HashMap::from([(
+                Self::BOB.to_owned(),
+                self.bob_access_key.clone(),
+            )]);
+            crate::context::messaging_helpers::build_inner_wire(
+                &clock,
+                ctx_str,
+                &DID::from(Self::ALICE),
+                payload,
+                crate::context::supervisor::MessageSigner::Active(
+                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+                ),
+                &recipients,
+                aad_sequence,
+                None,
+                scp_protocol::envelope::inner::MessageType::Content,
+            )
+            .expect("alice builds the inner envelope")
+        }
+
+        /// Seals `inner` through Alice's production sender-key and MLS seal at
+        /// sender sequence `aad_sequence`.
+        fn seal_inner_from_alice(
+            &mut self,
+            context_id_bytes: &[u8; 32],
+            inner: &crate::envelope::inner::InnerEnvelope,
+            aad_sequence: u64,
+        ) -> Vec<u8> {
+            self.alice_state
+                .mode
+                .crypto_mut()
+                .expect("encrypted context")
+                .seal(
+                    context_id_bytes,
+                    Self::ALICE,
+                    inner,
+                    &[0u8; 32],
+                    3600,
+                    aad_sequence,
+                )
+                .expect("alice seals the application message")
+        }
+
+        /// Asserts `result` is the receive path's content-integrity rejection
+        /// and that Bob's recv floor did not move.
+        fn assert_integrity_rejection(
+            &self,
+            result: &Result<crate::context::messaging_helpers::DeliverOutcome, ContextError>,
+        ) {
+            assert!(
+                matches!(result, Err(ContextError::CryptoFailed(m)) if m == "content integrity check failed"),
+                "the content-integrity check must reject the envelope, got {result:?}"
+            );
+            assert!(
+                self.bob_sup
+                    .export_recv_sequence_floors(&self.ctx_bytes)
+                    .is_empty(),
+                "a rejected envelope must not move the recv floor"
+            );
+        }
+
         /// Delivers `blob` to Bob through the production actor receive path
         /// (`MessagingCommand::DeliverIncoming` → `deliver_incoming`).
         fn deliver(
@@ -23366,6 +23436,86 @@ mod tests {
             ),
             "the genuine envelope must surface as Alice's application message, got {accepted:?}"
         );
+    }
+
+    /// The production receive path rejects an inner envelope whose payload was
+    /// replaced after Alice signed it. The signature covers `payload_hash`, not
+    /// the padded payload, so only the content-integrity check
+    /// (`payload_hash == SHA256(stripped_payload)`) catches the swap.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_rejects_a_payload_altered_after_signing() {
+        let ctx_str = "deliver-incoming-altered-payload";
+        let resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let (mut inner, ctx_id) = fx.alice_inner(ctx_str, 1, b"signed content");
+        let (other, _) = fx.alice_inner(ctx_str, 1, b"swapped content");
+        assert_ne!(inner.payload, other.payload);
+        inner.payload = other.payload;
+        let altered = fx.seal_inner_from_alice(&ctx_id, &inner, 1);
+
+        let result = fx.deliver(ctx_str, altered);
+        fx.assert_integrity_rejection(&result);
+    }
+
+    /// The production receive path rejects an inner envelope whose signed
+    /// `payload_hash` does not match its payload: Alice signs the hash of other
+    /// content, so the signature verifies and only the content-integrity check
+    /// rejects it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn deliver_incoming_rejects_a_signed_payload_hash_that_does_not_match_the_payload() {
+        let ctx_str = "deliver-incoming-mismatched-payload-hash";
+        let resolver = crate::crypto::mls::two_party_test_support::pair_resolver(
+            DeliverFixture::ALICE,
+            DeliverFixture::BOB,
+        );
+        let mut fx = DeliverFixture::new(ctx_str, resolver);
+
+        let (mut inner, ctx_id) = fx.alice_inner(ctx_str, 1, b"signed content");
+        let (other, _) = fx.alice_inner(ctx_str, 1, b"other content");
+        inner.payload_hash = other.payload_hash;
+        let canonical = scp_protocol::envelope::inner::compute_canonical_hash(
+            &crate::envelope::inner::InnerEnvelopeParams {
+                version: inner.version,
+                context_id: &inner.context_id,
+                sender_did: &inner.sender_did,
+                epoch: inner.epoch,
+                generation: inner.generation,
+                sequence: inner.sequence,
+                timestamp: inner.timestamp,
+                message_type: inner.message_type,
+                payload: &[],
+                provenance: None,
+                signing_key_id: inner.signing_key_id,
+            },
+            &inner.payload_hash,
+            &inner.provenance_hash,
+        )
+        .expect("canonical hash");
+        inner.signature = ed25519_dalek::Signer::sign(
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            &canonical,
+        )
+        .to_bytes();
+        assert!(
+            scp_protocol::envelope::inner::verify_inner_signature(
+                &inner,
+                crate::crypto::mls::two_party_test_support::alice_signing_key()
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .expect("verifiable"),
+            "the mismatched hash carries Alice's valid signature"
+        );
+        let mismatched = fx.seal_inner_from_alice(&ctx_id, &inner, 1);
+
+        let result = fx.deliver(ctx_str, mismatched);
+        fx.assert_integrity_rejection(&result);
     }
 
     /// An application message whose MLS sender is the receiving node's own DID
