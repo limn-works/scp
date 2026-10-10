@@ -2184,7 +2184,7 @@ impl DurableProviders {
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Self {
         Self {
-            saga_journal: Arc::new(NoopSagaJournal),
+            saga_journal: Arc::new(NoOpSagaJournal),
             mls_storage,
         }
     }
@@ -2404,13 +2404,13 @@ impl Supervisor {
     #[cfg(any(test, feature = "testing"))]
     pub fn for_query_shim() -> Self {
         let persistence: Arc<dyn ContextPersistence> =
-            Arc::new(crate::context::persistence::NoopContextPersistence);
-        let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoopSagaJournal);
+            Arc::new(crate::context::persistence::NoOpContextPersistence);
+        let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoOpSagaJournal);
         Self::new_inner(persistence, saga_journal, SupervisorConfig::default())
     }
 
     /// Test-only constructor: builds a supervisor over the given providers with
-    /// the no-op saga journal ([`NoopSagaJournal`]), so the saga coordinator
+    /// the no-op saga journal ([`NoOpSagaJournal`]), so the saga coordinator
     /// runs but never durably journals.
     ///
     /// Compiled only under `test` or the `testing` feature. A shipped build
@@ -2421,7 +2421,7 @@ impl Supervisor {
     ///
     /// `persistence: None` gives the supervisor's own persistence field and
     /// every actor it builds a
-    /// [`NoopContextPersistence`](crate::context::persistence::NoopContextPersistence)
+    /// [`NoOpContextPersistence`](crate::context::persistence::NoOpContextPersistence)
     /// and leaves the helper-side slot empty, so `persistence_ref()` returns
     /// `None`: helpers skip best-effort persists and `restore_all_contexts`
     /// returns `PersistenceFailed`.
@@ -2444,7 +2444,7 @@ impl Supervisor {
     ) -> Arc<Self> {
         let helper_persistence: Option<Arc<dyn ContextPersistence>> = persistence.map(Arc::from);
         let persistence: Arc<dyn ContextPersistence> = helper_persistence.as_ref().map_or_else(
-            || Arc::new(crate::context::persistence::NoopContextPersistence) as _,
+            || Arc::new(crate::context::persistence::NoOpContextPersistence) as _,
             Arc::clone,
         );
         Self::bootstrap(ProviderBootstrap {
@@ -17401,7 +17401,7 @@ const fn hard_rate_limit_allow(
 }
 
 // ---------------------------------------------------------------------------
-// No-op SagaJournal — test-only. The `NoopContextPersistence` counterpart lives
+// No-op SagaJournal — test-only. The `NoOpContextPersistence` counterpart lives
 // in [`crate::context::persistence`].
 // ---------------------------------------------------------------------------
 
@@ -17410,11 +17410,11 @@ const fn hard_rate_limit_allow(
 /// Compiled only under `test` or the `testing` feature: a journal that stores
 /// nothing nullifies crash-recovery replay (§17.17 `SCP-CAPSEL-8000`).
 #[cfg(any(test, feature = "testing"))]
-struct NoopSagaJournal;
+struct NoOpSagaJournal;
 
 #[cfg(any(test, feature = "testing"))]
 #[async_trait::async_trait]
-impl SagaJournal for NoopSagaJournal {
+impl SagaJournal for NoOpSagaJournal {
     async fn append(
         &self,
         _entry: crate::context::supervisor::saga_journal::JournalEntry,
@@ -31280,7 +31280,7 @@ mod tests {
         let journal: Arc<dyn SagaJournal> =
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
         let persistence: Arc<dyn ContextPersistence> =
-            Arc::new(crate::context::persistence::NoopContextPersistence);
+            Arc::new(crate::context::persistence::NoOpContextPersistence);
         let supervisor = Supervisor::new(persistence, journal, SupervisorConfig::default());
 
         let saga_id = SagaId("saga-durable-repair".to_owned());
@@ -31331,7 +31331,7 @@ mod tests {
         let journal2: Arc<dyn SagaJournal> =
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
         let persistence2: Arc<dyn ContextPersistence> =
-            Arc::new(crate::context::persistence::NoopContextPersistence);
+            Arc::new(crate::context::persistence::NoOpContextPersistence);
         let restarted = Supervisor::new(persistence2, journal2, SupervisorConfig::default());
         assert!(
             restarted.saga_repair_records_for(&saga_id).is_empty(),
@@ -34525,7 +34525,7 @@ mod open_outlet_stream_tests {
             event_log,
             key_resolver,
             Some(Box::new(
-                crate::context::persistence::NoopContextPersistence,
+                crate::context::persistence::NoOpContextPersistence,
             )),
             Some(payment_adapter),
             None,
@@ -36217,7 +36217,7 @@ mod streaming_saga_tests {
             transport,
             event_log,
             key_resolver,
-            Box::new(crate::context::persistence::NoopContextPersistence),
+            Box::new(crate::context::persistence::NoOpContextPersistence),
             Some(payment_adapter),
             None,
             Some(clock),

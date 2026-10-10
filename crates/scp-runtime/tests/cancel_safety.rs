@@ -248,13 +248,13 @@ async fn send_future_cancelled_after_commit_keeps_sequence() {
 
 /// `Supervisor` fixture for the saga-reservation case. The reservation store
 /// under test is in-memory (a `Mutex<HashSet<..>>`) and never touches
-/// persistence or the journal, so the inert `NoopContextPersistence` +
+/// persistence or the journal, so the inert `NoOpContextPersistence` +
 /// empty in-memory journal are sufficient — this mirrors `test_supervisor`
 /// in `tests/actor_saga_coordinator.rs` (integration test files cannot share
 /// a module, so the constructor is replicated).
 fn test_supervisor() -> Supervisor {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(scp_runtime::context::persistence::NoopContextPersistence);
+        Arc::new(scp_runtime::context::persistence::NoOpContextPersistence);
     let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
         InMemoryStorage::new(),
     )));

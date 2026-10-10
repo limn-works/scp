@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 /// snapshot when dropped, so a restart restores nothing.
 /// `InMemoryRevocationChecker` starts empty and so reports every UCAN as not
 /// revoked. `InMemoryCaveatResolver` attaches caveats that no token signature
-/// covers. `NoopContextPersistence` reports every context snapshot as stored
-/// and stores nothing, so a restart restores no context. `NoopSagaJournal`
+/// covers. `NoOpContextPersistence` reports every context snapshot as stored
+/// and stores nothing, so a restart restores no context. `NoOpSagaJournal`
 /// journals no saga, so crash recovery replays nothing.
 const GATED_DOUBLES: &[&str] = &[
     "InMemoryFfiTrustStore",
@@ -36,8 +36,8 @@ const GATED_DOUBLES: &[&str] = &[
     "InMemoryPersistence",
     "InMemoryRevocationChecker",
     "InMemoryCaveatResolver",
-    "NoopContextPersistence",
-    "NoopSagaJournal",
+    "NoOpContextPersistence",
+    "NoOpSagaJournal",
 ];
 
 /// True when a cfg predicate holds only if `test` or `feature = "testing"` holds.

@@ -381,7 +381,7 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 /// clone of Bob's crypto provider (so a test can assert on the installed group).
 ///
 /// `persistence` is threaded straight through: pass `None` for the happy path
-/// (a `NoopContextPersistence` default that always succeeds) or a failing
+/// (a `NoOpContextPersistence` default that always succeeds) or a failing
 /// double for the crash-safety test.
 fn bob_supervisor(
     persistence: Option<Box<dyn ContextPersistence>>,
