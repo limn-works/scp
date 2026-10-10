@@ -261,11 +261,13 @@ constant).
 | `SCP-CTX-2095` | native FFI-common registry + Swift + Kotlin + ts-native + `scp-client-wasm` (**shared meaning, all surfaces**) | Pseudonym registry empty — peers have not announced routing IDs (§9.10.4); native `ContextError::PseudonymRegistryEmpty`, browser `ClientError::PseudonymRegistryEmpty` |
 | `SCP-CTX-2138` | native FFI-common registry | Operation refused because the owning Supervisor began shutdown or dropped (`ContextError::SupervisorShutDown`, ADR-049 Decision 16 items 2 and 4) — NOT emitted by `scp-client-wasm` |
 | `SCP-CTX-2139` | native FFI-common registry | Outlet stream or streaming saga that the Supervisor had opened, dropped unregistered because bridge shutdown began; the operation had started (ADR-049 Decision 16 item 2) — NOT emitted by `scp-client-wasm` |
+| `SCP-CRYPTO-4006` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`), the ts-native, Python and `UniFFI` host custody contracts, and the Kotlin SDK key custody interface | Key not found: the key handle is unknown or its key was destroyed (`PlatformError::KeyNotFound`). A host custody callback signals key-not-found with this code, and the bridge maps a host failure with any other code to `SCP-CRYPTO-4060`. ADR-006's 2026-09-29 amendment fixes this mapping. The Kotlin SDK key custody interface (`AndroidKeyCustody`) throws this code for every key-not-found |
 | `SCP-CRYPTO-4010` | native FFI-common registry (also Kotlin SDK) | MLS group create error — native meaning; NOT emitted by `scp-client-wasm` |
 | `SCP-CRYPTO-4020` | `scp-client-wasm` (browser participant) | Sender-key (§9.16) layer failure (`ClientError::SenderKey`) |
 | `SCP-CRYPTO-4030` | `scp-client-wasm` (browser participant) | Event-log append / proof failure (`ClientError::EventLog`) |
 | `SCP-CRYPTO-4040` | `scp-client-wasm` (browser participant) | Convergent committer-timestamp AAD failure — missing or malformed (ADR-057) (`ClientError::Mls(ConvergentTimestampMissing \| ConvergentTimestampMalformed)`) |
 | `SCP-CRYPTO-4041` | `scp-client-wasm` (browser participant) | Generic MLS group operation failure — create/add/join/encrypt/decrypt/commit catch-all (`ClientError::Mls(_)`) |
+| `SCP-CRYPTO-4060` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody error: a key custody provider or a host custody callback failed for a reason other than key-not-found or a rejected host pseudonym. Covers every `PlatformError` variant except `KeyNotFound` (`SCP-CRYPTO-4006`), `PseudonymRejected` (`SCP-IDENT-1055`), `StorageLockHeld` (`SCP-STORAGE-8005`) and `StorageClosed` (`SCP-STORAGE-8006`), whether it reaches the bridge as a `PlatformError` or as a `CustodyFailure` (ADR-006 2026-09-29 amendment) |
 | `SCP-TRANS-5005` | `scp-client-wasm` (browser participant) | Injected outbound `Socket`/`RelaySink` failed to enqueue a relay frame — WebSocket closed / JS exception (`ClientError::Transport`) |
 | `SCP-TRANS-5010` | native FFI-common registry (also Kotlin SDK) | Transport subscription error — native meaning; NOT emitted by `scp-client-wasm` |
 | `SCP-VALID-7010` | native FFI-common registry (**pre-existing cross-language overlap**: reused by Swift/Kotlin/ts-native SDKs for their own validation conditions) | UCAN token validation error — native meaning; NOT emitted by `scp-client-wasm` |
@@ -304,8 +306,8 @@ enforcement mechanism.)
 | `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
 | `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
-| `SCP-STORAGE-8005` | selection layer, SDK `shutdown`, and `From<PlatformError>` translation (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store (§17.6 "One Opener per Durable Directory") |
-| `SCP-STORAGE-8006` | `From<PlatformError>` translation (all bridges) | `PlatformError::StorageClosed` (§17.6 "One Opener per Durable Directory") |
+| `SCP-STORAGE-8005` | selection layer, SDK `shutdown`, and `From<PlatformError>` and `CustodyFailure` translation (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store; or `PlatformError::StorageLockHeld` from a custody backend, bare or wrapped in a `CustodyFailure` (§17.6 "One Opener per Durable Directory") |
+| `SCP-STORAGE-8006` | `From<PlatformError>` and `CustodyFailure` translation (all bridges) | `PlatformError::StorageClosed`, bare or wrapped in a `CustodyFailure` (§17.6 "One Opener per Durable Directory") |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |
@@ -314,7 +316,7 @@ enforcement mechanism.)
 The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
 colliding with the Android backend's `8001-8003`, which were allocated first.
 
-The selection layer owns `8000` and `8004`, and shares `8005` with each bridge's SDK `shutdown` and its `From<PlatformError>` translation of `PlatformError::StorageLockHeld`. `8000` reports that the caller
+The selection layer owns `8000` and `8004`, and shares `8005` with each bridge's SDK `shutdown` and its translation of `PlatformError::StorageLockHeld`, whether that error arrives bare or wrapped in a `CustodyFailure`. `8000` reports that the caller
 named no storage backend; `8004` reports that the backend the caller did name
 failed to open — a wrong `SQLCipher` key or passphrase, an unwritable directory, a
 corrupt file, or a salt-sidecar fail-closed condition. At open, `8005` reports that another
@@ -362,7 +364,7 @@ reusing `8001` would make one code string mean both "storage key not found" and
 This section documents `SCP-IDENT-1017` (missing signing custody) and the
 per-bridge contract for how that one condition surfaces across the bridges. It
 is **not** the full registry of `SCP-IDENT-` codes — other `SCP-IDENT-` codes
-exist (for example, the pseudonym-derivation family `SCP-IDENT-1054`..`1057`)
+exist (for example, the pseudonym-derivation family `SCP-IDENT-1054`..`1056`)
 and are documented with their own features.
 
 | Code | Description |

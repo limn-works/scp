@@ -27,9 +27,6 @@ scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 # Option A). `derive_pseudonym` derives this member's per-context pseudonym over
 # the wasm-held MLS SignatureKeyPair via this crate — no forked HMAC/HKDF recipe.
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
-# The Ed25519 seed extracted from the MLS SignatureKeyPair is reconstructed into
-# a `SigningKey` to feed `scp_crypto::pseudonym::derive_pseudonym_keypair`.
-ed25519-dalek = { workspace = true }
 
 # `js` is declared in the wasm32 section below, not here. openmls refuses to compile for
 # wasm32 without it (`compile_error!` at openmls-0.9.0/src/lib.rs:148) and on every other

@@ -24,8 +24,7 @@ use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 
 /// Enum dispatch wrapper for [`KeyCustody`] implementations used by the
@@ -106,7 +105,7 @@ impl KeyCustody for FfiKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.derive_pseudonym(key, context_id).await,
@@ -120,7 +119,7 @@ impl KeyCustody for FfiKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         match self {
             #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
@@ -215,8 +214,9 @@ impl KeyCustody for FfiKeyCustody {
 ///
 /// Each method re-acquires the GIL via [`Python::with_gil`] and invokes the
 /// correspondingly-named Python method. Returned values are extracted into
-/// owned Rust types. Any Python exception is mapped to
-/// [`PlatformError::CustodyError`] carrying the exception text.
+/// owned Rust types. An exception whose `code` is `SCP-CRYPTO-4006` maps to
+/// [`PlatformError::KeyNotFound`]; any other exception maps to
+/// [`PlatformError::CustodyError`] carrying its code and text.
 pub struct PyKeyCustodyProvider {
     /// The Python object exposing the custody methods. Held as a GIL-
     /// independent [`Py<PyAny>`] so it can be moved across the
@@ -289,7 +289,7 @@ impl PyKeyCustodyProvider {
                 .obj
                 .bind(py)
                 .call_method1(method_name, (key_id,))
-                .map_err(|e| Self::call_err(method_name, &e))?;
+                .map_err(|e| Self::call_err(py, method_name, &e))?;
             result
                 .extract::<T>()
                 .map_err(|e| Self::type_err(method_name, &e))
@@ -313,7 +313,7 @@ impl PyKeyCustodyProvider {
                 .obj
                 .bind(py)
                 .call_method1(method_name, (key_id, bytes))
-                .map_err(|e| Self::call_err(method_name, &e))?;
+                .map_err(|e| Self::call_err(py, method_name, &e))?;
             result
                 .extract::<T>()
                 .map_err(|e| Self::type_err(method_name, &e))
@@ -341,7 +341,7 @@ impl PyKeyCustodyProvider {
                 .obj
                 .bind(py)
                 .call_method1(method_name, (key_id, bytes, epoch))
-                .map_err(|e| Self::call_err(method_name, &e))?;
+                .map_err(|e| Self::call_err(py, method_name, &e))?;
             result
                 .extract::<T>()
                 .map_err(|e| Self::type_err(method_name, &e))
@@ -355,18 +355,42 @@ impl PyKeyCustodyProvider {
             self.obj
                 .bind(py)
                 .call_method1(method_name, (key_id,))
-                .map_err(|e| Self::call_err(method_name, &e))?;
+                .map_err(|e| Self::call_err(py, method_name, &e))?;
             Ok(())
         })
     }
 
-    fn call_err(method_name: &str, e: &PyErr) -> PlatformError {
-        PlatformError::CustodyError(format!("KeyCustodyProvider.{method_name} raised: {e}"))
+    /// Maps a raised exception through the shared host-failure mapping: an
+    /// exception whose `code` attribute is `SCP-CRYPTO-4006` is key-not-found,
+    /// and any other exception is a custody error carrying its code and text.
+    fn call_err(py: Python<'_>, method_name: &str, e: &PyErr) -> PlatformError {
+        scp_ffi_common::custody_parse::host_failure(
+            method_name,
+            Self::exc_code(py, e).as_deref(),
+            &e.to_string(),
+        )
     }
 
+    /// The raised exception's `code` attribute, when it is a string.
+    fn exc_code(py: Python<'_>, e: &PyErr) -> Option<String> {
+        e.value(py)
+            .getattr("code")
+            .ok()
+            .and_then(|c| c.extract::<String>().ok())
+    }
+
+    /// A result that did not extract. A derive method's error names the
+    /// shape it must return, since the retired `(public_key, key_id)`
+    /// tuple is the usual mistake.
     fn type_err(method_name: &str, e: &PyErr) -> PlatformError {
+        let expected = match method_name {
+            "derive_pseudonym" | "derive_rotatable_pseudonym" => {
+                " (expected bytes: the 33-byte compressed P-256 pseudonym point)"
+            }
+            _ => "",
+        };
         PlatformError::CustodyError(format!(
-            "KeyCustodyProvider.{method_name} returned an unexpected type: {e}"
+            "KeyCustodyProvider.{method_name} returned an unexpected type{expected}: {e}"
         ))
     }
 }
@@ -410,17 +434,23 @@ impl FfiKeyCustody {
 /// Concrete [`KeyCustody`] adapter delegating to a [`PyKeyCustodyProvider`].
 ///
 /// The provider returns:
-/// - `generate_keypair(key_type: str) -> str` — a numeric key-id string.
+/// - `generate_keypair(key_type: str) -> str` — a key id: the canonical
+///   decimal form of a `u64`, as `str(n)` writes it (no sign, no leading zero,
+///   no whitespace), which [`parse_handle`](scp_ffi_common::custody_parse::parse_handle)
+///   enforces (`SCP-CRYPTO-4060` otherwise).
 /// - `sign(key_id: str, message: bytes) -> bytes` — a 64-byte Ed25519 sig.
 /// - `get_public_key(key_id: str) -> bytes` — 32 public-key bytes.
 /// - `destroy_key(key_id: str) -> None`.
 /// - `dh_agree(key_id: str, peer_public: bytes) -> bytes` — 32 shared bytes.
-/// - `derive_pseudonym(key_id: str, context_id: bytes) -> bytes` —
-///   `[public_key (32) || key_id_utf8]`.
-/// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes, pseudonym_epoch: int) -> bytes`
-///   — `[public_key (32) || key_id_utf8]`. The provider performs the canonical
-///   v2 derivation (HMAC key is the private-derived `pseudonym_secret`, domain
-///   `"scp-pseudonym-v2"`); the bridge does NOT synthesize the preimage.
+/// - `derive_pseudonym(key_id: str, context_id: bytes) -> bytes` — the 33-byte
+///   compressed P-256 pseudonym point and nothing else; a pseudonym has no
+///   private key, so the host stores nothing (ADR-021's 2026-09-29
+///   amendment). Bytes that are not such a point fail with `SCP-IDENT-1055`.
+/// - `derive_rotatable_pseudonym(key_id: str, context_id: bytes,
+///   pseudonym_epoch: int) -> bytes` — the v2 point, checked as above. The
+///   provider performs the canonical v2 derivation (HMAC key is the
+///   private-derived `pseudonym_secret`, domain `"scp-pseudonym-v2"`); the
+///   bridge does NOT synthesize the preimage.
 /// - `export_signing_key_bytes(key_id: str) -> bytes` — 32 private seed bytes.
 /// - `custody_type(key_id: str) -> str` — `"hardware"` / `"software"` /
 ///   `"in_memory"`.
@@ -521,11 +551,11 @@ impl KeyCustody for PyCallbackKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> Result<PseudonymKeypair, PlatformError> {
-        let bytes: Vec<u8> =
+    ) -> Result<Pseudonym, PlatformError> {
+        let point: Vec<u8> =
             self.provider
                 .call_str_bytes("derive_pseudonym", &key.id().to_string(), context_id)?;
-        scp_ffi_common::custody_parse::unpack_pseudonym("derive_pseudonym", &bytes)
+        scp_ffi_common::custody_parse::parse_pseudonym("derive_pseudonym", &point)
     }
 
     async fn derive_rotatable_pseudonym(
@@ -533,24 +563,25 @@ impl KeyCustody for PyCallbackKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> Result<PseudonymKeypair, PlatformError> {
+    ) -> Result<Pseudonym, PlatformError> {
         // Canonical v2 recipe (spec §9.10.4.A / §9.10.4.1): the HMAC key is the
-        // private-derived `pseudonym_secret` (HKDF over the Ed25519 private
+        // private-derived `pseudonym_secret` (HKDF over the identity private
         // seed), NEVER the public key. The provider performs the canonical
         // derivation itself — seed = HMAC-SHA256(pseudonym_secret, context_id ||
-        // BE64(pseudonym_epoch) || "scp-pseudonym-v2"); keypair =
-        // Ed25519_keygen(seed[0..32]). The epoch is passed through directly
+        // BE64(pseudonym_epoch) || "scp-pseudonym-v2"); d =
+        // seed_to_scalar("SCP-PSEUDONYM-P256-V1", seed), returned as the 33-byte
+        // compressed P-256 point. The epoch is passed through directly
         // rather than synthesized into the context_id bridge-side, so the v1
         // platform adapter does not re-append its own "scp-pseudonym" domain
         // separator (which would corrupt the v2 domain). Mirrors the UniFFI /
         // napi CallbackKeyCustody contract.
-        let bytes: Vec<u8> = self.provider.call_str_bytes_u64(
+        let point: Vec<u8> = self.provider.call_str_bytes_u64(
             "derive_rotatable_pseudonym",
             &key.id().to_string(),
             context_id,
             pseudonym_epoch,
         )?;
-        scp_ffi_common::custody_parse::unpack_pseudonym("derive_rotatable_pseudonym", &bytes)
+        scp_ffi_common::custody_parse::parse_pseudonym("derive_rotatable_pseudonym", &point)
     }
 
     async fn ed25519_to_x25519_agree(
@@ -635,65 +666,126 @@ impl KeyCustody for PyCallbackKeyCustody {
     }
 }
 
+/// A stdlib-only fake Python `KeyCustodyProvider`, shared by this module's
+/// tests and the `context` bridge tests.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod test_fakes {
     use pyo3::types::PyModule;
 
     use super::*;
 
-    /// Python source for a fake `KeyCustodyProvider` that exercises the
-    /// `Callback` enum delegation using ONLY the stdlib (`hashlib`/`hmac`) —
-    /// no `PyNaCl`/cryptography. The returned bytes are NOT a real Ed25519
-    /// keypair (`sign` returns a deterministic 64-byte HMAC, `get_public_key` a
-    /// 32-byte SHA-256), so this verifies the bridge WIRING — argument
-    /// marshalling, return-shape unpacking, error mapping — independently of
-    /// cryptographic validity (which the Python integration test covers
-    /// end-to-end against `dht.create`). Mirrors the protocol contract
-    /// documented on `PyCallbackKeyCustody`.
+    /// Python source for a fake `KeyCustodyProvider` using ONLY the stdlib
+    /// (`hashlib`/`hmac`), no `PyNaCl`/cryptography. Identity keys are NOT a
+    /// real keypair (`sign` returns a deterministic 64-byte HMAC,
+    /// `get_public_key` a 32-byte SHA-256 of the seed), because the bridge
+    /// checks nothing about them. A pseudonym IS a real P-256 point, since the
+    /// bridge validates it, so the fake runs the §9.10.4 seed-to-scalar step
+    /// over its context seed and multiplies with a compact affine P-256.
+    /// `fault` makes the derive path misbehave in one named way: a 32-byte
+    /// legacy key (`legacy32`), the retired `(point, key_id)` tuple
+    /// (`tuple`), or the §25.19 Vector 30 v1 point for every v1 derive
+    /// (`vector30`).
     const FAKE_PROVIDER_PY: &std::ffi::CStr = c"
 import hashlib, hmac
 
+P = 2**256 - 2**224 + 2**192 + 2**96 - 1
+N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+G = (0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
+     0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5)
+
+def add(p, q):
+    if p is None:
+        return q
+    if q is None:
+        return p
+    if p[0] == q[0] and (p[1] + q[1]) % P == 0:
+        return None
+    if p == q:
+        lam = (3 * p[0] * p[0] - 3) * pow(2 * p[1], -1, P) % P
+    else:
+        lam = (q[1] - p[1]) * pow(q[0] - p[0], -1, P) % P
+    x = (lam * lam - p[0] - q[0]) % P
+    return (x, (lam * (p[0] - x) - p[1]) % P)
+
+def mul(k, p):
+    acc = None
+    while k:
+        if k & 1:
+            acc = add(acc, p)
+        p = add(p, p)
+        k >>= 1
+    return acc
+
+def compressed(d):
+    x, y = mul(d, G)
+    return bytes([2 + (y & 1)]) + x.to_bytes(32, 'big')
+
+def seed_to_scalar(seed):
+    okm, block, i = b'', b'', 1
+    while len(okm) < 48:
+        block = hmac.new(seed, block + b'SCP-PSEUDONYM-P256-V1' + bytes([i]), hashlib.sha256).digest()
+        okm += block
+        i += 1
+    return int.from_bytes(okm[:48], 'big') % (N - 1) + 1
+
+class HostError(Exception):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
 class FakeCustody:
-    def __init__(self):
+    def __init__(self, fault=None):
         self._seeds = {}
         self._next = 1
+        self._fault = fault
 
     def generate_keypair(self, key_type):
-        kid = str(self._next)
+        kid = '007' if self._fault == 'noncanonical_keypair' else str(self._next)
         self._next += 1
         self._seeds[kid] = hashlib.sha256(kid.encode()).digest()
         return kid
 
+    def _seed(self, key_id):
+        if key_id not in self._seeds:
+            raise HostError('key not found: ' + key_id, 'SCP-CRYPTO-4006')
+        return self._seeds[key_id]
+
     def sign(self, key_id, message):
-        return hmac.new(self._seeds[key_id], bytes(message), hashlib.sha512).digest()
+        if self._fault == 'sign_4001':
+            raise HostError('hsm offline', 'SCP-CRYPTO-4001')
+        return hmac.new(self._seed(key_id), bytes(message), hashlib.sha512).digest()
 
     def get_public_key(self, key_id):
-        return hashlib.sha256(self._seeds[key_id]).digest()
+        return hashlib.sha256(self._seed(key_id)).digest()
 
     def destroy_key(self, key_id):
         self._seeds.pop(key_id, None)
 
     def dh_agree(self, key_id, peer_public):
-        return hmac.new(self._seeds[key_id], bytes(peer_public), hashlib.sha256).digest()
+        return hmac.new(self._seed(key_id), bytes(peer_public), hashlib.sha256).digest()
+
+    def _point(self, seed):
+        if self._fault == 'legacy32':
+            return hashlib.sha256(seed).digest()
+        point = compressed(seed_to_scalar(seed))
+        if self._fault == 'tuple':
+            return (point, '1')
+        return point
 
     def derive_pseudonym(self, key_id, context_id):
-        d = hmac.new(self._seeds[key_id], bytes(context_id), hashlib.sha256).digest()
-        kid = str(self._next)
-        self._next += 1
-        self._seeds[kid] = d
-        return d + kid.encode('utf-8')
+        seed = hmac.new(self._seed(key_id), bytes(context_id), hashlib.sha256).digest()
+        if self._fault == 'vector30':
+            return bytes.fromhex(
+                '0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72')
+        return self._point(seed)
 
     def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
         # Canonical v2 preimage: context_id || BE64(epoch) || 'scp-pseudonym-v2'.
         # The bridge passes the epoch through unmodified and does NOT append the
         # v1 'scp-pseudonym' separator, so this provider owns the full recipe.
         preimage = bytes(context_id) + pseudonym_epoch.to_bytes(8, 'big') + b'scp-pseudonym-v2'
-        d = hmac.new(self._seeds[key_id], preimage, hashlib.sha256).digest()
-        kid = str(self._next)
-        self._next += 1
-        self._seeds[kid] = d
-        return d + kid.encode('utf-8')
+        return self._point(hmac.new(self._seed(key_id), preimage, hashlib.sha256).digest())
 
     def export_signing_key_bytes(self, key_id):
         return self._seeds[key_id]
@@ -702,18 +794,49 @@ class FakeCustody:
         return 'software'
 ";
 
-    /// Builds a `FfiKeyCustody::Callback` wrapping a freshly-constructed
-    /// stdlib-only `FakeCustody` Python instance.
-    fn fake_callback_custody() -> FfiKeyCustody {
+    /// Builds a `PyCallbackKeyCustody` over a fresh `FakeCustody(fault)`.
+    pub fn fake_py_custody(fault: Option<&str>) -> PyCallbackKeyCustody {
         Python::with_gil(|py| {
             let module =
                 PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
                     .expect("fake provider module compiles");
             let cls = module.getattr("FakeCustody").expect("FakeCustody class");
-            let obj = cls.call0().expect("FakeCustody instance");
-            let provider = PyKeyCustodyProvider::new(py, obj.unbind()).expect("valid provider");
-            FfiKeyCustody::Callback(PyCallbackKeyCustody::new(provider))
+            let obj = cls.call1((fault,)).expect("FakeCustody instance").unbind();
+            PyCallbackKeyCustody::new(PyKeyCustodyProvider::new(py, obj).expect("valid provider"))
         })
+    }
+
+    /// The fake's context seed for identity key id `key_id`, v1 or v2.
+    pub fn fake_context_seed(key_id: u64, context_id: &[u8], epoch: Option<u64>) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        let identity_seed = Sha256::digest(key_id.to_string().as_bytes());
+        let mut preimage = context_id.to_vec();
+        if let Some(epoch) = epoch {
+            preimage.extend_from_slice(&epoch.to_be_bytes());
+            preimage.extend_from_slice(b"scp-pseudonym-v2");
+        }
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&identity_seed)
+            .expect("HMAC accepts any key length");
+        mac.update(&preimage);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// The compressed pseudonym point the fake returns for a context seed.
+    pub fn fake_pseudonym_point(context_seed: &[u8; 32]) -> [u8; 33] {
+        scp_crypto::pseudonym::pseudonym_from_context_seed(context_seed).to_compressed()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::test_fakes::{fake_context_seed, fake_pseudonym_point, fake_py_custody};
+    use super::*;
+
+    /// Builds a `FfiKeyCustody::Callback` wrapping a fresh fault-free fake.
+    fn fake_callback_custody() -> FfiKeyCustody {
+        FfiKeyCustody::Callback(fake_py_custody(None))
     }
 
     #[tokio::test]
@@ -748,8 +871,9 @@ class FakeCustody:
         );
     }
 
+    /// v1: the bridge returns the host's exact point and its routing id.
     #[tokio::test]
-    async fn ffi_custody_callback_derive_pseudonym_unpacks_handle() {
+    async fn ffi_custody_callback_derive_pseudonym_returns_host_point() {
         let custody = fake_callback_custody();
         let handle = custody
             .generate_keypair(KeyType::Ed25519)
@@ -759,18 +883,33 @@ class FakeCustody:
             .derive_pseudonym(&handle, b"context-xyz")
             .await
             .expect("callback derive_pseudonym");
+        let expected = fake_pseudonym_point(&fake_context_seed(handle.id(), b"context-xyz", None));
+        assert_eq!(pseudo.public_key().to_compressed(), expected);
         assert_eq!(
-            pseudo.public_key.as_bytes().len(),
-            32,
-            "pseudonym public key is 32 bytes"
+            pseudo.routing_id(),
+            &scp_crypto::pseudonym::pseudonym_routing_id(
+                &scp_crypto::p256::P256PublicKey::from_sec1(&expected).expect("valid point")
+            )
         );
-        // The unpacked key handle must be usable for a follow-up sign — proves
-        // the `[pubkey(32) || key_id_utf8]` return is unpacked correctly.
-        let sig = custody
-            .sign(&pseudo.key_handle, b"as pseudonym")
+    }
+
+    /// The routing id of a host's pseudonym is §25.19 Vector 30's v1 routing id
+    /// when the host returns Vector 30's v1 point.
+    #[tokio::test]
+    async fn callback_pseudonym_routing_id_is_spec_25_19_vector_30() {
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("vector30")));
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
             .await
-            .expect("sign with derived pseudonym handle");
-        assert_eq!(sig.as_bytes().len(), 64);
+            .expect("key");
+        let pseudo = custody
+            .derive_pseudonym(&handle, b"context-alpha")
+            .await
+            .expect("derive");
+        assert_eq!(
+            hex::encode(pseudo.routing_id()),
+            "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307"
+        );
     }
 
     #[tokio::test]
@@ -787,44 +926,148 @@ class FakeCustody:
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("callback generate keypair");
-
-        let context_id = b"context-xyz";
-        let epoch: u64 = 7;
         let pseudo = custody
-            .derive_rotatable_pseudonym(&handle, context_id, epoch)
+            .derive_rotatable_pseudonym(&handle, b"context-xyz", 7)
             .await
             .expect("callback derive_rotatable_pseudonym");
+        let expected =
+            fake_pseudonym_point(&fake_context_seed(handle.id(), b"context-xyz", Some(7)));
         assert_eq!(
-            pseudo.public_key.as_bytes().len(),
-            32,
-            "rotatable pseudonym public key is 32 bytes"
-        );
-
-        // Reproduce the fake provider's canonical v2 preimage. handle id 1 is the
-        // first generate_keypair; its seed is SHA-256("1").
-        use hmac::{Hmac, Mac};
-        use sha2::{Digest, Sha256};
-        let seed = Sha256::digest(handle.id().to_string().as_bytes());
-        let mut preimage = context_id.to_vec();
-        preimage.extend_from_slice(&epoch.to_be_bytes());
-        preimage.extend_from_slice(b"scp-pseudonym-v2");
-        let mut mac =
-            <Hmac<Sha256> as Mac>::new_from_slice(&seed).expect("HMAC accepts any key length");
-        mac.update(&preimage);
-        let expected_pubkey = mac.finalize().into_bytes();
-        assert_eq!(
-            pseudo.public_key.as_bytes(),
-            expected_pubkey.as_slice(),
+            pseudo.public_key().to_compressed(),
+            expected,
             "bridge must pass raw context_id + epoch (canonical v2), not a \
              double-domain-appended preimage"
         );
+    }
 
-        // The unpacked handle must be usable for a follow-up sign.
-        let sig = custody
-            .sign(&pseudo.key_handle, b"as rotatable pseudonym")
+    /// A host exception whose `code` is `SCP-CRYPTO-4006` is key-not-found, and
+    /// one whose `code` is the generic `SCP-CRYPTO-4001` is a custody error;
+    /// the bridge reports them as `SCP-CRYPTO-4006` and `SCP-CRYPTO-4060`.
+    #[tokio::test]
+    async fn callback_host_exception_codes_map_to_typed_errors() {
+        use scp_ffi_common::error_codes as codes;
+        let custody = fake_callback_custody();
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
             .await
-            .expect("sign with derived rotatable pseudonym handle");
-        assert_eq!(sig.as_bytes().len(), 64);
+            .expect("identity key");
+        custody
+            .destroy_key(&identity)
+            .await
+            .expect("destroy identity");
+        let err = custody
+            .derive_pseudonym(&identity, b"ctx")
+            .await
+            .expect_err("destroyed identity");
+        assert!(matches!(err, PlatformError::KeyNotFound), "{err:?}");
+        match crate::error::ScpPyError::from(err) {
+            crate::error::ScpPyError::CryptoError { code, .. } => {
+                assert_eq!(code, codes::CRYPTO_4006);
+            }
+            other => panic!("expected CRYPTO_4006, got {other:?}"),
+        }
+
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("sign_4001")));
+        let identity = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("identity key");
+        let err = custody
+            .sign(&identity, b"message")
+            .await
+            .expect_err("host 4001");
+        match &err {
+            PlatformError::CustodyError(m) => {
+                assert!(
+                    m.contains(codes::CRYPTO_4001) && m.contains("hsm offline"),
+                    "{m}"
+                );
+            }
+            other => panic!("4001 must be a custody error, got {other:?}"),
+        }
+        match crate::error::ScpPyError::from(err) {
+            crate::error::ScpPyError::CryptoError { code, .. } => {
+                assert_eq!(code, codes::CRYPTO_4060);
+            }
+            other => panic!("expected CRYPTO_4060, got {other:?}"),
+        }
+    }
+
+    /// Asserts that `err` is the `CustodyError` variant; tests assert the
+    /// variant, never the message text.
+    fn assert_custody_error(err: &PlatformError) {
+        assert!(
+            matches!(err, PlatformError::CustodyError(_)),
+            "expected CustodyError, got {err:?}"
+        );
+    }
+
+    /// A host still returning a 32-byte (Ed25519-era) pseudonym fails as a
+    /// rejected pseudonym that names the point length.
+    #[tokio::test]
+    async fn ffi_custody_callback_legacy_32_byte_pseudonym_is_rejected() {
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("legacy32")));
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("key");
+        match custody
+            .derive_pseudonym(&handle, b"ctx")
+            .await
+            .expect_err("legacy 32-byte key")
+        {
+            PlatformError::PseudonymRejected(m) => assert!(m.contains("got 32 bytes"), "{m}"),
+            other => panic!("expected PseudonymRejected, got {other:?}"),
+        }
+    }
+
+    /// A derive method that returns the retired `(point, key_id)` tuple
+    /// fails as a custody error whose text names the bytes it must return.
+    #[tokio::test]
+    async fn ffi_custody_callback_derive_tuple_names_expected_shape() {
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("tuple")));
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("key");
+        for err in [
+            custody
+                .derive_pseudonym(&handle, b"ctx")
+                .await
+                .expect_err("tuple from derive_pseudonym"),
+            custody
+                .derive_rotatable_pseudonym(&handle, b"ctx", 0)
+                .await
+                .expect_err("tuple from derive_rotatable_pseudonym"),
+        ] {
+            match &err {
+                PlatformError::CustodyError(m) => assert!(
+                    m.contains("expected bytes: the 33-byte compressed P-256 pseudonym point"),
+                    "{m}"
+                ),
+                other => panic!("expected CustodyError, got {other:?}"),
+            }
+        }
+    }
+
+    /// A key id must be the canonical decimal form of a `u64`: `"007"` from
+    /// `generate_keypair` is the custody error `SCP-CRYPTO-4060`.
+    #[tokio::test]
+    async fn ffi_custody_callback_non_canonical_key_ids_are_rejected() {
+        use scp_ffi_common::error_codes as codes;
+        let custody = FfiKeyCustody::Callback(fake_py_custody(Some("noncanonical_keypair")));
+        let err = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect_err("\"007\" from generate_keypair");
+        assert_custody_error(&err);
+        match crate::error::ScpPyError::from(err) {
+            crate::error::ScpPyError::CryptoError { code, message } => {
+                assert_eq!(code, codes::CRYPTO_4060);
+                assert!(message.contains("non-canonical key_id"), "{message}");
+            }
+            other => panic!("expected CRYPTO_4060, got {other:?}"),
+        }
     }
 
     #[tokio::test]

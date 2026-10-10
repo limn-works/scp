@@ -8,6 +8,39 @@ plugins {
     id("signing")
 }
 
+// The directory cargo compiles `libscp_ffi_uniffi` into, asked of `cargo metadata`
+// exactly as `:scp-kt` does (a shared `build.target-dir` puts it outside this
+// checkout). The provider runs only when a test task reads it.
+val cargoTargetDir: Provider<String> =
+    providers
+        .exec {
+            workingDir = rootProject.projectDir.parentFile.parentFile
+            commandLine(
+                "cargo",
+                "metadata",
+                "--manifest-path",
+                "crates/scp-ffi/uniffi/Cargo.toml",
+                "--format-version",
+                "1",
+                "--no-deps",
+            )
+        }.standardOutput.asText
+        .map { json ->
+            val metadata = groovy.json.JsonSlurper().parseText(json) as Map<*, *>
+            metadata["target_directory"] as? String
+                ?: throw GradleException("cargo metadata named no target_directory")
+        }
+
+// Passes `-Djna.library.path` to the unit-test JVM (same shape as `:scp-kt`).
+class JnaLibraryPath(
+    @get:Input val cargoTargetDir: Provider<String>,
+) : CommandLineArgumentProvider {
+    override fun asArguments(): Iterable<String> {
+        val dir = cargoTargetDir.get()
+        return listOf("-Djna.library.path=$dir/debug${File.pathSeparator}$dir/release")
+    }
+}
+
 group = "works.limn"
 version = findProperty("scpVersion")?.toString() ?: "0.1.0-SNAPSHOT"
 
@@ -57,7 +90,12 @@ android {
             // The Platform runs the Jupiter tests through `junit-jupiter-engine`
             // and the JUnit 4 tests (Robolectric, the Compose rule) through
             // `junit-vintage-engine`, both declared below.
-            all { it.useJUnitPlatform() }
+            all {
+                it.useJUnitPlatform()
+                // The pseudonym tests call the `scp-ffi-uniffi` P-256 exports (§9.5,
+                // §9.10.4) through the `:scp-kt` bindings, so JNA must find the cdylib.
+                it.jvmArgumentProviders.add(JnaLibraryPath(cargoTargetDir))
+            }
         }
     }
 
@@ -119,6 +157,9 @@ dependencies {
     testImplementation("androidx.test:core:1.6.1")
     testImplementation("androidx.lifecycle:lifecycle-runtime-testing:2.8.7")
     testImplementation("junit:junit:4.13.2")
+    // The JVM unit tests load the UniFFI cdylib through the jar build of JNA; the
+    // `@aar` above carries only the Android native stubs.
+    testImplementation("net.java.dev.jna:jna:5.18.1")
     testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.11.4")
 
     // SQLite JDBC — JVM-side SQLite for storage conformance tests (SCP-PERSIST-060)

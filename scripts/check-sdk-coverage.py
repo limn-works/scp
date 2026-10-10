@@ -110,6 +110,18 @@ SDK_EXTENSIONS: dict[str, str] = {
 # Do NOT "simplify" by deleting these entries: removing one re-opens a
 # fail-closed gap for that op.
 ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
+    # P-256 pseudonym point helpers are module-level free functions named
+    # without a domain prefix in every SDK.
+    ("Crypto", "p256_pseudonym_point"): {
+        "python": ["p256_pseudonym_point"],
+        "typescript": ["p256PseudonymPoint"],
+        "swift": ["p256PseudonymPoint"],
+    },
+    ("Crypto", "p256_software_pseudonym_point"): {
+        "python": ["p256_software_pseudonym_point"],
+        "typescript": ["p256SoftwarePseudonymPoint"],
+        "swift": ["p256SoftwarePseudonymPoint"],
+    },
     # Identity attestations carry the "Link" infix across all SDKs.
     ("Identity", "create_attestation"): {
         "python": ["create_identity_link_attestation"],

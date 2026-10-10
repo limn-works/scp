@@ -4533,7 +4533,7 @@ mod restore_reconcile_tests {
                 crate::context::export_import::ExportScope::Full,
                 &scp_clock::SystemClock,
                 |hash: &[u8; 32]| {
-                    Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+                    Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
                 },
             )
             .expect("build a signed export");

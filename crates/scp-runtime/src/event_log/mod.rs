@@ -29,12 +29,44 @@ pub struct KeyCustodySigner<'a, C: KeyCustody> {
 
 #[async_trait::async_trait]
 impl<C: KeyCustody> EventLogSigner for KeyCustodySigner<'_, C> {
-    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
-        let sig = self
-            .custody
-            .sign(self.key, message)
-            .await
-            .map_err(|e| e.to_string())?;
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, scp_crypto::CustodyFailure> {
+        let sig = self.custody.sign(self.key, message).await?;
         Ok(sig.into_bytes())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use scp_platform::testing::InMemoryKeyCustody;
+    use scp_platform::traits::{KeyCustody, KeyType};
+
+    use super::KeyCustodySigner;
+
+    /// A checkpoint signed through a destroyed key fails with a typed
+    /// key-not-found custody failure, which every bridge reports as
+    /// `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn checkpoint_with_a_destroyed_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&key).await.unwrap();
+        let log = scp_event_log::EventLog::new("ctx-checkpoint-custody".to_owned());
+        let signer = KeyCustodySigner {
+            custody: &custody,
+            key: &key,
+        };
+        let err = scp_event_log::checkpoint::generate_checkpoint(
+            &log,
+            &scp_did::DID::from("did:dht:alice"),
+            1,
+            &signer,
+        )
+        .await
+        .expect_err("a checkpoint under a destroyed key must fail");
+        assert!(
+            matches!(&err, scp_event_log::EventLogError::Custody(failure) if failure.is_key_not_found()),
+            "expected EventLogError::Custody key-not-found, got {err:?}"
+        );
     }
 }

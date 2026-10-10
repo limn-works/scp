@@ -882,13 +882,13 @@ To verify an implementation against these test vectors:
 
 §25.1 names the generator, states how to run it, states which values it produces, and states which published known-answer tests it checks itself against. A value printed above that the generator does not reproduce is a defect in this section.
 
-**Six shipped artifacts still carry the superseded signature algorithm.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `crates/scp-crypto/src/pseudonym.rs`, `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs`, `tests/conformance/vectors/outlet_streaming_saga_vectors.json` and `tests/conformance/vectors/outlet_registration_v2.json` assert or carry the values these vectors printed before 2026-09-10, under the algorithm §9.5 of the security-model spec superseded on that date. The artifact flow puts the spec first, so this section is the authority for every byte above until each artifact is regenerated on P-256, and an implementer comparing against one of them today reproduces the superseded values.
+**Four shipped artifacts still carry the superseded signature algorithm.** `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-event-log/tests/test_vectors.rs`, `tests/conformance/vectors/outlet_streaming_saga_vectors.json` and `tests/conformance/vectors/outlet_registration_v2.json` assert or carry the values these vectors printed before 2026-09-10, under the algorithm §9.5 of the security-model spec superseded on that date. The artifact flow puts the spec first, so this section is the authority for every byte above until each artifact is regenerated on P-256, and an implementer comparing against one of them today reproduces the superseded values.
 
 Independent implementations SHOULD run the generator, compare its output against the values printed above, and then embed those outputs in their own test suites.
 
 ## 25.19 Per-Context Pseudonym Derivation Vectors (§9.10.4, §9.10.4.A, §9.10.4.1)
 
-These vectors pin the **software-custody** per-context pseudonym keypair derivation. Software custody is cross-platform deterministic: every SDK (Rust, Swift, Kotlin, TypeScript) MUST reproduce the exact public-key bytes below for the same identity seed, `context_id`, and epoch. **Hardware custody** (Secure Enclave, Android Keystore TEE, HSM) is device-local by design — the `pseudonym_secret` is derived inside the hardware boundary from a non-exportable key, so hardware pseudonyms are NOT expected to match these values and are NOT cross-device deterministic (§9.10.4.A).
+These vectors pin the **software-custody** per-context pseudonym derivation. Software custody is cross-platform deterministic: every SDK (Rust, Swift, Kotlin, TypeScript, Python) MUST reproduce the exact public-key bytes below for the same identity seed, `context_id`, and epoch. Under the §9.10.4.A native interim, native software custody reproduces them when the 32-byte `identity_scalar` below is held as the identity's Ed25519 seed; the Rust, Swift and Kotlin KATs install it that way in the custody under test. The TypeScript and Python KATs pass it to the software-host export `p256_software_pseudonym_point`, which runs the production derivation and returns the point. The v1 routing id that each bridge's callback adapter computes from the Vector 30 point is asserted per bridge: for PyO3 and UniFFI by a Rust test, and for napi, whose Rust unit tests cannot host a JavaScript callback, by a TypeScript test that runs through the addon (the tests are named below). **Hardware custody** (Secure Enclave, Android Keystore TEE, HSM) is device-local by design — the `pseudonym_secret` is a device-local secret generated inside the hardware boundary, so hardware pseudonyms are NOT expected to match these values and are NOT cross-device deterministic (§9.10.4.A).
 
 Derivation recipe (all implementations agree):
 
@@ -912,7 +912,10 @@ context_seed_v2 = HMAC-SHA256(pseudonym_secret, context_id || BE64(epoch) || "sc
 # seed-to-scalar (FIPS 186-5 A.2.1, extra random bits — §9.10.4):
 scalar_input = HKDF-Expand-SHA256(context_seed, "SCP-PSEUDONYM-P256-V1", 48)
 d            = (int(scalar_input) mod (n - 1)) + 1
-pseudonym_public_key = P256_keypair_from_scalar(d).public_key   (33-byte compressed)
+pseudonym_public_key = d·G   (33-byte compressed; d is discarded)
+
+# routing id (every routing field carries this, never the point):
+pseudonym_routing_id = SHA-256("scp-pseudonym-routing-v1:" || pseudonym_public_key)
 ```
 
 The 32-byte `context_seed` is the HKDF-Expand input of the seed-to-scalar rule, never a scalar in its own right: §9.10.4 forbids reducing it directly, which biases the low-order scalars, and forbids reject-and-retry, which makes the derivation diverge across implementations that draw retries differently. The HMAC `data` is plain concatenation with NO length prefixes — these are fixed-format internal inputs, and the domain-separator suffix (`"scp-pseudonym"` vs `"scp-pseudonym-v2"`) plus the fixed 8-byte BE64 epoch make the encoding unambiguous.
@@ -939,11 +942,17 @@ Expected context_seed_v1:
 Expected v1 pseudonym public key (33-byte compressed):
   0x0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72
 
+Expected v1 pseudonym_routing_id:
+  0xb7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307
+
 Expected context_seed_v2 (epoch = 1):
   0x6ab63aa150992ff032f6963c31dc9f5a8bd4e9518516f9fbd3bea7bc07f64b38
 
 Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
   0x0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479
+
+Expected v2 pseudonym_routing_id (epoch = 1):
+  0xb19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9
 ```
 
 ### Vector 31: Pseudonym Derivation — identity seed 0x9d,0x01..0x1f
@@ -966,14 +975,20 @@ Expected context_seed_v1:
 Expected v1 pseudonym public key (33-byte compressed):
   0x0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d
 
+Expected v1 pseudonym_routing_id:
+  0xcab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c
+
 Expected context_seed_v2 (epoch = 1):
   0x8133a9d716dcbe729b1f447ac0efccf3795e8bf28da2db4744090d0316ead730
 
 Expected v2 pseudonym public key (epoch = 1, 33-byte compressed):
   0x037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3
+
+Expected v2 pseudonym_routing_id (epoch = 1):
+  0x3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27
 ```
 
-`derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` are two of the unported artifacts §25.18 names. The native/`wasm32` byte-parity obligation those two tests carry is unchanged, because only the curve and the key width changed.
+`spec_25_19_vectors_30_31` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A) and `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs` assert every value above, routing ids included, on native and on `wasm32`. `scripts/gen-test-vectors-p256.py` emits them. `test_software_pseudonym_point_reproduces_spec_25_19` in `bindings/python/tests/test_p256_host_helpers.py` and the matching test in `bindings/typescript/tests/p256-host-helpers.test.ts` assert the four points through the bridge exports. The Vector 30 v1 routing id is asserted through each bridge's callback adapter: for PyO3 by `callback_pseudonym_routing_id_is_spec_25_19_vector_30` in `crates/scp-ffi/src/custody.rs`, for UniFFI by `callback_pseudonym_routing_id_is_spec_25_19_vector_30` in `crates/scp-ffi/uniffi/src/bridge.rs`, and for napi by the test "the host receives the caller's context and epoch unchanged and the bridge returns the §25.19 Vector 30 routing ids" in `bindings/typescript/tests/custody-bridge-checks.test.ts`, which drives the addon's `TestingCallbackCustody`.
 
 ### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
 

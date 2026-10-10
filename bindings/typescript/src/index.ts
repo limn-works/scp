@@ -219,7 +219,11 @@ export type {
   ScpOptions,
   StorageConfig,
 } from "./scp";
-export { SCP } from "./scp";
+export {
+  p256PseudonymPoint,
+  p256SoftwarePseudonymPoint,
+  SCP,
+} from "./scp";
 
 // ---------------------------------------------------------------------------
 // Errors

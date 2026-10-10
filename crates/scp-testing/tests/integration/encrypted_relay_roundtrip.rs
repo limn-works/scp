@@ -50,8 +50,7 @@ use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
@@ -122,7 +121,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         &self,
         _key: &KeyHandle,
         _context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
@@ -131,7 +130,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         _key: &KeyHandle,
         _context_id: &[u8],
         _pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
 
@@ -384,8 +383,9 @@ async fn alice_bob_encrypted_message_via_relay() {
         .await
         .unwrap();
 
-    let routing_bytes = pseudonym.public_key.as_bytes();
-    let routing_arr: [u8; 32] = routing_bytes.try_into().unwrap();
+    // §9.10.4: routing fields carry the 32-byte routing id of the P-256
+    // pseudonym, never the 33-byte point itself.
+    let routing_arr: [u8; 32] = *pseudonym.routing_id();
 
     // 8c. Seal: serialize inner, encrypt with sender key, encrypt with MLS,
     //     wrap in outer envelope (ADR-001, ADR-002, ADR-007).

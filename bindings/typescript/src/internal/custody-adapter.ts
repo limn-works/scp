@@ -1,0 +1,201 @@
+// custody-adapter.ts — the native-shaped custody record napi-rs expects for a
+// caller's KeyCustodyProvider (ADR-006). `SCP.identityCreateWithCustody` passes
+// it to the bridge; the bridge-check tests drive the same record through the
+// napi `TestingCallbackCustody` hook.
+
+import type { KeyCustodyProvider } from "../scp";
+
+/**
+ * The one outcome shape every custody callback hands the bridge. A host
+ * failure travels as `{ ok: false, code?, message }`, never as a thrown
+ * exception: napi-rs turns an exception thrown inside a threadsafe-function
+ * callback into a process-level uncaught exception. The bridge maps a failure
+ * whose `code` is `"SCP-CRYPTO-4006"` to key-not-found and any other failure
+ * to a custody error.
+ */
+export type NativeHostResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; code?: string; message: string };
+
+type HostFailure = { ok: false; code?: string; message: string };
+
+/** Runs `read`, returning `fallback` if it throws. */
+function safely<T>(read: () => T, fallback: T): T {
+  try {
+    return read();
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * The failure arm for a thrown value. Reading the code and message never
+ * throws, whatever was thrown (`Object.create(null)`, a revoked Proxy, an
+ * `Error` whose `message` is not a string), and the message is always a string.
+ */
+function failureOf(thrown: unknown): HostFailure {
+  const message = safely(() => {
+    if (typeof thrown === "string") return thrown;
+    const m: unknown = (thrown as { message?: unknown } | null | undefined)?.message;
+    return typeof m === "string" ? m : String(thrown);
+  }, "the host threw a value with no readable message");
+  const code = safely(() => {
+    const c: unknown = (thrown as { code?: unknown } | null | undefined)?.code;
+    return typeof c === "string" ? c : undefined;
+  }, undefined);
+  return code === undefined ? { ok: false, message } : { ok: false, code, message };
+}
+
+/** Whether `value` is a Promise or another thenable. Reading `then` may throw. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    ((typeof value === "object" && value !== null) || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+/**
+ * Runs one host call and returns its outcome. A throw, a Promise or other
+ * thenable (every provider method is synchronous), and a return that `convert`
+ * rejects all become the failure arm, which the bridge reports as a custody
+ * error. A returned thenable is settled against a no-op handler, so its
+ * rejection never reaches the process as an unhandled rejection.
+ */
+function hostCall<T>(
+  method: string,
+  call: () => unknown,
+  convert: (raw: unknown) => T,
+): NativeHostResult<T> {
+  try {
+    const raw = call();
+    if (isThenable(raw)) {
+      safely(() => {
+        Promise.resolve(raw).catch(() => {});
+      }, undefined);
+      return {
+        ok: false,
+        message: `KeyCustodyProvider.${method} returned a Promise; provider methods must be synchronous`,
+      };
+    }
+    return { ok: true, value: convert(raw) };
+  } catch (e: unknown) {
+    return failureOf(e);
+  }
+}
+
+/** A wrongly typed host return, reported as a custody failure. */
+function wrongType(method: string, expected: string): TypeError {
+  return new TypeError(`KeyCustodyProvider.${method} returned a value that is not ${expected}`);
+}
+
+function asString(method: string): (raw: unknown) => string {
+  return (raw) => {
+    if (typeof raw !== "string") throw wrongType(method, "a string");
+    return raw;
+  };
+}
+
+function asBytes(method: string): (raw: unknown) => number[] {
+  return (raw) => {
+    if (!(raw instanceof Uint8Array)) throw wrongType(method, "a Uint8Array");
+    return Array.from(raw);
+  };
+}
+
+/**
+ * `asBytes` for key material (`dhAgree`, `exportSigningKeyBytes`). napi-rs
+ * reads a Rust `Vec<u8>` only from a JS `Array<number>`, so the adapter must
+ * hand the bridge a copy of the host's secret. napi-rs copies that array into
+ * Rust synchronously, as soon as the callback returns; the microtask below
+ * then zero-fills the adapter's copy, so no second copy of the secret stays
+ * on the JS heap. The host's own `Uint8Array` belongs to the host and is left
+ * untouched.
+ */
+function asSecretBytes(method: string): (raw: unknown) => number[] {
+  const convert = asBytes(method);
+  return (raw) => {
+    const copy = convert(raw);
+    queueMicrotask(() => copy.fill(0));
+    return copy;
+  };
+}
+
+/**
+ * Wraps `provider` in the record the napi `NapiKeyCustodyProvider` object
+ * reads.
+ */
+export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
+  // NAPI marshals each provider method as a ThreadsafeFunction WITHOUT
+  // preserving `this`, and Rust `Vec<u8>` crosses the wire as a JS
+  // `Array<number>` (not `Uint8Array`). The adapter below (a) closes over
+  // `provider` in each arrow so `this` is bound, (b) converts byte args
+  // inbound (`Array<number>` → `Uint8Array`) and byte returns outbound
+  // (`Uint8Array` → `Array<number>`), and (c) runs every host call, conversion
+  // included, through `hostCall`, so a host throw, a Promise return and a
+  // wrongly typed return each reach Rust as a structured failure. napi-rs delivers a multi-element Rust tuple
+  // (`(String, Vec<u8>)`) to the JS callback as a SINGLE `[keyId, bytes]`
+  // array argument, not as two positional args, so the tuple callbacks
+  // (`sign`, `dhAgree`, `derivePseudonym`, `deriveRotatablePseudonym`) accept
+  // one array and destructure it.
+  return {
+    generateKeypair: (keyType: string): NativeHostResult<string> =>
+      hostCall(
+        "generateKeypair",
+        () => provider.generateKeypair(keyType),
+        asString("generateKeypair"),
+      ),
+    sign: ([keyId, message]: [string, number[]]): NativeHostResult<number[]> =>
+      hostCall("sign", () => provider.sign(keyId, Uint8Array.from(message)), asBytes("sign")),
+    getPublicKey: (keyId: string): NativeHostResult<number[]> =>
+      hostCall("getPublicKey", () => provider.getPublicKey(keyId), asBytes("getPublicKey")),
+    // `destroyKey` returns nothing the bridge reads, so any non-thenable
+    // return (a `Map.delete` boolean, say) is accepted.
+    destroyKey: (keyId: string): NativeHostResult<undefined> =>
+      hostCall(
+        "destroyKey",
+        () => provider.destroyKey(keyId),
+        () => undefined,
+      ),
+    dhAgree: ([keyId, peerPublic]: [string, number[]]): NativeHostResult<number[]> =>
+      hostCall(
+        "dhAgree",
+        () => provider.dhAgree(keyId, Uint8Array.from(peerPublic)),
+        asSecretBytes("dhAgree"),
+      ),
+    derivePseudonym: ([keyId, contextId]: [string, number[]]): NativeHostResult<number[]> =>
+      hostCall(
+        "derivePseudonym",
+        () => provider.derivePseudonym(keyId, Uint8Array.from(contextId)),
+        // The bridge checks the bytes are a compressed P-256 point.
+        asBytes("derivePseudonym"),
+      ),
+    // The Rust `(String, Vec<u8>, u64)` tuple likewise arrives as a single
+    // `[keyId, contextId, epoch]` array; the `u64` epoch crosses as a JS
+    // `bigint`.
+    deriveRotatablePseudonym: ([keyId, contextId, epoch]: [
+      string,
+      number[],
+      bigint,
+    ]): NativeHostResult<number[]> =>
+      hostCall(
+        "deriveRotatablePseudonym",
+        () => provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
+        asBytes("deriveRotatablePseudonym"),
+      ),
+    // A sign-only / hardware / secure-enclave custody throws here to signal it
+    // cannot export raw private-key bytes (ADR-006). The failure reaches Rust
+    // as an error: §9.10.4 best-effort paths (the post-create / post-import
+    // `PseudonymAnnouncement`, which signs via the exported key) skip, and
+    // required callers surface a custody error. Signing never uses this path;
+    // it goes through `KeyCustody::sign`, so sign-only custody can still
+    // produce a signed export.
+    exportSigningKeyBytes: (keyId: string): NativeHostResult<number[]> =>
+      hostCall(
+        "exportSigningKeyBytes",
+        () => provider.exportSigningKeyBytes(keyId),
+        asSecretBytes("exportSigningKeyBytes"),
+      ),
+    custodyType: (keyId: string): NativeHostResult<string> =>
+      hostCall("custodyType", () => provider.custodyType(keyId), asString("custodyType")),
+  };
+}

@@ -871,7 +871,7 @@ pub(crate) fn create_export<F, E>(
 ) -> Result<ContextExport, ContextError>
 where
     F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
-    E: std::fmt::Display,
+    E: Into<scp_crypto::CustodyFailure>,
 {
     let exported_at = clock.now_secs();
 
@@ -915,9 +915,7 @@ where
     // on the envelope, not the snapshot).
     let hash = export.canonical_snapshot_hash()?;
 
-    export.snapshot_signature = sign(&hash).map_err(|e| {
-        ContextError::EventLogFailed(format!("export snapshot signing failed: {e}"))
-    })?;
+    export.snapshot_signature = sign(&hash).map_err(|e| ContextError::Custody(e.into()))?;
 
     Ok(export)
 }
@@ -948,7 +946,7 @@ mod tests {
     // (`FnOnce(&[u8; 32]) -> Result<[u8; 64], E>`); the test signer is
     // infallible.
     #[allow(clippy::unnecessary_wraps)]
-    fn sign_with_test_key(hash: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+    fn sign_with_test_key(hash: &[u8; 32]) -> Result<[u8; 64], scp_crypto::CustodyFailure> {
         use ed25519_dalek::Signer;
         Ok(test_signing_key().sign(hash).to_bytes())
     }
@@ -1256,6 +1254,29 @@ mod tests {
     // -------------------------------------------------------------------
     // Roundtrip serialization tests
     // -------------------------------------------------------------------
+
+    /// A signer whose custody no longer holds the exporter's key fails the
+    /// export with the typed custody failure, so every bridge reports
+    /// key-not-found as `SCP-CRYPTO-4006`.
+    #[test]
+    fn export_carries_a_custody_key_not_found_as_a_typed_failure() {
+        let err = create_export(
+            test_snapshot("ctx-export-key-not-found"),
+            Vec::new(),
+            DID::from(TEST_CREATOR_DID),
+            ExportScope::Full,
+            &scp_clock::SystemClock,
+            |_: &[u8; 32]| Err::<[u8; 64], _>(scp_platform::PlatformError::KeyNotFound),
+        )
+        .expect_err("an export whose signer reports key-not-found must fail");
+        match err {
+            ContextError::Custody(failure) => assert!(
+                failure.is_key_not_found(),
+                "key-not-found must keep its kind, got {failure:?}"
+            ),
+            other => panic!("expected ContextError::Custody, got {other:?}"),
+        }
+    }
 
     #[test]
     fn roundtrip_export_empty_events() {

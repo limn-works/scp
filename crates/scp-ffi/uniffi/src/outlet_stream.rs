@@ -238,13 +238,12 @@ async fn resolve_stream_signer(
         let (custody, key_handle) = entry.value();
         (Arc::clone(custody), *key_handle)
     };
-    let public_key = custody
-        .public_key(&handle)
-        .await
-        .map_err(|e| ScpError::Context {
-            msg: format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            code: codes::CTX_2001.to_owned(),
-        })?;
+    let public_key = custody.public_key(&handle).await.map_err(|e| {
+        ScpError::custody_failure(
+            format!("failed to resolve stream signing key for '{identity_did}': {e}"),
+            &scp_crypto::CustodyFailure::from(&e),
+        )
+    })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| ScpError::Context {
         msg: format!(
@@ -754,6 +753,35 @@ pub(crate) async fn outlet_stream_poll_next_impl(
 // grant_credit
 // ---------------------------------------------------------------------------
 
+/// Maps a credit-grant signing failure to the caller's error. A custody
+/// failure carries the code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns; a canonicalization failure carries `SCP-CTX-2001`.
+fn credit_sign_error(e: &StreamSignerError) -> ScpError {
+    e.custody_failure().map_or_else(
+        || ScpError::Context {
+            msg: format!("failed to sign credit grant: {e:?}"),
+            code: codes::CTX_2001.to_owned(),
+        },
+        |failure| ScpError::custody_failure(format!("failed to sign credit grant: {e}"), &failure),
+    )
+}
+
+/// Maps a rejected stream cancel to the caller's error. A custody failure
+/// while signing the cancel carries the code
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code) assigns; every
+/// other rejection carries its §5.4.4 code.
+fn cancel_rejected_error(e: &scp_core::context::outlets::CancelError) -> ScpError {
+    e.custody_failure().map_or_else(
+        || ScpError::Outlet {
+            msg: format!("stream cancel rejected: {e:?}"),
+            code: cancel_error_to_code(e).to_owned(),
+        },
+        |failure| {
+            ScpError::custody_failure(format!("stream cancel signing failed: {e:?}"), &failure)
+        },
+    )
+}
+
 /// Grants `grant` additional billable chunks of credit to a live stream. The
 /// bridge SIGNS the [`OutletStreamCredit`] INTERNALLY under the pinned invoker's
 /// custody key (mirroring how `cancel` signs internally) and auto-assigns the
@@ -872,10 +900,7 @@ pub(crate) async fn outlet_stream_grant_credit_impl(
     let sig = signer
         .sign(&preimage)
         .await
-        .map_err(|e| ScpError::Context {
-            msg: format!("failed to sign credit grant: {e:?}"),
-            code: codes::CTX_2001.to_owned(),
-        })?;
+        .map_err(|e| credit_sign_error(&e))?;
     let credit = OutletStreamCredit {
         request_id,
         grant,
@@ -959,10 +984,7 @@ pub(crate) async fn outlet_stream_cancel_impl(
         .await
         .apply_outlet_cancel_signed(&signer, &cancel_identity)
         .await
-        .map_err(|e| ScpError::Outlet {
-            msg: format!("stream cancel rejected: {e:?}"),
-            code: cancel_error_to_code(&e).to_owned(),
-        })?;
+        .map_err(|e| cancel_rejected_error(&e))?;
     Ok(())
 }
 
@@ -2029,6 +2051,50 @@ impl Scp {
         self.inner
             .outlet_streaming_saga_registry
             .contains_key(saga_id)
+    }
+}
+
+#[cfg(test)]
+mod custody_error_tests {
+    use super::*;
+    use scp_core::context::outlets::CancelError;
+
+    fn code(e: &ScpError) -> String {
+        e.code().to_owned()
+    }
+
+    /// A custody failure while signing a credit grant or a cancel reaches the
+    /// caller with the code `custody_failure_code` assigns (checked here for
+    /// key-not-found and a generic custody failure), and a non-custody failure
+    /// keeps its own code.
+    #[test]
+    fn outlet_signing_custody_failures_carry_the_custody_codes() {
+        let not_found = StreamSignerError::Custody {
+            category: StreamSignerCustodyCategory::KeyNotFound,
+        };
+        let backend = StreamSignerError::Custody {
+            category: StreamSignerCustodyCategory::BackendFault,
+        };
+        assert_eq!(code(&credit_sign_error(&not_found)), codes::CRYPTO_4006);
+        assert_eq!(code(&credit_sign_error(&backend)), codes::CRYPTO_4060);
+        assert_eq!(
+            code(&credit_sign_error(&StreamSignerError::Jcs(
+                "bad".to_owned()
+            ))),
+            codes::CTX_2001
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::Signing(not_found))),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::Signing(backend))),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::SignatureInvalid)),
+            cancel_error_to_code(&CancelError::SignatureInvalid)
+        );
     }
 }
 

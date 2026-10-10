@@ -686,7 +686,8 @@ async fn pseudonym_derivation() {
 
     // Same identity, different contexts -> different pseudonyms.
     assert_ne!(
-        pseudo_a.public_key, pseudo_b.public_key,
+        pseudo_a.public_key(),
+        pseudo_b.public_key(),
         "different contexts must produce different pseudonyms"
     );
 
@@ -695,7 +696,8 @@ async fn pseudonym_derivation() {
         .await
         .unwrap();
     assert_eq!(
-        pseudo_a.public_key, pseudo_a2.public_key,
+        pseudo_a.public_key(),
+        pseudo_a2.public_key(),
         "same inputs must produce the same pseudonym"
     );
 }

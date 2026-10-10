@@ -1818,6 +1818,28 @@
             "kotlin": "internal sender-key delivery loop, not a standalone SDK operation",
             "swift": "internal sender-key delivery loop, not a standalone SDK operation"
           }
+        },
+        {
+          "name": "p256_pseudonym_point",
+          "python": true,
+          "typescript": true,
+          "kotlin": false,
+          "swift": true,
+          "notes": "Custody-host helper (§9.10.4, FIPS 186-5 A.2.1): the 33-byte compressed P-256 pseudonym point of a 32-byte context_seed the host computed itself (inside a keystore, say). No scalar reaches the host. One implementation in scp_ffi_common::p256_host, exported by PyO3, napi-rs and UniFFI.",
+          "exemptions": {
+            "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256PseudonymPoint directly (scp-kt-android's P256Pseudonym wraps it); the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
+          }
+        },
+        {
+          "name": "p256_software_pseudonym_point",
+          "python": true,
+          "typescript": true,
+          "kotlin": false,
+          "swift": true,
+          "notes": "Custody-host helper (§9.10.4.A): the 33-byte compressed P-256 pseudonym point a software custody derives from its 32-byte identity key material, v1 or v2 at an epoch. No scalar reaches the host. One implementation in scp_ffi_common::p256_host, exported by PyO3, napi-rs and UniFFI.",
+          "exemptions": {
+            "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256SoftwarePseudonymPoint directly (scp-kt-android's P256Pseudonym wraps it); the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
+          }
         }
       ]
     },

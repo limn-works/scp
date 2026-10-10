@@ -95,6 +95,9 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 z-base-32 = { workspace = true }
+# `p256_host` exports the §9.10.4 scalar reduction and the §9.5 RFC 6979
+# signer so no Swift or Kotlin host re-implements them (SCP-307).
+scp-crypto = { path = "../../scp-crypto" }
 
 # A stdio MCP server's stdin is a Unix socket whose writes cannot raise
 # SIGPIPE (`SO_NOSIGPIPE` on Apple, `MSG_NOSIGNAL` elsewhere): a Swift app

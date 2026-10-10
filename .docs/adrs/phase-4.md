@@ -637,11 +637,17 @@ agent_deregister(did) -> { removed }
 
 ## ADR-021: UniFFI Bridge Definitions
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling).
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, `derive_pseudonym` returns the pseudonym point).
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, gave an identity a root set, one operational key, and a pre-rotation commitment, and resolution returns a key state (`09-security-model.md` §9.1 invariant 1, `03-identity.md` §3.10.4).
 
 **Amendment (2026-09-10 — the bridge's pseudonym derivation and Secure Enclave custody move to P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. The pseudonym derivation this ADR's bridge exposes gains the seed-to-scalar step of §9.10.4 of the security-model spec, so its comment reads `P256_keygen(seed_to_scalar(seed[0..32]))`. The `KeyCustodyProvider` note states that the Swift implementation generates each P-256 key in the Secure Enclave, which the ruling made reachable and which ADR-025, the Apple platform adapter, carries in its own 2026-09-10 amendment. The UniFFI type mapping and the callback-interface shape are untouched.
+
+**Amendment (2026-09-29 — SCP-307, `derive_pseudonym` returns the pseudonym point).** SCP-307 (spec §9.10.4 and §9.10.4.A) supersedes the 2026-09-10 amendment's sentence that the callback-interface shape is untouched. This amendment binds the UniFFI `KeyCustodyProvider`, the PyO3 custody protocol and the napi custody interface alike. `derive_pseudonym` and `derive_rotatable_pseudonym` return the 33-byte SEC1 compressed P-256 point and nothing else, and the bridge computes the routing id from it. The bridge fails the derivation with `SCP-IDENT-1055` when those bytes are not a valid compressed P-256 point. It reports a host's `SCP-CRYPTO-4006` as key-not-found. No host stores a pseudonym key or signs with one, so `sign`, `get_public_key` and `destroy_key` never receive a pseudonym. Each bridge exports two helpers from one Rust implementation, so no host re-implements the derivation:
+- `p256_pseudonym_point(context_seed)` is for a host whose `pseudonym_secret` stays inside a keystore that computes the context seed. It runs the §9.10.4 seed-to-scalar step and returns the point.
+- `p256_software_pseudonym_point(ikm, context_id, epoch)` is for a software host. It runs the whole §9.10.4.A recipe from the identity's private key material (the Ed25519 seed until the identity key moves to P-256, SCP-315) and returns the point. An absent epoch selects v1, and a present one selects v2 (§9.10.4.1). The helper receives key material the host's software custody already holds, and it wipes its own copy.
+
+Neither helper returns a private scalar. The `bytes derive_pseudonym` line in the interface definition below, which returned `[pseudonym_public_key_bytes(32) || key_id_utf8_bytes]`, is kept as history.
 
 ### Context
 

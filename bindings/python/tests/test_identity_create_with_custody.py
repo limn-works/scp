@@ -21,15 +21,11 @@ Requires the native extension built with ``testing``::
 from __future__ import annotations
 
 import hashlib
+from typing import Literal
 
 import pytest
 
-from .pseudonym_recipe import (
-    canonical_pseudonym_blob,
-    canonical_pseudonym_seed,
-    canonical_rotatable_pseudonym_blob,
-    canonical_rotatable_pseudonym_seed,
-)
+from scp_sdk import p256_software_pseudonym_point
 
 # ---------------------------------------------------------------------------
 # Minimal pure-Python Ed25519 (RFC 8032) — stdlib only.
@@ -129,8 +125,22 @@ class _FakeKeychain:
     ``sign``, mirroring how a real keychain would behave.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        tuple_result: bool = False,
+        fault: Literal["legacy32"] | None = None,
+    ) -> None:
+        # ``tuple_result`` makes both derive methods return the retired
+        # ``(point, key_id)`` pair in place of the point bytes, the shape
+        # mistake the bridge must name.
+        self._tuple_result = tuple_result
+        # ``fault="legacy32"`` makes the host return the retired 32-byte
+        # Ed25519 pseudonym shape, which the bridge must reject (§9.10.4).
+        self._fault = fault
         self._seeds: dict[str, bytes] = {}
+        # Every (identity key id, context) a derivation received.
+        self.derive_calls: list[tuple[str, bytes]] = []
         self._next = 1
 
     def generate_keypair(self, key_type: str) -> str:
@@ -155,28 +165,29 @@ class _FakeKeychain:
         # stand-in keeps the protocol surface complete.
         return hashlib.sha256(self._seeds[key_id] + bytes(peer_public)).digest()
 
+    def _point(self, key_id: str, context_id: bytes, epoch: int | None = None) -> bytes:
+        # The SDK's software helper derives the point from the Ed25519
+        # identity seed (the native interim ikm until the identity key moves to
+        # P-256, SCP-315). Nothing is stored.
+        point = p256_software_pseudonym_point(self._seeds[key_id], bytes(context_id), epoch)
+        if self._fault == "legacy32":
+            point = point[1:]
+        if self._tuple_result:
+            return (point, "1")  # type: ignore[return-value]
+        return point
+
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
-        # Canonical v1 recipe (§9.10.4.A): HKDF-derived secret, then
-        # HMAC(context_id || "scp-pseudonym"). Register the derived signing
-        # key under a fresh id and return ``public_key (32) || key_id_utf8``.
-        seed = canonical_pseudonym_seed(self._seeds[key_id], context_id)
-        kid = str(self._next)
-        self._next += 1
-        self._seeds[kid] = seed
-        return canonical_pseudonym_blob(self._seeds[key_id], context_id, kid)
+        # The v1 recipe (§9.10.4.A).
+        self.derive_calls.append((key_id, bytes(context_id)))
+        return self._point(key_id, context_id)
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
     ) -> bytes:
-        # Canonical v2 recipe (§9.10.4.A): HMAC(context_id || epoch_BE ||
-        # "scp-pseudonym-v2"). Same blob shape as the v1 path.
-        seed = canonical_rotatable_pseudonym_seed(self._seeds[key_id], context_id, pseudonym_epoch)
-        kid = str(self._next)
-        self._next += 1
-        self._seeds[kid] = seed
-        return canonical_rotatable_pseudonym_blob(
-            self._seeds[key_id], context_id, pseudonym_epoch, kid
-        )
+        # The v2 recipe (§9.10.4.1) at the epoch. Same return shape as the v1
+        # path.
+        self.derive_calls.append((key_id, bytes(context_id)))
+        return self._point(key_id, context_id, pseudonym_epoch)
 
     def export_signing_key_bytes(self, key_id: str) -> bytes:
         return self._seeds[key_id]
@@ -231,3 +242,68 @@ async def test_identity_create_with_custody_rejects_incomplete_provider(scp) -> 
 
     with pytest.raises(_scp_core.ValidationError, match="missing the required method"):
         await scp.identity_create_with_custody(Incomplete())
+
+
+_ENCRYPTED_PARAMS = {"ceiling": ["messages:read"], "memory_scope": "ephemeral"}
+
+
+@pytest.mark.asyncio
+async def test_point_provider_derives_in_context_create(scp) -> None:
+    """An encrypted ``context_create`` succeeds with a provider returning the
+    pseudonym point, and it drives that provider to derive one."""
+    provider = _FakeKeychain()
+    identity = await scp.identity_create_with_custody(provider)
+    before = len(provider.derive_calls)
+    ctx = await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+
+    assert ctx.context_id
+    assert len(provider.derive_calls) > before, "context_create never derived a pseudonym"
+
+
+@pytest.mark.asyncio
+async def test_32_byte_host_pseudonym_fails_context_create_with_ident_1055(scp) -> None:
+    """§9.10.4: the bridge fails closed with ``SCP-IDENT-1055`` on host
+    pseudonym bytes that are not a compressed P-256 point, such as the retired
+    32-byte Ed25519 key."""
+    from scp_sdk import _scp_core
+
+    provider = _FakeKeychain(fault="legacy32")
+    identity = await scp.identity_create_with_custody(provider)
+    with pytest.raises(_scp_core.ScpError, match="got 32 bytes") as excinfo:
+        await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+    assert str(excinfo.value).startswith("[SCP-IDENT-1055]"), excinfo.value
+
+
+@pytest.mark.asyncio
+async def test_tuple_pseudonym_result_fails_naming_the_expected_shape(scp) -> None:
+    """A provider whose derive returns the retired ``(point, key_id)`` pair
+    fails, and the error text names the expected bytes."""
+    from scp_sdk import _scp_core
+
+    provider = _FakeKeychain(tuple_result=True)
+    identity = await scp.identity_create_with_custody(provider)
+
+    expected = r"expected bytes: the 33-byte compressed P-256 pseudonym point"
+    with pytest.raises(_scp_core.ScpError, match=expected) as excinfo:
+        await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+    assert str(excinfo.value).startswith("[SCP-CRYPTO-4060]"), excinfo.value
+
+
+@pytest.mark.asyncio
+async def test_coroutine_derive_fails_with_custody_error(scp) -> None:
+    """A provider whose derive is an ``async def`` returns a coroutine, which is
+    the wrong type: the operation fails with ``SCP-CRYPTO-4060``, not
+    ``SCP-IDENT-1055``."""
+    from scp_sdk import _scp_core
+
+    class _AsyncDerive(_FakeKeychain):
+        async def derive_pseudonym(  # type: ignore[override]
+            self, key_id: str, context_id: bytes
+        ) -> bytes:
+            return super().derive_pseudonym(key_id, context_id)
+
+    provider = _AsyncDerive()
+    identity = await scp.identity_create_with_custody(provider)
+    with pytest.raises(_scp_core.ScpError, match="coroutine") as excinfo:
+        await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
+    assert str(excinfo.value).startswith("[SCP-CRYPTO-4060]"), excinfo.value

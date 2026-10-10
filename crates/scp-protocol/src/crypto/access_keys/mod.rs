@@ -142,9 +142,14 @@ pub enum AccessKeyError {
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
 
-    /// A key custody operation failed.
-    #[error("key custody error: {0}")]
-    KeyCustodyError(String),
+    /// Custody returned a wrapping (X25519) public key that is not 32 bytes.
+    #[error("malformed wrapping public key: {0}")]
+    MalformedWrappingPublicKey(String),
+
+    /// A key custody call failed (`KeyCustody`). The bridges report the code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
 
     /// The epoch counter overflowed (reached `u64::MAX`).
     #[error("epoch counter overflow: already at u64::MAX")]

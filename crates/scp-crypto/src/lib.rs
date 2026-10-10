@@ -2,26 +2,27 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-//! Shared Ed25519 signature verification helpers.
-//!
-//! Centralizes Ed25519 signature verification for SCP. Module-level wrappers
-//! delegate to [`verify_ed25519_signature`] rather than inlining
-//! `VerifyingKey::from_bytes` + `Signature::from_bytes` + `verify_strict`
-//! sequences.
-//!
-//! A single function is provided:
-//! - [`verify_ed25519_signature`] — strict verification (cofactorless, rejects
-//!   small-order points).
-//!
-//! See GitHub issues #81, #509, #609.
+//! Crate contents:
+//! - [`verify_ed25519_signature`]: strict Ed25519 verification (cofactorless,
+//!   rejects small-order points).
+//! - [`p256`]: the P-256 primitives (§9.5).
+//! - [`pseudonym`]: the software-custody pseudonym derivation (§9.10.4).
+//! - [`custody`]: the typed [`CustodyFailure`] a failed custody call carries.
+//! - [`signer`]: the curve-neutral [`ScpSigner`] trait.
 
+pub mod custody;
+pub mod p256;
 pub mod pseudonym;
+pub mod signer;
+
+pub use custody::{CustodyFailure, CustodyFailureKind};
+pub use signer::{ScpSigner, SigAlg, SignError};
 
 /// Verifies an Ed25519 signature against a public key and message bytes.
 ///
-/// This is the sole verification entry point for SCP. Module-specific
-/// verification functions should call this and map the `Err(String)` to
-/// their local error type.
+/// Ed25519 verification paths across the workspace call this and map the
+/// `Err(String)` to their local error type, rather than re-inlining
+/// `VerifyingKey::from_bytes` + `Signature::from_bytes` + `verify_strict`.
 ///
 /// Uses strict verification (`verify_strict`), which rejects signatures
 /// involving small-order points — the strongest verification mode provided

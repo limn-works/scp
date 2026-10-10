@@ -84,6 +84,7 @@ pub mod mcp;
 pub mod media;
 pub mod outlet_stream;
 pub mod outlets;
+pub mod p256_host;
 pub mod provenance;
 pub mod runtime;
 pub mod scp;
@@ -271,6 +272,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     sync::register_sync(m)?;
     scpid::register_scpid(m)?;
     media::register_media(m)?;
+    p256_host::register_p256_host(m)?;
 
     // Server startup (relay + application node) — feature-gated.
     #[cfg(feature = "server")]

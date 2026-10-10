@@ -38,8 +38,7 @@ use scp_did::SigningKeyId;
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 use scp_testing::builder::ScenarioBuilder;
 use scp_testing::clock::Clock;
@@ -102,7 +101,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         &self,
         _: &KeyHandle,
         _: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
     fn derive_rotatable_pseudonym(
@@ -110,7 +109,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
         _: &KeyHandle,
         _: &[u8],
         _: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         async { Err(PlatformError::CustodyError("not supported".into())) }
     }
     fn ed25519_to_x25519_agree(
@@ -425,7 +424,8 @@ async fn end_to_end_network_demo() {
     let pseudonym = derive_pseudonym(&alice_custody, &alice_identity_key, ctx_id.as_bytes())
         .await
         .unwrap();
-    let routing_arr: [u8; 32] = pseudonym.public_key.as_bytes().try_into().unwrap();
+    // §9.10.4: routing fields carry the routing id of the 33-byte P-256 point.
+    let routing_arr: [u8; 32] = *pseudonym.routing_id();
 
     println!("  Step 2: Pseudonym derived for routing");
     println!("    routing_id:  {}...", hex::encode(&routing_arr[..8]));

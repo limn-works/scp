@@ -6711,9 +6711,7 @@ impl Supervisor {
                 // sequence is reusable, then surface the error.
                 self.release_broadcast_reservation(&actor, context_id, reservation.reservation_id)
                     .await;
-                let _ = reply.send(Err(ContextError::CryptoFailed(format!(
-                    "custody signing failed: {e}"
-                ))));
+                let _ = reply.send(Err(ContextError::Custody((&e).into())));
                 return Ok(Outcome::ok_mutated(()));
             }
         };
@@ -11142,7 +11140,8 @@ impl Supervisor {
     ///
     /// Returns [`ContextError`] if the context does not exist, the actor reply
     /// channel closes, event-log export or Merkle verification fails, canonical
-    /// hashing fails, or `sign` returns an error.
+    /// hashing fails, or `sign` returns an error ([`ContextError::Custody`],
+    /// which keeps the custody failure's kind for the bridges).
     pub async fn export_context<F, E>(
         self: &Arc<Self>,
         context_id: &str,
@@ -11151,7 +11150,7 @@ impl Supervisor {
     ) -> Result<crate::context::export_import::ContextExport, ContextError>
     where
         F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
-        E: std::fmt::Display,
+        E: Into<scp_crypto::CustodyFailure>,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = LifecycleCommand::ExportContext {
@@ -14939,19 +14938,14 @@ impl Supervisor {
                 let dh = custody
                     .ed25519_to_x25519_agree(active_key_handle, &sealed_bundle_enc)
                     .await
-                    .map_err(|e| {
-                        ContextError::CryptoFailed(format!(
-                            "spawn-from-Welcome: invitation KEM DH agreement failed: {e}"
-                        ))
-                    })?;
+                    .map_err(|e| ContextError::Custody(e.into()))?;
                 let dh_bytes: zeroize::Zeroizing<[u8; 32]> =
                     zeroize::Zeroizing::new(*dh.as_bytes());
                 // pkRm = the joiner's OWN #active public key mapped to X25519.
-                let active_pub = custody.public_key(active_key_handle).await.map_err(|e| {
-                    ContextError::CryptoFailed(format!(
-                        "spawn-from-Welcome: reading the joiner #active public key failed: {e}"
-                    ))
-                })?;
+                let active_pub = custody
+                    .public_key(active_key_handle)
+                    .await
+                    .map_err(|e| ContextError::Custody(e.into()))?;
                 let active_pub_bytes: [u8; 32] =
                     active_pub.as_bytes().try_into().map_err(|_| {
                         ContextError::CryptoFailed(
@@ -21302,7 +21296,9 @@ mod tests {
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
             &scp_clock::SystemClock,
-            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+            |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
         )
         .expect("build a valid signed export");
 
@@ -21350,7 +21346,9 @@ mod tests {
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
             &scp_clock::SystemClock,
-            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+            |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
         )
         .expect("build a valid signed broadcast export");
         let verifying_key = signing_key.verifying_key();
@@ -21424,7 +21422,9 @@ mod tests {
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
             &scp_clock::SystemClock,
-            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+            |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
         )
         .expect("build a valid signed full export");
 
@@ -21564,7 +21564,9 @@ mod tests {
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
             &scp_clock::SystemClock,
-            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+            |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
         )
         .expect("build a valid signed full export");
 
@@ -21608,7 +21610,9 @@ mod tests {
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
             &scp_clock::SystemClock,
-            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+            |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
         )
         .expect("build a valid signed export with a malformed ceiling");
         let verifying_key = signing_key.verifying_key();
@@ -21912,7 +21916,9 @@ mod tests {
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
             &scp_clock::SystemClock,
-            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+            |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
         )
         .expect("build a valid signed export")
     }
@@ -22102,7 +22108,9 @@ mod tests {
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
             &scp_clock::SystemClock,
-            |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
+            |hash: &[u8; 32]| {
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
         )
         .expect("build a valid signed full export");
 
@@ -22289,7 +22297,7 @@ mod tests {
             &scp_clock::SystemClock,
             |hash: &[u8; 32]| {
                 use ed25519_dalek::Signer;
-                Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
             },
         )
         .expect("build a valid signed full export");
@@ -22384,7 +22392,7 @@ mod tests {
             &scp_clock::SystemClock,
             |hash: &[u8; 32]| {
                 use ed25519_dalek::Signer;
-                Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
             },
         )
         .expect("build a valid signed full export");
@@ -22453,7 +22461,7 @@ mod tests {
             &scp_clock::SystemClock,
             |hash: &[u8; 32]| {
                 use ed25519_dalek::Signer;
-                Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
             },
         )
         .expect("build a valid signed full export");

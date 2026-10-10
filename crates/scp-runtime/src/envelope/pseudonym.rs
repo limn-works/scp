@@ -1,24 +1,26 @@
 //! Per-context pseudonym derivation for SCP envelope routing.
 //!
-//! Each participant derives a deterministic pseudonym keypair for every context
-//! they join. The pseudonym's public key serves as the `routing_id` in outer
-//! envelopes. Relays see only pseudonyms — never real DIDs — so they cannot
-//! link activity across contexts.
+//! Each participant derives a deterministic P-256 pseudonym point for every
+//! context they join. Routing fields carry the pseudonym's 32-byte routing id,
+//! `SHA-256("scp-pseudonym-routing-v1:" || compressed public key)`
+//! ([`Pseudonym::routing_id`]). Relays see only pseudonyms — never real
+//! DIDs — so they cannot link activity across contexts.
 //!
-//! # Derivation (v1 — epoch 0)
+//! # Derivation (v1, static, no epoch)
 //!
 //! 1. `seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")`
-//! 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+//! 2. `d = (int(HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48)) mod (n − 1)) + 1`;
+//!    the pseudonym is the P-256 key `d` (§9.10.4)
 //!
-//! Here `identity_key_material` is the private-derived `pseudonym_secret` (HKDF-SHA256 over the Ed25519 private seed; spec §9.10.4.A), NEVER the public key.
+//! Here `identity_key_material` is the private-derived `pseudonym_secret` (HKDF-SHA256 over the identity private key bytes; spec §9.10.4.A), NEVER the public key.
 //!
-//! # Rotatable derivation (v2 — epoch > 0)
+//! # Rotatable derivation (v2, every rotation epoch, epoch 0 included)
 //!
 //! To mitigate relay-side pseudonym correlation (BLACK-001), pseudonyms can
 //! be rotated by including a rotation epoch in the HMAC input:
 //!
 //! 1. `seed = HMAC-SHA256(identity_key_material, context_id || epoch_BE || "scp-pseudonym-v2")`
-//! 2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`
+//! 2. the P-256 key from `seed` exactly as in v1
 //!
 //! Epoch 0 in v2 derivation produces a DIFFERENT pseudonym than the v1
 //! derivation (different domain separator). This is intentional — once a
@@ -31,22 +33,22 @@
 //! See ADR-002 acceptance criterion 1, ADR-006 for the custody model, and
 //! BLACK-001 for the threat model motivating rotation.
 
-use scp_platform::traits::{KeyCustody, KeyHandle, PseudonymKeypair};
+use scp_platform::traits::{KeyCustody, KeyHandle, Pseudonym};
 
 use scp_protocol::envelope::EnvelopeError;
 
-/// Derives a deterministic, context-scoped pseudonym keypair (v1, non-rotatable).
+/// Derives a deterministic, context-scoped pseudonym point (v1, non-rotatable).
 ///
 /// Delegates to [`KeyCustody::derive_pseudonym`], which computes:
 /// ```text
 /// seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")
-/// pseudonym_keypair = Ed25519_keygen(seed[0..32])
+/// d    = (int(HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48)) mod (n − 1)) + 1
 /// ```
 ///
-/// Here `identity_key_material` is the private-derived `pseudonym_secret` (HKDF-SHA256 over the Ed25519 private seed; spec §9.10.4.A), NEVER the public key.
+/// Here `identity_key_material` is the private-derived `pseudonym_secret` (HKDF-SHA256 over the identity private key bytes; spec §9.10.4.A), NEVER the public key.
 ///
-/// The pseudonym keypair's public key is the `routing_id` used in outer
-/// envelopes. Same identity key + same `context_id` always produces the same
+/// The pseudonym's routing id ([`Pseudonym::routing_id`]) is the
+/// `routing_id` used in outer envelopes. Same identity key + same `context_id` always produces the same
 /// pseudonym. Different `context_id` produces a different, unlinkable
 /// pseudonym.
 ///
@@ -55,25 +57,25 @@ use scp_protocol::envelope::EnvelopeError;
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::PseudonymDerivationFailed`] if the underlying
-/// key custody operation fails (e.g., key handle not found, wrong key type).
+/// Returns [`EnvelopeError::Custody`] if the underlying key custody operation
+/// fails (e.g., key handle not found, wrong key type).
 pub async fn derive_pseudonym(
     key_custody: &impl KeyCustody,
     identity_key_handle: &KeyHandle,
     context_id: &[u8],
-) -> Result<PseudonymKeypair, EnvelopeError> {
+) -> Result<Pseudonym, EnvelopeError> {
     key_custody
         .derive_pseudonym(identity_key_handle, context_id)
         .await
-        .map_err(|e| EnvelopeError::PseudonymDerivationFailed(e.to_string()))
+        .map_err(|e| EnvelopeError::Custody(e.into()))
 }
 
-/// Derives a rotatable, epoch-scoped pseudonym keypair (v2).
+/// Derives a rotatable, epoch-scoped pseudonym point (v2).
 ///
 /// Delegates to [`KeyCustody::derive_rotatable_pseudonym`], which computes:
 /// ```text
 /// seed = HMAC-SHA256(identity_key_material, context_id || epoch_BE || "scp-pseudonym-v2")
-/// pseudonym_keypair = Ed25519_keygen(seed[0..32])
+/// d    = (int(HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48)) mod (n − 1)) + 1
 /// ```
 ///
 /// Changing `pseudonym_epoch` produces a different, unlinkable pseudonym for
@@ -88,18 +90,18 @@ pub async fn derive_pseudonym(
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::PseudonymDerivationFailed`] if the underlying
-/// key custody operation fails (e.g., key handle not found, wrong key type).
+/// Returns [`EnvelopeError::Custody`] if the underlying key custody operation
+/// fails (e.g., key handle not found, wrong key type).
 pub async fn derive_rotatable_pseudonym(
     key_custody: &impl KeyCustody,
     identity_key_handle: &KeyHandle,
     context_id: &[u8],
     pseudonym_epoch: u64,
-) -> Result<PseudonymKeypair, EnvelopeError> {
+) -> Result<Pseudonym, EnvelopeError> {
     key_custody
         .derive_rotatable_pseudonym(identity_key_handle, context_id, pseudonym_epoch)
         .await
-        .map_err(|e| EnvelopeError::PseudonymDerivationFailed(e.to_string()))
+        .map_err(|e| EnvelopeError::Custody(e.into()))
 }
 
 #[cfg(test)]
@@ -114,6 +116,22 @@ mod tests {
     // v1 (non-rotatable) pseudonym tests
     // -----------------------------------------------------------------------
 
+    /// A destroyed identity key fails derivation with a typed key-not-found
+    /// custody failure, which every bridge reports as `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn derive_pseudonym_with_a_destroyed_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&key_handle).await.unwrap();
+        let err = derive_pseudonym(&custody, &key_handle, b"test-context-1")
+            .await
+            .expect_err("derivation under a destroyed key must fail");
+        assert!(
+            matches!(&err, EnvelopeError::Custody(failure) if failure.is_key_not_found()),
+            "expected EnvelopeError::Custody key-not-found, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn derive_pseudonym_is_deterministic() {
         let custody = InMemoryKeyCustody::new();
@@ -127,7 +145,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(p1.public_key.as_bytes(), p2.public_key.as_bytes());
+        assert_eq!(
+            p1.public_key().to_compressed(),
+            p2.public_key().to_compressed()
+        );
     }
 
     #[tokio::test]
@@ -142,7 +163,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(p1.public_key.as_bytes(), p2.public_key.as_bytes());
+        assert_ne!(
+            p1.public_key().to_compressed(),
+            p2.public_key().to_compressed()
+        );
     }
 
     #[tokio::test]
@@ -155,28 +179,31 @@ mod tests {
         let p1 = derive_pseudonym(&custody, &key1, context_id).await.unwrap();
         let p2 = derive_pseudonym(&custody, &key2, context_id).await.unwrap();
 
-        assert_ne!(p1.public_key.as_bytes(), p2.public_key.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn pseudonym_public_key_is_32_bytes() {
-        let custody = InMemoryKeyCustody::new();
-        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-
-        let p = derive_pseudonym(&custody, &key_handle, b"ctx")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            p.public_key.as_bytes().len(),
-            32,
-            "Ed25519 public key should be 32 bytes"
+        assert_ne!(
+            p1.public_key().to_compressed(),
+            p2.public_key().to_compressed()
         );
     }
 
     // -----------------------------------------------------------------------
     // v2 (rotatable) pseudonym tests — BLACK-001 mitigation
     // -----------------------------------------------------------------------
+
+    /// A destroyed identity key fails v2 derivation with a typed key-not-found
+    /// custody failure, as v1 does, so every bridge reports `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn derive_rotatable_pseudonym_with_a_destroyed_key_is_custody_key_not_found() {
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.destroy_key(&key_handle).await.unwrap();
+        let err = derive_rotatable_pseudonym(&custody, &key_handle, b"test-context-1", 3)
+            .await
+            .expect_err("v2 derivation under a destroyed key must fail");
+        assert!(
+            matches!(&err, EnvelopeError::Custody(failure) if failure.is_key_not_found()),
+            "expected EnvelopeError::Custody key-not-found, got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn rotatable_pseudonym_is_deterministic() {
@@ -192,8 +219,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            p1.public_key.as_bytes(),
-            p2.public_key.as_bytes(),
+            p1.public_key().to_compressed(),
+            p2.public_key().to_compressed(),
             "same epoch must produce same pseudonym"
         );
     }
@@ -212,8 +239,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            p1.public_key.as_bytes(),
-            p2.public_key.as_bytes(),
+            p1.public_key().to_compressed(),
+            p2.public_key().to_compressed(),
             "different epochs must produce different pseudonyms (BLACK-001)"
         );
     }
@@ -232,8 +259,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            v1.public_key.as_bytes(),
-            v2_epoch0.public_key.as_bytes(),
+            v1.public_key().to_compressed(),
+            v2_epoch0.public_key().to_compressed(),
             "v2 epoch 0 must differ from v1 (different domain separator)"
         );
     }
@@ -251,8 +278,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            p1.public_key.as_bytes(),
-            p2.public_key.as_bytes(),
+            p1.public_key().to_compressed(),
+            p2.public_key().to_compressed(),
             "different contexts must produce different pseudonyms even at same epoch"
         );
     }
@@ -272,14 +299,14 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            p1.public_key.as_bytes(),
-            p2.public_key.as_bytes(),
+            p1.public_key().to_compressed(),
+            p2.public_key().to_compressed(),
             "different identity keys must produce different pseudonyms"
         );
     }
 
     #[tokio::test]
-    async fn rotatable_pseudonym_public_key_is_32_bytes() {
+    async fn rotatable_pseudonym_public_key_is_33_byte_p256_point() {
         let custody = InMemoryKeyCustody::new();
         let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
@@ -288,9 +315,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            p.public_key.as_bytes().len(),
-            32,
-            "Ed25519 public key should be 32 bytes"
+            p.public_key().to_compressed().len(),
+            33,
+            "pseudonym public key is a 33-byte compressed P-256 point"
         );
     }
 }

@@ -198,9 +198,10 @@ fn resolve_stream_signer(
     let public_key = rt
         .block_on(async { custody.public_key(&handle).await })
         .map_err(|e| {
-            ScpPyError::context(format!(
-                "failed to resolve stream signing key for '{identity_did}': {e}"
-            ))
+            ScpPyError::custody_failure(
+                format!("failed to resolve stream signing key for '{identity_did}': {e}"),
+                &scp_crypto::CustodyFailure::from(&e),
+            )
         })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| {
@@ -745,6 +746,34 @@ fn outlet_stream_poll_next_impl(
 // grant_credit
 // ---------------------------------------------------------------------------
 
+/// Maps a credit-grant signing failure to the caller's error. A custody
+/// failure carries the code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// assigns; a canonicalization failure carries `SCP-CTX-2001`.
+fn credit_sign_error(e: &StreamSignerError) -> ScpPyError {
+    e.custody_failure().map_or_else(
+        || ScpPyError::context(format!("failed to sign credit grant: {e:?}")),
+        |failure| {
+            ScpPyError::custody_failure(format!("failed to sign credit grant: {e}"), &failure)
+        },
+    )
+}
+
+/// Maps a rejected stream cancel to the caller's error. A custody failure
+/// while signing the cancel carries the code
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code) assigns; every
+/// other rejection carries its §5.4.4 code.
+fn cancel_rejected_error(e: &scp_core::context::outlets::CancelError) -> ScpPyError {
+    e.custody_failure().map_or_else(
+        || ScpPyError::ContextError {
+            message: format!("stream cancel rejected: {e:?}"),
+            code: cancel_error_to_code(e).to_owned(),
+        },
+        |failure| {
+            ScpPyError::custody_failure(format!("stream cancel signing failed: {e:?}"), &failure)
+        },
+    )
+}
+
 /// Grants `grant` additional billable chunks of credit to a live stream. The
 /// bridge SIGNS the [`OutletStreamCredit`] INTERNALLY under the pinned invoker's
 /// custody key (mirroring how `cancel` signs internally) and auto-assigns the
@@ -897,7 +926,7 @@ fn outlet_stream_grant_credit_impl(
             let sig = signer
                 .sign(&preimage)
                 .await
-                .map_err(|e| ScpPyError::context(format!("failed to sign credit grant: {e:?}")))?;
+                .map_err(|e| credit_sign_error(&e))?;
             let credit = OutletStreamCredit {
                 request_id,
                 grant,
@@ -1015,10 +1044,7 @@ fn outlet_stream_cancel_impl(
                 .await
         })
     });
-    cancel_result.map_err(|e| ScpPyError::ContextError {
-        message: format!("stream cancel rejected: {e:?}"),
-        code: cancel_error_to_code(&e).to_owned(),
-    })?;
+    cancel_result.map_err(|e| cancel_rejected_error(&e))?;
     Ok(())
 }
 
@@ -2031,6 +2057,97 @@ impl crate::scp::PyScp {
 // ---------------------------------------------------------------------------
 // Crash-safe monotonic_seq (SCP-OUT-034 AC31)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod custody_error_tests {
+    use super::*;
+    use scp_core::context::outlets::CancelError;
+    use scp_ffi_common::error_codes as codes;
+
+    /// The code the error's `[CODE] …` rendering leads with.
+    fn code(e: &ScpPyError) -> String {
+        let rendered = e.to_string();
+        rendered
+            .trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// A custody failure while signing a credit grant or a cancel reaches the
+    /// caller with the code `custody_failure_code` assigns (checked here for
+    /// key-not-found and a generic custody failure), and a non-custody failure
+    /// keeps its own code.
+    #[test]
+    fn outlet_signing_custody_failures_carry_the_custody_codes() {
+        let not_found = StreamSignerError::Custody {
+            category: StreamSignerCustodyCategory::KeyNotFound,
+        };
+        let backend = StreamSignerError::Custody {
+            category: StreamSignerCustodyCategory::BackendFault,
+        };
+        assert_eq!(code(&credit_sign_error(&not_found)), codes::CRYPTO_4006);
+        assert_eq!(code(&credit_sign_error(&backend)), codes::CRYPTO_4060);
+        assert_eq!(
+            code(&credit_sign_error(&StreamSignerError::Jcs(
+                "bad".to_owned()
+            ))),
+            codes::CTX_2001
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::Signing(not_found))),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::Signing(backend))),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            code(&cancel_rejected_error(&CancelError::SignatureInvalid)),
+            cancel_error_to_code(&CancelError::SignatureInvalid)
+        );
+    }
+
+    /// A stream signer for an identity whose `#active` key custody no longer
+    /// holds fails with key-not-found `SCP-CRYPTO-4006`, the code every other
+    /// custody operation reports, never the context code of the
+    /// verifying-key check.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn stream_signer_under_a_destroyed_custody_key_is_crypto_4006() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let identity = scp
+                .identity_create(py, "in_memory", None)
+                .expect("identity_create should succeed");
+            let did = identity.did().to_owned();
+            let (custody, active) = crate::runtime::with_identity(&bi, &did, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .expect("registered identity");
+            crate::runtime()
+                .expect("runtime")
+                .block_on(custody.destroy_key(&active))
+                .expect("destroy_key should succeed");
+            let err = resolve_stream_signer(&bi, &did)
+                .err()
+                .expect("a destroyed #active key must not resolve a stream signer")
+                .to_string();
+            assert!(
+                err.contains(codes::CRYPTO_4006),
+                "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+            );
+        });
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

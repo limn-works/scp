@@ -396,8 +396,8 @@ pub struct NapiMessage {
 /// member cannot send application data on a pseudonymous routing axis — so
 /// derivation failure MUST be a typed error rather than a swallowed `None`.
 /// Codes match the `PyO3` reference bridge exactly so the same failure yields the
-/// same `.code` across bridges: missing key material → SCP-IDENT-1054,
-/// derivation failure → SCP-IDENT-1055, wrong key length → SCP-IDENT-1057.
+/// same `.code` across bridges: missing key material → SCP-IDENT-1054, and a
+/// custody derivation failure → its custody code ([`pseudonym_derivation_failed`]).
 ///
 /// Un-gated for production: pseudonym derivation runs through retained
 /// callback custody (OS-keychain/HSM), exactly like the rest of the signing
@@ -418,39 +418,44 @@ async fn derive_context_pseudonym_required(
             code: codes::IDENT_1054.to_owned(),
         }));
     };
-    derive_pseudonym_bytes(custody, &scp_id.identity_key, context_id).await
+    derive_pseudonym_bytes(custody, &scp_id.identity_key, context_id)
+        .await
+        .map_err(NapiError::from)
+}
+
+/// The error a failed custody pseudonym derivation surfaces as, coded by
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+/// of its [`CustodyFailure`](scp_crypto::CustodyFailure). A key destroyed
+/// mid-derivation fails as key-not-found (§9.10.4.A).
+pub(crate) fn pseudonym_derivation_failed(e: &scp_platform::PlatformError) -> ScpNapiError {
+    ScpNapiError::custody_failure(
+        format!("pseudonym derivation failed: {e}"),
+        &scp_crypto::CustodyFailure::from(e),
+    )
 }
 
 /// Core pseudonym-derivation sequence shared by every NAPI entry point.
 ///
 /// Holds the single authoritative definition of the derivation-failure code
-/// contract (derivation failure → SCP-IDENT-1055, wrong key length →
-/// SCP-IDENT-1057). The missing-key-material code (SCP-IDENT-1054) is surfaced
+/// contract ([`pseudonym_derivation_failed`]; host-returned pseudonym bytes that are
+/// not a valid 33-byte compressed P-256 point → SCP-IDENT-1055). The missing-key-material code (SCP-IDENT-1054) is surfaced
 /// by the callers that resolve custody (which know whether the lookup came from
 /// a handle or the registry). Centralizing here mirrors the `PyO3` reference
-/// bridge so the 1054/1055/1057 contract cannot drift across create / join /
+/// bridge so the 1054/1055 contract cannot drift across create / join /
 /// import.
-async fn derive_pseudonym_bytes(
+pub(crate) async fn derive_pseudonym_bytes(
     custody: &crate::custody::NapiKeyCustody,
     identity_key: &scp_platform::KeyHandle,
     context_id: &str,
-) -> napi::Result<[u8; 32]> {
+) -> Result<[u8; 32], ScpNapiError> {
     let pseudonym = custody
         .derive_pseudonym(identity_key, context_id.as_bytes())
         .await
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("pseudonym derivation failed: {e}"),
-                code: codes::IDENT_1055.to_owned(),
-            })
-        })?;
-    let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().map_err(|_| {
-        NapiError::from(ScpNapiError::Identity {
-            message: "pseudonym public key must be 32 bytes".to_owned(),
-            code: codes::IDENT_1057.to_owned(),
-        })
-    })?;
-    Ok(bytes)
+        .map_err(|e| pseudonym_derivation_failed(&e))?;
+    // §9.10.4: the routing axis carries the 32-byte routing id of the 33-byte
+    // P-256 pseudonym. `Pseudonym::from_point` already rejected a malformed
+    // host-returned point, which surfaced above as SCP-IDENT-1055.
+    Ok(*pseudonym.routing_id())
 }
 
 /// Resolves a member's per-context pseudonym from the bridge identity registry,
@@ -459,7 +464,7 @@ async fn derive_pseudonym_bytes(
 /// Mirrors the `PyO3` reference bridge's `derive_member_pseudonym(bi, did,
 /// context_id)`: resolves the importer/joiner's custody + identity key from the
 /// registry (a miss is missing key material → SCP-IDENT-1054), then routes
-/// through [`derive_pseudonym_bytes`] for the 1055/1057 contract. Used by the
+/// through [`derive_pseudonym_bytes`] for the 1055 contract. Used by the
 /// (encrypted-only) IMPORT path and the encrypted JOIN path so the routing axis
 /// is never silently degraded to the reserved `[0u8; 32]` sentinel.
 async fn derive_member_pseudonym_required(
@@ -479,7 +484,9 @@ async fn derive_member_pseudonym_required(
         })
     })?;
     let (custody, identity_key) = custody_and_key;
-    derive_pseudonym_bytes(&custody, &identity_key, context_id).await
+    derive_pseudonym_bytes(&custody, &identity_key, context_id)
+        .await
+        .map_err(NapiError::from)
 }
 
 /// Best-effort §9.10.4 pseudonym announcement (NAPI).
@@ -988,7 +995,7 @@ pub(crate) async fn context_join_on(
     // `[0u8; 32]` sentinel — peers reject any announce of a reserved value, so
     // the joiner becomes permanently unaddressable with no error surfaced.
     // Route through `derive_member_pseudonym_required` to propagate the
-    // canonical identity codes (1054/1055/1056/1057) at create/import
+    // canonical identity codes (1054/1055/1056) at create/import
     // granularity. BROADCAST contexts soft-fail to `None`: they carry no
     // per-member pseudonym (spec §5.14) and the runtime ignores the value.
     let context_id = handle.context_id.clone();
@@ -1463,6 +1470,8 @@ pub(crate) async fn context_join_from_welcome_on(
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
+            // A typed custody failure keeps its custody code (a destroyed
+            // `#active` key is `SCP-CRYPTO-4006`) through `typed_supervisor_failure`.
             return Err(NapiError::from(typed_supervisor_failure(
                 "context_join_from_welcome",
                 codes::CTX_2013,
@@ -1934,12 +1943,7 @@ pub(crate) async fn context_send_on(
 
         scp_core::envelope::create_inner_envelope(&params, custody.as_ref(), &signing_key)
             .await
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Crypto {
-                    message: format!("inner envelope signing failed: {e}"),
-                    code: codes::CRYPTO_4001.to_owned(),
-                })
-            })?;
+            .map_err(|e| NapiError::from(ScpNapiError::inner_envelope_error(&e)))?;
     }
 
     // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
@@ -3062,11 +3066,7 @@ pub(crate) async fn broadcast_publish_on(
     };
     sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
         .await
-        .map_err(|e| {
-            napi::Error::from_reason(format!(
-                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-            ))
-        })?;
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     rx.await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -3208,11 +3208,7 @@ pub(crate) async fn broadcast_publish_asset_on(
     };
     sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
         .await
-        .map_err(|e| {
-            napi::Error::from_reason(format!(
-                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-            ))
-        })?;
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     let envelope = rx
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
@@ -3342,11 +3338,7 @@ pub(crate) async fn broadcast_publish_assets_on(
         };
         sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
             .await
-            .map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "supervisor dispatch_broadcast_command_with_custody failed: {e}"
-                ))
-            })?;
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
         let envelope = rx
             .await
             .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
@@ -5102,8 +5094,8 @@ pub(crate) async fn context_import_on(
     // exports are rejected upstream with SCP-CTX-2092), so a real pseudonym is
     // ALWAYS required — derive it UNCONDITIONALLY, exactly like the PyO3
     // reference bridge. Custody / derivation failure is a hard error carrying
-    // granular codes (missing material → 1054, derivation failure → 1055, wrong
-    // length → 1057, custody unavailable → 1056), never a silent zero-pseudonym
+    // granular codes (missing material → 1054, derivation failure → 1055,
+    // custody unavailable → 1056), never a silent zero-pseudonym
     // fallback (which would reintroduce the relay-correlation vector) and never
     // a `[0u8; 32]` sentinel for broadcast (which would make the member
     // permanently unaddressable). Resolve the importer's custody+key from the
@@ -5633,7 +5625,9 @@ fn parse_template_id_napi(
 ///
 /// `ActorBusy` reports `SCP-CTX-2130` (ADR-049 §10), whose producers and retry
 /// behaviour the `ContextError::ActorBusy` doc states. `SupervisorShutDown`
-/// reports `SCP-CTX-2138`. Every other failure reports `code`.
+/// reports `SCP-CTX-2138`. `Custody` keeps its custody code
+/// ([`ScpNapiError::custody_failure`]: a destroyed `#active` key is
+/// `SCP-CRYPTO-4006`). Every other failure reports `code`.
 /// The Welcome join, the key-package reservation and the invite map their
 /// errors through it.
 fn typed_supervisor_failure(
@@ -5644,6 +5638,9 @@ fn typed_supervisor_failure(
     let code = match e {
         scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
         scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
+        scp_core::context::ContextError::Custody(failure) => {
+            return ScpNapiError::custody_failure(format!("{op} failed: {e}"), failure);
+        }
         _ => code,
     };
     ScpNapiError::Context {
@@ -5803,9 +5800,9 @@ mod tests {
         use scp_identity::DidMethod;
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
             scp_dht::InMemoryDhtClient::new(),
@@ -5860,9 +5857,9 @@ mod tests {
         use scp_identity::{DidDht, DidMethod};
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
-        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
         let (identity, document, pre_rotation_handle) = if with_agent_key {
@@ -6029,9 +6026,9 @@ mod tests {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
 
         // custody_A: the sender identity's OWN custody — holds the agent key.
-        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
         let (identity, document, pre_rotation_handle) = dht
@@ -6063,9 +6060,9 @@ mod tests {
         // custody_B: a DIFFERENT, empty custody on the context handle. It does
         // NOT hold the agent key handle — so a resolver that (wrongly) sourced
         // #agent custody from the handle would fail against it.
-        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(Box::new(
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
-        ));
+        )));
         // Balances the decrement `NapiContextHandle`'s `Drop` runs.
         crate::increment_handle_count();
         let handle = super::NapiContextHandle {
@@ -6513,6 +6510,51 @@ mod tests {
         assert!(
             !crate::runtime::has_release_mark(&bi, &closed),
             "a settled close with no live handle must leave no mark"
+        );
+    }
+
+    /// A join whose `#active` key custody no longer holds fails at the
+    /// runtime's invitation KEM agreement (the first step of the join) with a
+    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
+    /// through `typed_supervisor_failure` and still rolls its reversible state
+    /// back.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let joiner_did = register_in_memory_joiner(&bi).await;
+        let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.active_signing_key))
+        })
+        .expect("the joiner is registered");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &active)
+            .await
+            .expect("destroy_key should succeed");
+        let ctx_id = "b".repeat(64);
+        let sealed = super::NapiSealedInvitation {
+            context_id: ctx_id.clone(),
+            creator_did: "did:dht:z6MkNapiDestroyedActiveCreator".to_owned(),
+            enc: vec![0u8; 32],
+            ciphertext: b"bogus-bundle-ciphertext".to_vec(),
+        };
+        let Err(err) = super::context_join_from_welcome_on(
+            &bi,
+            joiner_did,
+            sealed,
+            "bogus-reservation-id".to_owned(),
+        )
+        .await
+        else {
+            panic!("a join under a destroyed #active key must fail");
+        };
+        assert!(
+            err.reason.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed #active key, got: {}",
+            err.reason
+        );
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+            "FFI (UCAN) state must NOT survive a failed join"
         );
     }
 
@@ -7809,6 +7851,28 @@ mod tests {
                 )),
                 fallback
             );
+            for (kind, expected) in [
+                (
+                    scp_crypto::CustodyFailureKind::KeyNotFound,
+                    codes::CRYPTO_4006,
+                ),
+                (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
+            ] {
+                let failure = scp_crypto::CustodyFailure {
+                    kind,
+                    detail: "custody detail".to_owned(),
+                };
+                match super::typed_supervisor_failure(
+                    "context_join_from_welcome",
+                    fallback,
+                    &ContextError::Custody(failure),
+                ) {
+                    crate::error::ScpNapiError::Crypto { code, .. } => {
+                        assert_eq!(code, expected);
+                    }
+                    other => panic!("expected a {expected} Crypto error, got {other:?}"),
+                }
+            }
         }
     }
 
@@ -9062,6 +9126,49 @@ mod tests {
         );
     }
 
+    /// A custody that no longer holds the exporter's `#active` key fails the
+    /// export with `SCP-CRYPTO-4006`: the runtime carries the custody failure
+    /// as a typed value, and the bridge maps its kind to the code. Reverting
+    /// the runtime to a text error would report a context code instead.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_export_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "context:close"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+            .await
+            .expect("destroy_key should succeed");
+
+        let err = super::context_export_on(&bi, &handle)
+            .await
+            .expect_err("export with a destroyed signing key must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed export key, got: {msg}"
+        );
+    }
+
     /// Confirms the export signature is genuinely verified on import: flipping a
     /// byte inside the serialized export (which lands in the signed snapshot
     /// region) MUST cause `context_import_on` to fail. This proves the signature
@@ -9142,7 +9249,7 @@ mod tests {
         /// custody can fail (the JS callback may throw), so the `Result` is part
         /// of the contract even though this in-test signer is infallible.
         #[allow(clippy::unnecessary_wraps)]
-        fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], std::convert::Infallible> {
+        fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], scp_crypto::CustodyFailure> {
             use ed25519_dalek::Signer;
             Ok(self.signing_key.sign(digest).to_bytes())
         }
@@ -9307,7 +9414,7 @@ mod tests {
     ///
     /// This helper is the single deduped definition of the encrypted JOIN /
     /// IMPORT derivation contract for the NAPI bridge — the join and import
-    /// paths both route through it so the 1054/1055/1057 codes cannot drift
+    /// paths both route through it so the 1054/1055 codes cannot drift
     /// across entry points. A registry miss (no identity registered for the
     /// DID) resolves no custody, so the encrypted routing axis must hard-fail
     /// rather than silently degrade to the reserved `[0u8; 32]` sentinel.
@@ -9335,6 +9442,117 @@ mod tests {
             msg.contains(codes::IDENT_1054),
             "expected missing-key-material code {}, got: {msg}",
             codes::IDENT_1054
+        );
+    }
+
+    /// §9.10.4: `derive_pseudonym_bytes` returns the routing id of the
+    /// custody's P-256 pseudonym, recomputed here from the identity seed with
+    /// the scp-crypto recipe and a direct SHA-256 over the routing prefix.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derive_pseudonym_bytes_is_the_recipe_routing_id() {
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use scp_platform::KeyCustody as _;
+        use scp_platform::testing::InMemoryKeyCustody;
+        use sha2::{Digest, Sha256};
+
+        let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        )));
+        let handle = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .expect("generate identity key");
+        let seed = zeroize::Zeroizing::new(
+            custody
+                .export_ed25519_signing_key(&handle)
+                .await
+                .expect("export identity seed")
+                .to_bytes(),
+        );
+        let routing_id = super::derive_pseudonym_bytes(&custody, &handle, "ctx-napi-kat")
+            .await
+            .expect("derivation succeeds");
+
+        let point = scp_crypto::pseudonym::derive_pseudonym(
+            &seed,
+            b"ctx-napi-kat",
+            scp_crypto::pseudonym::PseudonymVersion::Static,
+        )
+        .to_compressed();
+        let mut hasher = Sha256::new();
+        hasher.update(b"scp-pseudonym-routing-v1:");
+        hasher.update(point);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(routing_id, expected);
+    }
+
+    /// §9.10.4.A: deriving under a key custody does not hold fails as
+    /// key-not-found (`SCP-CRYPTO-4006`), never as a zero routing id.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derive_pseudonym_bytes_unknown_key_is_crypto_4006() {
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = crate::custody::NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        )));
+        let missing = scp_platform::KeyHandle::new(4242);
+        let err = super::derive_pseudonym_bytes(&custody, &missing, "ctx-napi-kat")
+            .await
+            .expect_err("an unknown identity key must fail derivation");
+        match err {
+            crate::error::ScpNapiError::Crypto { code, .. } => {
+                assert_eq!(code, codes::CRYPTO_4006);
+            }
+            other => panic!("expected CRYPTO_4006, got {other:?}"),
+        }
+    }
+
+    /// A broadcast author whose `#active` key the custody no longer holds
+    /// fails the publish with `SCP-CRYPTO-4006`: the supervisor carries the
+    /// signing failure as `ContextError::Custody`, and the bridge maps its kind.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_publish_with_a_destroyed_signing_key_is_crypto_4006() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let creator = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params = serde_json::json!({
+            "mode": "broadcast",
+            "ceiling": ["messages:read"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &creator, params)
+            .await
+            .expect("broadcast context_create should succeed");
+        let custody = handle
+            .in_memory_custody
+            .as_ref()
+            .expect("an in-memory identity retains its custody on the handle");
+        let key = handle
+            .signing_key
+            .expect("the handle retains the signing key");
+        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &key)
+            .await
+            .expect("destroy_key should succeed");
+
+        let Err(err) =
+            super::broadcast_publish_on(&bi, &handle, creator.inner.did.clone(), b"hi".to_vec())
+                .await
+        else {
+            panic!("broadcast publish with a destroyed signing key must fail")
+        };
+        assert!(
+            err.reason.contains(codes::CRYPTO_4006),
+            "expected CRYPTO_4006 for a destroyed broadcast key, got: {}",
+            err.reason
         );
     }
 

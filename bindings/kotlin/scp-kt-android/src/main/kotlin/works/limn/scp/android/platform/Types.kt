@@ -27,7 +27,7 @@ package works.limn.scp.android.platform
  * enum has not moved to them.
  */
 enum class KeyType {
-    /** Ed25519 signing key (identity keys, active signing keys, pseudonym keys). */
+    /** Ed25519 signing key (identity keys, active signing keys). */
     ED25519,
 
     /** X25519 key agreement key (HPKE wrapping keys). */
@@ -84,20 +84,7 @@ data class KeyHandle(
 )
 
 /**
- * Handle to a derived pseudonym keypair.
- *
- * Pseudonym keys are always software-managed regardless of whether the source
- * identity key is a Keystore key. See ADR-006 for the derivation algorithm.
- *
- * @property id Unique identifier for the pseudonym signing key.
- * @property custodyType Always [CustodyType.SOFTWARE] for derived pseudonym keys.
- */
-data class PseudonymKeyHandle(
-    val id: String,
-    val custodyType: CustodyType,
-)
 
-/**
  * Attestation that a key has been destroyed.
  *
  * For Android Keystore keys, [method] is [DestructionMethod.HARDWARE] because Keystore held
@@ -151,12 +138,10 @@ enum class DestructionMethod {
  * SCP-specific exception with structured error codes.
  *
  * Error codes follow the pattern `SCP-{DOMAIN}-{NUMBER}`:
- * - `SCP-CRYPTO-4001`: Key not found (a software or Keystore lookup, any key type, X25519
- *   included), with two exceptions: [KeyCustodyProvider.dhAgree] throws `SCP-CRYPTO-4002` for a
- *   missing key, and [KeyCustodyProvider.exportSigningKeyBytes] throws `SCP-CRYPTO-4005` for a
- *   Keystore handle ([CustodyType.HARDWARE]) whether or not its key exists
- * - `SCP-CRYPTO-4002`: [KeyCustodyProvider.dhAgree] found no software key under the handle: a
- *   destroyed or unknown handle, or a Keystore Ed25519 handle
+ * - `SCP-CRYPTO-4006`: Key not found (a software or Keystore lookup, any key type, X25519
+ *   included, or a Keystore identity's pseudonym secret), with one exception:
+ *   [KeyCustodyProvider.exportSigningKeyBytes] throws `SCP-CRYPTO-4005` for a Keystore handle
+ *   ([CustodyType.HARDWARE]) whether or not its key exists
  * - `SCP-CRYPTO-4003`: Wrong key type for operation, or a [KeyCustodyProvider.dhAgree] peer
  *   public key that is not 32 bytes long. [KeyCustodyProvider.dhAgree] raises it for a wrong
  *   key type only when the handle names a software Ed25519 key.
@@ -302,7 +287,9 @@ interface PushProvider {
  * software P-256 agreement key, stored in EncryptedSharedPreferences, below it. Story SCP-110
  * tracks both moves.
  *
- * This interface matches neither Rust declaration.
+ * This interface matches neither Rust declaration. It is not the `scp-ffi-uniffi`
+ * `KeyCustodyProvider` callback protocol, whose key ids are u64 strings, and no in-tree Kotlin
+ * host implements that bridge protocol yet.
  *
  * - Method set: it declares the methods of the UniFFI `KeyCustodyProvider` callback interface in
  *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`, and it names the callback's
@@ -321,8 +308,9 @@ interface PushProvider {
  * - Return types: [generateKeypair] returns a [KeyHandle], while the Rust trait's returns its
  *   `u64` `KeyHandle` and the UniFFI callback's `generate_keypair` returns a `String` key ID.
  *   [destroyKey] returns a [DestructionAttestation], while both Rust declarations return
- *   nothing. The pseudonym methods return a [PseudonymKeyHandle], while the Rust trait returns
- *   a `PseudonymKeypair` and the UniFFI callback returns bytes. [sign], [publicKey] and
+ *   nothing. The pseudonym methods return a [ByteArray] holding a 33-byte compressed P-256
+ *   point, as the UniFFI callback returns bytes, while the Rust trait returns a `Pseudonym`.
+ *   [sign], [publicKey] and
  *   [dhAgree] return a [ByteArray], as the UniFFI callback's methods return bytes, while the
  *   Rust trait returns a `Signature`, a `PublicKey` and a `SharedSecret`.
  * - Synchrony: its methods are synchronous. Every method of both Rust declarations is `async`
@@ -332,17 +320,26 @@ interface PushProvider {
  *   class, and the Rust trait returns a `PlatformError`. ADR-027 states that a UniFFI callback
  *   that throws any exception other than the generated one panics the Rust caller.
  *
- * [AndroidKeyCustody] converts no exception to [ScpException]. Each method throws [ScpException]
- * only for the codes its `@throws` lines name, and every other failure escapes as the original
- * throwable, so a `catch (e: ScpException)` does not catch it. The Keystore path, which an
+ * [AndroidKeyCustody] converts one exception to [ScpException]: [destroyKey] throws a
+ * `KeyStoreException` from `deleteEntry` as `SCP-CRYPTO-4004`. Otherwise each method throws
+ * [ScpException] only for the codes its `@throws` lines name, and every other failure escapes as
+ * the original throwable, so a `catch (e: ScpException)` does not catch it. The Keystore path, which an
  * Ed25519 [generateKeypair] takes on API 33+ and each other method below takes for a
  * [CustodyType.HARDWARE] handle, can let these escape:
  *
- * - [generateKeypair]: `KeyPairGenerator.getInstance` throws `NoSuchAlgorithmException` or
- *   `NoSuchProviderException`, `initialize` throws `InvalidAlgorithmParameterException`, and
- *   `generateKeyPair` throws `ProviderException` when Keystore fails to generate the key.
- * - [sign], [derivePseudonym] and [deriveRotatablePseudonym], which sign through Keystore to
- *   derive the pseudonym secret: `KeyStore.getInstance` throws `KeyStoreException`,
+ * - [generateKeypair]: `KeyPairGenerator.getInstance` and `KeyGenerator.getInstance` throw
+ *   `NoSuchAlgorithmException` or `NoSuchProviderException`, `initialize` and `init` throw
+ *   `InvalidAlgorithmParameterException`, and `generateKeyPair` and `generateKey` throw
+ *   `ProviderException` when Keystore fails to generate the identity key or its pseudonym
+ *   secret. A failure generating the secret deletes the identity key before it escapes.
+ * - [derivePseudonym] and [deriveRotatablePseudonym], which compute the context seed with the
+ *   identity's Keystore HMAC pseudonym secret: `KeyStore.getInstance` throws
+ *   `KeyStoreException`, `KeyStore.load` throws `IOException`, `NoSuchAlgorithmException` or
+ *   `CertificateException`, `containsAlias` throws `KeyStoreException`, `KeyStore.getKey`
+ *   throws `KeyStoreException`, `NoSuchAlgorithmException` or `UnrecoverableKeyException`,
+ *   `Mac.getInstance` throws `NoSuchAlgorithmException`, and `Mac.init` throws
+ *   `InvalidKeyException`.
+ * - [sign]: `KeyStore.getInstance` throws `KeyStoreException`,
  *   `KeyStore.load` throws `IOException`, `NoSuchAlgorithmException` or `CertificateException`,
  *   `KeyStore.getEntry` throws `KeyStoreException`, `NoSuchAlgorithmException` or
  *   `UnrecoverableEntryException`, `Signature.getInstance` throws `NoSuchAlgorithmException`,
@@ -352,7 +349,8 @@ interface PushProvider {
  *   exceptions, and `IllegalStateException` when the encoded public key is not the 44-byte
  *   X.509 Ed25519 SubjectPublicKeyInfo.
  * - [destroyKey]: the same `KeyStore.getInstance` and `KeyStore.load` exceptions, and
- *   `KeyStoreException` from `containsAlias` and `deleteEntry`.
+ *   `KeyStoreException` from `containsAlias`. A `KeyStoreException` from `deleteEntry` is
+ *   thrown as `SCP-CRYPTO-4004`.
  *
  * [dhAgree] and [exportSigningKeyBytes] do not reach Keystore. [dhAgree] still lets one
  * non-[ScpException] escape, and remote input causes it: [dhAgree] passes a 32-byte peer key to
@@ -368,9 +366,9 @@ interface PushProvider {
  *   key to this instance's software key map, so the exception escapes with the key in the map
  *   and no handle returned.
  * - [destroyKey] for a [CustodyType.SOFTWARE] handle removes the handle's seed entry after it
- *   removes the key from the software key map and before its `SCP-CRYPTO-4001` and
+ *   removes the key from the software key map and before its `SCP-CRYPTO-4006` and
  *   `SCP-CRYPTO-4004` checks, so the exception escapes with the key gone from the map and any
- *   persisted seed still on disk. A retry reaches the same removal before the `SCP-CRYPTO-4001`
+ *   persisted seed still on disk. A retry reaches the same removal before the `SCP-CRYPTO-4006`
  *   check, and an [AndroidKeyCustody] constructed later restores the key from a seed still on
  *   disk.
  *
@@ -394,24 +392,22 @@ interface KeyCustodyProvider {
     fun generateKeypair(keyType: KeyType): KeyHandle
 
     /**
-     * Sign data with an Ed25519 key.
+     * Sign data with an Ed25519 identity key.
      *
      * @param keyHandle Handle to an Ed25519 key.
-     * @param data The bytes to sign.
-     * @return 64-byte Ed25519 signature.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
+     * @param data The message.
+     * @return A 64-byte Ed25519 signature.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
+     * @throws ScpException with code `SCP-CRYPTO-4003` if key is X25519.
      */
     fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray
 
     /**
      * Return the raw public key bytes for a handle.
      *
-     * Works for both Ed25519 (32 bytes) and X25519 (32 bytes) key handles.
-     *
      * @param keyHandle Handle to any key type.
-     * @return Raw public key bytes (32 bytes).
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @return The raw 32-byte public key.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      */
     fun publicKey(keyHandle: KeyHandle): ByteArray
 
@@ -419,34 +415,40 @@ interface KeyCustodyProvider {
      * Destroy key material associated with a handle.
      *
      * After this call, operations with the same handle on the same [AndroidKeyCustody] instance
-     * throw [ScpException] with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws
-     * `SCP-CRYPTO-4002`, or `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it
-     * checks the peer key's length before any key lookup; and [exportSigningKeyBytes] on a
-     * Keystore handle ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
+     * throw [ScpException] with code `SCP-CRYPTO-4006`, with two exceptions: [dhAgree] throws
+     * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
+     * length before any key lookup; and [exportSigningKeyBytes] on a Keystore handle
+     * ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
      * [KeyHandle.custodyType] before any key lookup.
      * Each [AndroidKeyCustody] instance holds its own map of software keys and restores every
      * persisted software Ed25519 seed into it when constructed, so another instance in the same
      * process that already holds a software key keeps signing with it after this call. The
      * other direction also holds: an instance constructed before another instance generated a
      * software Ed25519 key does not hold that key, yet its destroyKey queues removal of the key's
-     * persisted seed and then throws `SCP-CRYPTO-4001` because its own map lacks the key. The
+     * persisted seed and then throws `SCP-CRYPTO-4006` because its own map lacks the key. The
      * instance that holds the key keeps signing with it until its process ends, and no process
      * started after the removal reaches disk restores it.
      * [AndroidKeyCustody] removes the persisted seed of a software Ed25519 key that
      * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
      * can restore the key when this process dies before the removal reaches disk (see
      * [DestructionAttestation.confirmed]).
-     * A Keystore or EncryptedSharedPreferences failure escapes as the original exception, listed
-     * in the interface KDoc.
+     * A `KeyStoreException` from the Keystore `deleteEntry` is thrown as `SCP-CRYPTO-4004`; every
+     * other Keystore or EncryptedSharedPreferences failure escapes as the original exception,
+     * listed in the interface KDoc.
+     *
+     * No pseudonym key exists to destroy: once the identity (and, for a Keystore identity, its
+     * pseudonym secret) is gone, deriving any of its pseudonyms fails with `SCP-CRYPTO-4006`
+     * (`09-security-model.md` §9.10.4.A).
      *
      * @param keyHandle Handle to destroy.
      * @return A [DestructionAttestation] naming the destruction method, with
      *   [DestructionAttestation.confirmed] always `true`: a failed post-deletion check throws
      *   `SCP-CRYPTO-4004` instead.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if no key sits under the handle: for a
-     *   Keystore handle, Keystore holds no alias `scp.key.<id>`; for a software handle, this
-     *   instance's software key map holds no entry, and the persisted seed under the handle's ID
-     *   is already queued for removal when this is thrown.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if no key sits under the handle: for a
+     *   Keystore handle, Keystore holds no alias `scp.key.<id>` (any pseudonym secret left
+     *   behind is deleted first); for a software handle, this instance's software key map holds
+     *   no entry, and the persisted seed under the handle's ID is already queued for removal
+     *   when this is thrown.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
     fun destroyKey(keyHandle: KeyHandle): DestructionAttestation
@@ -461,7 +463,7 @@ interface KeyCustodyProvider {
      * @param keyHandle Handle to an X25519 key.
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4002` if [peerPublic] is 32 bytes long and no
+     * @throws ScpException with code `SCP-CRYPTO-4006` if [peerPublic] is 32 bytes long and no
      *   software key sits under [keyHandle]: a destroyed or unknown handle, or a Keystore
      *   Ed25519 handle.
      * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
@@ -474,37 +476,38 @@ interface KeyCustodyProvider {
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
 
     /**
-     * Derive a deterministic, context-scoped pseudonym keypair.
+     * Derive a deterministic, context-scoped pseudonym and return its point.
      *
      * Shipped algorithm. The HMAC key is a private-derived `pseudonym_secret`, NEVER the
      * public key (public-key keying would be a membership-enumeration oracle):
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
+     *      the pseudonym is the 33-byte compressed point `d * G`. No pseudonym key is
+     *      stored, and none can sign.
      *
-     * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")`. This Ed25519 derivation diverges from spec §9.10.4
-     * and §9.10.4.A and from ADR-027 acceptance criterion 6, which key the software
-     * `pseudonym_secret` on the P-256 private scalar and turn `seed` into a P-256 keypair
-     * through the FIPS 186-5 Appendix A.2.1 seed-to-scalar step. Android software pseudonyms
-     * therefore do not match the spec §25.19 known-answer vectors. Story SCP-110 tracks the
-     * move to P-256. Keystore
-     * custody ([CustodyType.HARDWARE]): [AndroidKeyCustody] computes
-     * `pseudonym_secret = SHA-256(sign(keyHandle, "scp-pseudonym-secret-v1"))`.
-     * [sign] returns that signature to any caller holding the custody object, so
-     * such a caller can recompute every pseudonym; the secret does not stay inside
-     * Keystore. This diverges from ADR-027 acceptance criterion 6, which makes the
-     * secret a symmetric key generated inside the secure boundary.
+     * Software custody: `pseudonym_secret = HKDF-SHA256(ikm = ed25519_private_seed,
+     * salt = "scp-pseudonym-secret-v1")`, the §9.10.4.A native interim until the identity key
+     * moves to P-256 (story SCP-110); the steps after it match every other software custody
+     * byte for byte (§25.19). Keystore custody ([CustodyType.HARDWARE]): `pseudonym_secret` is
+     * a device-local HMAC-SHA256 key that [AndroidKeyCustody] generates inside Android Keystore
+     * at [generateKeypair]. Keystore computes step 1, the secret never leaves it, and no
+     * signature feeds it, so the pseudonym is device-local by design (not identical across
+     * devices).
+     *
+     * The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A): once
+     * the identity is destroyed, the derivation fails with key-not-found
+     * (`SCP-CRYPTO-4006`).
      *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.
-     * @return A [PseudonymKeyHandle] to the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @return The 33-byte SEC1 compressed P-256 point.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      */
-    fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle
+    fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): ByteArray
 
     /**
-     * Derive a deterministic, context-scoped, epoch-rotatable pseudonym keypair.
+     * Derive a deterministic, context-scoped, epoch-rotatable pseudonym and return its point.
      *
      * Identical to [derivePseudonym] except the per-epoch domain separator and the
      * big-endian epoch counter are mixed into the HMAC body, so each epoch yields an
@@ -513,36 +516,38 @@ interface KeyCustodyProvider {
      * public key (public-key keying would be a membership-enumeration oracle). Shipped
      * algorithm:
      *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || BE64(epoch) || "scp-pseudonym-v2")`
-     *   2. `pseudonym_keypair = Ed25519_keygen(seed[0..32])`  // RFC-8032 seed
+     *   2. `d = HKDF-Expand-SHA256(seed, "SCP-PSEUDONYM-P256-V1", 48) mod (n - 1) + 1`;
+     *      the pseudonym is the 33-byte compressed point `d * G`. No pseudonym key is
+     *      stored, and none can sign.
      *
      * The `"scp-pseudonym-v2"` domain separator differs from v1's `"scp-pseudonym"`,
      * so v2 at any epoch never collides with the v1 [derivePseudonym] output.
      *
-     * Software custody: `pseudonym_secret = HKDF-SHA256(ed25519_private_seed,
-     * salt="scp-pseudonym-secret-v1")`. This Ed25519 derivation diverges from spec §9.10.4.A,
-     * which keys the software `pseudonym_secret` on the P-256 private scalar and turns `seed`
-     * into a P-256 keypair through the seed-to-scalar step of §9.10.4 (FIPS 186-5 Appendix
-     * A.2.1), so Android software pseudonyms do not match the spec §25.19 known-answer vectors.
-     * Story SCP-110 tracks the move to P-256. Keystore
-     * custody ([CustodyType.HARDWARE]): [AndroidKeyCustody] computes
-     * `pseudonym_secret = SHA-256(sign(keyHandle, "scp-pseudonym-secret-v1"))`.
-     * [sign] returns that signature to any caller holding the custody object, so
-     * such a caller can recompute every pseudonym; the secret does not stay inside
-     * Keystore. This diverges from ADR-027 acceptance criterion 6, which makes the
-     * secret a symmetric key generated inside the secure boundary.
+     * Software custody: `pseudonym_secret = HKDF-SHA256(ikm = ed25519_private_seed,
+     * salt = "scp-pseudonym-secret-v1")`, the §9.10.4.A native interim until the identity key
+     * moves to P-256 (story SCP-110); the steps after it match every other software custody
+     * byte for byte (§25.19). Keystore custody ([CustodyType.HARDWARE]): `pseudonym_secret` is
+     * a device-local HMAC-SHA256 key that [AndroidKeyCustody] generates inside Android Keystore
+     * at [generateKeypair]. Keystore computes step 1, the secret never leaves it, and no
+     * signature feeds it, so the pseudonym is device-local by design (not identical across
+     * devices).
+     *
+     * The pseudonym dies with its identity (`09-security-model.md` §9.10.4.A): once
+     * the identity is destroyed, the derivation fails with key-not-found
+     * (`SCP-CRYPTO-4006`).
      *
      * @param keyHandle Handle to the identity Ed25519 key.
      * @param contextId Raw context ID bytes.
      * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
-     * @return A [PseudonymKeyHandle] to the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if key not found.
+     * @return The 33-byte SEC1 compressed P-256 point.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      */
     fun deriveRotatablePseudonym(
         keyHandle: KeyHandle,
         contextId: ByteArray,
         pseudonymEpoch: Long,
-    ): PseudonymKeyHandle
+    ): ByteArray
 
     /**
      * Export the raw Ed25519 private key bytes (32 bytes) for a key handle.
@@ -563,7 +568,7 @@ interface KeyCustodyProvider {
      *
      * @param keyHandle Handle to an Ed25519 key.
      * @return 32-byte raw Ed25519 private key bytes.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is a software handle
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the handle is a software handle
      *   and no software key is found under it.
      * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
      * @throws ScpException with code `SCP-CRYPTO-4005` if the handle is a Keystore handle

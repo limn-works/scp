@@ -1140,6 +1140,48 @@
       "path": "crates/scp-ffi/napi/src/ucan.rs",
       "kind": "getter",
       "reason": "Getter for a UCAN token id on a result type."
+    },
+    {
+      "name": "new",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Builds the adapter around the provider. Not a protocol operation."
+    },
+    {
+      "name": "generate_keypair",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Generates an identity key through the adapter; a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060, as production reports it. Not a protocol operation."
+    },
+    {
+      "name": "derive_pseudonym",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the v1 routing id the adapter computes from the host's 33-byte point (\u00a79.10.4); host bytes that are not a compressed P-256 point are SCP-IDENT-1055. Not a protocol operation."
+    },
+    {
+      "name": "derive_rotatable_pseudonym",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the v2 routing id at an epoch (\u00a79.10.4.1) after checking the epoch fits a u64; host failures are coded as for derive_pseudonym. Not a protocol operation."
+    },
+    {
+      "name": "sign",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Signs through the adapter; a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
+    },
+    {
+      "name": "destroy_key",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Destroys a key through the adapter; a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
+    },
+    {
+      "name": "dh_agree",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the shared secret the adapter read from the host's dhAgree, so a test shows the bridge reads the secret intact before the TypeScript adapter zeroes its copy; a peer key that is not 32 bytes is SCP-VALID-7005, a host failure SCP-CRYPTO-4006 or SCP-CRYPTO-4060. Not a protocol operation."
     }
   ],
   "pending_registration": {

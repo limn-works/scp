@@ -137,9 +137,14 @@ pub enum EnvelopeError {
     #[error("invalid padding: {0}")]
     InvalidPadding(String),
 
-    /// Ed25519 signing via `KeyCustody` failed.
+    /// An Ed25519 signature returned by `KeyCustody` is malformed.
     #[error("signing failed: {0}")]
     SigningFailed(String),
+
+    /// A key custody call failed (`KeyCustody`). The bridges report the code
+    /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
+    #[error(transparent)]
+    Custody(#[from] scp_crypto::CustodyFailure),
 
     /// Ed25519 signature verification failed due to malformed input.
     #[error("verification failed: {0}")]
@@ -152,10 +157,6 @@ pub enum EnvelopeError {
     /// `MessagePack` deserialization failed.
     #[error("deserialization failed: {0}")]
     DeserializationFailed(String),
-
-    /// Pseudonym derivation via `KeyCustody` failed.
-    #[error("pseudonym derivation failed: {0}")]
-    PseudonymDerivationFailed(String),
 
     /// The `routing_id` field is not a valid 32-byte identifier.
     #[error("invalid routing_id: {0}")]

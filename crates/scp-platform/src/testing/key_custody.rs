@@ -15,8 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::traits::{
-    CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
-    Signature,
+    CustodyType, KeyCustody, KeyHandle, KeyType, Pseudonym, PublicKey, SharedSecret, Signature,
 };
 
 /// Tracks what type of key material is stored for a given handle.
@@ -24,6 +23,22 @@ use crate::traits::{
 enum StoredKeyType {
     Ed25519,
     X25519,
+}
+
+impl StoredKeyType {
+    /// The error for using a key of this type where `expected` is required.
+    const fn wrong_type(self, expected: KeyType) -> PlatformError {
+        match self {
+            Self::Ed25519 => PlatformError::WrongKeyType {
+                expected,
+                actual: KeyType::Ed25519,
+            },
+            Self::X25519 => PlatformError::WrongKeyType {
+                expected,
+                actual: KeyType::X25519,
+            },
+        }
+    }
 }
 
 /// Internal key storage that holds both Ed25519 and X25519 private keys.
@@ -140,6 +155,34 @@ impl InMemoryKeyCustody {
         KeyHandle::new(id)
     }
 
+    /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` under
+    /// `version`. A pseudonym has no private key, so this reads the identity
+    /// seed under the store lock, derives the point, and stores nothing; a
+    /// destroyed identity fails with `KeyNotFound` (§9.10.4.A).
+    async fn derive_p256_pseudonym(
+        &self,
+        key_id: u64,
+        context_id: &[u8],
+        version: PseudonymVersion,
+    ) -> Result<Pseudonym, PlatformError> {
+        let store = self.store.lock().await;
+        let key_type = store.lookup_type(KeyHandle::new(key_id))?;
+        if key_type != StoredKeyType::Ed25519 {
+            return Err(key_type.wrong_type(KeyType::Ed25519));
+        }
+        let signing_key = store
+            .ed25519_keys
+            .get(&key_id)
+            .ok_or(PlatformError::KeyNotFound)?;
+
+        // Software custody (§9.10.4.A): the ikm is the identity private
+        // seed, never the public key. Until the identity key moves to P-256
+        // (SCP-315) it is Ed25519, so its 32-byte seed is the ikm.
+        let ikm = Zeroizing::new(signing_key.to_bytes());
+        drop(store);
+        Ok(Pseudonym::new(derive_pseudonym(&ikm, context_id, version)))
+    }
+
     /// Imports an existing Ed25519 private key and returns a handle to it.
     ///
     /// This is used in tests where the signing key must match an externally
@@ -172,10 +215,7 @@ impl InMemoryKeyCustody {
         let store = self.store.lock().await;
         let key_type = store.lookup_type(*handle)?;
         if key_type != StoredKeyType::Ed25519 {
-            return Err(PlatformError::WrongKeyType {
-                expected: KeyType::Ed25519,
-                actual: KeyType::X25519,
-            });
+            return Err(key_type.wrong_type(KeyType::Ed25519));
         }
         store
             .ed25519_keys
@@ -191,7 +231,7 @@ impl Default for InMemoryKeyCustody {
     }
 }
 
-use scp_crypto::pseudonym::derive_pseudonym_keypair;
+use scp_crypto::pseudonym::{PseudonymVersion, derive_pseudonym};
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
@@ -236,10 +276,7 @@ impl KeyCustody for InMemoryKeyCustody {
             let key_type = store.lookup_type(KeyHandle::new(key_id))?;
 
             if key_type != StoredKeyType::Ed25519 {
-                return Err(PlatformError::WrongKeyType {
-                    expected: KeyType::Ed25519,
-                    actual: KeyType::X25519,
-                });
+                return Err(key_type.wrong_type(KeyType::Ed25519));
             }
 
             let signing_key = store
@@ -321,10 +358,7 @@ impl KeyCustody for InMemoryKeyCustody {
             let key_type = store.lookup_type(KeyHandle::new(key_id))?;
 
             if key_type != StoredKeyType::X25519 {
-                return Err(PlatformError::WrongKeyType {
-                    expected: KeyType::X25519,
-                    actual: KeyType::Ed25519,
-                });
+                return Err(key_type.wrong_type(KeyType::X25519));
             }
 
             let secret = store
@@ -344,44 +378,12 @@ impl KeyCustody for InMemoryKeyCustody {
         &self,
         key: &KeyHandle,
         context_id: &[u8],
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            let mut store = self.store.lock().await;
-            let key_type = store.lookup_type(KeyHandle::new(key_id))?;
-
-            if key_type != StoredKeyType::Ed25519 {
-                return Err(PlatformError::WrongKeyType {
-                    expected: KeyType::Ed25519,
-                    actual: KeyType::X25519,
-                });
-            }
-
-            let signing_key = store
-                .ed25519_keys
-                .get(&key_id)
-                .ok_or(PlatformError::KeyNotFound)?;
-
-            // Software custody: pseudonym keypair = Ed25519_keygen(HMAC-SHA256(
-            //   pseudonym_secret, context_id || "scp-pseudonym")), where the
-            // pseudonym_secret is derived from the private seed via HKDF (§9.10.4.A),
-            // NOT the public key, to prevent membership enumeration attacks.
-            let pseudonym_signing_key = derive_pseudonym_keypair(signing_key, &context_id, None);
-            let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
-
-            // Store the derived signing key and return a handle.
-            let handle = self.next_handle();
-            store
-                .ed25519_keys
-                .insert(handle.id(), pseudonym_signing_key);
-            store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
-            drop(store);
-
-            Ok(PseudonymKeypair {
-                public_key: PublicKey::new(pseudonym_verifying_key.to_bytes().to_vec()),
-                key_handle: handle,
-            })
+            self.derive_p256_pseudonym(key_id, &context_id, PseudonymVersion::Static)
+                .await
         }
     }
 
@@ -390,46 +392,18 @@ impl KeyCustody for InMemoryKeyCustody {
         key: &KeyHandle,
         context_id: &[u8],
         pseudonym_epoch: u64,
-    ) -> impl Future<Output = Result<PseudonymKeypair, PlatformError>> + Send {
+    ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            let mut store = self.store.lock().await;
-            let key_type = store.lookup_type(KeyHandle::new(key_id))?;
-
-            if key_type != StoredKeyType::Ed25519 {
-                return Err(PlatformError::WrongKeyType {
-                    expected: KeyType::Ed25519,
-                    actual: KeyType::X25519,
-                });
-            }
-
-            let signing_key = store
-                .ed25519_keys
-                .get(&key_id)
-                .ok_or(PlatformError::KeyNotFound)?;
-
-            // Software custody: rotatable pseudonym keypair = Ed25519_keygen(
-            //   HMAC-SHA256(pseudonym_secret, context_id || epoch_BE
-            //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
-            // private seed via HKDF (§9.10.4.A), NOT the public key, to prevent
-            // membership enumeration attacks. epoch_BE breaks long-term correlation.
-            let pseudonym_signing_key =
-                derive_pseudonym_keypair(signing_key, &context_id, Some(pseudonym_epoch));
-            let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
-
-            // Store the derived signing key and return a handle.
-            let handle = self.next_handle();
-            store
-                .ed25519_keys
-                .insert(handle.id(), pseudonym_signing_key);
-            store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
-            drop(store);
-
-            Ok(PseudonymKeypair {
-                public_key: PublicKey::new(pseudonym_verifying_key.to_bytes().to_vec()),
-                key_handle: handle,
-            })
+            self.derive_p256_pseudonym(
+                key_id,
+                &context_id,
+                PseudonymVersion::Rotatable {
+                    epoch: pseudonym_epoch,
+                },
+            )
+            .await
         }
     }
 
@@ -445,10 +419,7 @@ impl KeyCustody for InMemoryKeyCustody {
             let key_type = store.lookup_type(KeyHandle::new(key_id))?;
 
             if key_type != StoredKeyType::Ed25519 {
-                return Err(PlatformError::WrongKeyType {
-                    expected: KeyType::Ed25519,
-                    actual: KeyType::X25519,
-                });
+                return Err(key_type.wrong_type(KeyType::Ed25519));
             }
 
             let signing_key = store
@@ -526,7 +497,7 @@ mod tests {
 
     use super::*;
     use hmac::{Hmac, Mac};
-    use scp_crypto::pseudonym::derive_pseudonym_secret;
+    use scp_crypto::pseudonym::{derive_pseudonym_secret, pseudonym_from_context_seed};
     use sha2::Sha256;
 
     #[tokio::test]
@@ -646,7 +617,10 @@ mod tests {
         let second = custody.derive_pseudonym(&handle, context_id).await.unwrap();
 
         // Same identity key + same context_id = same pseudonym public key.
-        assert_eq!(first.public_key.as_bytes(), second.public_key.as_bytes());
+        assert_eq!(
+            first.public_key().to_compressed(),
+            second.public_key().to_compressed()
+        );
     }
 
     #[tokio::test]
@@ -664,7 +638,10 @@ mod tests {
             .unwrap();
 
         // Different contexts produce different pseudonyms.
-        assert_ne!(first.public_key.as_bytes(), second.public_key.as_bytes());
+        assert_ne!(
+            first.public_key().to_compressed(),
+            second.public_key().to_compressed()
+        );
     }
 
     #[tokio::test]
@@ -773,28 +750,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn derive_pseudonym_key_handle_can_sign() {
-        use ed25519_dalek::Verifier;
-
-        let custody = InMemoryKeyCustody::new();
-        let identity_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let pseudonym = custody
-            .derive_pseudonym(&identity_handle, b"context-1")
-            .await
-            .unwrap();
-
-        let data = b"pseudonym signed message";
-        let sig = custody.sign(&pseudonym.key_handle, data).await.unwrap();
-
-        let pk_bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().unwrap();
-        let verifying_key = VerifyingKey::from_bytes(&pk_bytes).unwrap();
-        let sig_bytes: [u8; 64] = sig.as_bytes().try_into().unwrap();
-        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-        assert!(verifying_key.verify(data, &signature).is_ok());
-    }
-
-    #[tokio::test]
     async fn handles_are_unique_across_key_types() {
         let custody = InMemoryKeyCustody::new();
         let h1 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -826,8 +781,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            first.public_key.as_bytes(),
-            second.public_key.as_bytes(),
+            first.public_key().to_compressed(),
+            second.public_key().to_compressed(),
             "same identity + context + epoch = same pseudonym"
         );
     }
@@ -848,8 +803,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            epoch0.public_key.as_bytes(),
-            epoch1.public_key.as_bytes(),
+            epoch0.public_key().to_compressed(),
+            epoch1.public_key().to_compressed(),
             "different epochs must produce different pseudonyms (BLACK-001)"
         );
     }
@@ -867,8 +822,8 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            v1.public_key.as_bytes(),
-            v2_epoch0.public_key.as_bytes(),
+            v1.public_key().to_compressed(),
+            v2_epoch0.public_key().to_compressed(),
             "v2 epoch 0 must differ from v1 (different domain separator)"
         );
     }
@@ -901,16 +856,16 @@ mod tests {
 
         // Compute expected pseudonym seed using the v2 reference algorithm:
         // seed = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
-        let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
-        let pseudonym_secret = derive_pseudonym_secret(&identity_signing_key);
+        // Native software custody: the ikm is the Ed25519 identity seed until the
+        // identity key moves to P-256 (SCP-315).
+        let pseudonym_secret = derive_pseudonym_secret(&Zeroizing::new(seed_bytes));
         let mut mac = Hmac::<Sha256>::new_from_slice(pseudonym_secret.as_slice()).unwrap();
         mac.update(context_id);
         mac.update(&epoch.to_be_bytes());
         mac.update(b"scp-pseudonym-v2");
         let expected_seed: [u8; 32] = mac.finalize().into_bytes().into();
 
-        let expected_signing_key = SigningKey::from_bytes(&expected_seed);
-        let expected_pubkey = expected_signing_key.verifying_key();
+        let expected_pubkey = pseudonym_from_context_seed(&expected_seed).to_compressed();
 
         let custody = InMemoryKeyCustody::new();
         let handle = custody.import_ed25519_key(&seed_bytes).await;
@@ -921,8 +876,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            pseudo.public_key.as_bytes(),
-            expected_pubkey.as_bytes(),
+            pseudo.public_key().to_compressed(),
+            expected_pubkey.as_slice(),
             "v2 pseudonym must match reference HMAC-SHA256 algorithm output"
         );
     }
@@ -949,8 +904,9 @@ mod tests {
         // seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
         // §9.10.4.A: HMAC key is a secret derived from the private key via HKDF,
         // NOT the public key, to prevent membership enumeration attacks.
-        let identity_signing_key = SigningKey::from_bytes(&seed_bytes);
-        let pseudonym_secret = derive_pseudonym_secret(&identity_signing_key);
+        // Native software custody: the ikm is the Ed25519 identity seed until the
+        // identity key moves to P-256 (SCP-315).
+        let pseudonym_secret = derive_pseudonym_secret(&Zeroizing::new(seed_bytes));
         let mut mac = Hmac::<Sha256>::new_from_slice(pseudonym_secret.as_slice()).unwrap();
         mac.update(context_id);
         mac.update(b"scp-pseudonym");
@@ -965,8 +921,8 @@ mod tests {
         let pseudo1 = custody.derive_pseudonym(&handle, context_id).await.unwrap();
         let pseudo2 = custody.derive_pseudonym(&handle, context_id).await.unwrap();
         assert_eq!(
-            pseudo1.public_key.as_bytes(),
-            pseudo2.public_key.as_bytes(),
+            pseudo1.public_key().to_compressed(),
+            pseudo2.public_key().to_compressed(),
             "pseudonym derivation must be deterministic for identical inputs"
         );
 
@@ -975,23 +931,29 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(
-            pseudo1.public_key.as_bytes(),
-            pseudo_other.public_key.as_bytes(),
+            pseudo1.public_key().to_compressed(),
+            pseudo_other.public_key().to_compressed(),
             "different context_id must produce different pseudonym"
         );
 
         // Assert that the implementation matches the reference algorithm.
         // expected_seed is HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym"),
-        // so the expected public key is the verifying key of the Ed25519 signing
-        // key derived from that seed. This is the authoritative golden value —
-        // Swift, Kotlin, and TypeScript implementations MUST produce the same
-        // public key bytes for these inputs.
-        let expected_signing_key = SigningKey::from_bytes(&expected_seed);
-        let expected_pubkey = expected_signing_key.verifying_key();
+        // so the expected public key is the P-256 key from that seed by the
+        // FIPS 186-5 A.2.1 step under "SCP-PSEUDONYM-P256-V1" (§9.10.4).
+        let expected_pubkey = pseudonym_from_context_seed(&expected_seed).to_compressed();
         assert_eq!(
-            pseudo1.public_key.as_bytes(),
-            expected_pubkey.as_bytes(),
+            pseudo1.public_key().to_compressed(),
+            expected_pubkey.as_slice(),
             "pseudonym public key must match reference HMAC-SHA256 algorithm output"
         );
+    }
+
+    #[tokio::test]
+    async fn destroyed_identity_derives_no_pseudonym() {
+        crate::pseudonym_checks::check_destroyed_identity_derives_no_pseudonym(
+            &InMemoryKeyCustody::new(),
+        )
+        .await
+        .unwrap();
     }
 }

@@ -90,6 +90,8 @@ __all__ = [
     "SealedInvitation",
     "SqliteStorage",
     "StorageConfig",
+    "p256_pseudonym_point",
+    "p256_software_pseudonym_point",
 ]
 
 
@@ -108,13 +110,45 @@ class KeyCustodyProvider(Protocol):
     the GIL while orchestrating, then re-acquires it per call), so a method
     body may block on a keystore without stalling the asyncio event loop.
 
-    Key identifiers are opaque, numeric-string handles your implementation
-    assigns in :meth:`generate_keypair` and maps internally to real key
-    material. Byte values are passed and returned as ``bytes``.
+    Key identifiers are handles your implementation assigns in :meth:`generate_keypair` and maps
+    internally to real key material. Each is the canonical decimal form of an unsigned 64-bit
+    integer, as ``str(n)`` writes it for an ``int`` ``n`` in ``[0, 2**64 - 1]``: ASCII digits only,
+    with no sign, no leading zero (``"0"`` itself is allowed) and no whitespace. The bridge rejects
+    any other id (``"007"``, ``"+7"``, ``" 7"``, a UUID) with the custody error ``SCP-CRYPTO-4060``.
+    Byte values are passed and returned as ``bytes``.
+
+    A pseudonym has no private key (``09-security-model.md`` §9.10.4): your
+    implementation stores no pseudonym key and signs with none, so
+    :meth:`sign`, :meth:`get_public_key` and :meth:`destroy_key` never receive
+    a pseudonym.
+
+    Every method is a plain ``def``. A method that returns a coroutine (an
+    ``async def``), or a value of the wrong type (for :meth:`derive_pseudonym`,
+    anything but ``bytes``), fails the operation with the custody error
+    ``SCP-CRYPTO-4060``; ``SCP-IDENT-1055`` covers only ``bytes`` that are not
+    a compressed P-256 point.
+
+    A method reports failure by raising. Raise an exception whose ``code`` is
+    ``"SCP-CRYPTO-4006"`` (key not found), such as
+    ``CryptoError(msg, "SCP-CRYPTO-4006")``, for a key id that was destroyed
+    or never existed; the bridge reports it as key-not-found. Any other
+    exception, whatever its ``code``, becomes the custody error
+    ``SCP-CRYPTO-4060`` carrying that code and the exception text. Every SDK
+    operation that calls the provider reports these two codes, including the
+    pseudonym derivation inside ``context_create`` and the identity key reads
+    and signatures of identity operations. There are two exceptions:
+    ``SCP-IDENT-1055``, reported when the bytes a :meth:`derive_pseudonym` or
+    :meth:`derive_rotatable_pseudonym` call returned are not a compressed
+    P-256 point, and ``SCP-IDENT-1037``, which ``scpid_sign`` reports for any custody failure
+    (spec §3.11.4).
     """
 
     def generate_keypair(self, key_type: str) -> str:
-        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id."""
+        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id.
+
+        The id is a canonical decimal ``u64`` string (``SCP-CRYPTO-4060``
+        otherwise).
+        """
         ...
 
     def sign(self, key_id: str, message: bytes) -> bytes:
@@ -122,11 +156,16 @@ class KeyCustodyProvider(Protocol):
         ...
 
     def get_public_key(self, key_id: str) -> bytes:
-        """Return the 32 public-key bytes for ``key_id``."""
+        """Return the 32 public-key bytes of the Ed25519 or X25519 key ``key_id``."""
         ...
 
     def destroy_key(self, key_id: str) -> None:
-        """Destroy key material for ``key_id``; subsequent ops must fail."""
+        """Destroy key material for ``key_id``; subsequent ops must fail.
+
+        That includes pseudonym derivation under a destroyed identity key,
+        which raises key-not-found ``SCP-CRYPTO-4006``
+        (``09-security-model.md`` §9.10.4.A).
+        """
         ...
 
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
@@ -134,42 +173,46 @@ class KeyCustodyProvider(Protocol):
         ...
 
     def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
-        """Derive a context-scoped pseudonym keypair (v1, static).
+        """Derive the context-scoped P-256 pseudonym point (v1, static; §9.10.4).
 
-        Returns ``public_key_bytes (32) || key_id_utf8`` — the 32-byte
-        pseudonym public key concatenated with the UTF-8 numeric id of the
-        derived signing key.
+        Returns the 33-byte SEC1 compressed P-256 pseudonym point and nothing
+        else. The bridge fails the operation with ``SCP-IDENT-1055`` when the
+        bytes are not a valid compressed P-256 point. Raise key-not-found
+        (``SCP-CRYPTO-4006``) when ``key_id`` was destroyed or never existed.
 
-        Canonical recipe (all custody backends MUST produce identical bytes)::
+        Canonical recipe (all software custody backends MUST produce identical
+        bytes; ``ikm`` is the identity private key material, the 32-byte
+        Ed25519 seed until the identity key moves to P-256, SCP-315)::
 
             pseudonym_secret = HKDF-SHA256(
-                ikm=ed25519_private_seed, salt=b"scp-pseudonym-secret-v1",
-                info=b"", length=32)
+                ikm=ikm, salt=b"scp-pseudonym-secret-v1", info=b"", length=32)
             seed = HMAC-SHA256(pseudonym_secret, context_id + b"scp-pseudonym")
-            pseudonym_keypair = Ed25519_keygen(seed[:32])
+            d = int.from_bytes(HKDF-Expand-SHA256(
+                prk=seed, info=b"SCP-PSEUDONYM-P256-V1", length=48),
+                "big") % (n - 1) + 1
+            point = SEC1_compressed(d * G)
+
+        ``d`` is discarded, never stored.
         """
         ...
 
     def derive_rotatable_pseudonym(
         self, key_id: str, context_id: bytes, pseudonym_epoch: int
     ) -> bytes:
-        """Derive a rotatable, epoch-scoped pseudonym keypair (v2).
+        """Derive a rotatable, epoch-scoped P-256 pseudonym point (v2).
 
-        Returns the same ``public_key_bytes (32) || key_id_utf8`` shape as
-        :meth:`derive_pseudonym`. Including the rotation epoch in the HMAC
-        derivation produces a different pseudonym per epoch within the same
-        context, mitigating relay-side pseudonym correlation.
+        Returns the 33-byte compressed point, checked as for
+        :meth:`derive_pseudonym`. Including
+        the rotation epoch in the HMAC derivation produces a different
+        pseudonym per epoch within the same context, mitigating relay-side
+        pseudonym correlation.
 
-        Canonical recipe (all custody backends MUST produce identical bytes)::
+        Canonical recipe: as :meth:`derive_pseudonym`, with::
 
-            pseudonym_secret = HKDF-SHA256(
-                ikm=ed25519_private_seed, salt=b"scp-pseudonym-secret-v1",
-                info=b"", length=32)
             seed = HMAC-SHA256(
                 pseudonym_secret,
                 context_id + pseudonym_epoch.to_bytes(8, "big")
                 + b"scp-pseudonym-v2")
-            pseudonym_keypair = Ed25519_keygen(seed[:32])
 
         The ``"scp-pseudonym-v2"`` domain separator differs from the v1
         ``"scp-pseudonym"`` so epoch 0 produces a distinct pseudonym from the
@@ -332,6 +375,48 @@ def _native_mod() -> Any:
     ADR-048 §1 (pure helpers exposed as ``_scp_core.<name>``).
     """
     return native_module()
+
+
+def p256_pseudonym_point(context_seed: bytes | bytearray) -> bytes:
+    """Return the 33-byte SEC1 compressed pseudonym point of a 32-byte §9.10.4 ``context_seed``.
+
+    For a host that computes the v1 or v2 seed itself, such as inside a
+    keystore. The seed is reduced to a scalar under the fixed
+    ``SCP-PSEUDONYM-P256-V1`` label (FIPS 186-5 A.2.1) and only the point
+    ``d * G`` is returned: no scalar reaches the host.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``context_seed`` is not 32 bytes.
+    """
+    fn = _native_mod().p256_pseudonym_point
+    try:
+        return fn(context_seed)
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
+
+
+def p256_software_pseudonym_point(
+    ikm: bytes | bytearray, context_id: bytes, epoch: int | None = None
+) -> bytes:
+    """Return the 33-byte SEC1 compressed pseudonym point a software custody derives from ``ikm``.
+
+    ``09-security-model.md`` §9.10.4.A: ``pseudonym_secret =
+    HKDF-SHA256(ikm, "scp-pseudonym-secret-v1")``, the v1 context seed when
+    ``epoch`` is ``None`` and the v2 seed at ``epoch`` otherwise, then the
+    point. No scalar reaches the host; a host that must wipe ``ikm`` passes
+    it as a ``bytearray`` and clears it after the call.
+
+    Raises:
+        ValidationError: ``SCP-VALID-7005`` when ``ikm`` is not 32 bytes.
+        OverflowError: when ``epoch`` is negative or wider than 64 bits.
+    """
+    fn = _native_mod().p256_software_pseudonym_point
+    try:
+        return fn(ikm, context_id, epoch)
+    except OverflowError:
+        raise
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
 
 
 def _native_cls() -> Any:

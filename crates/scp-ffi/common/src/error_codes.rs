@@ -251,16 +251,21 @@ pub const IDENT_1053: &str = "SCP-IDENT-1053";
 // when deriving the caller's per-member routing pseudonym from custody-held
 // identity key material. Encrypted / pseudonymous contexts hard-fail on
 // derivation error; broadcast contexts (spec §5.14) skip derivation entirely.
+// A custody failure during derivation is not a pseudonym error: it carries
+// the code `custody_failure_code` assigns.
 // -----------------------------------------------------------------------
 
 /// Pseudonym derivation: identity missing core key material.
 pub const IDENT_1054: &str = "SCP-IDENT-1054";
-/// Pseudonym derivation failed (custody/KDF error).
+/// A host-derived pseudonym the bridge rejects.
+///
+/// The bridge rejects a malformed key id or point, a `get_public_key(key_id)`
+/// that fails with any code or returns a different point, or a key id already
+/// bound to another point (ADR-021 2026-09-27 amendment). Custody failures of
+/// the derive call itself carry the code [`custody_failure_code`] assigns.
 pub const IDENT_1055: &str = "SCP-IDENT-1055";
 /// Pseudonym derivation: no custody provider available.
 pub const IDENT_1056: &str = "SCP-IDENT-1056";
-/// Pseudonym derivation: derived public key was not 32 bytes.
-pub const IDENT_1057: &str = "SCP-IDENT-1057";
 
 /// Production DHT client initialization failed.
 ///
@@ -716,6 +721,14 @@ pub const CRYPTO_4002: &str = "SCP-CRYPTO-4002";
 pub const CRYPTO_4003: &str = "SCP-CRYPTO-4003";
 /// Decryption failed.
 pub const CRYPTO_4004: &str = "SCP-CRYPTO-4004";
+/// Key not found: the key handle is unknown or its key was destroyed.
+///
+/// Every native bridge reports `PlatformError::KeyNotFound` with this code,
+/// and a host custody callback signals key-not-found by failing with it; the
+/// bridge maps a host failure with any other code to a custody error
+/// ([`CRYPTO_4060`]). A pseudonym whose identity was destroyed fails with this
+/// code (`09-security-model.md` §9.10.4.A).
+pub const CRYPTO_4006: &str = "SCP-CRYPTO-4006";
 /// MLS group create error.
 pub const CRYPTO_4010: &str = "SCP-CRYPTO-4010";
 /// MLS proposal error.
@@ -742,7 +755,10 @@ pub const CRYPTO_4057: &str = "SCP-CRYPTO-4057";
 pub const CRYPTO_4058: &str = "SCP-CRYPTO-4058";
 /// `UniFFI` HPKE error.
 pub const CRYPTO_4059: &str = "SCP-CRYPTO-4059";
-/// `UniFFI` key custody error.
+/// Key custody error: a key custody provider, or a host's custody callback,
+/// failed for a reason that has no more specific code.
+///
+/// [`custody_failure_code`] decides which custody failures carry this code.
 pub const CRYPTO_4060: &str = "SCP-CRYPTO-4060";
 
 // -------------------------------------------------------------------------
@@ -1412,3 +1428,21 @@ pub const SAGA_13065: &str = "SCP-SAGA-13065";
 /// Saga `Busy` terminal — the participant context set overlapped an in-flight
 /// saga (per-participant-context-set gating, §5.15.4).
 pub const SAGA_13066: &str = "SCP-SAGA-13066";
+
+/// The bridge error code for a runtime [`CustodyFailure`](scp_crypto::CustodyFailure).
+///
+/// One mapping for the `PyO3`, napi-rs and `UniFFI` bridges: key-not-found is
+/// [`CRYPTO_4006`], a rejected host pseudonym is [`IDENT_1055`], a closed
+/// custody store is [`STORAGE_8006`], a custody store whose directory lock is
+/// still held is [`STORAGE_8005`], and any other custody failure is
+/// [`CRYPTO_4060`].
+#[must_use]
+pub const fn custody_failure_code(e: &scp_crypto::CustodyFailure) -> &'static str {
+    match e.kind {
+        scp_crypto::CustodyFailureKind::KeyNotFound => CRYPTO_4006,
+        scp_crypto::CustodyFailureKind::PseudonymRejected => IDENT_1055,
+        scp_crypto::CustodyFailureKind::StorageClosed => STORAGE_8006,
+        scp_crypto::CustodyFailureKind::StorageLockHeld => STORAGE_8005,
+        scp_crypto::CustodyFailureKind::Failed => CRYPTO_4060,
+    }
+}

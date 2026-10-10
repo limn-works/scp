@@ -68,8 +68,8 @@ nonisolated extension PlatformError: LocalizedError {
 /// See ADR-006 for the `KeyType` enum specification and ADR-025 for the Apple
 /// platform adapter design.
 public nonisolated enum KeyType: String, Sendable, Equatable {
-    /// Ed25519 signing key. Used for identity keys, active signing keys, and
-    /// pseudonym keys. Private bytes are 32 bytes; public bytes are 32 bytes.
+    /// Ed25519 signing key. Used for identity keys and active signing keys.
+    /// Private bytes are 32 bytes; public bytes are 32 bytes.
     case ed25519
     /// X25519 key-agreement key. Used for HPKE wrapping keys. Private bytes
     /// are 32 bytes; public bytes are 32 bytes.
@@ -136,30 +136,6 @@ public nonisolated enum DestructionMethod: String, Sendable {
     /// Key material was destroyed by the hardware security module. Not
     /// applicable to Apple Keychain-backed keys.
     case hardware
-}
-
-// MARK: - PseudonymResult
-
-/// The result of a pseudonym derivation operation.
-///
-/// Contains the 32-byte Ed25519 public key of the derived pseudonym and an
-/// opaque handle (UUID string) for the stored pseudonym signing key. The
-/// handle can be used with ``AppleKeyCustody/sign(_:data:)`` to produce
-/// pseudonym-signed messages.
-///
-/// See ADR-006 for the derivation algorithm and ADR-025 for the implementation
-/// on Apple platforms.
-public nonisolated struct PseudonymResult: Sendable {
-    /// The 32-byte Ed25519 public key of the derived pseudonym.
-    public nonisolated let publicKey: Data
-    /// Opaque UUID handle to the derived signing key stored in Keychain.
-    public nonisolated let handle: String
-
-    /// Memberwise initializer.
-    public nonisolated init(publicKey: Data, handle: String) {
-        self.publicKey = publicKey
-        self.handle = handle
-    }
 }
 
 // MARK: - KeyMetadata
@@ -288,6 +264,13 @@ public final class AppleKeyCustody: Sendable {
 
     // MARK: - Private Keychain helpers
 
+    /// `kSecAttrDescription` tag recording the biometric policy an item was
+    /// stored under, so a re-store can tell whether the existing item's
+    /// access control matches the current policy.
+    private nonisolated var policyTag: String {
+        "scp.policy.\(biometricPolicy.rawValue)"
+    }
+
     /// Builds a base Keychain query dictionary for a key handle.
     ///
     /// All operations (add, fetch, delete) start from this base and extend it
@@ -385,6 +368,28 @@ public final class AppleKeyCustody: Sendable {
         return keyType
     }
 
+    /// A `SecAccessControl` requiring the currently enrolled biometric set.
+    /// `.biometryCurrentSet` invalidates access if biometrics change (new
+    /// fingerprint enrolled, Face ID reset), which triggers key rotation per
+    /// 9.12. Falls back to device passcode on hardware without biometric
+    /// sensors.
+    private nonisolated func biometricAccessControl(for handle: String) throws -> SecAccessControl {
+        var cfError: Unmanaged<CFError>?
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            .biometryCurrentSet,
+            &cfError
+        ) else {
+            let errorDesc = cfError.map { ($0.takeRetainedValue() as Error).localizedDescription }
+                ?? "unknown error"
+            throw PlatformError.custodyError(
+                "Failed to create biometric access control for handle '\(handle)': \(errorDesc)"
+            )
+        }
+        return accessControl
+    }
+
     /// Stores 32-byte raw private key bytes in the Keychain under `handle`.
     ///
     /// The public key bytes are cached in the ``KeyMetadata`` label so that
@@ -399,7 +404,7 @@ public final class AppleKeyCustody: Sendable {
     ///   - bytes: The raw 32-byte private key bytes.
     ///   - handle: The opaque UUID handle that will reference this key.
     ///   - keyType: The ``KeyType`` to tag this item with.
-    ///   - publicKeyBytes: The 32-byte public key bytes to cache in metadata.
+    ///   - publicKeyBytes: The public key bytes to cache in metadata.
     /// - Throws: ``PlatformError/keychainError(_:)`` if the add operation fails.
     nonisolated func storePrivateKeyBytes(
         _ bytes: Data,
@@ -423,51 +428,79 @@ public final class AppleKeyCustody: Sendable {
         var query = baseQuery(for: handle)
         query[kSecAttrLabel as String] = metadataLabel
         query[kSecValueData as String] = bytes as CFData
+        query[kSecAttrDescription as String] = policyTag
 
         switch biometricPolicy {
         case .none:
             query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
         case .required:
-            // Create a SecAccessControl requiring the currently enrolled biometric
-            // set. `.biometryCurrentSet` invalidates access if biometrics change
-            // (new fingerprint enrolled, Face ID reset), which triggers key
-            // rotation per 9.12. Falls back to device passcode on hardware
-            // without biometric sensors.
-            var cfError: Unmanaged<CFError>?
-            guard let accessControl = SecAccessControlCreateWithFlags(
-                nil,
-                kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-                .biometryCurrentSet,
-                &cfError
-            ) else {
-                let errorDesc = cfError.map { ($0.takeRetainedValue() as Error).localizedDescription }
-                    ?? "unknown error"
-                throw PlatformError.custodyError(
-                    "Failed to create biometric access control for handle '\(handle)': \(errorDesc)"
-                )
-            }
-            query[kSecAttrAccessControl as String] = accessControl
+            query[kSecAttrAccessControl as String] = try biometricAccessControl(for: handle)
         }
-
         let status = SecItemAdd(query as CFDictionary, nil)
         switch status {
         case errSecSuccess:
             break
         case errSecDuplicateItem:
-            // For deterministic handles (pseudonym derivation), the item may
-            // already exist with different access control. Delete and re-add
-            // to ensure correct biometric policy is applied.
-            let deleteStatus = SecItemDelete(baseQuery(for: handle) as CFDictionary)
-            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-                throw PlatformError.keychainError(deleteStatus)
-            }
-            let retryStatus = SecItemAdd(query as CFDictionary, nil)
-            guard retryStatus == errSecSuccess else {
-                throw PlatformError.keychainError(retryStatus)
-            }
+            try replaceExisting(handle: handle, query: query)
         default:
             throw PlatformError.keychainError(status)
+        }
+    }
+
+    /// Resolves an `errSecDuplicateItem` from storing `query` under `handle`:
+    /// the existing item is replaced, so the new bytes and the current
+    /// biometric policy apply.
+    private nonisolated func replaceExisting(
+        handle: String,
+        query: [String: Any]
+    ) throws {
+        let deleteStatus = SecItemDelete(baseQuery(for: handle) as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            throw PlatformError.keychainError(deleteStatus)
+        }
+        let retryStatus = SecItemAdd(query as CFDictionary, nil)
+        guard retryStatus == errSecSuccess else {
+            throw PlatformError.keychainError(retryStatus)
+        }
+    }
+}
+
+// MARK: - Pseudonym derivation
+
+extension AppleKeyCustody {
+    /// Shared §9.10.4.A derivation: reads the Ed25519 seed of
+    /// `identityHandle` and returns the 33-byte compressed pseudonym point
+    /// computed by the shared Rust helper. `epoch` is `nil` for the v1
+    /// (static) pseudonym. Nothing is stored: a pseudonym has no private key
+    /// after this call, so destroying the identity leaves nothing to derive
+    /// from.
+    nonisolated func derivePseudonymPoint(
+        method: String,
+        identityHandle: String,
+        contextId: Data,
+        epoch: UInt64?
+    ) throws -> Data {
+        let storedType = try fetchKeyType(for: identityHandle)
+        guard storedType == .ed25519 else {
+            throw PlatformError.wrongKeyType(
+                "\(method) requires an Ed25519 key; handle '\(identityHandle)' is \(storedType.rawValue)"
+            )
+        }
+
+        var identitySeed = try fetchPrivateKeyBytes(for: identityHandle)
+        defer { identitySeed.resetBytes(in: 0 ..< identitySeed.count) }
+
+        do {
+            return try p256SoftwarePseudonymPoint(ikm: identitySeed, contextId: contextId, epoch: epoch)
+        } catch let scpErr as ScpError {
+            // The shared helper's typed error and code reach the caller
+            // unchanged, as in the Kotlin SDK.
+            throw scpErr
+        } catch {
+            throw PlatformError.custodyError(
+                "P-256 pseudonym derivation failed: \(error.localizedDescription)"
+            )
         }
     }
 }
@@ -524,11 +557,8 @@ public extension AppleKeyCustody {
 
     // MARK: sign
 
-    /// Signs `data` with the Ed25519 key identified by `keyHandle`.
-    ///
-    /// Retrieves the private key bytes from Keychain and constructs an
-    /// `ed25519_dalek`-compatible signing key. Returns a 64-byte Ed25519
-    /// signature.
+    /// Signs `data` with the Ed25519 key identified by `keyHandle` and
+    /// returns the 64-byte Ed25519 signature.
     ///
     /// The private key bytes are held in memory only for the duration of this
     /// call. They are not cached, logged, or returned across the FFI boundary.
@@ -537,19 +567,20 @@ public extension AppleKeyCustody {
     ///   - keyHandle: The UUID handle returned by ``generateKeypair(keyType:)``
     ///     for an `"ed25519"` key.
     ///   - data: The bytes to sign.
-    /// - Returns: 64-byte Ed25519 signature.
+    /// - Returns: A 64-byte signature.
     /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` refers to
     ///   an X25519 key, ``PlatformError/keyNotFound(_:)`` if the handle is
     ///   unknown, ``PlatformError/biometricAuthenticationFailed(_:)`` if
     ///   biometric gating is active and authentication fails,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects the key bytes.
+    ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects Ed25519 key
+    ///   bytes.
     ///
     /// See ADR-025 Key custody and ADR-006 `sign`.
     @concurrent
     func sign(_ keyHandle: String, data: Data) async throws -> Data {
         let storedType = try fetchKeyType(for: keyHandle)
-        guard storedType == .ed25519 else {
+        guard storedType != .x25519 else {
             throw PlatformError.wrongKeyType(
                 "sign requires an Ed25519 key; handle '\(keyHandle)' is X25519"
             )
@@ -572,7 +603,7 @@ public extension AppleKeyCustody {
 
     // MARK: publicKey
 
-    /// Returns the 32-byte public key for any key handle (Ed25519 or X25519).
+    /// Returns the 32-byte public key for any key handle.
     ///
     /// Reads the cached public key from Keychain metadata attributes. This
     /// does NOT access key material and therefore does NOT trigger biometric
@@ -580,11 +611,12 @@ public extension AppleKeyCustody {
     /// items that predate the metadata cache.
     ///
     /// - Parameter keyHandle: The UUID handle returned by
-    ///   ``generateKeypair(keyType:)`` or ``derivePseudonym(_:contextId:)``.
-    /// - Returns: 32-byte raw public key bytes.
+    ///   ``generateKeypair(keyType:)``.
+    /// - Returns: The raw public key bytes.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects the key bytes.
+    ///   ``PlatformError/custodyError(_:)`` if the stored key type is unknown
+    ///   or CryptoKit rejects Ed25519 or X25519 key bytes.
     ///
     /// See ADR-025 Key custody and ADR-006 `public_key`.
     @concurrent
@@ -633,7 +665,10 @@ public extension AppleKeyCustody {
     // MARK: destroyKey
 
     /// Deletes the Keychain item for `keyHandle` and returns a destruction
-    /// attestation after confirming the item is gone.
+    /// attestation after confirming that it no longer exists. No pseudonym
+    /// item exists to delete: a pseudonym is a public point derived on
+    /// demand from the identity seed, so once the seed is gone no pseudonym
+    /// of this identity can be derived again (§9.10.4.A).
     ///
     /// ## Deletion verification
     ///
@@ -683,7 +718,7 @@ public extension AppleKeyCustody {
         let verifyStatus = SecItemCopyMatching(verifyQuery as CFDictionary, &verifyResult)
 
         guard verifyStatus == errSecItemNotFound else {
-            // Item still present -- destruction cannot be confirmed.
+            // An item is still present -- destruction cannot be confirmed.
             throw PlatformError.destructionFailed(keyHandle)
         }
 
@@ -747,221 +782,82 @@ public extension AppleKeyCustody {
 
     // MARK: derivePseudonym
 
-    /// Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
+    /// Derives the deterministic, context-scoped P-256 pseudonym of an
+    /// Ed25519 identity key (spec §9.10.4.A) and returns its 33-byte
+    /// compressed point.
     ///
-    /// ## Algorithm (ADR-006, spec section 9.10.4.A):
-    /// 1. Retrieve the Ed25519 private key bytes for `keyHandle` from Keychain.
-    /// 2. Derive `pseudonym_secret = HKDF-SHA256(ikm: private_key_bytes,
-    ///    salt: "scp-pseudonym-secret-v1", info: "", len: 32)`.
-    /// 3. Compute `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`.
-    /// 4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
-    /// 5. Store the derived private key in Keychain under a deterministic handle.
-    /// 6. Return a ``PseudonymResult`` with the 32-byte public key and the handle.
+    /// Reads the Ed25519 seed for `keyHandle` from Keychain (native software
+    /// custody keys the recipe on this seed, §9.10.4 native interim), passes
+    /// it to the shared Rust helper `p256SoftwarePseudonymPoint`, and wipes
+    /// the local copy. The helper runs `pseudonym_secret = HKDF-SHA256(seed,
+    /// "scp-pseudonym-secret-v1")`, `context_seed = HMAC-SHA256(
+    /// pseudonym_secret, contextId || "scp-pseudonym")`, the FIPS 186-5
+    /// A.2.1 reduction to a scalar, and returns the point. No pseudonym key
+    /// is stored, and none can sign.
     ///
-    /// **CRITICAL:** Using public key bytes as the HMAC key would
-    /// be a membership enumeration oracle — anyone who knows a member's public
-    /// key could compute their pseudonym for any context ID and check relay
-    /// subscriptions. The `pseudonym_secret` is derived from private key bytes
-    /// via HKDF-SHA-256, making it unknowable without the private key.
-    ///
-    /// The derivation is deterministic: the same `keyHandle` + `contextId`
-    /// pair always produces the same pseudonym public key.
+    /// **CRITICAL:** The HMAC key is derived from the private seed. Keying it
+    /// on the public key would be a membership-enumeration oracle: anyone who
+    /// knows a member's public key could compute their pseudonym for any
+    /// context and check relay subscriptions.
     ///
     /// - Parameters:
-    ///   - keyHandle: The UUID handle for the **identity** Ed25519 key (source
-    ///     key material for the derivation).
-    ///   - contextId: The raw context ID bytes used as the HMAC message.
-    /// - Returns: A ``PseudonymResult`` containing the 32-byte pseudonym public
-    ///   key and an opaque UUID handle to the derived signing key in Keychain.
-    /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` is X25519,
-    ///   ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
+    ///   - keyHandle: The handle of the **identity** Ed25519 key.
+    ///   - contextId: The raw context ID bytes.
+    /// - Returns: The 33-byte SEC1 compressed P-256 point.
+    /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` is not an
+    ///   Ed25519 key, ``PlatformError/keyNotFound(_:)`` if the handle is
+    ///   unknown (including after ``destroyKey(_:)``),
     ///   ``PlatformError/biometricAuthenticationFailed(_:)`` if biometric
     ///   gating is active and authentication fails,
-    ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` for HMAC or keygen failures.
+    ///   ``PlatformError/keychainError(_:)`` for Keychain failures. The
+    ///   shared Rust helper's error propagates unchanged:
+    ///   ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7005` if the seed
+    ///   is not 32 bytes. Any other error surfaces as
+    ///   ``PlatformError/custodyError(_:)``.
     ///
-    /// See ADR-025 Key custody, ADR-006 `derive_pseudonym`, spec section
-    /// 9.10.4.A, and `InMemoryKeyCustody.derive_pseudonym` in
-    /// `scp-platform/src/testing/key_custody.rs` for the canonical Rust
-    /// reference implementation.
+    /// See spec §9.10.4.A and `derive_pseudonym` in
+    /// `scp-crypto/src/pseudonym.rs` for the Rust reference.
     @concurrent
     func derivePseudonym(
         _ keyHandle: String,
         contextId: Data
-    ) async throws -> PseudonymResult {
-        let storedType = try fetchKeyType(for: keyHandle)
-        guard storedType == .ed25519 else {
-            throw PlatformError.wrongKeyType(
-                "derivePseudonym requires an Ed25519 key; handle '\(keyHandle)' is X25519"
-            )
-        }
-
-        var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
-        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
-
-        do {
-            // Derive pseudonym_secret from private key via HKDF-SHA256 (spec
-            // section 9.10.4.A). This prevents membership enumeration attacks:
-            // only the key holder can compute pseudonyms.
-            let pseudonymSecret = HKDF<SHA256>.deriveKey(
-                inputKeyMaterial: SymmetricKey(data: privateKeyBytes),
-                salt: Data("scp-pseudonym-secret-v1".utf8),
-                info: Data(),
-                outputByteCount: 32
-            )
-
-            // HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")
-            var hmac = HMAC<SHA256>(key: pseudonymSecret)
-            hmac.update(data: contextId)
-            hmac.update(data: Data("scp-pseudonym".utf8))
-            let seed = Data(hmac.finalize())
-
-            // Derive Ed25519 keypair from the 32-byte HMAC-SHA256 output.
-            let pseudonymKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed.prefix(32))
-            let pseudonymPublicKey = pseudonymKey.publicKey.rawRepresentation
-
-            // Deterministic handle: HMAC-SHA256(key_handle_utf8, contextId || "scp-pseudonym-handle")
-            // Same inputs -> same handle -> same Keychain slot. No accumulation.
-            let handleHmacKey = SymmetricKey(data: Data(keyHandle.utf8))
-            var handleHmac = HMAC<SHA256>(key: handleHmacKey)
-            handleHmac.update(data: contextId)
-            handleHmac.update(data: Data("scp-pseudonym-handle".utf8))
-            let pseudonymHandle = Data(handleHmac.finalize()).map { String(format: "%02x", $0) }.joined()
-
-            try storePrivateKeyBytes(
-                pseudonymKey.rawRepresentation,
-                for: pseudonymHandle,
-                keyType: .ed25519,
-                publicKeyBytes: pseudonymPublicKey
-            )
-
-            return PseudonymResult(publicKey: pseudonymPublicKey, handle: pseudonymHandle)
-        } catch let platformErr as PlatformError {
-            throw platformErr
-        } catch {
-            throw PlatformError.custodyError(
-                "Ed25519 pseudonym key derivation failed: \(error.localizedDescription)"
-            )
-        }
+    ) async throws -> Data {
+        try derivePseudonymPoint(
+            method: "derivePseudonym",
+            identityHandle: keyHandle,
+            contextId: contextId,
+            epoch: nil
+        )
     }
 
     // MARK: deriveRotatablePseudonym
 
-    /// Derives a deterministic, context-scoped, epoch-rotatable Ed25519
-    /// pseudonym keypair.
+    /// Derives the deterministic, context-scoped, epoch-rotatable P-256
+    /// pseudonym of an Ed25519 identity key (rotation per spec §9.10.4.1,
+    /// derivation per §9.10.4.A) and returns its 33-byte compressed point.
     ///
-    /// This is the v2 (rotatable) counterpart to ``derivePseudonym(_:contextId:)``.
-    /// It binds an additional 64-bit `pseudonymEpoch` into the derivation so a
-    /// member can rotate their context pseudonym (e.g. on a re-key event)
-    /// without changing their identity key.
-    ///
-    /// ## Algorithm (spec §9.10.4.1):
-    /// 1. Retrieve the Ed25519 private key bytes for `keyHandle` from Keychain.
-    /// 2. Derive `pseudonym_secret = HKDF-SHA256(ikm: private_key_bytes,
-    ///    salt: "scp-pseudonym-secret-v1", info: "", len: 32)` — identical to
-    ///    the v1 secret, so a single identity key feeds both derivations.
-    /// 3. Compute `seed = HMAC-SHA256(pseudonym_secret,
-    ///    contextId || BE64(pseudonymEpoch) || "scp-pseudonym-v2")`. The epoch is
-    ///    serialized as 8 big-endian bytes and the `"-v2"` domain separator keeps
-    ///    v2 outputs disjoint from v1 (`"scp-pseudonym"`).
-    /// 4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
-    /// 5. Store the derived private key in Keychain under a deterministic handle
-    ///    that also binds the epoch + `"v2"`, so it occupies a distinct slot from
-    ///    the v1 handle and from other epochs.
-    /// 6. Return a ``PseudonymResult`` with the 32-byte public key and the handle.
-    ///
-    /// **CRITICAL:** As in v1, the HMAC key is the private-derived
-    /// `pseudonym_secret`, never the public key — public-key keying would be a
-    /// membership-enumeration oracle. The `pseudonym_secret` is unknowable
-    /// without the identity private key.
-    ///
-    /// The derivation is deterministic: the same `keyHandle` + `contextId` +
-    /// `pseudonymEpoch` triple always produces the same pseudonym public key.
+    /// Identical to ``derivePseudonym(_:contextId:)`` except that the
+    /// context seed is `HMAC-SHA256(pseudonym_secret,
+    /// contextId || BE64(pseudonymEpoch) || "scp-pseudonym-v2")`.
     ///
     /// - Parameters:
-    ///   - keyHandle: The UUID handle for the **identity** Ed25519 key (source
-    ///     key material for the derivation).
-    ///   - contextId: The raw context ID bytes used as the first HMAC message
-    ///     segment.
-    ///   - pseudonymEpoch: The rotation epoch, serialized as 8 big-endian bytes.
-    /// - Returns: A ``PseudonymResult`` containing the 32-byte pseudonym public
-    ///   key and an opaque handle to the derived signing key in Keychain.
-    /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` is X25519,
-    ///   ``PlatformError/keyNotFound(_:)`` if the handle is unknown,
-    ///   ``PlatformError/biometricAuthenticationFailed(_:)`` if biometric
-    ///   gating is active and authentication fails,
-    ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
-    ///   ``PlatformError/custodyError(_:)`` for HMAC or keygen failures.
-    ///
-    /// See ADR-025 Key custody, spec §9.10.4.1, and
-    /// `derive_pseudonym_keypair` in `scp-crypto/src/pseudonym.rs` for the
-    /// canonical Rust reference implementation.
+    ///   - keyHandle: The handle of the **identity** Ed25519 key.
+    ///   - contextId: The raw context ID bytes.
+    ///   - pseudonymEpoch: The rotation epoch.
+    /// - Returns: The 33-byte SEC1 compressed P-256 point.
+    /// - Throws: The same errors as ``derivePseudonym(_:contextId:)``.
     @concurrent
     func deriveRotatablePseudonym(
         _ keyHandle: String,
         contextId: Data,
         pseudonymEpoch: UInt64
-    ) async throws -> PseudonymResult {
-        let storedType = try fetchKeyType(for: keyHandle)
-        guard storedType == .ed25519 else {
-            throw PlatformError.wrongKeyType(
-                "deriveRotatablePseudonym requires an Ed25519 key; handle '\(keyHandle)' is X25519"
-            )
-        }
-
-        var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
-        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
-
-        // Epoch serialized as 8 big-endian bytes (matches Rust `u64::to_be_bytes`).
-        let epochBytes = withUnsafeBytes(of: pseudonymEpoch.bigEndian) { Data($0) }
-
-        do {
-            // Derive pseudonym_secret from private key via HKDF-SHA256 (identical
-            // to the v1 secret). This prevents membership enumeration attacks:
-            // only the key holder can compute pseudonyms.
-            let pseudonymSecret = HKDF<SHA256>.deriveKey(
-                inputKeyMaterial: SymmetricKey(data: privateKeyBytes),
-                salt: Data("scp-pseudonym-secret-v1".utf8),
-                info: Data(),
-                outputByteCount: 32
-            )
-
-            // HMAC-SHA256(pseudonym_secret, contextId || BE64(epoch) || "scp-pseudonym-v2")
-            var hmac = HMAC<SHA256>(key: pseudonymSecret)
-            hmac.update(data: contextId)
-            hmac.update(data: epochBytes)
-            hmac.update(data: Data("scp-pseudonym-v2".utf8))
-            let seed = Data(hmac.finalize())
-
-            // Derive Ed25519 keypair from the 32-byte HMAC-SHA256 output.
-            let pseudonymKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed.prefix(32))
-            let pseudonymPublicKey = pseudonymKey.publicKey.rawRepresentation
-
-            // Deterministic handle bound to epoch + "v2" so it occupies a distinct
-            // Keychain slot from the v1 handle and from other epochs:
-            // HMAC-SHA256(key_handle_utf8, contextId || BE64(epoch) || "scp-pseudonym-handle-v2")
-            let handleHmacKey = SymmetricKey(data: Data(keyHandle.utf8))
-            var handleHmac = HMAC<SHA256>(key: handleHmacKey)
-            handleHmac.update(data: contextId)
-            handleHmac.update(data: epochBytes)
-            handleHmac.update(data: Data("scp-pseudonym-handle-v2".utf8))
-            let pseudonymHandle = Data(handleHmac.finalize()).map { String(format: "%02x", $0) }.joined()
-
-            try storePrivateKeyBytes(
-                pseudonymKey.rawRepresentation,
-                for: pseudonymHandle,
-                keyType: .ed25519,
-                publicKeyBytes: pseudonymPublicKey
-            )
-
-            return PseudonymResult(publicKey: pseudonymPublicKey, handle: pseudonymHandle)
-        } catch let platformErr as PlatformError {
-            throw platformErr
-        } catch {
-            throw PlatformError.custodyError(
-                "Ed25519 rotatable pseudonym key derivation failed: \(error.localizedDescription)"
-            )
-        }
+    ) async throws -> Data {
+        try derivePseudonymPoint(
+            method: "deriveRotatablePseudonym",
+            identityHandle: keyHandle,
+            contextId: contextId,
+            epoch: pseudonymEpoch
+        )
     }
 
     // MARK: exportSigningKeyBytes
@@ -987,7 +883,7 @@ public extension AppleKeyCustody {
         let storedType = try fetchKeyType(for: keyId)
         guard storedType == .ed25519 else {
             throw PlatformError.wrongKeyType(
-                "exportSigningKeyBytes requires an Ed25519 key; handle '\(keyId)' is X25519"
+                "exportSigningKeyBytes requires an Ed25519 key; handle '\(keyId)' is \(storedType.rawValue)"
             )
         }
 

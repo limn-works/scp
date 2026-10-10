@@ -451,3 +451,167 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Pseudonym custody test hooks (§9.10.4)
+// ---------------------------------------------------------------------------
+
+/// Test-only handle over one callback custody adapter built from a JS provider.
+///
+/// TypeScript tests reach the adapter through it: the context and epoch it
+/// forwards to the host, the routing id it computes from the host's pseudonym
+/// point, the `SCP-IDENT-1055` rejection of a bad point, and the mapping of
+/// each host failure to a typed error.
+#[napi]
+pub struct TestingCallbackCustody {
+    inner: std::sync::Arc<crate::custody::NapiCallbackKeyCustody>,
+}
+
+/// The error production reports for a custody failure outside derivation:
+/// the bridge's `From<PlatformError>`, which codes it with
+/// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
+fn custody_err(e: scp_platform::PlatformError) -> napi::Error {
+    napi::Error::from(ScpNapiError::from(e))
+}
+
+fn testing_handle(key_id: &str) -> napi::Result<scp_platform::KeyHandle> {
+    scp_ffi_common::custody_parse::parse_handle("testing", key_id).map_err(custody_err)
+}
+
+#[napi]
+impl TestingCallbackCustody {
+    /// Wraps `provider` in a fresh callback custody adapter.
+    ///
+    /// # Errors
+    ///
+    /// A `napi::Error` if a callback cannot become a threadsafe function.
+    #[napi(constructor)]
+    pub fn new(provider: crate::custody::NapiKeyCustodyProvider) -> napi::Result<Self> {
+        Ok(Self {
+            inner: std::sync::Arc::new(crate::custody::NapiCallbackKeyCustody::from_provider(
+                provider,
+            )?),
+        })
+    }
+
+    /// Generates an Ed25519 identity key through the provider.
+    ///
+    /// # Errors
+    ///
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi(js_name = "generateKeypair")]
+    pub async fn generate_keypair(&self) -> napi::Result<String> {
+        use scp_platform::KeyCustody;
+        self.inner
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .map(|h| h.id().to_string())
+            .map_err(custody_err)
+    }
+
+    /// Derives the v1 pseudonym of `identity_key_id` in `context_id` and
+    /// returns its 32-byte routing id, the value production puts on the
+    /// routing axis (§9.10.4).
+    ///
+    /// # Errors
+    ///
+    /// The adapter's custody error coded as production derivation reports it,
+    /// by [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
+    #[napi(js_name = "derivePseudonym")]
+    pub async fn derive_pseudonym(
+        &self,
+        identity_key_id: String,
+        context_id: String,
+    ) -> napi::Result<Buffer> {
+        use scp_platform::KeyCustody;
+        let identity = testing_handle(&identity_key_id)?;
+        let pseudonym = self
+            .inner
+            .derive_pseudonym(&identity, context_id.as_bytes())
+            .await
+            .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
+        Ok(Buffer::from(pseudonym.routing_id().to_vec()))
+    }
+
+    /// Derives the v2 (rotatable) pseudonym of `identity_key_id` in
+    /// `context_id` at `epoch` (§9.10.4.1) and returns its 32-byte routing id.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-VALID-7001` for an `epoch` that is negative or does not fit in a
+    /// `u64`; otherwise the adapter's custody error coded as production
+    /// derivation reports it (as for `derivePseudonym`).
+    #[napi(js_name = "deriveRotatablePseudonym")]
+    pub async fn derive_rotatable_pseudonym(
+        &self,
+        identity_key_id: String,
+        context_id: String,
+        epoch: napi::bindgen_prelude::BigInt,
+    ) -> napi::Result<Buffer> {
+        use scp_platform::KeyCustody;
+        let identity = testing_handle(&identity_key_id)?;
+        let epoch = crate::economy::amount_u64_from_bigint(&epoch, "epoch")?;
+        let pseudonym = self
+            .inner
+            .derive_rotatable_pseudonym(&identity, context_id.as_bytes(), epoch)
+            .await
+            .map_err(|e| napi::Error::from(crate::context::pseudonym_derivation_failed(&e)))?;
+        Ok(Buffer::from(pseudonym.routing_id().to_vec()))
+    }
+
+    /// Signs `data` with `key_id` through the adapter's `sign`.
+    ///
+    /// # Errors
+    ///
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi]
+    pub async fn sign(&self, key_id: String, data: Buffer) -> napi::Result<Buffer> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        self.inner
+            .sign(&key, &data)
+            .await
+            .map(|signature| Buffer::from(signature.as_bytes().to_vec()))
+            .map_err(custody_err)
+    }
+
+    /// Runs the adapter's `dh_agree` for `key_id` against `peer_public` and
+    /// returns the 32-byte shared secret the bridge read from the host.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-VALID-7005` when `peer_public` is not 32 bytes; otherwise the code
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi(js_name = "dhAgree")]
+    pub async fn dh_agree(&self, key_id: String, peer_public: Buffer) -> napi::Result<Buffer> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        let peer: [u8; 32] = peer_public.as_ref().try_into().map_err(|_| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("peer_public must be 32 bytes, got {}", peer_public.len()),
+                code: codes::VALID_7005.to_owned(),
+            })
+        })?;
+        self.inner
+            .dh_agree(&key, &peer)
+            .await
+            .map(|shared| Buffer::from(shared.as_bytes().to_vec()))
+            .map_err(custody_err)
+    }
+
+    /// Destroys `key_id` through the adapter.
+    ///
+    /// # Errors
+    ///
+    /// The code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
+    /// assigns to the custody error, as production reports it.
+    #[napi(js_name = "destroyKey")]
+    pub async fn destroy_key(&self, key_id: String) -> napi::Result<()> {
+        use scp_platform::KeyCustody;
+        let key = testing_handle(&key_id)?;
+        self.inner.destroy_key(&key).await.map_err(custody_err)
+    }
+}

@@ -286,7 +286,8 @@ impl ScpPyError {
 
     /// Identity error with the given message and an explicit canonical code.
     /// Used by the §9.10.4 pseudonym-derivation paths to carry the specific
-    /// `SCP-IDENT-1054..1057` codes instead of the generic identity code.
+    /// `SCP-IDENT-1054` and `SCP-IDENT-1055` codes instead of the generic
+    /// identity code.
     pub fn identity_with_code(msg: impl Into<String>, code: &str) -> Self {
         Self::IdentityError {
             message: msg.into(),
@@ -386,6 +387,13 @@ impl From<scp_identity::IdentityError> for ScpPyError {
         use scp_identity::IdentityError as IE;
         use scp_platform::PreRotationCustodyError as PE;
 
+        // A custody failure keeps its custody code (key-not-found is
+        // SCP-CRYPTO-4006), not the generic identity code.
+        let e = match e {
+            IE::Platform(pe) => return Self::from(pe),
+            other => other,
+        };
+
         if let IE::PreRotation(pre_err) = &e {
             let code = match pre_err {
                 PE::HandleNotFound => codes::IDENT_1047,
@@ -470,6 +478,7 @@ impl From<scp_core::context::ContextError> for ScpPyError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
         match &e {
+            CE::Custody(failure) => Self::custody_failure(format!("{e}"), failure),
             // Surface the canonical rate-limit code on the typed
             // envelope so callers can `except ScpError` + `.code`
             // check instead of string-matching `SCP-ECON-12090`
@@ -748,6 +757,9 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpPyError {
 
 impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpPyError {
     fn from(e: scp_core::crypto::sender_keys::SenderKeyError) -> Self {
+        if let scp_core::crypto::sender_keys::SenderKeyError::Custody(failure) = &e {
+            return Self::custody_failure(format!("sender key operation failed: {e}"), failure);
+        }
         Self::CryptoError {
             message: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
@@ -761,6 +773,9 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpPyError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpPyError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        if let scp_core::crypto::ucan::UcanError::Custody(failure) = &e {
+            return Self::custody_failure(format!("UCAN signing failed: {e}"), failure);
+        }
         // Canonical UCAN→error-code mapping lives in `scp_ffi_common::ucan_errors`
         // so all three FFI bridges (PyO3/NAPI/UniFFI) stay in lockstep.
         // The cross-bridge parity harness (`OP_UCAN_VALIDATE_MALFORMED`)
@@ -780,6 +795,9 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpPyError {
 
 impl From<scp_core::envelope::EnvelopeError> for ScpPyError {
     fn from(e: scp_core::envelope::EnvelopeError) -> Self {
+        if let scp_core::envelope::EnvelopeError::Custody(failure) = &e {
+            return Self::custody_failure(format!("envelope operation failed: {e}"), failure);
+        }
         Self::CryptoError {
             message: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
@@ -793,6 +811,9 @@ impl From<scp_core::envelope::EnvelopeError> for ScpPyError {
 
 impl From<scp_event_log::EventLogError> for ScpPyError {
     fn from(e: scp_event_log::EventLogError) -> Self {
+        if let scp_event_log::EventLogError::Custody(failure) = &e {
+            return Self::custody_failure(format!("event log operation failed: {e}"), failure);
+        }
         Self::ContextError {
             message: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
@@ -900,31 +921,59 @@ impl From<scp_transport::TransportError> for ScpPyError {
 
 // Platform errors → ScpPyError::CryptoError (key custody)
 
+impl ScpPyError {
+    /// A custody failure the runtime carried as a typed
+    /// [`CustodyFailure`](scp_crypto::CustodyFailure), coded by
+    /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
+    pub(crate) fn custody_failure(message: String, e: &scp_crypto::CustodyFailure) -> Self {
+        let code = scp_ffi_common::error_codes::custody_failure_code(e).to_owned();
+        match e.kind {
+            scp_crypto::CustodyFailureKind::PseudonymRejected => {
+                Self::IdentityError { message, code }
+            }
+            scp_crypto::CustodyFailureKind::StorageClosed
+            | scp_crypto::CustodyFailureKind::StorageLockHeld => {
+                Self::ValidationError { message, code }
+            }
+            scp_crypto::CustodyFailureKind::KeyNotFound
+            | scp_crypto::CustodyFailureKind::Failed => Self::CryptoError { message, code },
+        }
+    }
+}
+
+impl ScpPyError {
+    /// A failed checkpoint generation: a custody failure keeps its custody code
+    /// ([`Self::custody_failure`]), and any other event-log failure is
+    /// `SCP-CTX-2001`.
+    pub(crate) fn checkpoint_error(e: &scp_event_log::EventLogError) -> Self {
+        let message = format!("checkpoint generation failed: {e}");
+        match e {
+            scp_event_log::EventLogError::Custody(failure) => {
+                Self::custody_failure(message, failure)
+            }
+            _ => Self::context(message),
+        }
+    }
+}
+
 impl From<scp_platform::PlatformError> for ScpPyError {
     fn from(e: scp_platform::PlatformError) -> Self {
-        // Spec §17.6 "One Opener per Durable Directory": the closed-store and
-        // lock-still-held conditions carry their registered storage codes.
-        match &e {
-            scp_platform::PlatformError::StorageClosed => {
-                return Self::ValidationError {
-                    message: e.to_string(),
-                    code: codes::STORAGE_8006.to_owned(),
-                };
+        // Every variant, the two §17.6 storage conditions included, takes its
+        // code from `custody_failure_code`, so a bare and a wrapped
+        // `PlatformError` report the same code. A storage call raises the two
+        // §17.6 conditions too, so their message is the error's own text and
+        // never blames key custody.
+        let failure = scp_crypto::CustodyFailure::from(&e);
+        let message = match failure.kind {
+            scp_crypto::CustodyFailureKind::StorageClosed
+            | scp_crypto::CustodyFailureKind::StorageLockHeld => e.to_string(),
+            scp_crypto::CustodyFailureKind::KeyNotFound
+            | scp_crypto::CustodyFailureKind::PseudonymRejected
+            | scp_crypto::CustodyFailureKind::Failed => {
+                format!("platform key operation failed: {e} — check key custody configuration")
             }
-            scp_platform::PlatformError::StorageLockHeld { .. } => {
-                return Self::ValidationError {
-                    message: e.to_string(),
-                    code: codes::STORAGE_8005.to_owned(),
-                };
-            }
-            _ => {}
-        }
-        Self::CryptoError {
-            message: format!(
-                "platform key operation failed: {e} — check key custody configuration"
-            ),
-            code: codes::CRYPTO_4004.to_owned(),
-        }
+        };
+        Self::custody_failure(message, &failure)
     }
 }
 
@@ -997,6 +1046,79 @@ mod tests {
             ScpPyError::IdentityError { code, .. } => code,
             other => panic!("expected IdentityError, got {other:?}"),
         }
+    }
+
+    /// Every runtime error that carries a custody failure reaches the caller
+    /// with the code `custody_failure_code` assigns (checked here for
+    /// key-not-found, a generic custody failure and a rejected host
+    /// pseudonym). Broadcast publish signing and join key agreement arrive as
+    /// `ContextError::Custody`.
+    #[test]
+    fn custody_failures_carry_the_custody_codes_in_every_carrier() {
+        use scp_crypto::{CustodyFailure, CustodyFailureKind as K};
+        fn failure(kind: K) -> CustodyFailure {
+            CustodyFailure {
+                kind,
+                detail: "custody detail".to_owned(),
+            }
+        }
+        fn crypto_code(e: ScpPyError) -> String {
+            match e {
+                ScpPyError::CryptoError { code, .. } => code,
+                other => panic!("expected a crypto error, got {other:?}"),
+            }
+        }
+        fn identity_code(e: ScpPyError) -> String {
+            match e {
+                ScpPyError::IdentityError { code, .. } => code,
+                other => panic!("expected an identity error, got {other:?}"),
+            }
+        }
+        use scp_core::context::ContextError;
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(ContextError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        assert_eq!(
+            identity_code(ContextError::Custody(failure(K::PseudonymRejected)).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(
+                scp_core::crypto::sender_keys::SenderKeyError::Custody(failure(K::KeyNotFound))
+                    .into()
+            ),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::crypto::ucan::UcanError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_core::envelope::EnvelopeError::Custody(failure(K::KeyNotFound)).into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
+            codes::CRYPTO_4060
+        );
+        use scp_platform::PlatformError;
+        assert_eq!(
+            crypto_code(PlatformError::KeyNotFound.into()),
+            codes::CRYPTO_4006
+        );
+        assert_eq!(
+            identity_code(PlatformError::PseudonymRejected("x".to_owned()).into()),
+            codes::IDENT_1055
+        );
+        assert_eq!(
+            crypto_code(PlatformError::CustodyError("x".to_owned()).into()),
+            codes::CRYPTO_4060
+        );
     }
 
     #[test]
@@ -1198,8 +1320,8 @@ mod tests {
     }
 
     /// Spec §17.6 "One Opener per Durable Directory": a held lock and a closed
-    /// store carry their registered storage codes; any other platform error
-    /// keeps the crypto catch-all.
+    /// store carry their registered storage codes, and a generic storage error
+    /// is a custody failure, `SCP-CRYPTO-4060`.
     #[test]
     fn storage_platform_errors_carry_registered_codes() {
         let held: ScpPyError = scp_platform::PlatformError::StorageLockHeld {
@@ -1218,9 +1340,107 @@ mod tests {
         );
         let other: ScpPyError = scp_platform::PlatformError::StorageError("io".to_owned()).into();
         assert!(
-            matches!(&other, ScpPyError::CryptoError { code, .. } if code == codes::CRYPTO_4004),
+            matches!(&other, ScpPyError::CryptoError { code, .. } if code == codes::CRYPTO_4060),
             "{other:?}"
         );
+    }
+
+    /// Spec §17.6 and ADR-006's SCP-307 amendment: every `PlatformError`
+    /// variant reaches the caller with one code, whether it arrives bare or
+    /// wrapped in a `CustodyFailure` (here inside `ContextError::Custody`). A
+    /// real closed `SqliteStorage` supplies the `StorageClosed`, which must
+    /// report `SCP-STORAGE-8006` on the wrapped path, not `SCP-CRYPTO-4060`.
+    #[tokio::test]
+    async fn platform_errors_keep_one_code_bare_or_wrapped_in_a_custody_failure() {
+        use scp_platform::Storage as _;
+        fn variant_and_code(e: &ScpPyError) -> (&'static str, String) {
+            match e {
+                ScpPyError::IdentityError { code, .. } => ("identity", code.clone()),
+                ScpPyError::CryptoError { code, .. } => ("crypto", code.clone()),
+                ScpPyError::ValidationError { code, .. } => ("validation", code.clone()),
+                other => panic!("unexpected custody error variant: {other:?}"),
+            }
+        }
+        fn wrapped(e: &scp_platform::PlatformError) -> ScpPyError {
+            scp_core::context::ContextError::Custody(scp_crypto::CustodyFailure::from(e)).into()
+        }
+
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("create a tempdir");
+        };
+        let storage = match scp_platform::sqlite::SqliteStorage::new(dir.path(), &[0x5a; 32]) {
+            Ok(storage) => storage,
+            Err(e) => panic!("open the store: {e}"),
+        };
+        if let Err(e) = storage.close() {
+            panic!("close the store: {e}");
+        }
+        let closed = match storage.retrieve("custody/next_id").await {
+            Err(e) => e,
+            Ok(v) => panic!("a closed store refuses every operation, got {v:?}"),
+        };
+        assert!(
+            matches!(closed, scp_platform::PlatformError::StorageClosed),
+            "{closed:?}"
+        );
+        assert_eq!(
+            variant_and_code(&wrapped(&closed)),
+            ("validation", codes::STORAGE_8006.to_owned())
+        );
+
+        for error in [
+            closed,
+            scp_platform::PlatformError::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            },
+            scp_platform::PlatformError::KeyNotFound,
+            scp_platform::PlatformError::PseudonymRejected("x".to_owned()),
+            scp_platform::PlatformError::WrongKeyType {
+                expected: scp_platform::traits::KeyType::Ed25519,
+                actual: scp_platform::traits::KeyType::X25519,
+            },
+            scp_platform::PlatformError::StorageError("io".to_owned()),
+            scp_platform::PlatformError::AttestationError("x".to_owned()),
+            scp_platform::PlatformError::PushError("x".to_owned()),
+            scp_platform::PlatformError::CustodyError("x".to_owned()),
+            scp_platform::PlatformError::Unsupported("x"),
+        ] {
+            let wrapped_error = wrapped(&error);
+            let debug = format!("{error:?}");
+            let bare: ScpPyError = error.into();
+            assert_eq!(
+                variant_and_code(&bare),
+                variant_and_code(&wrapped_error),
+                "{debug}"
+            );
+        }
+
+        // A storage call raises the two §17.6 conditions too, so a bare one
+        // reports the error's own text, never a key-custody diagnosis.
+        for (error, expected_code) in [
+            (
+                scp_platform::PlatformError::StorageClosed,
+                codes::STORAGE_8006,
+            ),
+            (
+                scp_platform::PlatformError::StorageLockHeld {
+                    dir: "/tmp/scp".to_owned(),
+                    lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+                },
+                codes::STORAGE_8005,
+            ),
+        ] {
+            let expected_message = error.to_string();
+            let bare: ScpPyError = error.into();
+            match bare {
+                ScpPyError::ValidationError { message, code } => {
+                    assert_eq!(message, expected_message);
+                    assert_eq!(code, expected_code);
+                }
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        }
     }
 
     /// §5.9: a `RestoreAccess` with nothing to restore must surface the

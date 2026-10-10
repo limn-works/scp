@@ -1,27 +1,43 @@
 [package]
 name = "scp-crypto"
 version = "0.1.0-beta.2"
-description = "Low-level cryptographic anchor (Ed25519 verification) for SCP (Shared Context Protocol)"
+description = "Low-level cryptographic anchor (Ed25519 verification, P-256 primitives) for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords = ["protocol", "cryptography", "ed25519"]
+keywords = ["protocol", "cryptography", "ed25519", "p256"]
 categories = ["cryptography"]
 
 [dependencies]
 ed25519-dalek = { workspace = true }
 # Pseudonym derivation (§9.10.4.A): HKDF-SHA-256 pseudonym secret + HMAC-SHA-256
-# per-context keypair derivation. All pure RustCrypto primitives already in the
-# wasm tree, so `scp-crypto` stays wasm-safe with the derivation moved here.
+# per-context seed, and the §9.10.4 seed-to-scalar HKDF-Expand. Pure RustCrypto
+# crates already in the wasm tree, so `scp-crypto` stays wasm-safe. These are the
+# workspace's one hash-crate generation; their HMAC and HKDF state is not wiped,
+# so wiping secret intermediates is best effort: scp-crypto wipes the buffers it
+# owns (`Zeroizing`), not the crates' internal state or compiler-made copies.
 hkdf = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
+# P-256 primitives (§9.5, §9.10.4): signing, strict/lenient verification, ECDH,
+# SEC1 point validation, and the FIPS 186-5 A.2.1 seed-to-scalar step.
+p256 = { workspace = true }
+thiserror = { workspace = true }
+
+# p256's ecdsa (via signature/rand_core) and the workspace ed25519-dalek pull
+# getrandom 0.2, which fails to compile on wasm32-unknown-unknown without a
+# backend. Select the JS backend there, as scp-protocol and scp-client do.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 rand = { workspace = true }
+hex = { workspace = true }
+proptest = "1"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

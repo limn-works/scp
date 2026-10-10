@@ -112,7 +112,7 @@ impl TestSigner {
 
 #[async_trait::async_trait]
 impl crate::EventLogSigner for TestSigner {
-    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+    async fn sign(&self, message: &[u8]) -> Result<Vec<u8>, scp_crypto::CustodyFailure> {
         let sig = self.signing_key.sign(message);
         Ok(sig.to_bytes().to_vec())
     }

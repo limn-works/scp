@@ -6,38 +6,37 @@
 // is incompatible with SCP's frequent signing operations. ADR-027, as amended on 2026-09-10,
 // requires a different scheme: an EC P-256 signing key in Keystore at every supported API
 // level, and P-256 key agreement in Keystore from API 31 with a Bouncy Castle software P-256
-// agreement key below it. This class has not moved to P-256; story SCP-110 tracks that move.
+// agreement key below it. This class's signing and agreement keys have not moved to P-256;
+// story SCP-110 tracks that move. Its pseudonyms are P-256 points (§9.10.4).
 //
 // Android Keystore does not hand a Keystore-held Ed25519 private key to the app. This class never
 // reads KeyInfo.securityLevel, so it does not know whether Keystore put the key in the TEE or in
 // software, and it reports CustodyType.HARDWARE for every Keystore key. This class performs all signing
-// and DH itself and returns signatures and shared secrets. Two paths hand a caller a software
-// private key or the material that derives one:
-// - exportSigningKeyBytes returns the 32-byte private seed of any Ed25519 key this class
-//   holds in software: a generateKeypair key on API 26-32, and every derived pseudonym key,
-//   including a pseudonym derived from a Keystore identity key whose own seed the method
-//   refuses to export. It accepts any Ed25519 id in softwareKeys, not only a generateKeypair handle.
+// and DH itself and returns signatures, shared secrets and pseudonym points. One path hands a
+// caller a software private key:
+// - exportSigningKeyBytes returns the 32-byte private seed of a software Ed25519 identity key,
+//   which generateKeypair creates on API 26-32. That seed is also the HKDF input of the
+//   identity's software pseudonym secret, so its holder derives every pseudonym of the identity.
 //   ADR-027 acceptance criterion 14 (private key isolation) says the Rust engine receives only
 //   signatures and public keys, never private key material. The UniFFI KeyCustodyProvider
 //   callback declares export_signing_key_bytes, which would carry this seed to Rust, so this
 //   method's design diverges from criterion 14.
-// - sign signs any caller-supplied bytes with a hardware identity key, and derivePseudonymSecret
-//   derives every pseudonym secret of that key from its signature over the public string
-//   "scp-pseudonym-secret-v1". A caller that signs that string derives every pseudonym private
-//   key of the identity. ADR-027 acceptance criterion 6 forbids this construction.
-// No other public method returns a software private key, and no public method returns an
-// X25519 private key. The softwareKeys map is not behind that boundary: it is `internal`, so
-// any code in this module reads every software key pair, X25519 included, and Kotlin compiles
-// it to a public JVM getter with a mangled name that Java code in an app can call.
-// No code passes this class to the Rust engine.
+// The pseudonym secret of a Keystore identity is a Keystore HMAC-SHA256 key that never leaves
+// Keystore, and no pseudonym has a private key this class holds. No other public method returns
+// a software private key, and no public method returns an X25519 private key. The softwareKeys
+// map is not behind that boundary: it is `internal`, so any code in this module reads every
+// software key pair, X25519 included, and Kotlin compiles it to a public JVM getter with a
+// mangled name that Java code in an app can call.
+// This class implements this package's own [KeyCustodyProvider], not the `scp-ffi-uniffi` bridge
+// protocol, and no code passes this class to the Rust engine.
 //
 // Software Ed25519 keys that generateKeypair creates (API 26-32 fallback) are persisted to
 // EncryptedSharedPreferences (Jetpack Security) so they survive process death once the write
 // reaches disk. The write uses apply(), which queues it and returns first; when the process
 // dies before the queued write lands, the key is lost. Without persistence,
 // API 26-32 users would lose their DID identity key on every process restart — causing
-// identity loss, context membership loss, and UCAN delegation loss. Derived pseudonym keys
-// are held in memory only.
+// identity loss, context membership loss, and UCAN delegation loss. No pseudonym key is
+// stored: the pseudonym methods return a P-256 point.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference), section 9.12 (Compromise Recovery),
@@ -48,20 +47,14 @@ package works.limn.scp.android.platform
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.Signature
-import java.security.spec.NamedParameterSpec
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair
 import org.bouncycastle.crypto.agreement.X25519Agreement
 import org.bouncycastle.crypto.generators.Ed25519KeyPairGenerator
@@ -81,8 +74,8 @@ import java.security.SecureRandom
  * Implements the Kotlin [KeyCustodyProvider] interface in `Types.kt`, whose KDoc states how
  * it differs from the Rust `KeyCustody` trait and from the UniFFI `KeyCustodyProvider`
  * callback interface. No code passes this class to the Rust engine: `SCP.identityCreateWithCustody`
- * in `scp-kt` takes the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which this class
- * does not implement.
+ * in `scp-kt` takes the UniFFI-generated `uniffi.scp.KeyCustodyProvider`, whose key ids are u64
+ * strings, and this class does not implement it.
  *
  * ## Key storage strategy
  *
@@ -99,16 +92,17 @@ import java.security.SecureRandom
  *   which returns before the write reaches disk. The key survives process death once the
  *   write lands, and is lost when the process dies first. [CustodyType.SOFTWARE] is reported.
  *
- * - **Derived pseudonym keys (all API levels):** [derivePseudonym] and
- *   [deriveRotatablePseudonym] hold every derived Ed25519 pseudonym key in Bouncy Castle
- *   software, in [softwareKeys], in memory only, including a pseudonym of a Keystore identity
- *   key on API 33+. [CustodyType.SOFTWARE] is reported.
+ * - **Pseudonyms (all API levels):** [derivePseudonym] and [deriveRotatablePseudonym]
+ *   return a 33-byte compressed P-256 point and store no key. A Keystore identity's pseudonym
+ *   secret is a Keystore HMAC-SHA256 key that [generateKeypair] creates beside the identity
+ *   key; a software identity's is derived from its Ed25519 seed.
  *
  * - **X25519 (all API levels):** This class keeps every X25519 wrapping key in Bouncy Castle
  *   software, stored in [softwareKeys], at every API level. It does not use the X25519 key
  *   agreement Android Keystore offers from API 33. [CustodyType.SOFTWARE] is reported.
  *
- * ADR-027, as amended on 2026-09-10, requires P-256 in place of this scheme; the file header
+ * ADR-027, as amended on 2026-09-10, requires P-256 signing and agreement keys in place of
+ * this scheme; the file header
  * states the required scheme.
  *
  * ## StrongBox
@@ -119,7 +113,8 @@ import java.security.SecureRandom
  *
  * ## Errors
  *
- * This class converts no exception to [ScpException]. Each method throws [ScpException] only for
+ * This class converts one exception to [ScpException]: [destroyKey] throws a `KeyStoreException`
+ * from `deleteEntry` as `SCP-CRYPTO-4004`. Otherwise each method throws [ScpException] only for
  * the codes its KDoc names, and every other failure escapes as the original throwable. The
  * KDoc of [KeyCustodyProvider] lists the Keystore and JCA exceptions each method can let escape,
  * and the [dhAgree] KDoc names the Bouncy Castle `IllegalStateException` a low-order peer key
@@ -140,9 +135,15 @@ import java.security.SecureRandom
  * @property encryptedPrefs Persistent storage for software Ed25519 private key seeds.
  *   In production, this is an [EncryptedSharedPreferences] instance backed by Android
  *   Keystore. In tests, a plain [SharedPreferences] can be injected.
+ * @property keystore The Android Keystore operations of the hardware identity path;
+ *   JVM tests inject a fake.
+ * @property keystoreEd25519 Whether Ed25519 identities are generated in [keystore]
+ *   (API 33+) rather than in software.
  */
 class AndroidKeyCustody internal constructor(
     private val encryptedPrefs: SharedPreferences,
+    private val keystore: KeystoreKeys = AndroidKeystoreKeys,
+    private val keystoreEd25519: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
 ) : KeyCustodyProvider {
 
     /**
@@ -163,7 +164,7 @@ class AndroidKeyCustody internal constructor(
     )
 
     // -----------------------------------------------------------------------
-    // Software key storage — API 26-32 Ed25519 keys, derived pseudonym keys, and X25519 keys
+    // Software key storage — API 26-32 Ed25519 keys and X25519 keys
     // -----------------------------------------------------------------------
 
     /**
@@ -172,15 +173,13 @@ class AndroidKeyCustody internal constructor(
      * Key: UUID string (same as [KeyHandle.id]).
      * Value: Bouncy Castle asymmetric key pair (Ed25519 or X25519).
      *
-     * This map holds three kinds of key:
+     * This map holds two kinds of key:
      * - Ed25519 keys that [generateKeypair] creates on API 26-32 (no Keystore EdDSA support)
-     * - Ed25519 pseudonym keys that [derivePseudonym] and [deriveRotatablePseudonym] store, at
-     *   every API level and for a Keystore identity key too
      * - X25519 keys on all API levels (this class does not use Keystore X25519)
      *
      * Ed25519 keys that [generateKeypair] creates are additionally written to [encryptedPrefs]
      * with `apply()`, so they survive process death once the queued write reaches disk.
-     * Derived pseudonym keys and X25519 wrapping keys are held in memory only.
+     * X25519 wrapping keys are held in memory only. No pseudonym key is stored.
      *
      * The map is `internal`, not `private`, because the unit tests read it. Kotlin compiles an
      * `internal` property to a public JVM getter with a mangled name, so Java code in an app can
@@ -230,7 +229,7 @@ class AndroidKeyCustody internal constructor(
     override fun generateKeypair(keyType: KeyType): KeyHandle {
         val keyId = UUID.randomUUID().toString()
         return when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && keyType == KeyType.ED25519 -> {
+            keystoreEd25519 && keyType == KeyType.ED25519 -> {
                 generateKeystoreEd25519(keyId)
             }
             keyType == KeyType.ED25519 -> {
@@ -252,15 +251,14 @@ class AndroidKeyCustody internal constructor(
      * For software-backed keys ([CustodyType.SOFTWARE]): Bouncy Castle's [Ed25519Signer]
      * performs the signing with key material from [softwareKeys].
      *
-     * The method signs any [data] and applies no domain separation. For a hardware key, a
-     * signature over `"scp-pseudonym-secret-v1"` is the input [derivePseudonymSecret] hashes
-     * into the key's pseudonym secret, so a caller that signs that string derives every
-     * pseudonym private key of the identity.
+     * The method signs any [data] and applies no domain separation. No pseudonym secret
+     * depends on a signature: a Keystore identity's pseudonym secret is a separate Keystore
+     * HMAC-SHA256 key (§9.10.4.A).
      *
      * @param keyHandle Handle returned by [generateKeypair] for an Ed25519 key.
      * @param data The bytes to sign.
-     * @return 64-byte Ed25519 signature.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
+     * @return 64-byte signature.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the key is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
      */
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
@@ -280,9 +278,9 @@ class AndroidKeyCustody internal constructor(
      *
      * For software-backed keys: returns the Bouncy Castle public key parameters directly.
      *
-     * @param keyHandle Handle returned by [generateKeypair] or [derivePseudonym].
+     * @param keyHandle Handle returned by [generateKeypair].
      * @return Raw 32-byte public key bytes.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the key is not found.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the key is not found.
      */
     override fun publicKey(keyHandle: KeyHandle): ByteArray {
         return if (keyHandle.custodyType == CustodyType.HARDWARE) {
@@ -295,20 +293,24 @@ class AndroidKeyCustody internal constructor(
     /**
      * Destroys the key material associated with [keyHandle].
      *
-     * For Keystore keys ([CustodyType.HARDWARE]): deletes the entry from Android Keystore and performs
-     * a re-fetch to confirm deletion (section 9.15 key destruction verification).
+     * For Keystore keys ([CustodyType.HARDWARE]): deletes the pseudonym secret and then the
+     * identity entry from Android Keystore, re-fetching each to confirm deletion (section 9.15
+     * key destruction verification).
      *
      * For software-backed keys: removes the entry from the [softwareKeys] map and removes the
      * seed of a software Ed25519 key that [generateKeypair] creates (API 26-32) from
      * [encryptedPrefs] with `apply()`, which returns before the removal reaches disk. The
      * post-deletion check reads only [softwareKeys].
      *
+     * No pseudonym key exists to destroy: once the identity (and, for a hardware
+     * identity, its pseudonym secret) is gone, no pseudonym of it can be derived
+     * (§9.10.4.A).
+     *
      * After this call, operations with the same handle on the same instance throw [ScpException]
-     * with code `SCP-CRYPTO-4001`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4002`, or
-     * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
-     * length before any key lookup; and [exportSigningKeyBytes] on a Keystore handle
-     * ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
-     * [KeyHandle.custodyType] before any key lookup.
+     * with code `SCP-CRYPTO-4006`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4003` when its
+     * peer key is not 32 bytes, because it checks the peer key's length before any key lookup;
+     * and [exportSigningKeyBytes] on a Keystore handle ([CustodyType.HARDWARE]) throws
+     * `SCP-CRYPTO-4005`, because it refuses on [KeyHandle.custodyType] before any key lookup.
      * Each instance holds its own [softwareKeys] map and restores every persisted software Ed25519
      * seed into it when constructed, so another instance in the same process that already holds a
      * software key keeps signing with it after this call.
@@ -319,16 +321,15 @@ class AndroidKeyCustody internal constructor(
      * @param keyHandle Handle to destroy.
      * @return [DestructionAttestation] naming the destruction method, with `confirmed` always
      *   `true`: a failed post-deletion check throws `SCP-CRYPTO-4004` instead.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is already invalid.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the handle is already invalid.
      * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
      */
-    override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation {
-        return if (keyHandle.custodyType == CustodyType.HARDWARE) {
+    override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation =
+        if (keyHandle.custodyType == CustodyType.HARDWARE) {
             destroyKeystoreKey(keyHandle)
         } else {
             softwareKeyOps.destroy(keyHandle)
         }
-    }
 
     /**
      * Performs X25519 Diffie-Hellman key agreement.
@@ -342,7 +343,7 @@ class AndroidKeyCustody internal constructor(
      * @param keyHandle Handle to an X25519 key from [generateKeypair].
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4002` if [peerPublic] is 32 bytes long and no
+     * @throws ScpException with code `SCP-CRYPTO-4006` if [peerPublic] is 32 bytes long and no
      *   software key sits under [keyHandle]: a destroyed or unknown handle, or a Keystore
      *   Ed25519 handle, which never enters [softwareKeyTypes] and so skips the key-type check.
      * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
@@ -374,7 +375,7 @@ class AndroidKeyCustody internal constructor(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "X25519 key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4002",
+                "SCP-CRYPTO-4006",
             )
         val agreement = X25519Agreement()
         agreement.init(keyPair.private)
@@ -388,235 +389,121 @@ class AndroidKeyCustody internal constructor(
     }
 
     /**
-     * Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
+     * Derives the deterministic, context-scoped P-256 pseudonym of an identity and
+     * returns its 33-byte compressed point (§9.10.4, §9.10.4.A). Nothing is stored.
      *
-     * ## Algorithm (spec section 9.10.4.A):
+     * ## Algorithm (spec §9.10.4, §9.10.4.A):
      *
-     * **Software keys (API 26-32, [CustodyType.SOFTWARE]):**
-     *   1. Extract 32-byte private key bytes from the Bouncy Castle [Ed25519PrivateKeyParameters].
-     *   2. Derive pseudonymSecret = HKDF-SHA256(ikm: privateKeyBytes,
-     *      salt: "scp-pseudonym-secret-v1", info: "", len: 32).
-     *   3. Compute `seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")`.
-     *   4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+     *   1. `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`, where
+     *      `pseudonym_secret` is the identity key's §9.10.4.A secret.
+     *   2. `d = HKDF-Expand-SHA256(prk = seed, info = "SCP-PSEUDONYM-P256-V1", 48)
+     *      mod (n - 1) + 1` (FIPS 186-5 A.2.1).
+     *   3. The pseudonym is the 33-byte compressed point `d * G`.
      *
-     * **Hardware keys (API 33+, [CustodyType.HARDWARE]):**
-     *   Keystore does not hand the private key bytes to the app, so HKDF over them is not
-     *   possible. Instead, the pseudonym secret is derived from the Keystore signature over a
-     *   fixed message:
-     *   1. `signatureBytes = Keystore_sign("scp-pseudonym-secret-v1")` (Ed25519 is deterministic per RFC 8032).
-     *   2. `pseudonymSecret = SHA-256(signatureBytes)` (compress 64-byte signature to 32-byte secret).
-     *   3. `seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")`.
-     *   4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+     * **Software keys (API 26-32, [CustodyType.SOFTWARE]):** `pseudonym_secret =
+     * HKDF-SHA256(ikm = Ed25519 private seed, salt = "scp-pseudonym-secret-v1")`, the
+     * §9.10.4.A native interim until the identity key moves to P-256 (SCP-315). The Rust helper behind
+     * [P256Pseudonym.softwarePoint] runs all three steps, so software pseudonyms match
+     * every other software custody byte for byte (§25.19).
      *
-     *   This construction diverges from ADR-027 acceptance criterion 6, which makes the
-     *   hardware `pseudonym_secret` a 32-byte symmetric key generated inside the TEE at key
-     *   generation and never `SHA-256` over a signature, because an ECDSA hardware signer
-     *   draws its own nonce and would yield a different secret on every call.
-     *
-     *   Neither path keeps `pseudonymSecret` from a caller of this class. On the hardware path,
-     *   [sign] signs "scp-pseudonym-secret-v1" for any caller, and SHA-256 of that signature is
-     *   the secret. On the software path, [exportSigningKeyBytes] returns the private seed that
-     *   the HKDF takes as input. A caller holding the secret derives every pseudonym private
-     *   key of the identity.
-     *
-     *   **Limitation:** Hardware-derived pseudonyms produce different values than Rust's
-     *   HKDF-based derivation for the same logical key, because the Keystore key material is
-     *   not portable. This is acceptable because Keystore keys are inherently non-portable and
-     *   cross-platform pseudonym identity requires portable key material.
-     *
-     * The derivation is deterministic: the same `keyHandle` + `contextId` pair always
-     * produces the same pseudonym public key. Each call creates a new UUID handle in
-     * [softwareKeys] — callers should manage handle lifecycle.
+     * **Hardware keys (API 33+, [CustodyType.HARDWARE]):** `pseudonym_secret` is a
+     * device-local HMAC-SHA256 key generated inside Android Keystore alongside the
+     * identity key at [generateKeypair]; Keystore computes step 1 and the secret never
+     * leaves it. It is never derived from a signature (§9.10.4.A), so the pseudonym is
+     * device-local and stable across launches. Steps 2 and 3 run in the Rust helper
+     * behind [P256Pseudonym.pointFromSeed].
      *
      * @param keyHandle Handle to the identity Ed25519 key (source for derivation).
      * @param contextId Raw context ID bytes.
-     * @return [PseudonymKeyHandle] referencing the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the identity key is not found.
+     * @return The 33-byte SEC1 compressed P-256 point.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the identity key or its
+     *   pseudonym secret is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the identity key is not Ed25519.
      */
-    override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): PseudonymKeyHandle {
-        // Enforce Ed25519 type for the source identity key.
-        if (keyHandle.custodyType == CustodyType.SOFTWARE) {
-            val storedType = softwareKeyTypes[keyHandle.id]
-            if (storedType != null && storedType != KeyType.ED25519) {
-                throw ScpException(
-                    "derivePseudonym requires an Ed25519 key; handle '${keyHandle.id}' is X25519",
-                    "SCP-CRYPTO-4003",
-                )
-            }
-        }
-
-        // Derive pseudonym_secret: HKDF for software keys, Keystore-sign for hardware keys.
-        // Neither path keeps the secret from a caller of this class: exportSigningKeyBytes()
-        // returns the software HKDF input, and sign() signs "scp-pseudonym-secret-v1" for a
-        // hardware key. ADR-027 acceptance criterion 6 forbids SHA-256 over a signature.
-        val pseudonymSecret = derivePseudonymSecret(keyHandle)
-
+    override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): ByteArray {
+        requireEd25519Identity(keyHandle, "derivePseudonym")
         // v1 HMAC body: contextId || "scp-pseudonym".
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(pseudonymSecret, "HmacSHA256"))
-        pseudonymSecret.fill(0) // zeroize after use
-        mac.update(contextId)
-        mac.update("scp-pseudonym".toByteArray(Charsets.UTF_8))
-        val seed = mac.doFinal()
-
-        // Derive Ed25519 keypair from seed using FixedSecureRandom for determinism.
-        val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
-            init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
-        }.generateKeyPair()
-        seed.fill(0) // zeroize after use
-
-        val pseudonymId = UUID.randomUUID().toString()
-        softwareKeys[pseudonymId] = pseudonymKeypair
-        softwareKeyTypes[pseudonymId] = KeyType.ED25519
-
-        return PseudonymKeyHandle(
-            id = pseudonymId,
-            custodyType = CustodyType.SOFTWARE,
-        )
+        return pseudonymPoint(keyHandle, contextId, null, "scp-pseudonym".toByteArray(Charsets.UTF_8))
     }
 
     /**
-     * Derives a deterministic, context-scoped, epoch-rotatable Ed25519 pseudonym keypair.
+     * Derives the deterministic, context-scoped, epoch-rotatable P-256 pseudonym of an
+     * identity and returns its 33-byte compressed point (§9.10.4.1).
      *
-     * Identical to [derivePseudonym] except the big-endian u64 epoch and the v2 domain
-     * separator are folded into the HMAC body, yielding an independent, unlinkable
-     * pseudonym per epoch for the same identity and context.
-     *
-     * ## Algorithm (spec section 9.10.4.A, rotatable variant):
-     *
-     *   1. Derive `pseudonymSecret` exactly as in [derivePseudonym] (HKDF for software
-     *      keys, Keystore-sign for hardware keys).
-     *   2. Compute `seed = HMAC-SHA256(pseudonymSecret, contextId || BE64(epoch) ||
-     *      "scp-pseudonym-v2")`. The `BE64(epoch)` term is the 8-byte big-endian encoding
-     *      of [pseudonymEpoch].
-     *   3. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
-     *
-     * The `"scp-pseudonym-v2"` separator differs from v1's `"scp-pseudonym"`, so a v2
-     * pseudonym at any epoch never collides with the v1 [derivePseudonym] output.
-     *
-     * Matches the Rust `derive_pseudonym_keypair()` with `epoch = Some(pseudonymEpoch)` in
-     * `scp-crypto/src/pseudonym.rs` (and the file/sqlite custody backends, which call it) so
-     * software-custody pseudonyms are identical across platforms. The hardware (Keystore) path
-     * is device-local by design.
+     * Identical to [derivePseudonym] except the HMAC body is `contextId || BE64(epoch) ||
+     * "scp-pseudonym-v2"`, yielding an independent, unlinkable pseudonym per epoch for
+     * the same identity and context. The `"scp-pseudonym-v2"` separator differs from
+     * v1's `"scp-pseudonym"`, so a v2 pseudonym at any epoch never collides with the v1
+     * [derivePseudonym] output.
      *
      * @param keyHandle Handle to the identity Ed25519 key (source for derivation).
      * @param contextId Raw context ID bytes.
      * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
-     * @return [PseudonymKeyHandle] referencing the derived signing key.
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the identity key is not found.
+     * @return The 33-byte SEC1 compressed P-256 point.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the identity key or its
+     *   pseudonym secret is not found.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the identity key is not Ed25519.
      */
     override fun deriveRotatablePseudonym(
         keyHandle: KeyHandle,
         contextId: ByteArray,
         pseudonymEpoch: Long,
-    ): PseudonymKeyHandle {
-        // Enforce Ed25519 type for the source identity key.
-        if (keyHandle.custodyType == CustodyType.SOFTWARE) {
-            val storedType = softwareKeyTypes[keyHandle.id]
-            if (storedType != null && storedType != KeyType.ED25519) {
-                throw ScpException(
-                    "deriveRotatablePseudonym requires an Ed25519 key; " +
-                        "handle '${keyHandle.id}' is X25519",
-                    "SCP-CRYPTO-4003",
-                )
-            }
-        }
-
-        // Derive pseudonym_secret: HKDF for software keys, Keystore-sign for hardware keys.
-        // Neither path keeps the secret from a caller of this class: exportSigningKeyBytes()
-        // returns the software HKDF input, and sign() signs "scp-pseudonym-secret-v1" for a
-        // hardware key. ADR-027 acceptance criterion 6 forbids SHA-256 over a signature.
-        val pseudonymSecret = derivePseudonymSecret(keyHandle)
-
-        // v2 HMAC body: contextId || BE64(epoch) || "scp-pseudonym-v2". The distinct domain
-        // separator means v2 at any epoch never collides with the v1 derivePseudonym output.
+    ): ByteArray {
+        requireEd25519Identity(keyHandle, "deriveRotatablePseudonym")
         val epochBe = ByteBuffer.allocate(Long.SIZE_BYTES)
             .order(ByteOrder.BIG_ENDIAN)
             .putLong(pseudonymEpoch)
             .array()
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(pseudonymSecret, "HmacSHA256"))
-        pseudonymSecret.fill(0) // zeroize after use
-        mac.update(contextId)
-        mac.update(epochBe)
-        mac.update("scp-pseudonym-v2".toByteArray(Charsets.UTF_8))
-        val seed = mac.doFinal()
-
-        // Derive Ed25519 keypair from seed using FixedSecureRandom for determinism.
-        val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
-            init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
-        }.generateKeyPair()
-        seed.fill(0) // zeroize after use
-
-        val pseudonymId = UUID.randomUUID().toString()
-        softwareKeys[pseudonymId] = pseudonymKeypair
-        softwareKeyTypes[pseudonymId] = KeyType.ED25519
-
-        return PseudonymKeyHandle(
-            id = pseudonymId,
-            custodyType = CustodyType.SOFTWARE,
+        // v2 HMAC body: contextId || BE64(epoch) || "scp-pseudonym-v2".
+        return pseudonymPoint(
+            keyHandle,
+            contextId,
+            pseudonymEpoch,
+            epochBe + "scp-pseudonym-v2".toByteArray(Charsets.UTF_8),
         )
     }
 
-    /**
-     * Derives a 32-byte pseudonym secret from the identity key.
-     *
-     * For software keys: `HKDF-SHA256(ikm: privateKeyBytes, salt: "scp-pseudonym-secret-v1", info: "", len: 32)`
-     * — matches the Rust `derive_pseudonym_secret()` in `scp-crypto/src/pseudonym.rs`.
-     *
-     * For hardware keys: `SHA-256(Keystore_sign("scp-pseudonym-secret-v1"))` — deterministic
-     * because Ed25519 signing is deterministic (RFC 8032). The 64-byte signature is hashed
-     * to 32 bytes for use as an HMAC key. This diverges from ADR-027 acceptance criterion 6,
-     * which makes the hardware secret a TEE-generated symmetric key and never `SHA-256` over a
-     * signature, because an ECDSA hardware signer draws its own nonce. [sign] returns the same
-     * signature to any caller, and [exportSigningKeyBytes] returns a software key's HKDF input
-     * to any caller, so neither secret is confined to this class.
-     */
-    private fun derivePseudonymSecret(keyHandle: KeyHandle): ByteArray {
-        val salt = "scp-pseudonym-secret-v1".toByteArray(Charsets.UTF_8)
-
-        if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            // Keystore path: sign the salt message deterministically, hash the result.
-            val signatureBytes = signWithKeystore(keyHandle, salt)
-            val digest = java.security.MessageDigest.getInstance("SHA-256")
-            return digest.digest(signatureBytes)
+    /** Rejects a software identity handle recorded as X25519 with `SCP-CRYPTO-4003`. */
+    private fun requireEd25519Identity(keyHandle: KeyHandle, operation: String) {
+        if (keyHandle.custodyType != CustodyType.SOFTWARE) return
+        val storedType = softwareKeyTypes[keyHandle.id]
+        if (storedType != null && storedType != KeyType.ED25519) {
+            throw ScpException(
+                "$operation requires an Ed25519 key; handle '${keyHandle.id}' is X25519",
+                "SCP-CRYPTO-4003",
+            )
         }
-
-        // Software path: extract private key bytes and apply HKDF-SHA256.
-        val keyPair = softwareKeys[keyHandle.id]
-            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
-
-        val privateParams = keyPair.private as Ed25519PrivateKeyParameters
-        val privateKeyBytes = privateParams.encoded
-        val secret = hkdfSha256(privateKeyBytes, salt, ByteArray(0), 32)
-        privateKeyBytes.fill(0) // zeroize private key material
-        return secret
     }
 
     /**
-     * HKDF-SHA256 (RFC 5869) extract-and-expand.
-     *
-     * Matches the Rust `hkdf::Hkdf::<Sha256>` used in
-     * `scp-crypto/src/pseudonym.rs::derive_pseudonym_secret`.
+     * The pseudonym point of [keyHandle]. A hardware identity computes the context seed
+     * `HMAC-SHA256(pseudonym_secret, contextId || suffix)` inside Keystore, and only
+     * while its identity alias exists, so a destroy that removed the identity but not
+     * yet the secret cannot leave a derivable pseudonym. A software identity passes its
+     * Ed25519 seed to the Rust helper with [epoch] (`null` for v1), and the seed copy is
+     * wiped.
      */
-    private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
-        // Extract: PRK = HMAC-SHA256(salt, IKM)
-        val extractMac = Mac.getInstance("HmacSHA256")
-        extractMac.init(SecretKeySpec(salt, "HmacSHA256"))
-        val prk = extractMac.doFinal(ikm)
-
-        // Expand: OKM = T(1) where T(1) = HMAC-SHA256(PRK, info || 0x01)
-        // For length <= 32 (one block), only one iteration is needed.
-        require(length <= 32) { "HKDF-SHA256 expand: length must be <= 32 for single-block output" }
-        val expandMac = Mac.getInstance("HmacSHA256")
-        expandMac.init(SecretKeySpec(prk, "HmacSHA256"))
-        prk.fill(0) // zeroize PRK
-        expandMac.update(info)
-        expandMac.update(byteArrayOf(0x01))
-        val okm = expandMac.doFinal()
-        return okm.copyOf(length)
+    private fun pseudonymPoint(
+        keyHandle: KeyHandle,
+        contextId: ByteArray,
+        epoch: Long?,
+        suffix: ByteArray,
+    ): ByteArray {
+        if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            if (!keystore.containsAlias("scp.key.${keyHandle.id}")) {
+                throw ScpException("Key not found in Keystore: ${keyHandle.id}", "SCP-CRYPTO-4006")
+            }
+            val seed = PseudonymSecret.keystoreContextSeed(keystore, keyHandle.id, contextId, suffix)
+            return P256Pseudonym.pointFromSeed(seed)
+        }
+        val keyPair = softwareKeys[keyHandle.id]
+            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
+        val seed = (keyPair.private as Ed25519PrivateKeyParameters).encoded
+        return try {
+            P256Pseudonym.softwarePoint(seed, contextId, epoch)
+        } finally {
+            seed.fill(0)
+        }
     }
 
     /**
@@ -624,32 +511,29 @@ class AndroidKeyCustody internal constructor(
      *
      * For software-backed keys ([CustodyType.SOFTWARE]): extracts the 32-byte seed from
      * the Bouncy Castle [Ed25519PrivateKeyParameters] and returns a copy. That covers a
-     * [generateKeypair] key on API 26-32 and every key [derivePseudonym] and
-     * [deriveRotatablePseudonym] store, including a pseudonym derived from a Keystore identity
-     * key.
+     * [generateKeypair] key on API 26-32; no pseudonym has a stored key to export.
      *
      * For Keystore keys ([CustodyType.HARDWARE]): throws an error because Keystore does
      * not hand the private key bytes to the app, so this method cannot hand a Keystore key's
      * bytes to a core function that takes a raw signing key. ADR-063's curve slice requires
      * every core function that takes a raw signing key to take a signer instead, and every
      * key-export accessor to leave the custody adapters and all three bridges. That slice
-     * has not landed, so this accessor
-     * still exports the seed of a software key. ADR-027 acceptance criterion 14 (private key isolation) already says
-     * the Rust engine receives only signatures and public keys, never private key material,
-     * and the UniFFI `KeyCustodyProvider` callback's `export_signing_key_bytes` would carry this
-     * seed to Rust, so this method's design diverges from criterion 14. No code passes this
-     * class to the Rust engine, so no seed from it reaches Rust.
+     * has not landed, so this accessor still exports the seed of a software key. ADR-027
+     * acceptance criterion 14 (private key isolation) already says the Rust engine receives
+     * only signatures and public keys, never private key material, and the UniFFI
+     * `KeyCustodyProvider` callback's `export_signing_key_bytes` would carry this seed to Rust,
+     * so this method's design diverges from criterion 14. No code passes this class to the
+     * Rust engine, so no seed from it reaches Rust.
      *
-     * @param keyHandle Handle naming any Ed25519 key held in software: one [generateKeypair]
-     *   returned, or a [KeyHandle] built from a [PseudonymKeyHandle.id]. The method checks
-     *   only [KeyHandle.custodyType] and the stored key type, not where the handle came from.
+     * @param keyHandle Handle naming an Ed25519 key held in software, which [generateKeypair]
+     *   returned. The method checks only [KeyHandle.custodyType] and the stored key type.
      * @return 32-byte raw Ed25519 private key bytes.
      * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
      * @throws ScpException with code `SCP-CRYPTO-4005` if the handle is a Keystore handle
      *   ([CustodyType.HARDWARE]), checked before any key lookup, so a destroyed or unknown
      *   Keystore handle also gets this code (Keystore does not hand its private key bytes to
      *   the app).
-     * @throws ScpException with code `SCP-CRYPTO-4001` if the handle is a software handle and
+     * @throws ScpException with code `SCP-CRYPTO-4006` if the handle is a software handle and
      *   no software key is found under it.
      */
     override fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray {
@@ -675,7 +559,7 @@ class AndroidKeyCustody internal constructor(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
 
         val privateParams = keyPair.private as Ed25519PrivateKeyParameters
@@ -706,19 +590,22 @@ class AndroidKeyCustody internal constructor(
      * to sign messages during relay connections and message processing without user
      * interaction.
      */
+    @Suppress("TooGenericExceptionCaught") // any failure must delete the half-made identity
     private fun generateKeystoreEd25519(keyId: String): KeyHandle {
         val keystoreAlias = "scp.key.$keyId"
-        val spec = KeyGenParameterSpec.Builder(
-            keystoreAlias,
-            KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY,
-        )
-            .setAlgorithmParameterSpec(NamedParameterSpec.ED25519)
-            .setDigests() // EdDSA does not require explicit digest
-            .setUserAuthenticationRequired(false) // SCP requires background processing
-            .build()
-        val keyPairGenerator = KeyPairGenerator.getInstance("EdDSA", "AndroidKeyStore")
-        keyPairGenerator.initialize(spec)
-        keyPairGenerator.generateKeyPair()
+        keystore.generateEd25519(keystoreAlias)
+        try {
+            keystore.generateHmacSha256(PseudonymSecret.alias(keyId))
+        } catch (e: Exception) {
+            // An identity without its pseudonym secret could never derive a pseudonym,
+            // and no handle to it is returned, so it would sit orphaned in Keystore.
+            try {
+                keystore.deleteEntry(keystoreAlias)
+            } catch (cleanup: Exception) {
+                e.addSuppressed(cleanup)
+            }
+            throw e
+        }
         return KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
     }
 
@@ -733,7 +620,7 @@ class AndroidKeyCustody internal constructor(
         val entry = keyStore.getEntry(keystoreAlias, null) as? KeyStore.PrivateKeyEntry
             ?: throw ScpException(
                 "Key not found in Keystore: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         return Signature.getInstance("EdDSA").apply {
             initSign(entry.privateKey)
@@ -754,7 +641,7 @@ class AndroidKeyCustody internal constructor(
         val entry = keyStore.getEntry(keystoreAlias, null) as? KeyStore.PrivateKeyEntry
             ?: throw ScpException(
                 "Key not found in Keystore: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         val encoded = entry.certificate.publicKey.encoded
         // X.509 SubjectPublicKeyInfo for Ed25519 is 44 bytes: 12-byte header + 32-byte key (RFC 8410 §3)
@@ -766,12 +653,19 @@ class AndroidKeyCustody internal constructor(
     }
 
     /**
-     * Deletes a key from Android Keystore and verifies deletion.
+     * Deletes a Keystore identity and its pseudonym secret from Android Keystore and
+     * verifies deletion.
      *
      * Performs the key destruction verification required by section 9.15:
-     *   1. Delete the Keystore entry.
-     *   2. Re-fetch to confirm the alias no longer exists.
+     *   1. Delete the pseudonym secret, then the identity entry. The secret goes first so
+     *      that a failure between the two leaves the identity in place, and a retry
+     *      completes the destroy.
+     *   2. Re-fetch to confirm neither alias exists.
      *   3. Return [DestructionAttestation] with [DestructionMethod.HARDWARE] and `confirmed = true`.
+     *
+     * An identity alias that is already absent reports `SCP-CRYPTO-4006`, after deleting
+     * any pseudonym secret left behind and confirming it is gone (`SCP-CRYPTO-4004` if it
+     * persists).
      *
      * Returns [DestructionMethod.HARDWARE] because Keystore held and deleted the key. The
      * method does not read `KeyInfo.securityLevel`, so it reports
@@ -779,24 +673,18 @@ class AndroidKeyCustody internal constructor(
      */
     private fun destroyKeystoreKey(keyHandle: KeyHandle): DestructionAttestation {
         val keystoreAlias = "scp.key.${keyHandle.id}"
-        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val secretAlias = PseudonymSecret.alias(keyHandle.id)
 
-        if (!keyStore.containsAlias(keystoreAlias)) {
+        if (!keystore.containsAlias(keystoreAlias)) {
+            if (keystore.containsAlias(secretAlias)) keystore.deleteConfirmed(keyHandle.id, secretAlias)
             throw ScpException(
                 "Key not found in Keystore: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         }
 
-        keyStore.deleteEntry(keystoreAlias)
-
-        // Verify deletion per section 9.15 — re-fetch must confirm absence
-        if (keyStore.containsAlias(keystoreAlias)) {
-            throw ScpException(
-                "Key destruction failed: entry persisted after deletion for ${keyHandle.id}",
-                "SCP-CRYPTO-4004",
-            )
-        }
+        // Secret first, then identity; each deletion is re-fetched per section 9.15.
+        keystore.deleteConfirmed(keyHandle.id, secretAlias, keystoreAlias)
 
         return DestructionAttestation(
             method = DestructionMethod.HARDWARE,
@@ -819,11 +707,9 @@ class AndroidKeyCustody internal constructor(
 /**
  * Bouncy Castle software key operations for [AndroidKeyCustody].
  *
- * Manages three kinds of software key: Ed25519 keys that [AndroidKeyCustody.generateKeypair]
- * creates on API 26-32, where Android Keystore has no EdDSA; Ed25519 pseudonym keys that
- * [AndroidKeyCustody.derivePseudonym] and [AndroidKeyCustody.deriveRotatablePseudonym] store,
- * at every API level and for a Keystore identity key too; and X25519 keys on all API levels,
- * because [AndroidKeyCustody] does not use Keystore X25519.
+ * Manages two kinds of software key: Ed25519 keys that [AndroidKeyCustody.generateKeypair]
+ * creates on API 26-32, where Android Keystore has no EdDSA; and X25519 keys on all API
+ * levels, because [AndroidKeyCustody] does not use Keystore X25519.
  *
  * Extracted from [AndroidKeyCustody] to keep the parent class focused on routing
  * between hardware and software custody while respecting function count limits.
@@ -885,7 +771,7 @@ internal class SoftwareKeyOps(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
 
         // Enforce Ed25519 type
@@ -910,7 +796,7 @@ internal class SoftwareKeyOps(
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
 
         val storedType = softwareKeyTypes[keyHandle.id]
@@ -920,7 +806,7 @@ internal class SoftwareKeyOps(
                 pubKey.encoded
             }
             else -> {
-                // Ed25519 (default for pseudonym keys where type may not be tracked)
+                // Ed25519
                 val pubKey = keyPair.public as Ed25519PublicKeyParameters
                 pubKey.encoded
             }
@@ -930,7 +816,7 @@ internal class SoftwareKeyOps(
     /**
      * Destroys a software-backed key by removing it from the in-memory map and removing its
      * seed entry from [encryptedPrefs], which only an Ed25519 key that [generateEd25519]
-     * created has; for a derived pseudonym key or an X25519 key the removal is a no-op.
+     * created has; for an X25519 key the removal is a no-op.
      *
      * Returns [DestructionMethod.SOFTWARE_ONLY] because the key material was held in software
      * (the Bouncy Castle in-memory map, plus EncryptedSharedPreferences for a generated Ed25519
@@ -949,7 +835,7 @@ internal class SoftwareKeyOps(
         if (removed == null) {
             throw ScpException(
                 "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4001",
+                "SCP-CRYPTO-4006",
             )
         }
 
@@ -1021,5 +907,30 @@ internal class SoftwareKeyOps(
     companion object {
         /** Key prefix for Ed25519 private key entries in EncryptedSharedPreferences. */
         private const val PREFS_KEY_PREFIX = "scp.ed25519."
+    }
+}
+
+/**
+ * Deletes each of [aliases] in order and confirms by re-fetch that none remains
+ * (section 9.15). A Keystore failure or a surviving alias is `SCP-CRYPTO-4004`, and
+ * the aliases after a failed one are left in place.
+ */
+private fun KeystoreKeys.deleteConfirmed(keyId: String, vararg aliases: String) {
+    for (alias in aliases) {
+        try {
+            deleteEntry(alias)
+        } catch (e: java.security.KeyStoreException) {
+            throw ScpException(
+                "Key destruction failed: Keystore could not delete $alias for $keyId",
+                "SCP-CRYPTO-4004",
+                e,
+            )
+        }
+        if (containsAlias(alias)) {
+            throw ScpException(
+                "Key destruction failed: $alias persisted after deletion for $keyId",
+                "SCP-CRYPTO-4004",
+            )
+        }
     }
 }

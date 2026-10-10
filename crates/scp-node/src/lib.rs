@@ -3827,7 +3827,7 @@ impl KeyCustody for NoOpCustody {
         _handle: &scp_platform::KeyHandle,
         _context_id: &[u8],
     ) -> impl std::future::Future<
-        Output = Result<scp_platform::PseudonymKeypair, scp_platform::PlatformError>,
+        Output = Result<scp_platform::Pseudonym, scp_platform::PlatformError>,
     > + Send {
         std::future::ready(Err(scp_platform::PlatformError::StorageError(
             "NoOpCustody: not configured".to_owned(),
@@ -3840,7 +3840,7 @@ impl KeyCustody for NoOpCustody {
         _context_id: &[u8],
         _pseudonym_epoch: u64,
     ) -> impl std::future::Future<
-        Output = Result<scp_platform::PseudonymKeypair, scp_platform::PlatformError>,
+        Output = Result<scp_platform::Pseudonym, scp_platform::PlatformError>,
     > + Send {
         std::future::ready(Err(scp_platform::PlatformError::StorageError(
             "NoOpCustody: not configured".to_owned(),

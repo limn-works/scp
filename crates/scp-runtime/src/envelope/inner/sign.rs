@@ -35,7 +35,8 @@ use scp_protocol::envelope::padding::pad_to_bucket;
 ///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::SigningFailed`] if the signing operation fails.
+/// Returns [`EnvelopeError::Custody`] if custody signing fails, and
+/// [`EnvelopeError::SigningFailed`] if the signature is not 64 bytes.
 /// Returns [`EnvelopeError::SerializationFailed`] if provenance serialization fails.
 /// Returns [`EnvelopeError::PayloadTooLarge`] if the payload exceeds the
 /// maximum bucket size.
@@ -57,7 +58,7 @@ pub async fn create_inner_envelope(
     let signature = key_custody
         .sign(signing_key, &canonical_hash)
         .await
-        .map_err(|e| EnvelopeError::SigningFailed(e.to_string()))?;
+        .map_err(|e| EnvelopeError::Custody(e.into()))?;
 
     // 5. Pad payload to bucket boundary.
     let padded_payload = pad_to_bucket(params.payload)?;
@@ -176,6 +177,38 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         (custody, key)
+    }
+
+    /// A destroyed signing key fails inner-envelope signing with a typed
+    /// key-not-found custody failure, which every bridge reports as
+    /// `SCP-CRYPTO-4006`.
+    #[tokio::test]
+    async fn create_inner_envelope_with_a_destroyed_key_is_custody_key_not_found() {
+        let (custody, signing_key) = setup().await;
+        custody.destroy_key(&signing_key).await.unwrap();
+        let err = create_inner_envelope(
+            &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload: b"hello world",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .expect_err("signing under a destroyed key must fail");
+        assert!(
+            matches!(&err, EnvelopeError::Custody(failure) if failure.is_key_not_found()),
+            "expected EnvelopeError::Custody key-not-found, got {err:?}"
+        );
     }
 
     #[tokio::test]
