@@ -39,8 +39,11 @@
 //! # Per-entry binding
 //!
 //! Each entry carries a 16-byte `entry_id` that `FileKeyCustody::append_entry`
-//! draws from the operating system's CSPRNG and that no later write changes. A
-//! handle map records that identifier, `FileKeyCustody::decrypt_entry` finds an
+//! draws from the operating system's CSPRNG and that no later write changes.
+//! Every handle's `u64` is the first eight bytes of that identifier read
+//! little-endian (`handle_id_for`), so a handle a caller persists names the same
+//! entry after a reopen and in every custody object over that file. A handle
+//! map records that identifier, `FileKeyCustody::decrypt_entry` finds an
 //! entry by comparing identifiers rather than by indexing on a position, and
 //! `FileKeyCustody::encrypt_key` passes `key_type ‖ entry_id` as AES-256-GCM
 //! associated data. `decrypt_entry` also compares the stored `key_type` byte
@@ -144,7 +147,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -300,6 +302,21 @@ impl StoredKeyType {
 /// which is what makes this identifier the value a handle binds to.
 type EntryId = [u8; ENTRY_ID_LEN];
 
+/// Returns the [`KeyHandle`] id of the entry `entry_id` names: the first eight
+/// bytes of that identifier, read little-endian.
+///
+/// Deriving the id from the entry, instead of numbering entries by position at
+/// construction, gives an entry one handle id in every custody object and after
+/// every reopen. A caller that persists a handle across a restart, as
+/// `scp-node` and the identity migration in `scp-identity` do, therefore reads
+/// the key it was given after a `destroy_key` moved that key to another
+/// position, and a persisted handle whose entry was destroyed finds no entry.
+fn handle_id_for(entry_id: &EntryId) -> u64 {
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&entry_id[..8]);
+    u64::from_le_bytes(id)
+}
+
 /// Builds the AES-256-GCM associated data that binds one entry's ciphertext to
 /// its key type and to its identifier: `key_type | entry_id`.
 ///
@@ -337,32 +354,45 @@ fn find_entry_index(data: &[u8], entry_id: &EntryId) -> Option<usize> {
     (0..entry_count).find(|index| &read_entry_id(data, *index) == entry_id)
 }
 
-/// Draws an entry identifier that no entry in `data` already carries.
+/// Draws an entry identifier whose handle id ([`handle_id_for`]) no entry in
+/// `data` already carries.
 ///
-/// Rejecting a collision here makes "one identifier names at most one entry"
-/// hold by construction, and every lookup in this module depends on that.
+/// Rejecting a collision here makes "one handle id, and so one identifier,
+/// names at most one entry" hold by construction, and every lookup in this
+/// module depends on that.
 ///
 /// # Errors
 ///
 /// Returns [`PlatformError::CustodyError`] when eight consecutive draws all
-/// repeat an identifier this file already holds. Two 128-bit draws from the
-/// operating system's CSPRNG collide with probability 2⁻¹²⁸, so a caller
-/// reaches this arm when that CSPRNG repeats itself, and reporting that beats
-/// writing an entry two handles could name.
+/// repeat a handle id this file already holds. A 64-bit draw from the operating
+/// system's CSPRNG repeats one of `n` stored handle ids with probability
+/// `n · 2⁻⁶⁴`, so a caller reaches this arm when that CSPRNG repeats itself,
+/// and reporting that beats writing an entry two handles could name.
 fn generate_unique_entry_id(data: &[u8]) -> Result<EntryId, PlatformError> {
+    unique_entry_id_from(data, |entry_id| rand::rngs::OsRng.fill_bytes(entry_id))
+}
+
+/// The collision check behind [`generate_unique_entry_id`], over a caller's
+/// source of draws so a test can supply colliding ones.
+fn unique_entry_id_from(
+    data: &[u8],
+    mut draw: impl FnMut(&mut EntryId),
+) -> Result<EntryId, PlatformError> {
     const DRAWS: usize = 8;
 
+    let entry_count = data.len().saturating_sub(HEADER_SIZE) / ENTRY_SIZE;
     for _ in 0..DRAWS {
         let mut entry_id = [0u8; ENTRY_ID_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut entry_id);
-        if find_entry_index(data, &entry_id).is_none() {
+        draw(&mut entry_id);
+        let handle_id = handle_id_for(&entry_id);
+        if (0..entry_count).all(|index| handle_id_for(&read_entry_id(data, index)) != handle_id) {
             return Ok(entry_id);
         }
     }
 
     Err(PlatformError::CustodyError(format!(
-        "the operating system's random source returned an entry identifier this key file \
-         already holds on all {DRAWS} draws"
+        "the operating system's random source returned a handle id this key file already \
+         holds on all {DRAWS} draws"
     )))
 }
 
@@ -860,10 +890,8 @@ pub struct FileKeyCustody {
     /// HMAC-SHA-256 key, derived from that same passphrase under its own label,
     /// that authenticates every byte of a key file outside its HMAC field.
     mac_key: Zeroizing<[u8; DIGEST_LEN]>,
-    /// Maps handle IDs to key type and entry index.
+    /// Maps handle IDs to key type and entry identifier.
     handle_map: Mutex<HandleMap>,
-    /// Counter for allocating new handle IDs.
-    next_id: AtomicU64,
     /// Serializes file read-modify-write operations to prevent data races
     /// when multiple tasks call `append_entry` concurrently.
     ///
@@ -985,7 +1013,6 @@ impl FileKeyCustody {
             derived_key: material.wrap_key,
             mac_key: material.mac_key,
             handle_map: Mutex::new(HandleMap::new()),
-            next_id: AtomicU64::new(1),
             file_write_lock: StdMutex::new(()),
         })
     }
@@ -1044,9 +1071,10 @@ impl FileKeyCustody {
         // reports a modified file rather than a wrong passphrase.
         let entry_count = verify_file(&data, &material.mac_key)?;
 
-        // Build the handle map from stored entries.
+        // Build the handle map from stored entries. Each handle id comes from
+        // its entry's identifier, never from its position, so this map hands
+        // out the same ids every earlier custody object over this file did.
         let mut handle_map = HandleMap::new();
-        let mut next_id = 1u64;
 
         for i in 0..entry_count {
             let offset = HEADER_SIZE + i * ENTRY_SIZE;
@@ -1054,9 +1082,17 @@ impl FileKeyCustody {
             let key_type = StoredKeyType::from_byte(key_type_byte)?;
             let entry_id = read_entry_id(&data, i);
 
-            let handle_id = next_id;
-            next_id += 1;
-            handle_map.entries.insert(handle_id, (key_type, entry_id));
+            let handle_id = handle_id_for(&entry_id);
+            if handle_map
+                .entries
+                .insert(handle_id, (key_type, entry_id))
+                .is_some()
+            {
+                return Err(PlatformError::CustodyError(format!(
+                    "key file holds two entries with handle id {handle_id}; one handle cannot \
+                     name both"
+                )));
+            }
         }
 
         Ok(Self {
@@ -1064,7 +1100,6 @@ impl FileKeyCustody {
             derived_key: material.wrap_key,
             mac_key: material.mac_key,
             handle_map: Mutex::new(handle_map),
-            next_id: AtomicU64::new(next_id),
             file_write_lock: StdMutex::new(()),
         })
     }
@@ -1320,12 +1355,6 @@ impl FileKeyCustody {
         Ok(entry_id)
     }
 
-    /// Allocates the next handle ID.
-    fn next_handle(&self) -> KeyHandle {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        KeyHandle::new(id)
-    }
-
     /// The §9.10.4 P-256 pseudonym of identity `key_id` in `context_id` under
     /// `version`. A pseudonym has no private key, so this reads the identity
     /// seed, derives the point, and stores nothing; a destroyed identity fails
@@ -1434,7 +1463,7 @@ impl KeyCustody for FileKeyCustody {
             // `import_ed25519_signing_key`.
             let mut map = self.handle_map.lock().await;
             let entry_id = self.append_entry(stored_type, &key_bytes)?;
-            let handle = self.next_handle();
+            let handle = KeyHandle::new(handle_id_for(&entry_id));
             map.entries.insert(handle.id(), (stored_type, entry_id));
             drop(map);
 
@@ -1802,18 +1831,11 @@ impl KeyCustody for FileKeyCustody {
                     continue;
                 }
 
-                // Return the handle this object already holds for that entry.
-                // This object holds none when another custody object over this
-                // path wrote the entry, so this branch mints one instead of
-                // appending a second copy of the same key.
-                let existing_handle = map
-                    .entries
-                    .iter()
-                    .find_map(|(handle_id, (_, id))| (*id == entry_id).then_some(*handle_id));
-                if let Some(handle_id) = existing_handle {
-                    return Ok(KeyHandle::new(handle_id));
-                }
-                let handle = self.next_handle();
+                // Return that entry's handle. This object holds no map entry
+                // for it when another custody object over this path wrote the
+                // entry, so this branch records one instead of appending a
+                // second copy of the same key.
+                let handle = KeyHandle::new(handle_id_for(&entry_id));
                 map.entries
                     .insert(handle.id(), (StoredKeyType::Ed25519, entry_id));
                 return Ok(handle);
@@ -1830,7 +1852,7 @@ impl KeyCustody for FileKeyCustody {
             let entry_id =
                 self.append_entry_holding_the_write_locks(StoredKeyType::Ed25519, &key_bytes)?;
 
-            let handle = self.next_handle();
+            let handle = KeyHandle::new(handle_id_for(&entry_id));
             map.entries
                 .insert(handle.id(), (StoredKeyType::Ed25519, entry_id));
             drop(map);
@@ -1854,6 +1876,12 @@ mod tests {
     fn make_custody(dir: &TempDir, passphrase: &str) -> FileKeyCustody {
         let path = dir.path().join("keys.scp");
         FileKeyCustody::new(&path, passphrase).unwrap()
+    }
+
+    /// Every handle `custody` holds, in no particular order.
+    async fn handles_of(custody: &FileKeyCustody) -> Vec<KeyHandle> {
+        let map = custody.handle_map.lock().await;
+        map.entries.keys().map(|id| KeyHandle::new(*id)).collect()
     }
 
     #[tokio::test]
@@ -1913,8 +1941,9 @@ mod tests {
 
         // Reopen with the same passphrase.
         let custody2 = FileKeyCustody::new(&path, passphrase).unwrap();
-        // The handle IDs are reassigned on load; the first key gets handle 1.
-        let handle2 = KeyHandle::new(1);
+        // A handle id comes from its entry's identifier, so the handle the
+        // first object returned names the same key after a reopen.
+        let handle2 = handle;
         let pubkey2 = custody2.public_key(&handle2).await.unwrap();
         assert_eq!(
             pubkey.as_bytes(),
@@ -2168,6 +2197,115 @@ mod tests {
         }
     }
 
+    /// A handle a caller persists across a restart names the key it was given,
+    /// after a `destroy_key` moved that key to another position. Numbering
+    /// handles by position at construction hands `h1` the key that slid into
+    /// position 0 here and lets `destroy_key(h0)` remove it.
+    #[tokio::test]
+    async fn a_persisted_handle_names_its_key_after_destroy_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        let mut handles = Vec::new();
+        let mut publics = Vec::new();
+        for _ in 0..3 {
+            let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+            publics.push(custody.public_key(&handle).await.unwrap());
+            handles.push(handle);
+        }
+        custody.destroy_key(&handles[0]).await.unwrap();
+        drop(custody);
+
+        let reopened = FileKeyCustody::new(&path, "pw").unwrap();
+        for i in 1..3 {
+            assert_eq!(
+                reopened.public_key(&handles[i]).await.unwrap().as_bytes(),
+                publics[i].as_bytes(),
+                "persisted handle {i} must name its own key after a reopen"
+            );
+        }
+        assert!(
+            matches!(
+                reopened.public_key(&handles[0]).await,
+                Err(PlatformError::KeyNotFound)
+            ),
+            "the handle of the destroyed key must find nothing after a reopen"
+        );
+        assert!(
+            matches!(
+                reopened.destroy_key(&handles[0]).await,
+                Err(PlatformError::KeyNotFound)
+            ),
+            "re-destroying the destroyed key's handle must remove nothing"
+        );
+        assert_eq!(
+            reopened.public_key(&handles[1]).await.unwrap().as_bytes(),
+            publics[1].as_bytes(),
+            "a repeated destroy of a stale handle must leave the next key in place"
+        );
+    }
+
+    /// Construction rejects a file in which two entries derive one handle id,
+    /// because one handle cannot name both. Only a passphrase holder can seal
+    /// such a file, which this test does directly.
+    #[tokio::test]
+    async fn two_entries_with_one_handle_id_are_rejected_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "pw").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let mut data = custody.read_file().unwrap();
+        let first_id = HEADER_SIZE + ENTRY_ID_IN_ENTRY;
+        let second_id = HEADER_SIZE + ENTRY_SIZE + ENTRY_ID_IN_ENTRY;
+        let prefix: [u8; 8] = data[first_id..first_id + 8].try_into().unwrap();
+        data[second_id..second_id + 8].copy_from_slice(&prefix);
+        seal_file_mac(&custody.mac_key, &mut data).unwrap();
+        atomic_write(&path, &data).unwrap();
+        drop(custody);
+
+        match FileKeyCustody::new(&path, "pw").err().unwrap() {
+            PlatformError::CustodyError(msg) => assert!(
+                msg.contains("two entries with handle id"),
+                "the error must name the shared handle id: {msg}"
+            ),
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
+    /// A draw whose handle id a stored entry already carries is redrawn, even
+    /// when its remaining eight bytes differ; a fresh draw is accepted.
+    #[tokio::test]
+    async fn an_entry_id_sharing_a_stored_handle_id_is_redrawn() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "pw");
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let data = custody.read_file().unwrap();
+        let stored = read_entry_id(&data, 0);
+
+        let mut colliding = stored;
+        colliding[ENTRY_ID_LEN - 1] ^= 0xFF;
+        let mut fresh = stored;
+        fresh[0] ^= 0xFF;
+
+        let mut draws = [colliding, fresh].into_iter();
+        let accepted = unique_entry_id_from(&data, |id| *id = draws.next().unwrap()).unwrap();
+        assert_eq!(
+            accepted, fresh,
+            "the first draw shares a handle id and must be redrawn"
+        );
+
+        match unique_entry_id_from(&data, |id| *id = colliding) {
+            Err(PlatformError::CustodyError(msg)) => assert!(
+                msg.contains("handle id this key file already holds"),
+                "the error must name the repeated handle id: {msg}"
+            ),
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
     /// A file an older format version wrote carries neither a commitment nor a
     /// file HMAC, so construction can check neither its passphrase nor its
     /// integrity. `open_existing` rejects it by version and names that version,
@@ -2280,7 +2418,7 @@ mod tests {
 
         // Inject a desynchronized entry: a handle the map claims names an
         // entry identifier the file does not carry.
-        let desync_id = custody.next_handle().id();
+        let desync_id = handle_id_for(&[0xAB; ENTRY_ID_LEN]);
         {
             let mut map = custody.handle_map.lock().await;
             map.entries
@@ -2498,9 +2636,7 @@ mod tests {
 
         // Reopen and verify all keys.
         let custody2 = FileKeyCustody::new(&path, passphrase).unwrap();
-        let rh1 = KeyHandle::new(1);
-        let rh2 = KeyHandle::new(2);
-        let rh3 = KeyHandle::new(3);
+        let (rh1, rh2, rh3) = (h1, h2, h3);
 
         assert_eq!(
             custody2.public_key(&rh1).await.unwrap().as_bytes(),
@@ -2953,11 +3089,11 @@ mod tests {
         );
 
         // Reopening reads all eight entries back, which proves each entry
-        // decrypts under the index it sits at.
+        // decrypts under its own identifier.
         let reopened = FileKeyCustody::new(&path, "pw").unwrap();
         let mut reread = Vec::with_capacity(WRITERS);
-        for id in 1..=WRITERS as u64 {
-            let public = reopened.public_key(&KeyHandle::new(id)).await.unwrap();
+        for handle in handles_of(&reopened).await {
+            let public = reopened.public_key(&handle).await.unwrap();
             reread.push(public.as_bytes().to_vec());
         }
         reread.sort_unstable();
@@ -3077,9 +3213,9 @@ mod tests {
             .unwrap();
         let mut reread: Vec<Vec<u8>> = runtime.block_on(async {
             let mut keys = Vec::with_capacity(CONSTRUCTORS);
-            for id in 1..=CONSTRUCTORS as u64 {
+            for handle in handles_of(&reopened).await {
                 let public = reopened
-                    .public_key(&KeyHandle::new(id))
+                    .public_key(&handle)
                     .await
                     .expect("a reopen must decrypt every key each racing constructor wrote");
                 keys.push(public.as_bytes().to_vec());
@@ -3241,8 +3377,8 @@ mod tests {
 
         let reopened = FileKeyCustody::new(&path, "pw").unwrap();
         let mut public_keys = Vec::with_capacity(2 * CROSS_PROCESS_APPENDS);
-        for id in 1..=(2 * CROSS_PROCESS_APPENDS) as u64 {
-            let public = reopened.public_key(&KeyHandle::new(id)).await.unwrap();
+        for handle in handles_of(&reopened).await {
+            let public = reopened.public_key(&handle).await.unwrap();
             public_keys.push(public.as_bytes().to_vec());
         }
         public_keys.sort_unstable();
@@ -3279,10 +3415,10 @@ mod tests {
         let ed = a.generate_keypair(KeyType::Ed25519).await.unwrap();
         a.generate_keypair(KeyType::X25519).await.unwrap();
 
-        // `b` loads the same two entries and mints handles 1 and 2 for them, so
-        // handle 1 names entry 0.
+        // `b` loads the same two entries, and derives the same handle ids from
+        // their identifiers, so `ed` names entry 0 in `b` too.
         let b = FileKeyCustody::new(&path, "pw").unwrap();
-        b.destroy_key(&KeyHandle::new(1)).await.unwrap();
+        b.destroy_key(&ed).await.unwrap();
 
         let sign_error = a
             .sign(&ed, b"payload")
@@ -3360,7 +3496,7 @@ mod tests {
         let path = dir.path().join("keys.scp");
 
         let custody = FileKeyCustody::new(&path, "pw").unwrap();
-        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let mut data = custody.read_file().unwrap();
         data[HEADER_SIZE] = KEY_TYPE_X25519;
@@ -3370,7 +3506,6 @@ mod tests {
 
         let reopened = FileKeyCustody::new(&path, "pw")
             .expect("a re-sealed file passes its HMAC check, so the reopen succeeds");
-        let handle = KeyHandle::new(1);
 
         // The X25519 base point, so an unmutated build could not fail on a
         // low-order peer instead of on the AEAD.
@@ -3594,16 +3729,16 @@ mod tests {
             a_handles.push(handle);
         }
 
-        // `b` loads the same four entries and mints handles 1 through 4 for
-        // positions 0 through 3.
+        // `b` loads the same four entries and derives the same four handle ids
+        // from their identifiers.
         let b = FileKeyCustody::new(&path, "pw").unwrap();
         let before = std::fs::read(&path).unwrap();
 
         a.destroy_key(&a_handles[1]).await.unwrap();
 
         // The rewrite really did move two entries down one position each, so
-        // the handles `b` minted against positions 2 and 3 now name positions
-        // that hold other keys. Every assertion below rests on that.
+        // positions 2 and 3, where `b` read the third and fourth keys, now hold
+        // other bytes. Every assertion below rests on that.
         let after = std::fs::read(&path).unwrap();
         assert_eq!(
             after.len(),
@@ -3617,12 +3752,12 @@ mod tests {
         );
 
         assert_eq!(
-            b.public_key(&KeyHandle::new(1)).await.unwrap().as_bytes(),
+            b.public_key(&a_handles[0]).await.unwrap().as_bytes(),
             publics[0].as_slice(),
             "the entry ahead of the destroyed one must keep serving its handle"
         );
         let destroyed = b
-            .public_key(&KeyHandle::new(2))
+            .public_key(&a_handles[1])
             .await
             .expect_err("the handle naming the destroyed entry must fail");
         match destroyed {
@@ -3633,19 +3768,19 @@ mod tests {
             other => panic!("expected CustodyError, got {other:?}"),
         }
         assert_eq!(
-            b.public_key(&KeyHandle::new(3)).await.unwrap().as_bytes(),
+            b.public_key(&a_handles[2]).await.unwrap().as_bytes(),
             publics[2].as_slice(),
             "the third handle must read the third key, not the key that moved into position 2"
         );
         assert_eq!(
-            b.public_key(&KeyHandle::new(4)).await.unwrap().as_bytes(),
+            b.public_key(&a_handles[3]).await.unwrap().as_bytes(),
             publics[3].as_slice(),
             "the fourth handle must read the fourth key at its new position"
         );
 
         // Signing goes through the same lookup, so assert it recovers the same
         // key rather than only that it succeeds.
-        let signature = b.sign(&KeyHandle::new(3), b"payload").await.unwrap();
+        let signature = b.sign(&a_handles[2], b"payload").await.unwrap();
         let verifying_key =
             VerifyingKey::from_bytes(&publics[2].as_slice().try_into().unwrap()).unwrap();
         let signature_bytes: [u8; 64] = signature.as_bytes().try_into().unwrap();
@@ -3673,14 +3808,14 @@ mod tests {
         let path = dir.path().join("keys.scp");
 
         let a = FileKeyCustody::new(&path, "pw").unwrap();
-        a.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let a_first = a.generate_keypair(KeyType::Ed25519).await.unwrap();
         let a_second = a.generate_keypair(KeyType::Ed25519).await.unwrap();
         let a_second_public = a.public_key(&a_second).await.unwrap();
 
-        // `b` loads both entries as handles 1 and 2, destroys the first, and
-        // writes a third key into the position that rewrite freed.
+        // `b` loads both entries under the same handle ids, destroys the first,
+        // and writes a third key into the position that rewrite freed.
         let b = FileKeyCustody::new(&path, "pw").unwrap();
-        b.destroy_key(&KeyHandle::new(1)).await.unwrap();
+        b.destroy_key(&a_first).await.unwrap();
         let b_fresh = b.generate_keypair(KeyType::Ed25519).await.unwrap();
         let b_fresh_public = b.public_key(&b_fresh).await.unwrap();
 

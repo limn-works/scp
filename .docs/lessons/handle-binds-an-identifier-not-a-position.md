@@ -36,9 +36,14 @@ fn entry_aad(key_type: StoredKeyType, entry_id: &EntryId) -> [u8; 1 + ENTRY_ID_L
 fn find_entry_index(data: &[u8], entry_id: &EntryId) -> Option<usize>
 ```
 
-A compaction then copies each surviving entry byte for byte, a stale handle
-finds no entry and returns an error, and no rewrite can hand a handle another
-handle's key.
+A compaction then copies each surviving entry byte for byte, and a stale handle
+finds no entry and returns an error.
+
+The handle's own value must come from the identifier too. A constructor that
+numbers handles 1 to n by file position rebuilds the positional binding on
+every reopen, and `scp-node` and the identity migration in `scp-identity`
+persist handles across restarts. `FileKeyCustody` therefore uses the first
+eight bytes of `entry_id` as the handle's `u64`.
 
 **Rule**: a position is a property of a container's current layout, not an
 identity. Binding a capability to a position makes every rewrite of that
