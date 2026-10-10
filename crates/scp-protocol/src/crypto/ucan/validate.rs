@@ -424,10 +424,24 @@ impl ProofResolver for InMemoryProofResolver {
 /// canonical wire location is the UCAN `nb` field (§7.3.8), but validation
 /// only requires a deterministic look-up keyed by `&UcanToken`. Every
 /// production validation site uses [`TokenNbCaveatResolver`], which reads the
-/// token's own signed `nb`. No resolver that ignores `nb` exists: one would
-/// skip the Step 11b time-box on a root outlet token (admitting it past
-/// `nb.valid_until`) and reject every delegated outlet token at its first edge
-/// with `OriginKindUnspecified`.
+/// token's own signed `nb`.
+///
+/// **Sealed.** The trait has a private supertrait, so no crate outside
+/// `scp-protocol` can implement it, and every `ValidationContext` built outside
+/// this crate carries [`TokenNbCaveatResolver`]:
+///
+/// ```compile_fail
+/// use scp_protocol::crypto::ucan::UcanToken;
+/// use scp_protocol::crypto::ucan::validate::CaveatResolver;
+/// use scp_protocol::trust::caveats::InvocationCaveats;
+///
+/// struct IgnoresNb;
+/// impl CaveatResolver for IgnoresNb {
+///     fn resolve_caveats(&self, _token: &UcanToken) -> Option<InvocationCaveats> {
+///         None
+///     }
+/// }
+/// ```
 ///
 /// Returning `Some(_)` opts the token into Step 7b (attenuation) and Step
 /// 11b (time-box) caveat enforcement. Returning `None` means the token
@@ -446,13 +460,21 @@ impl ProofResolver for InMemoryProofResolver {
 /// later awaited from a `Send`-only executor (napi, uniffi). The
 /// `Send + Sync` super-bound makes such futures `Send` without
 /// per-call-site adapters.
-pub trait CaveatResolver: Send + Sync {
+pub trait CaveatResolver: sealed::Sealed + Send + Sync {
     /// Resolves the [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats) for the given token, or returns
     /// `None` if the token carries no caveat-level constraints.
     fn resolve_caveats(
         &self,
         token: &UcanToken,
     ) -> Option<crate::trust::caveats::InvocationCaveats>;
+}
+
+mod sealed {
+    /// Private supertrait of [`super::CaveatResolver`].
+    pub trait Sealed {}
+    impl Sealed for super::TokenNbCaveatResolver {}
+    #[cfg(test)]
+    impl Sealed for super::InMemoryCaveatResolver {}
 }
 
 /// A [`CaveatResolver`] that reads each token's caveats directly from its
@@ -490,21 +512,21 @@ impl CaveatResolver for TokenNbCaveatResolver {
     }
 }
 
-/// In-memory [`CaveatResolver`] keyed by encoded JWT string.
+/// Test-only [`CaveatResolver`] keyed by encoded JWT string; it ignores `nb`.
 ///
-/// Restricted to test builds. Tests use it to attach caveats to a token
-/// without re-signing its `nb` field.
+/// Tests use it to attach caveats to a token without re-signing its `nb`
+/// field.
 ///
 /// Map values are owned [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats) records — the resolver
 /// returns clones so the validation pipeline can take an owned snapshot
 /// without holding a borrow on the resolver across recursive chain walks.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub struct InMemoryCaveatResolver {
     /// Map of `UcanToken::encoded` → [`InvocationCaveats`](crate::trust::caveats::InvocationCaveats).
     pub caveats: std::collections::HashMap<String, crate::trust::caveats::InvocationCaveats>,
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl InMemoryCaveatResolver {
     /// Creates an empty resolver.
     #[must_use]
@@ -524,14 +546,14 @@ impl InMemoryCaveatResolver {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl Default for InMemoryCaveatResolver {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl CaveatResolver for InMemoryCaveatResolver {
     fn resolve_caveats(
         &self,
