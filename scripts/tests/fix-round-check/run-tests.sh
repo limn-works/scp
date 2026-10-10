@@ -1601,9 +1601,11 @@ case_25() {
 # agent that an edit to a workflow has coverage it does not have.
 #
 # EVIDENCE, not the criterion: a file of the suite's own directory holds a line naming a
-# repository-root variable and a `workflows/` path together. `scripts/tests/ci-gate/
-# ci_gate_selftest.py` writes `WORKFLOW = REPO / ".github/workflows/ci.yml"` and this file
-# writes `"$REPO_ROOT/.github/workflows/ci.yml"`, while `scripts/tests/toolchain-wiring/
+# repository-root variable and a `.github/` path together. `scripts/tests/ci-gate/
+# ci_gate_selftest.py` writes `WORKFLOW = REPO / ".github/workflows/ci.yml"`, this file
+# writes `"$REPO_ROOT/.github/workflows/ci.yml"`, and `scripts/tests/rust-toolchain-action/
+# run-tests.sh` writes `"$REPO_ROOT/.github/actions/rust-toolchain/install.sh"`, a file
+# under `.github/` that is not a workflow, while `scripts/tests/toolchain-wiring/
 # run-tests.sh` writes `"$root/.github/workflows/ci.yml"` against a fixture tree it created
 # and `scripts/tests/signing-guard/run-tests.sh` names no workflow path at all. A suite
 # that roots a path at this repository under a variable spelled some other way fails this
@@ -1633,7 +1635,7 @@ while IFS= read -r suite; do
         [[ $suite_dir == scripts/tests/* ]] && scan="$REPO_ROOT/$suite_dir"
     fi
     qualifies=0
-    grep -rqE 'REPO[A-Z_]*[^a-zA-Z0-9_].*workflows/' "$scan" 2>/dev/null && qualifies=1
+    grep -rqE 'REPO[A-Z_]*[^a-zA-Z0-9_].*\.github/' "$scan" 2>/dev/null && qualifies=1
     named=0
     case $GITHUB_LANE_LINE in
         *"$suite"*) named=1 ;;
