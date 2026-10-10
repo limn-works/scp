@@ -21381,8 +21381,6 @@ mod tests {
     fn restore_readmits_the_ids_it_restores() {
         use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
         let rt = runtime();
-        // `restore_context` reads the snapshot the persistence provider holds;
-        // only the Sqlite backend attaches one.
         let tmp = tempfile::tempdir().expect("tempdir");
         let scp = crate::scp::Scp::with_storage(crate::StorageConfig::Sqlite {
             path: tmp.path().to_string_lossy().into_owned(),

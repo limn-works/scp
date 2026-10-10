@@ -2051,8 +2051,6 @@ impl CoreFields {
     /// override `resume`). No-ops silently when:
     /// - No `ContextManager` is attached yet (the bridge hasn't seen its
     ///   first `identity_create` / `context_create`).
-    /// - The attached `ContextManager` was built without persistence
-    ///   (ephemeral test / in-memory path).
     ///
     /// Routes through `Supervisor::restore_on_startup` (ADR-049),
     /// which restores contexts BEFORE the durable saga-journal replay in the
