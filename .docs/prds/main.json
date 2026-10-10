@@ -10548,7 +10548,6 @@
       "severity": "critical",
       "status": "in-progress",
       "files": [
-        ".clippy.toml",
         ".docs/adrs/phase-1.md",
         ".docs/adrs/phase-4.md",
         ".docs/adrs/phase-5.md",
@@ -10666,7 +10665,6 @@
         "crates/scp-protocol/src/crypto/ucan/mod.rs",
         "crates/scp-protocol/src/envelope/mod.rs",
         "crates/scp-protocol/src/provenance/attach.rs",
-        "crates/scp-runtime/clippy.toml",
         "crates/scp-runtime/src/context/export_import.rs",
         "crates/scp-runtime/src/context/outlets/signer.rs",
         "crates/scp-runtime/src/context/outlets/stream.rs",

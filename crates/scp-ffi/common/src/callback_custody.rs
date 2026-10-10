@@ -504,12 +504,15 @@ where
 ///
 /// Asks the host for the key and for its public key, which must state the
 /// requested type and role and pass [`registered_key`], and caches it. When
-/// the key id is not numeric, the host's answer is refused, or the cache
-/// already holds the id, the new host key is destroyed before the error is
-/// returned, and a destroy that also fails is appended to the error. An id the
-/// cache holds is never destroyed: it names a key this adapter holds, so the
-/// refusal is returned alone. On a poisoned registry lock nothing is
-/// destroyed, since the cache cannot say whether the id names a held key.
+/// the key id is not numeric, the host's `get_public_key` fails, or the
+/// host's answer is refused, the flow destroys the new host key before it
+/// returns the error, and appends a destroy failure other than key-not-found
+/// to the error. The flow leaves the host key in place in two cases. When the
+/// cache already holds the id, the id names a key this adapter holds, so the
+/// flow returns the refusal alone. When the registry lock is poisoned, the
+/// cache cannot say whether the id names a held key, so the flow appends that
+/// the key was not destroyed. When the host's `generate_keypair` fails, no key
+/// id exists and nothing is destroyed.
 ///
 /// A caller that drops this future between the host's mint and the cache
 /// write leaves the minted key on the host, unnamed by any handle.

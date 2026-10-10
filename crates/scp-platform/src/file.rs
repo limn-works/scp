@@ -46,8 +46,8 @@
 //!
 //! The Argon2id output is never used as a key directly. HKDF-SHA256 over it
 //! derives two independent subkeys under distinct info labels: the
-//! AES-256-GCM entry key ([`ENTRY_KEY_INFO`]) and the file-tag HMAC key
-//! ([`FILE_MAC_INFO`]).
+//! AES-256-GCM entry key (`scp/file-key-custody/v1/entry-aead`) and the
+//! file-tag HMAC key (`scp/file-key-custody/v1/file-mac`).
 //!
 //! The Argon2id salt is generated once when the file is created and reused
 //! for all entries. Each entry has a unique AES-256-GCM nonce. The
